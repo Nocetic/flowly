@@ -356,6 +356,54 @@ def config_set(params: dict) -> dict:
     return {"ok": True, "willRestart": bool(params.get("restart"))}
 
 
+# ── Pet (Petdex floating companion) ─────────────────────────────────────────
+
+def _pet_err(exc: Exception) -> FeatureRpcError:
+    return FeatureRpcError(getattr(exc, "code", "PET_ERROR"), getattr(exc, "message", str(exc)))
+
+
+def pet_info(params: dict) -> dict:
+    from flowly.pet import service
+    try:
+        return service.get_info()
+    except service.PetServiceError as exc:
+        raise _pet_err(exc) from exc
+
+
+async def pet_gallery(params: dict) -> dict:
+    from flowly.pet import service
+    try:
+        return await service.get_gallery()
+    except service.PetServiceError as exc:
+        raise _pet_err(exc) from exc
+
+
+async def pet_select(params: dict) -> dict:
+    from flowly.pet import service
+    slug = (params.get("slug") or "").strip()
+    if not slug:
+        raise FeatureRpcError("INVALID", "slug is required")
+    try:
+        return await service.select(slug)
+    except service.PetServiceError as exc:
+        raise _pet_err(exc) from exc
+
+
+def pet_disable(params: dict) -> dict:
+    from flowly.pet import service
+    return service.disable()
+
+
+def pet_scale(params: dict) -> dict:
+    from flowly.pet import service
+    if "scale" not in params:
+        raise FeatureRpcError("INVALID", "scale is required")
+    try:
+        return service.set_scale(params["scale"])
+    except service.PetServiceError as exc:
+        raise _pet_err(exc) from exc
+
+
 # ── Memory (entries + USER.md) ──────────────────────────────────────────────
 
 def chat_inflight(params: dict) -> dict:
@@ -2184,6 +2232,11 @@ _DISPATCH: dict[str, tuple] = {
     "chat.inflight":      (chat_inflight, True, False),
     "config.get":         (config_get, False, False),
     "config.set":         (config_set, True, True),
+    "pet.info":           (pet_info, True, False),
+    "pet.gallery":        (pet_gallery, True, False),
+    "pet.select":         (pet_select, True, False),
+    "pet.disable":        (pet_disable, True, False),
+    "pet.scale":          (pet_scale, True, False),
     "mcp.list":           (mcp_list, False, False),
     "mcp.upsert":         (mcp_upsert, True, True),
     "mcp.set_enabled":    (mcp_set_enabled, True, True),
