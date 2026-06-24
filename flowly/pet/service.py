@@ -9,6 +9,7 @@ active pet — config is only mutated after a successful install.
 from __future__ import annotations
 
 import base64
+import io
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,9 @@ from flowly.config.loader import load_config, save_config
 from flowly.pet import constants, manifest, sprites, store
 
 _MIME_BY_EXT = {".webp": "image/webp", ".png": "image/png", ".gif": "image/gif"}
+
+# Longest side (px) of a generated thumbnail.
+THUMB_MAX = 128
 
 
 class PetServiceError(Exception):
@@ -181,3 +185,59 @@ def set_scale(scale: Any) -> dict:
     cfg.display.pet.scale = clamped
     save_config(cfg)
     return {"ok": True, "scale": clamped}
+
+
+# ── thumbnails ───────────────────────────────────────────────────────────────
+
+def _data_uri(path: Path) -> str:
+    mime = _MIME_BY_EXT.get(path.suffix.lower(), "image/png")
+    return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def _render_thumb(slug: str, sheet_path: Path, dest: Path) -> None:
+    """Crop the idle row's first frame, downscale, and cache it as a PNG."""
+    meta = store.read_meta(slug) or {}
+    idle_row = int((meta.get("rowByState") or {}).get(constants.DEFAULT_STATE, 0))
+    fw, fh = constants.FRAME_WIDTH, constants.FRAME_HEIGHT
+    frame = sprites.load_image(sheet_path).crop((0, idle_row * fh, fw, (idle_row + 1) * fh))
+    frame.thumbnail((THUMB_MAX, THUMB_MAX))  # in place, preserves aspect ratio
+    buf = io.BytesIO()
+    frame.save(buf, format="PNG")
+    store.atomic_write_bytes(dest, buf.getvalue())
+
+
+async def get_thumb(slug: str, *, client: Any = None) -> dict:
+    """Return a small thumbnail for *slug* as a cached PNG data URI.
+
+    Generated from an installed spritesheet when possible, otherwise fetched
+    (server-side, host-pinned) from the manifest's thumbnail URL — the client
+    never fetches Petdex assets directly.
+    """
+    safe = _safe(slug)
+    if not safe:
+        raise PetServiceError("INVALID", f"invalid pet slug: {slug!r}")
+
+    cached = store.pet_dir(safe) / "thumb.png"
+    if cached.is_file():
+        return {"slug": safe, "dataUri": _data_uri(cached)}
+
+    sheet = _spritesheet_path(safe)
+    if sheet is not None:
+        _render_thumb(safe, sheet, cached)
+        return {"slug": safe, "dataUri": _data_uri(cached)}
+
+    try:
+        data = await manifest.fetch_manifest(client=client)
+    except manifest.PetManifestError as exc:
+        raise PetServiceError("MANIFEST_UNAVAILABLE", str(exc)) from exc
+    entry = next((e for e in manifest.pets_from_manifest(data) if _safe(e.get("slug")) == safe), None)
+    if entry is None:
+        raise PetServiceError("NOT_FOUND", f"pet not in manifest: {safe}")
+    url = entry.get("thumb") or entry.get("thumbnail")
+    if not url:
+        raise PetServiceError("NOT_FOUND", f"no thumbnail for pet: {safe}")
+    try:
+        await store.download_asset(url, cached, client=client)
+    except store.PetStoreError as exc:
+        raise PetServiceError("DOWNLOAD_FAILED", str(exc)) from exc
+    return {"slug": safe, "dataUri": _data_uri(cached)}
