@@ -839,6 +839,25 @@ class MCPServerConfig(BaseModel):
     sampling: MCPSamplingConfig = Field(default_factory=MCPSamplingConfig)
 
 
+class PetDisplayConfig(BaseModel):
+    """Optional floating desktop pet (Petdex companion). Off by default."""
+    enabled: bool = False
+    slug: str = ""
+    scale: float = 0.33  # default mirrors flowly/pet/constants.DEFAULT_SCALE
+
+    @field_validator("scale")
+    @classmethod
+    def _clamp_scale(cls, v: float) -> float:
+        # Mirror flowly.pet.constants SCALE_MIN/SCALE_MAX inline so the config
+        # module stays dependency-free (config must not import the pet package).
+        return max(0.1, min(3.0, float(v)))
+
+
+class DisplayConfig(BaseModel):
+    """Cosmetic display options surfaced by the desktop app."""
+    pet: PetDisplayConfig = Field(default_factory=PetDisplayConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for flowly."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -849,6 +868,7 @@ class Config(BaseSettings):
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
+    display: DisplayConfig = Field(default_factory=DisplayConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(
         default_factory=dict, alias="mcpServers",
     )
