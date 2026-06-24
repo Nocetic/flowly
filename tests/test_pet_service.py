@@ -22,11 +22,13 @@ def pet_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def png() -> bytes:
-    """A 192x416 spritesheet: 2 opaque rows (idle, run), one frame each."""
-    img = Image.new("RGBA", (192, 416), (0, 0, 0, 0))
+    """A full 9-row Petdex atlas (192x1872) with one opaque frame on the idle
+    row (0) and the canonical 'running' row (7) — so 'run' must resolve to 7,
+    not to row 1, under the real row taxonomy."""
+    img = Image.new("RGBA", (192, 208 * 9), (0, 0, 0, 0))
     block = Image.new("RGBA", (192, 208), (255, 0, 0, 255))
-    img.paste(block, (0, 0))
-    img.paste(block, (0, 208))
+    img.paste(block, (0, 0))            # row 0 = idle
+    img.paste(block, (0, 208 * 7))      # row 7 = running
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -68,7 +70,7 @@ class TestService:
 
         assert info["enabled"] is True
         assert info["slug"] == "otter"
-        assert info["rowByState"] == {"idle": 0, "run": 1}
+        assert info["rowByState"] == {"idle": 0, "run": 7}  # 'running' row, not row 1
         assert info["framesByState"] == {"idle": 1, "run": 1}
         assert info["spritesheetMime"] == "image/png"
         assert base64.b64decode(info["spritesheet"]) == png
@@ -89,6 +91,25 @@ class TestService:
         assert otter["installed"] is True
         assert otter["active"] is True
         assert gallery["offline"] is False
+
+    async def test_gallery_uses_display_name_from_manifest(self, pet_env):
+        # Real Petdex manifest entries carry ``displayName``; the gallery must
+        # surface it as the name rather than echoing the slug.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/manifest"):
+                return httpx.Response(200, json={"pets": [{
+                    "slug": "homelander", "displayName": "Homelander",
+                    "spritesheetUrl": "https://assets.petdex.dev/x/sprite.webp",
+                }]})
+            return httpx.Response(404)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            gallery = await service.get_gallery(client=client)
+        finally:
+            await client.aclose()
+        hl = next(p for p in gallery["pets"] if p["slug"] == "homelander")
+        assert hl["name"] == "Homelander"  # displayName, not the slug
 
     async def test_gallery_offline_falls_back_to_installed(self, pet_env, png):
         online = _client(png)

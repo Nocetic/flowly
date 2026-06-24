@@ -76,6 +76,41 @@ class TestErrors:
             await client.aclose()
 
 
+class TestRedirect:
+    async def test_follows_onhost_redirect_to_assets_cdn(self):
+        # petdex.dev/api/manifest 307s to assets.petdex.dev — must be followed.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/manifest"):
+                return httpx.Response(
+                    307, headers={"location": "https://assets.petdex.dev/manifests/v1.json"}
+                )
+            if request.url.host == "assets.petdex.dev":
+                return httpx.Response(200, json={"pets": [{"slug": "otter"}]})
+            return httpx.Response(404)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            m = await manifest.fetch_manifest(client=client)
+        finally:
+            await client.aclose()
+        assert m == {"pets": [{"slug": "otter"}]}
+
+    async def test_rejects_offhost_redirect(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "petdex.dev":
+                return httpx.Response(
+                    307, headers={"location": "https://evil.example/manifest.json"}
+                )
+            return httpx.Response(200, json={"pets": [{"slug": "evil"}]})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(manifest.PetManifestError):
+                await manifest.fetch_manifest(client=client)
+        finally:
+            await client.aclose()
+
+
 class TestExtract:
     def test_pets_from_manifest_filters_non_dicts(self):
         out = manifest.pets_from_manifest({"pets": [{"slug": "a"}, "bad", {"slug": "b"}]})

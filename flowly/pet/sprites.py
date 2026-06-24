@@ -1,9 +1,11 @@
 """Spritesheet analysis: map rows onto animation states, trim blank frames.
 
-A Petdex spritesheet is a grid of ``FRAME_WIDTH x FRAME_HEIGHT`` cells: one row
-per animation state, columns are that animation's frames. Rows are padded to a
-fixed column count, so we trim **trailing** blank (fully-transparent) frames to
-recover the real frame count per state.
+A Petdex spritesheet is a grid of ``FRAME_WIDTH x FRAME_HEIGHT`` cells. Rows are
+NOT one-per-state in our PET_STATES order — they follow a fixed physical layout
+(see ``constants.PETDEX_ROW_ORDER`` / ``LEGACY_ROW_ORDER``) selected by row
+count. We resolve each requested state to its physical row via that taxonomy,
+then trim **trailing** blank (fully-transparent) frames to recover the real
+frame count per state.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from flowly.pet.constants import FRAME_HEIGHT, FRAME_WIDTH
+from flowly.pet.constants import FRAME_HEIGHT, FRAME_WIDTH, state_row_index
 
 
 def load_image(path: Path | str) -> Any:
@@ -43,19 +45,23 @@ def count_frames_in_row(
 def analyze(
     image: Any, states: list[str], *, frame_w: int = FRAME_WIDTH, frame_h: int = FRAME_HEIGHT
 ) -> tuple[dict[str, int], dict[str, int]]:
-    """Map an ordered list of state names onto spritesheet rows.
+    """Resolve each requested state to its physical spritesheet row.
 
-    Returns ``(row_by_state, frames_by_state)``. States beyond the available rows
-    are skipped. A row with zero non-blank frames is still mapped with
-    ``frames_by_state[state] == 0`` so the caller can decide how to fall back.
+    Returns ``(row_by_state, frames_by_state)``. The row is chosen by the
+    canonical taxonomy for the sheet's row count (not the order of *states*), so
+    e.g. ``run`` resolves to the ``running`` row even when it isn't row 2. A row
+    with zero non-blank frames still maps with ``frames_by_state[state] == 0``.
     """
     rgba = image.convert("RGBA")
     rows = max(0, rgba.height // frame_h)
     row_by_state: dict[str, int] = {}
     frames_by_state: dict[str, int] = {}
-    for idx, state in enumerate(states):
-        if idx >= rows:
-            break
+    if rows == 0:
+        return row_by_state, frames_by_state
+    for state in states:
+        idx = state_row_index(state, rows)
+        if idx >= rows:  # taxonomy row missing on this (short) sheet → idle row
+            idx = 0
         row_by_state[state] = idx
         frames_by_state[state] = count_frames_in_row(rgba, idx, frame_w=frame_w, frame_h=frame_h)
     return row_by_state, frames_by_state

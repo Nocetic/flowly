@@ -70,6 +70,18 @@ def is_allowed_url(url: str) -> bool:
     return host == _ALLOWED_HOST or host.endswith("." + _ALLOWED_HOST)
 
 
+def is_allowed_response_chain(resp: Any) -> bool:
+    """True only if the final URL **and every redirect hop** stayed host-pinned.
+
+    Following redirects (petdex.dev → assets.petdex.dev) is required, but a
+    redirect must never carry us off ``petdex.dev`` — that would defeat the
+    host pin. Validate the whole chain, not just the URL we were handed.
+    """
+    history = getattr(resp, "history", None) or []
+    urls = [str(resp.url)] + [str(h.url) for h in history]
+    return all(is_allowed_url(u) for u in urls)
+
+
 # ── metadata ─────────────────────────────────────────────────────────────────
 
 def list_installed() -> list[str]:
@@ -134,8 +146,10 @@ async def download_asset(url: str, dest: Path, *, client: Any = None) -> Path:
         client = httpx.AsyncClient(timeout=30.0, headers={"user-agent": USER_AGENT})
     try:
         total = 0
-        async with client.stream("GET", url) as resp:
+        async with client.stream("GET", url, follow_redirects=True) as resp:
             resp.raise_for_status()
+            if not is_allowed_response_chain(resp):
+                raise PetStoreError(f"asset redirected off-host: {resp.url}")
             declared = resp.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > MAX_ASSET_BYTES:
                 raise PetStoreError(f"asset too large: {declared} bytes (cap {MAX_ASSET_BYTES})")

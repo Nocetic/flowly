@@ -113,7 +113,7 @@ async def get_gallery(*, client: Any = None) -> dict:
         seen.add(slug)
         pets.append({
             "slug": slug,
-            "name": e.get("name") or slug,
+            "name": e.get("displayName") or e.get("name") or slug,
             "installed": slug in installed,
             "active": slug == active,
         })
@@ -145,7 +145,7 @@ async def _install(slug: str, *, client: Any = None) -> None:
     row_by, frames_by = sprites.analyze(sprites.load_image(dest), states)
     store.write_meta(slug, {
         "slug": slug,
-        "name": entry.get("name") or slug,
+        "name": entry.get("displayName") or entry.get("name") or slug,
         "loopMs": int(entry.get("loopMs") or constants.DEFAULT_LOOP_MS),
         "spritesheet": dest.name,
         "rowByState": row_by,

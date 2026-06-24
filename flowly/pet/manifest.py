@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from flowly.pet.store import USER_AGENT
+from flowly.pet.store import USER_AGENT, is_allowed_response_chain
 
 MANIFEST_URL = "https://petdex.dev/api/manifest"
 CACHE_TTL_SECONDS = 300  # 5 minutes
@@ -51,8 +51,12 @@ async def fetch_manifest(*, force: bool = False, client: Any = None) -> dict[str
     if own_client:
         client = httpx.AsyncClient(timeout=15.0, headers={"user-agent": USER_AGENT})
     try:
-        resp = await client.get(MANIFEST_URL)
+        # petdex.dev/api/manifest 307-redirects to the assets CDN; follow it,
+        # but never off the pinned host.
+        resp = await client.get(MANIFEST_URL, follow_redirects=True)
         resp.raise_for_status()
+        if not is_allowed_response_chain(resp):
+            raise PetManifestError(f"manifest redirected off-host: {resp.url}")
         data = resp.json()
     except httpx.HTTPError as exc:
         raise PetManifestError(f"failed to fetch Petdex manifest: {exc}") from exc
