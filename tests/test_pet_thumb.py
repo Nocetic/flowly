@@ -84,6 +84,23 @@ class TestThumb:
         assert base64.b64decode(res["dataUri"].split(",", 1)[1]) == thumb
         assert (pet_env / "pets" / "foxy" / "thumb.png").is_file()
 
+    async def test_renders_from_manifest_spritesheet_when_no_thumb(self, pet_env):
+        # Real Petdex entries carry a spritesheetUrl but NO dedicated thumb —
+        # the gallery must still preview them (this is why only the installed
+        # pet used to show). Render the idle frame from the sheet, keep only the
+        # small PNG, and don't mark the pet installed.
+        sheet = _png(192, 208 * 9)  # full 9-row atlas, not installed
+        client = _sheet_client(sheet)
+        try:
+            res = await service.get_thumb("otter", client=client)
+        finally:
+            await client.aclose()
+        assert res["dataUri"].startswith("data:image/png;base64,")
+        otter_dir = pet_env / "pets" / "otter"
+        assert (otter_dir / "thumb.png").is_file()
+        assert not (otter_dir / "pet.json").is_file()  # NOT installed
+        assert list(otter_dir.glob("_thumbsrc*")) == []  # temp sheet cleaned up
+
     async def test_invalid_slug(self, pet_env):
         with pytest.raises(service.PetServiceError):
             await service.get_thumb("...")

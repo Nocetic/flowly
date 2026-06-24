@@ -234,10 +234,27 @@ async def get_thumb(slug: str, *, client: Any = None) -> dict:
     if entry is None:
         raise PetServiceError("NOT_FOUND", f"pet not in manifest: {safe}")
     url = entry.get("thumb") or entry.get("thumbnail")
-    if not url:
-        raise PetServiceError("NOT_FOUND", f"no thumbnail for pet: {safe}")
+    if url:
+        try:
+            await store.download_asset(url, cached, client=client)
+        except store.PetStoreError as exc:
+            raise PetServiceError("DOWNLOAD_FAILED", str(exc)) from exc
+        return {"slug": safe, "dataUri": _data_uri(cached)}
+
+    # The public Petdex manifest ships no dedicated thumbnail — only a
+    # spritesheet. Render the idle frame from it so the gallery previews EVERY
+    # pet, not just installed ones. Fetch to a temp file, render, keep only the
+    # small cached PNG (don't leave the 2 MB sheet on disk for a pet we haven't
+    # adopted).
+    sheet_url = entry.get("spritesheet") or entry.get("spritesheetUrl")
+    if not sheet_url:
+        raise PetServiceError("NOT_FOUND", f"no thumbnail or spritesheet for pet: {safe}")
+    tmp_sheet = store.pet_dir(safe) / f"_thumbsrc{_ext_from_url(sheet_url)}"
     try:
-        await store.download_asset(url, cached, client=client)
+        await store.download_asset(sheet_url, tmp_sheet, client=client)
+        _render_thumb(safe, tmp_sheet, cached)
     except store.PetStoreError as exc:
         raise PetServiceError("DOWNLOAD_FAILED", str(exc)) from exc
+    finally:
+        tmp_sheet.unlink(missing_ok=True)
     return {"slug": safe, "dataUri": _data_uri(cached)}
