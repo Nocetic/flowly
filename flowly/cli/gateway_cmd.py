@@ -538,7 +538,12 @@ def gateway(
         # skip the agent turn entirely (no-op data-collection runs).
         script_preamble = ""
         if job.script:
-            script_result = script_runner.run(job.script)
+            # Run the blocking subprocess off the event loop — `script_runner.run`
+            # does a synchronous `subprocess.run(..., timeout=120)`, so calling it
+            # inline would freeze the WHOLE gateway (all channels, WS, REST,
+            # heartbeat, other cron) for the script's entire duration. to_thread
+            # keeps the loop serving everyone else while the script runs.
+            script_result = await asyncio.to_thread(script_runner.run, job.script)
             script_preamble = script_runner.format_for_prompt(script_result)
             if script_result.success and not script_result.wake_agent:
                 logger.info(
