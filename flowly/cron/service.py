@@ -522,6 +522,15 @@ class CronService:
         self._executing = True
         try:
             await self._run_due_jobs()
+        except Exception:
+            # A tick failure (e.g. _save_store hitting a full / read-only disk)
+            # must NEVER escape: this runs inside the fire-and-forget `tick`
+            # task, so an uncaught error kills that task and the timer is never
+            # re-armed — silently stopping ALL cron jobs until restart. Log it
+            # and fall through to the re-arm in `finally`. (In-memory next_run
+            # is advanced before the failing save, so the next wake is in the
+            # future — no busy-loop.)
+            logger.exception("Cron: tick failed; re-arming and retrying next cycle")
         finally:
             self._executing = False
             try:
@@ -534,6 +543,9 @@ class CronService:
                         pass
             finally:
                 lock_fd.close()
+            # Always re-arm, even after a failed tick — this is the single point
+            # that keeps the self-perpetuating timer chain alive.
+            self._arm_timer()
 
     async def _run_due_jobs(self) -> None:
         now = _now_ms()
@@ -579,7 +591,9 @@ class CronService:
             await self._execute_job(job)
 
         self._save_store()
-        self._arm_timer()
+        # NOTE: the timer is re-armed by _on_timer's `finally` (which runs even
+        # if the _save_store above raises), so a tick failure can't kill the
+        # chain. Re-arming here too would just double-schedule the same wake.
 
     def _save_job_output(
         self,
