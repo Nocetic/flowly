@@ -15,9 +15,8 @@ Faz 1 limitations
   multiple Teams channels they create multiple webhooks today; Faz 2
   introduces routing.
 
-Adapted from an upstream Teams webhook writer; the surface is mapped
-onto Flowly's BaseChannel contract so the rest of the gateway routes
-through it unchanged.
+The webhook surface is mapped onto Flowly's BaseChannel contract so the
+rest of the gateway routes through it unchanged.
 """
 
 from __future__ import annotations

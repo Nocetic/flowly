@@ -17,8 +17,6 @@ Rules:
 Scope: strictly $FLOWLY_HOME and /tmp/flowly-*.  Never touches
 ``~/.flowly/sessions``, ``~/.flowly/skills``, ``~/.flowly/plugins``,
 ``~/.flowly/credentials``, ``config.json``, or any system directory.
-
-Adapted from an upstream community contribution.
 """
 
 from __future__ import annotations

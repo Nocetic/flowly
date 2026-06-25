@@ -25,8 +25,6 @@ guards must live here:
   shell execution on the HA host (or SSRF from the HA server). They are
   rejected even if the user's token would otherwise authorise them.
 - Entity IDs are validated against ``_ENTITY_ID_RE`` whenever supplied.
-
-Adapted from an upstream homeassistant tool implementation.
 """
 
 from __future__ import annotations

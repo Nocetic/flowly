@@ -50,8 +50,8 @@ KG_SUMMARY_MAX_CHARS = 2500
 MEMORY_TAIL_MAX_CHARS = 3000
 MIN_WORDS_FOR_EVAL = 8            # skip gate if barely any content
 
-# OMI-inspired silence handling: long quiet stretches reset the buffer so
-# the next stretch of conversation isn't scored against stale context.
+# Silence handling: long quiet stretches reset the buffer so the next stretch
+# of conversation isn't scored against stale context.
 SILENCE_RESET_SECONDS = 120       # 2 min inactivity → buffer cleared
 MIN_WORDS_AFTER_SILENCE = 5       # require real content before re-arming
 
@@ -602,7 +602,7 @@ class CoachingManager:
         if screenshot_b64 is not None:
             session.latest_screenshot_b64 = screenshot_b64
 
-        # ── Silence handling (OMI pattern) ────────────────────────────────
+        # ── Silence handling ──────────────────────────────────────────────
         # Long quiet → the previous context is stale. Reset buffer so the
         # next stretch of conversation stands on its own. Keep the gate
         # silent until MIN_WORDS_AFTER_SILENCE words have arrived.

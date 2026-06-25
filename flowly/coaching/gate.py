@@ -1,8 +1,8 @@
 """3-stage gate pipeline for coaching tips.
 
-Inspired by OMI's relevance → generate → critic pattern. Most conversations
-get rejected at stage 1 with a cheap LLM call. Only exceptional moments
-reach stage 2 (generate tip) and stage 3 (final usefulness check).
+Most conversations get rejected at stage 1 with a cheap relevance check.
+Only exceptional moments reach stage 2 (generate tip) and stage 3 (final
+usefulness check).
 """
 
 import json
@@ -858,5 +858,4 @@ async def extract_entities(
     except Exception as e:
         logger.warning(f"[Coach.extract_entities] failed: {e}")
         return []
-
 

@@ -58,13 +58,11 @@ class Step:
     """One concrete unit of work in a plan.
 
     Field choices:
-    - `content` (imperative) and `activeForm` (gerund) borrowed from
-      Claude Code's TodoWrite — lets a UI render "Clicking Format
-      menu" while in_progress vs "Click Format menu" while pending,
-      without the LLM having to emit both.
-    - `successCriteria` is the central addition vs Claude Code:
-      observable, validator-checkable. The Step is not "done" until
-      this can be verified in the actual page state.
+    - `content` (imperative) and `activeForm` (gerund) let a UI render
+      "Clicking Format menu" while in_progress vs "Click Format menu"
+      while pending, without the LLM having to emit both.
+    - `successCriteria` is observable and validator-checkable. The Step
+      is not "done" until this can be verified in the actual page state.
     - `evidence` slot stays None until done. Required when flipping
       to done. Free-form string — typically "screenshot shows ...",
       "DOM contains ...", or "URL changed to ...".

@@ -1,6 +1,6 @@
 """Temporal knowledge graph — structured facts about people, projects, and relationships.
 
-SQLite-based, adapted from MemPalace. Features:
+SQLite-backed store with:
 - Entity aliases ("Berke" → "Berke Toprak")
 - Fuzzy name resolution (partial match)
 - Value predicates (email, phone) stored as properties, not entity nodes
