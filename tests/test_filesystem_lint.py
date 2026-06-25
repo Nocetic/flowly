@@ -79,7 +79,11 @@ def test_check_delta_clean_toml():
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def test_write_file_clean_python(tmp_path: Path):
