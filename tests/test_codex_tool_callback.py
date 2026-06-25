@@ -121,11 +121,10 @@ class _StubTool:
 
 
 def _run(coro):
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    # asyncio.run fully owns the loop lifecycle, so these tests are immune to
+    # event-loop state another test in the suite may have left behind — which
+    # previously made them fail only when run as part of the full suite.
+    return asyncio.run(coro)
 
 
 class TestMCPServerProtocol:

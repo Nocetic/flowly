@@ -79,11 +79,12 @@ def test_check_delta_clean_toml():
 
 
 def _run(coro):
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    # asyncio.run fully owns the loop lifecycle (create → set-current → run →
+    # close → reset). Unlike a bare new_event_loop()+run_until_complete, it is
+    # immune to event-loop state another test in the suite may have left behind
+    # (a closed/unset current loop), which previously made these tests fail only
+    # when run as part of the full suite.
+    return asyncio.run(coro)
 
 
 def test_write_file_clean_python(tmp_path: Path):
