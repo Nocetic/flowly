@@ -1,0 +1,32 @@
+# Cross-platform line ending configuration
+* text=auto
+
+# Shell scripts must use Unix line endings
+*.sh text eol=lf
+
+# Windows batch files must use Windows line endings
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Python files
+*.py text eol=lf
+
+# TypeScript/JavaScript files
+*.ts text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+
+# Config files
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.env text eol=lf
+
+# Markdown
+*.md text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.ico binary

@@ -1,0 +1,17 @@
+manifest_version: 1
+name: github
+description: Search, read, and manage GitHub repos, issues, and pull requests.
+source: https://github.com/modelcontextprotocol/servers/tree/main/src/github
+transport:
+  type: stdio
+  command: npx
+  args: ["-y", "@modelcontextprotocol/server-github"]
+auth:
+  type: api_key
+  env:
+    - name: GITHUB_PERSONAL_ACCESS_TOKEN
+      prompt: "GitHub personal access token (https://github.com/settings/tokens)"
+      secret: true
+post_install: |
+  The token is stored in $FLOWLY_HOME/.env. Grant it only the scopes you
+  need (repo, read:org). Restart your session to load the tools.

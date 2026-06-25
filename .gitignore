@@ -1,0 +1,47 @@
+.assets
+.env
+*.pyc
+dist/
+build/
+build2/
+build3/
+build-x64/
+.venv/
+.venv-x64/
+docs/*
+# Security engineering docs are companion to the tracked SECURITY.md
+# and should be visible to anyone cloning the repo. The other docs/
+# entries are local-only planning notes (intentionally excluded by
+# the docs/* glob above).
+!docs/security/
+!docs/cli-distribution.md
+!docs/memory-governance-architecture.md
+!docs/skill-self-improvement-architecture.md
+!docs/internal-gateway-rpc-architecture.md
+*.egg-info/
+*.egg
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+path/
+.DS_Store
+.dispatch/
+
+# Internal tooling, worktrees, and stray planning notes — never part of the
+# public OSS repo (guards against an accidental `git add .`).
+.claude/
+.worktrees/
+amp
+# Internal feature/roadmap planning notes — keep local, never publish.
+*_PLAN.md
+
+# Compiled iMessage send helper (built per-platform by helpers/build.sh)
+flowly/channels/helpers/Flowly iMessage Helper.app/
+!docs/feature-rpc-architecture.md
+
+# Internal engineering notes (not shipped)
+STREAMING_ENGINEERING.md
+GATEWAY_CONNECTION_PLAN.md

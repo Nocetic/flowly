@@ -1,0 +1,18 @@
+manifest_version: 1
+name: filesystem
+description: Read, write, and search files within a directory you allow.
+source: https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+transport:
+  type: stdio
+  command: npx
+  args: ["-y", "@modelcontextprotocol/server-filesystem", "${MCP_FILESYSTEM_ROOT}"]
+auth:
+  type: api_key
+  env:
+    - name: MCP_FILESYSTEM_ROOT
+      prompt: "Absolute path to the directory the server may access"
+      secret: false
+      default: "~"
+post_install: |
+  The server is restricted to the directory you entered. Use an absolute
+  path. To allow more than one directory, edit the args in config.json.

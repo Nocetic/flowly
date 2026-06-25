@@ -1,0 +1,17 @@
+manifest_version: 1
+name: notion
+description: Read and write Notion pages, databases, and blocks.
+source: https://github.com/makenotion/notion-mcp-server
+transport:
+  type: stdio
+  command: npx
+  args: ["-y", "@notionhq/notion-mcp-server"]
+auth:
+  type: api_key
+  env:
+    - name: NOTION_API_KEY
+      prompt: "Notion internal integration token (https://www.notion.so/my-integrations)"
+      secret: true
+post_install: |
+  Share the Notion pages/databases you want accessible with your
+  integration. The token is stored in $FLOWLY_HOME/.env.

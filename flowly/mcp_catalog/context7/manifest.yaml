@@ -1,0 +1,13 @@
+manifest_version: 1
+name: context7
+description: Up-to-date, version-specific documentation for libraries and frameworks.
+source: https://github.com/upstash/context7
+transport:
+  type: stdio
+  command: npx
+  args: ["-y", "@upstash/context7-mcp"]
+auth:
+  type: none
+post_install: |
+  No setup needed. Ask the agent to "use context7 to fetch the latest docs
+  for <library>" — it resolves the library, then queries the docs.

@@ -1,0 +1,12 @@
+manifest_version: 1
+name: playwright
+description: Drive a real browser — navigate, click, fill forms, screenshot.
+source: https://github.com/microsoft/playwright-mcp
+transport:
+  type: stdio
+  command: npx
+  args: ["-y", "@playwright/mcp@latest"]
+auth:
+  type: none
+post_install: |
+  First run downloads a browser (~150MB) via Playwright. No credentials.

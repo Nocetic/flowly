@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest a capability or improvement for the Flowly CLI/gateway
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Note: many capabilities are better as a **skill** or **plugin** than a
+        core change — see CONTRIBUTING.md and PLUGINS.md before proposing core work.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do that's hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should Flowly do? CLI surface, config, behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI / TUI
+        - Gateway / channels
+        - Providers (LLM)
+        - Tools
+        - Skills
+        - Plugins
+        - Memory
+        - Other
+    validations:
+      required: false

@@ -1,0 +1,12 @@
+manifest_version: 1
+name: time
+description: Current time and timezone conversion tools.
+source: https://github.com/modelcontextprotocol/servers/tree/main/src/time
+transport:
+  type: stdio
+  command: uvx
+  args: ["mcp-server-time"]
+auth:
+  type: none
+post_install: |
+  No setup needed. Requires `uv`/`uvx` on PATH.

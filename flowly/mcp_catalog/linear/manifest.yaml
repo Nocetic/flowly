@@ -1,0 +1,12 @@
+manifest_version: 1
+name: linear
+description: Find, create, and update Linear issues, projects, and comments.
+source: https://linear.app/docs/mcp
+transport:
+  type: http
+  url: https://mcp.linear.app/mcp
+auth:
+  type: oauth
+post_install: |
+  Linear uses native MCP OAuth. Run `flowly mcp login linear` to authorize
+  in the browser, then restart your session.

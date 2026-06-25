@@ -1,0 +1,9 @@
+name: disk-cleanup
+version: 1.0.0
+manifest_version: 1
+description: "Auto-track and clean up ephemeral session files (test scripts, temp outputs, cron logs) under $FLOWLY_HOME and /tmp/flowly-*. Runs via post_tool_call + on_session_end hooks — no agent action required."
+author: "Flowly contributors"
+kind: standalone
+provides_hooks:
+  - post_tool_call
+  - on_session_end

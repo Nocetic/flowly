@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Nocetic/flowly/security/advisories/new
+    about: Report security issues privately — see SECURITY.md. Do not open a public issue.
+  - name: Questions & ideas
+    url: https://github.com/Nocetic/flowly/discussions
+    about: Usage questions, design proposals, and showcasing what you built.
+  - name: Flowly apps & cloud
+    url: https://useflowlyapp.com
+    about: For the Mac/iOS/Android apps or hosted cloud, use their support channels.

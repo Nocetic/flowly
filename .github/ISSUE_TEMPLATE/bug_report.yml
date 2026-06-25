@@ -1,0 +1,74 @@
+name: Bug report
+description: Something in the Flowly CLI/gateway is broken or behaves wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please search existing issues first.
+        For a **security vulnerability**, do not file here — see SECURITY.md.
+        This repo is the open-source CLI/agent core; for the desktop or mobile
+        apps, use their own support channels.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you do, and what went wrong?
+      placeholder: Running `flowly ...` produced ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. flowly setup ...
+        2. flowly ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: false
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Logs / traceback
+      description: Paste the full error. Redact API keys and tokens.
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Flowly version
+      description: Output of `flowly --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python --version` (skip if you installed via install.sh)
+    validations:
+      required: false
+  - type: input
+    id: context
+    attributes:
+      label: Provider / channel
+      description: Which LLM provider and channel (if relevant), e.g. "openrouter, Telegram"
+    validations:
+      required: false

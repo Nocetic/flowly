@@ -1,0 +1,48 @@
+# Dependabot — automated dependency scanning for flowlyai
+#
+# Opens PRs for outdated or vulnerable dependencies on a weekly schedule.
+# We review and merge them ourselves; Dependabot does not auto-merge.
+#
+# Package ecosystems covered:
+#   - pip:       Python dependencies declared in pyproject.toml / uv.lock
+#   - github-actions: workflow action versions
+#
+# Security advisories trigger PRs immediately regardless of schedule.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Europe/Istanbul"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    # Group minor/patch updates together to reduce PR noise; majors stay
+    # individual because they can break API contracts.
+    groups:
+      python-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Europe/Istanbul"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"
+      include: "scope"

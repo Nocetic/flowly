@@ -1,0 +1,12 @@
+manifest_version: 1
+name: fetch
+description: Fetch a URL and convert it to clean markdown for the agent to read.
+source: https://github.com/modelcontextprotocol/servers/tree/main/src/fetch
+transport:
+  type: stdio
+  command: uvx
+  args: ["mcp-server-fetch"]
+auth:
+  type: none
+post_install: |
+  No setup needed. Requires `uv`/`uvx` on PATH (Python package runner).
