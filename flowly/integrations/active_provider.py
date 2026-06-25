@@ -327,6 +327,19 @@ def set_active_provider(key: str) -> str | None:
 
     model_changed: str | None = None
     if key:
+        # Only rewrite the model if the target provider can ACTUALLY serve the
+        # next request. If it isn't usable yet (no key / no account),
+        # resolve_active_provider falls through to a DIFFERENT provider in the
+        # cascade — and rewriting the model to the target's bare default (e.g.
+        # "claude-haiku-4-5") would then 404 on that other provider on the user's
+        # very first message. Target usability is independent of providers.active,
+        # so the on-disk config (which already holds the target's credential) is
+        # the right thing to check.
+        from flowly.config.loader import load_config
+        try:
+            target_usable = _build_for(load_config(), key) is not None
+        except Exception:
+            target_usable = False
         current = str(
             ((raw.get("agents") or {}).get("defaults") or {}).get("model") or ""
         )
@@ -335,7 +348,8 @@ def set_active_provider(key: str) -> str | None:
         # without rewriting (avoids a repeating "model → X" notification when
         # the catalogue doesn't list the curated alias verbatim).
         if (
-            fallback
+            target_usable
+            and fallback
             and current.strip().lower() != fallback.lower()
             and not model_fits_provider(current, key)
         ):

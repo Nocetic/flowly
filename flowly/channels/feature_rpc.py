@@ -312,9 +312,10 @@ def mcp_oauth_start(params: dict) -> dict:
 def config_get() -> dict:
     """Return the raw config.json — same shape the desktop reads locally."""
     from flowly.config.loader import get_config_path
-    path = get_config_path()
-    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    return {"config": data}
+    from flowly.integrations.config_io import _load_raw_or_empty
+    # Tolerate a transiently malformed config.json (the loader self-heals from
+    # the same state via .bak) — never crash the remote Settings load.
+    return {"config": _load_raw_or_empty(get_config_path())}
 
 
 def _deep_merge(base: dict, patch: dict) -> dict:
@@ -328,18 +329,22 @@ def _deep_merge(base: dict, patch: dict) -> dict:
 
 def config_set(params: dict) -> dict:
     """Deep-merge a config patch into config.json. Returns
-    ``{"ok": True, "willRestart": bool}`` — caller schedules the restart."""
+    ``{"ok": True, "willRestart": bool}`` — caller schedules the restart.
+
+    Writes through the integrations atomic writer: temp-file + ``os.replace``,
+    a ``.bak`` of the previous file, and owner-only (0600 / Windows ACL) perms.
+    config.json holds provider API keys, so a plain in-place write would both
+    drop those perms and risk an unrecoverable half-written file on a crash."""
     from flowly.config.loader import get_config_path
+    from flowly.integrations.config_io import _atomic_write_json, _load_raw_or_empty
 
     patch = params.get("config") or params.get("patch") or {}
     if not isinstance(patch, dict):
         raise FeatureRpcError("INVALID", "config patch must be an object")
 
     path = get_config_path()
-    current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    merged = _deep_merge(current, patch)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    merged = _deep_merge(_load_raw_or_empty(path), patch)
+    _atomic_write_json(path, merged)
     return {"ok": True, "willRestart": bool(params.get("restart"))}
 
 
