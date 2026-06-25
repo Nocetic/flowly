@@ -357,6 +357,11 @@ def _build_linux_unit(
         [Unit]
         Description=Flowly Gateway Service
         After=network.target
+        # Never give up restarting: systemd's default start-rate limiter
+        # (5 starts / 10s) would push the unit into a permanent `failed`
+        # state on a quick early crash-loop, and Restart=always then stops
+        # helping. 0 disables that limiter so the gateway always comes back.
+        StartLimitIntervalSec=0
 
         [Service]
         Type=simple
@@ -658,49 +663,73 @@ def service_install(
         log_dir = _get_log_dir()
         argv = exec_argv + list(gateway_args)
 
-        command = argv[0]
-        arguments = " ".join(argv[1:]) if len(argv) > 1 else ""
-        out_log = str(log_dir / "flowly-gateway.out.log")
-        err_log = str(log_dir / "flowly-gateway.err.log")
+        # Full gateway command line with CreateProcess-correct quoting. The
+        # supervisor below runs THIS directly — no cmd.exe in the chain.
+        gateway_cmdline = subprocess.list2cmdline(argv)
+        # Stable home, NOT Path.cwd(): never capture the install-time dir.
+        working_dir = str(Path.home())
+        stop_flag = win_xml.parent / f"{label}.stop"
 
-        # Escape XML special characters in dynamic values
+        # Escape XML special characters in dynamic values (task XML below).
         def _xml_escape(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
-        # Use cmd /c wrapper to redirect stdout/stderr to log files.
-        # Inject FLOWLY_HOME (and FLOWLY_CWD when --cwd given) via `set`
-        # so the service resolves the right profile / runtime cwd without
-        # relying on the install-time directory.
+        def _vbs_str(s: str) -> str:
+            # VBScript string literal: an embedded double-quote is doubled.
+            return '"' + str(s).replace('"', '""') + '"'
+
+        # Console-less supervisor launcher (a .vbs run by wscript.exe).
         #
-        # PYTHONUTF8=1 first: the gateway prints Unicode glyphs (✓, →, the
-        # banner) and, when stdout is redirected to the log file under Task
-        # Scheduler, Python otherwise defaults to the legacy code page (cp1252)
-        # and rich's console.print raises UnicodeEncodeError — crashing the
-        # service on startup while a foreground run (UTF-8 console) is fine.
-        env_sets = ['set "PYTHONUTF8=1"', f'set "FLOWLY_HOME={flowly_home}"']
+        # Why a supervisor LOOP instead of fire-and-forget:
+        #  * `sh.Run(cmd, 0, False)` returns instantly, so Task Scheduler marks
+        #    the task "finished OK" and stops watching — when the gateway later
+        #    crashes, RestartOnFailure can't fire and it stays down for hours.
+        #    The loop keeps wscript alive AS the task's action: when the gateway
+        #    exits (a crash, OR a logon CTRL_CLOSE reap) it relaunches it.
+        #  * No cmd.exe anywhere: cmd allocates a console, and on logon Windows
+        #    broadcasts CTRL_CLOSE to console groups, reaping a console-bound
+        #    gateway with 0xC000013A (which Task Scheduler reads as "cancelled",
+        #    not a failure). wscript is GUI-subsystem (no console), so the
+        #    supervisor itself is immune and brings the gateway back.
+        #  * Logs: `flowly gateway` already writes a rotating
+        #    ~/.flowly/logs/gateway.log, so we no longer need a cmd `>>` redirect.
+        #  * A stop-flag file lets `flowly service stop` end the loop cleanly even
+        #    on the Startup-folder fallback (which schtasks /end can't reach).
+        vbs_lines = [
+            "' Flowly Gateway supervisor — console-less, auto-restart on exit.",
+            "Option Explicit",
+            "Dim sh, fso, env, stopFlag, t0, dur, backoff",
+            'Set sh = CreateObject("WScript.Shell")',
+            'Set fso = CreateObject("Scripting.FileSystemObject")',
+            'Set env = sh.Environment("PROCESS")',
+            'env.Item("PYTHONUTF8") = "1"',
+            f'env.Item("FLOWLY_HOME") = {_vbs_str(flowly_home)}',
+        ]
         if runtime_cwd:
-            env_sets.append(f'set "FLOWLY_CWD={runtime_cwd}"')
-        env_prefix = " && ".join(env_sets)
-        # Append (>>) not overwrite (>): a bare > truncates the log on every
-        # service start, losing the prior run's diagnostics. >> preserves
-        # history across restarts (matching launchd/systemd append behaviour).
-        # The cmd line that launches the gateway (env + redirect to logs).
-        cmd_line = f'cmd /c {env_prefix} && "{command}" {arguments} >> "{out_log}" 2>> "{err_log}"'
-        # Run it HIDDEN via a tiny VBScript. Task Scheduler + cmd.exe pops a
-        # visible console window for InteractiveToken tasks, and CLOSING that
-        # window kills the gateway. wscript's Run(cmd, 0, False) launches with no
-        # window (0) and doesn't wait — so there's nothing to accidentally close.
-        vbs_cmd = cmd_line.replace('"', '""')  # VBS string escaping
-        vbs_body = (
-            'Set sh = CreateObject("WScript.Shell")\r\n'
-            'sh.Run "' + vbs_cmd + '", 0, False\r\n'
-        )
+            vbs_lines.append(f'env.Item("FLOWLY_CWD") = {_vbs_str(runtime_cwd)}')
+        vbs_lines += [
+            f"sh.CurrentDirectory = {_vbs_str(working_dir)}",
+            f"stopFlag = {_vbs_str(str(stop_flag))}",
+            "backoff = 3",
+            "Do",
+            "  If fso.FileExists(stopFlag) Then Exit Do",
+            "  t0 = Timer",
+            f"  sh.Run {_vbs_str(gateway_cmdline)}, 0, True",
+            "  If fso.FileExists(stopFlag) Then Exit Do",
+            "  dur = Timer - t0",
+            "  If dur < 0 Then dur = 99999",      # Timer wraps at midnight
+            "  If dur > 60 Then",                  # healthy run → reset backoff
+            "    backoff = 3",
+            "  ElseIf backoff < 60 Then",          # fast crash → back off
+            "    backoff = backoff * 2",
+            "  End If",
+            "  WScript.Sleep backoff * 1000",
+            "Loop",
+        ]
         vbs_path = win_xml.parent / f"{label}.vbs"
-        vbs_path.write_text(vbs_body, encoding="utf-8")
+        vbs_path.write_text("\r\n".join(vbs_lines) + "\r\n", encoding="utf-8")
         task_command = "wscript.exe"
         task_arguments = f'"{vbs_path}"'
-        # Stable home, NOT Path.cwd(): never capture the install-time dir.
-        working_dir = str(Path.home())
 
         task_xml = textwrap.dedent(
             f"""\
@@ -712,6 +741,7 @@ def service_install(
               <Triggers>
                 <LogonTrigger>
                   <Enabled>true</Enabled>
+                  <Delay>PT30S</Delay>
                 </LogonTrigger>
               </Triggers>
               <Principals>
@@ -727,12 +757,16 @@ def service_install(
                 <AllowHardTerminate>true</AllowHardTerminate>
                 <StartWhenAvailable>true</StartWhenAvailable>
                 <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+                <IdleSettings>
+                  <StopOnIdleEnd>false</StopOnIdleEnd>
+                  <RestartOnIdle>false</RestartOnIdle>
+                </IdleSettings>
                 <AllowStartOnDemand>true</AllowStartOnDemand>
                 <Enabled>true</Enabled>
                 <Hidden>true</Hidden>
                 <RestartOnFailure>
                   <Interval>PT1M</Interval>
-                  <Count>10</Count>
+                  <Count>999</Count>
                 </RestartOnFailure>
                 <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
               </Settings>
@@ -747,6 +781,10 @@ def service_install(
             """
         )
         win_xml.write_text(task_xml, encoding="utf-16")
+
+        # Fresh start: clear any stop-flag a previous `service stop` left behind,
+        # otherwise the supervisor would exit immediately on first launch.
+        stop_flag.unlink(missing_ok=True)
 
         # Try Task Scheduler with a hard timeout (schtasks can wedge on locked-
         # down machines). On any failure, fall back to a Startup-folder .cmd.
@@ -773,42 +811,35 @@ def service_install(
                 _run_cmd(["schtasks", "/run", "/tn", label], check=False)
             console.print(f"[green]✓[/green] Installed Windows Task Scheduler service: {label}")
             console.print(f"[dim]File: {win_xml}[/dim]")
+            console.print(f"[dim]Logs: {log_dir / 'gateway.log'}[/dim]")
             return
 
-        # Fallback: a Startup-folder launcher. Runs the gateway at logon in the
-        # user session — no admin, no Task Scheduler. (Not managed by
-        # `flowly service stop/restart`, which target the scheduled task; stop a
-        # Startup-folder gateway by quitting the process / `flowly service stop`
-        # won't reach it — acceptable for this rarely-hit fallback path.)
+        # Fallback: a Startup-folder launcher that starts the SAME supervisor
+        # .vbs via wscript — no admin, no Task Scheduler, still console-less and
+        # auto-restarting. `flowly service stop` reaches it via the stop-flag.
         startup_dir = (
             Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
             / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
         )
         startup_dir.mkdir(parents=True, exist_ok=True)
         startup_cmd = startup_dir / f"{label}.cmd"
-        cmd_lines = ["@echo off", 'set "PYTHONUTF8=1"', f'set "FLOWLY_HOME={flowly_home}"']
-        if runtime_cwd:
-            cmd_lines.append(f'set "FLOWLY_CWD={runtime_cwd}"')
-        cmd_lines.append(f'start "Flowly Gateway" /min "{command}" {arguments}')
-        startup_cmd.write_text("\r\n".join(cmd_lines) + "\r\n", encoding="utf-8")
+        startup_cmd.write_text(
+            "@echo off\r\n" f'start "" wscript.exe "{vbs_path}"\r\n',
+            encoding="utf-8",
+        )
         console.print(f"[green]✓[/green] Installed Startup-folder launcher (runs at logon): {startup_cmd}")
 
         if start:
             try:
-                _env = {**os.environ, "PYTHONUTF8": "1", "FLOWLY_HOME": str(flowly_home)}
-                if runtime_cwd:
-                    _env["FLOWLY_CWD"] = str(runtime_cwd)
                 subprocess.Popen(
-                    argv,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    ["wscript.exe", str(vbs_path)],
                     creationflags=0x00000008 | 0x00000200,  # DETACHED_PROCESS | NEW_PROCESS_GROUP
-                    env=_env,
                 )
                 console.print("[green]✓[/green] Gateway started.")
             except Exception as ee:
                 console.print(f"[yellow]Couldn't auto-start ({ee}) — run 'flowly gateway'.[/yellow]")
         console.print(f"[dim]File: {startup_cmd}[/dim]")
+        console.print(f"[dim]Logs: {log_dir / 'gateway.log'}[/dim]")
         return
 
     console.print(f"[red]Unsupported platform for service install: {platform.system()}[/red]")
@@ -866,6 +897,10 @@ def service_start(
             if win_xml and not win_xml.exists():
                 console.print("[red]Service not installed. Run 'flowly service install' first.[/red]")
                 raise typer.Exit(1)
+            if win_xml:
+                # Clear the stop-flag so the supervisor loop runs instead of
+                # exiting on its first check.
+                (win_xml.parent / f"{label}.stop").unlink(missing_ok=True)
             _run_cmd(["schtasks", "/run", "/tn", label])
             console.print(f"[green]✓[/green] Started service {label}")
             return
@@ -900,6 +935,13 @@ def service_stop(
         elif system == "linux":
             _run_cmd(["systemctl", "--user", "stop", label], check=False)
         elif system == "windows":
+            # Signal the supervisor loop to exit (covers the Startup-folder
+            # fallback that schtasks /end can't reach), then end the task.
+            if win_xml:
+                try:
+                    (win_xml.parent / f"{label}.stop").write_text("", encoding="utf-8")
+                except OSError:
+                    pass
             _run_cmd(["schtasks", "/end", "/tn", label], check=False)
         else:
             console.print(f"[red]Unsupported platform: {platform.system()}[/red]")
@@ -1177,21 +1219,13 @@ def service_logs(
 
     if system == "windows":
         log_dir = _get_log_dir()
-        out_log = log_dir / "flowly-gateway.out.log"
-        err_log = log_dir / "flowly-gateway.err.log"
-        selected_files: list[Path] = []
-        if stream in {"out", "both"}:
-            selected_files.append(out_log)
-        if stream in {"err", "both"}:
-            selected_files.append(err_log)
-
-        existing_files = [p for p in selected_files if p.exists()]
-        missing_files = [p for p in selected_files if not p.exists()]
-        for missing in missing_files:
-            console.print(f"[yellow]Log file not found yet:[/yellow] {missing}")
-
+        # The Windows service runs console-less (no cmd `>>` redirect), so the
+        # single source of truth is the gateway's own rotating gateway.log.
+        gateway_log = log_dir / "gateway.log"
+        existing_files = [gateway_log] if gateway_log.exists() else []
         if not existing_files:
             console.print("[red]No log file available yet.[/red]")
+            console.print(f"[dim]Expected: {gateway_log}[/dim]")
             raise typer.Exit(1)
 
         if follow:
@@ -1249,12 +1283,19 @@ def service_uninstall(
             console.print(f"[green]✓[/green] Uninstalled service {label}")
             return
         if system == "windows" and win_xml:
+            # Tell the supervisor loop to exit first (reaches the Startup-folder
+            # fallback), then tear down the task and its launchers.
+            try:
+                (win_xml.parent / f"{label}.stop").write_text("", encoding="utf-8")
+            except OSError:
+                pass
             _run_cmd(["schtasks", "/end", "/tn", label], check=False)
             _run_cmd(["schtasks", "/delete", "/tn", label, "/f"], check=False)
             if win_xml.exists():
                 win_xml.unlink()
-            # Remove the hidden-launch VBScript next to the task XML.
+            # Remove the hidden-launch VBScript + stop-flag next to the task XML.
             (win_xml.parent / f"{label}.vbs").unlink(missing_ok=True)
+            (win_xml.parent / f"{label}.stop").unlink(missing_ok=True)
             # Also remove the Startup-folder fallback launcher, if present.
             startup_cmd = (
                 Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))

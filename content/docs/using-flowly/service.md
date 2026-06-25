@@ -40,9 +40,9 @@ Flowly uses each OS's native service manager. The service label is `ai.flowly.ga
 
 Behavior per platform:
 
-- **macOS (launchd):** runs at load and is kept alive, working directory `$HOME`. Loaded/unloaded via `launchctl`.
-- **Linux (systemd user unit):** `Type=simple`, `Restart=always`. To survive logout it needs systemd **linger** enabled — `flowly doctor --fix` runs `loginctl enable-linger` for you.
-- **Windows (Task Scheduler):** registered with `schtasks`, launched hidden (no console window). If Task Scheduler is denied because the shell isn't elevated, install **falls back to a Startup-folder launcher** that runs the gateway at logon — so an administrator shell is *not* required, it just changes which mechanism is used.
+- **macOS (launchd):** runs at load and is kept alive (`KeepAlive`), working directory `$HOME`. launchd relaunches the gateway automatically if it exits. Loaded/unloaded via `launchctl`.
+- **Linux (systemd user unit):** `Type=simple`, `Restart=always`, `RestartSec=3` — the gateway is relaunched a few seconds after any crash. `StartLimitIntervalSec=0` disables systemd's default "give up after 5 restarts in 10s" limiter, so a fast early crash-loop never lands the unit in a permanent `failed` state. To survive logout (and start at boot) it needs systemd **linger** enabled — install enables it when permitted, and `flowly doctor --fix` / `loginctl enable-linger` does it otherwise.
+- **Windows (Task Scheduler):** the task starts a **console-less supervisor** (a `wscript.exe` launcher) at logon. The supervisor runs the gateway directly — no `cmd.exe`, so there's no console window for Windows to reap on logon — and **relaunches it automatically whenever it exits** (a crash, or a logon reap), with a short backoff. The task also carries `RestartOnFailure` (999 retries) and no execution-time limit. If Task Scheduler is denied because the shell isn't elevated, install **falls back to a Startup-folder launcher** that starts the same supervisor at logon — an administrator shell is *not* required, it just changes which mechanism registers it.
 
 > [!IMPORTANT]
 > On Linux, the service only survives logout when systemd linger is enabled (`flowly doctor --fix` can do this). On Windows, an elevated shell lets Flowly use Task Scheduler; without one it automatically uses the Startup folder instead — either way the gateway starts at logon.
@@ -54,11 +54,37 @@ Gateway logs are written to:
 - Windows: `~/AppData/Local/flowly/logs`
 - macOS / Linux: `<FLOWLY_HOME>/logs`
 
-The service writes `flowly-gateway.out.log` and `flowly-gateway.err.log` in that directory on every platform (macOS, Linux, and Windows). View them with:
+The gateway always writes a rotating **`gateway.log`** (new file at midnight, 30‑day retention, `.gz` archives) in that directory on every platform — this is the canonical operational log. On macOS and Linux the service *additionally* captures stdout/stderr to `flowly-gateway.out.log` / `flowly-gateway.err.log`; on Windows the service runs console-less, so `gateway.log` is the single source of truth there. `flowly service logs` tails the right file for your platform:
 
 ```bash
 flowly service logs
 ```
+
+## Keeping it alive
+
+If the gateway stops on its own after a while, work through these. Start everywhere with the log and status — a clean crash leaves a traceback at the tail of `gateway.log`:
+
+```bash
+flowly service status     # installed? running? local /health?
+flowly service logs       # tail gateway.log (Ctrl+C to stop)
+```
+
+The most common self-inflicted cause is **no LLM provider configured** — the gateway exits at boot without one, which under a service manager looks like an immediate crash-loop. `flowly service status` and `flowly doctor` both flag it; run `flowly setup`, then `flowly service start`.
+
+**Linux — the service disappears a while after you log out / close SSH.** A `--user` service is torn down when your last login session ends *unless* **linger** is enabled — and `Restart=always` can't save it, because it's the whole user manager going away, not the service crashing:
+
+```bash
+loginctl show-user "$USER" --property=Linger     # want: Linger=yes
+sudo loginctl enable-linger "$USER"              # or: flowly doctor --fix
+```
+
+Genuine crashes are covered by `Restart=always` + `StartLimitIntervalSec=0` (retried indefinitely, never permanently `failed`).
+
+**Windows — it runs, then is down a few hours later.** This is exactly what the console-less supervisor fixes: the launcher relaunches the gateway whenever it exits, so a mid-life crash recovers on its own within seconds. If it still won't stay up:
+
+- `flowly service status` shows the task state; `flowly service logs` tails `gateway.log` for the crash reason.
+- Confirm the task exists: `schtasks /query /tn ai.flowly.gateway`. If install used the **Startup-folder fallback** (no admin at install time) there is no scheduled task — the supervisor starts at logon instead, and `flowly service stop` still ends it cleanly via its stop-flag.
+- A reinstall refreshes the launcher and task: `flowly service install` (idempotent).
 
 ## Smart restart
 
