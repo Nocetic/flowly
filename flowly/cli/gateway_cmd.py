@@ -228,6 +228,32 @@ def gateway(
         except Exception as e:
             logger.debug(f"[Gateway] Audit retention skipped: {e}")
 
+    # Prune generated media (~/.flowly/media) so image generation can't fill the
+    # disk over time — the disk-cleanup plugin deliberately protects this folder,
+    # so nothing else reclaims it. Best-effort; never blocks startup. Tunable via
+    # FLOWLY_MEDIA_RETENTION_DAYS / FLOWLY_MEDIA_MAX_SIZE_MB (age -1 / size 0 = off).
+    try:
+        from flowly.media.retention import (
+            DEFAULT_MAX_SIZE_MB,
+            DEFAULT_RETENTION_DAYS,
+            prune_media,
+        )
+        from flowly.profile import get_flowly_home
+
+        def _media_env_int(name: str, default: int) -> int:
+            try:
+                return int(os.environ[name])
+            except (KeyError, ValueError):
+                return default
+
+        prune_media(
+            get_flowly_home() / "media",
+            retention_days=_media_env_int("FLOWLY_MEDIA_RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
+            max_size_mb=_media_env_int("FLOWLY_MEDIA_MAX_SIZE_MB", DEFAULT_MAX_SIZE_MB),
+        )
+    except Exception as e:
+        logger.debug(f"[Gateway] Media retention skipped: {e}")
+
     # Resolve persona: CLI flag overrides config
     active_persona = persona if persona else config.agents.defaults.persona
     if active_persona:

@@ -100,7 +100,11 @@ def _content_part_to_anthropic(part: Any) -> dict[str, Any] | None:
     part_type = str(part.get("type") or "").lower()
     if part_type in {"text", "input_text", "output_text"}:
         text = part.get("text")
-        if isinstance(text, str):
+        # Drop empty / whitespace-only text parts. The Anthropic Messages API
+        # rejects a text block whose text is empty ("text content blocks must be
+        # non-empty"), and one such block persisted in history 400s every later
+        # request in that conversation. tool_use / image parts are unaffected.
+        if isinstance(text, str) and text.strip():
             block: dict[str, Any] = {"type": "text", "text": text}
             if isinstance(part.get("cache_control"), dict):
                 block["cache_control"] = part["cache_control"]
@@ -140,17 +144,25 @@ def _content_part_to_anthropic(part: Any) -> dict[str, Any] | None:
 
 
 def _content_to_blocks(content: Any, *, empty_text: str) -> list[dict[str, Any]]:
+    # The placeholder is only emitted when it is itself non-empty. A blank
+    # ``empty_text`` (the assistant / system path) yields NO block, so this
+    # function never produces an empty text block: the assistant caller falls
+    # back to its own non-empty "(empty)" placeholder, and the system path
+    # simply omits it. Non-blank placeholders (user, tool_result) are kept.
+    def _placeholder() -> list[dict[str, Any]]:
+        return [{"type": "text", "text": empty_text}] if empty_text.strip() else []
+
     if isinstance(content, list):
         blocks = [
             block for block in (_content_part_to_anthropic(part) for part in content)
             if block is not None
         ]
-        return blocks or [{"type": "text", "text": empty_text}]
+        return blocks or _placeholder()
     if content is None:
-        return [{"type": "text", "text": empty_text}]
+        return _placeholder()
     text = str(content)
     if not text.strip():
-        text = empty_text
+        return _placeholder()
     return [{"type": "text", "text": text}]
 
 

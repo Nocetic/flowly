@@ -37,6 +37,15 @@ Flowly is configured mainly through `~/.flowly/config.json`. The environment var
 | `FLOWLY_CRON_TIMEOUT` | `600` | Per-job watchdog timeout, in seconds. |
 | `FLOWLY_CRON_RETENTION_DAYS` | `30` | How long per-run output archives are kept. |
 
+## Media
+
+Generated media (image generation, etc.) is written to `<FLOWLY_HOME>/media`. The gateway prunes it at start so it can't fill the disk; recent files are kept so chat-history re-fetch still works.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `FLOWLY_MEDIA_RETENTION_DAYS` | `30` | Delete generated media older than this many days at gateway start. `-1` disables the age cap. |
+| `FLOWLY_MEDIA_MAX_SIZE_MB` | `500` | If `<FLOWLY_HOME>/media` is still larger than this, delete the oldest files until under cap. `0` disables the size cap. |
+
 ## Skills & plugins
 
 | Variable | Default | What it does |
