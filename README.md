@@ -63,11 +63,11 @@ flowly
 </tr>
 <tr>
   <td><b>Delegates and parallelizes</b></td>
-  <td>Spawn isolated sub-agents for parallel workstreams (<code>delegate</code>, <code>spawn</code>), run a cross-channel <b>task board</b> sequentially or in parallel (<a href="BOARD.md">BOARD.md</a>), and hand heavy coding off to a local <b>Codex</b> session (opt-in).</td>
+  <td>Spawn isolated sub-agents for parallel workstreams (<code>delegate</code>, <code>spawn</code>), run a cross-channel <b>task board</b> sequentially or in parallel (<a href="content/docs/features/board.md">task board docs</a>), and hand heavy coding off to a local <b>Codex</b> session (opt-in).</td>
 </tr>
 <tr>
   <td><b>MCP, both directions</b></td>
-  <td>Connect any <a href="MCP.md">MCP</a> server (<code>flowly mcp install …</code>) <i>and</i> run Flowly itself as an MCP server (<code>flowly mcp serve</code>) for Claude Desktop, Cursor, or Claude Code.</td>
+  <td>Connect any <a href="content/docs/features/mcp.md">MCP</a> server (<code>flowly mcp install …</code>) <i>and</i> run Flowly itself as an MCP server (<code>flowly mcp serve</code>) for Claude Desktop, Cursor, or Claude Code.</td>
 </tr>
 <tr>
   <td><b>Scheduled & unattended</b></td>
@@ -75,7 +75,7 @@ flowly
 </tr>
 <tr>
   <td><b>Yours to extend & contain</b></td>
-  <td>Full Python <b>plugins</b> (tools, slash commands, channels, lifecycle hooks → <a href="PLUGINS.md">PLUGINS.md</a>), switchable <b>personas</b>, and a <b>sandbox</b> (macOS <code>sandbox-exec</code>, Linux <code>bwrap</code>; opt out with <code>FLOWLY_SANDBOX=0</code>).</td>
+  <td>Full Python <b>plugins</b> (tools, slash commands, channels, lifecycle hooks → <a href="content/docs/features/plugins.md">plugins</a>), switchable <b>personas</b>, and a <b>sandbox</b> (macOS <code>sandbox-exec</code>, Linux <code>bwrap</code>; opt out with <code>FLOWLY_SANDBOX=0</code>).</td>
 </tr>
 </table>
 
@@ -170,13 +170,15 @@ It survives reboots and terminal close.
 
 ## Documentation
 
-- [MCP.md](content/docs/features/mcp.md) — connect external MCP servers + run Flowly as an MCP server
-- [PLUGINS.md](content/docs/features/plugins.md) — extend Flowly with custom tools, hooks, commands, skills
-- [BOARD.md](content/docs/features/board.md) — the cross-channel task board (sequential + parallel agents)
-- [SECURITY.md](SECURITY.md) — trust model + vulnerability reporting
-- [SELF_HOSTING.md](content/docs/using-flowly/self-hosting.md) — run Flowly on your own machine or a VPS
-- [DESKTOP_VS_OSS.md](content/docs/using-flowly/desktop-vs-oss.md) — what's open source vs. Desktop & Cloud
-- [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup, project layout, PR process
+**Full docs:** [useflowlyapp.com/docs](https://useflowlyapp.com/docs) — searchable, with everything below. The Markdown sources live in [`content/docs/`](content/docs).
+
+- [MCP](content/docs/features/mcp.md) — connect external MCP servers + run Flowly as an MCP server
+- [Plugins](content/docs/features/plugins.md) — extend Flowly with custom tools, hooks, commands, skills
+- [Task board](content/docs/features/board.md) — the cross-channel task board (sequential + parallel agents)
+- [Self-hosting](content/docs/using-flowly/self-hosting.md) — run Flowly on your own machine or a VPS
+- [Open source vs. Desktop & Cloud](content/docs/using-flowly/desktop-vs-oss.md) — what's in this repo vs. the apps
+- [Security](SECURITY.md) — trust model + vulnerability reporting
+- [Contributing](CONTRIBUTING.md) — dev setup, project layout, PR process
 - **Engineering deep-dives:** [memory governance](docs/memory-governance-architecture.md) · [skill self-improvement](docs/skill-self-improvement-architecture.md) · [internal gateway RPC](docs/internal-gateway-rpc-architecture.md)
 
 ---
