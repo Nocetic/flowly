@@ -112,3 +112,51 @@ def test_switch_to_usable_provider_rewrites_model(isolated_home):
     assert data["providers"]["active"] == "anthropic"
     assert changed == DEFAULT_MODELS["anthropic"]
     assert data["agents"]["defaults"]["model"] == DEFAULT_MODELS["anthropic"]
+
+
+# ── H1 ──────────────────────────────────────────────────────────────────────
+
+def test_connections_set_rejects_invalid_enum_and_keeps_config(isolated_home):
+    from flowly.channels import feature_rpc
+    from flowly.config.loader import load_config
+
+    # A valid base config (telegram dm_policy = "pairing").
+    _write_cfg({"channels": {"telegram": {"enabled": True, "token": "123:abc", "dmPolicy": "pairing"}}})
+
+    # dm_policy maps to Literal["open","pairing","allowlist"] — "garbage" must be
+    # rejected with a clean error, NOT written (which would brick the whole config).
+    with pytest.raises(feature_rpc.FeatureRpcError):
+        _dispatch("connections.set", {"key": "telegram", "values": {"dm_policy": "garbage"}})
+
+    # config.json is untouched: still loads, dm_policy unchanged, no garbage on disk.
+    assert load_config().channels.telegram.dm_policy == "pairing"
+    data = json.loads(_config_path().read_text(encoding="utf-8"))
+    assert data["channels"]["telegram"]["dmPolicy"] == "pairing"
+
+
+def test_connections_set_accepts_valid_enum(isolated_home):
+    from flowly.config.loader import load_config
+
+    _write_cfg({"channels": {"telegram": {"enabled": True, "token": "123:abc", "dmPolicy": "pairing"}}})
+    result, _ = _dispatch("connections.set", {"key": "telegram", "values": {"dm_policy": "allowlist"}})
+    assert result["ok"] is True
+    assert load_config().channels.telegram.dm_policy == "allowlist"
+
+
+def test_connections_set_accepts_offlist_fal_model(isolated_home):
+    # fal_image.model is a free str (its SELECT choices are only suggestions) —
+    # an off-list FAL model id must NOT be rejected (no over-rejection).
+    result, _ = _dispatch("connections.set", {
+        "key": "fal_image",
+        "values": {"enabled": True, "api_key": "fal-x", "model": "fal-ai/some-custom-model"},
+    })
+    assert result["ok"] is True
+    data = json.loads(_config_path().read_text(encoding="utf-8"))
+    assert data["tools"]["imageGeneration"]["model"] == "fal-ai/some-custom-model"
+
+
+def test_connections_set_rejects_non_dict_values(isolated_home):
+    from flowly.channels import feature_rpc
+
+    with pytest.raises(feature_rpc.FeatureRpcError):
+        _dispatch("connections.set", {"key": "telegram", "values": ["not", "a", "dict"]})

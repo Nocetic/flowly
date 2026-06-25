@@ -71,12 +71,48 @@ def read_card_values(card: IntegrationCard) -> dict[str, Any]:
 # ── writing ────────────────────────────────────────────────────────
 
 
+class CardValidationError(ValueError):
+    """A card's values would make config.json fail schema validation.
+
+    Raised before persisting so a bad value (e.g. an out-of-range SELECT that
+    maps to a ``Literal`` schema field) is rejected with a clear message instead
+    of being written verbatim — which would make the WHOLE config fail to load
+    at next boot, silently reverting to ``.bak`` and losing the user's save."""
+
+
+def _assert_config_valid(raw: dict[str, Any]) -> None:
+    """Validate ``raw`` through the SAME path :func:`load_config` uses at boot.
+
+    Because the check is identical to boot validation, it accepts exactly what
+    boot accepts (a free ``str`` SELECT like ``fal_image.model`` passes; only a
+    constrained ``Literal`` field rejects an off-list value) — no over-rejection.
+    """
+    from flowly.config.loader import convert_keys
+    from flowly.config.schema import Config
+
+    try:
+        Config.model_validate(convert_keys(raw))
+    except Exception as exc:  # pydantic ValidationError (a ValueError) or convert error
+        errors = getattr(exc, "errors", None)
+        if callable(errors):
+            try:
+                first = errors()[0]
+                loc = ".".join(str(p) for p in first.get("loc", ())) or "config"
+                raise CardValidationError(f"{loc}: {first.get('msg', 'invalid value')}") from exc
+            except (IndexError, TypeError, KeyError):
+                pass
+        raise CardValidationError(str(exc)) from exc
+
+
 def apply_card_values(card: IntegrationCard, values: dict[str, Any]) -> None:
     """Persist ``values`` (snake_case) into config.json at ``card.config_path``.
 
     - Existing fields outside the card are preserved (deep merge).
     - Snake_case → camelCase conversion happens at write time so the file
       stays consistent with the rest of the config.
+    - The merged result is validated against the real schema BEFORE writing;
+      a value that wouldn't load is rejected (``CardValidationError``) rather
+      than corrupting config.json.
     - The previous parseable config.json is copied to ``config.json.bak``
       before write so :func:`flowly.config.loader.load_config` can recover
       from any post-write corruption.
@@ -88,6 +124,7 @@ def apply_card_values(card: IntegrationCard, values: dict[str, Any]) -> None:
     section_camel = convert_to_camel({f.key: _coerce_out(f, values.get(f.key)) for f in card.fields})
     _set_path(raw, card.config_path, section_camel, merge=True)
 
+    _assert_config_valid(raw)  # reject a value that would brick config.json at boot
     _atomic_write_json(path, raw)
 
 

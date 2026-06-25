@@ -137,7 +137,7 @@ def connections_set(params: dict) -> dict:
     ``{"ok": True, "willRestart": bool}`` — the caller schedules the restart."""
     from flowly.integrations.registry import get_card
     from flowly.integrations.config_io import (
-        read_card_values, apply_card_values, clear_card,
+        CardValidationError, read_card_values, apply_card_values, clear_card,
     )
 
     key = params.get("key", "")
@@ -148,9 +148,17 @@ def connections_set(params: dict) -> dict:
     if params.get("clear"):
         clear_card(card)
     else:
+        values = params.get("values") or {}
+        if not isinstance(values, dict):
+            raise FeatureRpcError("INVALID", "values must be an object")
         merged = read_card_values(card)
-        merged.update(params.get("values") or {})
-        apply_card_values(card, merged)
+        merged.update(values)
+        try:
+            apply_card_values(card, merged)
+        except CardValidationError as exc:
+            # A bad field value would brick config.json at next boot — reject it
+            # with a clear message instead of corrupting the file + losing the save.
+            raise FeatureRpcError("INVALID", f"rejected: {exc}") from exc
 
     will_restart = bool(card.needs_gateway_restart and params.get("restart", True))
     return {"ok": True, "willRestart": will_restart}
