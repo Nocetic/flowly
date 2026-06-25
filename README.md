@@ -8,7 +8,7 @@
   </p>
 </div>
 
-**Flowly is an open-source AI agent that runs on _your_ machine, meets you on every channel you already use, and gets better the longer you use it.** One shared memory, one library of skills, your own LLM keys. It remembers across conversations, maintains and improves itself over time, schedules its own work, and connects to anything that speaks [MCP](MCP.md) — from a $5 VPS, a Mac mini, or the laptop in front of you.
+**Flowly is an open-source AI agent that runs on _your_ machine, meets you on every channel you already use, and gets better the longer you use it.** One shared memory, one library of skills, your own LLM keys. It remembers across conversations, maintains and improves itself over time, schedules its own work, and connects to anything that speaks [MCP](content/docs/features/mcp.md) — from a $5 VPS, a Mac mini, or the laptop in front of you.
 
 <div align="center">
   <img src="assets/demo-tui.png" alt="Flowly terminal UI" width="80%">
@@ -114,7 +114,7 @@ Two entry points: start the terminal UI with `flowly`, or run the gateway and ta
 
 ## Self-host or cloud
 
-Flowly's agent core is **Apache 2.0**. Self-host on your laptop, a VPS, or a Mac mini — your keys, your data, your machine. **Everything in this repo works with no Flowly account.** → [self-hosting guide](SELF_HOSTING.md) · [open source vs. Desktop/Cloud](DESKTOP_VS_OSS.md)
+Flowly's agent core is **Apache 2.0**. Self-host on your laptop, a VPS, or a Mac mini — your keys, your data, your machine. **Everything in this repo works with no Flowly account.** → [self-hosting guide](content/docs/using-flowly/self-hosting.md) · [open source vs. Desktop/Cloud](content/docs/using-flowly/desktop-vs-oss.md)
 
 Optional [Flowly Cloud](https://useflowlyapp.com) adds the native Mac/iOS/Android apps, cross-device sync, hosted LLM access, and a managed relay that keeps your bot reachable when your laptop sleeps. Sign-in is opt-in (`flowly login`) and only affects the cloud features; the agent is unchanged.
 
@@ -170,12 +170,12 @@ It survives reboots and terminal close.
 
 ## Documentation
 
-- [MCP.md](MCP.md) — connect external MCP servers + run Flowly as an MCP server
-- [PLUGINS.md](PLUGINS.md) — extend Flowly with custom tools, hooks, commands, skills
-- [BOARD.md](BOARD.md) — the cross-channel task board (sequential + parallel agents)
+- [MCP.md](content/docs/features/mcp.md) — connect external MCP servers + run Flowly as an MCP server
+- [PLUGINS.md](content/docs/features/plugins.md) — extend Flowly with custom tools, hooks, commands, skills
+- [BOARD.md](content/docs/features/board.md) — the cross-channel task board (sequential + parallel agents)
 - [SECURITY.md](SECURITY.md) — trust model + vulnerability reporting
-- [SELF_HOSTING.md](SELF_HOSTING.md) — run Flowly on your own machine or a VPS
-- [DESKTOP_VS_OSS.md](DESKTOP_VS_OSS.md) — what's open source vs. Desktop & Cloud
+- [SELF_HOSTING.md](content/docs/using-flowly/self-hosting.md) — run Flowly on your own machine or a VPS
+- [DESKTOP_VS_OSS.md](content/docs/using-flowly/desktop-vs-oss.md) — what's open source vs. Desktop & Cloud
 - [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup, project layout, PR process
 - **Engineering deep-dives:** [memory governance](docs/memory-governance-architecture.md) · [skill self-improvement](docs/skill-self-improvement-architecture.md) · [internal gateway RPC](docs/internal-gateway-rpc-architecture.md)
 

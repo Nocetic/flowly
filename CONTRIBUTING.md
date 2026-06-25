@@ -7,7 +7,7 @@ the code or open a [discussion](https://github.com/Nocetic/flowly/issues).
 > **Scope of this repo.** This is the open-source agent core: the `flowly` CLI,
 > the gateway, providers, tools, skills, and channel adapters. The native
 > Mac/iOS/Android apps and the hosted relay are separate, closed components — see
-> [DESKTOP_VS_OSS.md](DESKTOP_VS_OSS.md). PRs here target the CLI/gateway.
+> [DESKTOP_VS_OSS.md](content/docs/using-flowly/desktop-vs-oss.md). PRs here target the CLI/gateway.
 
 ---
 
@@ -141,7 +141,7 @@ dir. Keep `description` short and concrete — no marketing words.
 Plugins live in `~/.flowly/plugins/<name>/` (user) or `flowly/plugins_bundled/`
 (shipped). A plugin is a `plugin.yaml` manifest + an `__init__.py` exposing
 `register(ctx)`. The full API (tools, hooks, commands, skills) is in
-[PLUGINS.md](PLUGINS.md).
+[PLUGINS.md](content/docs/features/plugins.md).
 
 ### Adding a core tool
 

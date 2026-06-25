@@ -4,10 +4,12 @@ eyebrow: Features
 description: Connect Flowly to external MCP servers (GitHub, Linear, Notion, Playwright, your own) so the agent can call their tools — and expose Flowly itself as an MCP server to other clients.
 ---
 
-MCP servers are configured through `flowly mcp` subcommands, the `/mcp` modal in the TUI, or by hand-editing the `mcpServers` block in `~/.flowly/config.json`.
+Flowly speaks [MCP](https://modelcontextprotocol.io) **both ways**:
 
-> [!TIP]
-> For the full deep reference (security guards, OSV gate, circuit breaker, every config key), see [the root MCP guide](../../../MCP.md).
+- **As a client** — connect Flowly to external MCP servers (Context7, GitHub, Linear, Playwright, your own) and the agent calls their tools like any built-in.
+- **As a server** — run `flowly mcp serve` so other MCP clients (Claude Desktop, Cursor, Claude Code, another agent) can read your Flowly conversation history and, optionally, send messages and resolve approvals.
+
+Everything is managed from the `flowly mcp` command group, the `/mcp` modal in the TUI, the desktop **MCP** tab, or by hand-editing the `mcpServers` block in `~/.flowly/config.json`. Changes take effect at the next agent boot — restart the gateway (`flowly restart`) or start a new session.
 
 ## Adding a server
 
@@ -238,6 +240,72 @@ For OAuth servers the status badge reflects real authorization state — **sign-
 > [!NOTE]
 > The browser opens on the **bot host**. For a local/desktop bot that is your own machine, so sign-in is one click. For a remote/VPS bot, run the one-time `npx -y mcp-remote@latest <url>` on the host (over SSH) to cache the token there, then add the server as a **Local (stdio)** `mcp-remote` command from the tab.
 
+## Security
+
+MCP servers run third-party code, so Flowly applies several guards:
+
+- **OSV malware gate** — before an `npx`/`uvx` server spawns, Flowly queries the [OSV](https://osv.dev) database for known-malware advisories and blocks the spawn if any match. Fail-open (a network error allows the spawn); per-server opt-out via `osvCheck: false`.
+- **Filtered subprocess env** — stdio servers get only a safe baseline (`PATH`, `HOME`, …) plus the `env` you explicitly list. Flowly's own provider keys are never inherited.
+- **Credential redaction** — tokens and keys in error messages are replaced with `[REDACTED]` before the model or the logs see them.
+- **Prompt-injection scan** — tool descriptions are scanned for override patterns and logged (not blocked) so a hostile server is detectable.
+- **Sandbox** — under `FLOWLY_SANDBOX=1` the whole agent (and its MCP subprocesses) runs inside `sandbox-exec` (macOS) / `bwrap` (Linux). See [Sandbox & approvals](../using-flowly/sandbox-and-approvals.md).
+- **Circuit breaker** — a server that fails repeatedly is short-circuited for a cooldown (you'll see "unreachable, auto-retry in Ns") so the model stops hammering it; it recovers automatically.
+
+Subprocess stderr is redirected to `$FLOWLY_HOME/logs/mcp-stderr.log` so a chatty server can't corrupt the TUI — check it first when debugging.
+
+## Full `mcpServers` config reference
+
+Every key a server entry accepts (camelCase on disk; Flowly converts to snake internally — server names and `env`/`headers` keys are preserved verbatim):
+
+```json
+{
+  "mcpServers": {
+    "example": {
+      "enabled": true,
+      "command": "npx",                  // stdio: command + args + env
+      "args": ["-y", "@scope/pkg"],
+      "env": { "TOKEN": "${TOKEN}" },
+      "url": "",                         // http/sse: url + headers instead
+      "headers": {},
+      "transport": "auto",               // auto | stdio | http | sse
+      "timeout": 120,                    // per-tool-call seconds
+      "connectTimeout": 60,              // initial connect seconds
+      "tools": {                         // optional filtering / utilities
+        "include": [],                   //   whitelist (empty = all)
+        "exclude": [],                   //   blacklist (ignored if include set)
+        "resources": false,              //   expose resources/* utility tools
+        "prompts": false                 //   expose prompts/* utility tools
+      },
+      "auth": "",                        // "" | "oauth"
+      "scope": "",                       // optional OAuth scope
+      "sslVerify": true,                 // true | false | CA-bundle path
+      "clientCert": "",                  // mTLS cert (path or [cert, key])
+      "clientKey": "",
+      "osvCheck": true,                  // OSV malware gate
+      "reapOrphans": false,              // force-kill orphaned stdio children (Linux)
+      "supportsParallelToolCalls": false,
+      "sampling": {                      // server-initiated LLM (off by default)
+        "enabled": false,
+        "model": "",
+        "maxRpm": 10,
+        "maxTokensCap": 4096,
+        "allowedModels": []
+      }
+    }
+  }
+}
+```
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| Server won't connect | `flowly mcp test <name>`; read `$FLOWLY_HOME/logs/mcp-stderr.log` |
+| `npx`/`uvx` not found | Ensure Node / uv is on `PATH`, or set an absolute `command` + `env.PATH` |
+| Tools missing after add | Start a new session — MCP loads at agent boot (`flowly restart`) |
+| OAuth stuck | `flowly mcp login <name>` to re-authorize; for WorkOS-style servers use the `mcp-remote` bridge above |
+| "unreachable, auto-retry in Ns" | Circuit breaker is open after repeated failures — fix the server; it recovers automatically |
+
 ## Related
 
 - [Browser control](browser.md)
@@ -246,4 +314,4 @@ For OAuth servers the status badge reflects real authorization state — **sign-
 - [Tools reference](../reference/tools.md)
 - [CLI commands](../reference/cli-commands.md)
 - [Slash commands](../reference/slash-commands.md)
-- [Root MCP reference](../../../MCP.md)
+- [Sandbox & approvals](../using-flowly/sandbox-and-approvals.md)
