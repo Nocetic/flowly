@@ -53,9 +53,12 @@ Tools are the functions the agent calls to act on the world — reading files, r
 
 | Tool | What it does | Gated by |
 |---|---|---|
+| `image_generate` | Text-to-image via FAL; the result rides the assistant's reply. | `tools.imageGeneration.enabled` + key |
 | `video_analyze` | Analyze a video via a multimodal model. | — |
 | `artifact` | Create/manage renderable artifacts (HTML/SVG/Markdown/form/chart/code). | artifact store |
 | `voice` | Place / manage a voice call. | `integrations.voice.enabled` |
+
+See [Image generation](../features/image-generation.md) for the full image_generate guide (models, sizes, delivery).
 
 ## Channels & automation
 

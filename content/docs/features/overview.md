@@ -27,6 +27,11 @@ Flowly is a full agent, not just a chat box. These features work together across
 - **[Computer use](computer-use.md)** — control the macOS desktop via Accessibility.
 - **[Meeting coach](coaching.md)** — live, in-meeting assistance.
 
+## Media
+
+- **[Image generation](image-generation.md)** — text-to-image (FLUX, Stable Diffusion, Recraft, Ideogram); the picture rides the assistant's reply on every channel.
+- **[Artifacts](artifacts.md)** — render HTML, SVG, Markdown, charts, and forms the agent creates.
+
 ## Extend
 
 - **[Plugins](plugins.md)** — add custom tools, hooks, slash commands, and channels.
