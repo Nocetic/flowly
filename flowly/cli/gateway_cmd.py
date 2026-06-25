@@ -57,6 +57,23 @@ def _install_gateway_file_sink(level: str = "INFO") -> None:
         logger.warning(f"[gateway] daily file log sink not installed: {exc}")
 
 
+def _should_drop_stderr_sink(stream) -> bool:
+    """True when stderr is redirected (a service manager) rather than a terminal.
+
+    Under launchd/systemd the gateway's stderr is ``flowly-gateway.err.log``,
+    which the OS appends to forever (no rotation). loguru's default stderr sink
+    would duplicate the ENTIRE INFO stream into that unrotated file → unbounded
+    disk growth on an always-on bot. The rotated ``gateway.log`` already has the
+    full log, so when stderr isn't a TTY we drop the default sink: ``.err.log``
+    then only holds raw crash tracebacks (tiny). A foreground ``flowly gateway``
+    keeps its console output.
+    """
+    try:
+        return not (getattr(stream, "isatty", None) and stream.isatty())
+    except Exception:
+        return True
+
+
 # ============================================================================
 
 
@@ -133,8 +150,17 @@ def gateway(
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    # Bot-side daily file sink (additive — keeps the default stderr sink).
+    # Bot-side daily file sink (additive). Under a service manager we then drop
+    # loguru's default stderr sink, because stderr is redirected to the
+    # never-rotated flowly-gateway.err.log and would duplicate the whole log
+    # there (unbounded disk growth). The rotated gateway.log keeps the full log;
+    # .err.log is left to capture only raw crash output.
     _install_gateway_file_sink(level="DEBUG" if verbose else "INFO")
+    if _GATEWAY_FILE_SINK_ID is not None and _should_drop_stderr_sink(sys.stderr):
+        try:
+            logger.remove(0)  # loguru's default stderr handler
+        except (ValueError, OSError):
+            pass
 
     from flowly import __banner__
     console.print(f"[cyan]{__banner__.format(version=__version__)}[/cyan]")

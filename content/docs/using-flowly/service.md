@@ -54,7 +54,7 @@ Gateway logs are written to:
 - Windows: `~/AppData/Local/flowly/logs`
 - macOS / Linux: `<FLOWLY_HOME>/logs`
 
-The gateway always writes a rotating **`gateway.log`** (new file at midnight, 30‑day retention, `.gz` archives) in that directory on every platform — this is the canonical operational log. On macOS and Linux the service *additionally* captures stdout/stderr to `flowly-gateway.out.log` / `flowly-gateway.err.log`; on Windows the service runs console-less, so `gateway.log` is the single source of truth there. `flowly service logs` tails the right file for your platform:
+The gateway always writes a rotating **`gateway.log`** (new file at midnight, 30‑day retention, `.gz` archives) in that directory on every platform — this is the canonical operational log, and what `flowly service logs` shows. On macOS and Linux the service manager also captures the process's raw stdout/stderr to `flowly-gateway.out.log` / `flowly-gateway.err.log`; under a service these now hold only the startup banner and any raw crash traceback (the full INFO stream is **not** duplicated there, so they stay small and don't fill the disk). On Windows the service runs console-less, so `gateway.log` is the only log.
 
 ```bash
 flowly service logs

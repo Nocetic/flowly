@@ -1120,27 +1120,15 @@ def service_logs(
     system = platform.system().lower()
 
     if system == "darwin":
-        stream = stream.lower().strip()
-        if stream not in {"out", "err", "both"}:
-            console.print("[red]Invalid --stream value. Use out, err, or both.[/red]")
-            raise typer.Exit(1)
-
         log_dir = _get_log_dir()
-        out_log = log_dir / "flowly-gateway.out.log"
-        err_log = log_dir / "flowly-gateway.err.log"
-        selected_files: list[Path] = []
-        if stream in {"out", "both"}:
-            selected_files.append(out_log)
-        if stream in {"err", "both"}:
-            selected_files.append(err_log)
-
-        existing_files = [p for p in selected_files if p.exists()]
-        missing_files = [p for p in selected_files if not p.exists()]
-        for missing in missing_files:
-            console.print(f"[yellow]Log file not found yet:[/yellow] {missing}")
-
+        # gateway.log is the full rotated log; flowly-gateway.err.log now only
+        # holds raw crash output (the duplicate INFO stream is dropped under the
+        # service). Show both, newest content from gateway.log.
+        candidates = [log_dir / "gateway.log", log_dir / "flowly-gateway.err.log"]
+        existing_files = [p for p in candidates if p.exists()]
         if not existing_files:
             console.print("[red]No log file available yet.[/red]")
+            console.print(f"[dim]Expected: {log_dir / 'gateway.log'}[/dim]")
             raise typer.Exit(1)
 
         if follow:
@@ -1165,42 +1153,33 @@ def service_logs(
         return
 
     if system == "linux":
-        # Try log files first (same as macOS), fall back to journalctl
+        # gateway.log is the full rotated log; .err.log holds raw crash output.
+        # Fall back to journalctl when neither file exists.
         log_dir = _get_log_dir()
-        out_log = log_dir / "flowly-gateway.out.log"
-        err_log = log_dir / "flowly-gateway.err.log"
-        log_files_exist = out_log.exists() or err_log.exists()
+        candidates = [log_dir / "gateway.log", log_dir / "flowly-gateway.err.log"]
+        existing_files = [p for p in candidates if p.exists()]
 
-        if log_files_exist:
-            # Use file-based logs (same logic as macOS)
-            selected_files: list[Path] = []
-            if stream in {"out", "both"}:
-                selected_files.append(out_log)
-            if stream in {"err", "both"}:
-                selected_files.append(err_log)
-
-            existing_files = [p for p in selected_files if p.exists()]
-            if existing_files:
-                if follow:
-                    console.print(
-                        f"[dim]Following logs ({', '.join(str(p) for p in existing_files)}). "
-                        "Press Ctrl+C to stop.[/dim]"
+        if existing_files:
+            if follow:
+                console.print(
+                    f"[dim]Following logs ({', '.join(str(p) for p in existing_files)}). "
+                    "Press Ctrl+C to stop.[/dim]"
+                )
+                try:
+                    subprocess.run(
+                        ["tail", "-n", str(lines), "-F", *[str(p) for p in existing_files]],
+                        check=False,
                     )
-                    try:
-                        subprocess.run(
-                            ["tail", "-n", str(lines), "-F", *[str(p) for p in existing_files]],
-                            check=False,
-                        )
-                    except KeyboardInterrupt:
-                        return
+                except KeyboardInterrupt:
                     return
-
-                for file_path in existing_files:
-                    console.print(f"\n[bold]{file_path}[/bold]")
-                    proc = _run_cmd(["tail", "-n", str(lines), str(file_path)], check=False)
-                    if proc.stdout:
-                        console.print(proc.stdout.rstrip("\n"))
                 return
+
+            for file_path in existing_files:
+                console.print(f"\n[bold]{file_path}[/bold]")
+                proc = _run_cmd(["tail", "-n", str(lines), str(file_path)], check=False)
+                if proc.stdout:
+                    console.print(proc.stdout.rstrip("\n"))
+            return
 
         # Fallback: journalctl (when using systemd without StandardOutput redirect)
         args = ["journalctl", "--user", "-u", label, "-n", str(lines), "--no-pager"]
