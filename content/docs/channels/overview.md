@@ -49,6 +49,7 @@ Channels `cli`, `tui`, and `desktop` are intentionally adapter-less — their re
 | [Slack](./slack.md) | Socket Mode WebSocket (`slack_sdk`) | `botToken` (`xoxb-`) + `appToken` (`xapp-`) |
 | [Teams](./teams.md) | Incoming Webhook (outbound only) | `webhookUrl` (HTTPS connector URL) |
 | [WhatsApp](./whatsapp.md) | Node baileys bridge over WebSocket | QR-code scan (no token in config) |
+| [iMessage](./imessage.md) | BlueBubbles Server (webhook in + REST out) | BlueBubbles `serverUrl` + `password` |
 | [Web](./web.md) | Outbound WebSocket to Flowly Cloud relay | `relayUrl` / `serverId` / `authToken` / `jwtSecret` |
 
 > [!NOTE]
@@ -78,10 +79,10 @@ flowly pairing revoke <channel> <user_id>
 flowly pairing allowed <channel>
 ```
 
-`<channel>` accepts `telegram`, `whatsapp`, `discord`, or `slack`. `--notify` (on `approve`) only sends a confirmation DM for Telegram.
+`<channel>` accepts `telegram`, `whatsapp`, `discord`, `slack`, or `imessage`. `--notify` (on `approve`) only sends a confirmation DM for Telegram.
 
 > [!WARNING]
-> **Allowlist enforcement is currently Telegram-only.** Only the Telegram adapter actually reads the pairing/allow store. Discord, Slack, and WhatsApp enforce access through their own `allowFrom` / policy config keys, not the pairing store — so approving a Discord or Slack code writes a file that those adapters never read. Use the channel's config `allowFrom`/policy keys for non-Telegram access control.
+> **Pairing is enforced by Telegram and iMessage.** Those two adapters read the pairing/allow store. Discord, Slack, and WhatsApp enforce access through their own `allowFrom` / policy config keys instead, not the pairing store — so approving a Discord or Slack code writes a file those adapters never read. Use the channel's config `allowFrom`/policy keys for Discord/Slack/WhatsApp access control.
 
 ## Channel status & login (WhatsApp)
 

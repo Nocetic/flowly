@@ -62,7 +62,7 @@ Set under `channels.imessage` in `~/.flowly/config.json`:
 | `groupPolicy` | string | `mention` | Group chats respond only when the bot is mentioned. |
 | `allowFrom` | string[] | `[]` | Allowed DM senders (phone/email handles). |
 | `groupAllowFrom` | string[] | `[]` | Allowed group participants. |
-| `mentionPatterns` | string[] | — | Words that count as a mention in groups. |
+| `mentionPatterns` | string[] | `[]` | Regex patterns that count as a mention in groups. When empty, the runtime falls back to `@?flowly\b` (matches "flowly" / "@flowly"). |
 
 ## Setup
 
@@ -71,8 +71,10 @@ Set under `channels.imessage` in `~/.flowly/config.json`:
 1. Install and run the [BlueBubbles Server](https://bluebubbles.app) on the Mac,
    grant it Automation + Full Disk Access, and set a server password.
 2. Point Flowly at it: set `bluebubblesUrl` + `bluebubblesPassword` above.
-3. In BlueBubbles, add a webhook to `http://<webhookHost>:<webhookPort>` so
-   inbound messages reach Flowly.
+3. **No manual webhook needed** — on start, Flowly auto-registers its listener
+   (`http://<webhookHost>:<webhookPort>/bluebubbles-webhook`) with the
+   BlueBubbles server. If auto-registration fails (older BlueBubbles, locked-down
+   network), add that exact URL as a webhook in BlueBubbles by hand.
 4. `flowly restart`.
 
 **Direct:**
