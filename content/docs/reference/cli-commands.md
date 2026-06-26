@@ -29,7 +29,7 @@ The `flowly` command is the entry point for everything — running the agent, st
 | `flowly skills` | Manage skills (list / install / remove / search). |
 | `flowly skill` | Govern self-improved skills (mine, curate, rollback, archive, usage). |
 | `flowly bundles` | Manage skill bundles. |
-| `flowly memory` | Inspect and correct long-term memory (list, review, accept/reject, correct, undo). |
+| `flowly memory` | Inspect and correct long-term memory (list, review, accept/reject, dream, correct, undo). |
 | `flowly plugins` | Manage plugins. |
 | `flowly mcp` | Manage MCP servers. |
 | `flowly persona` | Manage the bot persona. |
@@ -164,8 +164,9 @@ Inspect and correct long-term memory (the governed memory store). See [Memory](.
 | Subcommand | What it does |
 |---|---|
 | `list` | List stored memories. |
-| `review` | Review pending memory candidates. |
+| `review` | Review pending memory candidates (the `needs_review` queue). |
 | `accept` / `reject` | Accept or reject a candidate memory. |
+| `dream` | Run a cross-session "dreaming" pass now — scan recent chats and learn durable facts (also runs automatically on idle / daily / every N turns). `--max-messages` caps the batch. |
 | `feedback` | Give 👍/👎 feedback to retune a memory's trust score. |
 | `correct` | Correct a stored memory's content. |
 | `undo` | Undo the last memory change. |

@@ -159,19 +159,72 @@ None of these are required. The runtime injects the active conversation id inter
 > [!NOTE]
 > `sessions_list` is **not** part of memory — it lists and cancels background subagent tasks. See [delegation](../features/delegation.md).
 
-## Governance & the `flowly memory` CLI
+## Governance, the dreamer & the `flowly memory` CLI
 
 Behind the markdown, memories are governed in a SQLite store
-(`~/.flowly/memory/memory_governance.sqlite3`) with a real lifecycle — candidates,
-calibrated **trust scores**, conflict reconciliation, and an audit trail. A
-background **consolidation/"dreaming" pass is on by default** (`agents.defaults.memoryDreaming.enabled = true`): it runs after ~30 min of idle, once daily (03:30), and every ~10 turns, extracting candidates across sessions, merging duplicates, and retiring stale notes. `MEMORY.md` is the human-readable projection of the active set. Turn the layer off with `memoryDreaming.enabled = false`.
+(`~/.flowly/memory_governance.sqlite3`) with a real lifecycle — candidates,
+calibrated **trust scores**, conflict reconciliation, and an append-only audit
+trail. `MEMORY.md` is the human-readable projection of the **active** set. Three
+processes write into it, each with a distinct job — don't confuse them:
 
-Inspect and correct it from the CLI (or `/memory` in a chat):
+### Per-turn self-review (live, single-session)
+
+The [automatic curation](#automatic-curation-background-self-review) above: every
+`memoryNudgeInterval` turns (default 10) a background subagent reads the recent
+messages and appends genuinely-new facts via `memory_append` / `knowledge_graph`.
+Fast and greedy — it captures facts you state explicitly the moment you say them,
+straight to **active**.
+
+### Cross-session "dreaming" (offline, across sessions)
+
+A separate pass that reads conversation **deltas across sessions** (watermarked,
+so it never re-reads the same messages), extracts durable candidates the live
+path missed, and **reconciles them against what's already known** — both the
+governed store and your `USER.md` profile — before committing. On by default
+(`agents.defaults.memoryDreaming.enabled = true`), it fires:
+
+- after **30 min** with no user activity (idle — background heartbeats don't count),
+- once **daily** at 03:30 local,
+- every **10 user turns** (a coarse pass),
+- or on demand: **`flowly memory dream`**, or the desktop / iOS **"Learn from chats"** button.
+
+Each candidate is routed by confidence and privacy:
+
+- **explicitly stated + high confidence** → **active** (remembered immediately);
+- an explicit **contradiction** of a known fact → **supersedes** it (the old one is closed and linked to the new active one);
+- **inferred**, **mid-confidence**, or **sensitive** → the **review queue** (`needs_review`), for you to approve;
+- **already known** (same fact in the store or `USER.md`) → **skipped**, never duplicated.
+
+The review queue surfaces in the CLI (`flowly memory review`), the desktop memory
+panel, and the iOS app (a sheet on app open). Accepting promotes an item to
+active; rejecting discards it.
+
+Tune it under `agents.defaults.memoryDreaming` (camelCase on disk): `enabled`,
+`idleMinutes` (30), `dailyTime` (`"03:30"`), `turnInterval` (10), `autoFloor`
+(0.80 — at/above ⇒ auto-active when unconflicted and not sensitive), `reviewFloor`
+(0.55 — below ⇒ dropped), `maxMessagesPerRun` (500). Set `turnInterval: 0` to drop
+the per-turn pass and rely on idle + daily only; `enabled: false` turns the layer
+off entirely.
+
+### Consolidation (cleanup of the existing store)
+
+Distinct from dreaming, consolidation is an LLM-driven **cleanup** of what's
+already stored — it merges cross-key duplicate facts, retires free-form that
+duplicates the knowledge graph, and marks outdated notes stale. It runs in the
+background (every ~50 turns / ~30 min, gated on new writes since the last pass)
+and on demand via **`flowly memory consolidate`** or the desktop **"Clean now"**
+button. Configured under the same block: `autoConsolidate`,
+`consolidateTurnInterval` (50), `consolidateEveryMinutes` (30).
+
+### The CLI
+
+Inspect and correct everything from the CLI (or `/memory` in a chat):
 
 ```bash
-flowly memory list                  # what's stored
-flowly memory review                # pending candidates
+flowly memory list                  # active long-term memories
+flowly memory review                # the review queue (pending candidates)
 flowly memory accept <id>           # or: reject <id>
+flowly memory dream                 # learn from recent chats now (cross-session)
 flowly memory feedback <id>         # 👍/👎 to retune a memory's trust score
 flowly memory correct <id> "..."    # fix a memory's content
 flowly memory undo                  # revert the last change

@@ -87,6 +87,10 @@ Run these from a regular shell — they work without launching the TUI.
 | `flowly --theme catppuccin` | Launch with a specific TUI theme (catppuccin, synthwave, gruvbox...) |
 | `flowly gateway`           | Run the gateway daemon (Telegram/iOS/Discord channels go through it) |
 | `flowly status`            | One-line snapshot of model + provider + session |
+| `flowly memory list`       | Show active long-term memories |
+| `flowly memory review`     | Memories awaiting your review — accept / reject |
+| `flowly memory dream`      | Learn durable facts from recent chats now (the cross-session "dreamer"; also runs automatically on idle/daily) |
+| `flowly memory consolidate` | Merge duplicate + retire stale memories |
 | `flowly --help`            | Full command tree with options |
 
 ## Status bar badges
