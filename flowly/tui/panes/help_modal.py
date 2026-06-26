@@ -60,6 +60,7 @@ HELP_BODY = """
 | `/approvals`         | Pending approvals queue (or F3) |
 | `/permissions`       | Edit command permissions (security/ask/allowlist) |
 | `/artifacts`         | Artifacts gallery (or F4) |
+| `/memory` `/review`  | Review new memories inline — keep / discard the bot's pending candidates (also pops on open) |
 | `/board` `/kanban`   | Show the task board inline (status groups) |
 | `/subagents` `/subs` | Toggle subagent sidebar |
 | `/subagents models`  | Set which model each specialist runs on |

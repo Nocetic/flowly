@@ -449,6 +449,24 @@ class GatewayClient:
         reply = await self._await_reply(rid, timeout=5.0)
         return reply.get("approvals", [])
 
+    # --- memory review queue ---------------------------------------
+
+    async def memory_review(self) -> list[dict[str, Any]]:
+        """Items awaiting review (the governance ``needs_review`` queue)."""
+        rid = await self._rpc("memory.review", {})
+        reply = await self._await_reply(rid, timeout=5.0)
+        return reply.get("items", [])
+
+    async def memory_accept(self, item_id: str) -> dict[str, Any] | None:
+        rid = await self._rpc("memory.accept", {"id": item_id})
+        reply = await self._await_reply(rid, timeout=5.0)
+        return reply.get("item")
+
+    async def memory_reject(self, item_id: str) -> dict[str, Any] | None:
+        rid = await self._rpc("memory.reject", {"id": item_id})
+        reply = await self._await_reply(rid, timeout=5.0)
+        return reply.get("item")
+
     async def artifacts_list(
         self, *, limit: int = 50, search: str | None = None, type: str | None = None
     ) -> list[dict[str, Any]]:

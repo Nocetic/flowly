@@ -28,6 +28,7 @@ from flowly.tui.attachments import (
     render_message_with_attachments,
 )
 from flowly.tui.clipboard import save_clipboard_image
+from flowly.tui.panes.memory_review import MemoryReviewPanel
 
 # TUI autocomplete palette — derived from the single command registry (every
 # command not flagged gateway_only). Plugin/bundle/skill commands are merged in
@@ -1271,9 +1272,11 @@ class Composer(Vertical):
     Composer.approval-open > #composer-input-row,
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,
+    Composer.review-open > #composer-input-row,
     Composer.approval-open > #composer-hint,
     Composer.secret-open > #composer-hint,
-    Composer.setup-open > #composer-hint {
+    Composer.setup-open > #composer-hint,
+    Composer.review-open > #composer-hint {
         display: none;
     }
     Composer > #composer-attachments {
@@ -1316,6 +1319,42 @@ class Composer(Vertical):
     }
     Composer > #composer-approval > #approval-hint {
         height: 1;
+    }
+    Composer > #composer-review {
+        display: none;
+        height: auto;
+        padding: 1 2;
+        margin: 0;
+    }
+    Composer.review-open > #composer-review {
+        display: block;
+    }
+    Composer > #composer-review > #review-title {
+        height: 1;
+        text-style: bold;
+        color: #00a6c8;
+    }
+    Composer > #composer-review > #review-meta {
+        height: 1;
+    }
+    Composer > #composer-review > #review-text {
+        height: auto;
+        max-height: 3;
+        margin: 0 0 1 0;
+    }
+    Composer > #composer-review > .review-option {
+        height: 1;
+        margin: 0;
+        color: #83b8c2;
+    }
+    Composer > #composer-review > .review-option.selected {
+        color: #e6fbff;
+        background: #050505;
+        text-style: bold;
+    }
+    Composer > #composer-review > #review-hint {
+        height: 1;
+        color: #83b8c2;
     }
     Composer > #composer-secret {
         display: none;
@@ -1507,6 +1546,7 @@ class Composer(Vertical):
         yield ApprovalPrompt(id="composer-approval")
         yield InlineSecretPrompt(id="composer-secret")
         yield InlineSetupPrompt(id="composer-setup")
+        yield MemoryReviewPanel(id="composer-review")
         with Horizontal(id="composer-input-row"):
             yield Label("❯", id="composer-prompt", markup=False)
             editor = _Editor(id="composer-input", show_line_numbers=False)
@@ -1679,6 +1719,23 @@ class Composer(Vertical):
         except Exception:
             return False
         return prompt.route_editor_key(key)
+
+    def show_memory_review(self, item: dict, idx: int, total: int) -> None:
+        self.remove_class("palette-open")
+        self.remove_class("approval-open")
+        self.remove_class("secret-open")
+        self.remove_class("setup-open")
+        self.add_class("review-open")
+        panel = self.query_one("#composer-review", MemoryReviewPanel)
+        panel.set_item(item, idx, total)
+
+    def clear_memory_review(self) -> None:
+        try:
+            self.query_one("#composer-review", MemoryReviewPanel).clear()
+        except Exception:
+            pass
+        self.remove_class("review-open")
+        self.focus_input_safely()
 
     def show_secret_prompt(self, request: InlineSecretPromptRequest) -> None:
         self.remove_class("palette-open")

@@ -63,6 +63,7 @@ from flowly.tui.panes.composer import (
     InlineSetupPrompt,
     InlineSetupPromptRequest,
 )
+from flowly.tui.panes.memory_review import MemoryReviewPanel
 from flowly.tui.panes.confirm_modal import ConfirmModal
 from flowly.tui.panes.help_hint import HelpHint
 from flowly.tui.panes.help_modal import HelpModal
@@ -242,6 +243,9 @@ class FlowlyTUI(App[None]):
         self._approval_choice_future: asyncio.Future[str] | None = None
         self._inline_secret_future: asyncio.Future[str | None] | None = None
         self._inline_setup_future: asyncio.Future[dict[str, object] | None] | None = None
+        # Inline memory-review queue (the on-open "review new memories" panel).
+        self._memory_review_items: list[dict] = []
+        self._memory_review_idx = 0
         # Account (lazy: loaded in on_mount)
         self._account = None
         self._account_ref: list = [None]
@@ -317,6 +321,10 @@ class FlowlyTUI(App[None]):
         # initial compose pass.
         if self._auto_open_modal:
             self.call_later(self._maybe_open_initial_modal)
+        else:
+            # Surface the bot's memory review queue inline on open (the
+            # "review new memories" panel), if it has anything pending.
+            asyncio.create_task(self._maybe_show_memory_review())
 
     def on_paste(self, event: events.Paste) -> None:
         try:
@@ -976,6 +984,72 @@ class FlowlyTUI(App[None]):
         if fut is not None and not fut.done():
             fut.set_result(event.decision)
 
+    # --- inline memory review queue --------------------------------
+
+    async def _maybe_show_memory_review(self) -> None:
+        """Fetch the bot's review queue and surface it inline if non-empty.
+        Silent on any error (old gateway / offline) — never blocks the open."""
+        try:
+            items = await self._client.memory_review()
+        except Exception:
+            return
+        items = [i for i in items if isinstance(i, dict) and i.get("id")]
+        if not items:
+            return
+        self._memory_review_items = items
+        self._memory_review_idx = 0
+        try:
+            self.query_one(Composer).show_memory_review(items[0], 0, len(items))
+        except Exception:
+            pass
+
+    async def _open_memory_review_or_note(self) -> None:
+        """`/memory` — open the review panel, or note an empty queue to the user."""
+        try:
+            items = await self._client.memory_review()
+        except Exception as exc:
+            self.query_one(TranscriptPane).add_error(f"memory.review failed: {exc}")
+            return
+        items = [i for i in items if isinstance(i, dict) and i.get("id")]
+        if not items:
+            self.query_one(TranscriptPane).add_system("memory review queue is empty")
+            return
+        self._memory_review_items = items
+        self._memory_review_idx = 0
+        try:
+            self.query_one(Composer).show_memory_review(items[0], 0, len(items))
+        except Exception:
+            pass
+
+    @on(MemoryReviewPanel.Decision)
+    async def _on_memory_review_decision(self, event: MemoryReviewPanel.Decision) -> None:
+        event.stop()
+        composer = self.query_one(Composer)
+        if event.action == "close":
+            composer.clear_memory_review()
+            return
+        items, idx = self._memory_review_items, self._memory_review_idx
+        if idx >= len(items):
+            composer.clear_memory_review()
+            return
+        item = items[idx]
+        if event.action in ("keep", "discard"):
+            try:
+                if event.action == "keep":
+                    await self._client.memory_accept(str(item.get("id") or ""))
+                else:
+                    await self._client.memory_reject(str(item.get("id") or ""))
+            except Exception as exc:
+                self.query_one(TranscriptPane).add_error(f"memory {event.action} failed: {exc}")
+        # keep / discard / skip all advance to the next pending item.
+        self._memory_review_idx += 1
+        nxt = self._memory_review_idx
+        if nxt >= len(items):
+            composer.clear_memory_review()
+            self.query_one(TranscriptPane).add_system("✓ memory review done")
+            return
+        composer.show_memory_review(items[nxt], nxt, len(items))
+
     async def _show_inline_secret(self, req: InlineSecretPromptRequest) -> str | None:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str | None] = loop.create_future()
@@ -1302,6 +1376,11 @@ class FlowlyTUI(App[None]):
             return
         if head == "/artifacts":
             self.action_open_artifacts()
+            return
+        if head in ("/memory", "/review"):
+            transcript = self.query_one(TranscriptPane)
+            transcript.add_system("checking memory review queue…")
+            asyncio.create_task(self._open_memory_review_or_note())
             return
         if head in ("/subagents", "/subs"):
             sub = rest.strip()
