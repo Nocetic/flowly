@@ -908,7 +908,7 @@ class AgentLoop:
             la = getattr(self, "_last_activity_ts", 0.0)
             if la <= fired_for:
                 continue  # no new activity since the last idle fire
-            if (_time.time() - la) >= idle_s:
+            if (time.time() - la) >= idle_s:
                 fired_for = la
                 await self._maybe_run_dreamer("idle")
 

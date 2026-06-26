@@ -143,6 +143,34 @@ def test_extract_end_to_end_bridge():
     assert cands[0].source_message_ids == ["7"]
 
 
+def test_dreamer_idle_timer_fires(monkeypatch):
+    """The idle timer must call _maybe_run_dreamer once the idle threshold is
+    exceeded. Regression: the body referenced an undefined `_time`, so the
+    fire-and-forget task died silently on first tick (idle trigger never ran)."""
+    from flowly.agent.loop import AgentLoop
+
+    calls: list[str] = []
+
+    class _Fake:
+        _running = True
+        _dreamer_idle_minutes = 30
+        _last_activity_ts = 1.0  # far in the past → idle threshold long exceeded
+
+        async def _maybe_run_dreamer(self, trigger):
+            calls.append(trigger)
+            self._running = False  # stop the loop after the first fire
+
+    async def _no_sleep(_):
+        return None
+
+    async def main():
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        await asyncio.wait_for(AgentLoop._dreamer_idle_timer(_Fake()), timeout=2.0)
+
+    asyncio.run(main())
+    assert calls == ["idle"]
+
+
 def test_seconds_until_daily_logic():
     import datetime as dt
 
