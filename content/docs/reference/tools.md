@@ -4,7 +4,7 @@ eyebrow: Reference
 description: The built-in tools the Flowly agent can call. Many register only when their integration is configured.
 ---
 
-Tools are the functions the agent calls to act on the world — reading files, running commands, searching the web, controlling the desktop, posting to channels, and more. Core tools are always on; integration tools register only when their credentials/config are present. Manage them in a session with `/tools` and `/permissions`.
+Tools are the functions the agent calls to act on the world — reading files, running commands, searching the web, controlling the desktop, posting to channels, and more. Core tools are always on; integration tools register only when their credentials/config are present. Configure them in a session with `/permissions` (execution policy), `/integrations`, and `/channels`.
 
 > [!NOTE]
 > Many tools below only appear when enabled. For example, the Google tools register when `channels.email.enabled` is true, and `linear` registers when `integrations.linear.apiKey` is set.
@@ -19,6 +19,8 @@ Tools are the functions the agent calls to act on the world — reading files, r
 | `list_dir` | List a directory. |
 | `memory_append` | Append a durable note to `MEMORY.md` (de-duplicated). |
 | `memory_search` | Search the memory index (keyword + vector). |
+| `memory_recall` | Recall the most relevant governed memories for the current context. |
+| `memory_get` | Fetch a specific memory entry by id. |
 | `knowledge_graph` | Add/query the temporal knowledge graph (add/query/invalidate/search/timeline/merge/stats). |
 | `session_search` | Search across past sessions. |
 
@@ -26,7 +28,7 @@ Tools are the functions the agent calls to act on the world — reading files, r
 
 | Tool | What it does | Gated by |
 |---|---|---|
-| `shell` | Run a shell command (allowlist + approvals + sandbox). | `tools.exec.enabled` |
+| `exec` | Run a shell command (allowlist + approvals + sandbox). | `tools.exec.enabled` |
 | `process` | Manage long-running background processes. | — |
 | `docker` | Manage Docker containers. | — |
 | `system` | System resource / process monitor (cpu/memory/disk/network/processes/ports). | — |
@@ -56,7 +58,7 @@ Tools are the functions the agent calls to act on the world — reading files, r
 | `image_generate` | Text-to-image via FAL; the result rides the assistant's reply. | `tools.imageGeneration.enabled` + key |
 | `video_analyze` | Analyze a video via a multimodal model. | — |
 | `artifact` | Create/manage renderable artifacts (HTML/SVG/Markdown/form/chart/code). | artifact store |
-| `voice` | Place / manage a voice call. | `integrations.voice.enabled` |
+| `voice_call` | Place / manage a voice call. | `integrations.voice.enabled` |
 
 See [Image generation](../features/image-generation.md) for the full image_generate guide (models, sizes, delivery).
 
@@ -84,11 +86,12 @@ See [Image generation](../features/image-generation.md) for the full image_gener
 | `linear` | Linear issues/projects/teams/comments. | `integrations.linear.apiKey` |
 | `trello` | Trello boards/lists/cards. | `integrations.trello.{apiKey,token}` |
 | `x` | Post/delete/search/timeline on X/Twitter. | `integrations.x.*` |
+| `obsidian_search` / `obsidian_read` / `obsidian_list` / `obsidian_write` / `obsidian_append` | Search, read, list, write, and append notes in your Obsidian vault. | `integrations.obsidian.enabled` |
 | `ha_list_entities`, `ha_get_state`, `ha_list_services`, `ha_call_service` | Home Assistant control. | `integrations.homeAssistant.{url,token}` |
 
 ## Related
 
-- [Slash commands](slash-commands.md) — `/tools`, `/permissions`
+- [Slash commands](slash-commands.md) — `/permissions`, `/integrations`
 - [Sandbox & approvals](../using-flowly/sandbox-and-approvals.md)
 - [MCP](../features/mcp.md) — add external tools
 - [Integrations](../integrations/linear.md)

@@ -26,8 +26,10 @@ The `flowly` command is the entry point for everything — running the agent, st
 | `flowly service` | Manage the background gateway service. |
 | `flowly channels` | Manage channels. |
 | `flowly cron` | Manage scheduled tasks. |
-| `flowly skills` | Manage skills. |
+| `flowly skills` | Manage skills (list / install / remove / search). |
+| `flowly skill` | Govern self-improved skills (mine, curate, rollback, archive, usage). |
 | `flowly bundles` | Manage skill bundles. |
+| `flowly memory` | Inspect and correct long-term memory (list, review, accept/reject, correct, undo). |
 | `flowly plugins` | Manage plugins. |
 | `flowly mcp` | Manage MCP servers. |
 | `flowly persona` | Manage the bot persona. |
@@ -130,6 +132,21 @@ Manage the background gateway service (launchd / systemd / Task Scheduler).
 | `remove` | Remove an installed skill. |
 | `search` | Search the registry for skills. |
 
+## flowly skill
+
+Govern the opt-in skill self-improvement subsystem (distinct from `flowly skills`, which installs/removes skills). See [Skill self-improvement](../features/skill-self-improvement.md).
+
+| Subcommand | What it does |
+|---|---|
+| `mine` | Mine recurring procedures from history into proposed skills (`--dry-run` to preview). |
+| `curate` | Review and apply proposed skill improvements. |
+| `usage` | Show how often each self-improved skill has been used. |
+| `log` | Show the skill-change operation log. |
+| `undo` | Undo the last skill change. |
+| `rollback` | Roll a skill back to an earlier snapshot. |
+| `archive` / `restore` | Archive a skill (and restore it later). |
+| `stale` | List skills that haven't been used in a while. |
+
 ## flowly bundles
 
 | Subcommand | What it does |
@@ -139,6 +156,23 @@ Manage the background gateway service (launchd / systemd / Task Scheduler).
 | `create` | Create a new bundle. |
 | `delete` | Delete a bundle file. |
 | `reload` | Drop the in-process bundle cache. |
+
+## flowly memory
+
+Inspect and correct long-term memory (the governed memory store). See [Memory](../features/memory.md).
+
+| Subcommand | What it does |
+|---|---|
+| `list` | List stored memories. |
+| `review` | Review pending memory candidates. |
+| `accept` / `reject` | Accept or reject a candidate memory. |
+| `feedback` | Give 👍/👎 feedback to retune a memory's trust score. |
+| `correct` | Correct a stored memory's content. |
+| `undo` | Undo the last memory change. |
+| `refresh` | Rebuild the `MEMORY.md` block from the governed store. |
+| `status` / `stats` | Show memory store status and statistics. |
+| `consolidate` | Run a consolidation pass (merge duplicates, retire stale notes). |
+| `migrate` | Migrate the memory store to the latest schema. |
 
 ## flowly plugins
 
@@ -228,6 +262,8 @@ Sign in with a Flowly account (OAuth-driven, optional — BYOK works without it)
 | `--no-browser` | Don't try to open the authorization URL. |
 | `--repair` | Re-register + re-wire relay config using existing tokens (no browser). |
 | `--dry-run` | Show what `--repair` would change without writing. |
+| `--key <flw_…>` | Use a Flowly account key you already have (e.g. from the Desktop app) — sets the `flowly` provider with no server record and no relay. |
+| `--relay` / `--no-relay` | Force remote/phone reach (server registration + relay) on or off, skipping the interactive prompt. Default: ask. |
 
 ## flowly doctor
 

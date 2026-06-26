@@ -21,6 +21,7 @@ memory.
 | `obsidian_read` | Read a note (optionally the first *N* lines). |
 | `obsidian_list` | List notes in a folder. |
 | `obsidian_write` | Create or update a note in the vault. |
+| `obsidian_append` | Append content to the end of an existing note. |
 
 ## Configuration
 
@@ -36,7 +37,7 @@ Set under `integrations.obsidian` in `~/.flowly/config.json`:
       "autoInject": "on_demand",
       "ingestionPolicy": "review_gated",
       "includeGlobs": ["**/*.md"],
-      "excludeGlobs": [],
+      "excludeGlobs": [".obsidian/**", ".trash/**", ".git/**", "node_modules/**"],
       "maxNoteBytes": 1000000
     }
   }
@@ -51,7 +52,7 @@ Set under `integrations.obsidian` in `~/.flowly/config.json`:
 | `autoInject` | `off` \| `on_demand` | `on_demand` | `on_demand` injects top-k vault snippets only when the message looks like it needs the vault (keyword-gated). `off` never auto-injects — the agent must call a tool. |
 | `ingestionPolicy` | `manual_only` \| `review_gated` \| `selective_auto` | `review_gated` | How aggressively vault-derived facts may enter long-term memory (see below). |
 | `includeGlobs` | string[] | `["**/*.md"]` | Which files are part of the vault surface. |
-| `excludeGlobs` | string[] | `[]` | Files to skip (private folders, templates, archives). |
+| `excludeGlobs` | string[] | `[".obsidian/**", ".trash/**", ".git/**", "node_modules/**"]` | Files to skip (private folders, templates, archives). Defaults already exclude Obsidian/Git internals. |
 | `maxNoteBytes` | int | `1000000` | Skip notes larger than this (bytes). |
 
 ## Context injection
