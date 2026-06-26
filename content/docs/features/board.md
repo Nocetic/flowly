@@ -239,7 +239,7 @@ Everything is local, under your Flowly home — `~/.flowly/`, or
 | --- | --- |
 | `board.db` | Cards, statuses, results, notes (SQLite, WAL mode) |
 
-The card's `result` field stores the agent's output, **truncated to ~2,000
+The card's `result` field stores the agent's output, **truncated to ~200,000
 characters** (with a trailing ellipsis when longer). The pre-truncation text is
 not retained separately.
 

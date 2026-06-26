@@ -98,7 +98,7 @@ flowly cron run <job_id> [--force --port 18790]
 The agent can manage jobs directly with the `cron` tool. Actions: `list`, `add`, `update`, `remove`, `enable`, `disable`, `status`. This is the surface that accepts the human schedule strings and the extras above.
 
 > [!NOTE]
-> `/tasks` lists background **subagent** tasks, not cron jobs. There is no cron-specific slash command — manage cron via `flowly cron …` or the agent `cron` tool.
+> There is no cron-specific slash command — manage cron via `flowly cron …` or the agent `cron` tool. (`/subagents` (alias `/subs`) toggles the background **subagent** sidebar, which is unrelated to cron jobs.)
 
 ## Reliability behavior
 

@@ -17,6 +17,7 @@ Flowly is a full agent, not just a chat box. These features work together across
 
 - **[Board](board.md)** — a cross-channel task board the agent runs, sequentially or in parallel.
 - **[Cron](cron.md)** — schedule any prompt to run on a timer.
+- **[Heartbeat](heartbeat.md)** — a recurring self-check that lets the agent act on its own between messages.
 - **[Delegation](delegation.md)** — spawn subagents and multi-agent teams for parallel work.
 - **[Codex runtime](codex-runtime.md)** — hand a coding turn to OpenAI's Codex app-server.
 

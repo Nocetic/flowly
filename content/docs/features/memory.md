@@ -159,6 +159,29 @@ None of these are required. The runtime injects the active conversation id inter
 > [!NOTE]
 > `sessions_list` is **not** part of memory — it lists and cancels background subagent tasks. See [delegation](../features/delegation.md).
 
+## Governance & the `flowly memory` CLI
+
+Behind the markdown, memories are governed in a SQLite store
+(`~/.flowly/memory/memory_governance.sqlite3`) with a real lifecycle — candidates,
+calibrated **trust scores**, conflict reconciliation, and an audit trail. A
+background **consolidation/"dreaming" pass is on by default** (`agents.defaults.memoryDreaming.enabled = true`): it runs after ~30 min of idle, once daily (03:30), and every ~10 turns, extracting candidates across sessions, merging duplicates, and retiring stale notes. `MEMORY.md` is the human-readable projection of the active set. Turn the layer off with `memoryDreaming.enabled = false`.
+
+Inspect and correct it from the CLI (or `/memory` in a chat):
+
+```bash
+flowly memory list                  # what's stored
+flowly memory review                # pending candidates
+flowly memory accept <id>           # or: reject <id>
+flowly memory feedback <id>         # 👍/👎 to retune a memory's trust score
+flowly memory correct <id> "..."    # fix a memory's content
+flowly memory undo                  # revert the last change
+flowly memory consolidate           # merge duplicates / retire stale now
+flowly memory refresh               # rebuild the MEMORY.md block from the store
+flowly memory status                # store statistics
+```
+
+See [CLI commands](../reference/cli-commands.md) for the full group.
+
 ## Related
 
 - [Knowledge graph](./knowledge-graph.md)

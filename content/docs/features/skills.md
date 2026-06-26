@@ -1,7 +1,7 @@
 ---
 title: Skills
 eyebrow: Features
-description: A skill is a directory containing a SKILL.md "recipe" with YAML frontmatter and a markdown body that teaches the agent how to perform a task or use a tool. Flowly ships 76 builtin skills, and you can install more, drop them into your workspace, or have the agent author its own.
+description: A skill is a directory containing a SKILL.md "recipe" with YAML frontmatter and a markdown body that teaches the agent how to perform a task or use a tool. Flowly ships 135 builtin skills, and you can install more, drop them into your workspace, or have the agent author its own.
 ---
 
 ## SKILL.md format
@@ -21,7 +21,7 @@ The `metadata` field is a JSON string carrying a `flowly` object. Recognized `fl
 | --- | --- |
 | `requires.bins` | List of binaries that must be on `PATH` for the skill to be available. |
 | `requires.env` | List of environment variables that must be set. |
-| `os` / `platforms` | Restrict the skill to specific operating systems. |
+| `os` | Restrict the skill to specific operating systems. (Only `os` is honored — a `platforms` key is accepted but not read.) |
 | `always` | If truthy (and requirements met), the full body is always inlined into the prompt. |
 | `requires_tools` | Hide the skill unless **all** listed tools are available. |
 | `fallback_for_tools` | Hide the skill when **any** listed tool **is** available (use as a fallback). |
@@ -59,7 +59,7 @@ The agent does not see full skill bodies up front. Skills are disclosed in three
 | Tool | Capability |
 | --- | --- |
 | `skill_view` | Read-only. Loads and discloses a skill body (tier 2) or a linked file (tier 3). Also resolves plugin-namespaced skills as `plugin:name`. |
-| `skill_manage` | Create / patch / edit / delete / list / write_file / remove_file for agent-authored skills under `~/.flowly/skills/<name>/`. |
+| `skill_manage` | Create / patch / edit / delete / list / write_file / remove_file / archive / restore for agent-authored skills under `~/.flowly/skills/<name>/`. |
 
 `skill_manage` validates the skill name against `^[a-z0-9][a-z0-9_-]{0,63}$`, requires a `description` in frontmatter, scans content for prompt injection, and uses atomic writes. Supporting files are capped at 1 MB and restricted to the four supporting subdirs.
 

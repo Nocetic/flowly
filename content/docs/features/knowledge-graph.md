@@ -14,7 +14,7 @@ The graph holds three kinds of records:
 
 Nodes in the graph — people, companies, projects, events, or `unknown`.
 
-- Each entity has a normalized `id` derived from its name (lowercased, trimmed, spaces become underscores, apostrophes stripped). For example `"O'Brien Corp"` → `o_brien_corp`.
+- Each entity has a normalized `id` derived from its name (lowercased, trimmed, spaces become underscores, apostrophes stripped). For example `"O'Brien Corp"` → `obrien_corp`.
 - Entity `type` is one of `person | company | project | event | unknown`. An entity's type is upgraded from `unknown` to a concrete type when better information arrives, but is never downgraded.
 - Entities carry an optional JSON `properties` bag.
 
@@ -144,7 +144,7 @@ Merge a duplicate entity into a canonical one (source → target):
 
 ## How the KG enters the system prompt
 
-A compact KG summary (top entities by current-fact count) is injected into the agent's system prompt as a `# Knowledge Graph` section, scanned for injection payloads first. Subagents receive a `## Known Facts` summary the same way.
+A compact KG summary (top entities by current-fact count) is injected into the main agent's system prompt as a `# Knowledge Graph` section. Subagents receive a `## Known Facts` summary the same way — and that subagent path additionally scans the summary for prompt-injection payloads before injecting it.
 
 ## Notes / limitations
 

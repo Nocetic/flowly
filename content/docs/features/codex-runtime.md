@@ -86,11 +86,14 @@ All keys live under `tools.codexSession` in `~/.flowly/config.json` (camelCase o
 | `codexBin` | Path to the `codex` binary (when not on `PATH`). |
 | `codexHome` | Overrides `CODEX_HOME` for the subprocess (Codex state dir). |
 | `cwd` | Persistent working directory for Codex. |
-| `turnTimeoutS` | Hard deadline for a single Codex turn (watchdog). |
-| `postToolQuietTimeoutS` | Wedge timeout after a tool call with no further output. |
-| `approvalPolicy` | How Codex command/edit approvals are handled. |
-| `sandbox` | Codex sandbox profile for the turn. |
+| `turnTimeoutS` | Hard deadline for a single Codex turn (watchdog). Default `600`. |
+| `postToolQuietTimeoutS` | Wedge timeout after a tool call with no further output. Default `90`. |
+| `approvalPolicy` | How Codex command/edit approvals are handled: `on-request` (default), `never`, `auto-review`, `granular`. |
+| `sandbox` | Codex sandbox profile for the turn: `read-only`, `workspace-write` (default), `full-access`. |
 | `exposeFlowlyTools` | Registers the `flowly-tools` MCP callback. |
+
+> [!NOTE]
+> Codex runtime requires the `codex` CLI at **version 0.125.0 or newer**; `flowly codex enable` checks this and the runtime self-heals across the 0.125 item-state format. `enable` also accepts `--sandbox <profile>` and `--expose-tools` to set those two keys up front.
 
 ## Reliability
 

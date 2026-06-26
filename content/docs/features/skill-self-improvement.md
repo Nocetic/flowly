@@ -94,6 +94,23 @@ flowly skill curate             # curate + apply
 The agent can also trigger this itself through the `skill_improve` tool
 (`mode: "mine" | "curate"`) when it notices it's been repeating work.
 
+## Governance: review, roll back, archive
+
+The same `flowly skill` group exposes the safety rails this subsystem advertises —
+inspect what it did and undo it:
+
+```bash
+flowly skill usage              # how often each self-improved skill is used
+flowly skill log                # the operation log of skill changes
+flowly skill undo               # undo the last skill change
+flowly skill rollback <name>    # restore a skill from an earlier snapshot
+flowly skill archive <name>     # archive a skill (and: restore <name>)
+flowly skill stale              # list skills unused for a while
+```
+
+Snapshots are archive-only (nothing is hard-deleted) and `snapshotKeep` of them
+are retained. See [CLI commands](../reference/cli-commands.md) for the full group.
+
 ## How mining works
 
 Mining reads recent conversation deltas (capped at `maxMessagesPerRun`), looks for
