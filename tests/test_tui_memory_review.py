@@ -67,3 +67,24 @@ def test_set_item_is_idempotent_without_mount() -> None:
     assert panel._selected_idx == 2  # wraps to "skip"
     panel._move(1)
     assert panel._selected_idx == 0
+
+
+@pytest.mark.asyncio
+async def test_dismiss_suppresses_auto_review() -> None:
+    """Esc-dismiss (the `_memory_review_dismissed` flag) makes the on-open auto
+    path bail before it even fetches — it never re-pops until relaunch."""
+    from flowly.tui.app import FlowlyTUI
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.review_called = False
+
+        async def memory_review(self):
+            self.review_called = True
+            return [_ITEM]
+
+    fake = _FakeClient()
+    app = FlowlyTUI(client=fake)
+    app._memory_review_dismissed = True
+    await app._maybe_show_memory_review()
+    assert fake.review_called is False  # guard returned before fetching

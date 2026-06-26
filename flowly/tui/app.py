@@ -246,6 +246,9 @@ class FlowlyTUI(App[None]):
         # Inline memory-review queue (the on-open "review new memories" panel).
         self._memory_review_items: list[dict] = []
         self._memory_review_idx = 0
+        # Esc dismisses the auto-popup for the rest of this TUI session (resets on
+        # relaunch). `/memory` still opens it explicitly.
+        self._memory_review_dismissed = False
         # Account (lazy: loaded in on_mount)
         self._account = None
         self._account_ref: list = [None]
@@ -989,6 +992,8 @@ class FlowlyTUI(App[None]):
     async def _maybe_show_memory_review(self) -> None:
         """Fetch the bot's review queue and surface it inline if non-empty.
         Silent on any error (old gateway / offline) — never blocks the open."""
+        if self._memory_review_dismissed:
+            return
         try:
             items = await self._client.memory_review()
         except Exception:
@@ -1026,6 +1031,8 @@ class FlowlyTUI(App[None]):
         event.stop()
         composer = self.query_one(Composer)
         if event.action == "close":
+            # Esc → stop auto-popping for the rest of this session.
+            self._memory_review_dismissed = True
             composer.clear_memory_review()
             return
         items, idx = self._memory_review_items, self._memory_review_idx
