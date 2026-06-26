@@ -156,7 +156,7 @@ def test_dreamer_idle_timer_fires(monkeypatch):
     class _Fake:
         _running = True
         _dreamer_idle_minutes = 30
-        _last_activity_ts = 1.0  # far in the past → idle threshold long exceeded
+        _dreamer_last_user_ts = 1.0  # far in the past → idle threshold long exceeded
 
         async def _maybe_run_dreamer(self, trigger):
             calls.append(trigger)

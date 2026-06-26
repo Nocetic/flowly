@@ -666,6 +666,11 @@ class AgentLoop:
         self._dreamer_auto_floor = 0.80
         self._dreamer_review_floor = 0.55
         self._dreamer_turns = 0
+        # Last genuine USER turn (not heartbeat/cron) — drives the idle trigger.
+        # Kept separate from _last_activity_ts so a background heartbeat at the
+        # same cadence as idle_minutes can't keep resetting the idle clock. 0.0
+        # until the first user message, so it never fires on a quiet bot.
+        self._dreamer_last_user_ts = 0.0
         self._maybe_enable_memory_governance()
 
         self._skill_gov = None
@@ -924,9 +929,9 @@ class AgentLoop:
                 await asyncio.sleep(check)
             except asyncio.CancelledError:
                 return
-            la = getattr(self, "_last_activity_ts", 0.0)
+            la = getattr(self, "_dreamer_last_user_ts", 0.0)
             if la <= fired_for:
-                continue  # no new activity since the last idle fire
+                continue  # no new user activity since the last idle fire
             if (time.time() - la) >= idle_s:
                 fired_for = la
                 await self._maybe_run_dreamer("idle")
@@ -4401,6 +4406,13 @@ class AgentLoop:
 
         voice_hint = " [voice_mode]" if msg.metadata.get("voice_mode") else ""
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}{voice_hint}")
+
+        # Mark genuine user conversation activity for the dreamer's idle trigger —
+        # NOT shared with _last_activity_ts, which background heartbeat/cron turns
+        # also touch (a 30-min heartbeat would otherwise keep resetting a 30-min
+        # idle clock, so the idle pass would never fire).
+        if msg.channel not in ("system", "heartbeat", "cron"):
+            self._dreamer_last_user_ts = time.time()
 
         # Mark parent session busy so subagent announces are queued, not injected mid-processing
         self.subagents.mark_busy(msg.session_key)
