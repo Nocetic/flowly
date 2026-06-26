@@ -10,7 +10,7 @@ description: Flowly can search the web, pull a page's content, and search X/Twit
 | --- | --- |
 | `web_search` | Search the web via the **Brave Search API** — directly with your own key, or through the Flowly proxy. |
 | `web_fetch` | Fetch a URL and return its readable content, so the agent can read a page end-to-end. |
-| `x` / `x_search` | Search X/Twitter for live posts (see [X integration](/docs/integrations/x)). |
+| `x_search` | Grok-backed research/search over X/Twitter for live posts. The fuller `x` tool (post, delete, timeline, user lookup) lives in the [X integration](/docs/integrations/x). |
 
 Web search and fetch are part of Flowly's [grounding](/docs/features/memory)
 discipline: when a question is about current facts — weather, news, versions,
@@ -25,8 +25,7 @@ prices — the agent is steered to look it up rather than answer from memory.
 - **Flowly proxy:** with a [Flowly Cloud](/docs/using-flowly/flowly-cloud) account,
   search is routed through the hosted proxy — no separate Brave account needed.
 
-Configure under `tools.web` in `~/.flowly/config.json`, or run `flowly setup` →
-Tools and follow the prompts.
+Configure under `tools.web.search` in `~/.flowly/config.json` (`apiKey`, `maxResults`, `proxyUrl`), or run `flowly setup` → Tools and follow the prompts.
 
 ## Typical flow
 
@@ -41,7 +40,10 @@ The agent decides when to fetch deeper; you don't have to ask it to.
 ## Pitfalls
 
 - **No key, no cloud → no search.** If neither a Brave key nor a Flowly Cloud
-  account is configured, `web_search` can't run. `flowly doctor` will flag it.
+  account is configured, `web_search` returns a clear "Web search not available"
+  message instead of results.
+- **`web_fetch` won't hit your LAN.** It blocks `localhost` and private/internal
+  IP ranges (SSRF protection), so it can't be pointed at internal services.
 - **Fetch isn't a browser.** `web_fetch` reads page content; for pages that need
   clicking, logging in, or rendering, use [computer use](/docs/features/computer-use)
   or [browser tabs](/docs/features/browser) instead.

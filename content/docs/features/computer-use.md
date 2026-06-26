@@ -8,9 +8,9 @@ Flowly can capture the screen on its own through the `screenshot` tool. Computer
 
 ## Requirements
 
-- **macOS.** The `computer` tool is macOS-only.
-- **The Desktop helper.** UI automation and screen capture go through the native helper.
-- **`tools.computer.enabled` must be `true`** in `~/.flowly/config.json`. The tool registers only when this gate is set.
+- **macOS for the full experience.** The rich **AX-direct** automation (reading and acting on the Accessibility tree) is macOS-only. The `computer` tool also registers on Linux and Windows with OS-native fallbacks (`xdotool` on Linux, PowerShell on Windows) for pointer, keyboard, and capture — but without the structured AX workflow.
+- **The Desktop helper.** On macOS, AX automation and screen capture go through the native helper.
+- **`tools.computer.enabled` must be `true`** in `~/.flowly/config.json`. The tool registers only when this gate is set. Two optional knobs sit alongside it: `tools.computer.actionDelayMs` (pause between synthetic actions, default `100`) and `tools.computer.failsafe` (abort if the pointer is slammed into a screen corner, default `true`).
 
 ## `computer`
 
@@ -61,7 +61,7 @@ A typical flow: `activate_app` (or `launch_app`) → `read_window_state` to find
 
 ## `screenshot`
 
-Captures a display to an image file and returns the file path. Parameters:
+Captures a display to an image file under `~/.flowly/screenshots/` and **attaches it to the agent's reply automatically** — it returns a media-envelope summary, not a raw file path. Parameters:
 
 | Parameter | Description |
 |---|---|
@@ -69,7 +69,7 @@ Captures a display to an image file and returns the file path. Parameters:
 | `filename` | Optional custom filename (without extension). Defaults to a timestamp-based name. |
 | `format` | `png` or `jpg`. Default `png`. |
 
-Screenshots are saved under `~/.flowly/screenshots/`. To send a capture to the user, the agent uses the `message` tool with the screenshot's path.
+The capture rides the agent's own reply, so the agent does **not** call the `message` tool to send it — the tool's own description says so explicitly. (See [Image generation](image-generation.md) for the same reply-media delivery on generated images.)
 
 ## Limitations
 

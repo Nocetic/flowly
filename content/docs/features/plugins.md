@@ -228,7 +228,7 @@ Fourteen events are defined. The **Fires?** column reflects v1 wiring — events
 | `post_tool_call` | `ToolHookContext` | observation only | yes |
 | `transform_tool_result` | `ToolHookContext` | `str` to replace result | yes |
 | `transform_terminal_output` | `ToolHookContext` | `str` to replace output | no |
-| `pre_llm_call` | `LLMHookContext` | `str` / `{"context": str}` to inject into the user message | no |
+| `pre_llm_call` | `LLMHookContext` | `str` / `{"context": str}` to inject into the user message | yes |
 | `post_llm_call` | `LLMHookContext` | observation only | no |
 | `pre_api_request` | `LLMHookContext` | observation only | no |
 | `post_api_request` | `LLMHookContext` | observation only | no |
@@ -237,7 +237,7 @@ Fourteen events are defined. The **Fires?** column reflects v1 wiring — events
 | `on_session_finalize` | `SessionHookContext` | observation only | no |
 | `on_session_reset` | `SessionHookContext` | observation only | no |
 | `subagent_stop` | `SubagentStopContext` | observation only | no |
-| `pre_gateway_dispatch` | `GatewayDispatchContext` | `SkipAction` / `RewriteAction` | no |
+| `pre_gateway_dispatch` | `GatewayDispatchContext` | `SkipAction` / `RewriteAction` | yes |
 
 ### Action protocols
 

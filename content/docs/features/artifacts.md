@@ -148,7 +148,7 @@ Artifact behavior is controlled under `tools.artifact` in your Flowly config
 ```
 
 - `enabled` — turn the artifact tool on or off (default `true`).
-- `maxContentLength` — maximum content size in bytes (default `500000`, i.e. 500KB).
+- `maxContentLength` — a configured ceiling (default `500000`, i.e. 500 KB). **Note:** this key is accepted in config but not currently enforced by the artifact tool — there is no hard content-length limit today.
 
 ## Related
 
