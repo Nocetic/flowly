@@ -41,17 +41,29 @@ important relationships, recurring procedures, and explicit corrections.
 Do NOT extract: one-off task details, transient state, things obvious from a single \
 message, or anything you only weakly inferred. Prefer a few high-quality items over many.
 
+ALREADY REMEMBERED — facts already in long-term memory (key | text):
+{known}
+
+Reconcile against that list BEFORE returning anything:
+- If a fact is already covered there, do NOT return it again (no duplicates).
+- If the conversation CONTRADICTS or UPDATES one of them (a corrected location, a \
+changed preference, an outdated fact), return the corrected version and REUSE THE \
+EXACT key shown in [brackets] as "normalized_key" — this replaces the old fact \
+instead of adding a competing one. Set "is_explicit": true when the user stated the \
+change directly.
+- Otherwise only return genuinely NEW facts.
+
 Each array element MUST be an object:
 {
   "kind": one of ["profile","preference","project","environment","relationship","procedure","temporal","correction"],
   "text": a concise, self-contained statement WITHOUT "the user said" framing (e.g. "Prefers pytest + ruff"),
-  "normalized_key": a short stable dedup key, e.g. "profile:name", "pref:editor", "project:flowly-oss",
+  "normalized_key": a short stable dedup key — REUSE an existing [bracketed] key when correcting that fact, otherwise a new one like "profile:name", "pref:editor", "project:flowly-oss",
   "privacy_level": "normal" | "sensitive" | "secret"   (secret = passwords, API keys, tokens — never store the secret value itself),
   "is_explicit": true if the USER stated it directly, false if you inferred it,
   "confidence": a number 0.0-1.0
 }
 
-If there is nothing durable to remember, return []. Output JSON only.
+If there is nothing new or changed to remember, return []. Output JSON only.
 
 Conversation:
 {transcript}
@@ -88,17 +100,27 @@ class SubagentExtractor:
 
     # -- Extractor protocol -------------------------------------------------
 
-    def extract(self, delta: Sequence[MessageRow]) -> list[Candidate]:
+    def extract(
+        self, delta: Sequence[MessageRow], known: Sequence[Any] = ()
+    ) -> list[Candidate]:
         """Sync entry (called by the dreamer in a worker thread). Bridges the
-        async LLM call to the event loop and parses the result."""
+        async LLM call to the event loop and parses the result.
+
+        ``known`` is the existing active/queued memory (MemoryItem-like, with
+        ``normalized_key`` + ``text``). It is injected into the prompt so the
+        model deduplicates against what's already remembered and reuses an
+        existing key when correcting it — which lets the engine supersede the
+        old fact instead of accumulating a contradicting duplicate."""
         if not delta:
             return []
         try:
             if self._loop is not None:
-                fut = asyncio.run_coroutine_threadsafe(self._extract_async(delta), self._loop)
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._extract_async(delta, known), self._loop
+                )
                 raw = fut.result(timeout=self._timeout)
             else:
-                raw = asyncio.run(self._extract_async(delta))
+                raw = asyncio.run(self._extract_async(delta, known))
         except Exception as exc:  # noqa: BLE001 — extraction must never crash a run
             logger.warning(f"[dreamer-extract] LLM bridge failed: {exc}")
             return []
@@ -106,8 +128,10 @@ class SubagentExtractor:
 
     # -- LLM call (on the loop) ---------------------------------------------
 
-    async def _extract_async(self, delta: Sequence[MessageRow]) -> str:
-        prompt = self._build_prompt(delta)
+    async def _extract_async(
+        self, delta: Sequence[MessageRow], known: Sequence[Any] = ()
+    ) -> str:
+        prompt = self._build_prompt(delta, known)
         raw = ""
         for attempt in range(3):
             parts: list[str] = []
@@ -131,7 +155,7 @@ class SubagentExtractor:
 
     # -- pure, testable helpers --------------------------------------------
 
-    def _build_prompt(self, delta: Sequence[MessageRow]) -> str:
+    def _build_prompt(self, delta: Sequence[MessageRow], known: Sequence[Any] = ()) -> str:
         # Render most-recent-first within the char budget, then restore order.
         rendered: list[str] = []
         used = 0
@@ -144,7 +168,11 @@ class SubagentExtractor:
             rendered.append(line)
             used += len(line) + 1
         transcript = "\n".join(reversed(rendered))
-        return _EXTRACT_PROMPT.replace("{transcript}", transcript)
+        return (
+            _EXTRACT_PROMPT
+            .replace("{known}", _render_known(known))
+            .replace("{transcript}", transcript)
+        )
 
     def _parse(self, raw: str, delta: Sequence[MessageRow]) -> list[Candidate]:
         arr = _extract_json_array(raw)
@@ -160,6 +188,25 @@ class SubagentExtractor:
 
 
 # ── module-level helpers (unit-tested directly) ──────────────────────────────
+
+
+def _render_known(known: Sequence[Any], max_chars: int = 4000) -> str:
+    """Render existing memory as ``- [key] text`` lines for the prompt, capped so
+    a large store can't blow the token budget. Items are taken in the order given
+    (the dreamer passes most-recently-updated first)."""
+    rows: list[str] = []
+    used = 0
+    for it in known or ():
+        key = (getattr(it, "normalized_key", "") or "").strip() or "no-key"
+        text = " ".join((getattr(it, "text", "") or "").split())
+        if not text:
+            continue
+        line = f"- [{key}] {text}"
+        if used + len(line) > max_chars and rows:
+            break
+        rows.append(line)
+        used += len(line) + 1
+    return "\n".join(rows) if rows else "(nothing remembered yet)"
 
 
 def _extract_json_array(raw: str) -> list[dict]:

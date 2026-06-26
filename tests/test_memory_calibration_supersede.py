@@ -84,7 +84,7 @@ class _Scripted:
         self.batches = batches
         self.calls = 0
 
-    def extract(self, delta):
+    def extract(self, delta, known=()):
         b = self.batches[self.calls] if self.calls < len(self.batches) else []
         self.calls += 1
         return b

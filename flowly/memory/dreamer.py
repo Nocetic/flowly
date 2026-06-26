@@ -114,7 +114,9 @@ class DeltaSource(Protocol):
 
 
 class Extractor(Protocol):
-    def extract(self, delta: Sequence[MessageRow]) -> Sequence[Candidate]: ...
+    def extract(
+        self, delta: Sequence[MessageRow], known: Sequence[MemoryItem] = ()
+    ) -> Sequence[Candidate]: ...
 
 
 # --------------------------------------------------------------------------
@@ -228,6 +230,27 @@ class MemoryDreamerService:
         except (ValueError, TypeError):
             return 0
 
+    # -- known memory (reconciliation context) ------------------------------
+
+    def _known_memory(self, *, limit: int = 80) -> list[MemoryItem]:
+        """The existing active + queued memory the extractor reconciles against,
+        so it dedups against what's already known and reuses an existing key when
+        the conversation corrects a stored fact (which lets _resolve_conflict
+        supersede the old item instead of leaving a contradicting duplicate).
+
+        Most-recently-updated first, capped — a forensic/grounding aid, not
+        load-bearing; on any error we degrade to "no context" (the prior behavior)
+        rather than failing the run."""
+        try:
+            items = self.gov.list_items(status=STATUS_ACTIVE) + self.gov.list_items(
+                status=STATUS_NEEDS_REVIEW
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[dreamer] known-memory snapshot failed: {exc}")
+            return []
+        items.sort(key=lambda i: i.updated_at or "", reverse=True)
+        return items[:limit]
+
     # -- main pass ----------------------------------------------------------
 
     def run(self, *, max_messages: int = 500) -> DreamResult:
@@ -246,7 +269,7 @@ class MemoryDreamerService:
         if not delta:
             return DreamResult(ran=True, reason="no_delta", watermark=watermark)
 
-        candidates = list(self.extractor.extract(delta))
+        candidates = list(self.extractor.extract(delta, known=self._known_memory()))
         res = DreamResult(
             ran=True,
             processed_messages=len(delta),

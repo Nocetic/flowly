@@ -15,6 +15,7 @@ from flowly.memory.extractor import (
     SubagentExtractor,
     _extract_json_array,
     _provenance,
+    _render_known,
     _to_candidate,
 )
 
@@ -234,6 +235,115 @@ def test_dreamer_with_live_extractor_commits(tmp_path):
     # explicit profile fact auto-activated; inferred preference parked for review.
     assert any(i.text == "Name is Hakan" and i.kind == "profile" for i in active)
     assert any(i.kind == "preference" for i in review)
+    gov.close()
+
+
+def test_render_known_formats_and_caps():
+    class _I:
+        def __init__(self, k, t):
+            self.normalized_key = k
+            self.text = t
+
+    assert _render_known([]) == "(nothing remembered yet)"
+    out = _render_known([_I("pref:editor", "Uses  vim"), _I("", "no key here")])
+    assert "- [pref:editor] Uses vim" in out      # whitespace collapsed
+    assert "- [no-key] no key here" in out         # missing key → placeholder
+    # char cap: a large store is truncated, not dumped whole
+    capped = _render_known([_I(f"k{i}", "x" * 400) for i in range(50)], max_chars=1000)
+    assert 0 < len(capped) <= 1100
+
+
+def test_known_memory_injected_into_prompt():
+    # _build_prompt surfaces the known items so the model can dedup/correct.
+    ex = SubagentExtractor(provider=object(), model="m")
+
+    class _I:
+        normalized_key = "pref:canak-koyu-location"
+        text = "Çanak Koyu is in Eski Foça"
+
+    prompt = ex._build_prompt(
+        [MessageRow(id=1, session_key="web:x", role="user", content="hi", timestamp=0.0)],
+        known=[_I()],
+    )
+    assert "pref:canak-koyu-location" in prompt
+    assert "Eski Foça" in prompt
+    assert "ALREADY REMEMBERED" in prompt
+
+
+def test_dreamer_dedups_and_supersedes_via_known_memory(tmp_path):
+    """The dreamer injects existing memory into the extractor, so a corrected
+    fact reuses the old key and SUPERSEDES it instead of stacking a contradicting
+    duplicate. Regression for the Çanak Koyu case: the correction landed as a
+    second/third active item because the extractor never saw the store."""
+    from flowly.memory.dreamer import MemoryDreamerService, MessageRow
+    from flowly.memory.governance import (
+        STATUS_ACTIVE,
+        STATUS_SUPERSEDED,
+        GovernanceStore,
+    )
+
+    gov = GovernanceStore(str(tmp_path / "gov.sqlite3"))
+    old = gov.add_item(
+        kind="preference", text="Çanak Koyu is in Eski Foça",
+        status=STATUS_ACTIVE, normalized_key="pref:canak-koyu-location",
+        confidence=0.85, actor="user", reason="seed",
+    )
+
+    class _KnownAwareProvider:
+        """Emits the correction only when it actually SEES the existing memory in
+        the prompt (reusing its key) — so the test fails if injection regresses."""
+
+        def __init__(self):
+            self.seen_prompt = ""
+
+        async def chat_stream(self, messages, **kwargs):
+            self.seen_prompt = messages[0]["content"]
+            if (
+                "pref:canak-koyu-location" in self.seen_prompt
+                and "Eski Foça" in self.seen_prompt
+            ):
+                yield _Delta(
+                    '[{"kind":"preference","text":"Çanak Koyu is in Yeni Foça",'
+                    '"normalized_key":"pref:canak-koyu-location",'
+                    '"is_explicit":true,"confidence":0.95}]'
+                )
+            else:
+                yield _Delta("[]")
+
+    provider = _KnownAwareProvider()
+
+    class _DS:
+        def __init__(self):
+            self.n = 0
+
+        def read_since(self, watermark, limit):
+            self.n += 1
+            if self.n == 1:
+                return [MessageRow(id=10, session_key="web:x", role="user",
+                                   content="Düzeltme: Çanak Koyu aslında Yeni Foça'da",
+                                   timestamp=0.0)]
+            return []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        ex = SubagentExtractor(provider=provider, model="m", loop=loop)
+        svc = MemoryDreamerService(gov, _DS(), ex, calibrate=True)
+        return await asyncio.to_thread(svc.run, max_messages=50)
+
+    res = asyncio.run(main())
+
+    # the existing memory was actually injected into the prompt
+    assert "pref:canak-koyu-location" in provider.seen_prompt
+    assert "Eski Foça" in provider.seen_prompt
+    # …so the old fact was superseded, not duplicated: exactly one active remains
+    active = [
+        i for i in gov.list_items(status=STATUS_ACTIVE)
+        if i.normalized_key == "pref:canak-koyu-location"
+    ]
+    assert len(active) == 1
+    assert "Yeni Foça" in active[0].text
+    assert any(i.id == old.id for i in gov.list_items(status=STATUS_SUPERSEDED))
+    assert res.superseded == 1
     gov.close()
 
 
