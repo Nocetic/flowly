@@ -324,7 +324,10 @@ class MemoryDreamerService:
             except Exception as exc:  # never let summary regen break a run
                 logger.warning(f"[dreamer] on_committed hook failed: {exc}")
 
-        logger.info(
+        # Detailed engine breakdown at DEBUG; the live loop emits a clean,
+        # human-readable INFO summary per trigger. CLI/RPC paths surface their own
+        # result (console line / return payload), so nothing is lost at INFO.
+        logger.debug(
             f"[dreamer] processed={res.processed_messages} cand={res.candidates} "
             f"active={res.activated} review={res.needs_review} rej={res.rejected} "
             f"dup={res.duplicates} conflict={res.conflicts} super={res.superseded} "

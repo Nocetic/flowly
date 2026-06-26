@@ -882,20 +882,36 @@ class AgentLoop:
         if self._dreamer is None or self._dreamer_lock is None:
             return
         if self._dreamer_lock.locked():
+            logger.debug(f"[dreamer] {trigger} trigger skipped — a pass is already running")
             return
         async with self._dreamer_lock:
+            logger.info(
+                f"[dreamer] ▶ {trigger} trigger — scanning recent conversations for new memories…"
+            )
             try:
                 res = await asyncio.to_thread(
                     self._dreamer.run, max_messages=self._dreamer_max_messages
                 )
-                if res.ran and (res.candidates or res.activated or res.needs_review):
-                    logger.info(
-                        f"[dreamer] ({trigger}) processed={res.processed_messages} "
-                        f"cand={res.candidates} active={res.activated} "
-                        f"review={res.needs_review} super={res.superseded} wm={res.watermark}"
-                    )
             except Exception as exc:
-                logger.warning(f"[dreamer] ({trigger}) run failed: {exc}")
+                logger.warning(f"[dreamer] ✗ {trigger} run failed: {exc}")
+                return
+            # On a processed delta the engine already logs the detailed
+            # "[dreamer] processed=… super=…" line; here we make sure a watcher
+            # always sees an outcome — including the cheap cases the engine stays
+            # quiet on (already running, or nothing new past the watermark).
+            if not res.ran:
+                logger.info(f"[dreamer] ⏭ {trigger}: skipped ({res.reason})")
+            elif res.candidates == 0:
+                logger.info(
+                    f"[dreamer] ✓ {trigger}: nothing new to learn "
+                    f"(scanned {res.processed_messages} messages, watermark={res.watermark})"
+                )
+            else:
+                logger.info(
+                    f"[dreamer] ✓ {trigger}: learned from {res.processed_messages} "
+                    f"messages — {res.activated} added, {res.needs_review} for review, "
+                    f"{res.superseded} updated"
+                )
 
     async def _dreamer_idle_timer(self) -> None:
         """Fire one dreaming pass after idle_minutes of inactivity — once per
