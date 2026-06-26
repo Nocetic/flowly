@@ -17,6 +17,7 @@ description: Flowly talks to LLMs through pluggable providers — the hosted Flo
 | `gemini` | BYOK `api_key` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 | `groq` | BYOK `api_key` | `https://api.groq.com/openai/v1` |
 | `zhipu` | BYOK `api_key` | `https://open.bigmodel.cn/api/paas/v4` |
+| `sakana` | BYOK `api_key` | `https://api.sakana.ai/v1` (Fugu / Fugu Ultra, OpenAI-compat) |
 | `vllm` | BYOK `api_key` | none (self-hosted — you must set `apiBase`) |
 
 The API bases are built in; you normally only supply a key. All listed endpoints (except `xai_oauth`) speak the OpenAI Chat-Completions wire protocol. The `xai_oauth` provider uses xAI's Responses API instead.
@@ -87,7 +88,7 @@ The active provider is resolved in this priority order:
 
 1. `providers.active`, if that provider is currently usable (sticky; falls through if not).
 2. `flowly` hosted, if enabled and signed in.
-3. The BYOK cascade — first usable of `openrouter`, `anthropic`, `openai`, `xai`, `xai_oauth`, `gemini`, `groq`, `zhipu`, `vllm`.
+3. The BYOK cascade — first usable of `openrouter`, `anthropic`, `openai`, `xai`, `xai_oauth`, `gemini`, `groq`, `zhipu`, `sakana`, `vllm`.
 
 Switch live from the TUI:
 
@@ -145,7 +146,7 @@ When a provider slot has **more than one key** (`apiKey` plus `fallbackKeys`), F
 
 ## Model catalog (live vs empty)
 
-Flowly fetches the model list **live, per provider**, from each provider's `/v1/models` endpoint (cached in-memory per session). Providers differ in whether a catalog is available:
+Flowly builds the model picker from a live catalog — each provider's own `/models` endpoint where it has one, or the [models.dev](https://models.dev) community catalogue otherwise (cached locally, served stale on network failure). Providers differ in whether a catalog is available:
 
 | Provider | Catalog source |
 | --- | --- |
@@ -153,10 +154,11 @@ Flowly fetches the model list **live, per provider**, from each provider's `/v1/
 | `flowly` | Live `GET {base}/models` (plan-filtered with `allowed`/`locked` tags; degrades to OpenRouter on no-account/network/401). |
 | `xai` | Live `GET /v1/models` with your BYOK key. |
 | `xai_oauth` | Live `GET /v1/models` with the OAuth token. |
-| `anthropic`, `openai`, `gemini`, `groq`, `zhipu` | No fetcher — returns an empty list (no static catalog). |
+| `anthropic`, `openai`, `gemini`, `groq`, `zhipu` | The [models.dev](https://models.dev) community catalogue — cached locally, filtered to tool-capable models (no per-provider fetcher needed). |
+| `sakana`, `vllm` | No catalog — set the model id directly. |
 
 > [!NOTE]
-> For the empty-catalog providers, `/model`'s picker has nothing to enumerate; set the model id directly with `/model <id>`.
+> Only `sakana` and `vllm` have nothing for the `/model` picker to enumerate; for those, set the model id directly with `/model <id>`.
 
 ## Related
 

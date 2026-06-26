@@ -15,6 +15,20 @@ the system prompt on every turn, so the agent always reads them before it acts.
 edit them any time and the change takes effect on the next turn (no restart
 needed for prompt-level files).
 
+### Where it lives, and the runtime cwd
+
+The workspace defaults to `~/.flowly/workspace` and is configurable via
+`agents.defaults.workspace` in `config.json`. It's the home for the context
+files, [memory](/docs/features/memory), and [skills](/docs/features/skills).
+
+Don't confuse the **workspace** with the agent's **runtime working directory** —
+the folder the shell and file tools actually operate in. Those are resolved
+*separately*: the runtime cwd comes from `--cwd` / the `FLOWLY_CWD` environment
+variable (or config), not from the workspace. So the agent reads its standing
+context from the workspace while running commands and editing files in whatever
+project you've pointed it at. See [Sandbox and approvals](./sandbox-and-approvals.md)
+for the full runtime-cwd resolution chain.
+
 ## The files
 
 | File | Role |

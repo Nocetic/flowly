@@ -37,7 +37,7 @@ On a fresh machine this runs a device-code OAuth flow:
 1. Flowly requests a device code from the backend and prints a one-click authorization URL (with the code and your device name pre-filled).
 2. Your browser opens that URL. Once you approve, the CLI polls until the backend reports `authorized` (the device code expires after a few minutes).
 3. Flowly exchanges the result for account tokens and saves them locally.
-4. It then **registers this machine** with the backend and **wires the relay credentials** into your gateway config (see below).
+4. It then **asks whether to make this bot reachable remotely** (from your phone or other devices). This is **opt-in — the default is no.** Accept and Flowly registers this machine with the backend and wires the relay credentials into your gateway config (see below); decline and sign-in simply stores your account, leaving the gateway local-only. Use `--relay` / `--no-relay` to answer without the prompt. (A non-interactive shell keeps the legacy behavior of wiring the relay automatically.)
 
 If you are already signed in and everything is healthy, `flowly login` is a no-op that prints your account email. If your tokens are present but the relay config is incomplete (e.g. someone edited `config.json`), it does **not** silently change anything — it tells you to run `flowly login --repair`.
 
@@ -48,6 +48,8 @@ If you are already signed in and everything is healthy, `flowly login` is a no-o
 | `--no-browser` | Prints the authorization URL instead of trying to open a browser automatically. Useful over SSH or on headless machines. |
 | `--repair` | Re-registers the machine and re-writes the relay config using the tokens already on disk — no browser, no OAuth. Use it when sign-in succeeded but the relay wiring is broken. Exits non-zero if the saved token can't be refreshed (run a full `flowly login` to recover). |
 | `--repair --dry-run` | Prints exactly what `--repair` would change without writing anything to config, keychain, or the backend. |
+| `--key <flw_…>` | Sign in with a Flowly account key you already have (e.g. from the Desktop app) — sets the `flowly` provider, with no server record, no relay, and no browser. |
+| `--relay` / `--no-relay` | Skip the interactive prompt and force remote/phone reach (server registration + relay) on or off. |
 
 > [!NOTE]
 > Sign-in tokens are stored via your OS keychain when available, falling back to a `0600` file at `~/.flowly/credentials/account.json`. The id token is refreshed automatically before it expires.
@@ -56,7 +58,7 @@ If you are already signed in and everything is healthy, `flowly login` is a no-o
 
 Flowly identifies your machine with a stable `machineId`. It reuses the same identifier the Flowly Desktop app writes (a UUID at the desktop app's data path), so the same physical machine de-duplicates to a single server entry across Desktop and CLI installs. If that path isn't writable, it falls back to a hash of the hardware UUID.
 
-On login, Flowly calls the backend to **get-or-create a server** for this machine:
+When you opt into remote reach (above), Flowly calls the backend to **get-or-create a server** for this machine:
 
 - The call is idempotent — the same `machineId` always maps to the same `serverId`. Logging in repeatedly never creates duplicate servers.
 - The backend returns a `serverId` and a `gatewayAuthToken` (and a JWT secret). These are the credentials your gateway uses to reach the relay.
@@ -147,7 +149,7 @@ Logout performs three clean-ups and prints what it cleared:
 
 ## Relationship to pairing
 
-Signing in **pairs this machine** for app access: registration binds the machine to a `serverId`, and the wired relay credentials are what let your iOS / desktop / browser clients reach the gateway. This is distinct from per-channel pairing for Telegram / WhatsApp / Discord / Slack (the `flowly pairing` commands), which authorizes individual chat users on a messaging channel rather than a device for relay access.
+Opting into remote reach at sign-in **pairs this machine** for app access: registration binds the machine to a `serverId`, and the wired relay credentials are what let your iOS / desktop / browser clients reach the gateway. (Sign in without remote reach and none of this is provisioned — the gateway stays local-only.) This is distinct from per-channel pairing for Telegram / WhatsApp / Discord / Slack (the `flowly pairing` commands), which authorizes individual chat users on a messaging channel rather than a device for relay access.
 
 ## Privacy & data
 

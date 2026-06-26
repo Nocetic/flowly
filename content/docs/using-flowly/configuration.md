@@ -40,7 +40,7 @@ The loader is resilient by design:
 > If both `config.json` and `config.json.bak` fail to load, **secrets in the broken file are lost from the running process** (but the broken file is preserved on disk).
 
 > [!NOTE]
-> Saving is read-modify-write with a deep merge, so **unknown or manually-added keys are preserved**. A `None` value in the model never overwrites an existing non-`None` value on disk — to truly clear a value, write `""` or delete the key. Unknown top-level keys are ignored (`extra = "ignore"`), not errors. Environment variables prefixed `FLOWLY_` override config (nested with `__`, e.g. `FLOWLY_GATEWAY__PORT`).
+> Saving is read-modify-write with a deep merge, so **unknown or manually-added keys are preserved**. A `None` value in the model never overwrites an existing non-`None` value on disk — to truly clear a value, write `""` or delete the key. Unknown top-level keys are ignored (`extra = "ignore"`), not errors. A handful of behaviors are overridable with the documented [`FLOWLY_*` environment variables](../reference/environment-variables.md); note that a generic nested override like `FLOWLY_GATEWAY__PORT` only takes effect on the fallback path (when `config.json` is missing or unparseable) — when a valid `config.json` exists, it is **not** consulted for those.
 
 ## Top-level keys
 
@@ -141,7 +141,7 @@ Channels are off by default. See [Channels overview](../channels/overview.md).
 
 BYOK provider slots — each with `apiKey=""`, `apiBase=null`, `fallbackKeys=[]`: `anthropic`, `openai`, `openrouter`, `zhipu`, `vllm`, `gemini`, `groq`, `xai`.
 
-When `active=""`, the API-key cascade picks the provider in priority order: OpenRouter → Anthropic → OpenAI → xAI → Gemini → Zhipu → vLLM. See [Providers and models](./providers-and-models.md).
+When `active=""`, the API-key cascade picks the first usable provider in priority order: OpenRouter → Anthropic → OpenAI → xAI → xAI OAuth → Gemini → Groq → Zhipu → Sakana → vLLM. See [Providers and models](./providers-and-models.md).
 
 ### gateway
 
