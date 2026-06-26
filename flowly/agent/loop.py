@@ -2143,11 +2143,20 @@ class AgentLoop:
             from flowly.memory.manager import get_manager
             ms = self._memory_search_config
 
-            # Resolve api_key from main config if not overridden
+            # Resolve api_key from main config if not overridden.
             api_key = ms.api_key
             if not api_key and self._main_config:
-                # Use the active provider key as embedding key
-                api_key = self._main_config.get_api_key() or ""
+                # Only seed the embedding key from the active provider when it is
+                # actually an OpenAI key — embeddings work with OpenAI only. A
+                # non-OpenAI active key (xAI/Grok, a Flowly proxy `flw_…` key,
+                # etc.) would otherwise be mis-detected as a Gemini key by the
+                # "auto" resolver and fail silently (401 → keyword-only) while
+                # claiming vector search. Leaving it empty lets the resolver fall
+                # back to an explicitly-configured openai/gemini key, or honestly
+                # report keyword-only search.
+                active = self._main_config.get_api_key() or ""
+                if active.startswith("sk-"):
+                    api_key = active
 
             state_dir = self._state_dir if self._state_dir else (self.workspace / ".flowly_state")
 

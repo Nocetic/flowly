@@ -1064,7 +1064,15 @@ class ContextBuilder:
             else:
                 sub.append(f"# Memory\n\n{long_term}")
         try:
-            kg_path = self.workspace / ".flowly_state" / "knowledge_graph.sqlite3"
+            # The KG lives in the runtime state dir (where the gateway + dreamer
+            # write it), which is NOT necessarily relative to the workspace — a
+            # custom workspace would otherwise look beside itself and miss it.
+            # Prefer the canonical data dir; keep the workspace-relative paths as
+            # back-compat fallbacks.
+            from flowly.config.loader import get_data_dir
+            kg_path = get_data_dir() / "knowledge_graph.sqlite3"
+            if not kg_path.exists():
+                kg_path = self.workspace / ".flowly_state" / "knowledge_graph.sqlite3"
             if not kg_path.exists():
                 kg_path = self.workspace.parent / "knowledge_graph.sqlite3"
             if kg_path.exists():
