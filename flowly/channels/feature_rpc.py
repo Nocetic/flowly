@@ -618,7 +618,11 @@ def _dream_run(max_messages: int) -> dict:
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
     from flowly.memory.coordinator import MemoryGovernance
-    from flowly.memory.dreamer import MemoryDreamerService, SessionIndexDeltaSource
+    from flowly.memory.dreamer import (
+        MemoryDreamerService,
+        SessionIndexDeltaSource,
+        read_user_profile,
+    )
     from flowly.memory.extractor import SubagentExtractor
     from flowly.memory.governance import GovernanceStore
     from flowly.memory.kg_mirror import SqliteKGMirror
@@ -637,8 +641,9 @@ def _dream_run(max_messages: int) -> dict:
 
     si_path = str(state_db("session_index.sqlite"))
     kg_path = state_db("knowledge_graph.sqlite3")
+    ws = workspace_dir()
     gov = GovernanceStore(state_db("memory_governance.sqlite3"))
-    coordinator = MemoryGovernance(gov, memory_store=MemoryStore(workspace_dir()))
+    coordinator = MemoryGovernance(gov, memory_store=MemoryStore(ws))
     extractor = SubagentExtractor(provider=provider, model=model, loop=None)
     dreamer = MemoryDreamerService(
         gov,
@@ -649,6 +654,7 @@ def _dream_run(max_messages: int) -> dict:
         calibrate=True,
         kg_mirror=SqliteKGMirror(str(kg_path)) if kg_path.exists() else None,
         on_committed=coordinator.refresh,
+        profile_fn=lambda: read_user_profile(ws),
     )
     res = dreamer.run(max_messages=max_messages)
 

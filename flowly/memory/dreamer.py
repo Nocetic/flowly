@@ -62,6 +62,19 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def read_user_profile(workspace) -> str:
+    """Read USER.md (the user's curated profile) from a workspace dir. Returns
+    '' if it's missing or unreadable. Used to give the dreamer's extractor the
+    profile as dedup context so it doesn't re-propose facts already on file."""
+    try:
+        from pathlib import Path
+
+        path = Path(workspace) / "USER.md"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+    except Exception:
+        return ""
+
+
 # --------------------------------------------------------------------------
 # Data contracts
 # --------------------------------------------------------------------------
@@ -183,6 +196,7 @@ class MemoryDreamerService:
         calibrate: bool = False,
         calibration_weights=None,
         kg_mirror=None,
+        profile_fn: Optional[Callable[[], str]] = None,
     ):
         self.gov = gov
         self.delta_source = delta_source
@@ -190,6 +204,10 @@ class MemoryDreamerService:
         self.auto_floor = auto_floor
         self.review_floor = review_floor
         self.injection_check = injection_check
+        # Returns the user's curated profile text (USER.md). Injected into the
+        # extractor as dedup context so the dreamer doesn't re-propose facts the
+        # profile already records (e.g. the user's name). None → no profile.
+        self.profile_fn = profile_fn
         # Called after a successful commit pass (e.g. regenerate MEMORY.md).
         self.on_committed = on_committed
         self.lock_owner = lock_owner
@@ -251,6 +269,17 @@ class MemoryDreamerService:
         items.sort(key=lambda i: i.updated_at or "", reverse=True)
         return items[:limit]
 
+    def _read_profile(self) -> str:
+        """The user's curated profile (USER.md) as extra dedup context. Degrades
+        to empty on any error rather than failing the run."""
+        if self.profile_fn is None:
+            return ""
+        try:
+            return self.profile_fn() or ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[dreamer] profile read failed: {exc}")
+            return ""
+
     # -- main pass ----------------------------------------------------------
 
     def run(self, *, max_messages: int = 500) -> DreamResult:
@@ -269,7 +298,11 @@ class MemoryDreamerService:
         if not delta:
             return DreamResult(ran=True, reason="no_delta", watermark=watermark)
 
-        candidates = list(self.extractor.extract(delta, known=self._known_memory()))
+        candidates = list(
+            self.extractor.extract(
+                delta, known=self._known_memory(), profile=self._read_profile()
+            )
+        )
         res = DreamResult(
             ran=True,
             processed_messages=len(delta),

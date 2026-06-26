@@ -229,7 +229,7 @@ def test_dreamer_to_memory_md_end_to_end(gov, tmp_path):
             return [MessageRow(id=1, session_key="s", role="user", content="x", timestamp=1.0)]
 
     class _Extract:
-        def extract(self, delta, known=()):
+        def extract(self, delta, known=(), profile=""):
             return [Candidate(kind="preference", text="prefers vim",
                               normalized_key="editor", confidence=0.9)]
 

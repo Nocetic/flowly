@@ -256,7 +256,11 @@ def dream_cmd(
     it here to learn on demand. Cheap when there's nothing new (watermarked)."""
     from flowly.config.loader import get_data_dir, load_config
     from flowly.integrations.active_provider import resolve_active_provider
-    from flowly.memory.dreamer import MemoryDreamerService, SessionIndexDeltaSource
+    from flowly.memory.dreamer import (
+        MemoryDreamerService,
+        SessionIndexDeltaSource,
+        read_user_profile,
+    )
     from flowly.memory.extractor import SubagentExtractor
     from flowly.providers.factory import build_provider
 
@@ -273,6 +277,7 @@ def dream_cmd(
     review_floor = float(getattr(md, "review_floor", 0.55)) if md is not None else 0.55
 
     si_path = str(get_data_dir() / "session_index.sqlite")
+    workspace = config.workspace_path
     mg = _open()  # resolved gov + kg_mirror + memory_store (matches the runtime)
     # loop=None → the extractor drives its own asyncio.run here (no live loop),
     # exactly like the consolidate command's streaming call.
@@ -286,6 +291,7 @@ def dream_cmd(
         calibrate=True,
         kg_mirror=mg.kg_mirror,
         on_committed=mg.refresh,
+        profile_fn=lambda: read_user_profile(workspace),
     )
     console.print(f"[dim]dreaming via {ap.key}/{model}…[/dim]")
     res = dreamer.run(max_messages=max_messages)

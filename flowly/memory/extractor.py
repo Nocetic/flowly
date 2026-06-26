@@ -41,10 +41,14 @@ important relationships, recurring procedures, and explicit corrections.
 Do NOT extract: one-off task details, transient state, things obvious from a single \
 message, or anything you only weakly inferred. Prefer a few high-quality items over many.
 
+USER PROFILE — already on file about the user (do NOT re-extract anything already \
+stated here, e.g. their name if it appears below):
+{profile}
+
 ALREADY REMEMBERED — facts already in long-term memory (key | text):
 {known}
 
-Reconcile against that list BEFORE returning anything:
+Reconcile against the profile AND that list BEFORE returning anything:
 - If a fact is already covered there, do NOT return it again (no duplicates).
 - If the conversation CONTRADICTS or UPDATES one of them (a corrected location, a \
 changed preference, an outdated fact), return the corrected version and REUSE THE \
@@ -101,7 +105,7 @@ class SubagentExtractor:
     # -- Extractor protocol -------------------------------------------------
 
     def extract(
-        self, delta: Sequence[MessageRow], known: Sequence[Any] = ()
+        self, delta: Sequence[MessageRow], known: Sequence[Any] = (), profile: str = ""
     ) -> list[Candidate]:
         """Sync entry (called by the dreamer in a worker thread). Bridges the
         async LLM call to the event loop and parses the result.
@@ -110,17 +114,22 @@ class SubagentExtractor:
         ``normalized_key`` + ``text``). It is injected into the prompt so the
         model deduplicates against what's already remembered and reuses an
         existing key when correcting it — which lets the engine supersede the
-        old fact instead of accumulating a contradicting duplicate."""
+        old fact instead of accumulating a contradicting duplicate.
+
+        ``profile`` is the user's curated profile text (USER.md), injected as
+        dedup-only context so the dreamer doesn't re-propose facts already on
+        file there (e.g. the user's name). It is not key-reconciled — the profile
+        is user-owned and the dreamer never rewrites it."""
         if not delta:
             return []
         try:
             if self._loop is not None:
                 fut = asyncio.run_coroutine_threadsafe(
-                    self._extract_async(delta, known), self._loop
+                    self._extract_async(delta, known, profile), self._loop
                 )
                 raw = fut.result(timeout=self._timeout)
             else:
-                raw = asyncio.run(self._extract_async(delta, known))
+                raw = asyncio.run(self._extract_async(delta, known, profile))
         except Exception as exc:  # noqa: BLE001 — extraction must never crash a run
             logger.warning(f"[dreamer-extract] LLM bridge failed: {exc}")
             return []
@@ -129,9 +138,9 @@ class SubagentExtractor:
     # -- LLM call (on the loop) ---------------------------------------------
 
     async def _extract_async(
-        self, delta: Sequence[MessageRow], known: Sequence[Any] = ()
+        self, delta: Sequence[MessageRow], known: Sequence[Any] = (), profile: str = ""
     ) -> str:
-        prompt = self._build_prompt(delta, known)
+        prompt = self._build_prompt(delta, known, profile)
         raw = ""
         for attempt in range(3):
             parts: list[str] = []
@@ -155,7 +164,9 @@ class SubagentExtractor:
 
     # -- pure, testable helpers --------------------------------------------
 
-    def _build_prompt(self, delta: Sequence[MessageRow], known: Sequence[Any] = ()) -> str:
+    def _build_prompt(
+        self, delta: Sequence[MessageRow], known: Sequence[Any] = (), profile: str = ""
+    ) -> str:
         # Render most-recent-first within the char budget, then restore order.
         rendered: list[str] = []
         used = 0
@@ -170,6 +181,7 @@ class SubagentExtractor:
         transcript = "\n".join(reversed(rendered))
         return (
             _EXTRACT_PROMPT
+            .replace("{profile}", _render_profile(profile))
             .replace("{known}", _render_known(known))
             .replace("{transcript}", transcript)
         )
@@ -188,6 +200,14 @@ class SubagentExtractor:
 
 
 # ── module-level helpers (unit-tested directly) ──────────────────────────────
+
+
+def _render_profile(profile: str, max_chars: int = 4000) -> str:
+    """The user's curated profile (USER.md) as dedup context, trimmed/capped."""
+    text = (profile or "").strip()
+    if not text:
+        return "(no profile on file)"
+    return text[:max_chars]
 
 
 def _render_known(known: Sequence[Any], max_chars: int = 4000) -> str:

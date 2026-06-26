@@ -16,6 +16,7 @@ from flowly.memory.extractor import (
     _extract_json_array,
     _provenance,
     _render_known,
+    _render_profile,
     _to_candidate,
 )
 
@@ -344,6 +345,90 @@ def test_dreamer_dedups_and_supersedes_via_known_memory(tmp_path):
     assert "Yeni Foça" in active[0].text
     assert any(i.id == old.id for i in gov.list_items(status=STATUS_SUPERSEDED))
     assert res.superseded == 1
+    gov.close()
+
+
+def test_render_profile():
+    assert _render_profile("") == "(no profile on file)"
+    assert _render_profile("   ") == "(no profile on file)"
+    assert _render_profile("# Profile\n- Name: Hakan") == "# Profile\n- Name: Hakan"
+    assert len(_render_profile("x" * 9000, max_chars=100)) == 100
+
+
+def test_profile_injected_into_prompt():
+    ex = SubagentExtractor(provider=object(), model="m")
+    prompt = ex._build_prompt(
+        [MessageRow(id=1, session_key="web:x", role="user", content="hi", timestamp=0.0)],
+        profile="# User Profile\n- **Name:** Hakan",
+    )
+    assert "USER PROFILE" in prompt
+    assert "**Name:** Hakan" in prompt
+
+
+def test_read_user_profile(tmp_path):
+    from flowly.memory.dreamer import read_user_profile
+
+    assert read_user_profile(tmp_path) == ""        # no USER.md → empty
+    (tmp_path / "USER.md").write_text("- Name: Hakan", encoding="utf-8")
+    assert "Hakan" in read_user_profile(tmp_path)
+
+
+def test_dreamer_skips_facts_already_in_profile(tmp_path):
+    """The user's USER.md profile is injected so the dreamer doesn't re-propose
+    facts already on file. Regression for: the name "Hakan" landed back in the
+    review queue even though it was already in USER.md."""
+    from flowly.memory.dreamer import (
+        MemoryDreamerService,
+        MessageRow,
+        read_user_profile,
+    )
+    from flowly.memory.governance import GovernanceStore
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "USER.md").write_text("# User Profile — Hakan\n- **Name:** Hakan\n", encoding="utf-8")
+
+    gov = GovernanceStore(str(tmp_path / "gov.sqlite3"))
+
+    class _ProfileAwareProvider:
+        def __init__(self):
+            self.seen_prompt = ""
+
+        async def chat_stream(self, messages, **kwargs):
+            self.seen_prompt = messages[0]["content"]
+            if "**Name:** Hakan" in self.seen_prompt:
+                yield _Delta("[]")  # name already on file → nothing new
+            else:  # regression path: without injection the model "learns" it again
+                yield _Delta(
+                    '[{"kind":"profile","text":"Name is Hakan",'
+                    '"normalized_key":"profile:name","is_explicit":false,"confidence":0.6}]'
+                )
+
+    provider = _ProfileAwareProvider()
+
+    class _DS:
+        def __init__(self):
+            self.n = 0
+
+        def read_since(self, watermark, limit):
+            self.n += 1
+            if self.n == 1:
+                return [MessageRow(id=1, session_key="web:x", role="user",
+                                   content="selam ben hakan", timestamp=0.0)]
+            return []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        ex = SubagentExtractor(provider=provider, model="m", loop=loop)
+        svc = MemoryDreamerService(
+            gov, _DS(), ex, calibrate=True,
+            profile_fn=lambda: read_user_profile(ws),
+        )
+        return await asyncio.to_thread(svc.run, max_messages=50)
+
+    res = asyncio.run(main())
+    assert "**Name:** Hakan" in provider.seen_prompt   # profile reached the prompt
+    assert res.candidates == 0                          # nothing re-proposed
     gov.close()
 
 

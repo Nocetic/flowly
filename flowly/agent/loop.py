@@ -839,12 +839,14 @@ class AgentLoop:
             from flowly.memory.dreamer import (
                 MemoryDreamerService,
                 SessionIndexDeltaSource,
+                read_user_profile,
             )
             from flowly.memory.extractor import SubagentExtractor
             from flowly.memory.kg_mirror import SqliteKGMirror
 
             kg_path = str(self._state_dir / "knowledge_graph.sqlite3")
             si_path = str(self._state_dir / "session_index.sqlite")
+            _workspace = self.workspace
             self._dreamer = MemoryDreamerService(
                 self._memory_gov.gov,
                 SessionIndexDeltaSource(si_path),
@@ -854,6 +856,7 @@ class AgentLoop:
                 calibrate=True,
                 kg_mirror=SqliteKGMirror(kg_path),
                 on_committed=self._memory_gov.refresh,
+                profile_fn=lambda: read_user_profile(_workspace),
             )
             self._dreamer_lock = asyncio.Lock()
             if self._dreamer_idle_minutes > 0:
