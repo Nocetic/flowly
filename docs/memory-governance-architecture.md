@@ -14,9 +14,10 @@ setting it `false`. See [Rollout & defaults](#rollout--defaults).
 > **Status (2026-06).** Live capture (main agent + background self-review),
 > auto-supersede, manual + autonomous consolidation, and the full CLI are wired
 > and verified in chat. The offline cross-session `MemoryDreamerService` engine is
-> built and tested but **not yet wired to a live trigger** — see
-> [Wiring the offline dreamer](#wiring-the-offline-dreamer) and
-> [What is not wired](#what-is-not-wired).
+> **now wired to live triggers** (idle / daily / turn) through a streaming-provider
+> extractor (`flowly/memory/extractor.py`) — see
+> [Wiring the offline dreamer](#wiring-the-offline-dreamer). The extraction *prompt*
+> is v1; its at-scale quality is still being tuned.
 
 ---
 
@@ -684,8 +685,8 @@ auto_consolidate           = true
 consolidate_turn_interval  = 50      # 0 = off
 consolidate_every_minutes  = 30      # 0 = off
 freeze_injected_memory     = false   # F3b — flip ON only after a measured cache-read gain
-# dreamer-engine fields (not wired live): idle_minutes, daily_time,
-# turn_interval, max_messages_per_run
+# dreamer triggers (now live): idle_minutes, daily_time, turn_interval,
+# max_messages_per_run, auto_floor, review_floor
 ```
 
 Config keys are camelCase on disk (`memoryDreaming`, `consolidateTurnInterval`),
@@ -755,7 +756,10 @@ deterministic) while making consolidation manual.
 
 ## Wiring the offline dreamer
 
-`dreamer.py` is complete and unit-tested but has no live trigger. To wire it:
+**Implemented.** The extractor is `flowly/memory/extractor.py::SubagentExtractor`;
+the triggers are `AgentLoop._start_dreamer_timers` (construction + idle/daily timers),
+`_maybe_run_dreamer` (gated runner, run in a worker thread), and the turn counter in
+`_maybe_spawn_review`. The recipe it followed:
 
 1. **DeltaSource:** `SessionIndexDeltaSource(state_dir/"session_index.sqlite")`
    (already implemented; reads `messages WHERE id > watermark`).
@@ -782,9 +786,12 @@ never explicitly saved.
 
 Honest scope so nobody assumes more than is true:
 
-- **`MemoryDreamerService`** — the cross-session extraction engine (above) is built
-  and tested but not connected to a live trigger. Live consolidation today operates
-  on the *current* governed set, not a re-scan of session history.
+- ~~`MemoryDreamerService` is not connected to a live trigger~~ — **now wired.** A
+  streaming-provider `SubagentExtractor` (`flowly/memory/extractor.py`) feeds the
+  engine, and `AgentLoop` fires it on idle / daily / turn (the previously-dead
+  `idle_minutes` / `daily_time` / `turn_interval` config fields are now live).
+  Remaining: the extraction *prompt* is v1 (quality tuning), and a manual
+  `memory.dream` RPC + "Learn from chats" UI action is still to come.
 - **Consolidation model** is the agent's main model (often a slow reasoning model,
   ~40-90s/pass). A faster model for this structured task is a config change away.
 - **Consolidation is conservative** — it leaves borderline notes and pre-existing

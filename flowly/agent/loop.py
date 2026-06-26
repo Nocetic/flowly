@@ -654,6 +654,18 @@ class AgentLoop:
         self._consolidate_tool = None
         self._auto_consolidate = False
         self._consolidate_lock = None
+        # Cross-session dreamer (constructed lazily in _start_dreamer_timers,
+        # which needs the running loop for the extractor's sync→async bridge).
+        self._dreamer = None
+        self._dreamer_lock = None
+        self._dreamer_enabled = False
+        self._dreamer_idle_minutes = 0
+        self._dreamer_daily_time = ""
+        self._dreamer_turn_interval = 0
+        self._dreamer_max_messages = 500
+        self._dreamer_auto_floor = 0.80
+        self._dreamer_review_floor = 0.55
+        self._dreamer_turns = 0
         self._maybe_enable_memory_governance()
 
         self._skill_gov = None
@@ -731,6 +743,15 @@ class AgentLoop:
             self._consolidate_every_minutes = int(getattr(md, "consolidate_every_minutes", 30))
             self._consolidate_turns = 0
             self._consolidate_lock = None  # created lazily in the running loop
+            # Cross-session dreamer config — the previously-dead idle/daily/turn
+            # fields become live triggers (wired in _start_dreamer_timers).
+            self._dreamer_enabled = True
+            self._dreamer_idle_minutes = int(getattr(md, "idle_minutes", 30))
+            self._dreamer_daily_time = str(getattr(md, "daily_time", "03:30") or "")
+            self._dreamer_turn_interval = int(getattr(md, "turn_interval", 10))
+            self._dreamer_max_messages = int(getattr(md, "max_messages_per_run", 500))
+            self._dreamer_auto_floor = float(getattr(md, "auto_floor", 0.80))
+            self._dreamer_review_floor = float(getattr(md, "review_floor", 0.55))
             logger.info("[memory-gov] live governance enabled (post_tool_call hook + memory_consolidate tool)")
         except Exception as exc:
             logger.warning(f"[memory-gov] failed to enable: {exc}")
@@ -804,6 +825,124 @@ class AgentLoop:
                 logger.info(f"[memory-gov] auto-consolidate ({trigger}): {result}")
             except Exception as exc:
                 logger.warning(f"[memory-gov] auto-consolidate ({trigger}) failed: {exc}")
+
+    # ── Cross-session dreamer (offline memory discovery) ──────────────
+
+    def _start_dreamer_timers(self) -> None:
+        """Construct the dreamer (extractor bound to the running loop) and start
+        its idle + daily triggers. Called once from run(); the turn trigger lives
+        in _maybe_spawn_review and the manual trigger in _maybe_run_dreamer."""
+        if not self._dreamer_enabled or self._memory_gov is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            from flowly.memory.dreamer import (
+                MemoryDreamerService,
+                SessionIndexDeltaSource,
+            )
+            from flowly.memory.extractor import SubagentExtractor
+            from flowly.memory.kg_mirror import SqliteKGMirror
+
+            kg_path = str(self._state_dir / "knowledge_graph.sqlite3")
+            si_path = str(self._state_dir / "session_index.sqlite")
+            self._dreamer = MemoryDreamerService(
+                self._memory_gov.gov,
+                SessionIndexDeltaSource(si_path),
+                SubagentExtractor(provider=self.provider, model=self.model, loop=loop),
+                auto_floor=self._dreamer_auto_floor,
+                review_floor=self._dreamer_review_floor,
+                calibrate=True,
+                kg_mirror=SqliteKGMirror(kg_path),
+                on_committed=self._memory_gov.refresh,
+            )
+            self._dreamer_lock = asyncio.Lock()
+            if self._dreamer_idle_minutes > 0:
+                asyncio.create_task(self._dreamer_idle_timer())
+            if self._dreamer_daily_time:
+                asyncio.create_task(self._dreamer_daily_timer())
+            logger.info(
+                f"[dreamer] wired — idle={self._dreamer_idle_minutes}m "
+                f"daily={self._dreamer_daily_time or 'off'} turn={self._dreamer_turn_interval}"
+            )
+        except Exception as exc:
+            logger.warning(f"[dreamer] failed to start: {exc}")
+            self._dreamer = None
+
+    async def _maybe_run_dreamer(self, trigger: str) -> None:
+        """Run one cross-session dreaming pass if not already running.
+
+        Cheap when there is no new session delta (the dreamer short-circuits on
+        the watermark), and run in a worker thread so its SQLite writes and the
+        bridged extractor LLM call never block a user turn. Fire-and-forget;
+        the dreamer also holds its own advisory lock + watermark for crash safety.
+        """
+        if self._dreamer is None or self._dreamer_lock is None:
+            return
+        if self._dreamer_lock.locked():
+            return
+        async with self._dreamer_lock:
+            try:
+                res = await asyncio.to_thread(
+                    self._dreamer.run, max_messages=self._dreamer_max_messages
+                )
+                if res.ran and (res.candidates or res.activated or res.needs_review):
+                    logger.info(
+                        f"[dreamer] ({trigger}) processed={res.processed_messages} "
+                        f"cand={res.candidates} active={res.activated} "
+                        f"review={res.needs_review} super={res.superseded} wm={res.watermark}"
+                    )
+            except Exception as exc:
+                logger.warning(f"[dreamer] ({trigger}) run failed: {exc}")
+
+    async def _dreamer_idle_timer(self) -> None:
+        """Fire one dreaming pass after idle_minutes of inactivity — once per
+        active→idle transition, not repeatedly while idle."""
+        idle_s = max(60, self._dreamer_idle_minutes * 60)
+        check = min(idle_s, 120)
+        fired_for = 0.0
+        while self._running:
+            try:
+                await asyncio.sleep(check)
+            except asyncio.CancelledError:
+                return
+            la = getattr(self, "_last_activity_ts", 0.0)
+            if la <= fired_for:
+                continue  # no new activity since the last idle fire
+            if (_time.time() - la) >= idle_s:
+                fired_for = la
+                await self._maybe_run_dreamer("idle")
+
+    async def _dreamer_daily_timer(self) -> None:
+        """Fire one dreaming pass each day at daily_time (HH:MM local)."""
+        while self._running:
+            delay = self._seconds_until_daily(self._dreamer_daily_time)
+            if delay is None:
+                return  # unparseable time → disable the daily trigger
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            if not self._running:
+                return
+            await self._maybe_run_dreamer("daily")
+
+    @staticmethod
+    def _seconds_until_daily(hhmm: str, now=None):
+        """Seconds from ``now`` to the next local ``HH:MM``; None if unparseable."""
+        import datetime as _dt
+
+        try:
+            hh, mm = str(hhmm).strip().split(":")
+            hour, minute = int(hh), int(mm)
+            if not (0 <= hour < 24 and 0 <= minute < 60):
+                return None
+        except (ValueError, AttributeError):
+            return None
+        now = now or _dt.datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += _dt.timedelta(days=1)
+        return max(1.0, (target - now).total_seconds())
 
     # ── Skill self-improvement (auto-apply, snapshot-guarded) ─────────
 
@@ -1067,6 +1206,15 @@ class AgentLoop:
             if self._consolidate_turns >= self._consolidate_turn_interval:
                 self._consolidate_turns = 0
                 asyncio.create_task(self._maybe_consolidate("turn"))
+
+        # Cross-session dreamer: coarse turn-based trigger. Cheap when there is no
+        # new session delta (the dreamer short-circuits on its watermark), so it
+        # only does LLM work when fresh cross-session material has accumulated.
+        if self._dreamer is not None and self._dreamer_turn_interval > 0:
+            self._dreamer_turns += 1
+            if self._dreamer_turns >= self._dreamer_turn_interval:
+                self._dreamer_turns = 0
+                asyncio.create_task(self._maybe_run_dreamer("turn"))
 
         meta = session.metadata
 
@@ -2052,6 +2200,7 @@ class AgentLoop:
         logger.info("Agent loop started")
         self.subagents.resume_pending()
         self._start_memory_maintenance_timer()
+        self._start_dreamer_timers()
         self._start_skill_maintenance_timer()
         # Strong refs to in-flight concurrent chat turns (web/relay). Without
         # holding them, ``asyncio.create_task`` results could be GC'd mid-run;
