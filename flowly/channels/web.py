@@ -9,7 +9,7 @@ import os
 import ssl
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -37,6 +37,8 @@ _IMAGE_MAX_DIMENSION = 1280       # px on the longest edge
 _IMAGE_INITIAL_QUALITY = 75
 _IMAGE_MIN_QUALITY = 40
 _OUTBOUND_QUEUE_LIMIT = 50        # cap pending replays to avoid unbounded growth
+
+LocalEventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 
 
 def _build_ssl_context() -> ssl.SSLContext | None:
@@ -240,6 +242,7 @@ class WebChannel(BaseChannel):
         # worked since the tracked task only awaits the bus publish
         # and is done by the time abort fires.
         self._abort_callback: Callable[[str], None] | None = None
+        self._local_event_callback: LocalEventCallback | None = None
 
     @property
     def cron_session_id(self) -> str | None:
@@ -260,6 +263,39 @@ class WebChannel(BaseChannel):
         cheap set update — no await needed.
         """
         self._abort_callback = callback
+
+    def set_local_event_callback(self, callback: LocalEventCallback) -> None:
+        """Mirror web-channel live events to local gateway clients.
+
+        Relay delivery remains the source of truth for iOS/web. This optional
+        callback is only for already-connected local desktop clients that want
+        lightweight liveness signals without joining the relay conversation.
+        """
+        self._local_event_callback = callback
+
+    async def _emit_local_event(self, event_name: str, data: dict[str, Any]) -> None:
+        cb = self._local_event_callback
+        if not cb:
+            return
+        try:
+            result = cb(event_name, data)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            logger.debug(f"[WebChannel] local event mirror failed: {exc}")
+
+    def _session_key_for_relay_id(self, session_id: str) -> str:
+        """Best-effort reverse lookup for relay session id → stable session key."""
+        if not session_id:
+            return ""
+        fallback = ""
+        for key, relay_id in self._session_key_to_relay_id.items():
+            if relay_id != session_id:
+                continue
+            if key.startswith("web:"):
+                return key
+            fallback = fallback or key
+        return fallback or f"web:{session_id}"
 
     async def start(self) -> None:
         """Connect outbound to relay proxy and keep reconnecting (Telegram-like)."""
@@ -321,6 +357,7 @@ class WebChannel(BaseChannel):
         # tool-turn payloads.
         iter_event = msg.metadata.get("iteration_event")
         if isinstance(iter_event, dict) and iter_event:
+            session_key = self._session_key_for_relay_id(session_id)
             event_msg = {
                 "type": "event",
                 "sessionId": session_id,
@@ -328,6 +365,8 @@ class WebChannel(BaseChannel):
                 "data": {
                     "state": "iteration_step",
                     "runId": iter_event.get("runId") or "",
+                    "sessionKey": session_key,
+                    "source": "relay",
                     "iterationIdx": iter_event.get("iterationIdx", 0),
                     "role": iter_event.get("role"),
                     "content": iter_event.get("content", ""),
@@ -346,6 +385,7 @@ class WebChannel(BaseChannel):
                 },
             }
             await self._send_or_queue(json.dumps(event_msg))
+            asyncio.create_task(self._emit_local_event("chat", event_msg["data"]))
             return
 
         run_id = msg.metadata.get("run_id", str(uuid.uuid4()))
@@ -410,6 +450,8 @@ class WebChannel(BaseChannel):
         data_block: dict[str, Any] = {
             "state": "final",
             "runId": run_id,
+            "sessionKey": self._session_key_for_relay_id(session_id),
+            "source": "relay",
             "message": {
                 "content": content_blocks,
             },
@@ -466,6 +508,7 @@ class WebChannel(BaseChannel):
 
         payload = json.dumps(event_msg)
         await self._send_or_queue(payload)
+        asyncio.create_task(self._emit_local_event("chat", data_block))
 
     async def send_cron_register(self, job: dict) -> None:
         """Push a bot-created cron job to Firestore via relay.
@@ -880,11 +923,26 @@ class WebChannel(BaseChannel):
             # Captures ws and session_id at call time (safe even if self._ws reconnects).
             async def stream_callback(delta: str) -> None:
                 inflight.append(session_key, run_id, delta)
+                local_stream_data = {
+                    "state": "streaming",
+                    "runId": run_id,
+                    "sessionKey": session_key,
+                    "source": "relay",
+                    "delta": delta,
+                }
                 await ws.send(json.dumps({
                     "type": "event",
                     "sessionId": session_id,
                     "event": "chat",
                     "data": {"state": "streaming", "runId": run_id, "delta": delta},
+                }))
+                asyncio.create_task(self._emit_local_event("chat", local_stream_data))
+                asyncio.create_task(self._emit_local_event("agent", {
+                    "stream": "assistant",
+                    "runId": run_id,
+                    "sessionKey": session_key,
+                    "source": "relay",
+                    "data": {"text": delta},
                 }))
 
             # Process message asynchronously (don't block the recv loop).
@@ -913,6 +971,12 @@ class WebChannel(BaseChannel):
 
         elif method == "chat.abort":
             run_id = params.get("runId", "")
+            raw_session_key = params.get("sessionKey")
+            session_key = (
+                raw_session_key
+                if isinstance(raw_session_key, str) and raw_session_key
+                else self._session_key_for_relay_id(session_id)
+            )
             # ``task.cancel()`` used to be the heart of this handler,
             # but ``self._active_tasks[run_id]`` only ever held the
             # short-lived task that pushes the inbound to the bus —
@@ -964,6 +1028,12 @@ class WebChannel(BaseChannel):
                 "data": {"state": "aborted", "runId": run_id},
             }
             await ws.send(json.dumps(aborted_event))
+            asyncio.create_task(self._emit_local_event("chat", {
+                "state": "aborted",
+                "runId": run_id,
+                "sessionKey": session_key,
+                "source": "relay",
+            }))
 
         elif method == "chat.history":
             # History is managed by Firestore on the client side — return empty

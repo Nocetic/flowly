@@ -2428,6 +2428,16 @@ class GatewayServer:
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 
+    async def broadcast_event(self, event_name: str, data: dict) -> None:
+        """Push a generic event to all connected WS clients.
+
+        Used by transport mirrors that already own an event envelope, such as
+        the web relay channel forwarding lightweight chat liveness to desktop.
+        """
+        event = {"type": "event", "event": event_name, "data": data}
+        for ws in list(self._ws_clients.values()):
+            await self._ws_send(ws, event)
+
     # ------------------------------------------------------------------
     # HTTP: artifacts
     # ------------------------------------------------------------------

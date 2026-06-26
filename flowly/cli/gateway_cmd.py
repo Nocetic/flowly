@@ -1271,6 +1271,13 @@ Respond to the user now:"""
     # Wire browser_tab tool to gateway server
     agent.set_gateway_server(gateway_server)
 
+    # Mirror relay/web chat liveness to local desktop gateway clients. This
+    # lets the desktop UI react when another client (iOS/web) talks to this
+    # machine's bot without forcing the desktop to join that relay chat.
+    web = channels.get_channel("web")
+    if web and hasattr(web, "set_local_event_callback"):
+        web.set_local_event_callback(gateway_server.broadcast_event)
+
     # Wire artifact broadcast callback — push to desktop (gateway) AND relay (web channel)
     if artifact_store:
         artifact_tool = agent.tools.get("artifact")
@@ -1582,5 +1589,4 @@ Respond to the user now:"""
             console.print("[green]✓[/green] Shutdown complete")
 
     asyncio.run(run())
-
 
