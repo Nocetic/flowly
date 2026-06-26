@@ -603,6 +603,99 @@ async def memory_consolidate(params: dict) -> dict:
     return await asyncio.to_thread(_consolidate_run, dry_run)
 
 
+def _dream_run(max_messages: int) -> dict:
+    """One on-demand cross-session dreaming pass — the desktop/iOS "Learn from
+    chats" action. Builds the dreamer with the active provider's streaming
+    extractor and runs it synchronously on this worker thread.
+
+    Safe to run alongside the live agent's automatic triggers (idle/daily/turn):
+    the dreamer holds an advisory lock + a watermark, so a concurrent run returns
+    ``locked`` and an already-processed delta returns ``no_delta`` — both cheap
+    no-ops. ``loop=None`` tells the extractor to drive its own ``asyncio.run``
+    here (there is no live event loop on this thread), mirroring how
+    ``memory_consolidate`` streams its proposal."""
+    from flowly.agent.memory import MemoryStore
+    from flowly.config.loader import load_config
+    from flowly.integrations.active_provider import resolve_active_provider
+    from flowly.memory.coordinator import MemoryGovernance
+    from flowly.memory.dreamer import MemoryDreamerService, SessionIndexDeltaSource
+    from flowly.memory.extractor import SubagentExtractor
+    from flowly.memory.governance import GovernanceStore
+    from flowly.memory.kg_mirror import SqliteKGMirror
+    from flowly.providers.factory import build_provider
+
+    config = load_config()
+    ap = resolve_active_provider(config)
+    if ap is None:
+        raise FeatureRpcError("NO_PROVIDER", "No LLM provider configured")
+    model = config.agents.defaults.model
+    provider = build_provider(ap, default_model=model, config=config)
+
+    md = getattr(config.agents.defaults, "memory_dreaming", None)
+    auto_floor = float(getattr(md, "auto_floor", 0.80)) if md is not None else 0.80
+    review_floor = float(getattr(md, "review_floor", 0.55)) if md is not None else 0.55
+
+    si_path = str(state_db("session_index.sqlite"))
+    kg_path = state_db("knowledge_graph.sqlite3")
+    gov = GovernanceStore(state_db("memory_governance.sqlite3"))
+    coordinator = MemoryGovernance(gov, memory_store=MemoryStore(workspace_dir()))
+    extractor = SubagentExtractor(provider=provider, model=model, loop=None)
+    dreamer = MemoryDreamerService(
+        gov,
+        SessionIndexDeltaSource(si_path),
+        extractor,
+        auto_floor=auto_floor,
+        review_floor=review_floor,
+        calibrate=True,
+        kg_mirror=SqliteKGMirror(str(kg_path)) if kg_path.exists() else None,
+        on_committed=coordinator.refresh,
+    )
+    res = dreamer.run(max_messages=max_messages)
+
+    if not res.ran:
+        output = (
+            "Already learning — try again in a moment."
+            if res.reason == "locked"
+            else "Nothing new to learn."
+        )
+    elif res.reason == "no_delta":
+        output = "Nothing new to learn since the last pass."
+    elif res.candidates == 0:
+        output = f"Read {res.processed_messages} messages — nothing durable to remember."
+    else:
+        parts = [f"{res.activated} added"]
+        if res.needs_review:
+            parts.append(f"{res.needs_review} for review")
+        if res.superseded:
+            parts.append(f"{res.superseded} updated")
+        output = f"Learned from {res.processed_messages} messages: " + ", ".join(parts) + "."
+    return {
+        "ok": True,
+        "output": output,
+        "ran": res.ran,
+        "reason": res.reason,
+        "processed": res.processed_messages,
+        "candidates": res.candidates,
+        "activated": res.activated,
+        "needsReview": res.needs_review,
+        "superseded": res.superseded,
+        "watermark": res.watermark,
+    }
+
+
+async def memory_dream(params: dict) -> dict:
+    """``memory.dream`` — run one cross-session dreaming pass on demand (the
+    desktop/iOS "Learn from chats" button). Offloaded to a thread so the LLM
+    round-trip doesn't block the event loop."""
+    import asyncio
+    try:
+        max_messages = int(params.get("maxMessages") or params.get("max_messages") or 500)
+    except (TypeError, ValueError):
+        max_messages = 500
+    max_messages = max(1, min(max_messages, 5000))
+    return await asyncio.to_thread(_dream_run, max_messages)
+
+
 # ── Persona / Provider ──────────────────────────────────────────────────────
 
 def persona_list() -> dict:
@@ -2102,6 +2195,7 @@ _DISPATCH: dict[str, tuple] = {
     "memory.correct":     (_partial(memory_gov, "correct"), True, False),
     "memory.feedback":    (_partial(memory_gov, "feedback"), True, False),
     "memory.consolidate": (memory_consolidate, True, False),
+    "memory.dream":       (memory_dream, True, False),
     "obsidian.status":    (_partial(obsidian_rpc, "status"), True, False),
     "obsidian.search":    (_partial(obsidian_rpc, "search"), True, False),
     "persona.list":       (persona_list, False, False),

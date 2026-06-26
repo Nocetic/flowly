@@ -71,12 +71,17 @@ class SubagentExtractor:
         *,
         provider: Any,
         model: str,
-        loop: asyncio.AbstractEventLoop,
+        loop: asyncio.AbstractEventLoop | None = None,
         max_transcript_chars: int = 24_000,
         timeout_s: float = 180.0,
     ):
         self._provider = provider
         self._model = model
+        # When a loop is given (live agent), the dreamer runs in a worker thread
+        # and the LLM call is bridged back to that loop (the provider lives on it).
+        # When it is None (standalone RPC — the "Learn from chats" action), the
+        # whole pass already runs off the event loop, so we drive the coroutine
+        # directly with asyncio.run, exactly like memory_consolidate's _propose.
         self._loop = loop
         self._max_chars = max_transcript_chars
         self._timeout = timeout_s
@@ -89,8 +94,11 @@ class SubagentExtractor:
         if not delta:
             return []
         try:
-            fut = asyncio.run_coroutine_threadsafe(self._extract_async(delta), self._loop)
-            raw = fut.result(timeout=self._timeout)
+            if self._loop is not None:
+                fut = asyncio.run_coroutine_threadsafe(self._extract_async(delta), self._loop)
+                raw = fut.result(timeout=self._timeout)
+            else:
+                raw = asyncio.run(self._extract_async(delta))
         except Exception as exc:  # noqa: BLE001 — extraction must never crash a run
             logger.warning(f"[dreamer-extract] LLM bridge failed: {exc}")
             return []

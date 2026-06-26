@@ -242,6 +242,67 @@ def consolidate_cmd(
             console.print(f"  [dim]skip: {e}[/dim]")
 
 
+@memory_app.command("dream")
+def dream_cmd(
+    max_messages: int = typer.Option(
+        500, "--max-messages", "-m", help="Cap messages scanned in this pass."
+    ),
+):
+    """Cross-session 'dreaming': scan recent conversations, extract durable
+    memories, and commit the survivors through governance — high-confidence
+    explicit facts auto-activate, the rest land in the review queue.
+
+    The same pass the agent runs automatically on idle/daily/turn triggers; run
+    it here to learn on demand. Cheap when there's nothing new (watermarked)."""
+    from flowly.config.loader import get_data_dir, load_config
+    from flowly.integrations.active_provider import resolve_active_provider
+    from flowly.memory.dreamer import MemoryDreamerService, SessionIndexDeltaSource
+    from flowly.memory.extractor import SubagentExtractor
+    from flowly.providers.factory import build_provider
+
+    config = load_config()
+    ap = resolve_active_provider(config)
+    if ap is None:
+        console.print("[red]No LLM provider configured.[/red] Set one in /integrations.")
+        raise typer.Exit(1)
+
+    model = config.agents.defaults.model
+    provider = build_provider(ap, default_model=model, config=config)
+    md = getattr(config.agents.defaults, "memory_dreaming", None)
+    auto_floor = float(getattr(md, "auto_floor", 0.80)) if md is not None else 0.80
+    review_floor = float(getattr(md, "review_floor", 0.55)) if md is not None else 0.55
+
+    si_path = str(get_data_dir() / "session_index.sqlite")
+    mg = _open()  # resolved gov + kg_mirror + memory_store (matches the runtime)
+    # loop=None → the extractor drives its own asyncio.run here (no live loop),
+    # exactly like the consolidate command's streaming call.
+    extractor = SubagentExtractor(provider=provider, model=model, loop=None)
+    dreamer = MemoryDreamerService(
+        mg.gov,
+        SessionIndexDeltaSource(si_path),
+        extractor,
+        auto_floor=auto_floor,
+        review_floor=review_floor,
+        calibrate=True,
+        kg_mirror=mg.kg_mirror,
+        on_committed=mg.refresh,
+    )
+    console.print(f"[dim]dreaming via {ap.key}/{model}…[/dim]")
+    res = dreamer.run(max_messages=max_messages)
+    if not res.ran:
+        console.print(f"[yellow]skipped[/yellow] ({res.reason})")
+        return
+    if res.reason == "no_delta":
+        console.print("[dim]nothing new to learn since the last pass.[/dim]")
+        return
+    console.print(
+        f"[green]done[/green] processed={res.processed_messages} "
+        f"candidates={res.candidates} active={res.activated} "
+        f"review={res.needs_review} superseded={res.superseded} "
+        f"watermark={res.watermark}"
+    )
+
+
 @memory_app.command("migrate")
 def migrate_cmd():
     """Import legacy MEMORY.md entries into governance (one-time, idempotent)."""

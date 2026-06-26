@@ -218,3 +218,78 @@ def test_extract_empty_delta_skips_llm():
 
     ex = SubagentExtractor(provider=_Boom(), model="m", loop=asyncio.new_event_loop())
     assert ex.extract([]) == []
+
+
+def test_extract_standalone_no_loop():
+    """loop=None path (the standalone "Learn from chats" RPC): extract() drives
+    its own asyncio.run, callable from a plain sync context with no live loop."""
+    provider = _FakeProvider(
+        ['[{"kind":"preference","text":"Uses ruff","normalized_key":"pref:lint",'
+         '"is_explicit":true,"confidence":0.9}]']
+    )
+    ex = SubagentExtractor(provider=provider, model="m")  # loop defaults to None
+    delta = [MessageRow(id=1, session_key="cli:x", role="user",
+                        content="I use ruff", timestamp=0.0)]
+    cands = ex.extract(delta)
+    assert len(cands) == 1
+    assert cands[0].text == "Uses ruff"
+    assert cands[0].confidence == 0.9
+
+
+def test_memory_dream_rpc_end_to_end(tmp_path, monkeypatch):
+    """The full memory.dream RPC: a session-index delta → standalone dreamer →
+    governed items, with provider/config/state-paths faked. Proves the desktop/
+    iOS "Learn from chats" button wires straight through to active memory."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    from flowly.channels import feature_rpc
+    from flowly.memory.governance import STATUS_ACTIVE, GovernanceStore
+
+    # A session index with a couple of real messages to learn from.
+    si = tmp_path / "session_index.sqlite"
+    conn = sqlite3.connect(si)
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_key TEXT, "
+        "role TEXT, content TEXT, timestamp REAL)"
+    )
+    conn.execute("INSERT INTO messages VALUES (1,'cli:x','user','My name is Hakan',0.0)")
+    conn.execute("INSERT INTO messages VALUES (2,'cli:x','assistant','Hi Hakan',1.0)")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(feature_rpc, "state_db", lambda name: tmp_path / name)
+    monkeypatch.setattr(feature_rpc, "workspace_dir", lambda: tmp_path)
+
+    fake_cfg = SimpleNamespace(agents=SimpleNamespace(defaults=SimpleNamespace(
+        model="m",
+        memory_dreaming=SimpleNamespace(auto_floor=0.80, review_floor=0.55),
+    )))
+    monkeypatch.setattr("flowly.config.loader.load_config", lambda: fake_cfg)
+    monkeypatch.setattr(
+        "flowly.integrations.active_provider.resolve_active_provider",
+        lambda cfg: object(),
+    )
+    provider = _FakeProvider([
+        '[{"kind":"profile","text":"Name is Hakan","normalized_key":"profile:name",'
+        '"privacy_level":"normal","is_explicit":true,"confidence":0.95}]'
+    ])
+    monkeypatch.setattr(
+        "flowly.providers.factory.build_provider", lambda *a, **k: provider
+    )
+
+    out = feature_rpc._dream_run(500)
+    assert out["ok"] is True
+    assert out["ran"] is True
+    assert out["activated"] == 1
+    assert out["processed"] == 2
+    assert "Learned from 2 messages" in out["output"]
+
+    gov = GovernanceStore(str(tmp_path / "memory_governance.sqlite3"))
+    active = gov.list_items(status=STATUS_ACTIVE)
+    assert any(i.text == "Name is Hakan" for i in active)
+    gov.close()
+
+    # A second pass has nothing new past the watermark → cheap no-op.
+    out2 = feature_rpc._dream_run(500)
+    assert out2["reason"] == "no_delta"
