@@ -88,6 +88,7 @@ Short alias: `-n` is accepted as a dry-run flag.
 | Command | What it does |
 |---|---|
 | `/permissions` (`/policy`) | Edit command permissions (security / ask / allowlist). |
+| `/memory` (`/review`) | Review the bot's pending memory candidates inline — keep / discard them one at a time. Pops automatically on open when the review queue is non-empty; `Esc` dismisses it until you re-enter the TUI. |
 | `/approvals` | Open the pending approvals queue (or `F3`). |
 | `/activity` | Open the activity / audit log (or `F2`). |
 | `/artifacts` | Open the artifacts gallery (or `F4`). |

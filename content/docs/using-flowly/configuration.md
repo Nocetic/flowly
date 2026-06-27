@@ -114,6 +114,24 @@ The loader is resilient by design:
 | `vectorWeight` | `0.7` |
 | `textWeight` | `0.3` |
 
+`agents.defaults.memoryDreaming` — cross-session "dreaming" + autonomous consolidation (see [Memory](../features/memory.md)):
+
+| Key | Default |
+|---|---|
+| `enabled` | `true` (the whole governance/dreaming layer) |
+| `commitMode` | `"selective"` (`"selective"` \| `"manual"` \| `"aggressive"`) |
+| `idleMinutes` | `30` (run after this much agent inactivity; background heartbeats don't count) |
+| `dailyEnabled` | `true` |
+| `dailyTime` | `"03:30"` (HH:MM local) |
+| `turnInterval` | `10` (also run every N user turns; `0` disables the coarse pass) |
+| `autoFloor` | `0.80` (≥ → auto-active when unconflicted and not sensitive) |
+| `reviewFloor` | `0.55` (< → dropped instead of queued) |
+| `maxMessagesPerRun` | `500` (bound per pass so a backlog can't blow up one run) |
+| `autoConsolidate` | `true` (background cleanup: merge duplicates, retire stale) |
+| `consolidateTurnInterval` | `50` (consolidate every N user turns; `0` off) |
+| `consolidateEveryMinutes` | `30` (background consolidation timer; `0` off) |
+| `freezeInjectedMemory` | `false` (advanced: freeze the injected memory block per session for prefix-cache stability) |
+
 `agents.agents` (per-agent map) — `name`, `provider` (`"anthropic"` default \| `"openai"` \| `"flowly"`), `model=""`, `workingDirectory=""`, `persona=""`.
 `agents.teams` (per-team map) — `name`, `agents=[]`, `leaderAgent=""`.
 

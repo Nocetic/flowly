@@ -200,11 +200,13 @@ panel, and the iOS app (a sheet on app open). Accepting promotes an item to
 active; rejecting discards it.
 
 Tune it under `agents.defaults.memoryDreaming` (camelCase on disk): `enabled`,
-`idleMinutes` (30), `dailyTime` (`"03:30"`), `turnInterval` (10), `autoFloor`
-(0.80 — at/above ⇒ auto-active when unconflicted and not sensitive), `reviewFloor`
-(0.55 — below ⇒ dropped), `maxMessagesPerRun` (500). Set `turnInterval: 0` to drop
-the per-turn pass and rely on idle + daily only; `enabled: false` turns the layer
-off entirely.
+`commitMode` (`"selective"` default — `"manual"` queues *everything* for review,
+`"aggressive"` lowers the bar), `idleMinutes` (30), `dailyEnabled` (true) +
+`dailyTime` (`"03:30"`), `turnInterval` (10), `autoFloor` (0.80 — at/above ⇒
+auto-active when unconflicted and not sensitive), `reviewFloor` (0.55 — below ⇒
+dropped), `maxMessagesPerRun` (500). Set `turnInterval: 0` to drop the per-turn
+pass and rely on idle + daily only; `enabled: false` turns the layer off entirely.
+The full config table is in [Configuration](../using-flowly/configuration.md#agents).
 
 ### Consolidation (cleanup of the existing store)
 

@@ -10,7 +10,7 @@ Flowly is a full agent, not just a chat box. These features work together across
 
 - **[Skills](skills.md)** — drop-in Markdown recipes the agent loads on demand, including skills created from `/learn`.
 - **[Skill bundles](skill-bundles.md)** — group skills under a single `/slug`.
-- **[Memory](memory.md)** — durable notes plus a searchable memory index.
+- **[Memory](memory.md)** — durable, self-maintaining notes plus a searchable index; it learns across sessions ("dreaming") and queues uncertain facts for your review.
 - **[Knowledge graph](knowledge-graph.md)** — a temporal store of entities and facts.
 
 ## Automation
