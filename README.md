@@ -101,7 +101,7 @@ Two entry points: start the terminal UI with `flowly`, or run the gateway and ta
 
 | Action | Terminal (TUI) | Messaging channels |
 |---|---|---|
-| Start chatting | `flowly` | `flowly setup` → add channel, then message the bot |
+| Start chatting | `flowly` | `flowly setup` → add channel, then message your agent |
 | New / reset conversation | `/new` | `/new` |
 | Change model / provider | `/model`, `/provider` | `/model`, `/provider` |
 | Switch persona | `/persona [name]` | `/persona [name]` |
@@ -116,7 +116,7 @@ Two entry points: start the terminal UI with `flowly`, or run the gateway and ta
 
 Flowly's agent core is **Apache 2.0**. Self-host on your laptop, a VPS, or a Mac mini — your keys, your data, your machine. **Everything in this repo works with no Flowly account.** → [self-hosting guide](content/docs/using-flowly/self-hosting.md) · [open source vs. Desktop/Cloud](content/docs/using-flowly/desktop-vs-oss.md)
 
-Optional [Flowly Cloud](https://useflowlyapp.com) adds the native Mac/iOS/Android apps, cross-device sync, hosted LLM access, and a managed relay that keeps your bot reachable when your laptop sleeps. Sign-in is opt-in (`flowly login`) and only affects the cloud features; the agent is unchanged.
+Optional [Flowly Cloud](https://useflowlyapp.com) adds the native Mac/iOS/Android apps, cross-device sync, hosted LLM access, and a managed relay that keeps your agent reachable when your laptop sleeps. Sign-in is opt-in (`flowly login`) and only affects the cloud features; the agent is unchanged.
 
 ---
 
