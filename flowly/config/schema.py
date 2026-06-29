@@ -412,7 +412,7 @@ class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
     api_key: str = ""  # Brave Search API key (self-hosted, optional)
     max_results: int = 5
-    proxy_url: str = ""  # Flowly Cloud search proxy; self-host: use BRAVE_API_KEY instead
+    proxy_url: str = ""  # Flowly Cloud search proxy; empty + logged-in falls back to canonical /api/v1/search; self-host: use BRAVE_API_KEY instead
 
 
 class WebToolsConfig(BaseModel):

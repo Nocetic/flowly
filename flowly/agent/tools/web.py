@@ -193,6 +193,19 @@ class WebSearchTool(Tool):
         self._server_id = server_id
         self._auth_token = auth_token
 
+        # When the account relay creds are present (a logged-in bot) but no
+        # explicit proxy URL was configured, fall back to the canonical Flowly
+        # search proxy. The ``proxy_url`` config field is never auto-populated
+        # by login — only the relay creds (server_id/auth_token) are — so
+        # without this backfill the proxy path silently never activates even
+        # though the account is registered. Mirrors the relay_url canonical
+        # backfill in ``account/relay_config.py``. (A self-host who set a
+        # custom proxy_url keeps it; an own BRAVE_API_KEY still wins in
+        # ``execute`` since the direct path is checked first.)
+        if not self._proxy_url and self._server_id and self._auth_token:
+            base = os.environ.get("FLOWLY_API_BASE", "https://useflowlyapp.com")
+            self._proxy_url = base.rstrip("/") + "/api/v1/search"
+
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         if self.api_key:
             return await self._search_direct(query, count)
