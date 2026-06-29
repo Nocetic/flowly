@@ -45,3 +45,6 @@ flowly/channels/helpers/Flowly iMessage Helper.app/
 # Internal engineering notes (not shipped)
 STREAMING_ENGINEERING.md
 GATEWAY_CONNECTION_PLAN.md
+
+# Local agent guidance — contains local paths + private repo names; never publish.
+CLAUDE.md
