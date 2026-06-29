@@ -1758,6 +1758,11 @@ class GatewayServer:
             return
 
         deleted = self.sessions.delete(session_key)
+        # Drop the per-session cwd pin too — otherwise a future session
+        # that happens to reuse this session_key would inherit the
+        # deleted conversation's working directory.
+        from flowly.runtime_cwd import clear_session_cwd
+        clear_session_cwd(session_key)
         await self._ws_rpc_reply(ws, rpc_id, {"deleted": deleted, "sessionKey": session_key})
 
     # --- RPC: chat.history ---
@@ -1851,6 +1856,9 @@ class GatewayServer:
             from flowly.runtime_cwd import set_session_cwd
             try:
                 set_session_cwd(session_key, cwd)
+                logger.info(
+                    f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}"
+                )
             except ValueError:
                 await self._ws_rpc_error(
                     ws, rpc_id, "INVALID_CWD",

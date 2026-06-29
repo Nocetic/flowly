@@ -824,6 +824,9 @@ class WebChannel(BaseChannel):
                 from flowly.runtime_cwd import set_session_cwd
                 try:
                     set_session_cwd(session_key, cwd)
+                    logger.info(
+                        f"[WebChannel] chat.send pinned cwd={cwd} for session={session_key}"
+                    )
                 except ValueError:
                     err = {
                         "type": "rpc",
