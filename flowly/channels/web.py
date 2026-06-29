@@ -811,6 +811,32 @@ class WebChannel(BaseChannel):
                     "should send a stable sessionKey (chat document id)."
                 )
             idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
+
+            # Optional per-session runtime cwd (Desktop sends the project
+            # folder the user opened in the right-rail). Pin it before
+            # the run so exec / codex tools resolve to it via
+            # session_key. Omit → falls through to FLOWLY_CWD / config /
+            # workspace. Invalid → RPC error rather than silently running
+            # in the wrong place. Same shape gateway/server.py already
+            # supports (see _ws_rpc_chat_send).
+            cwd = params.get("cwd")
+            if cwd:
+                from flowly.runtime_cwd import set_session_cwd
+                try:
+                    set_session_cwd(session_key, cwd)
+                except ValueError:
+                    err = {
+                        "type": "rpc",
+                        "id": rpc_id,
+                        "sessionId": session_id,
+                        "error": {
+                            "code": "INVALID_CWD",
+                            "message": f"Not an existing absolute directory: {cwd}",
+                        },
+                    }
+                    await ws.send(json.dumps(err))
+                    return
+
             voice_mode = bool(params.get("voiceMode", False))
 
             # Track mapping so approval events can find the relay session
