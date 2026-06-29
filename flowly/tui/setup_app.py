@@ -97,7 +97,7 @@ class SetupApp(App[None]):
                 )
             else:  # default + tools/integrations
                 await self._catalog_flow(
-                    categories=("tool", "media", "voice"),
+                    categories=("tool", "web_search", "media", "voice"),
                     title="Integrations",
                     item_label="integration",
                 )

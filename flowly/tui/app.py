@@ -1819,7 +1819,7 @@ class FlowlyTUI(App[None]):
         ``/provider`` and ``/model``.
         """
         await self._open_card_catalog(
-            categories=("tool", "media", "voice"),
+            categories=("tool", "web_search", "media", "voice"),
             title="Integrations",
             item_label="integration",
         )

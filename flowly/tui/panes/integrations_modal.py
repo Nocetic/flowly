@@ -44,6 +44,7 @@ from flowly.integrations.probes import run_with_timeout
 _CATEGORY_ORDER: list[tuple[str, str]] = [
     ("channel", "messaging channels"),
     ("tool", "integrations"),
+    ("web_search", "web search"),
     ("media", "media generation"),
     ("voice", "voice"),
     ("provider", "LLM providers"),

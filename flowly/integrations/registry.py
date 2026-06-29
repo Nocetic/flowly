@@ -16,6 +16,7 @@ from __future__ import annotations
 from flowly.integrations.cards import Field, FieldType, IntegrationCard
 from flowly.integrations.probes import (
     probe_anthropic,
+    probe_brave_search,
     probe_discord,
     probe_email,
     probe_fal_image,
@@ -526,6 +527,35 @@ _MEDIA: list[IntegrationCard] = [
 ]
 
 
+# ── WEB SEARCH ─────────────────────────────────────────────────────
+# One card per pluggable web-search backend. Each backend is also a
+# `kind: backend` plugin (flowly/plugins_bundled/web-<name>/) — the card is
+# just the credential surface so it appears in the Desktop / iOS / Android
+# connections tab via the shared feature_rpc surface. Cards are added here
+# alongside each provider as it lands.
+
+
+_WEB_SEARCH: list[IntegrationCard] = [
+    IntegrationCard(
+        key="web_brave", label="Brave Search", category="web_search",
+        description="Default web search. Your own Brave API key, or the Flowly "
+                    "Cloud search proxy automatically when you're logged in.",
+        docs_url="https://brave.com/search/api/",
+        config_path="tools.web.search",
+        fields=[
+            _enabled_field(default=True),
+            Field("api_key", "Brave API key", FieldType.PASSWORD,
+                  placeholder="BSA…",
+                  help="Optional — leave empty to use the Flowly proxy when logged in."),
+        ],
+        probe=probe_brave_search,
+        # Search providers are resolved per call (not started at boot), so a
+        # key change applies immediately — no gateway restart needed.
+        needs_gateway_restart=False,
+    ),
+]
+
+
 # ── REGISTRY ───────────────────────────────────────────────────────
 
 
@@ -535,6 +565,7 @@ REGISTRY: list[IntegrationCard] = [
     *_VOICE,
     *_PROVIDERS,
     *_MEDIA,
+    *_WEB_SEARCH,
 ]
 
 

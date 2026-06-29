@@ -41,7 +41,7 @@ from flowly.profile import get_flowly_home
 # has its own surface; ``system`` is internal. ``media`` (FAL image generation)
 # is a generic card — masked key + model picker — so it renders through the same
 # field-by-type path as channels/tools with no client change.
-CONNECTION_CATEGORIES = ("channel", "tool", "voice", "media")
+CONNECTION_CATEGORIES = ("channel", "tool", "voice", "media", "web_search")
 _PAIRING_CHANNELS = ("telegram", "whatsapp", "imessage")
 
 

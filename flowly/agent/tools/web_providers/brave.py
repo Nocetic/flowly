@@ -106,7 +106,21 @@ class BraveWebSearchProvider(WebSearchProvider):
 
         return api_key, proxy_url, server_id, auth_token
 
+    def _config_enabled(self) -> bool:
+        """Honour the connections-card toggle (``tools.web.search.enabled``).
+
+        Defaults to True so installs without the key keep working. Only the
+        config-backed flag is consulted; explicitly-constructed providers
+        (the tool's fallback path) still respect a user's global toggle.
+        """
+        cfg = _cfg()
+        search = getattr(getattr(getattr(cfg, "tools", None), "web", None), "search", None)
+        val = getattr(search, "enabled", True)
+        return True if val is None else bool(val)
+
     def is_available(self) -> bool:
+        if not self._config_enabled():
+            return False
         api_key, proxy_url, server_id, auth_token = self._resolve_creds()
         return bool(api_key) or bool(proxy_url and server_id and auth_token)
 

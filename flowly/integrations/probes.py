@@ -245,6 +245,31 @@ async def probe_fal_image(values: dict[str, Any]) -> ProbeResult:
     return ProbeResult("ok", "key set") if has_key else ProbeResult("not_configured", "no API key")
 
 
+async def probe_brave_search(values: dict[str, Any]) -> ProbeResult:
+    """Brave Search — presence check (own key OR logged-in Flowly proxy).
+
+    No network call: Brave's free key has no cheap validate endpoint and the
+    proxy path is gated server-side. We report whether a usable credential
+    exists — a direct ``api_key`` or the account relay creds written by
+    ``flowly login``.
+    """
+    has_key = bool((values.get("api_key") or "").strip())
+    logged_in = False
+    try:
+        from flowly.config.loader import load_config
+
+        web = getattr(getattr(load_config(), "channels", None), "web", None)
+        logged_in = bool(getattr(web, "server_id", "") and getattr(web, "auth_token", ""))
+    except Exception:
+        logged_in = False
+
+    configured = has_key or logged_in
+    detail = "own key" if has_key else ("Flowly proxy" if logged_in else "no key / not logged in")
+    if not values.get("enabled", True):
+        return ProbeResult("disabled", f"{detail} · disabled" if configured else "disabled")
+    return ProbeResult("ok", detail) if configured else ProbeResult("not_configured", detail)
+
+
 async def probe_web_channel(values: dict[str, Any]) -> ProbeResult:
     """iOS pairing / web relay — driven by /login, not the form."""
     server_id = (values.get("server_id") or "").strip()
