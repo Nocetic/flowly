@@ -240,6 +240,19 @@ def gateway(
             "Expose only over TLS (reverse proxy) or a private network (Tailscale/VPN).[/dim]\n"
         )
 
+        # Same values as a scannable code. Use the LAN IP when bound to all
+        # interfaces (instant, no network call — never slow gateway startup);
+        # an explicit --host is encoded as-is.
+        from flowly.gateway.remote_info import detect_lan_ip
+        from flowly.gateway.remote_qr import remote_qr_markup
+
+        qr_host = detect_lan_ip() if _bind_all else effective_host
+        qr = remote_qr_markup(qr_host, port, auth_token) if qr_host else None
+        if qr:
+            console.print(f"  [bold]Scan with the Flowly app[/bold] [dim]({qr_host}:{port})[/dim]\n")
+            console.print(qr)
+            console.print()
+
     # Prune the audit log before anything else writes to it. Best-effort —
     # never blocks startup if the disk / filesystem is misbehaving.
     if config.audit.enabled:

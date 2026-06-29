@@ -1974,6 +1974,7 @@ class FlowlyTUI(App[None]):
             enable_remote_access,
             remote_access_status,
         )
+        from flowly.gateway.remote_qr import remote_qr_markup
 
         transcript = self.query_one(TranscriptPane)
         arg = (rest or "").strip().lower()
@@ -2031,7 +2032,22 @@ class FlowlyTUI(App[None]):
                 "  [yellow]Apply:[/yellow] [cyan]flowly service restart[/cyan] "
                 "[dim]— or restart the gateway (bind/token changed)[/dim]"
             )
-        transcript.add_system("\n".join(lines))
+        # Append the scannable code into the SAME block, below the typed values
+        # — same four fields, just point the app's camera at it. LAN IP first
+        # (the same-Wi-Fi common case); the token rides inside, so this stays
+        # TUI-local like the values above.
+        primary = lan or pub
+        qr = remote_qr_markup(primary, r["port"], r["token"]) if primary else None
+        if qr:
+            where = "same Wi-Fi" if lan else "this host"
+            lines += [
+                "",
+                f"  [b]Or scan with the Flowly app[/b] [dim]({where} · {primary}:{r['port']})[/dim]",
+                "",
+                qr,
+            ]
+        # Don't collapse when a QR is present — the code must render in full.
+        transcript.add_system("\n".join(lines), collapse_long=qr is None)
 
     async def _configure_provider_inline(
         self,

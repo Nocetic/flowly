@@ -28,6 +28,7 @@ dependencies = [
     "loguru>=0.7.0",
     "readability-lxml>=0.8.0",
     "rich>=13.0.0",
+    "segno>=1.6.0",
     "croniter>=2.0.0",
     "python-telegram-bot>=21.0",
     "tiktoken>=0.5.0",
