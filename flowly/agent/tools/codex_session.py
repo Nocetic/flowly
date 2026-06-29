@@ -310,6 +310,7 @@ class CodexSessionTool(Tool):
             codex_session = self._build_codex_session(
                 metadata=metadata,
                 cwd_override=cwd_override,
+                session_key=session_key,
             )
             self._session_store_set(session_key, codex_session)
 
@@ -383,13 +384,28 @@ class CodexSessionTool(Tool):
         *,
         metadata: dict[str, Any],
         cwd_override: str | None,
+        session_key: str = "",
     ) -> CodexSession:
         """Construct a fresh CodexSession, seeded from metadata.
 
         Reads any persisted ``codex_thread_id`` and
         ``codex_reasoning_items`` so a session resumed from disk
         picks up where it left off.
+
+        ``cwd_override`` (an explicit ``cwd`` arg from the LLM) wins.
+        Absent that, we honour the session-level cwd pin set by the
+        host channel — same pin that shell/exec tools read via
+        ``resolve_runtime_cwd``. Without this, Codex always spawns in
+        the boot-time fallback (typically ``~/.flowly/workspace``)
+        even when the user explicitly picked a project directory in
+        the right-rail.
         """
+        if not cwd_override and session_key:
+            from flowly.runtime_cwd import get_session_cwd
+            pinned = get_session_cwd(session_key)
+            if pinned is not None:
+                cwd_override = str(pinned)
+
         config = self._config
         if cwd_override:
             # Build a shallow-modified copy so per-call cwd overrides
