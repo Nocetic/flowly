@@ -413,6 +413,13 @@ class WebSearchConfig(BaseModel):
     api_key: str = ""  # Brave Search API key (self-hosted, optional)
     max_results: int = 5
     proxy_url: str = ""  # Flowly Cloud search proxy; empty + logged-in falls back to canonical /api/v1/search; self-host: use BRAVE_API_KEY instead
+    # Pluggable backend selection. Empty = auto (availability-ordered,
+    # Brave first). ``backend`` is the shared selector; ``search_backend`` /
+    # ``extract_backend`` override per capability. Values are provider names
+    # ("brave", "ddgs", "searxng", "tavily", "exa", "firecrawl", ...).
+    backend: str = ""
+    search_backend: str = ""
+    extract_backend: str = ""
 
 
 class WebToolsConfig(BaseModel):

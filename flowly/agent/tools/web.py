@@ -1,6 +1,8 @@
 """Web tools: web_search and web_fetch."""
 
+import asyncio
 import html
+import inspect
 import ipaddress
 import json
 import os
@@ -207,124 +209,106 @@ class WebSearchTool(Tool):
             self._proxy_url = base.rstrip("/") + "/api/v1/search"
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if self.api_key:
-            return await self._search_direct(query, count)
-        elif self._proxy_url and self._server_id and self._auth_token:
-            return await self._search_proxy(query, count)
-        else:
+        from flowly.agent.tools.web_providers import get_active_search_provider
+
+        provider = get_active_search_provider()
+        if provider is None:
+            # No plugin-registered backend (e.g. the Codex tool server or a
+            # subprocess agent that never booted plugin discovery). Fall back
+            # to a Brave provider built from this tool's own resolved creds.
+            provider = self._fallback_provider()
+        if provider is None:
             return "Error: Web search not available. No API key or proxy configured."
 
-    async def _search_direct(self, query: str, count: int | None = None) -> str:
-        """Direct Brave Search API call (self-hosted users with own key)."""
+        n = count or self.max_results
         try:
-            n = min(max(count or self.max_results, 1), 10)
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n, "extra_snippets": "true", "text_decorations": "false"},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0,
-                )
-                r.raise_for_status()
-
-            data = r.json()
-            results = data.get("web", {}).get("results", [])
-            if not results:
-                return f"No results for: {query}"
-
-            return self._format_results(query, results[:n])
-        except Exception as e:
+            data = await _run_provider_search(provider, query, n)
+        except Exception as e:  # noqa: BLE001
             return f"Error: {e}"
+        return _format_search_results(query, data)
 
-    async def _search_proxy(self, query: str, count: int | None = None) -> str:
-        """Search via Flowly web app proxy (centralized, no API key needed)."""
-        try:
-            n = min(max(count or self.max_results, 1), 10)
-            async with httpx.AsyncClient() as client:
-                r = await client.post(
-                    self._proxy_url,
-                    json={"query": query, "count": n},
-                    headers={
-                        "X-Flowly-Server-Id": self._server_id,
-                        "X-Flowly-API-Key": self._auth_token,
-                        "Content-Type": "application/json",
-                    },
-                    timeout=15.0,
-                )
+    def _fallback_provider(self) -> Any:
+        """Build a Brave provider from this tool's own resolved creds."""
+        from flowly.agent.tools.web_providers.brave import BraveWebSearchProvider
 
-            if r.status_code == 429:
-                data = r.json()
-                return f"Search rate limit reached: {data.get('error', {}).get('message', 'Try again later')}"
+        if not (
+            self.api_key
+            or (self._proxy_url and self._server_id and self._auth_token)
+        ):
+            return None
+        return BraveWebSearchProvider(
+            api_key=self.api_key,
+            proxy_url=self._proxy_url,
+            server_id=self._server_id,
+            auth_token=self._auth_token,
+            max_results=self.max_results,
+        )
 
-            r.raise_for_status()
-            data = r.json()
 
-            # Format enriched proxy results
-            results = data.get("results", [])
-            if not results:
-                return f"No results for: {query}"
+async def _run_provider_search(provider: Any, query: str, n: int) -> dict:
+    """Call a provider's ``search`` — awaiting it or offloading to a thread.
 
-            lines = [f"Results for: {query}\n"]
+    Search implementations are sync (network I/O), so run them in a worker
+    thread to keep the event loop responsive; a provider that declares an
+    async ``search`` is awaited directly.
+    """
+    if inspect.iscoroutinefunction(provider.search):
+        return await provider.search(query, n)
+    return await asyncio.to_thread(provider.search, query, n)
 
-            # Summary (if available from Brave Summarizer)
-            if summary := data.get("summary"):
-                lines.append(f"Summary: {summary}\n")
 
-            for i, item in enumerate(results[:n], 1):
-                line = f"{i}. {item.get('title', '')}\n   {item.get('url', '')}"
-                if desc := item.get("description"):
-                    line += f"\n   {desc}"
-                # Extra snippets from proxy
-                for snippet in item.get("extra_snippets", []):
-                    line += f"\n   > {snippet}"
-                # Metadata
-                meta_parts = []
-                if age := item.get("age"):
-                    meta_parts.append(age)
-                if source := item.get("source"):
-                    meta_parts.append(source)
-                if meta_parts:
-                    line += f"\n   [{' · '.join(meta_parts)}]"
-                lines.append(line)
+def _format_search_results(query: str, data: dict) -> str:
+    """Render a provider search envelope to the text the agent reads.
 
-            # News results
-            if news := data.get("news"):
-                lines.append("\nRecent News:")
-                for item in news:
-                    source = item.get("source", "")
-                    age = item.get("age", "")
-                    lines.append(f"- {item.get('title', '')} ({source}, {age})\n  {item.get('url', '')}")
+    Handles the generic ``{title, url, description, position}`` rows every
+    provider returns plus Brave's enrichments (``extra_snippets``, ``age``,
+    ``page_age``, ``language``, ``source``, ``meta_url.hostname``) and the
+    optional top-level ``summary`` / ``news`` when present.
+    """
+    if not data.get("success", True):
+        return str(data.get("error") or f"No results for: {query}")
 
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Error: {e}"
+    payload = data.get("data", {}) or {}
+    web = payload.get("web", []) or []
+    if not web:
+        return f"No results for: {query}"
 
-    @staticmethod
-    def _format_results(query: str, results: list[dict]) -> str:
-        """Format Brave API results with extra snippets and metadata."""
-        lines = [f"Results for: {query}\n"]
-        for i, item in enumerate(results, 1):
-            line = f"{i}. {item.get('title', '')}\n   {item.get('url', '')}"
-            if desc := item.get("description"):
-                line += f"\n   {desc}"
-            # Extra snippets — additional relevant passages from the page
-            for snippet in item.get("extra_snippets", []):
-                line += f"\n   > {snippet}"
-            # Metadata
-            meta_parts = []
-            if age := item.get("age"):
-                meta_parts.append(age)
-            if page_age := item.get("page_age"):
-                meta_parts.append(f"published: {page_age}")
-            if lang := item.get("language"):
-                meta_parts.append(f"lang: {lang}")
-            hostname = item.get("meta_url", {}).get("hostname", "")
-            if hostname:
-                meta_parts.append(hostname)
-            if meta_parts:
-                line += f"\n   [{' · '.join(meta_parts)}]"
-            lines.append(line)
-        return "\n".join(lines)
+    lines = [f"Results for: {query}\n"]
+    if summary := payload.get("summary"):
+        lines.append(f"Summary: {summary}\n")
+
+    for i, item in enumerate(web, 1):
+        line = f"{i}. {item.get('title', '')}\n   {item.get('url', '')}"
+        if desc := item.get("description"):
+            line += f"\n   {desc}"
+        for snippet in item.get("extra_snippets", []) or []:
+            line += f"\n   > {snippet}"
+        meta_parts = []
+        if age := item.get("age"):
+            meta_parts.append(age)
+        if page_age := item.get("page_age"):
+            meta_parts.append(f"published: {page_age}")
+        if lang := item.get("language"):
+            meta_parts.append(f"lang: {lang}")
+        if source := item.get("source"):
+            meta_parts.append(source)
+        hostname = (item.get("meta_url") or {}).get("hostname", "")
+        if hostname:
+            meta_parts.append(hostname)
+        if meta_parts:
+            line += f"\n   [{' · '.join(meta_parts)}]"
+        lines.append(line)
+
+    if news := payload.get("news"):
+        lines.append("\nRecent News:")
+        for item in news:
+            source = item.get("source", "")
+            age = item.get("age", "")
+            lines.append(
+                f"- {item.get('title', '')} ({source}, {age})\n  {item.get('url', '')}"
+            )
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
