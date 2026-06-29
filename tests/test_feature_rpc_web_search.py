@@ -76,6 +76,35 @@ def test_brave_probe_status(isolated_home):
     assert card["connected"] is True
 
 
+def test_connections_list_includes_ddgs_and_searxng(isolated_home):
+    by_key = _list_by_key()
+    assert "web_ddgs" in by_key
+    assert by_key["web_ddgs"]["category"] == "web_search"
+    assert "web_searxng" in by_key
+    sx = by_key["web_searxng"]
+    field_keys = {f["key"] for f in sx["fields"]}
+    assert {"enabled", "url"} <= field_keys
+
+
+def test_searxng_card_round_trips_url(isolated_home):
+    result, restart = _dispatch("connections.set", {
+        "key": "web_searxng",
+        "values": {"enabled": True, "url": "http://localhost:8080"},
+    })
+    assert result["ok"] is True
+    assert restart is False
+    card = _list_by_key()["web_searxng"]
+    assert card["enabled"] is True
+    assert card["values"]["url"] == "http://localhost:8080"
+    assert card["probeStatus"] == "ok"
+
+
+def test_ddgs_card_default_disabled(isolated_home):
+    # Opt-in: ddgs starts disabled until the user toggles it on.
+    card = _list_by_key()["web_ddgs"]
+    assert card["enabled"] is False
+
+
 def test_brave_card_clear(isolated_home):
     _dispatch("connections.set", {
         "key": "web_brave", "values": {"enabled": True, "api_key": "BSA-x"},

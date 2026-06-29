@@ -17,6 +17,7 @@ from flowly.integrations.cards import Field, FieldType, IntegrationCard
 from flowly.integrations.probes import (
     probe_anthropic,
     probe_brave_search,
+    probe_ddgs,
     probe_discord,
     probe_email,
     probe_fal_image,
@@ -30,6 +31,7 @@ from flowly.integrations.probes import (
     probe_openai,
     probe_openrouter,
     probe_sakana,
+    probe_searxng,
     probe_slack,
     probe_teams,
     probe_telegram,
@@ -551,6 +553,30 @@ _WEB_SEARCH: list[IntegrationCard] = [
         probe=probe_brave_search,
         # Search providers are resolved per call (not started at boot), so a
         # key change applies immediately — no gateway restart needed.
+        needs_gateway_restart=False,
+    ),
+    IntegrationCard(
+        key="web_ddgs", label="DuckDuckGo (ddgs)", category="web_search",
+        description="Free web search, no API key. Needs the ddgs package "
+                    "(`pip install ddgs` or `flowly[search]`).",
+        docs_url="https://pypi.org/project/ddgs/",
+        config_path="tools.web.search.ddgs",
+        fields=[_enabled_field(default=False)],
+        probe=probe_ddgs,
+        needs_gateway_restart=False,
+    ),
+    IntegrationCard(
+        key="web_searxng", label="SearXNG", category="web_search",
+        description="Privacy-respecting metasearch on your own SearXNG instance.",
+        docs_url="https://searx.space/",
+        config_path="tools.web.search.searxng",
+        fields=[
+            _enabled_field(default=False),
+            Field("url", "Instance URL", FieldType.TEXT,
+                  placeholder="http://localhost:8080",
+                  help="Base URL of your SearXNG instance."),
+        ],
+        probe=probe_searxng,
         needs_gateway_restart=False,
     ),
 ]

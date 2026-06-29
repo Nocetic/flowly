@@ -1,0 +1,8 @@
+name: web-ddgs
+version: 1.0.0
+manifest_version: 1
+description: "DuckDuckGo web search via the ddgs package — no API key. Install with `pip install ddgs` or `flowly[search]`."
+author: "Flowly"
+kind: backend
+provides_web_providers:
+  - ddgs

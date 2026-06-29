@@ -1,0 +1,8 @@
+name: web-searxng
+version: 1.0.0
+manifest_version: 1
+description: "SearXNG web search — point at your self-hosted instance URL. No API key, privacy-respecting metasearch."
+author: "Flowly"
+kind: backend
+provides_web_providers:
+  - searxng

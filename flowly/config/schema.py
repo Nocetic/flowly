@@ -408,6 +408,17 @@ class GatewayConfig(BaseModel):
         return v
 
 
+class DdgsProviderConfig(BaseModel):
+    """DuckDuckGo (ddgs) backend — no key, opt-in toggle."""
+    enabled: bool = False
+
+
+class SearxngProviderConfig(BaseModel):
+    """SearXNG backend — self-hosted instance URL + opt-in toggle."""
+    enabled: bool = False
+    url: str = ""
+
+
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
     enabled: bool = True  # Brave/default backend on/off (connections card toggle)
@@ -421,6 +432,9 @@ class WebSearchConfig(BaseModel):
     backend: str = ""
     search_backend: str = ""
     extract_backend: str = ""
+    # Per-provider sub-configs (also written by the connections cards).
+    ddgs: DdgsProviderConfig = Field(default_factory=DdgsProviderConfig)
+    searxng: SearxngProviderConfig = Field(default_factory=SearxngProviderConfig)
 
 
 class WebToolsConfig(BaseModel):

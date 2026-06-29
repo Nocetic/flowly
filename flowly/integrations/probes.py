@@ -270,6 +270,33 @@ async def probe_brave_search(values: dict[str, Any]) -> ProbeResult:
     return ProbeResult("ok", detail) if configured else ProbeResult("not_configured", detail)
 
 
+async def probe_ddgs(values: dict[str, Any]) -> ProbeResult:
+    """DuckDuckGo (ddgs) — reports whether the ddgs package is installed."""
+    try:
+        import ddgs  # noqa: F401
+
+        installed = True
+    except ImportError:
+        installed = False
+
+    if not values.get("enabled"):
+        return ProbeResult(
+            "disabled" if installed else "not_configured",
+            "installed · disabled" if installed else "ddgs not installed",
+        )
+    if installed:
+        return ProbeResult("ok", "ddgs installed")
+    return ProbeResult("not_configured", "run: pip install ddgs")
+
+
+async def probe_searxng(values: dict[str, Any]) -> ProbeResult:
+    """SearXNG — presence check on the configured instance URL."""
+    url = (values.get("url") or "").strip()
+    if not values.get("enabled"):
+        return ProbeResult("disabled" if url else "not_configured", "disabled" if url else "no URL")
+    return ProbeResult("ok", url) if url else ProbeResult("not_configured", "no instance URL")
+
+
 async def probe_web_channel(values: dict[str, Any]) -> ProbeResult:
     """iOS pairing / web relay — driven by /login, not the form."""
     server_id = (values.get("server_id") or "").strip()
