@@ -41,6 +41,7 @@ def enroll() -> None:
     afterward so it rebinds.
     """
     from flowly.gateway.remote_info import enable_remote_access
+    from flowly.gateway.remote_qr import remote_qr_markup
 
     r = enable_remote_access()
     lan = r.get("lan_ip") or ""
@@ -62,6 +63,16 @@ def enroll() -> None:
     if pub:
         console.print("    [dim]*needs a router port-forward; for away-from-home prefer a VPN (Tailscale).[/dim]")
     console.print()
+
+    # Same values as a scannable code — point the app's camera at it to skip
+    # typing host/token. LAN IP first (the same-Wi-Fi common case).
+    primary = lan or pub
+    qr = remote_qr_markup(primary, port, token) if primary else None
+    if qr:
+        where = "same Wi-Fi" if lan else "this host"
+        console.print(f"  [b]Or scan with the Flowly app[/b] [dim]({where} · {primary}:{port})[/dim]\n")
+        console.print(qr)
+        console.print()
 
     # Firewall — the usual blocker. On Windows we can add the rule directly.
     if platform.system() == "Windows":
