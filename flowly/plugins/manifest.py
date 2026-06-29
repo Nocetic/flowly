@@ -6,11 +6,10 @@ plugin's name, version, kind, declared tools/hooks, and any required
 environment variables.
 
 The full manifest schema includes ``kind: backend`` (pluggable
-backends like image_gen) and ``kind: exclusive`` (single-active
-providers like memory).  Flowly v1 only honours ``kind: standalone``;
-the other kinds parse without error but the manager logs a warning
-and skips loading.  This keeps upstream plugin manifests parseable
-even though their backend/exclusive features land in a later phase.
+backends like web search providers) and ``kind: exclusive``
+(single-active providers like memory).  ``standalone`` and ``backend``
+plugins both load; ``exclusive`` parses without error but the manager
+skips loading it (recorded with a reason) until that path is wired.
 """
 
 from __future__ import annotations
@@ -48,6 +47,7 @@ class PluginManifest:
     requires_env: list[str | dict[str, Any]] = field(default_factory=list)
     provides_tools: list[str] = field(default_factory=list)
     provides_hooks: list[str] = field(default_factory=list)
+    provides_web_providers: list[str] = field(default_factory=list)
     # Resolved at parse time:
     source: str = ""           # bundled | user | project
     path: Path | None = None
@@ -130,6 +130,7 @@ def parse_manifest(
         requires_env=list(data.get("requires_env", []) or []),
         provides_tools=list(data.get("provides_tools", []) or []),
         provides_hooks=list(data.get("provides_hooks", []) or []),
+        provides_web_providers=list(data.get("provides_web_providers", []) or []),
         source=source,
         path=plugin_dir,
         key=key,
