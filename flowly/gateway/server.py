@@ -1860,11 +1860,17 @@ class GatewayServer:
                     f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}"
                 )
             except ValueError:
-                await self._ws_rpc_error(
-                    ws, rpc_id, "INVALID_CWD",
-                    f"Not an existing absolute directory: {cwd}",
+                # Defensive: a client may ship a path that doesn't exist
+                # on this host (older client without per-kind cwd gating,
+                # or a renamed/deleted folder).  Hard-rejecting the chat
+                # would lose the user's message; drop the cwd silently
+                # and fall through the resolve_runtime_cwd chain
+                # (FLOWLY_CWD / config / workspace).
+                logger.warning(
+                    f"[GatewayWS] chat.send cwd={cwd!r} not a valid "
+                    f"directory on this host; ignoring and falling "
+                    f"back to workspace (session={session_key})"
                 )
-                return
 
         # P4 — opt-in voice mode. iOS push-to-talk sends `voiceMode: true`;
         # everything else omits the field and falls through as text.

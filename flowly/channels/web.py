@@ -828,17 +828,19 @@ class WebChannel(BaseChannel):
                         f"[WebChannel] chat.send pinned cwd={cwd} for session={session_key}"
                     )
                 except ValueError:
-                    err = {
-                        "type": "rpc",
-                        "id": rpc_id,
-                        "sessionId": session_id,
-                        "error": {
-                            "code": "INVALID_CWD",
-                            "message": f"Not an existing absolute directory: {cwd}",
-                        },
-                    }
-                    await ws.send(json.dumps(err))
-                    return
+                    # Defensive: a client may ship a path that doesn't
+                    # exist on THIS bot's filesystem — most obvious case
+                    # is an older desktop client (or another channel) that
+                    # doesn't yet gate cwd by bot kind, sending a local
+                    # path to a remote VPS bot.  Hard-rejecting the whole
+                    # chat.send would lose the user's message; drop the
+                    # cwd silently and fall through the resolve_runtime_cwd
+                    # chain (FLOWLY_CWD / config / workspace).
+                    logger.warning(
+                        f"[WebChannel] chat.send cwd={cwd!r} not a valid "
+                        f"directory on this host; ignoring and falling "
+                        f"back to workspace (session={session_key})"
+                    )
 
             voice_mode = bool(params.get("voiceMode", False))
 
