@@ -1103,6 +1103,53 @@ class AgentLoop:
         except Exception:
             logger.debug("[title] provisional set failed", exc_info=True)
 
+    def _sync_session_cwd_metadata(self, session_key: str, metadata: dict[str, Any]) -> None:
+        """Two-way sync between the in-memory cwd pin and persisted metadata.
+
+        Runs once per turn at session load. Covers two directions:
+
+        * **Restore**: metadata recorded a cwd from a previous turn but the
+          in-memory pin is empty (bot restart, channel that doesn't transport
+          cwd — CLI/Telegram/autonomous run). Restore the pin from metadata
+          so exec/codex tools resolve to the same dir the user picked earlier.
+
+        * **Persist**: the in-memory pin is non-empty (a frontend just
+          shipped cwd on this turn's chat.send, or we just restored from
+          metadata). Copy the current pin into metadata so the canonical
+          end-of-turn save snapshots it. Subsequent turns from any channel
+          inherit the same dir.
+
+        Stale entries (the recorded directory was deleted on disk) drop the
+        metadata field and degrade to the workspace fallback rather than
+        crash. This is best-effort — a failure here must never break the turn.
+        """
+        try:
+            from flowly.runtime_cwd import get_session_cwd, set_session_cwd
+
+            current_pin = get_session_cwd(session_key)
+            if current_pin is None:
+                stored = metadata.get("cwd")
+                if isinstance(stored, str) and stored.strip():
+                    try:
+                        current_pin = set_session_cwd(session_key, stored)
+                        logger.info(
+                            "[Loop] restored session cwd pin from metadata: "
+                            "key=%s cwd=%s",
+                            session_key, stored,
+                        )
+                    except ValueError:
+                        logger.warning(
+                            "[Loop] stored session cwd no longer exists, dropping: "
+                            "key=%s cwd=%s",
+                            session_key, stored,
+                        )
+                        metadata.pop("cwd", None)
+
+            if current_pin is not None:
+                metadata["cwd"] = str(current_pin)
+        except Exception:  # pragma: no cover — defensive
+            logger.debug("[Loop] session cwd metadata sync failed", exc_info=True)
+
     def _maybe_autotitle_session(self, session: Any, user_content: str, final_content: str | None) -> None:
         """Fire-and-forget a session-title generation after the first exchange.
 
@@ -4713,6 +4760,12 @@ class AgentLoop:
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
         display_content = str(msg.metadata.get("_display_content") or msg.content)
+
+        # Sync per-session cwd between the in-memory pin (set by chat.send
+        # cwd handlers on web/gateway channels) and persisted metadata, so
+        # the pin survives bot restarts and channels that don't transport
+        # cwd (CLI, Telegram, autonomous wake-ups).
+        self._sync_session_cwd_metadata(msg.session_key, session.metadata)
 
         # Persist early so the conversation surfaces in clients that poll the
         # session store (direct-gateway inbox on desktop/iOS has no Firestore
