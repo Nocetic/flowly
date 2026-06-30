@@ -535,6 +535,14 @@ class GatewayServer:
         provider in place.
         """
         try:
+            # A provider/model hot-reload lazy-imports provider modules. If the
+            # checkout was git-pulled under this running gateway, that import can
+            # resolve against stale cached modules → ImportError. Refuse with a
+            # clear restart hint instead.
+            from flowly.gateway.code_skew import SKEW_MESSAGE, is_skewed
+
+            if is_skewed():
+                return web.json_response({"error": SKEW_MESSAGE}, status=409)
             if not self.on_provider_reload:
                 return web.json_response(
                     {"error": "Provider reload not configured"}, status=500,
@@ -2472,6 +2480,12 @@ class GatewayServer:
 
     async def start(self) -> None:
         """Start the HTTP + WebSocket server."""
+        # Snapshot the checkout revision so risky hot-reloads can detect a
+        # later git pull and ask for a restart instead of crashing on stale
+        # modules. No-ops for non-git (PyPI / managed) installs.
+        from flowly.gateway.code_skew import snapshot_boot_revision
+
+        snapshot_boot_revision()
         self._app = self._create_app()
         # tcp_keepalive=False: aiohttp otherwise sets SO_KEEPALIVE on every
         # accepted socket in connection_made, which races on macOS when a client
