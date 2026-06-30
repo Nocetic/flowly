@@ -311,6 +311,73 @@ def _format_search_results(query: str, data: dict) -> str:
     return "\n".join(lines)
 
 
+def _html_to_markdown(html_content: str) -> str:
+    """Convert HTML to a lightweight markdown approximation."""
+    text = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
+                  lambda m: f'[{_strip_tags(m[2])}]({m[1]})', html_content, flags=re.I)
+    text = re.sub(r'<h([1-6])[^>]*>([\s\S]*?)</h\1>',
+                  lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n', text, flags=re.I)
+    text = re.sub(r'<li[^>]*>([\s\S]*?)</li>', lambda m: f'\n- {_strip_tags(m[1])}', text, flags=re.I)
+    text = re.sub(r'</(p|div|section|article)>', '\n\n', text, flags=re.I)
+    text = re.sub(r'<(br|hr)\s*/?>', '\n', text, flags=re.I)
+    return _normalize(_strip_tags(text))
+
+
+async def _fetch_readable(
+    url: str,
+    query: str | None = None,
+    extract_mode: str = "markdown",
+    max_chars: int = 50000,
+) -> dict[str, Any]:
+    """Fetch a URL and return readable content (HTML → markdown/text).
+
+    Shared by ``web_fetch`` and the local extract backend. The caller is
+    responsible for SSRF-validating *url* first. Returns a result dict, or
+    ``{"error": ..., "url": ...}`` on failure.
+    """
+    from readability import Document
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=30.0)
+            r.raise_for_status()
+
+        ctype = r.headers.get("content-type", "")
+        title = ""
+
+        if "application/json" in ctype:
+            text, extractor = json.dumps(r.json(), indent=2), "json"
+        elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
+            doc = Document(r.text)
+            title = doc.title() or ""
+            content = _html_to_markdown(doc.summary()) if extract_mode == "markdown" else _strip_tags(doc.summary())
+            text = f"# {title}\n\n{content}" if title else content
+            extractor = "readability"
+        else:
+            text, extractor = r.text, "raw"
+
+        original_length = len(text)
+        if query and len(text) > max_chars:
+            text = _extract_relevant_passages(text, query, max_chars)
+            extractor += "+relevance"
+        elif len(text) > max_chars:
+            text = text[:max_chars]
+
+        return {
+            "url": url,
+            "finalUrl": str(r.url),
+            "status": r.status_code,
+            "extractor": extractor,
+            "truncated": len(text) < original_length,
+            "length": len(text),
+            "originalLength": original_length,
+            "title": title,
+            "text": text,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e), "url": url}
+
+
 # ---------------------------------------------------------------------------
 # WebFetchTool
 # ---------------------------------------------------------------------------
@@ -338,65 +405,115 @@ class WebFetchTool(Tool):
         self.max_chars = max_chars
 
     async def execute(self, url: str, query: str | None = None, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> str:
-        from readability import Document
-
         # SSRF protection
         allowed, reason = _validate_url(url)
         if not allowed:
             return json.dumps({"error": reason, "url": url})
 
-        max_chars = maxChars or self.max_chars
+        result = await _fetch_readable(
+            url, query=query, extract_mode=extractMode, max_chars=maxChars or self.max_chars,
+        )
+        return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# WebExtractTool
+# ---------------------------------------------------------------------------
+
+
+async def _run_provider_extract(provider: Any, urls: list[str], **kwargs: Any) -> list[dict]:
+    """Call a provider's ``extract`` — awaiting it or offloading to a thread.
+
+    Providers may declare ``extract`` sync (SDK calls) or async (httpx); both
+    are supported. Sync ones run in a worker thread to keep the loop responsive.
+    """
+    if inspect.iscoroutinefunction(provider.extract):
+        return await provider.extract(urls, **kwargs)
+    return await asyncio.to_thread(lambda: provider.extract(urls, **kwargs))
+
+
+class WebExtractTool(Tool):
+    """Extract readable content from one or more URLs via the active backend."""
+
+    name = "web_extract"
+    description = (
+        "Extract clean readable content from one or more URLs using the configured "
+        "extract backend (Firecrawl / Tavily / Exa / Parallel), or local readability "
+        "when none is set. Better than web_fetch for JS-heavy pages when a paid "
+        "backend is configured; for a single simple page web_fetch is lighter."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "One or more URLs to extract content from",
+            },
+            "query": {"type": "string", "description": "Optional query for relevance-focused extraction"},
+            "format": {"type": "string", "enum": ["markdown", "html"], "description": "Preferred content format"},
+            "maxChars": {"type": "integer", "minimum": 100, "description": "Per-URL content character cap"},
+        },
+        "required": ["urls"],
+    }
+
+    def __init__(self, max_chars: int = 50000):
+        self.max_chars = max_chars
+
+    async def execute(
+        self,
+        urls: Any,
+        query: str | None = None,
+        format: str | None = None,
+        maxChars: int | None = None,
+        **kwargs: Any,
+    ) -> str:
+        if isinstance(urls, str):
+            urls = [urls]
+        if not isinstance(urls, list) or not urls:
+            return json.dumps({"success": False, "error": "Provide a non-empty list of URLs."})
+
+        cap = maxChars or self.max_chars
+
+        # SSRF-validate every URL up front; blocked ones become per-URL errors.
+        valid: list[str] = []
+        results: list[dict] = []
+        for u in urls:
+            ok, reason = _validate_url(str(u))
+            if ok:
+                valid.append(str(u))
+            else:
+                results.append({"url": u, "title": "", "content": "", "error": reason})
+        if not valid:
+            return json.dumps({"success": False, "results": results})
+
+        from flowly.agent.tools.web_providers import get_active_extract_provider
+
+        provider = get_active_extract_provider()
+        if provider is None:
+            from flowly.agent.tools.web_providers.local import LocalExtractProvider
+
+            provider = LocalExtractProvider()
 
         try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(url, headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=30.0)
-                r.raise_for_status()
+            extracted = await _run_provider_extract(
+                provider, valid, format=format, query=query, max_chars=cap,
+            )
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"success": False, "error": str(e), "backend": provider.name})
 
-            ctype = r.headers.get("content-type", "")
+        for item in extracted or []:
+            content = item.get("content") or ""
+            truncated = len(content) > cap
+            entry: dict[str, Any] = {
+                "url": item.get("url", ""),
+                "title": item.get("title", ""),
+                "content": content[:cap] if truncated else content,
+            }
+            if truncated:
+                entry["truncated"] = True
+            if item.get("error"):
+                entry["error"] = item["error"]
+            results.append(entry)
 
-            # JSON
-            if "application/json" in ctype:
-                text, extractor = json.dumps(r.json(), indent=2), "json"
-            # HTML
-            elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
-                doc = Document(r.text)
-                content = self._to_markdown(doc.summary()) if extractMode == "markdown" else _strip_tags(doc.summary())
-                text = f"# {doc.title()}\n\n{content}" if doc.title() else content
-                extractor = "readability"
-            else:
-                text, extractor = r.text, "raw"
-
-            # Query-focused extraction: if a query is provided, extract the
-            # most relevant passages instead of naively head-truncating.
-            original_length = len(text)
-            if query and len(text) > max_chars:
-                text = _extract_relevant_passages(text, query, max_chars)
-                extractor += "+relevance"
-            elif len(text) > max_chars:
-                text = text[:max_chars]
-
-            truncated = len(text) < original_length
-
-            return json.dumps({
-                "url": url,
-                "finalUrl": str(r.url),
-                "status": r.status_code,
-                "extractor": extractor,
-                "truncated": truncated,
-                "length": len(text),
-                "originalLength": original_length,
-                "text": text,
-            })
-        except Exception as e:
-            return json.dumps({"error": str(e), "url": url})
-
-    def _to_markdown(self, html_content: str) -> str:
-        """Convert HTML to markdown."""
-        text = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
-                      lambda m: f'[{_strip_tags(m[2])}]({m[1]})', html_content, flags=re.I)
-        text = re.sub(r'<h([1-6])[^>]*>([\s\S]*?)</h\1>',
-                      lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n', text, flags=re.I)
-        text = re.sub(r'<li[^>]*>([\s\S]*?)</li>', lambda m: f'\n- {_strip_tags(m[1])}', text, flags=re.I)
-        text = re.sub(r'</(p|div|section|article)>', '\n\n', text, flags=re.I)
-        text = re.sub(r'<(br|hr)\s*/?>', '\n', text, flags=re.I)
-        return _normalize(_strip_tags(text))
+        return json.dumps({"success": True, "backend": provider.name, "results": results})

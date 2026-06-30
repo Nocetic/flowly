@@ -71,6 +71,7 @@ _FALLBACK_PROTOCOL_VERSION = "2025-06-18"
 EXPOSED_TOOLS: tuple[str, ...] = (
     "web_search",
     "web_fetch",
+    "web_extract",
     "video_analyze",
     "skill_view",
     "skills_list",
@@ -107,6 +108,14 @@ def _build_tools() -> dict[str, Any]:
         tools["web_fetch"] = WebFetchTool()
     except Exception:
         logger.debug("WebFetchTool unavailable", exc_info=True)
+
+    # web_extract — standalone; falls back to local readability when no paid
+    # extract backend is configured.
+    try:
+        from flowly.agent.tools.web import WebExtractTool
+        tools["web_extract"] = WebExtractTool()
+    except Exception:
+        logger.debug("WebExtractTool unavailable", exc_info=True)
 
     # web_search — needs the web tool config (api key) or the web
     # channel relay creds (proxy). Build from config when present.

@@ -45,6 +45,7 @@ _DEFAULT_PREFERENCE = (
     "searxng",
     "ddgs",
     "xai",
+    "local",  # extract-only keyless fallback — last so paid extractors win
 )
 
 

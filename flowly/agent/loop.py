@@ -18,7 +18,7 @@ from flowly.providers.base import LLMProvider
 from flowly.agent.context import ContextBuilder
 from flowly.agent.tools.registry import ToolRegistry
 from flowly.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, MemoryAppendTool
-from flowly.agent.tools.web import WebSearchTool, WebFetchTool
+from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.tools.message import MessageTool
 from flowly.agent.tools.screenshot import ScreenshotTool
 from flowly.agent.tools.spawn import SpawnTool
@@ -1417,6 +1417,7 @@ class AgentLoop:
             auth_token=web_auth_token,
         ))
         self.tools.register(WebFetchTool())
+        self.tools.register(WebExtractTool())
 
         # Share web search proxy config with SubagentManager
         self.subagents._web_search_proxy_url = web_proxy_url
