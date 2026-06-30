@@ -10,6 +10,12 @@
 
 set -euo pipefail
 
+# The user's PATH as it was before we touch it. Under `curl | bash` the script
+# runs in a child shell, so any PATH we export here never reaches the parent —
+# we use this snapshot at the end to tell whether `flowly` is actually reachable
+# from the user's shell, and print an activation hint when it isn't.
+FLOWLY_INBOUND_PATH="${PATH}"
+
 FLOWLY_REPO_URL="${FLOWLY_REPO_URL:-https://github.com/Nocetic/flowly.git}"
 FLOWLY_BRANCH="${FLOWLY_BRANCH:-main}"
 FLOWLY_SRC="${FLOWLY_SRC:-${HOME}/.local/share/flowly/repo}"
@@ -495,19 +501,39 @@ main() {
   # First-run onboarding: when a terminal is available (even under
   # `curl | bash`, by reading /dev/tty), open the interactive account-or-API-key
   # picker right away — it also seeds the workspace. With no terminal
-  # (CI / --skip-bootstrap), fall back to the non-interactive workspace seed and
-  # print the manual next steps.
+  # (CI / --skip-bootstrap), fall back to the non-interactive workspace seed.
   if [[ "$FLOWLY_SKIP_BOOTSTRAP" != "1" ]] && (: </dev/tty) 2>/dev/null; then
     "$flowly_bin" setup </dev/tty || "$flowly_bin" bootstrap || true
-  else
-    if [[ "$FLOWLY_SKIP_BOOTSTRAP" != "1" ]]; then
-      "$flowly_bin" bootstrap || log "bootstrap failed; run 'flowly doctor --fix' after install."
-    fi
-    printf 'Get started (open a new shell first so PATH is picked up):\n'
-    printf '  1. flowly setup                    # choose an account or API key\n'
-    printf '  2. flowly service install --start  # run the gateway in the background\n'
-    printf '  3. flowly                          # start chatting\n'
+  elif [[ "$FLOWLY_SKIP_BOOTSTRAP" != "1" ]]; then
+    "$flowly_bin" bootstrap || log "bootstrap failed; run 'flowly doctor --fix' after install."
   fi
+
+  print_next_steps "$bin_dir"
+}
+
+# Closing instructions. The key gotcha: under `curl | bash` the launcher's
+# directory was added to your shell *profile*, but the CURRENT shell can't see
+# it until it re-reads that profile — so `flowly` is "command not found" right
+# after install until you either open a new terminal or run the export below.
+# We detect this by testing the user's original (pre-script) PATH.
+print_next_steps() {
+  local bin_dir="$1"
+  printf '\n'
+
+  if ! ( export PATH="$FLOWLY_INBOUND_PATH"; command -v flowly >/dev/null 2>&1 ); then
+    ok "One more step — put flowly on your PATH:"
+    printf '  • this shell now:  export PATH="%s:$PATH"\n' "$bin_dir"
+    if [[ "$FLOWLY_NO_PATH_UPDATE" == "1" ]]; then
+      printf '  • new terminals:   add that line to your shell profile yourself\n'
+    else
+      printf '  • or just open a new terminal (your shell profile was updated)\n'
+    fi
+    printf '\n'
+  fi
+
+  printf 'Get started:\n'
+  printf '  flowly service install --start   # run the gateway in the background\n'
+  printf '  flowly                           # start chatting\n'
 }
 
 main
