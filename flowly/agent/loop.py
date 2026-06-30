@@ -227,7 +227,7 @@ def _sanitize_tool_result(result: str, tool_name: str) -> str:
                 result = result[:max_chars] + f"\n[... truncated from {total_chars} chars]"
 
     # 3. Scan and wrap external content for prompt injection defense
-    if tool_name in ("web_fetch", "web_search", "browser_tab",
+    if tool_name in ("web_fetch", "web_extract", "web_search", "browser_tab",
                      "obsidian_search", "obsidian_read", "obsidian_list"):
         from flowly.agent.tools.content_guard import wrap_external_content
         result = wrap_external_content(result, source=tool_name)

@@ -23,7 +23,7 @@ Write the skill in Flowly's skill format:
   templates in `references/`, `scripts/`, `templates/`, or `assets/` files via
   `skill_manage(action="write_file")`.
 - Prefer Flowly tool names in instructions: `read_file`, `list_dir`, `web_fetch`,
-  `web_search`, `exec`, `skill_view`, and `skill_manage`. Do not write shell-only
+  `web_search`, `web_extract`, `exec`, `skill_view`, and `skill_manage`. Do not write shell-only
   instructions when a Flowly tool is the normal path.
 - Include concrete triggers, prerequisites, the normal workflow, edge cases, and
   one verification check.
