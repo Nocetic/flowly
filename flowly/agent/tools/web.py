@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from loguru import logger
 
 from flowly.agent.tools.base import Tool
 
@@ -387,11 +388,12 @@ class WebFetchTool(Tool):
 
     name = "web_fetch"
     description = (
-        "Fetch and read a SINGLE URL — extracts readable content "
-        "(HTML → markdown/text) via Readability. Optionally pass a 'query' for "
-        "relevance-focused passages. For several URLs at once, or JS-heavy / "
-        "anti-bot pages when an extract backend (Firecrawl/Tavily/Exa/Parallel) "
-        "is configured, use web_extract instead."
+        "Read ONE web page (a single URL) → readable content (markdown/text) "
+        "via Readability. Optionally pass a 'query' for relevance-focused "
+        "passages. Use this ONLY for a single URL. If you have 2 or more URLs, "
+        "do NOT call this repeatedly — use `web_extract` once (it batches them "
+        "and uses the configured extract backend, which is better for "
+        "JS-heavy / anti-bot pages)."
     )
     parameters = {
         "type": "object",
@@ -413,6 +415,7 @@ class WebFetchTool(Tool):
         if not allowed:
             return json.dumps({"error": reason, "url": url})
 
+        logger.info("web_fetch: {}", url)
         result = await _fetch_readable(
             url, query=query, extract_mode=extractMode, max_chars=maxChars or self.max_chars,
         )
@@ -440,10 +443,12 @@ class WebExtractTool(Tool):
 
     name = "web_extract"
     description = (
-        "Extract clean readable content from one or more URLs using the configured "
-        "extract backend (Firecrawl / Tavily / Exa / Parallel), or local readability "
-        "when none is set. Better than web_fetch for JS-heavy pages when a paid "
-        "backend is configured; for a single simple page web_fetch is lighter."
+        "Read TWO OR MORE web pages in ONE call — pass a list of URLs. Returns "
+        "clean readable content per URL via the configured extract backend "
+        "(Exa / Firecrawl / Tavily / Parallel; local readability as fallback). "
+        "ALWAYS prefer this over calling web_fetch repeatedly when you have "
+        "multiple URLs. Also better than web_fetch for JS-heavy / anti-bot pages. "
+        "(For a single simple page, web_fetch is lighter.)"
     )
     parameters = {
         "type": "object",
@@ -497,6 +502,8 @@ class WebExtractTool(Tool):
             from flowly.agent.tools.web_providers.local import LocalExtractProvider
 
             provider = LocalExtractProvider()
+
+        logger.info("web_extract: {} URL(s) via backend '{}'", len(valid), provider.name)
 
         try:
             extracted = await _run_provider_extract(
