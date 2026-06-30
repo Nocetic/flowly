@@ -10,7 +10,7 @@ name: install-windows
 
 on:
   push:
-    branches: [main, feat/git-install-update]  # TEMP: drop feat/git-install-update before merge
+    branches: [main]
     paths:
       - "scripts/install.sh"
       - "scripts/install.ps1"
