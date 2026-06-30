@@ -11,12 +11,16 @@ flowly update            # check, upgrade in place, restart the gateway
 flowly update --check    # just tell me if a newer version exists
 ```
 
-Flowly reads the latest released version from PyPI, compares it to what you're
-running, and — if there's something newer — upgrades in place and restarts the
-gateway so the new code takes effect. There's **no confirmation prompt**: running
-the command is the confirmation (use `--check` for a dry look). On Windows,
-`update` relaunches itself through a small detached helper so the running
-`flowly.exe` isn't locked while pip replaces it.
+How Flowly checks for an update depends on how it's installed. A native-script
+**git checkout** fetches its branch from git and measures how many commits it's
+behind; the **packaged** installs read the latest release from PyPI. Either way,
+if there's something newer Flowly upgrades in place and restarts the gateway so
+the new code takes effect. There's **no confirmation prompt**: running the
+command is the confirmation (use `--check` for a dry look). On Windows, the
+**PyPI** upgrade paths relaunch through a small detached helper so the running
+`flowly.exe` isn't locked while pip replaces it; the git-checkout path doesn't
+need that — its launcher runs `python -m flowly`, so nothing has to overwrite a
+running executable.
 
 ## Install-mode aware
 
@@ -25,11 +29,15 @@ upgrade path. You never pick the command:
 
 | How you installed | What `update` runs |
 | --- | --- |
-| Install script / `uv tool` | `uv tool upgrade flowly-ai` |
+| Native install script (git checkout) | `git pull --ff-only` + editable reinstall |
+| `uv tool` | `uv tool upgrade flowly-ai` |
 | `pipx` | `pipx upgrade flowly-ai` |
 | `pip` | `pip install --upgrade flowly-ai` |
-| Git checkout (source) | nothing — prints the `git pull` + reinstall steps |
 | **Inside Flowly Desktop** | **nothing** — the app owns its binary (see below) |
+
+The native `curl … | bash` / `irm … | iex` installers produce the git-checkout
+(source) install, so most users land on the first row: `flowly update` pulls the
+latest commit straight from git, no PyPI release required.
 
 ## Flowly Desktop is separate
 
@@ -54,7 +62,9 @@ touch each other, because they're physically separate installs.
 
 ## What happens on a successful update
 
-1. The package is upgraded via the matching command.
+1. Flowly is upgraded via the matching command — a git checkout is pulled
+   (`git pull --ff-only`, autostashing any local changes) and reinstalled
+   editable; a packaged install is upgraded in place.
 2. Stale bytecode (`__pycache__`) is cleared so a restart doesn't import a
    half-old/half-new mix.
 3. The gateway is restarted via the smart [`flowly restart`](/docs/using-flowly/service)
@@ -63,10 +73,18 @@ touch each other, because they're physically separate installs.
 
 ## Pitfalls
 
-- **PyPI unreachable.** If the version check can't reach PyPI, `update` stops
-  unless you pass `--force`.
+- **PyPI unreachable.** For a packaged install, if the version check can't reach
+  PyPI, `update` stops unless you pass `--force`. A git checkout fetches from its
+  git remote instead, so this doesn't apply to it.
 - **Foreground gateway.** A gateway started with `flowly gateway` in a terminal
   can't be restarted from outside that terminal — `update` tells you, and you
   restart it where it's running.
-- **Source checkouts** update with git, not this command: `git pull` then
-  reinstall your editable install.
+- **Git checkout on a detached HEAD or non-fast-forward.** `update` only
+  fast-forwards: if the checkout isn't on a branch, or local commits have
+  diverged from the remote, it stops and points you at the repo to sort it out
+  by hand. Local *uncommitted* changes are autostashed and restored around the
+  pull.
+- **Hot pull under a running gateway.** If the checkout is updated while the
+  gateway is still running, a provider/model hot-reload is refused with a
+  "restart the gateway" message rather than risking a stale-module import — run
+  `flowly restart` to load the new code.

@@ -27,9 +27,9 @@
 ## Quick start
 
 ```bash
-# Install — one command sets up uv, Python, and Flowly
+# Install — sets up uv, Python, and a Flowly git checkout that `flowly update` keeps current
 curl -fsSL https://useflowlyapp.com/install.sh | bash
-# (already manage tools with uv? `uv tool install flowly-ai`)
+# (prefer a packaged PyPI install? `uv tool install flowly-ai`)
 
 # First-time setup — pick an LLM provider, add any channels
 flowly setup
@@ -154,8 +154,8 @@ The gateway runs as a local daemon, and the **whole process runs inside the OS s
 
 | Method | Command | When |
 |---|---|---|
-| Install script | `curl -fsSL https://useflowlyapp.com/install.sh \| bash` | Recommended — sets up uv, Python, Flowly, PATH |
-| `uv tool` | `uv tool install flowly-ai` | If you already manage tools with uv |
+| Install script | `curl -fsSL https://useflowlyapp.com/install.sh \| bash` | Recommended — git checkout in a uv venv; `flowly update` pulls new versions between releases (Windows: `irm https://useflowlyapp.com/install.ps1 \| iex`) |
+| `uv tool` | `uv tool install flowly-ai` | Packaged PyPI install; tracks releases |
 | Source | `git clone … && pip install -e ".[dev]"` | Contributors |
 
 After install, run `flowly setup`. To run without a terminal session open:

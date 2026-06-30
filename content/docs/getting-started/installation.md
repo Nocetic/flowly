@@ -8,23 +8,24 @@ description: Flowly is a single Python package, flowly-ai, that runs entirely on
 
 | Method | Command | When to use |
 |---|---|---|
-| `uv tool` | `uv tool install flowly-ai` | **Recommended** — isolated env, fast |
+| Native script | `curl -fsSL https://useflowlyapp.com/install.sh \| bash` | **Recommended** — git checkout; `flowly update` pulls new versions between releases |
+| `uv tool` | `uv tool install flowly-ai` | Packaged PyPI install, isolated env |
 | `pip --user` | `pip install --user flowly-ai` | Standard Python users |
-| Native script | `curl -fsSL https://useflowlyapp.com/install.sh \| bash` | Hands-off; picks the right tool |
 | Source | `git clone … && pip install -e .` | Contributors |
 
 ```bash
-# Recommended
-uv tool install flowly-ai
-
-# Standard pip
-pip install --user flowly-ai
-
-# Native installer
+# Recommended (macOS / Linux)
 curl -fsSL https://useflowlyapp.com/install.sh | bash
+
+# Recommended (Windows PowerShell)
+irm https://useflowlyapp.com/install.ps1 | iex
+
+# Packaged PyPI install
+uv tool install flowly-ai
+pip install --user flowly-ai
 ```
 
-All methods install the same `flowly` CLI. The native script detects your environment and selects the appropriate underlying installer.
+All methods install the same `flowly` CLI. The native script clones the repo into an isolated, uv-managed virtualenv and installs Flowly editable — so it needs no pre-installed Python (uv provides it), and `flowly update` can fast-forward it with `git pull` without waiting for a PyPI release. The packaged methods track PyPI releases instead.
 
 ## First run
 
@@ -40,7 +41,7 @@ See [Setup wizard](./setup-wizard.md) for every subcommand and the BYOK one-shot
 
 ## Updating
 
-The simplest way is the built-in updater — it detects how Flowly was installed and upgrades in place (no prompt; on Windows it relaunches itself so the running `flowly.exe` isn't locked):
+The simplest way is the built-in updater — it detects how Flowly was installed and upgrades in place (no prompt). For a native-script (git checkout) install it runs `git pull --ff-only` + reinstall; for the packaged methods it upgrades the package (on Windows the PyPI paths relaunch through a detached helper so the running `flowly.exe` isn't locked):
 
 ```bash
 flowly update
@@ -49,11 +50,12 @@ flowly update
 Or upgrade manually with the same tool you installed it with:
 
 ```bash
+flowly update                      # git checkout: git pull + reinstall
 uv tool upgrade flowly-ai          # if installed via uv
 pip install -U --user flowly-ai    # if installed via pip
 ```
 
-Or re-run the native install script, which fetches the latest version:
+Or re-run the native install script, which fast-forwards the checkout to the latest commit:
 
 ```bash
 curl -fsSL https://useflowlyapp.com/install.sh | bash
