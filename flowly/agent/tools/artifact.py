@@ -314,7 +314,7 @@ class ArtifactTool(Tool):
             sliced = content[offset:end]
             metadata = artifact.get("metadata") or {}
             source_tool = metadata.get("tool_name")
-            if source_tool in ("web_fetch", "web_search", "browser_tab"):
+            if source_tool in ("web_fetch", "web_extract", "web_search", "browser_tab"):
                 from flowly.agent.tools.content_guard import wrap_external_content
                 sliced = wrap_external_content(sliced, source=str(source_tool))
             artifact = {

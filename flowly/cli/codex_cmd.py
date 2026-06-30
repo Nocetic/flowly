@@ -98,7 +98,7 @@ def enable(
             )
             n_servers = len(getattr(cfg, "mcp_servers", None) or {})
             console.print(f"  Flowly tool callback registered in {path}")
-            console.print("    (codex turns can use web_search, web_fetch, video_analyze, skill_view, skills_list)")
+            console.print("    (codex turns can use web_search, web_fetch, web_extract, video_analyze, skill_view, skills_list)")
             if n_servers:
                 console.print(f"    + migrated {n_servers} of your MCP server(s) into codex")
             console.print(f"    sandbox profile: {_sandbox_to_permission(cfg.tools.codex_session.sandbox)}")

@@ -56,6 +56,7 @@ class LoadedPlugin:
     tools_registered: list[str] = field(default_factory=list)
     hooks_registered: list[str] = field(default_factory=list)
     commands_registered: list[str] = field(default_factory=list)
+    web_providers_registered: list[str] = field(default_factory=list)
 
 
 class PluginManager:
@@ -77,6 +78,7 @@ class PluginManager:
         self._plugins: dict[str, LoadedPlugin] = {}
         self._plugin_tool_names: dict[str, set[str]] = {}
         self._plugin_hook_names: dict[str, set[str]] = {}
+        self._plugin_web_providers: dict[str, set[str]] = {}
         self._slash_commands: dict[str, dict[str, Any]] = {}
         self._plugin_skills: dict[str, dict[str, Any]] = {}
         self._discovered = False
@@ -133,13 +135,15 @@ class PluginManager:
                 )
                 continue
 
-            # v1: only standalone plugins load.  backend/exclusive parse
-            # but skip with a recorded reason (so `flowly plugins list`
-            # surfaces them).
-            if manifest.kind != "standalone":
+            # standalone + backend plugins load.  backend plugins register
+            # pluggable backends (e.g. web search providers) via the same
+            # register(ctx) entry point.  exclusive (single-active
+            # providers like memory) is not wired yet — skip with a
+            # recorded reason so `flowly plugins list` surfaces it.
+            if manifest.kind == "exclusive":
                 self._plugins[key] = LoadedPlugin(
                     manifest=manifest, enabled=False,
-                    error=f"kind={manifest.kind} not supported in v1",
+                    error=f"kind={manifest.kind} not supported yet",
                 )
                 continue
 
@@ -184,6 +188,7 @@ class PluginManager:
                 "tools": p.tools_registered,
                 "hooks": p.hooks_registered,
                 "commands": p.commands_registered,
+                "web_providers": p.web_providers_registered,
             }
             for p in sorted(self._plugins.values(), key=lambda x: x.manifest.key)
         ]
@@ -256,13 +261,17 @@ class PluginManager:
                 cmd for cmd, entry in self._slash_commands.items()
                 if entry.get("plugin") == manifest.name
             )
+            loaded.web_providers_registered = sorted(
+                self._plugin_web_providers.get(manifest.name, set())
+            )
             loaded.enabled = True
             logger.info(
-                "loaded plugin %s (tools=%d hooks=%d commands=%d)",
+                "loaded plugin %s (tools=%d hooks=%d commands=%d web=%d)",
                 manifest.key,
                 len(loaded.tools_registered),
                 len(loaded.hooks_registered),
                 len(loaded.commands_registered),
+                len(loaded.web_providers_registered),
             )
         except Exception as exc:
             loaded.error = f"{type(exc).__name__}: {exc}"
@@ -311,6 +320,7 @@ class PluginManager:
         self._plugins.clear()
         self._plugin_tool_names.clear()
         self._plugin_hook_names.clear()
+        self._plugin_web_providers.clear()
         self._slash_commands.clear()
         self._plugin_skills.clear()
 

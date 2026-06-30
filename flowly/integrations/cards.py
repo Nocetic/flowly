@@ -84,7 +84,9 @@ class IntegrationCard:
     """
     key: str
     label: str
-    category: Literal["channel", "tool", "voice", "provider", "system", "media"]
+    category: Literal[
+        "channel", "tool", "voice", "provider", "system", "media", "web_search"
+    ]
     description: str
     docs_url: str
     config_path: str

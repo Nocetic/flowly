@@ -1,0 +1,8 @@
+name: web-tavily
+version: 1.0.0
+manifest_version: 1
+description: "Tavily web search + content extraction backend. Configure via the connections card or env."
+author: "Flowly"
+kind: backend
+provides_web_providers:
+  - tavily

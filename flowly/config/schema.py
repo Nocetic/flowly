@@ -408,11 +408,69 @@ class GatewayConfig(BaseModel):
         return v
 
 
+class DdgsProviderConfig(BaseModel):
+    """DuckDuckGo (ddgs) backend — no key, opt-in toggle."""
+    enabled: bool = False
+    default: bool = False  # mark as the active web search backend
+
+
+class SearxngProviderConfig(BaseModel):
+    """SearXNG backend — self-hosted instance URL + opt-in toggle."""
+    enabled: bool = False
+    default: bool = False  # mark as the active web search backend
+    url: str = ""
+
+
+class TavilyProviderConfig(BaseModel):
+    """Tavily backend — search + extract via API key."""
+    enabled: bool = False
+    default: bool = False
+    api_key: str = ""
+
+
+class ExaProviderConfig(BaseModel):
+    """Exa backend — semantic search + extract via API key."""
+    enabled: bool = False
+    default: bool = False
+    api_key: str = ""
+
+
+class FirecrawlProviderConfig(BaseModel):
+    """Firecrawl backend — search + extract; cloud key or self-hosted URL."""
+    enabled: bool = False
+    default: bool = False
+    api_key: str = ""
+    api_url: str = ""  # self-hosted Firecrawl instance (optional)
+
+
+class ParallelProviderConfig(BaseModel):
+    """Parallel.ai backend — search + extract via API key."""
+    enabled: bool = False
+    default: bool = False
+    api_key: str = ""
+
+
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
+    enabled: bool = True  # Brave/default backend on/off (connections card toggle)
+    default: bool = False  # mark Brave as the active web search backend
     api_key: str = ""  # Brave Search API key (self-hosted, optional)
     max_results: int = 5
     proxy_url: str = ""  # Flowly Cloud search proxy; empty + logged-in falls back to canonical /api/v1/search; self-host: use BRAVE_API_KEY instead
+    # Pluggable backend selection. Empty = auto (availability-ordered,
+    # Brave first). ``backend`` is the shared selector; ``search_backend`` /
+    # ``extract_backend`` override per capability. Values are provider names
+    # ("brave", "ddgs", "searxng", "tavily", "exa", "firecrawl", ...).
+    backend: str = ""
+    search_backend: str = ""
+    extract_backend: str = ""
+    # Per-provider sub-configs (also written by the connections cards).
+    ddgs: DdgsProviderConfig = Field(default_factory=DdgsProviderConfig)
+    searxng: SearxngProviderConfig = Field(default_factory=SearxngProviderConfig)
+    tavily: TavilyProviderConfig = Field(default_factory=TavilyProviderConfig)
+    exa: ExaProviderConfig = Field(default_factory=ExaProviderConfig)
+    firecrawl: FirecrawlProviderConfig = Field(default_factory=FirecrawlProviderConfig)
+    parallel: ParallelProviderConfig = Field(default_factory=ParallelProviderConfig)
 
 
 class WebToolsConfig(BaseModel):

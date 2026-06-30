@@ -1,0 +1,8 @@
+name: web-local
+version: 1.0.0
+manifest_version: 1
+description: "Local readability content extraction — the keyless fallback web_extract backend. Always available."
+author: "Flowly"
+kind: backend
+provides_web_providers:
+  - local

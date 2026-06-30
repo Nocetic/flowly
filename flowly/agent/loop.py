@@ -18,7 +18,7 @@ from flowly.providers.base import LLMProvider
 from flowly.agent.context import ContextBuilder
 from flowly.agent.tools.registry import ToolRegistry
 from flowly.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, MemoryAppendTool
-from flowly.agent.tools.web import WebSearchTool, WebFetchTool
+from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.tools.message import MessageTool
 from flowly.agent.tools.screenshot import ScreenshotTool
 from flowly.agent.tools.spawn import SpawnTool
@@ -227,7 +227,7 @@ def _sanitize_tool_result(result: str, tool_name: str) -> str:
                 result = result[:max_chars] + f"\n[... truncated from {total_chars} chars]"
 
     # 3. Scan and wrap external content for prompt injection defense
-    if tool_name in ("web_fetch", "web_search", "browser_tab",
+    if tool_name in ("web_fetch", "web_extract", "web_search", "browser_tab",
                      "obsidian_search", "obsidian_read", "obsidian_list"):
         from flowly.agent.tools.content_guard import wrap_external_content
         result = wrap_external_content(result, source=tool_name)
@@ -1417,6 +1417,7 @@ class AgentLoop:
             auth_token=web_auth_token,
         ))
         self.tools.register(WebFetchTool())
+        self.tools.register(WebExtractTool())
 
         # Share web search proxy config with SubagentManager
         self.subagents._web_search_proxy_url = web_proxy_url

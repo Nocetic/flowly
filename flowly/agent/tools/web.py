@@ -1,6 +1,8 @@
 """Web tools: web_search and web_fetch."""
 
+import asyncio
 import html
+import inspect
 import ipaddress
 import json
 import os
@@ -9,6 +11,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from loguru import logger
 
 from flowly.agent.tools.base import Tool
 
@@ -207,124 +210,173 @@ class WebSearchTool(Tool):
             self._proxy_url = base.rstrip("/") + "/api/v1/search"
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if self.api_key:
-            return await self._search_direct(query, count)
-        elif self._proxy_url and self._server_id and self._auth_token:
-            return await self._search_proxy(query, count)
-        else:
+        from flowly.agent.tools.web_providers import get_active_search_provider
+
+        provider = get_active_search_provider()
+        if provider is None:
+            # No plugin-registered backend (e.g. the Codex tool server or a
+            # subprocess agent that never booted plugin discovery). Fall back
+            # to a Brave provider built from this tool's own resolved creds.
+            provider = self._fallback_provider()
+        if provider is None:
             return "Error: Web search not available. No API key or proxy configured."
 
-    async def _search_direct(self, query: str, count: int | None = None) -> str:
-        """Direct Brave Search API call (self-hosted users with own key)."""
+        n = count or self.max_results
         try:
-            n = min(max(count or self.max_results, 1), 10)
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n, "extra_snippets": "true", "text_decorations": "false"},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0,
-                )
-                r.raise_for_status()
-
-            data = r.json()
-            results = data.get("web", {}).get("results", [])
-            if not results:
-                return f"No results for: {query}"
-
-            return self._format_results(query, results[:n])
-        except Exception as e:
+            data = await _run_provider_search(provider, query, n)
+        except Exception as e:  # noqa: BLE001
             return f"Error: {e}"
+        return _format_search_results(query, data)
 
-    async def _search_proxy(self, query: str, count: int | None = None) -> str:
-        """Search via Flowly web app proxy (centralized, no API key needed)."""
-        try:
-            n = min(max(count or self.max_results, 1), 10)
-            async with httpx.AsyncClient() as client:
-                r = await client.post(
-                    self._proxy_url,
-                    json={"query": query, "count": n},
-                    headers={
-                        "X-Flowly-Server-Id": self._server_id,
-                        "X-Flowly-API-Key": self._auth_token,
-                        "Content-Type": "application/json",
-                    },
-                    timeout=15.0,
-                )
+    def _fallback_provider(self) -> Any:
+        """Build a Brave provider from this tool's own resolved creds."""
+        from flowly.agent.tools.web_providers.brave import BraveWebSearchProvider
 
-            if r.status_code == 429:
-                data = r.json()
-                return f"Search rate limit reached: {data.get('error', {}).get('message', 'Try again later')}"
+        if not (
+            self.api_key
+            or (self._proxy_url and self._server_id and self._auth_token)
+        ):
+            return None
+        return BraveWebSearchProvider(
+            api_key=self.api_key,
+            proxy_url=self._proxy_url,
+            server_id=self._server_id,
+            auth_token=self._auth_token,
+            max_results=self.max_results,
+        )
 
+
+async def _run_provider_search(provider: Any, query: str, n: int) -> dict:
+    """Call a provider's ``search`` — awaiting it or offloading to a thread.
+
+    Search implementations are sync (network I/O), so run them in a worker
+    thread to keep the event loop responsive; a provider that declares an
+    async ``search`` is awaited directly.
+    """
+    if inspect.iscoroutinefunction(provider.search):
+        return await provider.search(query, n)
+    return await asyncio.to_thread(provider.search, query, n)
+
+
+def _format_search_results(query: str, data: dict) -> str:
+    """Render a provider search envelope to the text the agent reads.
+
+    Handles the generic ``{title, url, description, position}`` rows every
+    provider returns plus Brave's enrichments (``extra_snippets``, ``age``,
+    ``page_age``, ``language``, ``source``, ``meta_url.hostname``) and the
+    optional top-level ``summary`` / ``news`` when present.
+    """
+    if not data.get("success", True):
+        return str(data.get("error") or f"No results for: {query}")
+
+    payload = data.get("data", {}) or {}
+    web = payload.get("web", []) or []
+    if not web:
+        return f"No results for: {query}"
+
+    lines = [f"Results for: {query}\n"]
+    if summary := payload.get("summary"):
+        lines.append(f"Summary: {summary}\n")
+
+    for i, item in enumerate(web, 1):
+        line = f"{i}. {item.get('title', '')}\n   {item.get('url', '')}"
+        if desc := item.get("description"):
+            line += f"\n   {desc}"
+        for snippet in item.get("extra_snippets", []) or []:
+            line += f"\n   > {snippet}"
+        meta_parts = []
+        if age := item.get("age"):
+            meta_parts.append(age)
+        if page_age := item.get("page_age"):
+            meta_parts.append(f"published: {page_age}")
+        if lang := item.get("language"):
+            meta_parts.append(f"lang: {lang}")
+        if source := item.get("source"):
+            meta_parts.append(source)
+        hostname = (item.get("meta_url") or {}).get("hostname", "")
+        if hostname:
+            meta_parts.append(hostname)
+        if meta_parts:
+            line += f"\n   [{' · '.join(meta_parts)}]"
+        lines.append(line)
+
+    if news := payload.get("news"):
+        lines.append("\nRecent News:")
+        for item in news:
+            source = item.get("source", "")
+            age = item.get("age", "")
+            lines.append(
+                f"- {item.get('title', '')} ({source}, {age})\n  {item.get('url', '')}"
+            )
+
+    return "\n".join(lines)
+
+
+def _html_to_markdown(html_content: str) -> str:
+    """Convert HTML to a lightweight markdown approximation."""
+    text = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
+                  lambda m: f'[{_strip_tags(m[2])}]({m[1]})', html_content, flags=re.I)
+    text = re.sub(r'<h([1-6])[^>]*>([\s\S]*?)</h\1>',
+                  lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n', text, flags=re.I)
+    text = re.sub(r'<li[^>]*>([\s\S]*?)</li>', lambda m: f'\n- {_strip_tags(m[1])}', text, flags=re.I)
+    text = re.sub(r'</(p|div|section|article)>', '\n\n', text, flags=re.I)
+    text = re.sub(r'<(br|hr)\s*/?>', '\n', text, flags=re.I)
+    return _normalize(_strip_tags(text))
+
+
+async def _fetch_readable(
+    url: str,
+    query: str | None = None,
+    extract_mode: str = "markdown",
+    max_chars: int = 50000,
+) -> dict[str, Any]:
+    """Fetch a URL and return readable content (HTML → markdown/text).
+
+    Shared by ``web_fetch`` and the local extract backend. The caller is
+    responsible for SSRF-validating *url* first. Returns a result dict, or
+    ``{"error": ..., "url": ...}`` on failure.
+    """
+    from readability import Document
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=30.0)
             r.raise_for_status()
-            data = r.json()
 
-            # Format enriched proxy results
-            results = data.get("results", [])
-            if not results:
-                return f"No results for: {query}"
+        ctype = r.headers.get("content-type", "")
+        title = ""
 
-            lines = [f"Results for: {query}\n"]
+        if "application/json" in ctype:
+            text, extractor = json.dumps(r.json(), indent=2), "json"
+        elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
+            doc = Document(r.text)
+            title = doc.title() or ""
+            content = _html_to_markdown(doc.summary()) if extract_mode == "markdown" else _strip_tags(doc.summary())
+            text = f"# {title}\n\n{content}" if title else content
+            extractor = "readability"
+        else:
+            text, extractor = r.text, "raw"
 
-            # Summary (if available from Brave Summarizer)
-            if summary := data.get("summary"):
-                lines.append(f"Summary: {summary}\n")
+        original_length = len(text)
+        if query and len(text) > max_chars:
+            text = _extract_relevant_passages(text, query, max_chars)
+            extractor += "+relevance"
+        elif len(text) > max_chars:
+            text = text[:max_chars]
 
-            for i, item in enumerate(results[:n], 1):
-                line = f"{i}. {item.get('title', '')}\n   {item.get('url', '')}"
-                if desc := item.get("description"):
-                    line += f"\n   {desc}"
-                # Extra snippets from proxy
-                for snippet in item.get("extra_snippets", []):
-                    line += f"\n   > {snippet}"
-                # Metadata
-                meta_parts = []
-                if age := item.get("age"):
-                    meta_parts.append(age)
-                if source := item.get("source"):
-                    meta_parts.append(source)
-                if meta_parts:
-                    line += f"\n   [{' · '.join(meta_parts)}]"
-                lines.append(line)
-
-            # News results
-            if news := data.get("news"):
-                lines.append("\nRecent News:")
-                for item in news:
-                    source = item.get("source", "")
-                    age = item.get("age", "")
-                    lines.append(f"- {item.get('title', '')} ({source}, {age})\n  {item.get('url', '')}")
-
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Error: {e}"
-
-    @staticmethod
-    def _format_results(query: str, results: list[dict]) -> str:
-        """Format Brave API results with extra snippets and metadata."""
-        lines = [f"Results for: {query}\n"]
-        for i, item in enumerate(results, 1):
-            line = f"{i}. {item.get('title', '')}\n   {item.get('url', '')}"
-            if desc := item.get("description"):
-                line += f"\n   {desc}"
-            # Extra snippets — additional relevant passages from the page
-            for snippet in item.get("extra_snippets", []):
-                line += f"\n   > {snippet}"
-            # Metadata
-            meta_parts = []
-            if age := item.get("age"):
-                meta_parts.append(age)
-            if page_age := item.get("page_age"):
-                meta_parts.append(f"published: {page_age}")
-            if lang := item.get("language"):
-                meta_parts.append(f"lang: {lang}")
-            hostname = item.get("meta_url", {}).get("hostname", "")
-            if hostname:
-                meta_parts.append(hostname)
-            if meta_parts:
-                line += f"\n   [{' · '.join(meta_parts)}]"
-            lines.append(line)
-        return "\n".join(lines)
+        return {
+            "url": url,
+            "finalUrl": str(r.url),
+            "status": r.status_code,
+            "extractor": extractor,
+            "truncated": len(text) < original_length,
+            "length": len(text),
+            "originalLength": original_length,
+            "title": title,
+            "text": text,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e), "url": url}
 
 
 # ---------------------------------------------------------------------------
@@ -336,8 +388,12 @@ class WebFetchTool(Tool):
 
     name = "web_fetch"
     description = (
-        "Fetch URL and extract readable content (HTML → markdown/text). "
-        "Optionally pass a 'query' parameter to get the most relevant passages."
+        "Read ONE web page (a single URL) → readable content (markdown/text) "
+        "via Readability. Optionally pass a 'query' for relevance-focused "
+        "passages. Use this ONLY for a single URL. If you have 2 or more URLs, "
+        "do NOT call this repeatedly — use `web_extract` once (it batches them "
+        "and uses the configured extract backend, which is better for "
+        "JS-heavy / anti-bot pages)."
     )
     parameters = {
         "type": "object",
@@ -354,65 +410,120 @@ class WebFetchTool(Tool):
         self.max_chars = max_chars
 
     async def execute(self, url: str, query: str | None = None, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> str:
-        from readability import Document
-
         # SSRF protection
         allowed, reason = _validate_url(url)
         if not allowed:
             return json.dumps({"error": reason, "url": url})
 
-        max_chars = maxChars or self.max_chars
+        logger.info("web_fetch: {}", url)
+        result = await _fetch_readable(
+            url, query=query, extract_mode=extractMode, max_chars=maxChars or self.max_chars,
+        )
+        return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# WebExtractTool
+# ---------------------------------------------------------------------------
+
+
+async def _run_provider_extract(provider: Any, urls: list[str], **kwargs: Any) -> list[dict]:
+    """Call a provider's ``extract`` — awaiting it or offloading to a thread.
+
+    Providers may declare ``extract`` sync (SDK calls) or async (httpx); both
+    are supported. Sync ones run in a worker thread to keep the loop responsive.
+    """
+    if inspect.iscoroutinefunction(provider.extract):
+        return await provider.extract(urls, **kwargs)
+    return await asyncio.to_thread(lambda: provider.extract(urls, **kwargs))
+
+
+class WebExtractTool(Tool):
+    """Extract readable content from one or more URLs via the active backend."""
+
+    name = "web_extract"
+    description = (
+        "Read TWO OR MORE web pages in ONE call — pass a list of URLs. Returns "
+        "clean readable content per URL via the configured extract backend "
+        "(Exa / Firecrawl / Tavily / Parallel; local readability as fallback). "
+        "ALWAYS prefer this over calling web_fetch repeatedly when you have "
+        "multiple URLs. Also better than web_fetch for JS-heavy / anti-bot pages. "
+        "(For a single simple page, web_fetch is lighter.)"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "One or more URLs to extract content from",
+            },
+            "query": {"type": "string", "description": "Optional query for relevance-focused extraction"},
+            "format": {"type": "string", "enum": ["markdown", "html"], "description": "Preferred content format"},
+            "maxChars": {"type": "integer", "minimum": 100, "description": "Per-URL content character cap"},
+        },
+        "required": ["urls"],
+    }
+
+    def __init__(self, max_chars: int = 50000):
+        self.max_chars = max_chars
+
+    async def execute(
+        self,
+        urls: Any,
+        query: str | None = None,
+        format: str | None = None,
+        maxChars: int | None = None,
+        **kwargs: Any,
+    ) -> str:
+        if isinstance(urls, str):
+            urls = [urls]
+        if not isinstance(urls, list) or not urls:
+            return json.dumps({"success": False, "error": "Provide a non-empty list of URLs."})
+
+        cap = maxChars or self.max_chars
+
+        # SSRF-validate every URL up front; blocked ones become per-URL errors.
+        valid: list[str] = []
+        results: list[dict] = []
+        for u in urls:
+            ok, reason = _validate_url(str(u))
+            if ok:
+                valid.append(str(u))
+            else:
+                results.append({"url": u, "title": "", "content": "", "error": reason})
+        if not valid:
+            return json.dumps({"success": False, "results": results})
+
+        from flowly.agent.tools.web_providers import get_active_extract_provider
+
+        provider = get_active_extract_provider()
+        if provider is None:
+            from flowly.agent.tools.web_providers.local import LocalExtractProvider
+
+            provider = LocalExtractProvider()
+
+        logger.info("web_extract: {} URL(s) via backend '{}'", len(valid), provider.name)
 
         try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(url, headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=30.0)
-                r.raise_for_status()
+            extracted = await _run_provider_extract(
+                provider, valid, format=format, query=query, max_chars=cap,
+            )
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"success": False, "error": str(e), "backend": provider.name})
 
-            ctype = r.headers.get("content-type", "")
+        for item in extracted or []:
+            content = item.get("content") or ""
+            truncated = len(content) > cap
+            entry: dict[str, Any] = {
+                "url": item.get("url", ""),
+                "title": item.get("title", ""),
+                "content": content[:cap] if truncated else content,
+            }
+            if truncated:
+                entry["truncated"] = True
+            if item.get("error"):
+                entry["error"] = item["error"]
+            results.append(entry)
 
-            # JSON
-            if "application/json" in ctype:
-                text, extractor = json.dumps(r.json(), indent=2), "json"
-            # HTML
-            elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
-                doc = Document(r.text)
-                content = self._to_markdown(doc.summary()) if extractMode == "markdown" else _strip_tags(doc.summary())
-                text = f"# {doc.title()}\n\n{content}" if doc.title() else content
-                extractor = "readability"
-            else:
-                text, extractor = r.text, "raw"
-
-            # Query-focused extraction: if a query is provided, extract the
-            # most relevant passages instead of naively head-truncating.
-            original_length = len(text)
-            if query and len(text) > max_chars:
-                text = _extract_relevant_passages(text, query, max_chars)
-                extractor += "+relevance"
-            elif len(text) > max_chars:
-                text = text[:max_chars]
-
-            truncated = len(text) < original_length
-
-            return json.dumps({
-                "url": url,
-                "finalUrl": str(r.url),
-                "status": r.status_code,
-                "extractor": extractor,
-                "truncated": truncated,
-                "length": len(text),
-                "originalLength": original_length,
-                "text": text,
-            })
-        except Exception as e:
-            return json.dumps({"error": str(e), "url": url})
-
-    def _to_markdown(self, html_content: str) -> str:
-        """Convert HTML to markdown."""
-        text = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
-                      lambda m: f'[{_strip_tags(m[2])}]({m[1]})', html_content, flags=re.I)
-        text = re.sub(r'<h([1-6])[^>]*>([\s\S]*?)</h\1>',
-                      lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n', text, flags=re.I)
-        text = re.sub(r'<li[^>]*>([\s\S]*?)</li>', lambda m: f'\n- {_strip_tags(m[1])}', text, flags=re.I)
-        text = re.sub(r'</(p|div|section|article)>', '\n\n', text, flags=re.I)
-        text = re.sub(r'<(br|hr)\s*/?>', '\n', text, flags=re.I)
-        return _normalize(_strip_tags(text))
+        return json.dumps({"success": True, "backend": provider.name, "results": results})

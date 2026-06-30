@@ -11,6 +11,9 @@ that exposes the v1 surface area:
   (``/foo``) usable across all channels (Telegram, Web, Desktop, …).
 * :meth:`register_skill` — register a plugin-namespaced skill that can
   be loaded via ``skill_view("<plugin>:<name>")``.
+* :meth:`register_web_search_provider` — register a ``kind: backend``
+  web search/extract backend selectable by the ``web_search`` /
+  ``web_extract`` tools.
 
 Methods deferred to v1.1+ (not yet wired):
 
@@ -187,4 +190,28 @@ class PluginContext:
         logger.debug(
             "plugin %s registered skill %s",
             self.manifest.name, qualified,
+        )
+
+    # ── Web search provider registration ───────────────────────
+
+    def register_web_search_provider(self, provider: Any) -> None:
+        """Register a pluggable web search/extract backend.
+
+        *provider* must be a
+        :class:`flowly.agent.tools.web_providers.WebSearchProvider`
+        instance.  Once registered it becomes selectable as the active
+        ``web_search`` / ``web_extract`` backend via
+        ``tools.web.search.backend`` (and the per-capability
+        ``searchBackend`` / ``extractBackend`` keys).  Only plugins
+        declaring ``kind: backend`` should call this.
+        """
+        from flowly.agent.tools.web_providers.registry import register_provider
+
+        register_provider(provider)
+        self._manager._plugin_web_providers.setdefault(
+            self.manifest.name, set()
+        ).add(provider.name)
+        logger.debug(
+            "plugin %s registered web provider %s",
+            self.manifest.name, provider.name,
         )

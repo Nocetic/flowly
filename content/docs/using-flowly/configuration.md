@@ -174,7 +174,7 @@ See [Sandbox and approvals](./sandbox-and-approvals.md) for execution policy.
 
 | Tool | Key defaults |
 |---|---|
-| `web.search` | `apiKey=""` (Brave), `maxResults=5`, `proxyUrl=""` |
+| `web.search` | Brave defaults (`apiKey=""`, `maxResults=5`, `proxyUrl=""`) + backend selectors (`backend`/`searchBackend`/`extractBackend`) + per-backend sub-sections (`ddgs`, `searxng`, `tavily`, `exa`, `firecrawl`, `parallel`). See [Web & research](/docs/features/web). |
 | `exec` | `enabled=true`, `timeoutSeconds=300`, `maxOutputChars=200000`, `approvalTimeoutSeconds=120`, `cronMode="deny"` (`"deny"`\|`"approve"`) |
 | `artifact` | `enabled=true`, `maxContentLength=500000` |
 | `browserTab` | `enabled=false` |

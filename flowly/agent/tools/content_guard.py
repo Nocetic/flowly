@@ -97,7 +97,7 @@ def is_memory_path(resolved_path: Path, workspace: Path | None) -> bool:
         return False
 
 
-# ── External content scanning (web_fetch, web_search, browser_tab) ────
+# ── External content scanning (web_fetch, web_extract, web_search, browser_tab) ──
 
 _EXTERNAL_INJECTION_PATTERNS: list[tuple[str, str, str]] = [
     # (pattern, threat_id, severity)

@@ -47,9 +47,15 @@ def _write_plugin(
 
 @pytest.fixture(autouse=True)
 def _reset_plugin_singleton():
+    from flowly.agent.tools.web_providers.registry import (
+        _reset_for_tests as _reset_web,
+    )
+
     _reset_for_tests()
+    _reset_web()
     yield
     _reset_for_tests()
+    _reset_web()
 
 
 # ── manifest.parse_manifest ────────────────────────────────────
@@ -384,24 +390,62 @@ class TestPluginManagerDiscovery:
         assert info["good"]["enabled"] is True
         assert mgr._tool_registry.has("good_tool")
 
-    def test_kind_backend_is_skipped_in_v1(self, tmp_path, monkeypatch):
+    def test_kind_backend_loads_and_registers_web_provider(self, tmp_path, monkeypatch):
+        from flowly.agent.tools.web_providers.registry import get_provider
+
         flowly_home = tmp_path / "home"
         plugins_dir = flowly_home / "plugins"
         plugins_dir.mkdir(parents=True)
         _write_plugin(
-            plugins_dir, "imageprov",
+            plugins_dir, "webprov",
             manifest_text=(
-                "name: imageprov\nversion: '1'\nkind: backend\n"
+                "name: webprov\nversion: '1'\nkind: backend\n"
+                "provides_web_providers:\n  - dummy\n"
             ),
+            init_text=textwrap.dedent("""\
+                from flowly.agent.tools.web_providers.base import WebSearchProvider
+
+                class _Dummy(WebSearchProvider):
+                    @property
+                    def name(self):
+                        return "dummy"
+
+                    def is_available(self):
+                        return True
+
+                    def search(self, query, limit=5):
+                        return {"success": True, "data": {"web": []}}
+
+                def register(ctx):
+                    ctx.register_web_search_provider(_Dummy())
+            """),
         )
         monkeypatch.setenv("FLOWLY_HOME", str(flowly_home))
 
         mgr = _make_manager()
-        mgr.discover_and_load(enabled={"imageprov"}, disabled=set())
+        mgr.discover_and_load(enabled={"webprov"}, disabled=set())
 
         info = {p["key"]: p for p in mgr.list_plugins()}
-        assert info["imageprov"]["enabled"] is False
-        assert "not supported" in info["imageprov"]["error"]
+        assert info["webprov"]["enabled"] is True
+        assert info["webprov"]["web_providers"] == ["dummy"]
+        assert get_provider("dummy") is not None
+
+    def test_kind_exclusive_is_skipped(self, tmp_path, monkeypatch):
+        flowly_home = tmp_path / "home"
+        plugins_dir = flowly_home / "plugins"
+        plugins_dir.mkdir(parents=True)
+        _write_plugin(
+            plugins_dir, "memprov",
+            manifest_text="name: memprov\nversion: '1'\nkind: exclusive\n",
+        )
+        monkeypatch.setenv("FLOWLY_HOME", str(flowly_home))
+
+        mgr = _make_manager()
+        mgr.discover_and_load(enabled={"memprov"}, disabled=set())
+
+        info = {p["key"]: p for p in mgr.list_plugins()}
+        assert info["memprov"]["enabled"] is False
+        assert "not supported" in info["memprov"]["error"]
 
 
 # ── Manager-level slash + skill lookups ────────────────────────

@@ -260,7 +260,7 @@ class BuiltinAgentTool(Tool):
                 + "[researcher: done. This IS the final research output — "
                 "deliver it to the user as-is. Do NOT call `writer` to "
                 "rewrite it, and do NOT run your own web_search / "
-                "web_fetch on the same topic.]"
+                "web_fetch / web_extract on the same topic.]"
             )
 
         return result

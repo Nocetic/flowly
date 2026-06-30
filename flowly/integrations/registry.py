@@ -16,9 +16,13 @@ from __future__ import annotations
 from flowly.integrations.cards import Field, FieldType, IntegrationCard
 from flowly.integrations.probes import (
     probe_anthropic,
+    probe_brave_search,
+    probe_ddgs,
     probe_discord,
     probe_email,
+    probe_exa,
     probe_fal_image,
+    probe_firecrawl,
     probe_flowly_account,
     probe_gemini,
     probe_groq,
@@ -28,8 +32,11 @@ from flowly.integrations.probes import (
     probe_obsidian,
     probe_openai,
     probe_openrouter,
+    probe_parallel,
     probe_sakana,
+    probe_searxng,
     probe_slack,
+    probe_tavily,
     probe_teams,
     probe_telegram,
     probe_trello,
@@ -48,6 +55,11 @@ from flowly.media.image_models import model_choices as _image_model_choices
 def _enabled_field(default: bool = False) -> Field:
     return Field("enabled", "Enabled", FieldType.BOOL, default=default,
                  help="Channel starts with the gateway when this is on.")
+
+
+def _default_backend_field() -> Field:
+    return Field("default", "Use as default backend", FieldType.BOOL, default=False,
+                 help="Make web_search use this backend. Overrides the auto pick.")
 
 
 def _allow_from() -> Field:
@@ -526,6 +538,117 @@ _MEDIA: list[IntegrationCard] = [
 ]
 
 
+# ── WEB SEARCH ─────────────────────────────────────────────────────
+# One card per pluggable web-search backend. Each backend is also a
+# `kind: backend` plugin (flowly/plugins_bundled/web-<name>/) — the card is
+# just the credential surface so it appears in the Desktop / iOS / Android
+# connections tab via the shared feature_rpc surface. Cards are added here
+# alongside each provider as it lands.
+
+
+_WEB_SEARCH: list[IntegrationCard] = [
+    IntegrationCard(
+        key="web_brave", label="Brave Search", category="web_search",
+        description="Default web search. Your own Brave API key, or the Flowly "
+                    "Cloud search proxy automatically when you're logged in.",
+        docs_url="https://brave.com/search/api/",
+        config_path="tools.web.search",
+        fields=[
+            _enabled_field(default=True),
+            _default_backend_field(),
+            Field("api_key", "Brave API key", FieldType.PASSWORD,
+                  placeholder="BSA…",
+                  help="Optional — leave empty to use the Flowly proxy when logged in."),
+        ],
+        probe=probe_brave_search,
+        # Search providers are resolved per call (not started at boot), so a
+        # key change applies immediately — no gateway restart needed.
+        needs_gateway_restart=False,
+    ),
+    IntegrationCard(
+        key="web_ddgs", label="DuckDuckGo (ddgs)", category="web_search",
+        description="Free web search, no API key. Needs the ddgs package "
+                    "(`pip install ddgs` or `flowly[search]`).",
+        docs_url="https://pypi.org/project/ddgs/",
+        config_path="tools.web.search.ddgs",
+        fields=[_enabled_field(default=False), _default_backend_field()],
+        probe=probe_ddgs,
+        needs_gateway_restart=False,
+    ),
+    IntegrationCard(
+        key="web_searxng", label="SearXNG", category="web_search",
+        description="Privacy-respecting metasearch on your own SearXNG instance.",
+        docs_url="https://searx.space/",
+        config_path="tools.web.search.searxng",
+        fields=[
+            _enabled_field(default=False),
+            _default_backend_field(),
+            Field("url", "Instance URL", FieldType.TEXT,
+                  placeholder="http://localhost:8080",
+                  help="Base URL of your SearXNG instance."),
+        ],
+        probe=probe_searxng,
+        needs_gateway_restart=False,
+    ),
+    IntegrationCard(
+        key="web_tavily", label="Tavily", category="web_search",
+        description="Search + page extraction in one API.",
+        docs_url="https://app.tavily.com/home",
+        config_path="tools.web.search.tavily",
+        fields=[
+            _enabled_field(default=False),
+            _default_backend_field(),
+            Field("api_key", "Tavily API key", FieldType.PASSWORD, placeholder="tvly-…"),
+        ],
+        probe=probe_tavily,
+        needs_gateway_restart=False,
+    ),
+    IntegrationCard(
+        key="web_exa", label="Exa", category="web_search",
+        description="Neural/semantic web search with content extraction.",
+        docs_url="https://exa.ai",
+        config_path="tools.web.search.exa",
+        fields=[
+            _enabled_field(default=False),
+            _default_backend_field(),
+            Field("api_key", "Exa API key", FieldType.PASSWORD),
+        ],
+        probe=probe_exa,
+        needs_gateway_restart=False,
+    ),
+    IntegrationCard(
+        key="web_firecrawl", label="Firecrawl", category="web_search",
+        description="Strongest extraction (JS-rendered). Cloud key or self-hosted URL.",
+        docs_url="https://docs.firecrawl.dev/introduction",
+        config_path="tools.web.search.firecrawl",
+        fields=[
+            _enabled_field(default=False),
+            _default_backend_field(),
+            Field("api_key", "Firecrawl API key", FieldType.PASSWORD,
+                  placeholder="fc-…", help="Leave empty for a self-hosted instance."),
+            Field("api_url", "Self-hosted URL", FieldType.TEXT,
+                  placeholder="https://firecrawl.example.com",
+                  help="Optional — your self-hosted Firecrawl base URL."),
+        ],
+        probe=probe_firecrawl,
+        needs_gateway_restart=False,
+    ),
+    IntegrationCard(
+        key="web_parallel", label="Parallel", category="web_search",
+        description="Objective-tuned search + parallel page extraction.",
+        docs_url="https://parallel.ai",
+        config_path="tools.web.search.parallel",
+        fields=[
+            _enabled_field(default=False),
+            _default_backend_field(),
+            Field("api_key", "Parallel API key", FieldType.PASSWORD),
+        ],
+        probe=probe_parallel,
+        needs_gateway_restart=False,
+    ),
+]
+
+
 # ── REGISTRY ───────────────────────────────────────────────────────
 
 
@@ -535,6 +658,7 @@ REGISTRY: list[IntegrationCard] = [
     *_VOICE,
     *_PROVIDERS,
     *_MEDIA,
+    *_WEB_SEARCH,
 ]
 
 

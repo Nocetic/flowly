@@ -26,7 +26,7 @@ from flowly.agent.tools.registry import ToolRegistry
 from flowly.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, MemoryAppendTool
 from flowly.agent.tools.shell import ExecTool
 from flowly.exec.types import ExecConfig
-from flowly.agent.tools.web import WebSearchTool, WebFetchTool
+from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
 from flowly.agent.subagent_announce_queue import AnnounceItem, get_or_create_queue
 
@@ -637,6 +637,7 @@ class SubagentManager:
                     auth_token=self._web_search_auth_token,
                 ),
                 "web_fetch": lambda: WebFetchTool(),
+                "web_extract": lambda: WebExtractTool(),
                 "skill_manage": lambda: SkillManageTool(workspace=self.workspace),
                 "knowledge_graph": _build_kg_tool,
                 "artifact": _build_artifact_tool,

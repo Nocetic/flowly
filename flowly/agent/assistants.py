@@ -163,7 +163,7 @@ _BUILTIN_ASSISTANTS: list[Assistant] = [
         async_dispatch=True,
         system_prompt=(
             "## Researcher\n\n"
-            "You are a research specialist. Use web_search and web_fetch "
+            "You are a research specialist. Use web_search, web_fetch and web_extract "
             "extensively. Gather material from multiple perspectives, "
             "include sources and citations, then deliver ONE "
             "self-contained markdown report as your final assistant "
