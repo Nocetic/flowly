@@ -297,6 +297,30 @@ async def probe_searxng(values: dict[str, Any]) -> ProbeResult:
     return ProbeResult("ok", url) if url else ProbeResult("not_configured", "no instance URL")
 
 
+def _cred_probe(has_cred: bool, enabled: bool) -> ProbeResult:
+    """Shared presence-only probe for key-based web search backends."""
+    if not enabled:
+        return ProbeResult("disabled" if has_cred else "not_configured", "key set · disabled" if has_cred else "no key")
+    return ProbeResult("ok", "key set") if has_cred else ProbeResult("not_configured", "no API key")
+
+
+async def probe_tavily(values: dict[str, Any]) -> ProbeResult:
+    return _cred_probe(bool((values.get("api_key") or "").strip()), bool(values.get("enabled")))
+
+
+async def probe_exa(values: dict[str, Any]) -> ProbeResult:
+    return _cred_probe(bool((values.get("api_key") or "").strip()), bool(values.get("enabled")))
+
+
+async def probe_parallel(values: dict[str, Any]) -> ProbeResult:
+    return _cred_probe(bool((values.get("api_key") or "").strip()), bool(values.get("enabled")))
+
+
+async def probe_firecrawl(values: dict[str, Any]) -> ProbeResult:
+    has_cred = bool((values.get("api_key") or "").strip()) or bool((values.get("api_url") or "").strip())
+    return _cred_probe(has_cred, bool(values.get("enabled")))
+
+
 async def probe_web_channel(values: dict[str, Any]) -> ProbeResult:
     """iOS pairing / web relay — driven by /login, not the form."""
     server_id = (values.get("server_id") or "").strip()

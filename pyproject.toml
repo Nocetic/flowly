@@ -64,6 +64,9 @@ dev = [
 # Install with: pip install "flowly-ai[search]".
 search = [
     "ddgs>=9.0.0",
+    "exa-py>=1.0.0",
+    "firecrawl-py>=1.0.0",
+    "parallel-web>=0.1.0",
 ]
 
 [project.scripts]

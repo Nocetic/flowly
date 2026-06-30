@@ -421,6 +421,35 @@ class SearxngProviderConfig(BaseModel):
     url: str = ""
 
 
+class TavilyProviderConfig(BaseModel):
+    """Tavily backend — search + extract via API key."""
+    enabled: bool = False
+    default: bool = False
+    api_key: str = ""
+
+
+class ExaProviderConfig(BaseModel):
+    """Exa backend — semantic search + extract via API key."""
+    enabled: bool = False
+    default: bool = False
+    api_key: str = ""
+
+
+class FirecrawlProviderConfig(BaseModel):
+    """Firecrawl backend — search + extract; cloud key or self-hosted URL."""
+    enabled: bool = False
+    default: bool = False
+    api_key: str = ""
+    api_url: str = ""  # self-hosted Firecrawl instance (optional)
+
+
+class ParallelProviderConfig(BaseModel):
+    """Parallel.ai backend — search + extract via API key."""
+    enabled: bool = False
+    default: bool = False
+    api_key: str = ""
+
+
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
     enabled: bool = True  # Brave/default backend on/off (connections card toggle)
@@ -438,6 +467,10 @@ class WebSearchConfig(BaseModel):
     # Per-provider sub-configs (also written by the connections cards).
     ddgs: DdgsProviderConfig = Field(default_factory=DdgsProviderConfig)
     searxng: SearxngProviderConfig = Field(default_factory=SearxngProviderConfig)
+    tavily: TavilyProviderConfig = Field(default_factory=TavilyProviderConfig)
+    exa: ExaProviderConfig = Field(default_factory=ExaProviderConfig)
+    firecrawl: FirecrawlProviderConfig = Field(default_factory=FirecrawlProviderConfig)
+    parallel: ParallelProviderConfig = Field(default_factory=ParallelProviderConfig)
 
 
 class WebToolsConfig(BaseModel):
