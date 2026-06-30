@@ -199,7 +199,10 @@ function Update-Checkout {
 # `flowly update` to the in-place git pull.
 function Install-FromSource {
     Write-Step "Creating Flowly virtualenv at $Venv (Python $Python)..."
-    & uv venv --python $Python $Venv
+    # --clear: the installer is meant to be re-run (it's the documented way to
+    # force-refresh an install), so a venv already existing at this path from a
+    # prior run must not abort it.
+    & uv venv --clear --python $Python $Venv
     if ($LASTEXITCODE -ne 0) { throw 'uv venv failed.' }
 
     $venvPy = Join-Path $Venv 'Scripts\python.exe'

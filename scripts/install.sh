@@ -388,7 +388,10 @@ clone_or_update_repo() {
 # is what routes `flowly update` to the git-pull path.
 install_from_source() {
   log "Creating Flowly virtualenv at ${FLOWLY_VENV} (Python ${FLOWLY_PYTHON})..."
-  uv venv --python "$FLOWLY_PYTHON" "$FLOWLY_VENV"
+  # --clear: the installer is meant to be re-run (it's the documented way to
+  # force-refresh an install), so a venv already existing at this path from a
+  # prior run must not abort it.
+  uv venv --clear --python "$FLOWLY_PYTHON" "$FLOWLY_VENV"
 
   log "Installing Flowly (editable) from ${FLOWLY_SRC}..."
   uv pip install --python "${FLOWLY_VENV}/bin/python" -e "$FLOWLY_SRC"
