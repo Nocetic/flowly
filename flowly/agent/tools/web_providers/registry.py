@@ -149,6 +149,32 @@ def _read_config_backend(capability: str) -> str:
     return (per_cap or shared or "").strip()
 
 
+def _read_default_backend() -> str:
+    """Return the provider whose connections card is marked default.
+
+    Each web_search card exposes a "Use as default backend" toggle that
+    writes ``default: true`` into its config section. This lets users pick
+    the active backend from the Desktop / TUI / iOS UI without editing the
+    raw ``backend`` string. Walked in preference order so a stray double-set
+    resolves deterministically. Returns "" when none is marked.
+    """
+    try:
+        from flowly.config.loader import load_config
+
+        search = load_config().tools.web.search
+    except Exception:
+        return ""
+    for name in _DEFAULT_PREFERENCE:
+        if name == "brave":
+            if getattr(search, "default", False):
+                return "brave"
+        else:
+            section = getattr(search, name, None)
+            if section is not None and getattr(section, "default", False):
+                return name
+    return ""
+
+
 def _capable(provider: WebSearchProvider, capability: str) -> bool:
     if capability == "search":
         return bool(provider.supports_search())
@@ -213,13 +239,19 @@ def _resolve(configured: str, *, capability: str) -> Optional[WebSearchProvider]
 def get_active_search_provider() -> Optional[WebSearchProvider]:
     """Resolve the currently-active web search provider."""
     _ensure_loaded()
-    return _resolve(_read_config_backend("search"), capability="search")
+    return _resolve(
+        _read_config_backend("search") or _read_default_backend(),
+        capability="search",
+    )
 
 
 def get_active_extract_provider() -> Optional[WebSearchProvider]:
     """Resolve the currently-active web extract provider."""
     _ensure_loaded()
-    return _resolve(_read_config_backend("extract"), capability="extract")
+    return _resolve(
+        _read_config_backend("extract") or _read_default_backend(),
+        capability="extract",
+    )
 
 
 def _reset_for_tests() -> None:

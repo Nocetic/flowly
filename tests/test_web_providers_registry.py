@@ -140,3 +140,21 @@ def test_get_active_uses_config(monkeypatch):
     monkeypatch.setattr(reg, "_read_config_backend", lambda cap: "exa")
     assert reg.get_active_search_provider().name == "exa"
     assert reg.get_active_extract_provider().name == "exa"
+
+
+def test_get_active_uses_default_flag(monkeypatch):
+    # When no explicit backend string is set, the card "default" flag picks
+    # the active backend (overriding the availability preference order).
+    reg.register_provider(_Fake("brave"))
+    reg.register_provider(_Fake("ddgs"))
+    monkeypatch.setattr(reg, "_read_config_backend", lambda cap: "")
+    monkeypatch.setattr(reg, "_read_default_backend", lambda: "ddgs")
+    assert reg.get_active_search_provider().name == "ddgs"
+
+
+def test_explicit_backend_beats_default_flag(monkeypatch):
+    reg.register_provider(_Fake("brave"))
+    reg.register_provider(_Fake("ddgs"))
+    monkeypatch.setattr(reg, "_read_config_backend", lambda cap: "brave")
+    monkeypatch.setattr(reg, "_read_default_backend", lambda: "ddgs")
+    assert reg.get_active_search_provider().name == "brave"

@@ -53,6 +53,11 @@ def _enabled_field(default: bool = False) -> Field:
                  help="Channel starts with the gateway when this is on.")
 
 
+def _default_backend_field() -> Field:
+    return Field("default", "Use as default backend", FieldType.BOOL, default=False,
+                 help="Make web_search use this backend. Overrides the auto pick.")
+
+
 def _allow_from() -> Field:
     return Field(
         "allow_from", "Allowed senders", FieldType.MULTI,
@@ -546,6 +551,7 @@ _WEB_SEARCH: list[IntegrationCard] = [
         config_path="tools.web.search",
         fields=[
             _enabled_field(default=True),
+            _default_backend_field(),
             Field("api_key", "Brave API key", FieldType.PASSWORD,
                   placeholder="BSA…",
                   help="Optional — leave empty to use the Flowly proxy when logged in."),
@@ -561,7 +567,7 @@ _WEB_SEARCH: list[IntegrationCard] = [
                     "(`pip install ddgs` or `flowly[search]`).",
         docs_url="https://pypi.org/project/ddgs/",
         config_path="tools.web.search.ddgs",
-        fields=[_enabled_field(default=False)],
+        fields=[_enabled_field(default=False), _default_backend_field()],
         probe=probe_ddgs,
         needs_gateway_restart=False,
     ),
@@ -572,6 +578,7 @@ _WEB_SEARCH: list[IntegrationCard] = [
         config_path="tools.web.search.searxng",
         fields=[
             _enabled_field(default=False),
+            _default_backend_field(),
             Field("url", "Instance URL", FieldType.TEXT,
                   placeholder="http://localhost:8080",
                   help="Base URL of your SearXNG instance."),

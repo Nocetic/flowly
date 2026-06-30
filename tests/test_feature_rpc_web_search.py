@@ -105,6 +105,20 @@ def test_ddgs_card_default_disabled(isolated_home):
     assert card["enabled"] is False
 
 
+def test_default_backend_toggle_round_trips(isolated_home):
+    # Every web_search card exposes a "Use as default backend" toggle so the
+    # active backend is pickable from the Desktop / TUI / iOS UI.
+    by_key = _list_by_key()
+    for key in ("web_brave", "web_ddgs", "web_searxng"):
+        assert "default" in {f["key"] for f in by_key[key]["fields"]}
+
+    _dispatch("connections.set", {
+        "key": "web_ddgs", "values": {"enabled": True, "default": True},
+    })
+    card = _list_by_key()["web_ddgs"]
+    assert card["values"]["default"] is True
+
+
 def test_brave_card_clear(isolated_home):
     _dispatch("connections.set", {
         "key": "web_brave", "values": {"enabled": True, "api_key": "BSA-x"},

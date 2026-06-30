@@ -411,17 +411,20 @@ class GatewayConfig(BaseModel):
 class DdgsProviderConfig(BaseModel):
     """DuckDuckGo (ddgs) backend — no key, opt-in toggle."""
     enabled: bool = False
+    default: bool = False  # mark as the active web search backend
 
 
 class SearxngProviderConfig(BaseModel):
     """SearXNG backend — self-hosted instance URL + opt-in toggle."""
     enabled: bool = False
+    default: bool = False  # mark as the active web search backend
     url: str = ""
 
 
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
     enabled: bool = True  # Brave/default backend on/off (connections card toggle)
+    default: bool = False  # mark Brave as the active web search backend
     api_key: str = ""  # Brave Search API key (self-hosted, optional)
     max_results: int = 5
     proxy_url: str = ""  # Flowly Cloud search proxy; empty + logged-in falls back to canonical /api/v1/search; self-host: use BRAVE_API_KEY instead
