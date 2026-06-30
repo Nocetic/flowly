@@ -38,8 +38,9 @@ Tools are the functions the agent calls to act on the world — reading files, r
 
 | Tool | What it does | Gated by |
 |---|---|---|
-| `web_search` | Web search (Brave), returns titles/URLs/snippets. | `BRAVE_API_KEY` or Flowly proxy |
-| `web_fetch` | Fetch a URL → markdown/text with query-relevant extraction. | — |
+| `web_search` | Web search via the active backend (Brave, DuckDuckGo, SearXNG, Tavily, Exa, Firecrawl, Parallel), returns titles/URLs/snippets. | A configured search backend ([Web & research](/docs/features/web)) |
+| `web_fetch` | Fetch **one** URL → markdown/text with query-relevant extraction. | — |
+| `web_extract` | Extract clean content from **two or more** URLs via the active extract backend (Tavily/Exa/Firecrawl/Parallel), or local readability. | — (paid backends are optional) |
 | `x_search` | Grok-backed research over X/Twitter. | xAI OAuth or `XAI_API_KEY` |
 
 ## Browser & desktop
