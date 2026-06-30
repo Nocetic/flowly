@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Install Flowly CLI/TUI on macOS and Linux with uv.
+# Install Flowly CLI/TUI on macOS and Linux from a git checkout.
 #
-# uv can download and manage Python itself, so this installer does not require
-# a system Python installation. The installed command is the PyPI package's
-# console script: flowly.
+# The installer clones the Flowly repository, builds an isolated virtualenv with
+# uv (which downloads and manages Python itself — no system Python required), and
+# installs Flowly into it as an editable checkout. Because the install lives in a
+# real git checkout, `flowly update` can fast-forward it with `git pull` instead
+# of waiting for a PyPI release. The installed command is the console script:
+# flowly.
 
 set -euo pipefail
 
-FLOWLY_PACKAGE="${FLOWLY_PACKAGE:-flowly-ai}"
+FLOWLY_REPO_URL="${FLOWLY_REPO_URL:-https://github.com/Nocetic/flowly.git}"
+FLOWLY_BRANCH="${FLOWLY_BRANCH:-main}"
+FLOWLY_SRC="${FLOWLY_SRC:-${HOME}/.local/share/flowly/repo}"
+FLOWLY_VENV="${FLOWLY_VENV:-${HOME}/.local/share/flowly/venv}"
 FLOWLY_PYTHON="${FLOWLY_PYTHON:-3.12}"
 FLOWLY_SKIP_BOOTSTRAP="${FLOWLY_SKIP_BOOTSTRAP:-0}"
 FLOWLY_NO_PATH_UPDATE="${FLOWLY_NO_PATH_UPDATE:-0}"
@@ -16,30 +22,51 @@ FLOWLY_TOOL_BIN_DIR="${FLOWLY_TOOL_BIN_DIR:-}"
 
 usage() {
   cat <<'EOF'
-Install Flowly CLI/TUI with uv.
+Install Flowly CLI/TUI from a git checkout with uv.
 
 Usage:
   curl -fsSL https://useflowlyapp.com/install.sh | bash
   bash scripts/install.sh [options]
 
 Options:
+  --branch NAME         Git branch to track (default: main)
+  --src PATH            Where to clone the checkout (default: ~/.local/share/flowly/repo)
   --python VERSION      Python version managed by uv (default: 3.12)
-  --bin-dir PATH        Install the flowly launcher into PATH via UV_TOOL_BIN_DIR
+  --bin-dir PATH        Install the flowly launcher into this PATH directory
   --skip-bootstrap      Do not run "flowly bootstrap"
   --skip-system-deps    Do not install optional tools (ffmpeg, ripgrep)
   --no-path-update      Do not edit shell profile files
   -h, --help            Show this help
 
 Environment:
-  FLOWLY_PACKAGE          PyPI package name (default: flowly-ai)
-  FLOWLY_PYTHON           Python version for uv managed install (default: 3.12)
+  FLOWLY_REPO_URL         Git remote to clone (default: GitHub)
+  FLOWLY_BRANCH           Branch to track (default: main)
+  FLOWLY_SRC              Checkout directory (default: ~/.local/share/flowly/repo)
+  FLOWLY_VENV             Virtualenv directory (default: ~/.local/share/flowly/venv)
+  FLOWLY_PYTHON           Python version for the uv managed venv (default: 3.12)
   FLOWLY_SKIP_SYSTEM_DEPS Set to 1 to skip optional tool install
-  FLOWLY_TOOL_BIN_DIR     Optional uv tool executable directory
+  FLOWLY_TOOL_BIN_DIR     Directory to place the flowly launcher in
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --branch)
+      FLOWLY_BRANCH="$2"
+      shift 2
+      ;;
+    --branch=*)
+      FLOWLY_BRANCH="${1#--branch=}"
+      shift
+      ;;
+    --src)
+      FLOWLY_SRC="$2"
+      shift 2
+      ;;
+    --src=*)
+      FLOWLY_SRC="${1#--src=}"
+      shift
+      ;;
     --python)
       FLOWLY_PYTHON="$2"
       shift 2
@@ -97,7 +124,6 @@ detect_platform() {
 refresh_path() {
   export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
   if [[ -n "$FLOWLY_TOOL_BIN_DIR" ]]; then
-    export UV_TOOL_BIN_DIR="$FLOWLY_TOOL_BIN_DIR"
     export PATH="${FLOWLY_TOOL_BIN_DIR}:${PATH}"
   fi
 }
@@ -131,12 +157,13 @@ ensure_uv() {
   log "Using uv: $(uv --version)"
 }
 
-uv_bin_dir() {
+# Where to drop the flowly launcher: an explicit override, else uv's bin dir
+# (usually ~/.local/bin), else ~/.local/bin.
+launcher_bin_dir() {
   if [[ -n "$FLOWLY_TOOL_BIN_DIR" ]]; then
     printf '%s\n' "$FLOWLY_TOOL_BIN_DIR"
     return 0
   fi
-
   if uv tool dir --bin >/dev/null 2>&1; then
     uv tool dir --bin
   else
@@ -278,6 +305,109 @@ pkg_install() {
   esac
 }
 
+# ── Git ─────────────────────────────────────────────────────────────────────
+#
+# Unlike the optional tools above, git is REQUIRED: the install is a checkout and
+# `flowly update` fast-forwards it. Install it via the platform package manager
+# when missing; bail with a clear hint if we can't.
+ensure_git() {
+  if command -v git >/dev/null 2>&1; then
+    log "Using git: $(git --version)"
+    return 0
+  fi
+
+  log "git not found — installing it (required for the git-checkout install)..."
+  local pm
+  pm="$(detect_pkg_manager)"
+  if [[ -z "$pm" ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      err "git is required. Install the Xcode Command Line Tools first:"
+      err "  xcode-select --install"
+    else
+      err "git is required and no supported package manager was found."
+      err "Install git with your package manager, then re-run this installer."
+    fi
+    exit 1
+  fi
+
+  if ! pkg_install "$pm" git; then
+    err "Could not install git automatically. Install it manually: ${pm} install git"
+    exit 1
+  fi
+  refresh_path
+  if ! command -v git >/dev/null 2>&1; then
+    err "git was installed but is not on PATH. Open a new shell and retry."
+    exit 1
+  fi
+  ok "Installed git: $(git --version)"
+}
+
+# ── Migration ───────────────────────────────────────────────────────────────
+#
+# Older installs used `uv tool install flowly-ai` (a PyPI package). Remove it so
+# its launcher doesn't shadow the new git-checkout launcher and to free the
+# package name. Best-effort — a missing/old uv must never abort a fresh install.
+migrate_uv_tool() {
+  if uv tool list 2>/dev/null | grep -q '^flowly-ai\b'; then
+    log "Removing the previous PyPI install (uv tool flowly-ai)..."
+    uv tool uninstall flowly-ai >/dev/null 2>&1 || true
+  fi
+}
+
+# ── Source checkout ─────────────────────────────────────────────────────────
+#
+# Clone the repo, or fast-forward an existing checkout to the tip of the tracked
+# branch. The clone is a full single-branch clone (NOT --depth 1) so that
+# `flowly update`'s `git rev-list --count HEAD..origin/<branch>` can measure how
+# far behind the checkout is.
+clone_or_update_repo() {
+  if [[ -d "${FLOWLY_SRC}/.git" ]]; then
+    log "Updating existing checkout at ${FLOWLY_SRC}..."
+    git -C "$FLOWLY_SRC" remote set-url origin "$FLOWLY_REPO_URL" 2>/dev/null || true
+    git -C "$FLOWLY_SRC" fetch --prune origin "$FLOWLY_BRANCH"
+    git -C "$FLOWLY_SRC" checkout "$FLOWLY_BRANCH" 2>/dev/null \
+      || git -C "$FLOWLY_SRC" checkout -B "$FLOWLY_BRANCH" "origin/${FLOWLY_BRANCH}"
+    git -C "$FLOWLY_SRC" reset --hard "origin/${FLOWLY_BRANCH}"
+    return 0
+  fi
+
+  if [[ -e "$FLOWLY_SRC" && -n "$(ls -A "$FLOWLY_SRC" 2>/dev/null)" ]]; then
+    err "Install directory ${FLOWLY_SRC} exists but is not a git checkout."
+    err "Move it aside (or set FLOWLY_SRC to another path), then re-run."
+    exit 1
+  fi
+
+  log "Cloning ${FLOWLY_REPO_URL} (branch ${FLOWLY_BRANCH}) into ${FLOWLY_SRC}..."
+  mkdir -p "$(dirname "$FLOWLY_SRC")"
+  git clone --branch "$FLOWLY_BRANCH" --single-branch "$FLOWLY_REPO_URL" "$FLOWLY_SRC"
+}
+
+# Build the isolated venv and install Flowly into it as an editable checkout.
+# Editable + a venv OUTSIDE the checkout is what keeps `detect_install_mode()`
+# reporting "source" (sys.prefix is this venv, not uv/tools or pipx/venvs), which
+# is what routes `flowly update` to the git-pull path.
+install_from_source() {
+  log "Creating Flowly virtualenv at ${FLOWLY_VENV} (Python ${FLOWLY_PYTHON})..."
+  uv venv --python "$FLOWLY_PYTHON" "$FLOWLY_VENV"
+
+  log "Installing Flowly (editable) from ${FLOWLY_SRC}..."
+  uv pip install --python "${FLOWLY_VENV}/bin/python" -e "$FLOWLY_SRC"
+}
+
+# Symlink the venv's flowly entry point into a PATH directory. The symlink keeps
+# the venv's interpreter shebang, so `flowly` always runs against this venv.
+install_launcher() {
+  local bin_dir="$1"
+  local venv_flowly="${FLOWLY_VENV}/bin/flowly"
+
+  if [[ ! -x "$venv_flowly" ]]; then
+    err "The editable install did not produce ${venv_flowly}."
+    exit 1
+  fi
+  mkdir -p "$bin_dir"
+  ln -sf "$venv_flowly" "${bin_dir}/flowly"
+}
+
 install_system_deps() {
   [[ "$FLOWLY_SKIP_SYSTEM_DEPS" == "1" ]] && return 0
 
@@ -317,12 +447,23 @@ install_system_deps() {
 main() {
   detect_platform
   ensure_uv
+  ensure_git
 
-  log "Installing ${FLOWLY_PACKAGE} with uv managed Python ${FLOWLY_PYTHON}..."
-  uv tool install --python "$FLOWLY_PYTHON" "$FLOWLY_PACKAGE" --force
+  clone_or_update_repo
+  install_from_source
+
+  # Prove the new venv works before touching any previous install, so a failed
+  # clone/build can never leave the machine with no working flowly.
+  "${FLOWLY_VENV}/bin/flowly" --version >/dev/null
+
+  # Only now retire the old PyPI/uv-tool install — and BEFORE we create our own
+  # launcher, so uv's uninstall (which deletes the launchers it created in the
+  # same bin dir) can't clobber the symlink we're about to write.
+  migrate_uv_tool
 
   local bin_dir flowly_bin
-  bin_dir="$(uv_bin_dir)"
+  bin_dir="$(launcher_bin_dir)"
+  install_launcher "$bin_dir"
   export PATH="${bin_dir}:${PATH}"
 
   if ! flowly_bin="$(resolve_flowly "$bin_dir")"; then
@@ -337,7 +478,7 @@ main() {
 
   install_system_deps
 
-  ok "Flowly CLI installed."
+  ok "Flowly CLI installed (git checkout: ${FLOWLY_SRC})."
   printf '\n'
 
   # First-run onboarding: when a terminal is available (even under
