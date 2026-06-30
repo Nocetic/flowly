@@ -387,11 +387,19 @@ clone_or_update_repo() {
 # reporting "source" (sys.prefix is this venv, not uv/tools or pipx/venvs), which
 # is what routes `flowly update` to the git-pull path.
 install_from_source() {
-  log "Creating Flowly virtualenv at ${FLOWLY_VENV} (Python ${FLOWLY_PYTHON})..."
-  # --clear: the installer is meant to be re-run (it's the documented way to
-  # force-refresh an install), so a venv already existing at this path from a
-  # prior run must not abort it.
-  uv venv --clear --python "$FLOWLY_PYTHON" "$FLOWLY_VENV"
+  if [[ -x "${FLOWLY_VENV}/bin/python" ]]; then
+    # The installer is meant to be re-run (it's the documented way to
+    # force-refresh an install). Reuse a healthy venv instead of recreating it:
+    # on Windows a service may have its python.exe open, and --clear deleting
+    # an in-use interpreter fails with a sharing violation. `uv pip install -e`
+    # below is idempotent against an existing venv, same as `flowly update`.
+    log "Reusing existing virtualenv at ${FLOWLY_VENV}..."
+  else
+    log "Creating Flowly virtualenv at ${FLOWLY_VENV} (Python ${FLOWLY_PYTHON})..."
+    # --clear: only reached when (re)creating, to wipe any broken/partial
+    # leftovers from an interrupted previous run.
+    uv venv --clear --python "$FLOWLY_PYTHON" "$FLOWLY_VENV"
+  fi
 
   log "Installing Flowly (editable) from ${FLOWLY_SRC}..."
   uv pip install --python "${FLOWLY_VENV}/bin/python" -e "$FLOWLY_SRC"

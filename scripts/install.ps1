@@ -198,14 +198,24 @@ function Update-Checkout {
 # "source" (sys.prefix is this venv, not uv/tools or pipx/venvs), which routes
 # `flowly update` to the in-place git pull.
 function Install-FromSource {
-    Write-Step "Creating Flowly virtualenv at $Venv (Python $Python)..."
-    # --clear: the installer is meant to be re-run (it's the documented way to
-    # force-refresh an install), so a venv already existing at this path from a
-    # prior run must not abort it.
-    & uv venv --clear --python $Python $Venv
-    if ($LASTEXITCODE -ne 0) { throw 'uv venv failed.' }
-
     $venvPy = Join-Path $Venv 'Scripts\python.exe'
+    if (Test-Path $venvPy) {
+        # The installer is meant to be re-run (it's the documented way to
+        # force-refresh an install). Reuse a healthy venv instead of recreating
+        # it: if the gateway is running as a service, it has this python.exe
+        # open, and Windows refuses to delete an in-use executable (--clear
+        # would fail with a sharing violation). `uv pip install -e` below is
+        # idempotent against an existing venv, same as `flowly update`.
+        Write-Step "Reusing existing virtualenv at $Venv ..."
+    }
+    else {
+        Write-Step "Creating Flowly virtualenv at $Venv (Python $Python)..."
+        # --clear: only reached when (re)creating, to wipe any broken/partial
+        # leftovers from an interrupted previous run.
+        & uv venv --clear --python $Python $Venv
+        if ($LASTEXITCODE -ne 0) { throw 'uv venv failed.' }
+    }
+
     Write-Step "Installing Flowly (editable) from $Src ..."
     & uv pip install --python $venvPy -e $Src
     if ($LASTEXITCODE -ne 0) { throw 'uv pip install failed.' }
