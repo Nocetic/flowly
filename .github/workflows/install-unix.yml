@@ -1,0 +1,94 @@
+name: install-unix
+
+# Verifies the git-checkout installer actually works on macOS and Linux: clone
+# + uv venv + editable install + launcher + `flowly update`'s "source" mode
+# detection, then a second run to prove re-running the installer (the
+# documented way to force-refresh) doesn't choke on its own prior output.
+#
+# Runs against THIS checkout (a local clone, not a hardcoded branch name) so
+# it always tests the code actually being proposed, not a stale ref.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/install.sh"
+      - "scripts/install.ps1"
+      - "flowly/cli/entry.py"
+      - "flowly/cli/update_cmd.py"
+      - "flowly/__main__.py"
+      - ".github/workflows/install-unix.yml"
+  pull_request:
+    paths:
+      - "scripts/install.sh"
+      - "scripts/install.ps1"
+      - "flowly/cli/entry.py"
+      - "flowly/cli/update_cmd.py"
+      - "flowly/__main__.py"
+      - ".github/workflows/install-unix.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve a local branch name to clone (checkout may be detached)
+        run: |
+          branch="$(git rev-parse --abbrev-ref HEAD)"
+          if [[ "$branch" == "HEAD" ]]; then
+            git checkout -B ci-install-test
+            branch="ci-install-test"
+          fi
+          echo "Testing branch: $branch"
+          echo "INSTALL_TEST_BRANCH=$branch" >> "$GITHUB_ENV"
+
+      - name: Run install.sh (clones this checkout into a temp src/venv)
+        env:
+          FLOWLY_REPO_URL: ${{ github.workspace }}
+          FLOWLY_BRANCH: ${{ env.INSTALL_TEST_BRANCH }}
+          FLOWLY_SRC: ${{ runner.temp }}/flowly-src
+          FLOWLY_VENV: ${{ runner.temp }}/flowly-venv
+        run: |
+          bash scripts/install.sh --skip-bootstrap --no-path-update --skip-system-deps
+
+      - name: Verify the install
+        env:
+          FLOWLY_VENV: ${{ runner.temp }}/flowly-venv
+        run: |
+          venv_py="${FLOWLY_VENV}/bin/python"
+          echo "--- venv python ---"
+          "$venv_py" --version
+          echo "--- flowly --version (via python -m) ---"
+          "$venv_py" -m flowly --version
+          echo "--- detect_install_mode ---"
+          mode="$("$venv_py" -c 'from flowly.cli.update_cmd import detect_install_mode; print(detect_install_mode())')"
+          echo "mode = $mode"
+          if [[ "$mode" != "source" ]]; then
+            echo "Expected install mode 'source', got '$mode'" >&2
+            exit 1
+          fi
+          echo "--- launcher (symlink) ---"
+          launcher="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")/flowly"
+          if [[ ! -x "$launcher" ]]; then
+            echo "Launcher not found at $launcher" >&2
+            exit 1
+          fi
+          "$launcher" --version
+
+      - name: Re-run install.sh (idempotency / re-run-to-update path)
+        env:
+          FLOWLY_REPO_URL: ${{ github.workspace }}
+          FLOWLY_BRANCH: ${{ env.INSTALL_TEST_BRANCH }}
+          FLOWLY_SRC: ${{ runner.temp }}/flowly-src
+          FLOWLY_VENV: ${{ runner.temp }}/flowly-venv
+        run: |
+          bash scripts/install.sh --skip-bootstrap --no-path-update --skip-system-deps

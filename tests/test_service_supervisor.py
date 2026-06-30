@@ -95,6 +95,35 @@ def test_windows_launcher_has_no_console(_win_install):
     assert "flowly.exe" in vbs
 
 
+def test_resolve_exec_argv_avoids_cmd_shim(monkeypatch):
+    """The git-checkout install's Windows launcher (``flowly.cmd``) is on
+    PATH — ``shutil.which("flowly")`` resolving to it must NOT be used
+    verbatim for the service argv, since a ``.cmd`` requires ``cmd.exe`` to
+    execute, reintroducing the console that test_windows_launcher_has_no_console
+    exists to forbid. Must fall back to the running interpreter with
+    ``-m flowly`` instead — that interpreter IS the venv python (this process
+    was itself launched by ``flowly.cmd``'s ``python -m flowly``).
+    """
+    import sys
+
+    from flowly.cli import service_cmd
+
+    monkeypatch.setattr(sys, "argv", ["__main__.py"])
+    monkeypatch.setattr(
+        sys, "executable", r"C:\Users\u\AppData\Local\Flowly\venv\Scripts\python.exe"
+    )
+    monkeypatch.setattr(
+        service_cmd.shutil, "which",
+        lambda name: r"C:\Users\u\AppData\Local\Flowly\bin\flowly.cmd" if name == "flowly" else None,
+    )
+
+    argv = service_cmd._resolve_flowly_exec_argv()
+
+    assert argv[0].lower().endswith("python.exe")
+    assert argv[1:] == ["-m", "flowly"]
+    assert not any(a.lower().endswith((".cmd", ".bat")) for a in argv)
+
+
 def test_windows_launcher_honours_stop_flag(_win_install):
     vbs, _xml = _win_install
     # The loop checks a stop-flag so `flowly service stop` can end it cleanly,

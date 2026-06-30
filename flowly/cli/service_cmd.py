@@ -64,7 +64,14 @@ def _resolve_flowly_exec_argv() -> list[str]:
          launchd/systemd service always targets the bundled runtime.
       2. argv[0] starts with "flowly" and points at an existing file → trust it
          (covers direct invocation of either `flowly` or `flowly-bin`).
-      3. `flowly` on PATH (legacy pip/uv installs).
+      3. `flowly` on PATH (legacy pip/uv installs) — UNLESS it resolves to a
+         `.cmd`/`.bat` shim (the git-checkout install's Windows launcher),
+         which Windows can only execute via `cmd.exe /c`. The Windows service
+         supervisor deliberately runs with no console in the chain (see
+         test_windows_launcher_has_no_console) so a logon CTRL_CLOSE broadcast
+         can't reap the gateway; a `.cmd` would reintroduce a console. Run the
+         current interpreter with `-m flowly` instead — equally correct (this
+         process IS that interpreter) and console-free.
       4. `~/.local/bin/flowly` fallback.
       5. `uv run flowly` as a last resort.
     """
@@ -92,7 +99,10 @@ def _resolve_flowly_exec_argv() -> list[str]:
     # (3) PATH lookup
     flowly_bin = shutil.which("flowly")
     if flowly_bin:
-        return [str(Path(flowly_bin).expanduser())]
+        flowly_path = Path(flowly_bin).expanduser()
+        if flowly_path.suffix.lower() in (".cmd", ".bat"):
+            return [str(exe), "-m", "flowly"]
+        return [str(flowly_path)]
 
     # (4) Standard user-local path
     local_bin = (Path.home() / ".local" / "bin" / "flowly").expanduser()

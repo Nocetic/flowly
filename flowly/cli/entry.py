@@ -15,7 +15,30 @@ Resolution order:
 from __future__ import annotations
 
 import os
+import platform
 import sys
+
+
+def _configure_windows_utf8_stdio() -> None:
+    """Force UTF-8 stdout/stderr on Windows so Rich's unicode (the ``✦`` logo,
+    checkmarks) doesn't crash every command.
+
+    Outside a UTF-8-aware terminal (a piped/redirected stream, a legacy
+    console host, certain locales), Python defaults stdio to the legacy code
+    page (cp1252 etc.) on Windows, and the first ``console.print`` with a
+    non-cp1252 character raises ``UnicodeEncodeError`` — aborting even
+    ``flowly --version``. ``errors="replace"`` degrades to ``?`` instead of
+    crashing. Mirrors the fix already applied to the gateway subcommand
+    (``gateway_cmd.py``); hoisted here so it covers every command, not just
+    ``gateway``.
+    """
+    if platform.system() != "Windows":
+        return
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def _configure_bundled_ssl_ca() -> None:
@@ -50,6 +73,9 @@ def _configure_bundled_ssl_ca() -> None:
 
 def main() -> None:
     """Parse profile flag, set FLOWLY_HOME, then launch the typer app."""
+    # Belt-and-braces: do this before anything else might print.
+    _configure_windows_utf8_stdio()
+
     # Sandbox first — may not return. If sandboxing is on and we
     # haven't already wrapped, this re-execs the current command
     # under sandbox-exec(1) and the next line never runs. The inner

@@ -9,7 +9,7 @@ no-op with guidance instead of attempting (and failing at) a package upgrade.
 
 Modes and their upgrade command:
     managed   → no-op (Flowly Desktop manages the binary)
-    source    → no-op with guidance (git checkout; `git pull` + reinstall)
+    source    → git pull --ff-only + reinstall (editable git checkout)
     uv-tool   → uv tool upgrade flowly-ai
     pipx      → pipx upgrade flowly-ai
     pip       → <python> -m pip install --upgrade flowly-ai
@@ -203,6 +203,131 @@ def _windows_self_update(cmd: list[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Source (git checkout) self-update — git pull --ff-only + reinstall
+# ---------------------------------------------------------------------------
+def _repo_root() -> Path | None:
+    """The git checkout root when Flowly runs from a source/editable install."""
+    try:
+        import flowly
+
+        root = Path(flowly.__file__).resolve().parent.parent  # parent of flowly/
+        return root if (root / ".git").exists() else None
+    except Exception:
+        return None
+
+
+def _git(repo: Path, *args: str, capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=capture, text=True, check=False,
+    )
+
+
+def _reinstall_editable(repo: Path) -> int:
+    """Re-resolve dependencies for the editable checkout after a pull.
+
+    Prefers uv (the installer uses it, and a uv-managed venv may not ship pip);
+    falls back to this interpreter's pip.
+    """
+    import shutil
+
+    if shutil.which("uv"):
+        cmd = ["uv", "pip", "install", "--python", sys.executable, "-e", str(repo)]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "-e", str(repo)]
+    console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
+    try:
+        return subprocess.run(cmd, check=False).returncode
+    except FileNotFoundError:
+        console.print(f"[red]✗[/red] [bold]{cmd[0]}[/bold] not found for reinstall.")
+        return 1
+
+
+def _update_source(*, check_only: bool, force: bool, restart: bool) -> int:
+    """Update a git-checkout install in place (git pull --ff-only + reinstall).
+
+    Pulls the checkout's current branch from origin, autostashing local changes,
+    then reinstalls deps and restarts the gateway. Mirrors the managed/PyPI
+    paths' UX (``--check``, up-to-date short-circuit) for a source install.
+    """
+    repo = _repo_root()
+    if repo is None:
+        console.print("[yellow]Not a git checkout — nothing to git-update.[/yellow]")
+        return 1
+
+    branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if not branch or branch == "HEAD":
+        console.print(
+            "[yellow]Detached HEAD[/yellow] — check out a branch, then re-run "
+            "[bold]flowly update[/bold]."
+        )
+        return 1
+
+    console.print(f"[dim]Fetching origin/{branch}…[/dim]")
+    if _git(repo, "fetch", "origin", branch, capture=False).returncode != 0:
+        console.print("[red]✗[/red] git fetch failed — check your network / remote.")
+        return 1
+
+    behind_out = _git(repo, "rev-list", "--count", f"HEAD..origin/{branch}").stdout.strip()
+    behind = int(behind_out) if behind_out.isdigit() else 0
+
+    if behind == 0 and not force:
+        console.print(
+            f"[green]✓[/green] Flowly is up to date ([bold]{current_version()}[/bold], {branch})."
+        )
+        return 0
+    if behind:
+        plural = "s" if behind != 1 else ""
+        console.print(
+            f"Update available: [bold cyan]{behind}[/bold cyan] new commit{plural} on {branch}."
+        )
+
+    if check_only:
+        return 0
+
+    # Recover from a half-finished previous update so stash/pull don't abort.
+    if _git(repo, "ls-files", "--unmerged").stdout.strip():
+        _git(repo, "reset", "-q")
+
+    stashed = False
+    if _git(repo, "status", "--porcelain").stdout.strip():
+        console.print("[dim]Stashing local changes…[/dim]")
+        if _git(
+            repo, "stash", "push", "--include-untracked", "-m", "flowly-update-autostash"
+        ).returncode == 0:
+            stashed = True
+
+    console.print(f"[dim]$ git pull --ff-only origin {branch}[/dim]")
+    if _git(repo, "pull", "--ff-only", "origin", branch, capture=False).returncode != 0:
+        console.print(
+            "[red]✗[/red] git pull failed (not a fast-forward?). Resolve it in:\n"
+            f"  [bold]{repo}[/bold]"
+        )
+        if stashed:
+            _git(repo, "stash", "pop")
+        return 1
+
+    if stashed:
+        console.print("[dim]Restoring local changes…[/dim]")
+        if _git(repo, "stash", "pop").returncode != 0:
+            console.print("[yellow]⚠ Stash pop had conflicts — resolve them in the repo.[/yellow]")
+
+    console.print("Reinstalling dependencies...")
+    rc = _reinstall_editable(repo)
+    if rc != 0:
+        console.print(f"[red]✗[/red] Dependency reinstall failed (exit {rc}).")
+        return rc
+
+    clear_pycache()
+    console.print("[green]✓[/green] Updated.")
+    if restart:
+        _restart_gateway()
+    else:
+        console.print("[dim]Skipped restart — run [bold]flowly restart[/bold] when ready.[/dim]")
+    return 0
+
+
 def run_update(
     *,
     check_only: bool = False,
@@ -223,12 +348,7 @@ def run_update(
         return 0
 
     if mode == "source":
-        console.print(
-            "[yellow]Source checkout[/yellow] — update with git, then reinstall:\n"
-            "  [bold]git pull[/bold]\n"
-            "  [bold]uv pip install -e \".[dev]\"[/bold]  (or your usual editable install)"
-        )
-        return 0
+        return _update_source(check_only=check_only, force=force, restart=restart)
 
     latest = _pypi_latest()
     if latest is None:
