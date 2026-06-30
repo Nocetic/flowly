@@ -387,8 +387,11 @@ class WebFetchTool(Tool):
 
     name = "web_fetch"
     description = (
-        "Fetch URL and extract readable content (HTML → markdown/text). "
-        "Optionally pass a 'query' parameter to get the most relevant passages."
+        "Fetch and read a SINGLE URL — extracts readable content "
+        "(HTML → markdown/text) via Readability. Optionally pass a 'query' for "
+        "relevance-focused passages. For several URLs at once, or JS-heavy / "
+        "anti-bot pages when an extract backend (Firecrawl/Tavily/Exa/Parallel) "
+        "is configured, use web_extract instead."
     )
     parameters = {
         "type": "object",

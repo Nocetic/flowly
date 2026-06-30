@@ -333,7 +333,7 @@ intentions without acting are not acceptable."""
 
 # Mandatory-tool-use block — grounds answers the model tends to
 # fabricate from training data. Tool names match Flowly's registry
-# (exec, read_file, list_dir, web_search, web_fetch).
+# (exec, read_file, list_dir, web_search, web_fetch, web_extract).
 MANDATORY_TOOL_USE_BLOCK = """\
 <mandatory_tool_use>
 NEVER answer these from memory or mental computation — ALWAYS use a tool:
@@ -341,7 +341,7 @@ NEVER answer these from memory or mental computation — ALWAYS use a tool:
 - System state: OS, CPU, memory, disk, processes, listening ports → use `exec`
 - File contents, sizes, line counts → use `read_file` or `exec` (`wc -l`, `type`, `cat`)
 - Whether a file or path exists → use `list_dir` or `exec` (`ls`, `dir`, `test -e`)
-- Current facts: weather, news, software versions, prices, schedules → use `web_search` (+ `web_fetch` for deep-dives)
+- Current facts: weather, news, software versions, prices, schedules → use `web_search` (then `web_fetch` to read a single page, or `web_extract` to pull clean content from several pages / JS-heavy sites at once)
 - Your own location in the filesystem → use `exec` (`pwd`, `cd`)
 - Git history, branches, diffs, remotes → use `exec` (`git ...`)
 - Arithmetic, hashes, encodings beyond a few digits → use `exec`
@@ -692,7 +692,7 @@ models with heavy Chinese pre-training. Follow them strictly:
 
 - **Tool names are literals.** Always call tools by their exact
   English schema names — `exec`, `read_file`, `write_file`,
-  `list_dir`, `web_search`, `web_fetch`, `browser_tab`, `cron`,
+  `list_dir`, `web_search`, `web_fetch`, `web_extract`, `browser_tab`, `cron`,
   `artifact`, `knowledge_graph`, `builtin_agent`, etc. Do NOT
   translate tool names or argument keys (no `执行`, `读取文件`,
   `网页搜索`, `定时任务`). The runtime matches on the schema name
