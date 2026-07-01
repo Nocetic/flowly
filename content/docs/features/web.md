@@ -100,10 +100,18 @@ extract-capable one is used instead.
 ## Optional dependencies
 
 The keyless/REST backends (Brave, SearXNG, Tavily) need nothing extra. The SDK
-backends are optional and lazy-loaded — install them with the `search` extra:
+backends are optional and lazy-loaded — install them with the `search` extra,
+into the same environment Flowly runs from:
 
 ```bash
-pip install "flowly-ai[search]"   # ddgs, exa-py, firecrawl-py, parallel-web
+# git-checkout install (default from the install script) — reinstall the
+# checkout editable WITH the extra, so it stays a live git checkout
+uv pip install --python ~/.local/share/flowly/venv/bin/python \
+  -e ~/.local/share/flowly/repo"[search]"
+
+# packaged pip / uv-tool install
+pip install "flowly-ai[search]"                 # ddgs, exa-py, firecrawl-py, parallel-web
+uv tool install flowly-ai --with "flowly-ai[search]"
 ```
 
 If a backend's package isn't installed, its card shows that and the tool returns

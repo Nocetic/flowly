@@ -45,9 +45,17 @@ Channel tokens, plugin enable/disable, and similar need a gateway bounce:
 need a restart.)
 
 **"flowly: command not found" after install.**
-The launcher isn't on PATH yet — open a new terminal, or add the install dir to
-PATH. The [install script](/docs/getting-started/installation) writes this for
-you; a new shell picks it up.
+The launcher is on PATH in your shell *profile*, but the shell you ran the
+installer from hasn't re-read it — most common right after a `curl … | bash`
+install, which runs in a child shell. Activate it in the current shell with the
+line the installer prints:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Or just open a new terminal — the [install script](/docs/getting-started/installation)
+already updated your shell profile, so fresh shells pick it up.
 
 **The bot doesn't start on boot (Linux).**
 systemd user services need *linger* enabled to run without an active login:
@@ -68,11 +76,12 @@ No. `flowly service install` tries Task Scheduler first and, if that's denied,
 automatically falls back to a Startup-folder launcher that runs the gateway at
 logon — no elevation required either way.
 
-**"flowly" isn't recognized after an update, or a `~lowly-ai` folder appears.**
-An interrupted `pip` upgrade — or one that ran while `flowly.exe` was locked —
-can leave a partial `~`-prefixed folder in your user site-packages. `flowly
-update` now relaunches itself on Windows to avoid the locked-exe case, but if you
-land in a half-broken state, delete the leftover and reinstall:
+**A `~lowly-ai` folder appears / "flowly" isn't recognized (packaged pip install).**
+Specific to a `pip install --user flowly-ai` install: an interrupted `pip`
+upgrade — or one that ran while `flowly.exe` was locked — can leave a partial
+`~`-prefixed folder in your user site-packages. `flowly update` now relaunches
+itself on Windows to avoid the locked-exe case, but if you land in a half-broken
+state, delete the leftover and reinstall:
 
 ```powershell
 $sp = python -m site --user-site
@@ -80,10 +89,15 @@ Remove-Item (Join-Path $sp "~lowly*") -Recurse -Force -ErrorAction SilentlyConti
 pip install --user --force-reinstall flowly-ai
 ```
 
-**Console glyphs crash the gateway on older Windows.**
-Fixed in current releases (the service forces UTF-8 output). If you're on an old
-build and see a `UnicodeEncodeError` / `cp1252` traceback, `flowly update` to the
-latest.
+A git-checkout install — the default from the install script — never touches
+site-packages, so this can't happen to it; re-run the installer or `flowly
+update` to repair one.
+
+**A `UnicodeEncodeError` / `cp1252` traceback on Windows.**
+Flowly's `✦` logo (and other Unicode) can't encode on a non-UTF-8 Windows
+console — a redirected/piped stream, or certain locales. Fixed in current
+releases: **every** `flowly` command now forces UTF-8 output (not just the
+gateway). If you hit it on an older build, `flowly update` to the latest.
 
 **Channel silent / not receiving.**
 Confirm the channel is `enabled` in config and that access control

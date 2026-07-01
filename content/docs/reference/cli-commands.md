@@ -19,7 +19,7 @@ The `flowly` command is the entry point for everything — running the agent, st
 | `flowly agent -m "..."` | Send a one-shot message to the agent. |
 | `flowly gateway` | Start the gateway daemon (channels run through it). |
 | `flowly login` / `logout` | Sign in / out of a Flowly account (OAuth, optional — BYOK works without it). |
-| `flowly update` | Update Flowly to the latest release. |
+| `flowly update` | Update Flowly in place — `git pull` for a git-checkout install, or the matching package upgrade (uv-tool/pipx/pip) otherwise. Auto-detects the install mode; `--check` previews, no-op inside Flowly Desktop. |
 | `flowly restart` | Restart the gateway (auto-detects service vs foreground). |
 | `flowly doctor` | Check configuration and runtime health (`--fix` to auto-repair). |
 | `flowly status` | Show Flowly status. |

@@ -87,6 +87,22 @@ These let tools pick up credentials from the environment instead of `config.json
 | `FLOWLY_BROWSER_PLAN_ENABLED` | `1` | Toggles the `browser_plan` tool. |
 | `FLOWLY_BROWSER_PLAN_PERSIST` | — | Controls browser-plan persistence. |
 
+## Install script
+
+Read only by the install script (`install.sh` / `install.ps1`), not by the
+running agent. They tune the git-checkout install; see [Installation](../getting-started/installation.md).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `FLOWLY_REPO_URL` | GitHub repo | Git remote the installer clones. |
+| `FLOWLY_BRANCH` | `main` | Branch to track (and that `flowly update` pulls). |
+| `FLOWLY_SRC` | `~/.local/share/flowly/repo` | Where the checkout is cloned. |
+| `FLOWLY_VENV` | `~/.local/share/flowly/venv` | Where the virtualenv is built (kept outside the checkout). |
+| `FLOWLY_PYTHON` | `3.12` | Python version uv provisions for the venv. |
+| `FLOWLY_SKIP_SYSTEM_DEPS` | `0` | Skip the optional `ffmpeg` / `ripgrep` install. |
+| `FLOWLY_SKIP_BOOTSTRAP` | `0` | Skip first-run onboarding. |
+| `FLOWLY_NO_PATH_UPDATE` | `0` | Don't edit shell profiles for PATH. |
+
 ## Related
 
 - [Configuration](../using-flowly/configuration.md)

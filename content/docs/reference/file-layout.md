@@ -55,12 +55,27 @@ sidecars):
 | `imessage-state.json` | iMessage channel watermark/state. |
 | `desktop-client-id` | Stable id for the paired desktop client. |
 
+## The install itself (not your data)
+
+The install script installs Flowly's **code** separately from your data, under
+`~/.local/share/flowly/`:
+
+| Path | What it is |
+| --- | --- |
+| `repo/` | The git checkout `flowly update` fast-forwards (`git pull`). |
+| `venv/` | The uv-managed virtualenv Flowly runs from (editable install of `repo/`). |
+
+The `flowly` launcher is a symlink into this venv, placed on your PATH. None of
+this is your data — you don't back it up; re-running the install script (or
+`flowly update`) reproduces it from git. A packaged `uv tool` / `pip` install
+lives wherever that tool keeps it instead, and has no `repo/`.
+
 ## Backing up
 
-A backup is just a copy of `~/.flowly/` while the gateway is stopped. To move to a
-new machine: stop the gateway, copy the directory, and start it there. Keep
-`config.json`, `.env`, and `credentials/` private — they hold your keys and
-tokens.
+A backup is just a copy of `~/.flowly/` while the gateway is stopped — that's
+your data. (Flowly's code lives elsewhere; see above.) To move to a new machine:
+stop the gateway, copy the directory, and start it there. Keep `config.json`,
+`.env`, and `credentials/` private — they hold your keys and tokens.
 
 > [!TIP]
 > Use `FLOWLY_HOME=/path/to/dir` (or `-p <profile>`) to run an isolated instance
