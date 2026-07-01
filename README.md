@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/banner.png" alt="Flowly — your personal AI agent, everywhere you work" width="100%">
+  <img src="assets/banner.png" alt="Flowly — the personal AI agent you own, everywhere you are" width="100%">
   <p>
     <a href="https://pypi.org/project/flowly-ai/"><img src="https://img.shields.io/pypi/v/flowly-ai?style=for-the-badge&label=pypi&color=7C5CFC" alt="PyPI"></a>
     <img src="https://img.shields.io/badge/python-≥3.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
@@ -8,7 +8,9 @@
   </p>
 </div>
 
-**Flowly is an open-source AI agent that runs on _your_ machine, meets you on every channel you already use, and gets better the longer you use it.** One shared memory, one library of skills, your own LLM keys. It remembers across conversations, maintains and improves itself over time, schedules its own work, and connects to anything that speaks [MCP](content/docs/features/mcp.md) — from a $5 VPS, a Mac mini, or the laptop in front of you.
+<p align="center"><b>Knows your world. Answers to you.</b></p>
+
+**Flowly is the personal AI agent you own** — it runs on _your_ machine, on _your_ LLM keys, and gets better the longer you use it. One governed **memory of your world** that learns across conversations and corrects itself, one library of skills, one agent that meets you on every channel you already use. It acts on your behalf in a visible, sandboxed loop, schedules its own work, and connects to anything that speaks [MCP](content/docs/features/mcp.md) — from a $5 VPS, a Mac mini, or the laptop in front of you. **Open source, yours to run, no account required.**
 
 <div align="center">
   <img src="assets/demo-tui.png" alt="Flowly terminal UI" width="80%">
@@ -55,7 +57,7 @@ flowly
 </tr>
 <tr>
   <td><b>A closed learning loop</b></td>
-  <td>Every fact you share becomes a <b>governed memory</b> with a calibrated trust score — 👍/👎 to retune it, and a background consolidation pass merges duplicates and retires stale notes. Structured facts also land in a <b>knowledge graph</b>. Opt in and Flowly mines your recurring procedures to <b>write and refine its own skills</b>, every change snapshotted and reversible. → <a href="docs/memory-governance-architecture.md">memory</a> · <a href="docs/skill-self-improvement-architecture.md">skills</a></td>
+  <td>Every fact you share becomes part of a governed <b>memory of your world</b> with a calibrated trust score — 👍/👎 to retune it, and a background consolidation pass merges duplicates and retires stale notes. Structured facts also land in a <b>knowledge graph</b>. Opt in and Flowly mines your recurring procedures to <b>write and refine its own skills</b>, every change snapshotted and reversible. → <a href="docs/memory-governance-architecture.md">memory</a> · <a href="docs/skill-self-improvement-architecture.md">skills</a></td>
 </tr>
 <tr>
   <td><b>135 built-in skills</b></td>
