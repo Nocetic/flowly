@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import time
 from typing import Any, TYPE_CHECKING
+
+from loguru import logger
 
 from flowly.agent.tools.base import Tool
 
@@ -36,6 +39,43 @@ def _unwrap_raw_envelope(params: Any) -> Any:
         if isinstance(parsed, dict):
             return parsed
     return params
+
+
+def _drop_unexpected_kwargs(tool: Tool, params: dict[str, Any]) -> dict[str, Any]:
+    """Strip kwargs the tool's ``execute`` signature can't accept.
+
+    Models occasionally invent an argument that isn't in the tool's JSON
+    schema (e.g. a ``count`` on ``x_search``). Passed straight through as
+    ``**params`` that raises ``TypeError: execute() got an unexpected keyword
+    argument`` — which the dispatcher turns into an opaque "Error executing
+    <tool>" and the call is wasted. Keep only the parameters ``execute``
+    actually names; if it declares ``**kwargs`` (VAR_KEYWORD) pass everything
+    through untouched. ``required`` params are already guaranteed present by
+    ``validate_tool_call``, so this can only drop non-schema extras.
+    """
+    try:
+        sig = inspect.signature(tool.execute)
+    except (TypeError, ValueError):
+        return params
+    accepts_var_keyword = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if accepts_var_keyword:
+        return params
+    allowed = {
+        name
+        for name, p in sig.parameters.items()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    dropped = [k for k in params if k not in allowed]
+    if dropped:
+        logger.debug(
+            "Dropping unexpected arg(s) {} not accepted by {}.execute",
+            dropped,
+            type(tool).__name__,
+        )
+    return {k: v for k, v in params.items() if k in allowed}
 
 
 def _extract_enum_values(schema: Any) -> list[Any] | None:
@@ -305,7 +345,7 @@ class ToolRegistry:
 
         t0 = time.monotonic()
         try:
-            result = await tool.execute(**params)
+            result = await tool.execute(**_drop_unexpected_kwargs(tool, params))
         except Exception as e:
             result = f"Error executing {name}: {str(e)}"
 

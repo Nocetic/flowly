@@ -246,3 +246,46 @@ class TestToolRegistry:
         reg.register(DummyTool("t"))
         result = await reg.execute("t", {})
         assert "Missing required" in result
+
+    @pytest.mark.asyncio
+    async def test_execute_drops_unexpected_kwarg_on_strict_signature(self):
+        """A model-invented arg not in the tool's execute() signature is
+        dropped instead of raising 'unexpected keyword argument'."""
+
+        class StrictTool(Tool):
+            def __init__(self):
+                self._name = "strict"
+
+            @property
+            def name(self) -> str:
+                return self._name
+
+            @property
+            def description(self) -> str:
+                return "strict-signature tool"
+
+            @property
+            def parameters(self) -> dict[str, Any]:
+                return {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                }
+
+            async def execute(self, query: str) -> str:
+                return f"ran:{query}"
+
+        reg = ToolRegistry()
+        reg.register(StrictTool())
+        # `count` is not in the schema nor the signature — must be dropped,
+        # not surfaced as "Error executing strict: ... unexpected keyword".
+        result = await reg.execute("strict", {"query": "hi", "count": 10})
+        assert result == "ran:hi"
+
+    @pytest.mark.asyncio
+    async def test_execute_keeps_kwargs_when_execute_accepts_var_keyword(self):
+        """Tools whose execute(**kwargs) accepts anything still get every arg."""
+        reg = ToolRegistry()
+        reg.register(DummyTool("t"))
+        result = await reg.execute("t", {"action": "go", "extra": 1})
+        assert "extra" in result
