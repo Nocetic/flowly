@@ -18,6 +18,7 @@ docs/*
 !docs/memory-governance-architecture.md
 !docs/skill-self-improvement-architecture.md
 !docs/internal-gateway-rpc-architecture.md
+!docs/petdex-floating-pet.md
 *.egg-info/
 *.egg
 *.pyc

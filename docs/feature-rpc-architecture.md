@@ -46,6 +46,36 @@ returning `willRestart: False` — no process bounce. Channel changes
 (`connections.set`) return `willRestart` from `card.needs_gateway_restart`
 and the gateway restarts itself.
 
+
+## Petdex floating pet RPCs
+
+The optional desktop pet is exposed through the same Feature RPC surface as
+models, connections, pairing, and credentials. The detailed bot-side contract is
+in [`docs/petdex-floating-pet.md`](petdex-floating-pet.md).
+
+Registered methods:
+
+| Method | Params | Result | Writes config/assets | Restart |
+| --- | --- | --- | --- | --- |
+| `pet.info` | `{}` | Active pet payload or `{"enabled": false}` | No | No |
+| `pet.gallery` | `{}` | Manifest/installed gallery with active flags | No | No |
+| `pet.select` | `{"slug": "..."}` | Enabled `pet.info` payload | Yes, after successful install | No |
+| `pet.disable` | `{}` | `{"enabled": false}` | Yes | No |
+| `pet.scale` | `{"scale": number}` | `{"ok": true, "scale": clamped}` | Yes | No |
+| `pet.thumb` | `{"slug": "..."}` | `{"slug": "...", "dataUri": "data:image/png;base64,..."}` | Thumbnail cache only | No |
+
+Implementation boundary:
+
+- The bot owns config, Petdex manifest access, host-pinned asset download,
+  profile-aware storage, spritesheet analysis, and thumbnail rendering.
+- The desktop app owns the floating window, drag handoff, canvas rendering, and
+  mapping live chat/tool/subagent activity to animation states.
+- TUI or other clients can call these RPCs to configure pets, but the bot never
+  renders a pet or opens a client window.
+
+Operationally, `Unknown RPC method: pet.info` means the client is newer than the
+running bot process or the gateway has not been restarted after updating.
+
 ## Auto-titles
 
 After the **first** user→assistant exchange, the agent loop names the
