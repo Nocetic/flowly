@@ -4876,7 +4876,7 @@ class AgentLoop:
             self.compaction.mark_memory_flush_done()
             # Reload history after flush
             history = session.get_history(max_messages=self.context_messages)
-            total_tokens = estimate_messages_tokens(history) + SYSTEM_PROMPT_TOKEN_OVERHEAD
+            total_tokens = estimate_messages_tokens(history) + system_prompt_tokens
 
         # Microcompaction: truncate old tool results to delay full compaction
         history = self.compaction.microcompact(history)
