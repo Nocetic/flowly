@@ -149,3 +149,112 @@ def status() -> None:
     console.print(f"codex CLI             : {'OK ' + info if ok else 'NOT available — ' + info}")
     if not ok:
         console.print("  Install: [cyan]npm i -g @openai/codex[/]  then  [cyan]codex login[/]")
+
+    # ChatGPT subscription (provider auth) — separate from the tool above.
+    from flowly.auth import openai_codex
+    payload = openai_codex.load_token_payload()
+    if payload is None:
+        console.print("ChatGPT subscription  : not connected — run `flowly codex login`")
+    else:
+        who = payload.email or "connected"
+        plan = f" · {payload.plan}" if payload.plan else ""
+        console.print(f"ChatGPT subscription  : {who}{plan}")
+
+
+@codex_app.command("login")
+def login(
+    device: bool = typer.Option(
+        False, "--device", help="Use the device-code flow (headless / no browser)."
+    ),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Print the URL instead of opening a browser."
+    ),
+    manual_paste: bool = typer.Option(
+        False, "--manual-paste", help="Paste the callback URL/code manually."
+    ),
+    set_active: bool = typer.Option(
+        True, "--set-active/--no-set-active",
+        help="Use the ChatGPT subscription as the active provider after login.",
+    ),
+    timeout_seconds: int = typer.Option(
+        300, "--timeout", help="Seconds to wait for the loopback callback."
+    ),
+) -> None:
+    """Sign in with ChatGPT (OpenAI Codex OAuth) to use your plan's GPT-5.x."""
+    import time
+
+    from flowly.auth import openai_codex
+
+    client_id = openai_codex.require_client_id()
+    try:
+        if device:
+            console.print("\nStarting device login…")
+            payload = openai_codex.login_with_device_code(
+                client_id=client_id,
+                on_user_code=lambda code, url: console.print(
+                    f"\nOpen [cyan]{url}[/] and enter code: [bold]{code}[/]\n"
+                ),
+            )
+        else:
+            console.print(
+                f"\nWaiting for ChatGPT OAuth callback on "
+                f"[cyan]{openai_codex.CODEX_OAUTH_REDIRECT_URI}[/]…"
+            )
+            if no_browser:
+                console.print(
+                    "[dim]On headless machines use --device (recommended) or --manual-paste.[/]"
+                )
+            payload = openai_codex.login_with_loopback(
+                client_id=client_id,
+                no_browser=no_browser,
+                manual_paste=(
+                    typer.prompt("Paste the final callback URL or code") if manual_paste else ""
+                ),
+                timeout_seconds=timeout_seconds,
+                on_authorize_url=(
+                    lambda url: console.print(f"\n[cyan]{url}[/cyan]\n") if no_browser else None
+                ),
+            )
+        if set_active:
+            from flowly.integrations.active_provider import set_active_provider
+
+            changed = set_active_provider("openai_codex")
+            if changed:
+                console.print(f"  model → [cyan]{changed}[/]")
+        console.print("\n[green]✓[/] ChatGPT subscription connected")
+        if payload.email:
+            console.print(f"  Account: [cyan]{payload.email}[/]")
+        if payload.plan:
+            console.print(f"  Plan: [cyan]{payload.plan}[/]")
+        if payload.expires_at:
+            mins = max(0, payload.expires_at - int(time.time())) // 60
+            console.print(f"  Token expires in: [cyan]{mins} min[/]")
+        if set_active:
+            console.print("  Provider: [green]openai_codex active[/]")
+    except KeyboardInterrupt:
+        console.print("\n[dim]cancelled[/]")
+        raise typer.Exit(code=130)
+    except openai_codex.CodexEntitlementError as exc:
+        console.print(f"[yellow]Authenticated, but this plan can't use Codex:[/] {exc}")
+        raise typer.Exit(code=3)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]✗ ChatGPT login failed:[/] {exc}")
+        raise typer.Exit(code=1)
+
+
+@codex_app.command("logout")
+def logout() -> None:
+    """Remove the stored ChatGPT subscription tokens (Flowly's own store)."""
+    from flowly.auth import openai_codex
+
+    openai_codex.clear_token_payload()
+    try:
+        from flowly.integrations.active_provider import clear_active_if_matches
+
+        clear_active_if_matches("openai_codex")
+    except Exception:
+        pass
+    console.print("[green]✓[/] ChatGPT subscription tokens removed")
+    console.print(
+        "  [dim](A `codex login` session in ~/.codex/auth.json, if any, is left untouched.)[/]"
+    )

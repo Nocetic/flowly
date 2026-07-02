@@ -243,7 +243,7 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
         cfg = load_config()
         if _build_for(cfg, key) is None:
             card = next((c for c in self._cards if c.key == key), None)
-            if card is not None and card.custom_action == "xai_login":
+            if card is not None and card.custom_action in ("xai_login", "codex_login"):
                 # Browser-OAuth provider: selecting it when not signed in
                 # should just start the browser login — no form, no key to
                 # paste. The app handles "needs_login" by firing the flow.
@@ -324,13 +324,18 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
             return
         key = oid[len(_CARD_PREFIX):]
         card = next((c for c in self._cards if c.key == key), None)
-        if card is None or card.custom_action != "xai_login":
+        if card is None or card.custom_action not in ("xai_login", "codex_login"):
             self._set_footer("[dim]nothing to sign out of for this provider[/dim]")
             return
         try:
-            from flowly.auth.xai_oauth import load_token_payload
+            if card.custom_action == "codex_login":
+                from flowly.auth.openai_codex import load_token_payload
+                label = "ChatGPT subscription"
+            else:
+                from flowly.auth.xai_oauth import load_token_payload
+                label = "xAI Grok OAuth"
             if load_token_payload() is None:
-                self._set_footer("[dim]xAI Grok OAuth is not signed in[/dim]")
+                self._set_footer(f"[dim]{label} is not signed in[/dim]")
                 return
         except Exception:
             pass
