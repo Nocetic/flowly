@@ -357,9 +357,14 @@ def _offer_start_gateway() -> None:
         start_now = False
 
     if start_now:
-        argv0 = sys.argv[0] or "flowly"
+        # Resolve the launcher properly instead of trusting sys.argv[0]: under
+        # `python -m flowly` (the Windows git-checkout launcher) argv[0] is
+        # __main__.py — not an executable.
+        from flowly.cli.service_cmd import _resolve_flowly_exec_argv
+
         try:
-            subprocess.run([argv0, "service", "install", "--start"], check=False)
+            argv = _resolve_flowly_exec_argv() + ["service", "install", "--start"]
+            subprocess.run(argv, check=False)
             console.print("\n  [green]✓[/green] Done — run [cyan]flowly[/cyan] to start chatting.")
             return
         except Exception:
@@ -518,10 +523,17 @@ def _flow_full() -> bool:
 
 
 def _flow_blank() -> bool:
-    """Provider only — no gateway offer, nothing extra."""
+    """Provider only, no channels/integrations — but still offer the gateway.
+
+    "Blank" skips *configuration*, not the runtime: without the background
+    gateway the user lands on "flowly → Gateway not reachable" and has to type
+    `flowly service install --start` themselves (a real support case). One
+    Enter on the default-Yes prompt covers it; decliners lose nothing.
+    """
     if not _run_provider_step():
         return False
     _show_summary()
+    _offer_start_gateway()
     return True
 
 

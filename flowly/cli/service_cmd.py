@@ -886,6 +886,16 @@ def service_start(
         )
         return
 
+    # A unit whose executable no longer exists (installed by a previous,
+    # since-retired install) "starts" fine per the service manager but the
+    # gateway never comes up — refuse with the fix instead of a false ✓.
+    from flowly.integrations.service_control import _stale_exec_hint
+
+    _stale = _stale_exec_hint(label)
+    if _stale:
+        console.print(f"[red]✗[/red] Can't start: {_stale.lstrip(' —')}")
+        raise typer.Exit(1)
+
     try:
         if system == "darwin" and mac_plist:
             if not mac_plist.exists():

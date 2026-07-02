@@ -22,11 +22,61 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import shlex
 import shutil
 import socket
 from dataclasses import dataclass
+from pathlib import Path
 
 DEFAULT_LABEL = "ai.flowly.gateway"
+
+
+def _unit_exec_path(label: str) -> Path | None:
+    """The executable the installed service unit points at, if parseable.
+
+    Reads the systemd user unit's ``ExecStart`` (Linux) or the launchd plist's
+    ``ProgramArguments[0]`` (macOS). Returns ``None`` when the unit doesn't
+    exist or can't be parsed — callers treat that as "nothing to say".
+    """
+    system = platform.system().lower()
+    try:
+        if system == "linux":
+            unit = Path.home() / ".config" / "systemd" / "user" / f"{label}.service"
+            if not unit.is_file():
+                return None
+            for line in unit.read_text(encoding="utf-8").splitlines():
+                if line.startswith("ExecStart="):
+                    tokens = shlex.split(line.split("=", 1)[1].strip())
+                    return Path(tokens[0]) if tokens else None
+        elif system == "darwin":
+            import plistlib
+
+            plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+            if not plist.is_file():
+                return None
+            with plist.open("rb") as f:
+                args = plistlib.load(f).get("ProgramArguments") or []
+            return Path(args[0]) if args else None
+    except Exception:
+        return None
+    return None
+
+
+def _stale_exec_hint(label: str) -> str:
+    """A pointed hint when the unit's executable no longer exists on disk.
+
+    The classic way to get here: the service was installed by a previous
+    (e.g. PyPI) install whose binary a later install retired — the service
+    manager keeps reporting ok while the gateway never binds its port.
+    Empty string when the executable is fine (or unknowable).
+    """
+    exec_path = _unit_exec_path(label)
+    if exec_path is None or exec_path.exists():
+        return ""
+    return (
+        f" — the service points at {exec_path}, which no longer exists "
+        f"(a previous install?). Fix:  flowly service install --start"
+    )
 
 
 @dataclass
@@ -93,6 +143,7 @@ async def restart_gateway(
                     f"kickstart sent but gateway didn't bind "
                     f"{health_check_host}:{health_check_port} within "
                     f"{health_check_timeout:.0f}s — check logs"
+                    + _stale_exec_hint(label)
                 ),
                 paused_seconds=elapsed,
             )
@@ -133,7 +184,8 @@ async def restart_gateway(
             detail=(
                 f"restarted via systemd ({elapsed:.1f}s downtime)"
                 if came_back
-                else f"systemctl restart returned ok but port didn't come back"
+                else "systemctl restart returned ok but port didn't come back"
+                + _stale_exec_hint(label)
             ),
             paused_seconds=elapsed,
         )
