@@ -31,6 +31,7 @@ from flowly.integrations.probes import (
     probe_linear,
     probe_obsidian,
     probe_openai,
+    probe_openai_codex,
     probe_openrouter,
     probe_parallel,
     probe_sakana,
@@ -500,6 +501,22 @@ _PROVIDERS: list[IntegrationCard] = [
         probe=probe_xai_oauth,
         needs_gateway_restart=False,
         custom_action="xai_login",   # browser OAuth flow, not a pasted-key form
+    ),
+    IntegrationCard(
+        key="openai_codex", label="ChatGPT subscription", category="provider",
+        description=(
+            "Use your ChatGPT Plus / Pro / Team plan through OpenAI's Codex "
+            "sign-in. GPT-5.x on your plan's Codex limits — no API key needed."
+        ),
+        docs_url="https://developers.openai.com/codex/auth",
+        config_path="providers.openai_codex",
+        fields=[
+            Field("enabled", "Enabled", FieldType.BOOL, default=True,
+                  help="When on, a stored ChatGPT login can serve GPT-5.x requests."),
+        ],
+        probe=probe_openai_codex,
+        needs_gateway_restart=False,
+        custom_action="codex_login",   # browser / device OAuth, not a pasted-key form
     ),
     _provider_card("zhipu", "Zhipu GLM",
                    "ChatGLM / GLM-4 from Zhipu AI.",

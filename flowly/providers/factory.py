@@ -5,6 +5,7 @@ from __future__ import annotations
 from flowly.integrations.active_provider import ActiveProvider
 from flowly.providers.anthropic_provider import AnthropicProvider
 from flowly.providers.base import LLMProvider
+from flowly.providers.codex_responses_provider import CodexResponsesProvider
 from flowly.providers.openrouter_provider import OpenRouterProvider
 from flowly.providers.xai_responses_provider import XAIResponsesProvider
 
@@ -36,6 +37,15 @@ def build_provider(
             default_model=default_model,
             provider_name=active.key,
             client_id=client_id,
+            request_timeout_seconds=timeout_seconds,
+        )
+    if active.key == "openai_codex":
+        return CodexResponsesProvider(
+            api_key=active.api_key,
+            account_id=active.account_id,
+            api_base=active.api_base,
+            default_model=default_model,
+            provider_name=active.key,
             request_timeout_seconds=timeout_seconds,
         )
     if active.key == "anthropic":

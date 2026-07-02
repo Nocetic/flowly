@@ -2263,7 +2263,10 @@ class FlowlyTUI(App[None]):
             elif result.get("action") == "needs_login":
                 # Enter on a not-yet-connected browser-OAuth provider →
                 # start the sign-in flow directly (no detail form).
-                self.action_xai_login()
+                if result.get("key") == "openai_codex":
+                    self.action_codex_login()
+                else:
+                    self.action_xai_login()
             elif result.get("action") == "login":
                 # Flowly account picked while signed out → browser sign-in
                 # (LoginModal auto-provisions the key), not a paste form.
@@ -2283,12 +2286,17 @@ class FlowlyTUI(App[None]):
                     # Worker); it drives the browser flow on its own and
                     # reports back to the transcript.
                     self.action_xai_login()
+                elif card is not None and card.custom_action == "codex_login":
+                    self.action_codex_login()
                 elif card is not None:
                     saved = await self.push_screen_wait(IntegrationSetupModal(card))
                     if saved and saved.get("action") == "saved":
                         self._refresh_active_provider_status()
             elif result.get("action") == "disconnect":
-                await self.action_xai_logout()
+                if result.get("key") == "openai_codex":
+                    await self.action_codex_logout()
+                else:
+                    await self.action_xai_logout()
             return
 
         # Direct switch / off — keeps the slash usable as a one-liner.
@@ -2315,6 +2323,9 @@ class FlowlyTUI(App[None]):
                 # Not signed in yet — drive the browser OAuth flow directly.
                 # @work method → fire-and-forget (Worker isn't awaitable).
                 self.action_xai_login()
+                return
+            if target.custom_action == "codex_login":
+                self.action_codex_login()
                 return
             if _inline_provider_key_field(target) is not None:
                 await self._configure_provider_inline(target, make_active=True)
@@ -2456,6 +2467,104 @@ class FlowlyTUI(App[None]):
         self._refresh_active_provider_status()
         acct = f" ([dim]{payload.email}[/])" if payload.email else ""
         transcript.add_system(f"✓ xAI Grok OAuth signed out{acct} · {tail}")
+
+    @work(exclusive=True, group="codex_login")
+    async def action_codex_login(self) -> None:
+        """Browser OAuth login for a ChatGPT subscription, from the TUI.
+
+        Mirrors ``flowly codex login``: prints the authorize URL into the
+        transcript, opens the browser with the detached spawner (avoids
+        Textual's fd-inheritance crash on ``webbrowser.open``), runs the
+        blocking loopback wait in a worker thread, then activates the
+        provider and hot-reloads the gateway in place.
+        """
+        from flowly.auth import openai_codex
+        from flowly.integrations.active_provider import set_active_provider
+        from flowly.tui.panes.login_modal import _open_browser_detached
+
+        transcript = self.query_one(TranscriptPane)
+
+        # Already have a token (Flowly store OR ~/.codex/auth.json) → just make
+        # it the active provider; don't force the browser dance again.
+        if openai_codex.load_token_payload() is not None:
+            changed = await asyncio.to_thread(set_active_provider, "openai_codex")
+            tail = await self._reload_gateway_provider()
+            self._refresh_active_provider_status()
+            note = f" · model → [b]{changed}[/b]" if changed else ""
+            transcript.add_system(
+                f"✓ ChatGPT subscription already connected — set as default{note} · {tail}"
+            )
+            return
+
+        client_id = openai_codex.require_client_id()
+        transcript.add_system(
+            "Starting ChatGPT sign-in… approve in your browser, then return here."
+        )
+
+        def _on_url(url: str) -> None:
+            opened = _open_browser_detached(url)
+            try:
+                from flowly.tui.osc52 import copy_to_clipboard
+                copy_to_clipboard(url)
+            except Exception:
+                pass
+            lead = (
+                "Opened your browser. If it didn't open, use the full URL below:"
+                if opened else "Open the full URL below to sign in:"
+            )
+            self.call_from_thread(
+                transcript.add_system, f"{lead}\n{url}", collapse_long=False
+            )
+
+        try:
+            payload = await asyncio.to_thread(
+                openai_codex.login_with_loopback,
+                client_id=client_id,
+                no_browser=True,          # we open the browser ourselves (detached)
+                timeout_seconds=300,
+                on_authorize_url=_on_url,
+            )
+        except openai_codex.CodexEntitlementError as exc:
+            transcript.add_error(f"Authenticated, but this plan can't use Codex: {exc}")
+            return
+        except Exception as exc:
+            transcript.add_error(f"ChatGPT sign-in failed: {exc}")
+            return
+
+        changed = await asyncio.to_thread(set_active_provider, "openai_codex")
+        tail = await self._reload_gateway_provider()
+        self._refresh_active_provider_status()
+        acct = f" ([cyan]{payload.email}[/])" if payload.email else ""
+        note = f" · model → [b]{changed}[/b]" if changed else ""
+        transcript.add_system(
+            f"✓ ChatGPT subscription connected{acct}{note} · {tail}"
+        )
+
+    async def action_codex_logout(self) -> None:
+        """Disconnect the stored ChatGPT subscription token from the TUI.
+
+        Clears Flowly's own token store, drops the explicit default if it
+        pointed at openai_codex (so the gateway falls back to the cascade),
+        and hot-reloads. A ``codex login`` session in ~/.codex/auth.json is
+        left untouched.
+        """
+        from flowly.auth import openai_codex
+
+        transcript = self.query_one(TranscriptPane)
+        payload = openai_codex.load_token_payload()
+        if payload is None:
+            transcript.add_system("ChatGPT subscription is not connected")
+            return
+        await asyncio.to_thread(openai_codex.clear_token_payload)
+        try:
+            from flowly.integrations.active_provider import clear_active_if_matches
+            clear_active_if_matches("openai_codex")
+        except Exception:
+            pass
+        tail = await self._reload_gateway_provider()
+        self._refresh_active_provider_status()
+        acct = f" ([dim]{payload.email}[/])" if payload.email else ""
+        transcript.add_system(f"✓ ChatGPT subscription signed out{acct} · {tail}")
 
     @work
     async def action_plugins(self) -> None:

@@ -635,6 +635,26 @@ async def probe_xai_oauth(values: dict[str, Any]) -> ProbeResult:
     return ProbeResult("ok", payload.email or "OAuth connected")
 
 
+async def probe_openai_codex(values: dict[str, Any]) -> ProbeResult:
+    if not values.get("enabled", True):
+        return ProbeResult("disabled", "ChatGPT subscription disabled")
+    try:
+        from flowly.auth.openai_codex import load_token_payload, token_is_expiring
+        payload = load_token_payload()
+    except Exception as exc:
+        return ProbeResult("unknown", f"token check failed: {type(exc).__name__}")
+    if payload is None:
+        return ProbeResult("not_configured", "run `flowly codex login`")
+    if not payload.account_id:
+        return ProbeResult("not_configured", "sign in again with `flowly codex login`")
+    label = payload.email or "ChatGPT connected"
+    if payload.plan:
+        label = f"{label} · {payload.plan}"
+    if token_is_expiring(payload):
+        return ProbeResult("ok", f"{label} (refreshing)")
+    return ProbeResult("ok", label)
+
+
 async def probe_anthropic(values: dict[str, Any]) -> ProbeResult:
     key = (values.get("api_key") or "").strip()
     if not key:

@@ -35,6 +35,7 @@ _BYOK_PRIORITY = (
     "openrouter",
     "anthropic",
     "openai",
+    "openai_codex",
     "xai",
     "xai_oauth",
     "gemini",
@@ -58,6 +59,9 @@ class ActiveProvider:
     api_key: str
     api_base: str | None
     source: str
+    # Extra credential some providers need beyond the bearer. Currently only
+    # ``openai_codex`` uses it (the ``ChatGPT-Account-Id`` header value).
+    account_id: str = ""
 
 
 def resolve_active_provider(config: Config) -> ActiveProvider | None:
@@ -172,6 +176,28 @@ def _build_for(config: Config, name: str) -> ActiveProvider | None:
             api_base="https://useflowlyapp.com/api/v1",
             source=source,
         )
+    if name == "openai_codex":
+        codex_cfg = getattr(config.providers, "openai_codex", None)
+        if codex_cfg is not None and not getattr(codex_cfg, "enabled", True):
+            return None
+        try:
+            from flowly.auth.openai_codex import resolve_runtime_credentials
+            creds = resolve_runtime_credentials(config=config)
+        except Exception as exc:
+            logger.debug("openai_codex provider unavailable: %s", exc)
+            return None
+        if creds is None or not creds.api_key or not creds.account_id:
+            return None
+        plan = f" · {creds.plan}" if creds.plan else ""
+        email = f" ({creds.email})" if creds.email else ""
+        return ActiveProvider(
+            key="openai_codex",
+            api_key=creds.api_key,
+            api_base=creds.base_url,
+            source=f"ChatGPT subscription{email}{plan}",
+            account_id=creds.account_id,
+        )
+
     if name == "xai_oauth":
         oauth_cfg = getattr(config.providers, "xai_oauth", None)
         if oauth_cfg is not None and not getattr(oauth_cfg, "enabled", True):
@@ -251,6 +277,7 @@ DEFAULT_MODELS: dict[str, str] = {
     "sakana": "fugu",                         # Fugu orchestrator (also: fugu-ultra)
     "xai": "grok-4.3",                        # matches model_catalog._XAI_TOP_MODEL
     "xai_oauth": "grok-4.20-reasoning",       # matches DEFAULT_XAI_RESPONSES_MODEL
+    "openai_codex": "gpt-5.5",                # matches DEFAULT_CODEX_MODEL
 }
 
 # Cheap offline "does this model plausibly belong to this provider?" check —
@@ -270,6 +297,9 @@ _MODEL_PREFIX_HINTS: dict[str, tuple[str, ...]] = {
     "sakana": ("fugu",),
     "xai": ("grok",),
     "xai_oauth": ("grok",),
+    # ChatGPT subscription serves the current-generation general GPT-5.x
+    # models (gpt-5.4 / gpt-5.5 families) — not codex-suffixed or older ids.
+    "openai_codex": ("gpt-5.4", "gpt-5.5"),
 }
 
 
@@ -398,6 +428,9 @@ def _default_base_for(provider_name: str) -> str | None:
         "openrouter": "https://openrouter.ai/api/v1",
         "anthropic":  "https://api.anthropic.com/v1",
         "openai":     "https://api.openai.com/v1",
+        # ChatGPT subscription (Codex OAuth) — the backend base; the provider
+        # posts to <base>/responses. Not the metered api.openai.com.
+        "openai_codex": "https://chatgpt.com/backend-api/codex",
         "xai":        "https://api.x.ai/v1",
         "xai_oauth":  "https://api.x.ai/v1",
         "groq":       "https://api.groq.com/openai/v1",

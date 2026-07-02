@@ -132,27 +132,27 @@ class SetupApp(App[None]):
             card = get_card(result.get("key") or "")
             if card is None:
                 return
-            if card.custom_action == "xai_login":
+            if card.custom_action in ("xai_login", "codex_login"):
                 # Browser-OAuth providers need the dedicated login flow,
                 # which lives on the full app. Point at the CLI path so a
                 # fresh user isn't stranded here.
-                self.notify(
-                    "Run `flowly xai login` to connect your xAI Grok "
-                    "subscription.",
-                    severity="warning",
-                    timeout=8,
+                cmd = (
+                    "flowly codex login` to connect your ChatGPT subscription"
+                    if card.custom_action == "codex_login"
+                    else "flowly xai login` to connect your xAI Grok subscription"
                 )
+                self.notify(f"Run `{cmd}.", severity="warning", timeout=8)
                 return
             saved = await self.push_screen_wait(IntegrationSetupModal(card))
             if saved and saved.get("action") == "saved":
                 self.notify(f"{card.label} saved", title="saved")
         elif action == "needs_login":
-            self.notify(
-                "Run `flowly xai login` to connect your xAI Grok "
-                "subscription.",
-                severity="warning",
-                timeout=8,
+            cmd = (
+                "flowly codex login` to connect your ChatGPT subscription"
+                if result.get("key") == "openai_codex"
+                else "flowly xai login` to connect your xAI Grok subscription"
             )
+            self.notify(f"Run `{cmd}.", severity="warning", timeout=8)
         elif action == "login":
             # Flowly account picked while signed out → browser sign-in via the
             # LoginModal (auto-provisions the account key + relay opt-in), NOT a

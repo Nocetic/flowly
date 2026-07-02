@@ -230,6 +230,13 @@ def _onboarding_menu() -> str | None:
                 value="xai_oauth",
                 name="xAI Grok subscription  ·  SuperGrok / X Premium+ (opens browser)",
             ))
+        # ChatGPT subscription (OpenAI Codex OAuth) — the user's own ChatGPT
+        # plan, so it sits in the BYOK list right under the OpenAI API key.
+        if slug == "openai":
+            choices.append(Choice(
+                value="openai_codex",
+                name="ChatGPT subscription  ·  Plus / Pro / Team, GPT-5.x (opens browser)",
+            ))
     choices.append(Separator())
     choices.append(Choice(value="back", name="← Back"))
 
@@ -266,6 +273,22 @@ def _run_xai_oauth_login() -> None:
         pass
     except KeyboardInterrupt:
         console.print("  [dim]xAI sign-in cancelled.[/dim]")
+
+
+def _run_codex_oauth_login() -> None:
+    """Run the ChatGPT subscription OAuth (opens the browser) — reuses `flowly codex login`."""
+    from flowly.cli.codex_cmd import login as codex_login
+
+    # Same OptionInfo-bypass + Exit-catch pattern as the managed sign-in.
+    try:
+        codex_login(
+            device=False, no_browser=False, manual_paste=False,
+            set_active=True, timeout_seconds=300,
+        )
+    except (typer.Exit, SystemExit):
+        pass
+    except KeyboardInterrupt:
+        console.print("  [dim]ChatGPT sign-in cancelled.[/dim]")
 
 
 def _prompt_byok_key(slug: str) -> bool:
@@ -415,6 +438,8 @@ def _run_provider_step() -> bool:
         _run_managed_login()
     elif choice == "xai_oauth":
         _run_xai_oauth_login()
+    elif choice == "openai_codex":
+        _run_codex_oauth_login()
     else:
         if not _prompt_byok_key(choice):
             return False

@@ -363,11 +363,40 @@ async def _fetch_xai_apikey() -> list[Model]:
     return await _fetch_xai_models(api_key, base)
 
 
+# ChatGPT subscription (Codex OAuth) has no public /models endpoint — the
+# plan gates access, not a catalogue. The backend serves the current
+# general-purpose GPT-5.x models and 400s everything else (older versions,
+# codex-suffixed ids). Verified live against a Plus plan on 2026-07-02;
+# higher tiers may unlock more, and a user can still type a custom id.
+_CODEX_MODELS: list[tuple[str, str, list[str]]] = [
+    ("gpt-5.5", "GPT-5.5 — newest, strongest reasoning", ["reasoning"]),
+    ("gpt-5.4", "GPT-5.4 — general purpose", ["reasoning"]),
+    ("gpt-5.4-mini", "GPT-5.4 Mini — fast and efficient", ["fast"]),
+]
+
+
+async def _fetch_openai_codex() -> list[Model]:
+    """ChatGPT subscription models — static, gated by the signed-in plan.
+
+    Only returns rows when a Codex OAuth credential is present, so the picker
+    stays empty (with the "sign in" hint) until the user logs in.
+    """
+    from flowly.auth.openai_codex import load_token_payload
+    payload = await asyncio.to_thread(load_token_payload)
+    if payload is None or not payload.access_token:
+        return []
+    return [
+        Model(id=mid, name=mid, description=desc, tags=list(tags))
+        for mid, desc, tags in _CODEX_MODELS
+    ]
+
+
 _FETCHERS: dict[str, "Any"] = {
     "openrouter": _fetch_openrouter,
     "flowly": _fetch_flowly_hosted,
     "xai_oauth": _fetch_xai_oauth,
     "xai": _fetch_xai_apikey,
+    "openai_codex": _fetch_openai_codex,
     # anthropic / openai / gemini / groq / zhipu — not implemented yet.
     # Their /v1/models endpoints need the user's API key; we'll plumb
     # that through once the OpenRouter MVP feels good.

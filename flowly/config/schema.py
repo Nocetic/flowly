@@ -336,6 +336,18 @@ class XAIOAuthConfig(BaseModel):
     api_base: str = "https://api.x.ai/v1"
 
 
+class OpenAICodexConfig(BaseModel):
+    """ChatGPT subscription (OpenAI Codex OAuth) configuration.
+
+    Tokens are stored in the OS keychain / ``~/.flowly/credentials`` rather
+    than in config.json. The OAuth client id is the public Codex CLI client,
+    baked in as a constant (not configurable). When enabled and signed in via
+    ``flowly codex login``, stored tokens serve GPT-5.x / Codex requests billed
+    against the user's ChatGPT plan.
+    """
+    enabled: bool = True
+
+
 class FlowlyHostedConfig(BaseModel):
     """Use the user's Flowly account to access hosted Anthropic/OpenAI/etc.
 
@@ -389,6 +401,7 @@ class ProvidersConfig(BaseModel):
     groq: ProviderConfig = Field(default_factory=ProviderConfig)  # For voice transcription
     xai: ProviderConfig = Field(default_factory=ProviderConfig)  # xAI Grok models
     xai_oauth: XAIOAuthConfig = Field(default_factory=XAIOAuthConfig)  # xAI Grok subscription OAuth
+    openai_codex: OpenAICodexConfig = Field(default_factory=OpenAICodexConfig)  # ChatGPT subscription OAuth
 
 
 class GatewayConfig(BaseModel):
