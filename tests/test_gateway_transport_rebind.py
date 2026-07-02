@@ -9,6 +9,8 @@ dead socket and the re-entered view freezes at the snapshot. ``bind_session_ws``
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from flowly.gateway.server import GatewayServer
@@ -72,3 +74,44 @@ def test_bind_ignores_empty_session_key() -> None:
     ws = _FakeWS()
     srv.bind_session_ws("", ws)
     assert srv._session_ws == {}
+
+
+@pytest.mark.asyncio
+async def test_offline_chat_final_schedules_push(monkeypatch) -> None:
+    srv = _bare_server()
+    calls: list[dict] = []
+
+    async def fake_notify(title: str, body: str, **kwargs) -> None:
+        calls.append({"title": title, "body": body, **kwargs})
+
+    from flowly.push import relay_push
+
+    monkeypatch.setattr(relay_push, "notify_devices", fake_notify)
+    srv._schedule_offline_chat_push("ios:chat-1", "hello\nsecond line")
+    await asyncio.sleep(0)
+
+    assert calls == [{
+        "title": "Flowly",
+        "body": "hello",
+        "conversation_id": "ios:chat-1",
+        "data": {"type": "chat"},
+    }]
+
+
+@pytest.mark.asyncio
+async def test_offline_chat_final_skips_push_when_session_live(monkeypatch) -> None:
+    srv = _bare_server()
+    ws = _FakeWS()
+    srv.bind_session_ws("ios:chat-1", ws)
+    calls: list[dict] = []
+
+    async def fake_notify(title: str, body: str, **kwargs) -> None:
+        calls.append({"title": title, "body": body, **kwargs})
+
+    from flowly.push import relay_push
+
+    monkeypatch.setattr(relay_push, "notify_devices", fake_notify)
+    srv._schedule_offline_chat_push("ios:chat-1", "hello")
+    await asyncio.sleep(0)
+
+    assert calls == []

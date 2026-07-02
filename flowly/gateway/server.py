@@ -2017,6 +2017,7 @@ class GatewayServer:
                     "message": final_message,
                 },
             })
+            self._schedule_offline_chat_push(session_key, response)
         except asyncio.CancelledError:
             await self._session_send(session_key, ws, {
                 "type": "event",
@@ -2127,6 +2128,43 @@ class GatewayServer:
         """Point a session's live stream at ``ws`` (transport-rebind)."""
         if session_key:
             self._session_ws[session_key] = ws
+
+    def _session_has_live_ws(
+        self, session_key: str, fallback_ws: web.WebSocketResponse | None = None,
+    ) -> bool:
+        """Whether a session currently has an open direct-gateway socket."""
+        target = self._session_ws.get(session_key) or fallback_ws
+        return bool(target is not None and not target.closed)
+
+    def _schedule_offline_chat_push(self, session_key: str, text: str) -> None:
+        """Wake registered iOS/Android clients when a direct chat finished offline.
+
+        Relay-backed chats are handled by the hosted relay's Firestore/device
+        path. This direct-gateway fallback uses the anonymous push registry that
+        clients install with ``push.register``; it is a no-op when no device has
+        registered push credentials.
+        """
+        if not text or self._session_has_live_ws(session_key):
+            return
+
+        preview = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        if not preview:
+            return
+
+        async def _run() -> None:
+            try:
+                from flowly.push.relay_push import notify_devices
+
+                await notify_devices(
+                    "Flowly",
+                    preview[:140],
+                    conversation_id=session_key,
+                    data={"type": "chat"},
+                )
+            except Exception as exc:  # pragma: no cover - best-effort background notify
+                logger.debug(f"[push] offline chat notify skipped: {exc}")
+
+        asyncio.create_task(_run())
 
     async def _handle_feature_rpc(
         self, ws: web.WebSocketResponse, rpc_id: str, method: str, params: dict,
