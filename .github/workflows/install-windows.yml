@@ -10,7 +10,7 @@ name: install-windows
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/migrate-service-refresh]  # TEMP: drop before merge
     paths:
       - "scripts/install.sh"
       - "scripts/install.ps1"
