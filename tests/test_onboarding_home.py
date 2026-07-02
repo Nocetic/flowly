@@ -14,14 +14,23 @@ import flowly.cli.onboard_cmd as ob
 
 # ── modes ────────────────────────────────────────────────────────────────
 
-def test_blank_mode_is_provider_only_no_gateway(monkeypatch):
+def test_blank_mode_skips_config_but_offers_gateway(monkeypatch):
+    """Blank skips channels/integrations/media — but still offers the gateway.
+
+    Without the offer, blank-mode users landed on "flowly → Gateway not
+    reachable" and had to type `flowly service install --start` by hand
+    (a real support case from a fresh VPS install).
+    """
     calls = []
     monkeypatch.setattr(ob, "_setup_home_menu", lambda: "blank")
     monkeypatch.setattr(ob, "_run_provider_step", lambda: calls.append("provider") or True)
+    monkeypatch.setattr(ob, "_configure_channels", lambda: calls.append("channels"))
+    monkeypatch.setattr(ob, "_configure_tools", lambda: calls.append("tools"))
+    monkeypatch.setattr(ob, "_configure_media", lambda: calls.append("media"))
     monkeypatch.setattr(ob, "_show_summary", lambda: calls.append("summary"))
     monkeypatch.setattr(ob, "_offer_start_gateway", lambda: calls.append("gateway"))
     ob._run_setup_home()
-    assert calls == ["provider", "summary"]  # blank: no gateway offer
+    assert calls == ["provider", "summary", "gateway"]  # no channels/tools/media
 
 
 def test_full_mode_configures_channels_tools_media(monkeypatch):

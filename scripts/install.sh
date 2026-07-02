@@ -493,6 +493,8 @@ main() {
 
   "$flowly_bin" --version >/dev/null
 
+  refresh_service "$flowly_bin"
+
   install_system_deps
 
   ok "Flowly CLI installed (git checkout: ${FLOWLY_SRC})."
@@ -509,6 +511,31 @@ main() {
   fi
 
   print_next_steps "$bin_dir"
+}
+
+# ── Background service refresh ──────────────────────────────────────────────
+#
+# A gateway service installed by a previous install has THAT install's launcher
+# path baked into its unit (systemd ExecStart / launchd ProgramArguments).
+# After we retire the old install, that binary is gone: `systemctl restart`
+# reports ok but the gateway never binds its port again. Rewrite the unit
+# against this install and restart it. This also means a re-run-to-update
+# actually bounces the running gateway onto the new code.
+refresh_service() {
+  local flowly_bin="$1"
+  local unit=""
+  case "$(uname -s)" in
+    Darwin) unit="${HOME}/Library/LaunchAgents/ai.flowly.gateway.plist" ;;
+    Linux)  unit="${HOME}/.config/systemd/user/ai.flowly.gateway.service" ;;
+  esac
+  [[ -n "$unit" && -f "$unit" ]] || return 0
+
+  log "Refreshing the background service to point at this install..."
+  if "$flowly_bin" service install --start >/dev/null 2>&1; then
+    ok "Background service updated and restarted."
+  else
+    log "Couldn't refresh the service automatically — run: flowly service install --start"
+  fi
 }
 
 # Closing instructions. The key gotcha: under `curl | bash` the launcher's

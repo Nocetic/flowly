@@ -306,6 +306,25 @@ function Install-SystemDeps {
     }
 }
 
+# A gateway service installed by a previous install has THAT install's flowly
+# executable baked into its scheduled task. After the old install is retired,
+# the task points at a binary that no longer exists and a restart can't bring
+# the gateway back. Rewrite the task against this install and restart it.
+function Update-ServiceIfInstalled {
+    param([string]$Flowly)
+    $taskXml = Join-Path $env:USERPROFILE 'AppData\Local\flowly\ai.flowly.gateway.xml'
+    if (-not (Test-Path $taskXml)) { return }
+
+    Write-Step 'Refreshing the background service to point at this install...'
+    & $Flowly service install --start *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Ok 'Background service updated and restarted.'
+    }
+    else {
+        Write-Step "Couldn't refresh the service automatically - run: flowly service install --start"
+    }
+}
+
 # ── Main ────────────────────────────────────────────────────────────────────
 Install-Uv
 $git = Install-Git
@@ -326,6 +345,8 @@ Add-UserPath -PathToAdd $BinDir
 
 & $flowly --version | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Flowly was installed, but the launcher at $flowly did not run." }
+
+Update-ServiceIfInstalled -Flowly $flowly
 
 Install-SystemDeps
 
