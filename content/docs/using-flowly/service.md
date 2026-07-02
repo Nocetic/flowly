@@ -80,6 +80,8 @@ sudo loginctl enable-linger "$USER"              # or: flowly doctor --fix
 
 Genuine crashes are covered by `Restart=always` + `StartLimitIntervalSec=0` (retried indefinitely, never permanently `failed`).
 
+**Restart reports ok, but the port never comes back.** The unit was probably installed by a *previous* Flowly install and points at a binary that no longer exists — `restart`/`start` detect this and print the fix: `flowly service install --start` rewrites the unit onto the current install. (The install script also does this automatically when it finds an existing unit.)
+
 **Windows — it runs, then is down a few hours later.** This is exactly what the console-less supervisor fixes: the launcher relaunches the gateway whenever it exits, so a mid-life crash recovers on its own within seconds. If it still won't stay up:
 
 - `flowly service status` shows the task state; `flowly service logs` tails `gateway.log` for the crash reason.

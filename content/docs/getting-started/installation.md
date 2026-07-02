@@ -27,6 +27,8 @@ pip install --user flowly-ai
 
 All methods install the same `flowly` CLI. The native script clones the repo into an isolated, uv-managed virtualenv and installs Flowly editable — so it needs no pre-installed Python (uv provides it), and `flowly update` can fast-forward it with `git pull` without waiting for a PyPI release. The packaged methods track PyPI releases instead.
 
+**Already have Flowly installed?** Running the native script over an existing PyPI/`uv tool` install migrates it in place: your `~/.flowly` data is untouched, the old package is retired only after the new install proves it works, and an installed background service is rewritten onto the new install and restarted — so nothing keeps pointing at the retired binary.
+
 ## First run
 
 On a fresh machine the **first-run picker opens automatically** right after the install script finishes. It asks how to power Flowly — **sign in with a Flowly account** (managed, nothing else to configure) or **enter your own API key** — which is the one mandatory step before the agent can run. The same picker also seeds your workspace and offers to start the gateway.

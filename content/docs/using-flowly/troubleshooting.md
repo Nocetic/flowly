@@ -61,6 +61,20 @@ already updated your shell profile, so fresh shells pick it up.
 systemd user services need *linger* enabled to run without an active login:
 `loginctl enable-linger $USER`. `flowly doctor` checks this.
 
+**`flowly service restart` says ok, but the gateway never comes back.**
+The classic cause: the service unit was installed by a *previous* install
+(e.g. the old PyPI package) and still points at a binary that a later install
+retired — the service manager keeps reporting success while nothing ever binds
+the port. One command rewrites the unit onto the current install and starts it:
+
+```bash
+flowly service install --start
+```
+
+Current releases close this loophole from both ends: the install script
+refreshes an existing service unit automatically, and `service restart`/`start`
+detect the stale executable and print exactly this fix instead of a false ✓.
+
 **Port already in use / "gateway already running".**
 Something is already listening on the gateway port (default `18790`) — usually a
 foreground `flowly gateway` or a duplicate of the service. `flowly service status`
