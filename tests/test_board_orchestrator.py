@@ -108,6 +108,19 @@ async def test_run_goal_all_done(store):
 
 
 @pytest.mark.asyncio
+async def test_run_goal_notifies_finished_once_for_parent(store):
+    finished = []
+
+    async def on_finished(card, outcome):
+        finished.append((card.id, card.title, card.result, outcome))
+
+    orch = BoardOrchestrator(store, make_spawn("ok"), on_finished=on_finished)
+    res = await orch.run_goal("ship feature", ["write tests", "implement"])
+
+    assert finished == [(res["parentId"], "ship feature", "2/2 done", "done")]
+
+
+@pytest.mark.asyncio
 async def test_run_goal_partial_failure(store):
     async def spawn_fn(task, **kw):
         if "bad" in task:

@@ -248,7 +248,11 @@ class BoardOrchestrator:
             parts.append(f"{cancelled} cancelled")
         summary = ", ".join(parts)
 
-        self._store.set_status(parent.id, STATUS_DONE, result=summary)
+        parent = self._store.set_status(parent.id, STATUS_DONE, result=summary)
+        # Parallel board goals should wake the app once when the aggregate
+        # parent finishes. Child cards are intentionally quiet to avoid sending
+        # one push per subtask.
+        await self._on_finished_safe(parent, "done")
         if deliver:
             await self._notify_safe(
                 origin_channel, origin_chat_id,

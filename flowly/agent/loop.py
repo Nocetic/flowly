@@ -1784,19 +1784,9 @@ class AgentLoop:
                 # UI-run task's result reaches the phone even when the app is
                 # closed. No-op when no device registered push (e.g. relay-only
                 # users without the anonymous push path). Banner-only (no chat).
-                if outcome not in ("done", "failed"):
-                    return
-                try:
-                    from flowly.push.relay_push import notify_devices
-                    name = (getattr(card, "title", "") or "task").strip()
-                    if outcome == "failed":
-                        body = f"failed: {(getattr(card, 'error', '') or '').strip()}"
-                    else:
-                        result = (getattr(card, "result", "") or "").strip()
-                        body = next((ln for ln in result.splitlines() if ln.strip()), "done")
-                    await notify_devices(f"Board · {name}"[:80], body[:140], data={"type": "board"})
-                except Exception as exc:  # pragma: no cover
-                    logger.debug(f"[board] push notify skipped: {exc}")
+                from flowly.push.board_push import notify_board_finished
+
+                await notify_board_finished(card, outcome)
 
             self._board_orchestrator = BoardOrchestrator(
                 self._board_store, _board_spawn,
