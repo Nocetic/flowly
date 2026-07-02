@@ -22,6 +22,45 @@ console = Console()
 _GATEWAY_FILE_SINK_ID: int | None = None
 
 
+def _schedule_cron_push_notification(
+    job, response: str | None, *, conversation_id: str = ""
+) -> None:
+    """Best-effort APNs/FCM notification for a completed gateway cron run.
+
+    Targeted cron deliveries pass ``conversation_id`` so a tap can open the
+    chat. Jobs created from the remote gateway Schedule screen may have no chat
+    target; they still need a banner, but with no deep-link conversation.
+    """
+    preview = next(
+        (ln.strip() for ln in (response or "").splitlines() if ln.strip()),
+        getattr(job, "name", None) or "Scheduled task",
+    )[:140]
+    title = getattr(job, "name", None) or "Flowly"
+    data = {
+        "type": "cron",
+        "jobId": str(getattr(job, "id", "") or ""),
+        "jobName": str(getattr(job, "name", "") or ""),
+    }
+    data = {k: v for k, v in data.items() if v}
+
+    async def _run() -> None:
+        try:
+            from flowly.push.relay_push import notify_devices
+
+            await notify_devices(
+                title,
+                preview,
+                conversation_id=conversation_id,
+                data=data,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort background notify
+            logger.debug(
+                f"Cron '{getattr(job, 'name', '')}' push-notify skipped: {exc}"
+            )
+
+    asyncio.create_task(_run())
+
+
 def _install_gateway_file_sink(level: str = "INFO") -> None:
     """Install a bot-side daily-rotating file sink for gateway logs.
 
@@ -750,18 +789,7 @@ def gateway(
                         # APNs/FCM via the relay too — the WS push only reaches a
                         # FOREGROUNDED app; this wakes a closed/backgrounded one.
                         # Fire-and-forget; no-op if no device registered push.
-                        try:
-                            import asyncio as _aio
-                            from flowly.push.relay_push import notify_devices
-                            _preview = next(
-                                (ln for ln in (response or "").splitlines() if ln.strip()),
-                                job.name or "",
-                            )[:140]
-                            _aio.ensure_future(notify_devices(
-                                job.name or "Flowly", _preview, conversation_id=_sk,
-                            ))
-                        except Exception as ne:
-                            logger.debug(f"Cron '{job.name}' push-notify skipped: {ne}")
+                        _schedule_cron_push_notification(job, response, conversation_id=_sk)
                     else:
                         from flowly.bus.events import OutboundMessage
                         try:
@@ -788,12 +816,17 @@ def gateway(
 
                 return response
             else:
-                # No specific target - ask agent to use message tool
+                # No specific target. This is the Schedule-screen path for a
+                # remote gateway: the run is archived under cron.output and
+                # should not be injected into a chat, but a closed iOS app still
+                # needs a banner when the job finishes.
                 prompt = (
                     f"[Scheduled Task: {job.name}]\n"
                     f"{job.payload.message}\n\n"
-                    f"After completing the task, send the result to the user using the message tool. "
-                    f"If any tool fails or returns an error, report it clearly in your message."
+                    "Return the result as plain text. It will be saved to the "
+                    "scheduled task output view automatically; do not use the "
+                    "message tool. If any tool fails or returns an error, report "
+                    "it clearly in your final response."
                 )
 
         try:
@@ -820,6 +853,9 @@ def gateway(
             logger.error(f"Cron job '{job.name}' agent_turn failed: {e}")
             await _notify_error(err)
             return f"__error__:{err}"
+
+        if job.payload.deliver and response and not is_silent_response(response):
+            _schedule_cron_push_notification(job, response)
 
         return response
 
@@ -1589,4 +1625,3 @@ Respond to the user now:"""
             console.print("[green]✓[/green] Shutdown complete")
 
     asyncio.run(run())
-
