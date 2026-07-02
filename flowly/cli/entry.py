@@ -8,8 +8,9 @@ resolves to the correct profile directory.
 Resolution order:
   1. ``-p`` / ``--profile`` CLI flag  (highest priority)
   2. ``FLOWLY_PROFILE`` env var       (for wrapper scripts)
-  3. ``~/.flowly/active_profile``     (sticky default)
-  4. ``"default"``                    (fallback)
+  3. existing ``FLOWLY_HOME`` env var (custom/isolated home)
+  4. ``~/.flowly/active_profile``     (sticky default)
+  5. ``"default"``                    (fallback)
 """
 
 from __future__ import annotations
@@ -111,16 +112,26 @@ def main() -> None:
     if profile is None:
         profile = os.environ.get("FLOWLY_PROFILE")
 
-    # 3. Check ~/.flowly/active_profile (sticky default)
-    if profile is None:
+    existing_home = os.environ.get("FLOWLY_HOME")
+
+    # 3. If FLOWLY_HOME is already explicit, preserve it. This keeps tests,
+    # wrappers, and one-off isolated runs from being silently redirected back to
+    # the default/sticky profile. -p / FLOWLY_PROFILE above still override it.
+    if profile is None and existing_home:
+        pass
+
+    # 4. Check ~/.flowly/active_profile (sticky default)
+    elif profile is None:
         from flowly.profile import get_active_profile
         active = get_active_profile()
         if active != "default":
             profile = active
 
-    # 4. Set FLOWLY_HOME before ANY other flowly import
-    from flowly.profile import set_profile
-    set_profile(profile)
+    # 5. Set FLOWLY_HOME before ANY other flowly import, unless an explicit
+    # FLOWLY_HOME was already present and no profile override was requested.
+    if not (profile is None and existing_home):
+        from flowly.profile import set_profile
+        set_profile(profile)
 
     # NOW it's safe to import the rest of flowly
     from flowly.cli.commands import app

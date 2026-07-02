@@ -307,6 +307,7 @@ def _next_commands(summary: SetupSummary) -> list[tuple[str, str]]:
     if not summary.gateway_installed:
         cmds.append(("flowly service install --start", "run the gateway in the background"))
     cmds.append(("flowly", "start chatting"))
+    cmds.append(("flowly memory import-prompt", "bring memories from ChatGPT/Gemini"))
     if not summary.configured_tools:
         cmds.append(("flowly setup tools", "add integrations"))
     if "MCP servers" in summary.missing:

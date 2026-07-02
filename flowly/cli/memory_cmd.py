@@ -7,6 +7,7 @@ store + KG, and renders output.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import typer
@@ -307,6 +308,98 @@ def dream_cmd(
         f"review={res.needs_review} superseded={res.superseded} "
         f"watermark={res.watermark}"
     )
+
+
+@memory_app.command("import-prompt")
+def import_prompt_cmd(
+    source: str = typer.Option(
+        "chatgpt", "--source", "-s", help="External source: chatgpt or gemini."
+    ),
+):
+    """Print the prompt to paste into ChatGPT/Gemini before importing."""
+    from flowly.memory.importer import memory_export_prompt
+
+    try:
+        console.print(memory_export_prompt(source))
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+
+@memory_app.command("import")
+def import_cmd(
+    input_path: str | None = typer.Argument(
+        None, help="Path to a copied memory dump. Use '-' or omit to read stdin."
+    ),
+    source: str = typer.Option(
+        "chatgpt", "--source", "-s", help="External source: chatgpt or gemini."
+    ),
+    text: str = typer.Option(
+        "", "--text", help="Import this literal text instead of reading a file/stdin."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Re-run even if this exact dump was imported before."
+    ),
+):
+    """Import a ChatGPT/Gemini memory dump into the governed review queue."""
+    from flowly.config.loader import load_config
+    from flowly.integrations.active_provider import resolve_active_provider
+    from flowly.memory.dreamer import read_user_profile
+    from flowly.memory.importer import run_import
+    from flowly.providers.factory import build_provider
+
+    raw = _read_import_input(input_path, text)
+    if not raw.strip():
+        console.print("[red]No import text provided.[/red]")
+        raise typer.Exit(1)
+
+    config = load_config()
+    ap = resolve_active_provider(config)
+    if ap is None:
+        console.print("[red]No LLM provider configured.[/red] Set one in /integrations.")
+        raise typer.Exit(1)
+
+    model = config.agents.defaults.model
+    provider = build_provider(ap, default_model=model, config=config)
+    mg = _open()
+    console.print(f"[dim]importing {source} memory via {ap.key}/{model}...[/dim]")
+    try:
+        res = run_import(
+            mg.gov,
+            provider=provider,
+            model=model,
+            text=raw,
+            source=source,
+            force=force,
+            on_committed=mg.refresh,
+            profile_fn=lambda: read_user_profile(config.workspace_path),
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    if not res.ran:
+        if res.reason == "already_imported":
+            console.print("[yellow]skipped[/yellow] this exact dump was already imported")
+        else:
+            console.print(f"[yellow]skipped[/yellow] ({res.reason})")
+        return
+
+    console.print(
+        f"[green]imported[/green] parsed~={res.parsed_items} chunks={res.chunks} "
+        f"candidates={res.candidates} review={res.needs_review} "
+        f"duplicates={res.duplicates} rejected={res.rejected}"
+    )
+
+
+def _read_import_input(input_path: str | None, literal_text: str) -> str:
+    if literal_text:
+        return literal_text
+    if input_path and input_path != "-":
+        return Path(input_path).expanduser().read_text(encoding="utf-8")
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
 
 
 @memory_app.command("migrate")

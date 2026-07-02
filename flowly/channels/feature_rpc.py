@@ -761,6 +761,84 @@ async def memory_dream(params: dict) -> dict:
     return await asyncio.to_thread(_dream_run, max_messages)
 
 
+def memory_import_prompt(params: dict) -> dict:
+    """Return the prompt a client can show for ChatGPT/Gemini export."""
+    from flowly.memory.importer import memory_export_prompt, normalize_source
+
+    source = params.get("source") or "chatgpt"
+    try:
+        normalized = normalize_source(str(source))
+        prompt = memory_export_prompt(normalized)
+    except ValueError as exc:
+        raise FeatureRpcError("INVALID", str(exc))
+    return {"source": normalized, "prompt": prompt}
+
+
+def _import_run(params: dict) -> dict:
+    """Blocking external memory import. Mirrors ``flowly memory import`` and
+    runs in a worker thread because it makes an LLM round-trip."""
+    from flowly.agent.memory import MemoryStore
+    from flowly.config.loader import load_config
+    from flowly.integrations.active_provider import resolve_active_provider
+    from flowly.memory.coordinator import MemoryGovernance
+    from flowly.memory.dreamer import read_user_profile
+    from flowly.memory.governance import GovernanceStore
+    from flowly.memory.importer import normalize_source, run_import
+    from flowly.providers.factory import build_provider
+
+    text = params.get("text") or params.get("dump") or ""
+    if not isinstance(text, str) or not text.strip():
+        raise FeatureRpcError("INVALID", "text required")
+    source = params.get("source") or "chatgpt"
+    try:
+        source = normalize_source(str(source))
+    except ValueError as exc:
+        raise FeatureRpcError("INVALID", str(exc))
+
+    config = load_config()
+    ap = resolve_active_provider(config)
+    if ap is None:
+        raise FeatureRpcError("NO_PROVIDER", "No LLM provider configured")
+    model = config.agents.defaults.model
+    provider = build_provider(ap, default_model=model, config=config)
+
+    ws = workspace_dir()
+    gov = GovernanceStore(state_db("memory_governance.sqlite3"))
+    coordinator = MemoryGovernance(gov, memory_store=MemoryStore(ws))
+    res = run_import(
+        gov,
+        provider=provider,
+        model=model,
+        text=text,
+        source=source,
+        force=bool(params.get("force", False)),
+        on_committed=coordinator.refresh,
+        profile_fn=lambda: read_user_profile(ws),
+    )
+
+    if not res.ran and res.reason == "already_imported":
+        output = "This exact memory dump was already imported."
+    elif not res.ran:
+        output = f"Import skipped: {res.reason}."
+    elif res.candidates == 0:
+        output = "No durable memories were found in the import."
+    else:
+        parts = [f"{res.needs_review} for review"]
+        if res.duplicates:
+            parts.append(f"{res.duplicates} duplicates")
+        if res.rejected:
+            parts.append(f"{res.rejected} rejected")
+        output = f"Imported {res.candidates} candidates: " + ", ".join(parts) + "."
+    return {"ok": True, "output": output, **res.to_dict()}
+
+
+async def memory_import(params: dict) -> dict:
+    """``memory.import`` — import a ChatGPT/Gemini memory dump into review."""
+    import asyncio
+
+    return await asyncio.to_thread(_import_run, params)
+
+
 # ── Persona / Provider ──────────────────────────────────────────────────────
 
 def persona_list() -> dict:
@@ -2267,6 +2345,8 @@ _DISPATCH: dict[str, tuple] = {
     "memory.feedback":    (_partial(memory_gov, "feedback"), True, False),
     "memory.consolidate": (memory_consolidate, True, False),
     "memory.dream":       (memory_dream, True, False),
+    "memory.import_prompt": (memory_import_prompt, True, False),
+    "memory.import":      (memory_import, True, False),
     "obsidian.status":    (_partial(obsidian_rpc, "status"), True, False),
     "obsidian.search":    (_partial(obsidian_rpc, "search"), True, False),
     "persona.list":       (persona_list, False, False),

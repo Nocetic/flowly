@@ -181,6 +181,16 @@ def test_watermark_advances_and_resumes(gov):
     assert res2.reason == "no_delta"
 
 
+def test_commit_candidates_does_not_advance_watermark(gov):
+    gov.set_meta(_WATERMARK_KEY, "42")
+    svc = _svc(gov, [], [], injection_check=lambda t: False)
+    res = svc.commit_candidates([
+        Candidate(kind="preference", text="likes pytest", normalized_key="pref:test", confidence=0.9)
+    ])
+    assert res.activated == 1
+    assert gov.get_meta(_WATERMARK_KEY) == "42"
+
+
 # -- single-writer lock -----------------------------------------------------
 
 

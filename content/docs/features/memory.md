@@ -208,6 +208,30 @@ dropped), `maxMessagesPerRun` (500). Set `turnInterval: 0` to drop the per-turn
 pass and rely on idle + daily only; `enabled: false` turns the layer off entirely.
 The full config table is in [Configuration](../using-flowly/configuration.md#agents).
 
+### External memory import (ChatGPT / Gemini)
+
+Flowly can import a copied memory/profile dump from ChatGPT or Google Gemini:
+
+```bash
+flowly memory import-prompt --source chatgpt
+flowly memory import --source chatgpt path/to/dump.md
+```
+
+The first command prints the prompt to paste into ChatGPT/Gemini. Paste the
+model's response into a file (or pipe it on stdin) and run `flowly memory import`.
+The importer uses the same governed commit path as the dreamer:
+
+- the pasted dump is treated as untrusted text and prompt-injection scanned;
+- compound bullets are normalized into memory candidates;
+- duplicates are skipped or bumped, not re-added;
+- contradictions with active Flowly memory go to review instead of silently
+  overwriting local memory;
+- imported items are never auto-activated in v1 — they land in the review queue.
+
+The same flow is available to clients via `memory.import_prompt` and
+`memory.import`, and to the agent through the `memory-import` skill when memory
+governance is enabled.
+
 ### Consolidation (cleanup of the existing store)
 
 Distinct from dreaming, consolidation is an LLM-driven **cleanup** of what's
@@ -231,6 +255,8 @@ flowly memory feedback <id>         # 👍/👎 to retune a memory's trust score
 flowly memory correct <id> "..."    # fix a memory's content
 flowly memory undo                  # revert the last change
 flowly memory consolidate           # merge duplicates / retire stale now
+flowly memory import-prompt         # get a ChatGPT/Gemini export prompt
+flowly memory import dump.md        # import external memory into review
 flowly memory refresh               # rebuild the MEMORY.md block from the store
 flowly memory status                # store statistics
 ```

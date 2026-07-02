@@ -31,7 +31,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional, Protocol, Sequence
+from typing import Any, Callable, Optional, Protocol, Sequence
 
 from loguru import logger
 
@@ -105,6 +105,8 @@ class Candidate:
     source_message_ids: list[str] = field(default_factory=list)
     # Calibration signal: did the user state this explicitly (vs agent inferred)?
     is_explicit: bool = False
+    # Adapter-specific provenance for review UIs (e.g. imported from ChatGPT).
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -292,6 +294,43 @@ class MemoryDreamerService:
         finally:
             self._release_lock()
 
+    def commit_candidates(
+        self,
+        candidates: Sequence[Candidate],
+        *,
+        processed_messages: int = 0,
+        reason: str = "",
+    ) -> DreamResult:
+        """Commit already-extracted candidates through the same governance
+        machine as a normal dreamer pass, without reading or advancing the
+        session watermark.
+
+        External importers use this to reuse injection scanning, duplicate
+        handling, conflict arbitration, audit writes, and summary refresh while
+        keeping the live session-index watermark untouched.
+        """
+        if not self._try_acquire_lock():
+            return DreamResult(ran=False, reason="locked")
+        try:
+            res = DreamResult(
+                ran=True,
+                processed_messages=processed_messages,
+                candidates=len(candidates),
+                watermark=self._watermark(),
+                reason=reason,
+            )
+            for cand in candidates:
+                self._commit_candidate(cand, res)
+
+            if self.on_committed is not None:
+                try:
+                    self.on_committed()
+                except Exception as exc:  # never let summary regen break a run
+                    logger.warning(f"[dreamer] on_committed hook failed: {exc}")
+            return res
+        finally:
+            self._release_lock()
+
     def _run_inner(self, *, max_messages: int) -> DreamResult:
         watermark = self._watermark()
         delta = list(self.delta_source.read_since(watermark, max_messages))
@@ -344,6 +383,7 @@ class MemoryDreamerService:
                 normalized_key=cand.normalized_key, confidence=cand.confidence,
                 privacy_level=cand.privacy_level, source_session=cand.source_session,
                 source_message_ids=cand.source_message_ids,
+                metadata=cand.metadata,
                 actor=ACTOR_DREAMER, reason="extracted",
             )
             self.gov.transition(
@@ -420,6 +460,7 @@ class MemoryDreamerService:
             normalized_key=cand.normalized_key, confidence=cand.confidence,
             privacy_level=cand.privacy_level, source_session=cand.source_session,
             source_message_ids=cand.source_message_ids,
+            metadata=cand.metadata,
             actor=ACTOR_DREAMER, reason="extracted",
         )
 

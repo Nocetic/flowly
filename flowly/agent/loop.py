@@ -737,6 +737,11 @@ class AgentLoop:
                 model=self.model, kg_summary_fn=_kg_summary,
             )
             self.tools.register(self._consolidate_tool)
+            from flowly.agent.tools.memory_import import MemoryImportTool
+            self.tools.register(MemoryImportTool(
+                facade=self._memory_gov, provider=self.provider,
+                model=self.model, workspace=self.workspace,
+            ))
             # Trust feedback: recall surfaces item ids, feedback nudges confidence.
             from flowly.agent.tools.memory_recall import MemoryRecallTool
             from flowly.agent.tools.memory_feedback import MemoryFeedbackTool
