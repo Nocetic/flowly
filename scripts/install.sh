@@ -25,6 +25,19 @@ FLOWLY_SKIP_BOOTSTRAP="${FLOWLY_SKIP_BOOTSTRAP:-0}"
 FLOWLY_NO_PATH_UPDATE="${FLOWLY_NO_PATH_UPDATE:-0}"
 FLOWLY_SKIP_SYSTEM_DEPS="${FLOWLY_SKIP_SYSTEM_DEPS:-0}"
 FLOWLY_TOOL_BIN_DIR="${FLOWLY_TOOL_BIN_DIR:-}"
+FLOWLY_VERBOSE="${FLOWLY_VERBOSE:-0}"
+FLOWLY_PROGRESS_TAIL_LINES="${FLOWLY_PROGRESS_TAIL_LINES:-12}"
+[[ "$FLOWLY_PROGRESS_TAIL_LINES" =~ ^[0-9]+$ ]] || FLOWLY_PROGRESS_TAIL_LINES=12
+FLOWLY_PROGRESS_RENDERED_LINES=0
+FLOWLY_PROGRESS_LAST_FRAME=""
+FLOWLY_PROGRESS_CURSOR_HIDDEN=0
+FLOWLY_COLOR_BLUE=""
+FLOWLY_COLOR_BLUE_SOFT=""
+FLOWLY_COLOR_BLUE_MUTED=""
+FLOWLY_COLOR_GREEN=""
+FLOWLY_COLOR_RED=""
+FLOWLY_COLOR_DIM=""
+FLOWLY_COLOR_RESET=""
 
 usage() {
   cat <<'EOF'
@@ -52,6 +65,7 @@ Environment:
   FLOWLY_PYTHON           Python version for the uv managed venv (default: 3.12)
   FLOWLY_SKIP_SYSTEM_DEPS Set to 1 to skip optional tool install
   FLOWLY_TOOL_BIN_DIR     Directory to place the flowly launcher in
+  FLOWLY_VERBOSE          Set to 1 to show raw command output
 EOF
 }
 
@@ -113,9 +127,259 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-log() { printf '\033[0;36m[flowly]\033[0m %s\n' "$*"; }
-ok() { printf '\033[0;32m[flowly]\033[0m %s\n' "$*"; }
-err() { printf '\033[0;31m[flowly]\033[0m %s\n' "$*" >&2; }
+init_colors() {
+  [[ -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]] || return 0
+  [[ -t 1 ]] || return 0
+  FLOWLY_COLOR_BLUE=$'\033[38;5;45m'
+  FLOWLY_COLOR_BLUE_SOFT=$'\033[38;5;81m'
+  FLOWLY_COLOR_BLUE_MUTED=$'\033[38;5;75m'
+  FLOWLY_COLOR_GREEN=$'\033[38;5;49m'
+  FLOWLY_COLOR_RED=$'\033[38;5;203m'
+  FLOWLY_COLOR_DIM=$'\033[2m'
+  FLOWLY_COLOR_RESET=$'\033[0m'
+}
+
+log() { printf '%s[flowly]%s %s\n' "$FLOWLY_COLOR_BLUE" "$FLOWLY_COLOR_RESET" "$*"; }
+ok() { printf '%s[flowly]%s %s\n' "$FLOWLY_COLOR_GREEN" "$FLOWLY_COLOR_RESET" "$*"; }
+err() { printf '%s[flowly]%s %s\n' "$FLOWLY_COLOR_RED" "$FLOWLY_COLOR_RESET" "$*" >&2; }
+
+print_banner() {
+  local cols
+  cols="$(progress_columns)"
+  if (( cols < 56 )); then
+    printf '%sFLOWLY%s\n\n' "$FLOWLY_COLOR_BLUE_SOFT" "$FLOWLY_COLOR_RESET"
+    return 0
+  fi
+
+  printf '%s ███████╗██╗      ██████╗ ██╗    ██╗██╗  ██╗   ██╗%s\n' "$FLOWLY_COLOR_BLUE_SOFT" "$FLOWLY_COLOR_RESET"
+  printf '%s ██╔════╝██║     ██╔═══██╗██║    ██║██║  ╚██╗ ██╔╝%s\n' "$FLOWLY_COLOR_BLUE_SOFT" "$FLOWLY_COLOR_RESET"
+  printf '%s █████╗  ██║     ██║   ██║██║ █╗ ██║██║   ╚████╔╝ %s\n' "$FLOWLY_COLOR_BLUE" "$FLOWLY_COLOR_RESET"
+  printf '%s ██╔══╝  ██║     ██║   ██║██║███╗██║██║    ╚██╔╝  %s\n' "$FLOWLY_COLOR_BLUE" "$FLOWLY_COLOR_RESET"
+  printf '%s ██║     ███████╗╚██████╔╝╚███╔███╔╝███████╗██║   %s\n' "$FLOWLY_COLOR_BLUE_MUTED" "$FLOWLY_COLOR_RESET"
+  printf '%s ╚═╝     ╚══════╝ ╚═════╝  ╚══╝╚══╝ ╚══════╝╚═╝   %s\n\n' "$FLOWLY_COLOR_BLUE_MUTED" "$FLOWLY_COLOR_RESET"
+}
+
+animation_available() {
+  [[ "$FLOWLY_VERBOSE" != "1" ]] || return 1
+  [[ -t 1 ]] || return 1
+  [[ -r /dev/tty && -w /dev/tty ]] || return 1
+  [[ "${TERM:-}" != "dumb" ]] || return 1
+  return 0
+}
+
+format_elapsed() {
+  local seconds="$1"
+  printf '%02d:%02d' "$((seconds / 60))" "$((seconds % 60))"
+}
+
+progress_bar() {
+  local fill="$1"
+  local width=10
+  local bar=""
+  local i
+
+  [[ "$fill" =~ ^[0-9]+$ ]] || fill=0
+  (( fill < 0 )) && fill=0
+  (( fill > width )) && fill=$width
+
+  for ((i = 0; i < width; i++)); do
+    if (( i < fill )); then
+      bar+="#"
+    else
+      bar+="-"
+    fi
+  done
+  printf '%s' "$bar"
+}
+
+progress_bar_render() {
+  local fill="$1"
+  local raw filled empty
+  raw="$(progress_bar "$fill")"
+  filled="${raw%%-*}"
+  empty="${raw#"$filled"}"
+  printf '%s%s%s%s%s' \
+    "$FLOWLY_COLOR_BLUE" "$filled" \
+    "$FLOWLY_COLOR_BLUE_MUTED" "$empty" \
+    "$FLOWLY_COLOR_RESET"
+}
+
+progress_columns() {
+  local cols="${COLUMNS:-}"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  (( cols < 40 )) && cols=80
+  printf '%s\n' "$cols"
+}
+
+count_lines() {
+  local text="$1"
+  if [[ -z "$text" ]]; then
+    printf '0'
+  else
+    printf '%s\n' "$text" | wc -l | tr -d ' '
+  fi
+}
+
+clear_progress() {
+  if (( FLOWLY_PROGRESS_RENDERED_LINES > 0 )); then
+    printf '\033[%dA\033[J' "$FLOWLY_PROGRESS_RENDERED_LINES"
+    FLOWLY_PROGRESS_RENDERED_LINES=0
+    FLOWLY_PROGRESS_LAST_FRAME=""
+  fi
+}
+
+hide_progress_cursor() {
+  if (( FLOWLY_PROGRESS_CURSOR_HIDDEN == 0 )); then
+    printf '\033[?25l'
+    FLOWLY_PROGRESS_CURSOR_HIDDEN=1
+  fi
+}
+
+show_progress_cursor() {
+  if (( FLOWLY_PROGRESS_CURSOR_HIDDEN == 1 )); then
+    printf '\033[?25h'
+    FLOWLY_PROGRESS_CURSOR_HIDDEN=0
+  fi
+}
+
+render_progress() {
+  local fill="$1"
+  local action="$2"
+  local elapsed="$3"
+  local logs_open="$4"
+  local log_file="$5"
+  local tail_output=""
+  local tail_count=0
+  local cols max_line max_action line block rendered_lines action_text
+
+  cols="$(progress_columns)"
+  max_action=$((cols - 24))
+  (( max_action < 20 )) && max_action=20
+  action_text="${action:0:max_action}"
+
+  if [[ "$logs_open" == "1" ]]; then
+    tail_output="$(tail -n "$FLOWLY_PROGRESS_TAIL_LINES" "$log_file" 2>/dev/null || true)"
+    tail_count="$(count_lines "$tail_output")"
+    (( tail_count == 0 )) && tail_count=1
+  fi
+
+  printf -v block '%s[flowly]%s Installing Flowly\n' "$FLOWLY_COLOR_BLUE" "$FLOWLY_COLOR_RESET"
+  printf -v block '%s         [%s] %s\n' "$block" "$(progress_bar_render "$fill")" "$action_text"
+  if [[ "$logs_open" == "1" ]]; then
+    printf -v block '%s         %s%s elapsed | press o/Ctrl+O to hide logs%s\n' \
+      "$block" "$FLOWLY_COLOR_BLUE_MUTED" "$(format_elapsed "$elapsed")" "$FLOWLY_COLOR_RESET"
+  else
+    printf -v block '%s         %s%s elapsed | press o/Ctrl+O for logs%s\n' \
+      "$block" "$FLOWLY_COLOR_BLUE_MUTED" "$(format_elapsed "$elapsed")" "$FLOWLY_COLOR_RESET"
+  fi
+  rendered_lines=3
+
+  if [[ "$logs_open" == "1" ]]; then
+    max_line=$((cols - 9))
+    (( max_line < 20 )) && max_line=20
+    printf -v block '%s\n%s--- live log ---%s\n' "$block" "$FLOWLY_COLOR_BLUE_MUTED" "$FLOWLY_COLOR_RESET"
+    rendered_lines=$((rendered_lines + 2 + tail_count))
+    if [[ -z "$tail_output" ]]; then
+      printf -v block '%s         waiting for log output\n' "$block"
+    else
+      while IFS= read -r line; do
+        line="${line//$'\r'/}"
+        printf -v block '%s         %s\n' "$block" "${line:0:max_line}"
+      done <<< "$tail_output"
+    fi
+  fi
+
+  [[ "$block" == "$FLOWLY_PROGRESS_LAST_FRAME" ]] && return 0
+  clear_progress
+  printf '%s' "$block"
+  FLOWLY_PROGRESS_RENDERED_LINES="$rendered_lines"
+  FLOWLY_PROGRESS_LAST_FRAME="$block"
+}
+
+run_flowly_command() {
+  local start_fill="$1"
+  local end_fill="$2"
+  local action="$3"
+  shift 3
+
+  local tmp_dir log_file
+  tmp_dir="${TMPDIR:-/tmp}"
+  tmp_dir="${tmp_dir%/}"
+  log_file="$(mktemp "${tmp_dir}/flowly-install.XXXXXX")"
+
+  if [[ "$FLOWLY_VERBOSE" == "1" ]]; then
+    log "$action..."
+    set +e
+    "$@"
+    local status=$?
+    set -e
+    return "$status"
+  fi
+
+  if ! animation_available; then
+    log "$action..."
+    if "$@" >"$log_file" 2>&1; then
+      ok "$action complete."
+      return 0
+    else
+      local status=$?
+      err "$action failed. Full log: $log_file"
+      tail -n 120 "$log_file" >&2 || true
+      return "$status"
+    fi
+  fi
+
+  local start_time now elapsed fill status logs_open key cmd_pid
+  start_time="$(date +%s)"
+  logs_open=0
+
+  "$@" >"$log_file" 2>&1 &
+  cmd_pid=$!
+
+  hide_progress_cursor
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    if IFS= read -r -s -n 1 -t 0.05 key </dev/tty; then
+      case "$key" in
+        o|O|$'\017') logs_open=$((1 - logs_open)) ;;
+      esac
+    fi
+
+    now="$(date +%s)"
+    elapsed=$((now - start_time))
+    fill=$((start_fill + elapsed / 3))
+    if (( fill >= end_fill )); then
+      fill=$((end_fill - 1))
+    fi
+    (( fill < start_fill )) && fill=$start_fill
+    (( fill < 1 )) && fill=1
+
+    render_progress "$fill" "$action" "$elapsed" "$logs_open" "$log_file"
+    sleep 0.20
+  done
+
+  if wait "$cmd_pid"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  now="$(date +%s)"
+  elapsed=$((now - start_time))
+  if (( status == 0 )); then
+    render_progress "$end_fill" "$action" "$elapsed" "$logs_open" "$log_file"
+    sleep 0.08
+    clear_progress
+    show_progress_cursor
+    ok "$action complete in $(format_elapsed "$elapsed")."
+    return 0
+  fi
+
+  clear_progress
+  show_progress_cursor
+  err "$action failed after $(format_elapsed "$elapsed"). Full log: $log_file"
+  tail -n 120 "$log_file" >&2 || true
+  return "$status"
+}
 
 detect_platform() {
   case "$(uname -s)" in
@@ -152,8 +416,7 @@ ensure_uv() {
     return 0
   fi
 
-  log "Installing uv package manager..."
-  download_uv_installer
+  run_flowly_command 1 2 "Installing uv package manager" download_uv_installer
   refresh_path
 
   if ! command -v uv >/dev/null 2>&1; then
@@ -404,11 +667,13 @@ install_from_source() {
     log "Creating Flowly virtualenv at ${FLOWLY_VENV} (Python ${FLOWLY_PYTHON})..."
     # --clear: only reached when (re)creating, to wipe any broken/partial
     # leftovers from an interrupted previous run.
-    uv venv --clear --python "$FLOWLY_PYTHON" "$FLOWLY_VENV"
+    run_flowly_command 2 4 "Creating Python environment" \
+      uv venv --clear --python "$FLOWLY_PYTHON" "$FLOWLY_VENV"
   fi
 
   log "Installing Flowly (editable) from ${FLOWLY_SRC}..."
-  uv pip install --python "${FLOWLY_VENV}/bin/python" -e "$FLOWLY_SRC"
+  run_flowly_command 4 7 "Installing packages" \
+    uv pip install --python "${FLOWLY_VENV}/bin/python" -e "$FLOWLY_SRC"
 }
 
 # Symlink the venv's flowly entry point into a PATH directory. The symlink keeps
@@ -462,6 +727,9 @@ install_system_deps() {
 }
 
 main() {
+  init_colors
+  trap show_progress_cursor EXIT
+  print_banner
   detect_platform
   ensure_uv
   ensure_git
