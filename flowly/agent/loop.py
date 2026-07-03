@@ -1561,6 +1561,27 @@ class AgentLoop:
                 from flowly.agent.tools.linear import LinearTool
                 self.tools.register(LinearTool(api_key=linear_cfg.api_key))
 
+        # GitHub tool (if a token is configured).
+        if self._main_config and hasattr(self._main_config, 'integrations'):
+            gh_cfg = getattr(self._main_config.integrations, 'github', None)
+            if gh_cfg and gh_cfg.token:
+                from flowly.agent.tools.github import GitHubTool
+                self.tools.register(GitHubTool(
+                    token=gh_cfg.token,
+                    default_repo=getattr(gh_cfg, 'default_repo', ''),
+                ))
+
+        # Sentry tool (if both token and org are configured).
+        if self._main_config and hasattr(self._main_config, 'integrations'):
+            sentry_cfg = getattr(self._main_config.integrations, 'sentry', None)
+            if sentry_cfg and sentry_cfg.token and sentry_cfg.org:
+                from flowly.agent.tools.sentry import SentryTool
+                self.tools.register(SentryTool(
+                    token=sentry_cfg.token,
+                    org=sentry_cfg.org,
+                    default_project=getattr(sentry_cfg, 'default_project', ''),
+                ))
+
         # Image generation (FAL-backed, opt-in) — dual-gated on enabled + key.
         if self._main_config and hasattr(self._main_config, 'tools'):
             img_cfg = getattr(self._main_config.tools, 'image_generation', None)
@@ -3880,7 +3901,7 @@ class AgentLoop:
                             pass
                     try:
                         # Inject session_key for tools that need approval routing
-                        if tool_call.name in ("exec", "email", "google_calendar", "google_drive", "google_tasks", "linear", "process", "clarify") and "session_key" not in call_args:
+                        if tool_call.name in ("exec", "email", "google_calendar", "google_drive", "google_tasks", "linear", "github", "sentry", "process", "clarify") and "session_key" not in call_args:
                             call_args["session_key"] = _current_session_key
 
                         # Spawn interception: redirect spawn → builtin_agent

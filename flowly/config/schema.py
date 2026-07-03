@@ -598,6 +598,30 @@ class LinearConfig(BaseModel):
     api_key: str = ""  # Personal API key from Linear Settings → API
 
 
+class GitHubConfig(BaseModel):
+    """GitHub integration configuration.
+
+    The ``github`` tool registers when ``token`` is non-empty. ``token`` is a
+    personal access token (classic or fine-grained) with repo scope.
+    ``default_repo`` ("owner/name") is an optional fallback when the tool
+    can't infer the repo from the open project's origin remote.
+    """
+    token: str = ""
+    default_repo: str = ""
+
+
+class SentryConfig(BaseModel):
+    """Sentry integration configuration.
+
+    The ``sentry`` tool registers when both ``token`` and ``org`` are set.
+    ``token`` is an auth token (Settings → Auth Tokens); ``org`` is the org
+    slug. ``default_project`` is an optional project slug used by list_issues.
+    """
+    token: str = ""
+    org: str = ""
+    default_project: str = ""
+
+
 class HomeAssistantConfig(BaseModel):
     """Home Assistant integration configuration.
 
@@ -646,6 +670,8 @@ class IntegrationsConfig(BaseModel):
     x: XConfig = Field(default_factory=XConfig)
     google_workspace: GoogleWorkspaceConfig = Field(default_factory=GoogleWorkspaceConfig)
     linear: LinearConfig = Field(default_factory=LinearConfig)
+    github: GitHubConfig = Field(default_factory=GitHubConfig)
+    sentry: SentryConfig = Field(default_factory=SentryConfig)
     home_assistant: HomeAssistantConfig = Field(default_factory=HomeAssistantConfig)
     obsidian: ObsidianConfig = Field(default_factory=ObsidianConfig)
 

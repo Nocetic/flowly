@@ -430,6 +430,67 @@ async def probe_linear(values: dict[str, Any]) -> ProbeResult:
     return ProbeResult("ok", "authenticated")
 
 
+async def probe_github(values: dict[str, Any]) -> ProbeResult:
+    token = (values.get("token") or "").strip()
+    if not token:
+        return ProbeResult("not_configured", "token missing")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+            r = await c.get(
+                "https://api.github.com/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": _UA,
+                },
+            )
+    except Exception as exc:
+        return _net_error(exc)
+    if r.status_code == 401:
+        return ProbeResult("auth_failed", "token rejected")
+    if r.status_code != 200:
+        return ProbeResult("down", f"HTTP {r.status_code}")
+    try:
+        login = r.json().get("login")
+        if login:
+            return ProbeResult("ok", f"@{login}")
+    except Exception:
+        pass
+    return ProbeResult("ok", "authenticated")
+
+
+async def probe_sentry(values: dict[str, Any]) -> ProbeResult:
+    token = (values.get("token") or "").strip()
+    org = (values.get("org") or "").strip()
+    if not token:
+        return ProbeResult("not_configured", "token missing")
+    if not org:
+        return ProbeResult("not_configured", "org slug missing")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+            r = await c.get(
+                f"https://sentry.io/api/0/organizations/{org}/",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": _UA,
+                },
+            )
+    except Exception as exc:
+        return _net_error(exc)
+    if r.status_code == 401:
+        return ProbeResult("auth_failed", "token rejected")
+    if r.status_code in (403, 404):
+        return ProbeResult("auth_failed", "org not accessible")
+    if r.status_code != 200:
+        return ProbeResult("down", f"HTTP {r.status_code}")
+    try:
+        name = r.json().get("slug") or org
+        return ProbeResult("ok", name)
+    except Exception:
+        pass
+    return ProbeResult("ok", "authenticated")
+
+
 async def probe_obsidian(values: dict[str, Any]) -> ProbeResult:
     """Check the Obsidian vault is reachable and holds at least one note.
 
