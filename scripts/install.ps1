@@ -46,8 +46,317 @@ if (-not $Venv) { $Venv = Join-Path $FlowlyBase 'venv' }
 $GitDir = Join-Path $FlowlyBase 'git'
 $BinDir = Join-Path $FlowlyBase 'bin'
 
-function Write-Step($Message) { Write-Host "[flowly] $Message" -ForegroundColor Cyan }
-function Write-Ok($Message)   { Write-Host "[flowly] $Message" -ForegroundColor Green }
+$FlowlyVerbose = $env:FLOWLY_VERBOSE -eq '1'
+$FlowlyProgressTailLines = 12
+if ($env:FLOWLY_PROGRESS_TAIL_LINES -match '^[0-9]+$') {
+    $FlowlyProgressTailLines = [int]$env:FLOWLY_PROGRESS_TAIL_LINES
+}
+$script:FlowlyProgressRenderedLines = 0
+$script:FlowlyProgressLastFrame = ''
+$script:FlowlyCursorHidden = $false
+$FlowlyEsc = [char]27
+$FlowlyUseAnsi = (-not [Console]::IsOutputRedirected) -and (-not $env:NO_COLOR) -and ($env:TERM -ne 'dumb')
+$FlowlyBlue = ''
+$FlowlyBlueSoft = ''
+$FlowlyBlueMuted = ''
+$FlowlyGreen = ''
+$FlowlyRed = ''
+$FlowlyReset = ''
+if ($FlowlyUseAnsi) {
+    $FlowlyBlue = "${FlowlyEsc}[38;5;45m"
+    $FlowlyBlueSoft = "${FlowlyEsc}[38;5;81m"
+    $FlowlyBlueMuted = "${FlowlyEsc}[38;5;75m"
+    $FlowlyGreen = "${FlowlyEsc}[38;5;49m"
+    $FlowlyRed = "${FlowlyEsc}[38;5;203m"
+    $FlowlyReset = "${FlowlyEsc}[0m"
+}
+
+function Format-FlowlyBrand { "${FlowlyBlue}[flowly]${FlowlyReset}" }
+function Write-Step($Message) { Write-Host "$(Format-FlowlyBrand) $Message" }
+function Write-Ok($Message)   { Write-Host "${FlowlyGreen}[flowly]${FlowlyReset} $Message" }
+function Write-Err($Message)  { Write-Host "${FlowlyRed}[flowly]${FlowlyReset} $Message" }
+
+function Write-Banner {
+    if ((Get-FlowlyTerminalWidth) -lt 56) {
+        Write-Host "${FlowlyBlueSoft}FLOWLY${FlowlyReset}"
+        Write-Host ''
+        return
+    }
+
+    Write-Host "${FlowlyBlueSoft} ███████╗██╗      ██████╗ ██╗    ██╗██╗  ██╗   ██╗${FlowlyReset}"
+    Write-Host "${FlowlyBlueSoft} ██╔════╝██║     ██╔═══██╗██║    ██║██║  ╚██╗ ██╔╝${FlowlyReset}"
+    Write-Host "${FlowlyBlue} █████╗  ██║     ██║   ██║██║ █╗ ██║██║   ╚████╔╝ ${FlowlyReset}"
+    Write-Host "${FlowlyBlue} ██╔══╝  ██║     ██║   ██║██║███╗██║██║    ╚██╔╝  ${FlowlyReset}"
+    Write-Host "${FlowlyBlueMuted} ██║     ███████╗╚██████╔╝╚███╔███╔╝███████╗██║   ${FlowlyReset}"
+    Write-Host "${FlowlyBlueMuted} ╚═╝     ╚══════╝ ╚═════╝  ╚══╝╚══╝ ╚══════╝╚═╝   ${FlowlyReset}"
+    Write-Host ''
+}
+
+function Test-FlowlyAnimation {
+    if ($FlowlyVerbose) { return $false }
+    if ([Console]::IsOutputRedirected) { return $false }
+    if ($env:TERM -eq 'dumb') { return $false }
+    return $true
+}
+
+function Format-FlowlyElapsed {
+    param([int]$Seconds)
+    $minutes = [Math]::Floor($Seconds / 60)
+    $rest = $Seconds % 60
+    return ('{0:00}:{1:00}' -f $minutes, $rest)
+}
+
+function Get-FlowlyBar {
+    param([int]$Fill)
+    $width = 10
+    if ($Fill -lt 0) { $Fill = 0 }
+    if ($Fill -gt $width) { $Fill = $width }
+    return (('#' * $Fill) + ('-' * ($width - $Fill)))
+}
+
+function Get-FlowlyBarRenderable {
+    param([int]$Fill)
+    $raw = Get-FlowlyBar -Fill $Fill
+    $filled = $raw.TrimEnd('-')
+    $empty = $raw.Substring($filled.Length)
+    return "${FlowlyBlue}${filled}${FlowlyBlueMuted}${empty}${FlowlyReset}"
+}
+
+function Get-FlowlyTerminalWidth {
+    try {
+        $width = [Console]::WindowWidth
+        if ($width -ge 40) { return $width }
+    }
+    catch { }
+    return 80
+}
+
+function Clear-FlowlyProgress {
+    if ($script:FlowlyProgressRenderedLines -gt 0) {
+        Write-Host -NoNewline ("{0}[{1}A{0}[J" -f $FlowlyEsc, $script:FlowlyProgressRenderedLines)
+        $script:FlowlyProgressRenderedLines = 0
+        $script:FlowlyProgressLastFrame = ''
+    }
+}
+
+function Hide-FlowlyCursor {
+    if (-not $script:FlowlyCursorHidden) {
+        Write-Host -NoNewline "${FlowlyEsc}[?25l"
+        $script:FlowlyCursorHidden = $true
+    }
+}
+
+function Show-FlowlyCursor {
+    if ($script:FlowlyCursorHidden) {
+        Write-Host -NoNewline "${FlowlyEsc}[?25h"
+        $script:FlowlyCursorHidden = $false
+    }
+}
+
+function Get-FlowlyLogTail {
+    param(
+        [string]$StdoutPath,
+        [string]$StderrPath
+    )
+
+    $lines = @()
+    foreach ($path in @($StdoutPath, $StderrPath)) {
+        if (Test-Path $path) {
+            try {
+                $lines += Get-Content -Path $path -Tail $FlowlyProgressTailLines -ErrorAction SilentlyContinue
+            }
+            catch { }
+        }
+    }
+    if ($lines.Count -gt $FlowlyProgressTailLines) {
+        $lines = $lines | Select-Object -Last $FlowlyProgressTailLines
+    }
+    return @($lines)
+}
+
+function Join-FlowlyCommandLogs {
+    param(
+        [string]$LogPath,
+        [string]$StdoutPath,
+        [string]$StderrPath
+    )
+
+    $lines = @()
+    foreach ($path in @($StdoutPath, $StderrPath)) {
+        if (Test-Path $path) {
+            try { $lines += Get-Content -Path $path -ErrorAction SilentlyContinue }
+            catch { }
+        }
+    }
+    Set-Content -Path $LogPath -Value $lines -Encoding UTF8
+}
+
+function Show-FlowlyProgress {
+    param(
+        [int]$Fill,
+        [string]$Action,
+        [int]$ElapsedSeconds,
+        [bool]$LogsOpen,
+        [string]$LogPath,
+        [string]$StdoutPath,
+        [string]$StderrPath,
+        [bool]$CanReadKeys
+    )
+
+    $width = Get-FlowlyTerminalWidth
+    $maxAction = $width - 24
+    if ($maxAction -lt 20) { $maxAction = 20 }
+    $actionText = $Action
+    if ($actionText.Length -gt $maxAction) {
+        $actionText = $actionText.Substring(0, $maxAction)
+    }
+
+    $lines = @()
+    $lines += "$(Format-FlowlyBrand) Installing Flowly"
+    $lines += ("         [{0}] {1}" -f (Get-FlowlyBarRenderable -Fill $Fill), $actionText)
+    $elapsed = Format-FlowlyElapsed -Seconds $ElapsedSeconds
+    if ($LogsOpen) {
+        $lines += ("         {0}{1} elapsed | press o/Ctrl+O to hide logs{2}" -f $FlowlyBlueMuted, $elapsed, $FlowlyReset)
+    }
+    elseif ($CanReadKeys) {
+        $lines += ("         {0}{1} elapsed | press o/Ctrl+O for logs{2}" -f $FlowlyBlueMuted, $elapsed, $FlowlyReset)
+    }
+    else {
+        $lines += ("         {0}{1} elapsed | log: {2}{3}" -f $FlowlyBlueMuted, $elapsed, $LogPath, $FlowlyReset)
+    }
+
+    if ($LogsOpen) {
+        $lines += ''
+        $lines += "${FlowlyBlueMuted}--- live log ---${FlowlyReset}"
+        $tail = Get-FlowlyLogTail -StdoutPath $StdoutPath -StderrPath $StderrPath
+        if ($tail.Count -eq 0) {
+            $lines += '         waiting for log output'
+        }
+        else {
+            $maxLine = $width - 9
+            if ($maxLine -lt 20) { $maxLine = 20 }
+            foreach ($line in $tail) {
+                $text = [string]$line
+                if ($text.Length -gt $maxLine) {
+                    $text = $text.Substring(0, $maxLine)
+                }
+                $lines += ("         {0}" -f $text)
+            }
+        }
+    }
+
+    $block = ($lines -join "`n") + "`n"
+    if ($block -eq $script:FlowlyProgressLastFrame) { return }
+
+    Clear-FlowlyProgress
+    Write-Host -NoNewline $block
+    $script:FlowlyProgressRenderedLines = $lines.Count
+    $script:FlowlyProgressLastFrame = $block
+}
+
+function Invoke-FlowlyCommand {
+    param(
+        [int]$StartFill,
+        [int]$EndFill,
+        [string]$Action,
+        [string]$File,
+        [string[]]$Arguments
+    )
+
+    $logPath = Join-Path ([IO.Path]::GetTempPath()) ("flowly-install-{0}.log" -f ([Guid]::NewGuid().ToString('N').Substring(0, 8)))
+
+    if ($FlowlyVerbose) {
+        Write-Step "$Action..."
+        & $File @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "$Action failed." }
+        return
+    }
+
+    if (-not (Test-FlowlyAnimation)) {
+        Write-Step "$Action..."
+        & $File @Arguments *> $logPath
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "$Action complete."
+            return
+        }
+        Write-Err "$Action failed. Full log: $logPath"
+        Get-Content -Path $logPath -Tail 120 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+        throw "$Action failed."
+    }
+
+    $stdoutPath = "$logPath.out"
+    $stderrPath = "$logPath.err"
+    $job = Start-Job -ScriptBlock {
+        param([string]$Command, [string[]]$CommandArgs, [string]$OutPath, [string]$ErrPath)
+        & $Command @CommandArgs > $OutPath 2> $ErrPath
+        if ($null -ne $LASTEXITCODE) {
+            $LASTEXITCODE
+        }
+        elseif ($?) {
+            0
+        }
+        else {
+            1
+        }
+    } -ArgumentList $File, (,$Arguments), $stdoutPath, $stderrPath
+
+    $started = Get-Date
+    $logsOpen = $false
+    $canReadKeys = -not [Console]::IsInputRedirected
+
+    Hide-FlowlyCursor
+    while ($job.State -eq 'Running') {
+        if ($canReadKeys) {
+            try {
+                while ([Console]::KeyAvailable) {
+                    $key = [Console]::ReadKey($true)
+                    $isCtrlO = ($key.Key -eq [ConsoleKey]::O) -and (($key.Modifiers -band [ConsoleModifiers]::Control) -ne 0)
+                    if ($key.KeyChar -eq 'o' -or $key.KeyChar -eq 'O' -or $isCtrlO) {
+                        $logsOpen = -not $logsOpen
+                    }
+                }
+            }
+            catch {
+                $canReadKeys = $false
+            }
+        }
+
+        $elapsedSeconds = [int]((Get-Date) - $started).TotalSeconds
+        $fill = $StartFill + [Math]::Floor($elapsedSeconds / 3)
+        if ($fill -ge $EndFill) { $fill = $EndFill - 1 }
+        if ($fill -lt $StartFill) { $fill = $StartFill }
+        if ($fill -lt 1) { $fill = 1 }
+        Show-FlowlyProgress -Fill $fill -Action $Action -ElapsedSeconds $elapsedSeconds -LogsOpen $logsOpen -LogPath $logPath -StdoutPath $stdoutPath -StderrPath $stderrPath -CanReadKeys $canReadKeys
+        Start-Sleep -Milliseconds 200
+        $job = Get-Job -Id $job.Id
+    }
+
+    Wait-Job -Job $job | Out-Null
+    $statusOutput = Receive-Job -Job $job
+    Remove-Job -Job $job -Force
+    Join-FlowlyCommandLogs -LogPath $logPath -StdoutPath $stdoutPath -StderrPath $stderrPath
+
+    $status = 1
+    if ($statusOutput) {
+        $status = [int]($statusOutput | Select-Object -Last 1)
+    }
+    $elapsedTotal = [int]((Get-Date) - $started).TotalSeconds
+
+    if ($status -eq 0) {
+        Show-FlowlyProgress -Fill $EndFill -Action $Action -ElapsedSeconds $elapsedTotal -LogsOpen $logsOpen -LogPath $logPath -StdoutPath $stdoutPath -StderrPath $stderrPath -CanReadKeys $canReadKeys
+        Start-Sleep -Milliseconds 80
+        Clear-FlowlyProgress
+        Show-FlowlyCursor
+        Write-Ok ("{0} complete in {1}." -f $Action, (Format-FlowlyElapsed -Seconds $elapsedTotal))
+        return
+    }
+
+    Clear-FlowlyProgress
+    Show-FlowlyCursor
+    Write-Err ("{0} failed after {1}. Full log: {2}" -f $Action, (Format-FlowlyElapsed -Seconds $elapsedTotal), $logPath)
+    Get-Content -Path $logPath -Tail 120 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+    throw "$Action failed."
+}
 
 function Add-UserPath {
     param([string]$PathToAdd)
@@ -212,13 +521,11 @@ function Install-FromSource {
         Write-Step "Creating Flowly virtualenv at $Venv (Python $Python)..."
         # --clear: only reached when (re)creating, to wipe any broken/partial
         # leftovers from an interrupted previous run.
-        & uv venv --clear --python $Python $Venv
-        if ($LASTEXITCODE -ne 0) { throw 'uv venv failed.' }
+        Invoke-FlowlyCommand -StartFill 2 -EndFill 4 -Action 'Creating Python environment' -File 'uv' -Arguments @('venv', '--clear', '--python', $Python, $Venv)
     }
 
     Write-Step "Installing Flowly (editable) from $Src ..."
-    & uv pip install --python $venvPy -e $Src
-    if ($LASTEXITCODE -ne 0) { throw 'uv pip install failed.' }
+    Invoke-FlowlyCommand -StartFill 4 -EndFill 7 -Action 'Installing packages' -File 'uv' -Arguments @('pip', 'install', '--python', $venvPy, '-e', $Src)
 }
 
 # Write a flowly.cmd launcher that runs `python -m flowly` from the venv. Going
@@ -326,6 +633,7 @@ function Update-ServiceIfInstalled {
 }
 
 # ── Main ────────────────────────────────────────────────────────────────────
+Write-Banner
 Install-Uv
 $git = Install-Git
 Update-Checkout -Git $git

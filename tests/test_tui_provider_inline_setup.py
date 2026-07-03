@@ -17,11 +17,14 @@ def test_inline_provider_key_field_accepts_byok_api_key_provider() -> None:
 def test_inline_provider_key_field_skips_account_and_oauth_providers() -> None:
     flowly = get_card("flowly")
     xai_oauth = get_card("xai_oauth")
+    zai_coding = get_card("zai_coding")
     assert flowly is not None
     assert xai_oauth is not None
+    assert zai_coding is not None
 
     assert _inline_provider_key_field(flowly) is None
     assert _inline_provider_key_field(xai_oauth) is None
+    assert _inline_provider_key_field(zai_coding) is None
 
 
 async def test_ctrl_c_cancels_inline_secret_before_exit() -> None:

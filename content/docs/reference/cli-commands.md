@@ -214,12 +214,18 @@ Inspect and correct long-term memory (the governed memory store). See [Memory](.
 
 ## flowly codex
 
+Manages two unrelated features that share the "Codex" name: the `codex_session` **tool** (delegate a coding turn to a `codex app-server` subprocess — see [Codex runtime](../features/codex-runtime.md)) and the `openai_codex` **provider** (run Flowly's own agent loop on your ChatGPT subscription — see [Providers & models](../using-flowly/providers-and-models.md)).
+
 | Subcommand | What it does |
 |---|---|
 | `enable` | Enable the `codex_session` tool (delegate coding turns to Codex). |
 | `disable` | Disable it (back to Flowly's own runtime). |
 | `cwd` | Set (or show) the working directory Codex runs in — persistent. |
-| `status` | Show whether the runtime is enabled + Codex CLI health. |
+| `status` | Show whether the `codex_session` tool is enabled + codex CLI health + ChatGPT subscription connection state. |
+| `login` | Sign in with ChatGPT (Codex OAuth) — sets `openai_codex` as the active provider. |
+| `logout` | Remove the stored ChatGPT subscription tokens (leaves a `codex login` session in `~/.codex/auth.json` untouched). |
+
+`login` options: `--device` (headless code-entry flow instead of a browser), `--no-browser`, `--manual-paste`, `--no-set-active`, `--timeout <seconds>`.
 
 ## flowly persona
 

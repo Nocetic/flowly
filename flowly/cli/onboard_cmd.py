@@ -212,7 +212,8 @@ def _onboarding_menu() -> str | None:
     """Provider picker — the full list inline.
 
     Returns ``"flowly"`` (managed sign-in), ``"xai_oauth"`` (Grok subscription
-    browser flow), a BYOK provider slug, or ``None`` (backed out / cancelled).
+    browser flow), ``"zai_coding"`` (GLM Coding Plan), a BYOK provider slug,
+    or ``None`` (backed out / cancelled).
     """
     from InquirerPy.base.control import Choice
     from InquirerPy.separator import Separator
@@ -236,6 +237,11 @@ def _onboarding_menu() -> str | None:
             choices.append(Choice(
                 value="openai_codex",
                 name="ChatGPT subscription  ·  Plus / Pro / Team, GPT-5.x (opens browser)",
+            ))
+        if slug == "zhipu":
+            choices.append(Choice(
+                value="zai_coding",
+                name="Z.AI GLM Coding Plan  ·  reuses OpenCode or stores a plan key",
             ))
     choices.append(Separator())
     choices.append(Choice(value="back", name="← Back"))
@@ -289,6 +295,18 @@ def _run_codex_oauth_login() -> None:
         pass
     except KeyboardInterrupt:
         console.print("  [dim]ChatGPT sign-in cancelled.[/dim]")
+
+
+def _run_zai_coding_login() -> None:
+    """Run the Z.AI GLM Coding Plan connector — reuses `flowly glm login`."""
+    from flowly.cli.glm_cmd import login as glm_login
+
+    try:
+        glm_login(api_key="", set_active=True)
+    except (typer.Exit, SystemExit):
+        pass
+    except KeyboardInterrupt:
+        console.print("  [dim]GLM Coding setup cancelled.[/dim]")
 
 
 def _prompt_byok_key(slug: str) -> bool:
@@ -440,6 +458,8 @@ def _run_provider_step() -> bool:
         _run_xai_oauth_login()
     elif choice == "openai_codex":
         _run_codex_oauth_login()
+    elif choice == "zai_coding":
+        _run_zai_coding_login()
     else:
         if not _prompt_byok_key(choice):
             return False
@@ -643,5 +663,4 @@ def _install_persona_files(workspace: Path):
                 encoding="utf-8",
             )
             console.print("  [dim]Created personas/default.md[/dim]")
-
 

@@ -348,6 +348,19 @@ class OpenAICodexConfig(BaseModel):
     enabled: bool = True
 
 
+class ZaiCodingConfig(BaseModel):
+    """Z.AI GLM Coding Plan configuration.
+
+    The plan key is stored in the OS keychain / ``~/.flowly/credentials``
+    rather than config.json. Flowly can also read an existing OpenCode
+    ``auth.json`` entry as a fallback. ``api_base`` is pinned to the dedicated
+    Coding Plan endpoint so requests use the subscription quota, not the
+    regular Zhipu/Z.AI metered API surface.
+    """
+    enabled: bool = True
+    api_base: str = "https://api.z.ai/api/coding/paas/v4"
+
+
 class FlowlyHostedConfig(BaseModel):
     """Use the user's Flowly account to access hosted Anthropic/OpenAI/etc.
 
@@ -402,6 +415,7 @@ class ProvidersConfig(BaseModel):
     xai: ProviderConfig = Field(default_factory=ProviderConfig)  # xAI Grok models
     xai_oauth: XAIOAuthConfig = Field(default_factory=XAIOAuthConfig)  # xAI Grok subscription OAuth
     openai_codex: OpenAICodexConfig = Field(default_factory=OpenAICodexConfig)  # ChatGPT subscription OAuth
+    zai_coding: ZaiCodingConfig = Field(default_factory=ZaiCodingConfig)  # Z.AI GLM Coding Plan
 
 
 class GatewayConfig(BaseModel):
@@ -598,6 +612,30 @@ class LinearConfig(BaseModel):
     api_key: str = ""  # Personal API key from Linear Settings → API
 
 
+class GitHubConfig(BaseModel):
+    """GitHub integration configuration.
+
+    The ``github`` tool registers when ``token`` is non-empty. ``token`` is a
+    personal access token (classic or fine-grained) with repo scope.
+    ``default_repo`` ("owner/name") is an optional fallback when the tool
+    can't infer the repo from the open project's origin remote.
+    """
+    token: str = ""
+    default_repo: str = ""
+
+
+class SentryConfig(BaseModel):
+    """Sentry integration configuration.
+
+    The ``sentry`` tool registers when both ``token`` and ``org`` are set.
+    ``token`` is an auth token (Settings → Auth Tokens); ``org`` is the org
+    slug. ``default_project`` is an optional project slug used by list_issues.
+    """
+    token: str = ""
+    org: str = ""
+    default_project: str = ""
+
+
 class HomeAssistantConfig(BaseModel):
     """Home Assistant integration configuration.
 
@@ -646,6 +684,8 @@ class IntegrationsConfig(BaseModel):
     x: XConfig = Field(default_factory=XConfig)
     google_workspace: GoogleWorkspaceConfig = Field(default_factory=GoogleWorkspaceConfig)
     linear: LinearConfig = Field(default_factory=LinearConfig)
+    github: GitHubConfig = Field(default_factory=GitHubConfig)
+    sentry: SentryConfig = Field(default_factory=SentryConfig)
     home_assistant: HomeAssistantConfig = Field(default_factory=HomeAssistantConfig)
     obsidian: ObsidianConfig = Field(default_factory=ObsidianConfig)
 

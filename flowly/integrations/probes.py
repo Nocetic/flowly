@@ -430,6 +430,67 @@ async def probe_linear(values: dict[str, Any]) -> ProbeResult:
     return ProbeResult("ok", "authenticated")
 
 
+async def probe_github(values: dict[str, Any]) -> ProbeResult:
+    token = (values.get("token") or "").strip()
+    if not token:
+        return ProbeResult("not_configured", "token missing")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+            r = await c.get(
+                "https://api.github.com/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": _UA,
+                },
+            )
+    except Exception as exc:
+        return _net_error(exc)
+    if r.status_code == 401:
+        return ProbeResult("auth_failed", "token rejected")
+    if r.status_code != 200:
+        return ProbeResult("down", f"HTTP {r.status_code}")
+    try:
+        login = r.json().get("login")
+        if login:
+            return ProbeResult("ok", f"@{login}")
+    except Exception:
+        pass
+    return ProbeResult("ok", "authenticated")
+
+
+async def probe_sentry(values: dict[str, Any]) -> ProbeResult:
+    token = (values.get("token") or "").strip()
+    org = (values.get("org") or "").strip()
+    if not token:
+        return ProbeResult("not_configured", "token missing")
+    if not org:
+        return ProbeResult("not_configured", "org slug missing")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+            r = await c.get(
+                f"https://sentry.io/api/0/organizations/{org}/",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": _UA,
+                },
+            )
+    except Exception as exc:
+        return _net_error(exc)
+    if r.status_code == 401:
+        return ProbeResult("auth_failed", "token rejected")
+    if r.status_code in (403, 404):
+        return ProbeResult("auth_failed", "org not accessible")
+    if r.status_code != 200:
+        return ProbeResult("down", f"HTTP {r.status_code}")
+    try:
+        name = r.json().get("slug") or org
+        return ProbeResult("ok", name)
+    except Exception:
+        pass
+    return ProbeResult("ok", "authenticated")
+
+
 async def probe_obsidian(values: dict[str, Any]) -> ProbeResult:
     """Check the Obsidian vault is reachable and holds at least one note.
 
@@ -618,6 +679,26 @@ probe_groq = _provider_probe("https://api.groq.com/openai")
 probe_xai = _provider_probe("https://api.x.ai")
 probe_zhipu = _provider_probe("https://open.bigmodel.cn/api/paas")
 probe_sakana = _provider_probe("https://api.sakana.ai")
+
+
+async def probe_zai_coding(values: dict[str, Any]) -> ProbeResult:
+    if not values.get("enabled", True):
+        return ProbeResult("disabled", "GLM Coding Plan disabled")
+    try:
+        from flowly.auth.zai_coding import resolve_runtime_credentials
+        from flowly.config.loader import load_config
+
+        creds = resolve_runtime_credentials(config=load_config())
+    except Exception as exc:
+        return ProbeResult("unknown", f"credential check failed: {type(exc).__name__}")
+    if creds is None or not creds.api_key:
+        return ProbeResult("not_configured", "run `flowly glm login` or connect OpenCode")
+    if creds.source == "opencode":
+        suffix = f" ({creds.provider_id})" if creds.provider_id else ""
+        return ProbeResult("ok", f"OpenCode{suffix}")
+    if creds.source == "env":
+        return ProbeResult("ok", "environment key")
+    return ProbeResult("ok", "Flowly key store")
 
 
 async def probe_xai_oauth(values: dict[str, Any]) -> ProbeResult:

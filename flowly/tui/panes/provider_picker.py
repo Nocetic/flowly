@@ -243,10 +243,13 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
         cfg = load_config()
         if _build_for(cfg, key) is None:
             card = next((c for c in self._cards if c.key == key), None)
-            if card is not None and card.custom_action in ("xai_login", "codex_login"):
-                # Browser-OAuth provider: selecting it when not signed in
-                # should just start the browser login — no form, no key to
-                # paste. The app handles "needs_login" by firing the flow.
+            if card is not None and card.custom_action in (
+                "xai_login",
+                "codex_login",
+                "zai_coding_login",
+            ):
+                # Subscription-style provider: selecting it when not connected
+                # should start its dedicated setup flow, not a generic form.
                 self.dismiss({"action": "needs_login", "key": key})
             elif card is not None and card.custom_action == "login":
                 # Flowly account: browser sign-in (which auto-provisions the
@@ -310,8 +313,8 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
         self.dismiss({"action": "opened_setup", "key": key})
 
     def action_disconnect(self) -> None:
-        """Sign out of a browser-OAuth provider (xAI Grok). For pasted-key
-        providers there's nothing to "sign out" of, so we just hint."""
+        """Sign out of a subscription-style provider. For pasted-key providers
+        there's nothing to "sign out" of, so we just hint."""
         ol = self.query_one(OptionList)
         if ol.highlighted is None:
             return
@@ -324,13 +327,20 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
             return
         key = oid[len(_CARD_PREFIX):]
         card = next((c for c in self._cards if c.key == key), None)
-        if card is None or card.custom_action not in ("xai_login", "codex_login"):
+        if card is None or card.custom_action not in (
+            "xai_login",
+            "codex_login",
+            "zai_coding_login",
+        ):
             self._set_footer("[dim]nothing to sign out of for this provider[/dim]")
             return
         try:
             if card.custom_action == "codex_login":
                 from flowly.auth.openai_codex import load_token_payload
                 label = "ChatGPT subscription"
+            elif card.custom_action == "zai_coding_login":
+                from flowly.auth.zai_coding import load_token_payload
+                label = "Z.AI GLM Coding Plan"
             else:
                 from flowly.auth.xai_oauth import load_token_payload
                 label = "xAI Grok OAuth"

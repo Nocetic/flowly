@@ -25,6 +25,7 @@ from flowly.integrations.probes import (
     probe_firecrawl,
     probe_flowly_account,
     probe_gemini,
+    probe_github,
     probe_groq,
     probe_home_assistant,
     probe_imessage,
@@ -36,6 +37,7 @@ from flowly.integrations.probes import (
     probe_parallel,
     probe_sakana,
     probe_searxng,
+    probe_sentry,
     probe_slack,
     probe_tavily,
     probe_teams,
@@ -47,6 +49,7 @@ from flowly.integrations.probes import (
     probe_x,
     probe_xai,
     probe_xai_oauth,
+    probe_zai_coding,
     probe_zhipu,
 )
 from flowly.media.image_models import DEFAULT_IMAGE_MODEL as _DEFAULT_IMAGE_MODEL
@@ -253,6 +256,41 @@ _TOOLS: list[IntegrationCard] = [
                   help="Linear → Settings → API → Personal API keys."),
         ],
         probe=probe_linear,
+        needs_gateway_restart=True,
+    ),
+    IntegrationCard(
+        key="github", label="GitHub", category="tool",
+        description="Read issues and pull requests, comment, and open issues on GitHub.",
+        docs_url="https://github.com/settings/tokens",
+        config_path="integrations.github",
+        fields=[
+            Field("token", "Personal access token", FieldType.PASSWORD,
+                  placeholder="ghp_… / github_pat_…", required=True,
+                  help="GitHub → Settings → Developer settings → Personal access tokens (repo scope)."),
+            Field("default_repo", "Default repo", FieldType.TEXT,
+                  placeholder="owner/name", required=False,
+                  help="Optional fallback when not working inside a git repo."),
+        ],
+        probe=probe_github,
+        needs_gateway_restart=True,
+    ),
+    IntegrationCard(
+        key="sentry", label="Sentry", category="tool",
+        description="Read error issues and event stacktraces from Sentry.",
+        docs_url="https://docs.sentry.io/api/auth/",
+        config_path="integrations.sentry",
+        fields=[
+            Field("token", "Auth token", FieldType.PASSWORD,
+                  placeholder="sntrys_…", required=True,
+                  help="Sentry → Settings → Auth Tokens (project:read, event:read)."),
+            Field("org", "Organization slug", FieldType.TEXT,
+                  placeholder="my-org", required=True,
+                  help="The org slug from your Sentry URL."),
+            Field("default_project", "Default project", FieldType.TEXT,
+                  placeholder="my-project", required=False,
+                  help="Optional project slug used by list_issues."),
+        ],
+        probe=probe_sentry,
         needs_gateway_restart=True,
     ),
     IntegrationCard(
@@ -517,6 +555,22 @@ _PROVIDERS: list[IntegrationCard] = [
         probe=probe_openai_codex,
         needs_gateway_restart=False,
         custom_action="codex_login",   # browser / device OAuth, not a pasted-key form
+    ),
+    IntegrationCard(
+        key="zai_coding", label="Z.AI GLM Coding Plan", category="provider",
+        description=(
+            "Use a GLM Coding Plan key through Z.AI's dedicated coding endpoint. "
+            "Flowly can reuse an existing OpenCode Z.AI key or store one itself."
+        ),
+        docs_url="https://docs.z.ai/devpack/quick-start",
+        config_path="providers.zai_coding",
+        fields=[
+            Field("enabled", "Enabled", FieldType.BOOL, default=True,
+                  help="When on, a stored or OpenCode-detected GLM Coding Plan key can serve GLM requests."),
+        ],
+        probe=probe_zai_coding,
+        needs_gateway_restart=False,
+        custom_action="zai_coding_login",
     ),
     _provider_card("zhipu", "Zhipu GLM",
                    "ChatGLM / GLM-4 from Zhipu AI.",

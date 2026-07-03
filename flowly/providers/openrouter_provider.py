@@ -48,7 +48,15 @@ _DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 def _strip_known_prefixes(model: str) -> str:
     """Strip litellm-era provider prefixes that some configs may still carry."""
-    for prefix in ("openrouter/", "hosted_vllm/", "zhipu/", "zai/", "gemini/"):
+    for prefix in (
+        "openrouter/",
+        "hosted_vllm/",
+        "zhipu/",
+        "zai/",
+        "zai_coding/",
+        "glm_coding/",
+        "gemini/",
+    ):
         if model.startswith(prefix):
             return model[len(prefix):]
     return model

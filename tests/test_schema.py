@@ -168,3 +168,6 @@ class TestProviderConfig:
             assert hasattr(providers, name)
             provider = getattr(providers, name)
             assert isinstance(provider, ProviderConfig)
+        assert hasattr(providers, "zai_coding")
+        assert providers.zai_coding.enabled is True
+        assert providers.zai_coding.api_base == "https://api.z.ai/api/coding/paas/v4"
