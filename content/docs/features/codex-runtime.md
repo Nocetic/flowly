@@ -12,6 +12,9 @@ This is an **opt-in tool, disabled by default**. It is not a runtime swap: your 
 > [!NOTE]
 > Codex runs the coding turn, but Flowly stays the shell: sessions, memory, skills, approvals, and the gateway all still belong to Flowly.
 
+> [!NOTE]
+> This is a different feature from the **ChatGPT subscription LLM provider** (`openai_codex`), which also uses OpenAI's Codex auth but runs Flowly's *own* agent loop on your ChatGPT plan instead of delegating to a subprocess. Both share the `flowly codex` CLI namespace and the "Codex" name; see [Providers & models](../using-flowly/providers-and-models.md#chatgpt-subscription-codex-oauth) for the provider.
+
 ## Prerequisites
 
 The Codex CLI must be installed and authenticated on the same machine as Flowly:
@@ -106,6 +109,7 @@ A few safeguards keep long Codex turns from hanging:
 ## Related
 
 - [Delegation & subagents](delegation.md)
+- [Providers & models](../using-flowly/providers-and-models.md) — the ChatGPT subscription LLM provider (a different Codex-auth feature)
 - [Sandbox & approvals](../using-flowly/sandbox-and-approvals.md)
 - [CLI commands](../reference/cli-commands.md)
 - [Slash commands](../reference/slash-commands.md)
