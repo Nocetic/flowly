@@ -156,7 +156,9 @@ def memory_export_prompt(source: str = "chatgpt") -> str:
         "Return Markdown with short bullets grouped under these headings when "
         "relevant: Identity, Preferences, Projects, Workflows, Environment, "
         "People, Constraints, and Corrections. Include uncertain items only if "
-        "you clearly mark them as uncertain."
+        "you clearly mark them as uncertain.\n\n"
+        "You can paste this list straight back into Flowly, or save it to a plain "
+        "text file and upload that — either works."
     )
 
 
