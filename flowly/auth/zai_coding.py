@@ -19,14 +19,27 @@ from typing import Any
 
 from loguru import logger
 
-from flowly.profile import get_flowly_home
+from flowly.profile import credential_scope_suffix, get_flowly_home
 
 DEFAULT_ZAI_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 DEFAULT_ZAI_CODING_MODEL = "glm-5.2"
 FLOWLY_ZAI_CODING_API_KEY_ENV = "FLOWLY_ZAI_CODING_API_KEY"
 
-_KEYRING_SERVICE = "flowly-tui"
 _KEYRING_ACCOUNT = "zai-coding"
+
+
+def _keyring_service() -> str:
+    """Keychain service name, scoped to the active FLOWLY_HOME.
+
+    Unsuffixed (``"flowly-tui"``) at the default home for backward
+    compatibility; suffixed everywhere else so two homes (e.g. a second
+    product built on this codebase) never share one keychain entry. See
+    :func:`flowly.profile.credential_scope_suffix`.
+    """
+    suffix = credential_scope_suffix()
+    return f"flowly-tui:{suffix}" if suffix else "flowly-tui"
+
+
 _OPENCODE_PROVIDER_IDS = (
     "zai",
     "z.ai",
@@ -228,7 +241,7 @@ def _load_flowly_token_payload() -> ZaiCodingTokenPayload | None:
     keyring = _try_keyring()
     if keyring is not None:
         try:
-            raw_blob = keyring.get_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+            raw_blob = keyring.get_password(_keyring_service(), _KEYRING_ACCOUNT)
         except Exception as exc:
             logger.warning("Z.AI Coding keyring read failed, falling back to file: {}", exc)
             raw_blob = None
@@ -339,7 +352,7 @@ def save_token_payload(payload: ZaiCodingTokenPayload) -> str:
     keyring = _try_keyring()
     if keyring is not None:
         try:
-            keyring.set_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT, json.dumps(raw, separators=(",", ":")))
+            keyring.set_password(_keyring_service(), _KEYRING_ACCOUNT, json.dumps(raw, separators=(",", ":")))
             try:
                 credentials_path().unlink(missing_ok=True)
             except OSError:
@@ -369,7 +382,7 @@ def clear_token_payload() -> None:
     keyring = _try_keyring()
     if keyring is not None:
         try:
-            keyring.delete_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+            keyring.delete_password(_keyring_service(), _KEYRING_ACCOUNT)
         except Exception:
             pass
     try:

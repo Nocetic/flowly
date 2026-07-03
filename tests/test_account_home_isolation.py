@@ -1,15 +1,16 @@
 """Multi-home credential isolation.
 
 ``FLOWLY_HOME`` lets a second engine built on this codebase (or a named
-profile) run fully isolated from the default ``~/.flowly`` install. Three
+profile) run fully isolated from the default ``~/.flowly`` install. Four
 places used to leak across homes because they didn't consult it:
 
 1. ``account/token_store.py`` — the personal-account keychain service name
    and file fallback path were hardcoded to ``~/.flowly``, so a second home
    would silently read/write the *default* home's Flowly account.
-2. ``auth/openai_codex.py`` / ``auth/xai_oauth.py`` — the file fallback path
-   was already home-scoped, but the OS-keychain *service name* wasn't, so a
-   working keychain would still let two homes share one entry.
+2. ``auth/openai_codex.py`` / ``auth/xai_oauth.py`` / ``auth/zai_coding.py``
+   — the file fallback path was already home-scoped, but the OS-keychain
+   *service name* wasn't, so a working keychain would still let two homes
+   share one entry (ChatGPT subscription, xAI Grok OAuth, GLM Coding Plan).
 3. ``channels/feature_rpc.py`` — ``xai_oauth``/``openai_codex`` were absent
    from ``_PROVIDER_SLOTS`` entirely, so Desktop/iOS never saw them.
 
@@ -26,7 +27,7 @@ import pytest
 
 from flowly import profile
 from flowly.account import token_store
-from flowly.auth import openai_codex, xai_oauth
+from flowly.auth import openai_codex, xai_oauth, zai_coding
 from flowly.channels import feature_rpc
 
 
@@ -36,6 +37,7 @@ def _no_real_keyring(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(token_store, "_try_keyring", lambda: None)
     monkeypatch.setattr(openai_codex, "_try_keyring", lambda: None)
     monkeypatch.setattr(xai_oauth, "_try_keyring", lambda: None)
+    monkeypatch.setattr(zai_coding, "_try_keyring", lambda: None)
 
 
 # ── profile.py: the shared scoping primitives ──────────────────────────
@@ -137,13 +139,14 @@ def test_legacy_purge_runs_at_the_default_home(
     assert not legacy.exists()  # purge IS allowed at the default home
 
 
-# ── openai_codex.py / xai_oauth.py: keychain service name scoping ──────
+# ── openai_codex.py / xai_oauth.py / zai_coding.py: keychain scoping ───
 
 
 def test_oauth_keyring_service_default_home_is_unchanged(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("FLOWLY_HOME", raising=False)
     assert openai_codex._keyring_service() == "flowly-tui"
     assert xai_oauth._keyring_service() == "flowly-tui"
+    assert zai_coding._keyring_service() == "flowly-tui"
 
 
 def test_oauth_keyring_service_non_default_home_is_scoped(
@@ -154,9 +157,29 @@ def test_oauth_keyring_service_non_default_home_is_scoped(
     expected = f"flowly-tui:{suffix}"
     assert openai_codex._keyring_service() == expected
     assert xai_oauth._keyring_service() == expected
-    # Same suffix for both (same home) — distinguished by _KEYRING_ACCOUNT,
-    # not by service name, so no collision between the two OAuth providers.
-    assert openai_codex._keyring_service() == xai_oauth._keyring_service()
+    assert zai_coding._keyring_service() == expected
+    # Same suffix for all three (same home) — distinguished by
+    # _KEYRING_ACCOUNT, not by service name, so no collision between the
+    # three providers themselves.
+    assert openai_codex._keyring_service() == xai_oauth._keyring_service() == zai_coding._keyring_service()
+
+
+def test_zai_coding_file_roundtrip_stays_under_custom_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    custom_home = tmp_path / "flowly-code"
+    monkeypatch.setenv("FLOWLY_HOME", str(custom_home))
+    # OpenCode's external auth.json is a foreign, singleton store (like
+    # ~/.codex/auth.json) — isolate it too so this test doesn't pick up a
+    # real OpenCode session on the dev machine running it.
+    monkeypatch.setenv("OPENCODE_AUTH_PATH", str(tmp_path / "no-opencode-here.json"))
+
+    status = zai_coding.save_api_key("test-glm-key", base_url=zai_coding.DEFAULT_ZAI_CODING_BASE_URL)
+    assert status.startswith("file:")
+    payload = zai_coding.load_token_payload()
+    assert payload is not None
+    assert payload.api_key == "test-glm-key"
+    assert (custom_home / "credentials" / "zai_coding.json").exists()
 
 
 # ── feature_rpc.py: subscription providers are visible to Desktop/iOS ──
