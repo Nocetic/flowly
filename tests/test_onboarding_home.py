@@ -108,6 +108,17 @@ def test_provider_step_routes_xai_oauth_then_model(monkeypatch):
     assert calls == ["xai", "model:xai_oauth"]
 
 
+def test_provider_step_routes_zai_coding_then_model(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ob, "_onboarding_menu", lambda: "zai_coding")
+    monkeypatch.setattr(ob, "_run_zai_coding_login", lambda: calls.append("glm"))
+    monkeypatch.setattr(ob, "_prompt_byok_key", lambda s: calls.append(f"byok:{s}"))
+    monkeypatch.setattr(ob, "_prompt_model", lambda s: calls.append(f"model:{s}"))
+    monkeypatch.setattr(ob, "_already_configured", lambda: True)
+    ob._run_provider_step()
+    assert calls == ["glm", "model:zai_coding"]
+
+
 def test_provider_step_routes_byok_slug(monkeypatch):
     calls = []
     monkeypatch.setattr(ob, "_onboarding_menu", lambda: "zhipu")

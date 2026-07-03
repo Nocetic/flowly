@@ -681,6 +681,26 @@ probe_zhipu = _provider_probe("https://open.bigmodel.cn/api/paas")
 probe_sakana = _provider_probe("https://api.sakana.ai")
 
 
+async def probe_zai_coding(values: dict[str, Any]) -> ProbeResult:
+    if not values.get("enabled", True):
+        return ProbeResult("disabled", "GLM Coding Plan disabled")
+    try:
+        from flowly.auth.zai_coding import resolve_runtime_credentials
+        from flowly.config.loader import load_config
+
+        creds = resolve_runtime_credentials(config=load_config())
+    except Exception as exc:
+        return ProbeResult("unknown", f"credential check failed: {type(exc).__name__}")
+    if creds is None or not creds.api_key:
+        return ProbeResult("not_configured", "run `flowly glm login` or connect OpenCode")
+    if creds.source == "opencode":
+        suffix = f" ({creds.provider_id})" if creds.provider_id else ""
+        return ProbeResult("ok", f"OpenCode{suffix}")
+    if creds.source == "env":
+        return ProbeResult("ok", "environment key")
+    return ProbeResult("ok", "Flowly key store")
+
+
 async def probe_xai_oauth(values: dict[str, Any]) -> ProbeResult:
     if not values.get("enabled", True):
         return ProbeResult("disabled", "subscription OAuth disabled")

@@ -2261,10 +2261,12 @@ class FlowlyTUI(App[None]):
                     f"✓ default provider → [b]{result['key']}[/b]"
                 )
             elif result.get("action") == "needs_login":
-                # Enter on a not-yet-connected browser-OAuth provider →
-                # start the sign-in flow directly (no detail form).
+                # Enter on a not-yet-connected subscription-style provider →
+                # start the dedicated setup flow directly (no detail form).
                 if result.get("key") == "openai_codex":
                     self.action_codex_login()
+                elif result.get("key") == "zai_coding":
+                    await self.action_zai_coding_login()
                 else:
                     self.action_xai_login()
             elif result.get("action") == "login":
@@ -2288,6 +2290,8 @@ class FlowlyTUI(App[None]):
                     self.action_xai_login()
                 elif card is not None and card.custom_action == "codex_login":
                     self.action_codex_login()
+                elif card is not None and card.custom_action == "zai_coding_login":
+                    await self.action_zai_coding_login()
                 elif card is not None:
                     saved = await self.push_screen_wait(IntegrationSetupModal(card))
                     if saved and saved.get("action") == "saved":
@@ -2295,6 +2299,8 @@ class FlowlyTUI(App[None]):
             elif result.get("action") == "disconnect":
                 if result.get("key") == "openai_codex":
                     await self.action_codex_logout()
+                elif result.get("key") == "zai_coding":
+                    await self.action_zai_coding_logout()
                 else:
                     await self.action_xai_logout()
             return
@@ -2327,6 +2333,9 @@ class FlowlyTUI(App[None]):
             if target.custom_action == "codex_login":
                 self.action_codex_login()
                 return
+            if target.custom_action == "zai_coding_login":
+                await self.action_zai_coding_login()
+                return
             if _inline_provider_key_field(target) is not None:
                 await self._configure_provider_inline(target, make_active=True)
                 return
@@ -2344,6 +2353,106 @@ class FlowlyTUI(App[None]):
         transcript.add_system(
             f"✓ default provider → [b]{target.label}[/b] · {reload_msg}"
         )
+
+    async def action_zai_coding_login(self) -> None:
+        """Connect a Z.AI GLM Coding Plan key from the TUI.
+
+        Reuses an existing Flowly/OpenCode/env credential when available;
+        otherwise prompts for a plan key in the composer tray and stores it in
+        Flowly's credential store.
+        """
+        from flowly.auth import zai_coding
+        from flowly.config.loader import load_config, save_config
+        from flowly.integrations.active_provider import set_active_provider
+
+        transcript = self.query_one(TranscriptPane)
+
+        def _enable_slot() -> None:
+            cfg = load_config()
+            cfg.providers.zai_coding.enabled = True
+            cfg.providers.zai_coding.api_base = zai_coding.DEFAULT_ZAI_CODING_BASE_URL
+            save_config(cfg)
+
+        payload = await asyncio.to_thread(zai_coding.load_token_payload)
+        if payload is not None and payload.api_key:
+            await asyncio.to_thread(_enable_slot)
+            changed = await asyncio.to_thread(set_active_provider, "zai_coding")
+            tail = await self._reload_gateway_provider()
+            self._refresh_active_provider_status()
+            note = f" · model → [b]{changed}[/b]" if changed else ""
+            source = payload.source or "stored"
+            if payload.source == "opencode" and payload.provider_id:
+                source = f"OpenCode ({payload.provider_id})"
+            transcript.add_system(
+                f"✓ Z.AI GLM Coding Plan already connected via {source} — "
+                f"set as default{note} · {tail}"
+            )
+            return
+
+        value = await self._show_inline_secret(
+            InlineSecretPromptRequest(
+                title="Configure Z.AI GLM Coding Plan",
+                label="GLM Coding Plan API key",
+                placeholder="Paste your Z.AI coding-plan key",
+                help=(
+                    "Saved to Flowly's credential store. If OpenCode already "
+                    "has a Z.AI key, Flowly reuses it automatically."
+                ),
+                required=True,
+                password=True,
+            )
+        )
+        if value is None:
+            transcript.add_system("Z.AI GLM Coding Plan setup cancelled")
+            return
+        api_key = value.strip()
+        if not api_key:
+            transcript.add_error("Z.AI GLM Coding Plan: API key is required")
+            return
+
+        try:
+            backend = await asyncio.to_thread(zai_coding.save_api_key, api_key)
+            await asyncio.to_thread(_enable_slot)
+            changed = await asyncio.to_thread(set_active_provider, "zai_coding")
+        except Exception as exc:
+            transcript.add_error(f"Z.AI GLM Coding Plan setup failed: {exc}")
+            return
+
+        tail = await self._reload_gateway_provider()
+        self._refresh_active_provider_status()
+        note = f" · model → [b]{changed}[/b]" if changed else ""
+        transcript.add_system(
+            f"✓ Z.AI GLM Coding Plan key saved · storage [dim]{backend}[/] "
+            f"· default provider → [b]Z.AI GLM Coding Plan[/b]{note} · {tail}"
+        )
+
+    async def action_zai_coding_logout(self) -> None:
+        """Remove Flowly's stored GLM Coding key.
+
+        OpenCode credentials are read-only fallbacks and are left untouched.
+        """
+        from flowly.auth import zai_coding
+
+        transcript = self.query_one(TranscriptPane)
+        payload = await asyncio.to_thread(zai_coding.load_token_payload)
+        if payload is None:
+            transcript.add_system("Z.AI GLM Coding Plan is not connected")
+            return
+        await asyncio.to_thread(zai_coding.clear_token_payload)
+        try:
+            from flowly.integrations.active_provider import clear_active_if_matches
+            await asyncio.to_thread(clear_active_if_matches, "zai_coding")
+        except Exception:
+            pass
+        tail = await self._reload_gateway_provider()
+        self._refresh_active_provider_status()
+        if payload.source != "flowly":
+            transcript.add_system(
+                "✓ Flowly GLM Coding key cleared · external OpenCode/env key "
+                f"left untouched · {tail}"
+            )
+        else:
+            transcript.add_system(f"✓ Z.AI GLM Coding Plan key removed · {tail}")
 
     @work(exclusive=True, group="xai_login")
     async def action_xai_login(self) -> None:

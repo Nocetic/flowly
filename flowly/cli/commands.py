@@ -127,6 +127,9 @@ app.add_typer(xai_app, name="xai")
 from flowly.cli.codex_cmd import codex_app
 app.add_typer(codex_app, name="codex")
 
+from flowly.cli.glm_cmd import glm_app
+app.add_typer(glm_app, name="glm")
+
 from flowly.cli.approvals_cmd import approvals_app, sessions_app
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(sessions_app, name="sessions")

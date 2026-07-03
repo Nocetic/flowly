@@ -972,6 +972,7 @@ _PROVIDER_SLOTS = (
     ("gemini", "Google Gemini", True),
     ("groq", "Groq", True),
     ("xai", "xAI (Grok API)", True),
+    ("zai_coding", "Z.AI GLM Coding Plan", True),
     ("zhipu", "Zhipu GLM", True),
     ("sakana", "Sakana Fugu", True),
     ("vllm", "vLLM (self-hosted)", True),
@@ -999,6 +1000,12 @@ def provider_list() -> dict:
                 (getattr(fl, "account_key", "") or "").strip()
                 or ((getattr(fl, "server_id", "") or "").strip() and (getattr(fl, "auth_token", "") or "").strip())
             )
+        elif key == "zai_coding":
+            try:
+                from flowly.auth.zai_coding import resolve_runtime_credentials
+                has_key = resolve_runtime_credentials(config=cfg) is not None
+            except Exception:
+                has_key = False
         else:
             has_key = bool(getattr(slot, "api_key", "")) if keyable else True
         providers.append({
@@ -1054,6 +1061,27 @@ async def provider_set_key(params: dict) -> dict:
         raise FeatureRpcError("INVALID", "value must be a string")
     key = key.strip()
     value = value.strip()
+    if key == "zai_coding":
+        from flowly.auth import zai_coding
+        from flowly.config.loader import load_config, save_config
+        cfg = load_config()
+        cfg.providers.zai_coding.enabled = True
+        cfg.providers.zai_coding.api_base = zai_coding.DEFAULT_ZAI_CODING_BASE_URL
+        save_config(cfg)
+        if value:
+            zai_coding.save_api_key(value)
+        else:
+            zai_coding.clear_token_payload()
+        from flowly.integrations import model_catalog
+        model_catalog.flush_cache()
+        has_key = zai_coding.resolve_runtime_credentials(config=load_config()) is not None
+        if _provider_reload_cb is not None:
+            try:
+                await _provider_reload_cb()
+                return {"ok": True, "key": key, "hasKey": has_key, "willRestart": False}
+            except Exception:
+                pass
+        return {"ok": True, "key": key, "hasKey": has_key, "willRestart": True}
     from flowly.config.loader import load_config, save_config
     cfg = load_config()
     slot = getattr(cfg.providers, key, None)

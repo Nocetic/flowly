@@ -145,6 +145,22 @@ class TestLoadConfig:
         assert config.providers.xai_oauth.client_id == "flowly-client"
         assert config.providers.xai_oauth.api_base == "https://api.x.ai/v1"
 
+    def test_load_zai_coding_camel_case_json(self, tmp_path: Path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "providers": {
+                "zaiCoding": {
+                    "enabled": True,
+                    "apiBase": "https://api.z.ai/api/coding/paas/v4",
+                }
+            },
+        }))
+
+        config = load_config(config_file)
+
+        assert config.providers.zai_coding.enabled is True
+        assert config.providers.zai_coding.api_base == "https://api.z.ai/api/coding/paas/v4"
+
     def test_invalid_json_returns_default(self, tmp_path: Path):
         config_file = tmp_path / "config.json"
         config_file.write_text("not json{{{")

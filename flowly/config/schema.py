@@ -348,6 +348,19 @@ class OpenAICodexConfig(BaseModel):
     enabled: bool = True
 
 
+class ZaiCodingConfig(BaseModel):
+    """Z.AI GLM Coding Plan configuration.
+
+    The plan key is stored in the OS keychain / ``~/.flowly/credentials``
+    rather than config.json. Flowly can also read an existing OpenCode
+    ``auth.json`` entry as a fallback. ``api_base`` is pinned to the dedicated
+    Coding Plan endpoint so requests use the subscription quota, not the
+    regular Zhipu/Z.AI metered API surface.
+    """
+    enabled: bool = True
+    api_base: str = "https://api.z.ai/api/coding/paas/v4"
+
+
 class FlowlyHostedConfig(BaseModel):
     """Use the user's Flowly account to access hosted Anthropic/OpenAI/etc.
 
@@ -402,6 +415,7 @@ class ProvidersConfig(BaseModel):
     xai: ProviderConfig = Field(default_factory=ProviderConfig)  # xAI Grok models
     xai_oauth: XAIOAuthConfig = Field(default_factory=XAIOAuthConfig)  # xAI Grok subscription OAuth
     openai_codex: OpenAICodexConfig = Field(default_factory=OpenAICodexConfig)  # ChatGPT subscription OAuth
+    zai_coding: ZaiCodingConfig = Field(default_factory=ZaiCodingConfig)  # Z.AI GLM Coding Plan
 
 
 class GatewayConfig(BaseModel):

@@ -49,6 +49,7 @@ from flowly.integrations.probes import (
     probe_x,
     probe_xai,
     probe_xai_oauth,
+    probe_zai_coding,
     probe_zhipu,
 )
 from flowly.media.image_models import DEFAULT_IMAGE_MODEL as _DEFAULT_IMAGE_MODEL
@@ -554,6 +555,22 @@ _PROVIDERS: list[IntegrationCard] = [
         probe=probe_openai_codex,
         needs_gateway_restart=False,
         custom_action="codex_login",   # browser / device OAuth, not a pasted-key form
+    ),
+    IntegrationCard(
+        key="zai_coding", label="Z.AI GLM Coding Plan", category="provider",
+        description=(
+            "Use a GLM Coding Plan key through Z.AI's dedicated coding endpoint. "
+            "Flowly can reuse an existing OpenCode Z.AI key or store one itself."
+        ),
+        docs_url="https://docs.z.ai/devpack/quick-start",
+        config_path="providers.zai_coding",
+        fields=[
+            Field("enabled", "Enabled", FieldType.BOOL, default=True,
+                  help="When on, a stored or OpenCode-detected GLM Coding Plan key can serve GLM requests."),
+        ],
+        probe=probe_zai_coding,
+        needs_gateway_restart=False,
+        custom_action="zai_coding_login",
     ),
     _provider_card("zhipu", "Zhipu GLM",
                    "ChatGLM / GLM-4 from Zhipu AI.",

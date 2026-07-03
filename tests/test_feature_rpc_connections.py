@@ -72,3 +72,27 @@ def test_connections_set_clear_disables_media(isolated_home):
     _dispatch("connections.set", {"key": "fal_image", "clear": True})
     card = _list_by_key(isolated_home)["fal_image"]
     assert card["enabled"] is False
+
+
+def test_provider_rpc_sets_zai_coding_key_in_credential_store(isolated_home, monkeypatch):
+    from flowly.auth import zai_coding
+
+    monkeypatch.setattr(zai_coding, "_try_keyring", lambda: None)
+    monkeypatch.setenv("OPENCODE_AUTH_PATH", str(Path(isolated_home) / "missing-opencode.json"))
+
+    result, restart = _dispatch("provider.set_key", {
+        "key": "zai_coding",
+        "value": "glm-plan-key",
+    })
+
+    assert result["ok"] is True
+    assert result["hasKey"] is True
+    assert restart is True
+    payload = zai_coding.load_token_payload(include_external=False)
+    assert payload is not None
+    assert payload.api_key == "glm-plan-key"
+
+    providers, _ = _dispatch("provider.list")
+    by_key = {p["key"]: p for p in providers["providers"]}
+    assert by_key["zai_coding"]["keyable"] is True
+    assert by_key["zai_coding"]["hasKey"] is True

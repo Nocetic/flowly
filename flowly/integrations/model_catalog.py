@@ -391,12 +391,38 @@ async def _fetch_openai_codex() -> list[Model]:
     ]
 
 
+_ZAI_CODING_MODELS: list[tuple[str, str, int, list[str]]] = [
+    ("glm-5.2", "GLM-5.2 — coding plan flagship", 1_000_000, ["coding", "reasoning"]),
+    ("glm-5-turbo", "GLM-5 Turbo — fast coding", 1_000_000, ["coding", "fast"]),
+    ("glm-4.7", "GLM-4.7 — efficient coding", 200_000, ["coding", "efficient"]),
+]
+
+
+async def _fetch_zai_coding() -> list[Model]:
+    """Z.AI GLM Coding Plan models.
+
+    The plan endpoint is a subscription surface and may not expose a public
+    catalogue, so we return the officially supported coding-plan models only
+    when a Flowly/OpenCode/env credential is available.
+    """
+    from flowly.auth.zai_coding import load_token_payload
+
+    payload = await asyncio.to_thread(load_token_payload)
+    if payload is None or not payload.api_key:
+        return []
+    return [
+        Model(id=mid, name=mid, description=desc, context_window=ctx, tags=list(tags))
+        for mid, desc, ctx, tags in _ZAI_CODING_MODELS
+    ]
+
+
 _FETCHERS: dict[str, "Any"] = {
     "openrouter": _fetch_openrouter,
     "flowly": _fetch_flowly_hosted,
     "xai_oauth": _fetch_xai_oauth,
     "xai": _fetch_xai_apikey,
     "openai_codex": _fetch_openai_codex,
+    "zai_coding": _fetch_zai_coding,
     # anthropic / openai / gemini / groq / zhipu — not implemented yet.
     # Their /v1/models endpoints need the user's API key; we'll plumb
     # that through once the OpenRouter MVP feels good.

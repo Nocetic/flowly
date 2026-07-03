@@ -13,8 +13,9 @@ Priority (first match wins)
    slash command, not inferred from credential presence.
 2. **Flowly hosted (cascade)** — ``providers.flowly.enabled`` is True
    AND the user is signed in. Used when ``providers.active`` is empty.
-3. **External cascade** — openrouter → anthropic → openai → xai →
-   xai_oauth → gemini → groq → zhipu → vllm. First usable provider wins.
+3. **External cascade** — openrouter → anthropic → openai →
+   openai_codex → zai_coding → xai → xai_oauth → gemini → groq →
+   zhipu → sakana → vllm. First usable provider wins.
 
 The explicit ``active`` choice is sticky: it survives until the user
 changes it (or until that provider becomes unusable, e.g. signs out of
@@ -36,6 +37,7 @@ _BYOK_PRIORITY = (
     "anthropic",
     "openai",
     "openai_codex",
+    "zai_coding",
     "xai",
     "xai_oauth",
     "gemini",
@@ -224,6 +226,33 @@ def _build_for(config: Config, name: str) -> ActiveProvider | None:
             source=f"xAI Grok OAuth{email}",
         )
 
+    if name == "zai_coding":
+        zai_cfg = getattr(config.providers, "zai_coding", None)
+        if zai_cfg is not None and not getattr(zai_cfg, "enabled", True):
+            return None
+        try:
+            from flowly.auth.zai_coding import resolve_runtime_credentials
+            creds = resolve_runtime_credentials(config=config)
+        except Exception as exc:
+            logger.debug("zai_coding provider unavailable: %s", exc)
+            return None
+        if creds is None or not creds.api_key:
+            return None
+        source = "Z.AI GLM Coding Plan"
+        if creds.source == "opencode":
+            suffix = f" ({creds.provider_id})" if creds.provider_id else ""
+            source = f"{source} · OpenCode{suffix}"
+        elif creds.source == "flowly":
+            source = f"{source} · Flowly store"
+        elif creds.source == "env":
+            source = f"{source} · env"
+        return ActiveProvider(
+            key="zai_coding",
+            api_key=creds.api_key,
+            api_base=creds.base_url,
+            source=source,
+        )
+
     if name not in _BYOK_PRIORITY:
         return None
     provider_cfg = getattr(config.providers, name, None)
@@ -274,6 +303,7 @@ DEFAULT_MODELS: dict[str, str] = {
     "gemini": "gemini-2.5-flash",             # present in the live models.dev catalogue
     "groq": "llama-3.3-70b-versatile",
     "zhipu": "glm-4.6",
+    "zai_coding": "glm-5.2",
     "sakana": "fugu",                         # Fugu orchestrator (also: fugu-ultra)
     "xai": "grok-4.3",                        # matches model_catalog._XAI_TOP_MODEL
     "xai_oauth": "grok-4.20-reasoning",       # matches DEFAULT_XAI_RESPONSES_MODEL
@@ -294,6 +324,7 @@ _MODEL_PREFIX_HINTS: dict[str, tuple[str, ...]] = {
     # first message, while a false "doesn't fit" just lands on llama + a note.
     "groq": ("llama", "meta-llama/", "mixtral", "gemma", "qwen", "deepseek", "openai/gpt-oss"),
     "zhipu": ("glm",),
+    "zai_coding": ("glm",),
     "sakana": ("fugu",),
     "xai": ("grok",),
     "xai_oauth": ("grok",),
@@ -436,6 +467,7 @@ def _default_base_for(provider_name: str) -> str | None:
         "groq":       "https://api.groq.com/openai/v1",
         "gemini":     "https://generativelanguage.googleapis.com/v1beta/openai",
         "zhipu":      "https://open.bigmodel.cn/api/paas/v4",
+        "zai_coding": "https://api.z.ai/api/coding/paas/v4",
         "sakana":     "https://api.sakana.ai/v1",
         # vllm is self-hosted; user must set api_base manually if they
         # use this slot. Returning None means resolver still works

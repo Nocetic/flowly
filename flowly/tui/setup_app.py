@@ -132,26 +132,27 @@ class SetupApp(App[None]):
             card = get_card(result.get("key") or "")
             if card is None:
                 return
-            if card.custom_action in ("xai_login", "codex_login"):
-                # Browser-OAuth providers need the dedicated login flow,
-                # which lives on the full app. Point at the CLI path so a
-                # fresh user isn't stranded here.
-                cmd = (
-                    "flowly codex login` to connect your ChatGPT subscription"
-                    if card.custom_action == "codex_login"
-                    else "flowly xai login` to connect your xAI Grok subscription"
-                )
+            if card.custom_action in ("xai_login", "codex_login", "zai_coding_login"):
+                # Subscription-style providers need dedicated setup flows.
+                # Point at the CLI path so a fresh user isn't stranded here.
+                if card.custom_action == "codex_login":
+                    cmd = "flowly codex login` to connect your ChatGPT subscription"
+                elif card.custom_action == "zai_coding_login":
+                    cmd = "flowly glm login` to connect your GLM Coding Plan"
+                else:
+                    cmd = "flowly xai login` to connect your xAI Grok subscription"
                 self.notify(f"Run `{cmd}.", severity="warning", timeout=8)
                 return
             saved = await self.push_screen_wait(IntegrationSetupModal(card))
             if saved and saved.get("action") == "saved":
                 self.notify(f"{card.label} saved", title="saved")
         elif action == "needs_login":
-            cmd = (
-                "flowly codex login` to connect your ChatGPT subscription"
-                if result.get("key") == "openai_codex"
-                else "flowly xai login` to connect your xAI Grok subscription"
-            )
+            if result.get("key") == "openai_codex":
+                cmd = "flowly codex login` to connect your ChatGPT subscription"
+            elif result.get("key") == "zai_coding":
+                cmd = "flowly glm login` to connect your GLM Coding Plan"
+            else:
+                cmd = "flowly xai login` to connect your xAI Grok subscription"
             self.notify(f"Run `{cmd}.", severity="warning", timeout=8)
         elif action == "login":
             # Flowly account picked while signed out → browser sign-in via the
