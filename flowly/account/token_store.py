@@ -26,20 +26,50 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from flowly.profile import credential_scope_suffix, get_flowly_home, is_default_home
+
 log = logging.getLogger(__name__)
 
-SERVICE_NAME = "flowly-tui"
 ACCOUNT_KEY = "account"  # single composite blob (id_token + refresh_token + metadata)
 
+# LEGACY_PATH is intentionally NOT home-scoped and the migration/purge
+# functions below intentionally only run at the default home: this is a
+# one-time migration source for plaintext files written before OS-keychain
+# support existed, back when every install used the default ~/.flowly
+# (profiles/custom homes came later). A legacy plaintext file only ever
+# belongs to the default home — a second home (e.g. a different product
+# built on this codebase) must never read, migrate, or delete it.
 LEGACY_PATH = Path.home() / ".flowly" / "credentials" / "account.json"
-FALLBACK_PATH = Path.home() / ".flowly" / "credentials" / "account.json"
-# Persistent marker: when present, this process and all future ones skip
-# keyring entirely. Written the first time macOS surfaces "Keychain Not
-# Found" (or any other set_password/get_password failure). Without this,
-# every launch re-prompts the user — the in-process latch alone is reset
-# each time Python exits. Delete the file to re-enable keyring (e.g.
-# after fixing your login keychain).
-KEYRING_MARKER_PATH = Path.home() / ".flowly" / "credentials" / ".keychain-broken"
+
+
+def _service_name() -> str:
+    """Keychain service name, scoped to the active FLOWLY_HOME.
+
+    See :func:`flowly.profile.credential_scope_suffix` — unsuffixed
+    (``"flowly-tui"``) at the default home for backward compatibility (no
+    re-login for existing users), suffixed everywhere else so two homes
+    never share one keychain entry.
+    """
+    suffix = credential_scope_suffix()
+    return f"flowly-tui:{suffix}" if suffix else "flowly-tui"
+
+
+def _credentials_dir() -> Path:
+    return get_flowly_home() / "credentials"
+
+
+def _fallback_path() -> Path:
+    return _credentials_dir() / "account.json"
+
+
+def _keyring_marker_path() -> Path:
+    # Persistent marker: when present, this process and all future ones skip
+    # keyring entirely. Written the first time macOS surfaces "Keychain Not
+    # Found" (or any other set_password/get_password failure). Without this,
+    # every launch re-prompts the user — the in-process latch alone is reset
+    # each time Python exits. Delete the file to re-enable keyring (e.g.
+    # after fixing your login keychain).
+    return _credentials_dir() / ".keychain-broken"
 
 
 @dataclass(frozen=True)
@@ -62,17 +92,18 @@ def _is_keyring_marked_broken() -> bool:
     cold start even though we already learned it doesn't work.
     """
     try:
-        return KEYRING_MARKER_PATH.exists()
+        return _keyring_marker_path().exists()
     except OSError:
         return False
 
 
 def _write_marker(reason: str) -> None:
     """Persist the keyring-broken latch so future processes skip it too."""
+    marker_path = _keyring_marker_path()
     try:
-        KEYRING_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
         import time
-        KEYRING_MARKER_PATH.write_text(
+        marker_path.write_text(
             f"# Flowly disabled the OS keychain after this error:\n"
             f"# {reason}\n"
             f"# Recorded at unix={int(time.time())}\n"
@@ -81,7 +112,7 @@ def _write_marker(reason: str) -> None:
         )
         try:
             from flowly.utils.file_security import secure_file
-            secure_file(KEYRING_MARKER_PATH)  # POSIX chmod; owner-only ACL on Windows
+            secure_file(marker_path)  # POSIX chmod; owner-only ACL on Windows
         except OSError:
             pass
     except OSError as exc:
@@ -103,7 +134,7 @@ def _try_keyring():
        background token refresh from re-triggering the dialog within the
        same launch.
 
-    2. **Persistent marker file** (``KEYRING_MARKER_PATH``) — written
+    2. **Persistent marker file** (``_keyring_marker_path()``) — written
        alongside the in-process flag. Consulted on first call of every
        new process so cold starts skip keyring entirely. The user can
        ``rm`` the marker to retry once they've fixed their keychain.
@@ -133,7 +164,7 @@ def _disable_keyring(reason: str) -> None:
     already = bool(_KEYRING_DISABLED)
     _KEYRING_DISABLED = True
     if not already:
-        log.warning("keyring disabled: %s (writing %s)", reason, KEYRING_MARKER_PATH)
+        log.warning("keyring disabled: %s (writing %s)", reason, _keyring_marker_path())
         _write_marker(reason)
 
 
@@ -145,8 +176,9 @@ def reset_keyring_disable() -> bool:
     global _KEYRING_DISABLED
     existed = False
     try:
-        existed = KEYRING_MARKER_PATH.exists()
-        KEYRING_MARKER_PATH.unlink(missing_ok=True)
+        marker_path = _keyring_marker_path()
+        existed = marker_path.exists()
+        marker_path.unlink(missing_ok=True)
     except OSError as exc:
         log.warning("keyring marker unlink failed: %s", exc)
     _KEYRING_DISABLED = None  # re-probe on next _try_keyring()
@@ -173,19 +205,20 @@ def storage_status() -> StorageStatus:
         else:
             nice = f"{type(backend).__name__} ({module})"
         return StorageStatus(backend="keyring", detail=nice, secure=True)
+    fallback_path = _fallback_path()
     if _is_keyring_marked_broken():
         return StorageStatus(
             backend="file",
             detail=(
-                f"fallback to {FALLBACK_PATH} (mode 0600) — OS keychain was "
-                f"unavailable in a prior run. Delete {KEYRING_MARKER_PATH} "
+                f"fallback to {fallback_path} (mode 0600) — OS keychain was "
+                f"unavailable in a prior run. Delete {_keyring_marker_path()} "
                 f"to retry once you've fixed it."
             ),
             secure=False,
         )
     return StorageStatus(
         backend="file",
-        detail=f"fallback to {FALLBACK_PATH} (mode 0600) — install gnome-keyring or libsecret for OS keychain",
+        detail=f"fallback to {fallback_path} (mode 0600) — install gnome-keyring or libsecret for OS keychain",
         secure=False,
     )
 
@@ -196,9 +229,10 @@ def save_credentials(payload: dict[str, Any]) -> StorageStatus:
     keyring = _try_keyring()
     if keyring is not None:
         try:
-            keyring.set_password(SERVICE_NAME, ACCOUNT_KEY, blob)
+            keyring.set_password(_service_name(), ACCOUNT_KEY, blob)
             # If a legacy file exists, sweep it now that the keychain is
             # authoritative. We refuse to leave plaintext sitting around.
+            # (Only at the default home — see _purge_legacy_file.)
             _purge_legacy_file()
             return storage_status()
         except Exception as exc:
@@ -214,9 +248,10 @@ def save_credentials(payload: dict[str, Any]) -> StorageStatus:
 def load_credentials() -> dict[str, Any] | None:
     """Read token payload. Migrates legacy JSON file if keyring is available."""
     keyring = _try_keyring()
+    service_name = _service_name()
     if keyring is not None:
         try:
-            raw = keyring.get_password(SERVICE_NAME, ACCOUNT_KEY)
+            raw = keyring.get_password(service_name, ACCOUNT_KEY)
         except Exception as exc:
             _disable_keyring(f"get_password: {type(exc).__name__}: {exc}")
             raw = None
@@ -225,10 +260,11 @@ def load_credentials() -> dict[str, Any] | None:
                 return json.loads(raw)
             except json.JSONDecodeError:
                 log.error("keyring blob malformed — clearing")
-                try: keyring.delete_password(SERVICE_NAME, ACCOUNT_KEY)
+                try: keyring.delete_password(service_name, ACCOUNT_KEY)
                 except Exception: pass
                 return None
-        # No entry in keyring yet — see if there's a legacy file to import.
+        # No entry in keyring yet — see if there's a legacy file to import
+        # (default home only — see _migrate_legacy_file_to_keyring).
         migrated = _migrate_legacy_file_to_keyring(keyring)
         if migrated is not None:
             return migrated
@@ -242,7 +278,7 @@ def clear_credentials() -> None:
     keyring = _try_keyring()
     if keyring is not None:
         try:
-            keyring.delete_password(SERVICE_NAME, ACCOUNT_KEY)
+            keyring.delete_password(_service_name(), ACCOUNT_KEY)
         except Exception:
             pass
     _purge_legacy_file()
@@ -252,25 +288,30 @@ def clear_credentials() -> None:
 
 
 def _write_file(blob: str) -> None:
-    FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = FALLBACK_PATH.with_suffix(".tmp")
+    fallback_path = _fallback_path()
+    fallback_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = fallback_path.with_suffix(".tmp")
     tmp.write_text(blob, encoding="utf-8")
-    tmp.replace(FALLBACK_PATH)
+    tmp.replace(fallback_path)
     try:
         from flowly.utils.file_security import secure_file
-        secure_file(FALLBACK_PATH)  # POSIX chmod; owner-only ACL on Windows
+        secure_file(fallback_path)  # POSIX chmod; owner-only ACL on Windows
     except OSError:
         pass
 
 
 def _read_file() -> dict[str, Any] | None:
     try:
-        return json.loads(FALLBACK_PATH.read_text(encoding="utf-8"))
+        return json.loads(_fallback_path().read_text(encoding="utf-8"))
     except (OSError, FileNotFoundError, json.JSONDecodeError):
         return None
 
 
 def _purge_legacy_file() -> None:
+    # LEGACY_PATH is a default-home-only artifact (see its docstring) — a
+    # non-default home must never touch another home's file.
+    if not is_default_home():
+        return
     try:
         LEGACY_PATH.unlink()
     except OSError:
@@ -281,7 +322,12 @@ def _migrate_legacy_file_to_keyring(keyring) -> dict[str, Any] | None:
     """On first keyring use, import any existing ~/.flowly/credentials/account.json.
 
     The file is deleted after a successful import — no plaintext lingering.
+    Default-home only: LEGACY_PATH is fixed at ~/.flowly, so a non-default
+    home (e.g. a second product built on this codebase) must never read,
+    migrate, or delete it — that file belongs to a different install.
     """
+    if not is_default_home():
+        return None
     try:
         raw = LEGACY_PATH.read_text(encoding="utf-8")
     except (OSError, FileNotFoundError):
@@ -292,7 +338,7 @@ def _migrate_legacy_file_to_keyring(keyring) -> dict[str, Any] | None:
         log.error("legacy credentials file malformed — leaving in place")
         return None
     try:
-        keyring.set_password(SERVICE_NAME, ACCOUNT_KEY, raw)
+        keyring.set_password(_service_name(), ACCOUNT_KEY, raw)
         log.info("migrated %s → keyring", LEGACY_PATH)
         _purge_legacy_file()
     except Exception as exc:

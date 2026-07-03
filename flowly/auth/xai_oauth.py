@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 from loguru import logger
 
-from flowly.profile import get_flowly_home
+from flowly.profile import credential_scope_suffix, get_flowly_home
 
 DEFAULT_XAI_OAUTH_BASE_URL = "https://api.x.ai/v1"
 XAI_OAUTH_DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration"
@@ -51,8 +51,21 @@ XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 # though our listener already received the code.
 _XAI_OAUTH_CORS_ORIGINS = frozenset({"https://accounts.x.ai", "https://auth.x.ai"})
 
-_KEYRING_SERVICE = "flowly-tui"
 _KEYRING_ACCOUNT = "xai-oauth"
+
+
+def _keyring_service() -> str:
+    """Keychain service name, scoped to the active FLOWLY_HOME.
+
+    Unsuffixed (``"flowly-tui"``) at the default home for backward
+    compatibility; suffixed everywhere else so two homes (e.g. a second
+    product built on this codebase) never share one keychain entry. See
+    :func:`flowly.profile.credential_scope_suffix`.
+    """
+    suffix = credential_scope_suffix()
+    return f"flowly-tui:{suffix}" if suffix else "flowly-tui"
+
+
 _REFRESH_SKEW_SECONDS = 90
 _HTTP_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
 
@@ -224,7 +237,7 @@ def load_token_payload() -> XAITokenPayload | None:
     keyring = _try_keyring()
     if keyring is not None:
         try:
-            raw_blob = keyring.get_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+            raw_blob = keyring.get_password(_keyring_service(), _KEYRING_ACCOUNT)
         except Exception as exc:
             logger.warning("xAI OAuth keyring read failed, falling back to file: {}", exc)
             raw_blob = None
@@ -241,7 +254,7 @@ def save_token_payload(payload: XAITokenPayload) -> str:
     keyring = _try_keyring()
     if keyring is not None:
         try:
-            keyring.set_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT, json.dumps(raw, separators=(",", ":")))
+            keyring.set_password(_keyring_service(), _KEYRING_ACCOUNT, json.dumps(raw, separators=(",", ":")))
             try:
                 credentials_path().unlink(missing_ok=True)
             except OSError:
@@ -257,7 +270,7 @@ def clear_token_payload() -> None:
     keyring = _try_keyring()
     if keyring is not None:
         try:
-            keyring.delete_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+            keyring.delete_password(_keyring_service(), _KEYRING_ACCOUNT)
         except Exception:
             pass
     try:

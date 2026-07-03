@@ -1042,14 +1042,17 @@ async def model_set(params: dict) -> dict:
 
 # Display metadata for the desktop's BYOK panel. ``keyable`` = takes a raw API
 # key (the rest are account/OAuth based). Slugs MUST match ProvidersConfig.
+# Labels match the corresponding IntegrationCard in integrations/registry.py.
 _PROVIDER_SLOTS = (
     ("flowly", "Flowly Account", False),
     ("anthropic", "Anthropic", True),
     ("openai", "OpenAI", True),
+    ("openai_codex", "ChatGPT subscription", False),
     ("openrouter", "OpenRouter", True),
     ("gemini", "Google Gemini", True),
     ("groq", "Groq", True),
     ("xai", "xAI (Grok API)", True),
+    ("xai_oauth", "xAI Grok OAuth", False),
     ("zai_coding", "Z.AI GLM Coding Plan", True),
     ("zhipu", "Zhipu GLM", True),
     ("sakana", "Sakana Fugu", True),
@@ -1081,6 +1084,18 @@ def provider_list() -> dict:
         elif key == "zai_coding":
             try:
                 from flowly.auth.zai_coding import resolve_runtime_credentials
+                has_key = resolve_runtime_credentials(config=cfg) is not None
+            except Exception:
+                has_key = False
+        elif key == "xai_oauth":
+            try:
+                from flowly.auth.xai_oauth import resolve_runtime_credentials
+                has_key = resolve_runtime_credentials(config=cfg) is not None
+            except Exception:
+                has_key = False
+        elif key == "openai_codex":
+            try:
+                from flowly.auth.openai_codex import resolve_runtime_credentials
                 has_key = resolve_runtime_credentials(config=cfg) is not None
             except Exception:
                 has_key = False

@@ -73,6 +73,34 @@ def get_flowly_home() -> Path:
     return _DEFAULT_HOME
 
 
+def is_default_home() -> bool:
+    """True iff the active ``FLOWLY_HOME`` is the default (``~/.flowly``)."""
+    return get_flowly_home() == _DEFAULT_HOME
+
+
+def credential_scope_suffix() -> str:
+    """Suffix identifying the active ``FLOWLY_HOME``, for scoping OS-keychain
+    service names.
+
+    Keychain entries are keyed by ``(service, account)``, not by file path —
+    unlike file-backed credentials, a keychain service name is shared by
+    every process that names it, regardless of ``FLOWLY_HOME``. Without this,
+    two engines running under different homes on the same OS user account
+    (e.g. a second product built on this codebase, or a named profile) would
+    silently read and write each other's stored tokens.
+
+    Returns ``""`` for the default home (``~/.flowly``) so existing keychain
+    entries there keep resolving under their current, unsuffixed service name
+    — no re-login for the overwhelming majority of installs. Any other home
+    gets a short deterministic suffix so its secrets never collide with
+    another home's.
+    """
+    if is_default_home():
+        return ""
+    import hashlib
+    return hashlib.sha256(str(get_flowly_home()).encode()).hexdigest()[:12]
+
+
 def display_flowly_home() -> str:
     """Return a user-friendly display string for the current home.
 
