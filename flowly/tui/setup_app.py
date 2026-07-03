@@ -21,6 +21,8 @@ is a separate, later step the CLI nudges toward once setup is done.
 
 from __future__ import annotations
 
+from typing import Any
+
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Center, Middle
@@ -48,6 +50,18 @@ class SetupApp(App[None]):
     CSS = """
     Screen {
         align: center middle;
+    }
+    ProviderPicker,
+    IntegrationsModal,
+    IntegrationSetupModal,
+    LoginModal {
+        align: center bottom;
+    }
+    ProviderPicker > Vertical,
+    IntegrationsModal > Vertical,
+    IntegrationSetupModal > Vertical,
+    LoginModal > Vertical {
+        margin-bottom: 5;
     }
     #setup-backdrop {
         width: auto;
@@ -106,6 +120,11 @@ class SetupApp(App[None]):
         finally:
             self.exit()
 
+    async def _show_inline_screen(self, screen: Any) -> Any:
+        # Keep the regular screen stack for focus, Esc bindings, and
+        # push_screen_wait results; CSS renders these as bottom sheets.
+        return await self.push_screen_wait(screen)
+
     # ── provider picker ──────────────────────────────────────────────
 
     async def _provider_flow(self) -> None:
@@ -119,7 +138,7 @@ class SetupApp(App[None]):
         from flowly.tui.panes.integration_setup_modal import IntegrationSetupModal
         from flowly.tui.panes.provider_picker import ProviderPicker
 
-        result = await self.push_screen_wait(ProviderPicker())
+        result = await self._show_inline_screen(ProviderPicker())
         if not result:
             return
 
@@ -143,7 +162,7 @@ class SetupApp(App[None]):
                     cmd = "flowly xai login` to connect your xAI Grok subscription"
                 self.notify(f"Run `{cmd}.", severity="warning", timeout=8)
                 return
-            saved = await self.push_screen_wait(IntegrationSetupModal(card))
+            saved = await self._show_inline_screen(IntegrationSetupModal(card))
             if saved and saved.get("action") == "saved":
                 self.notify(f"{card.label} saved", title="saved")
         elif action == "needs_login":
@@ -164,7 +183,7 @@ class SetupApp(App[None]):
             if load_account_sync():
                 self.notify("already signed in to Flowly", title="account")
             else:
-                account = await self.push_screen_wait(LoginModal())
+                account = await self._show_inline_screen(LoginModal())
                 if account:
                     self.notify("signed in to Flowly", title="account")
 
@@ -190,7 +209,7 @@ class SetupApp(App[None]):
         from flowly.tui.panes.login_modal import LoginModal
 
         while True:
-            result = await self.push_screen_wait(
+            result = await self._show_inline_screen(
                 IntegrationsModal(
                     categories=categories,
                     title=title,
@@ -217,12 +236,12 @@ class SetupApp(App[None]):
                         title="account",
                     )
                     continue
-                account = await self.push_screen_wait(LoginModal())
+                account = await self._show_inline_screen(LoginModal())
                 if account:
                     self.notify("signed in to Flowly", title="account")
                 continue
 
-            saved = await self.push_screen_wait(IntegrationSetupModal(card))
+            saved = await self._show_inline_screen(IntegrationSetupModal(card))
             if saved and saved.get("action") == "saved":
                 tail = (
                     " · restart gateway to activate"

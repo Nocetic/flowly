@@ -806,7 +806,11 @@ class IntegrationSetupModal(ModalScreen[dict[str, Any] | None]):
         the default, we set Flowly as the default so the user gets LLM
         access without an extra step."""
         from flowly.tui.panes.login_modal import LoginModal
-        result = await self.app.push_screen_wait(LoginModal())
+        show_inline = getattr(self.app, "_show_inline_screen", None)
+        if callable(show_inline):
+            result = await show_inline(LoginModal())
+        else:
+            result = await self.app.push_screen_wait(LoginModal())
         if result is None:
             self._set_status("login cancelled", "warn")
             return

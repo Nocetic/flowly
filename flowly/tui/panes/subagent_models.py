@@ -129,13 +129,17 @@ class SubagentModelsModal(ModalScreen[None]):
         a = next((x for x in self._assistants if x["name"] == name), None)
         if a is None:
             return
-        choice = await self.app.push_screen_wait(
-            _SpecialistModelPicker(
-                specialist=name,
-                default_model=str(a.get("defaultModel") or ""),
-                bot_model=self._bot_model,
-                override=str(a.get("override") or ""),
-            )
+        picker = _SpecialistModelPicker(
+            specialist=name,
+            default_model=str(a.get("defaultModel") or ""),
+            bot_model=self._bot_model,
+            override=str(a.get("override") or ""),
+        )
+        show_inline = getattr(self.app, "_show_inline_screen", None)
+        choice = (
+            await show_inline(picker)
+            if callable(show_inline)
+            else await self.app.push_screen_wait(picker)
         )
         if choice is None:
             return  # cancelled

@@ -10,6 +10,7 @@ from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 
+from flowly.integrations import Field, FieldType, IntegrationCard
 from flowly.tui.attachments import (
     is_video_path,
     render_message_with_attachments,
@@ -49,10 +50,8 @@ from flowly.tui.first_touch import (
 from flowly.tui.media_upload import AttachmentPreparationError, prepare_media_attachments
 from flowly.tui.panes.activity_modal import ActivityModal
 from flowly.tui.panes.approvals_modal import ApprovalsModal
-from flowly.tui.panes.policy_modal import PolicyModal
 from flowly.tui.panes.artifacts_modal import ArtifactsModal
 from flowly.tui.panes.assistant_picker import AssistantPicker
-from flowly.integrations import Field, FieldType, IntegrationCard
 from flowly.tui.panes.composer import (
     ApprovalPrompt,
     ApprovalPromptRequest,
@@ -63,11 +62,12 @@ from flowly.tui.panes.composer import (
     InlineSetupPrompt,
     InlineSetupPromptRequest,
 )
-from flowly.tui.panes.memory_review import MemoryReviewPanel
 from flowly.tui.panes.confirm_modal import ConfirmModal
 from flowly.tui.panes.help_hint import HelpHint
 from flowly.tui.panes.help_modal import HelpModal
 from flowly.tui.panes.login_modal import LoginModal
+from flowly.tui.panes.memory_review import MemoryReviewPanel
+from flowly.tui.panes.policy_modal import PolicyModal
 from flowly.tui.panes.session_picker import SessionPicker
 from flowly.tui.panes.status import ContextHeader, StatusBar
 from flowly.tui.panes.subagents import SubagentPane
@@ -1116,6 +1116,12 @@ class FlowlyTUI(App[None]):
         if fut is not None and not fut.done():
             fut.set_result(None)
 
+    async def _show_inline_screen(self, screen: Any) -> Any:
+        # Keep Textual's screen stack for focus, Esc bindings, OptionList
+        # navigation, and push_screen_wait results. Runtime CSS renders these
+        # screens as composer-adjacent bottom sheets instead of centered modals.
+        return await self.push_screen_wait(screen)
+
     def _safe_transcript_system(self, text: str) -> None:
         try:
             transcript = self.query_one(TranscriptPane)
@@ -1539,7 +1545,7 @@ class FlowlyTUI(App[None]):
             pass
 
         if not skip_confirm and msg_count > 0:
-            confirmed = await self.push_screen_wait(
+            confirmed = await self._show_inline_screen(
                 ConfirmModal(
                     title="Clear session?",
                     body=(
@@ -1783,7 +1789,7 @@ class FlowlyTUI(App[None]):
     async def action_subagent_models(self) -> None:
         """``/subagents models`` — open the per-specialist model editor."""
         from flowly.tui.panes.subagent_models import SubagentModelsModal
-        await self.push_screen_wait(SubagentModelsModal(self._client))
+        await self._show_inline_screen(SubagentModelsModal(self._client))
 
     @work
     async def action_spawn_subagent(self, task: str) -> None:
@@ -1807,7 +1813,7 @@ class FlowlyTUI(App[None]):
 
     @work
     async def action_open_help(self) -> None:
-        await self.push_screen_wait(HelpModal())
+        await self._show_inline_screen(HelpModal())
 
     # ── Connection catalogs ──────────────────────────────────────
 
@@ -1845,7 +1851,7 @@ class FlowlyTUI(App[None]):
         from flowly.tui.panes.integrations_modal import IntegrationsModal
 
         while True:
-            result = await self.push_screen_wait(
+            result = await self._show_inline_screen(
                 IntegrationsModal(
                     categories=categories,
                     title=title,
@@ -1882,7 +1888,7 @@ class FlowlyTUI(App[None]):
                 f"— run /logout first to switch"
             )
             return
-        result = await self.push_screen_wait(LoginModal())
+        result = await self._show_inline_screen(LoginModal())
         if not result:
             transcript.add_system("login cancelled")
             return
@@ -2252,7 +2258,7 @@ class FlowlyTUI(App[None]):
 
         # No-arg → open the arrow-key picker.
         if not rest:
-            result = await self.push_screen_wait(ProviderPicker())
+            result = await self._show_inline_screen(ProviderPicker())
             if not result:
                 return
             if result.get("action") == "switched":
@@ -2293,7 +2299,7 @@ class FlowlyTUI(App[None]):
                 elif card is not None and card.custom_action == "zai_coding_login":
                     await self.action_zai_coding_login()
                 elif card is not None:
-                    saved = await self.push_screen_wait(IntegrationSetupModal(card))
+                    saved = await self._show_inline_screen(IntegrationSetupModal(card))
                     if saved and saved.get("action") == "saved":
                         self._refresh_active_provider_status()
             elif result.get("action") == "disconnect":
@@ -2682,7 +2688,7 @@ class FlowlyTUI(App[None]):
         tab; gateway restart is auto-triggered after every toggle so
         the tool registry picks up the change without a manual reload."""
         from flowly.tui.panes.plugins_modal import PluginsModal
-        result = await self.push_screen_wait(PluginsModal())
+        result = await self._show_inline_screen(PluginsModal())
         transcript = self.query_one(TranscriptPane)
         if result and result.get("action") == "changed":
             n = int(result.get("count") or 0)
@@ -2698,7 +2704,7 @@ class FlowlyTUI(App[None]):
         remove servers. MCP tools register at agent boot, so the gateway
         is auto-restarted after each change (same as plugins)."""
         from flowly.tui.panes.mcp_modal import MCPModal
-        result = await self.push_screen_wait(MCPModal())
+        result = await self._show_inline_screen(MCPModal())
         transcript = self.query_one(TranscriptPane)
         if result and result.get("action") == "changed":
             n = int(result.get("count") or 0)
@@ -2718,7 +2724,7 @@ class FlowlyTUI(App[None]):
         flag, see live extension-connection status, and open the Chrome
         Web Store if the extension isn't installed yet."""
         from flowly.tui.panes.browser_modal import BrowserModal
-        result = await self.push_screen_wait(BrowserModal())
+        result = await self._show_inline_screen(BrowserModal())
         transcript = self.query_one(TranscriptPane)
         if result and result.get("action") == "saved":
             state = "enabled" if result.get("enabled") else "disabled"
@@ -2761,7 +2767,7 @@ class FlowlyTUI(App[None]):
 
         # Picker path.
         card = get_card(active.key)
-        result = await self.push_screen_wait(ModelPicker(
+        result = await self._show_inline_screen(ModelPicker(
             provider_key=active.key,
             provider_label=card.label if card else active.key,
             current_model=cfg.agents.defaults.model or "",
@@ -2780,7 +2786,7 @@ class FlowlyTUI(App[None]):
 
         if not name:
             original_theme = self._theme_name
-            result = await self.push_screen_wait(ThemePicker(self._theme_name))
+            result = await self._show_inline_screen(ThemePicker(self._theme_name))
             if not result:
                 self._apply_theme(original_theme, persist=False)
                 return
@@ -2917,7 +2923,7 @@ class FlowlyTUI(App[None]):
         except Exception as exc:
             transcript.add_error(f"audit fetch failed: {exc}")
             return
-        await self.push_screen_wait(ActivityModal(entries, stats))
+        await self._show_inline_screen(ActivityModal(entries, stats))
 
     @work
     async def action_open_approvals(self) -> None:
@@ -2927,7 +2933,7 @@ class FlowlyTUI(App[None]):
         except Exception as exc:
             transcript.add_error(f"approvals fetch failed: {exc}")
             return
-        result = await self.push_screen_wait(ApprovalsModal(pending))
+        result = await self._show_inline_screen(ApprovalsModal(pending))
         if not result:
             return
         aid = result.get("id", "")
@@ -2976,7 +2982,7 @@ class FlowlyTUI(App[None]):
                 transcript.add_error(f"permissions update failed: {exc}")
             return None
 
-        await self.push_screen_wait(PolicyModal(policy, apply))
+        await self._show_inline_screen(PolicyModal(policy, apply))
         await self._poll_badges()
 
     def action_copy_last(self) -> None:
@@ -3007,7 +3013,7 @@ class FlowlyTUI(App[None]):
         except Exception as exc:
             transcript.add_error(f"artifacts fetch failed: {exc}")
             return
-        await self.push_screen_wait(ArtifactsModal(arts))
+        await self._show_inline_screen(ArtifactsModal(arts))
 
     @work
     async def action_open_assistants(self) -> None:
@@ -3022,7 +3028,7 @@ class FlowlyTUI(App[None]):
                 "no assistants registered (registry not wired or empty)"
             )
             return
-        picked = await self.push_screen_wait(AssistantPicker(assistants))
+        picked = await self._show_inline_screen(AssistantPicker(assistants))
         if not picked:
             return
         name = picked["name"]
@@ -3047,7 +3053,7 @@ class FlowlyTUI(App[None]):
         if not sessions:
             transcript.add_system("no saved sessions")
             return
-        result = await self.push_screen_wait(SessionPicker(sessions, self._session_key))
+        result = await self._show_inline_screen(SessionPicker(sessions, self._session_key))
         if not result:
             return
         action = result.get("action")

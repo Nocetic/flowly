@@ -383,9 +383,11 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.approval-open > #composer-input-row,
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,
+    Composer.review-open > #composer-input-row,
     Composer.approval-open > #composer-hint,
     Composer.secret-open > #composer-hint,
-    Composer.setup-open > #composer-hint {{
+    Composer.setup-open > #composer-hint,
+    Composer.review-open > #composer-hint {{
         display: none;
     }}
     Composer > #composer-attachments {{
@@ -501,37 +503,82 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     SubagentRow.ok      {{ color: {palette.success}; }}
     SubagentRow.fail    {{ color: {palette.error}; }}
 
+    ActivityModal,
+    ApprovalModal,
+    ApprovalsModal,
+    ArtifactsModal,
+    AssistantPicker,
+    BrowserModal,
+    ConfirmModal,
+    HelpModal,
+    IntegrationSetupModal,
+    IntegrationsModal,
+    LoginModal,
+    MCPModal,
+    MCPSecretModal,
+    ModelPicker,
+    PluginsModal,
+    PolicyModal,
+    ProviderPicker,
+    SessionPicker,
+    SubagentModelsModal,
+    ThemePicker,
+    _SpecialistModelPicker {{
+        align: center bottom;
+    }}
+
     ApprovalModal > Vertical,
-    AssistantPicker > Vertical,
-    SessionPicker > Vertical,
-    ProviderPicker > Vertical,
-    ModelPicker > Vertical,
-    IntegrationsModal > Vertical,
-    IntegrationSetupModal > Vertical,
-    LoginModal > Vertical,
     ActivityModal > Vertical,
-    ArtifactsModal > Vertical,
     ApprovalsModal > Vertical,
+    ArtifactsModal > Vertical,
+    AssistantPicker > Vertical,
+    BrowserModal > Vertical,
+    ConfirmModal > Vertical,
+    HelpModal > Vertical,
+    IntegrationSetupModal > Vertical,
+    IntegrationsModal > Vertical,
+    LoginModal > Vertical,
+    MCPModal > Vertical,
+    MCPSecretModal > Vertical,
+    ModelPicker > Vertical,
+    PluginsModal > Vertical,
+    PolicyModal > Vertical,
+    ProviderPicker > Vertical,
+    SessionPicker > Vertical,
+    SubagentModelsModal > Vertical,
     ThemePicker > Vertical,
-    HelpModal > Vertical {{
+    _SpecialistModelPicker > Vertical {{
         background: {palette.surface};
         border: thick {palette.accent};
+        margin-bottom: 5;
     }}
 
     ApprovalModal .title,
-    AssistantPicker .title,
-    SessionPicker .title,
-    ProviderPicker .title,
-    ModelPicker .title,
-    IntegrationsModal .title,
-    IntegrationSetupModal .title,
-    LoginModal .title,
     ActivityModal .title,
-    ArtifactsModal .title,
     ApprovalsModal .title,
+    ArtifactsModal .title,
+    AssistantPicker .title,
+    BrowserModal .title,
+    ConfirmModal .title,
+    HelpModal Markdown,
+    IntegrationSetupModal .title,
+    IntegrationsModal .title,
+    LoginModal .title,
+    MCPModal .title,
+    MCPSecretModal .title,
+    ModelPicker .title,
+    PluginsModal .title,
+    PolicyModal .title,
+    ProviderPicker .title,
+    SessionPicker .title,
+    SubagentModelsModal .title,
     ThemePicker .title,
-    HelpModal Markdown {{
+    _SpecialistModelPicker .title {{
         color: {palette.accent};
+    }}
+
+    ConfirmModal .body {{
+        color: {palette.text};
     }}
 
     ApprovalModal .cmd,
@@ -544,16 +591,29 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
 
     AssistantPicker .hint,
     AssistantPicker .footnote,
-    SessionPicker .hint,
-    ProviderPicker .hint,
-    ProviderPicker .footer,
+    BrowserModal .description,
+    BrowserModal #status-line,
+    ConfirmModal .hint,
+    MCPModal .hint,
+    MCPModal .footer,
+    MCPSecretModal .hint,
     ModelPicker .hint,
     ModelPicker .footer,
-    IntegrationsModal .hint,
-    IntegrationsModal .footer,
+    PluginsModal .hint,
+    PluginsModal .footer,
+    PolicyModal .hint,
+    ProviderPicker .hint,
+    ProviderPicker .footer,
+    SessionPicker .hint,
+    SubagentModelsModal .hint,
+    SubagentModelsModal .footer,
+    _SpecialistModelPicker .hint,
+    _SpecialistModelPicker .footer,
     IntegrationSetupModal .field-row > Label,
     IntegrationSetupModal .field-help,
     IntegrationSetupModal #status-line,
+    IntegrationsModal .hint,
+    IntegrationsModal .footer,
     LoginModal .hint,
     LoginModal .status,
     ActivityModal .meta,
@@ -566,13 +626,17 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     }}
 
     AssistantPicker OptionList,
-    SessionPicker OptionList,
-    ProviderPicker OptionList,
-    ModelPicker OptionList,
-    IntegrationsModal OptionList,
-    IntegrationSetupModal VerticalScroll,
     ArtifactsModal ListView,
+    IntegrationSetupModal VerticalScroll,
+    IntegrationsModal OptionList,
+    MCPModal OptionList,
+    ModelPicker OptionList,
+    PluginsModal OptionList,
+    ProviderPicker OptionList,
+    SessionPicker OptionList,
+    SubagentModelsModal OptionList,
     ThemePicker OptionList,
+    _SpecialistModelPicker OptionList,
     HelpModal VerticalScroll,
     HelpModal Markdown {{
         background: {palette.surface};

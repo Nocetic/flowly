@@ -1,6 +1,31 @@
 from __future__ import annotations
 
+from flowly.tui.setup_app import SetupApp
 from flowly.tui.theme import css_for, get_theme, list_themes, resolve_theme_name
+
+BOTTOM_SHEET_SCREENS = (
+    "ActivityModal",
+    "ApprovalModal",
+    "ApprovalsModal",
+    "ArtifactsModal",
+    "AssistantPicker",
+    "BrowserModal",
+    "ConfirmModal",
+    "HelpModal",
+    "IntegrationSetupModal",
+    "IntegrationsModal",
+    "LoginModal",
+    "MCPModal",
+    "MCPSecretModal",
+    "ModelPicker",
+    "PluginsModal",
+    "PolicyModal",
+    "ProviderPicker",
+    "SessionPicker",
+    "SubagentModelsModal",
+    "ThemePicker",
+    "_SpecialistModelPicker",
+)
 
 
 def test_composer_hint_and_attachments_are_themed() -> None:
@@ -13,6 +38,31 @@ def test_composer_hint_and_attachments_are_themed() -> None:
     assert f"background: {amber.bg}; color: {amber.text_muted};" in css
     assert "Composer > #composer-attachments" in css
     assert f"background: {amber.bg}; color: {amber.accent};" in css
+
+
+def test_tui_screens_render_as_bottom_sheets() -> None:
+    css = css_for()
+
+    for screen in BOTTOM_SHEET_SCREENS:
+        assert f"{screen}," in css or f"{screen} {{" in css
+        assert f"{screen} > Vertical," in css or f"{screen} > Vertical {{" in css
+    assert "align: center bottom;" in css
+    assert "margin-bottom: 5;" in css
+
+
+def test_setup_screens_render_as_bottom_sheets() -> None:
+    css = SetupApp.CSS
+
+    for screen in (
+        "ProviderPicker",
+        "IntegrationsModal",
+        "IntegrationSetupModal",
+        "LoginModal",
+    ):
+        assert f"{screen}," in css or f"{screen} {{" in css
+        assert f"{screen} > Vertical," in css or f"{screen} > Vertical {{" in css
+    assert "align: center bottom;" in css
+    assert "margin-bottom: 5;" in css
 
 
 def test_user_bubble_surface_is_visible_and_assistant_bubbles_stay_transparent() -> None:
