@@ -159,6 +159,9 @@ def test(
             )
         if response.status_code in (401, 403):
             console.print(f"[red]✗ xAI rejected token: HTTP {response.status_code}[/]")
+            detail = xai_oauth.entitlement_detail(response.text)
+            if detail:
+                console.print(f"  [yellow]xAI says:[/] {detail}")
             raise typer.Exit(code=1)
         if response.status_code >= 400:
             console.print(f"[red]✗ xAI /models failed: HTTP {response.status_code}[/]")

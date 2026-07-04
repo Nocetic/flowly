@@ -14,6 +14,7 @@ from flowly.auth.xai_oauth import (
     DEFAULT_XAI_OAUTH_BASE_URL,
     XAIAuthError,
     XAIEntitlementError,
+    entitlement_detail,
     redact_secret,
     refresh_tokens,
     resolve_runtime_credentials,
@@ -319,9 +320,11 @@ class XAIResponsesProvider(LLMProvider):
                     await self._refresh_api_key()
                     continue
                 if response.status_code == 403:
+                    detail = entitlement_detail(response.text)
                     raise XAIEntitlementError(
                         "xAI returned HTTP 403. The account is authenticated but "
                         "not entitled to this API/model."
+                        + (f" xAI says: {detail}" if detail else "")
                     )
                 if response.status_code >= 400:
                     raise XAIAuthError(
@@ -443,10 +446,12 @@ class XAIResponsesProvider(LLMProvider):
                             await self._refresh_api_key()
                             continue
                         if response.status_code == 403:
-                            await response.aread()
+                            body = (await response.aread()).decode("utf-8", "replace")
+                            detail = entitlement_detail(body)
                             raise XAIEntitlementError(
                                 "xAI returned HTTP 403. The account is authenticated but "
                                 "not entitled to this API/model."
+                                + (f" xAI says: {detail}" if detail else "")
                             )
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "replace")

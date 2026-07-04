@@ -171,6 +171,36 @@ def redact_secret(text: str, *secrets_to_hide: str) -> str:
     return result
 
 
+def entitlement_detail(body: str | None) -> str | None:
+    """Extract xAI's human-readable message from a 403 error body.
+
+    xAI returns JSON like ``{"code": "personal-team-blocked:spending-limit",
+    "error": "You have run out of credits or need a Grok subscription…"}``.
+    Surfacing that message (instead of a bare "HTTP 403") tells the user
+    exactly what to do. Returns ``"message [code]"`` when parseable, else
+    ``None`` so callers fall back to their generic wording.
+    """
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    msg = data.get("error") or data.get("message") or data.get("detail")
+    code = data.get("code")
+    if isinstance(msg, dict):  # nested {"error": {"code": …, "message": …}}
+        code = code or msg.get("code")
+        msg = msg.get("message")
+    if not isinstance(msg, str) or not msg.strip():
+        return None
+    msg = msg.strip()
+    if isinstance(code, str) and code.strip():
+        return f"{msg} [{code.strip()}]"
+    return msg
+
+
 def validate_xai_oauth_base_url(url: str | None) -> str:
     candidate = (url or DEFAULT_XAI_OAUTH_BASE_URL).strip().rstrip("/")
     parsed = urllib.parse.urlparse(candidate)
@@ -434,9 +464,11 @@ def exchange_code_for_tokens(
     except httpx.HTTPError as exc:
         raise XAIAuthError(f"xAI token exchange failed: {type(exc).__name__}") from exc
     if response.status_code == 403:
+        detail = entitlement_detail(response.text)
         raise XAIEntitlementError(
             "xAI accepted the OAuth login but this account is not entitled to "
             "API access. Use an xAI API key or upgrade/link the subscription."
+            + (f" xAI says: {detail}" if detail else "")
         )
     if response.status_code >= 400:
         raise XAIAuthError(
@@ -488,9 +520,11 @@ def refresh_tokens(*, client_id: str | None = None, payload: XAITokenPayload | N
     except httpx.HTTPError as exc:
         raise XAIAuthError(f"xAI token refresh failed: {type(exc).__name__}") from exc
     if response.status_code == 403:
+        detail = entitlement_detail(response.text)
         raise XAIEntitlementError(
             "xAI OAuth refresh was rejected with HTTP 403. The account is "
             "authenticated but not entitled to this API surface."
+            + (f" xAI says: {detail}" if detail else "")
         )
     if response.status_code in (400, 401):
         clear_token_payload()

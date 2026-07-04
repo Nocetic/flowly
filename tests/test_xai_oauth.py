@@ -173,3 +173,69 @@ def test_exchange_code_classifies_403_as_entitlement(monkeypatch: pytest.MonkeyP
             code_challenge_value="challenge",
             token_endpoint="https://auth.x.ai/oauth2/token",
         )
+
+
+# --- entitlement_detail: surface xAI's 403 body message -----------------
+
+def test_entitlement_detail_parses_code_and_error():
+    body = (
+        '{"code": "personal-team-blocked:spending-limit", '
+        '"error": "You have run out of credits or need a Grok subscription. '
+        'Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok."}'
+    )
+    detail = xai_oauth.entitlement_detail(body)
+    assert detail is not None
+    assert "run out of credits" in detail
+    assert "personal-team-blocked:spending-limit" in detail
+
+
+def test_entitlement_detail_plain_error_only():
+    assert xai_oauth.entitlement_detail('{"error": "nope"}') == "nope"
+
+
+def test_entitlement_detail_nested_error_object():
+    body = '{"error": {"code": "x", "message": "inner message"}}'
+    detail = xai_oauth.entitlement_detail(body)
+    assert detail is not None
+    assert "inner message" in detail
+
+
+def test_entitlement_detail_garbage_returns_none():
+    assert xai_oauth.entitlement_detail("<html>Cloudflare</html>") is None
+    assert xai_oauth.entitlement_detail("") is None
+    assert xai_oauth.entitlement_detail(None) is None
+    assert xai_oauth.entitlement_detail('["list"]') is None
+
+
+def test_exchange_code_403_includes_body_detail(monkeypatch: pytest.MonkeyPatch):
+    class FakeResponse:
+        status_code = 403
+        text = '{"code": "personal-team-blocked:spending-limit", "error": "You have run out of credits."}'
+
+        def json(self):
+            return {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(xai_oauth.httpx, "Client", FakeClient)
+
+    with pytest.raises(xai_oauth.XAIEntitlementError) as excinfo:
+        xai_oauth.exchange_code_for_tokens(
+            code="code",
+            client_id="client",
+            code_verifier="verifier",
+            code_challenge_value="challenge",
+            token_endpoint="https://auth.x.ai/oauth2/token",
+        )
+    assert "run out of credits" in str(excinfo.value)
