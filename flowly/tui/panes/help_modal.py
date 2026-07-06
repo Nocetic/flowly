@@ -56,6 +56,7 @@ HELP_BODY = """
 | `/logout`            | Unpair (disable iOS access) |
 | `/whoami`            | Show pairing status + account info |
 | `/status`            | Show current model + session |
+| `/usage`             | Session token & cost breakdown for the active provider (+ context window) |
 | `/activity`          | Activity / audit log (or F2) |
 | `/approvals`         | Pending approvals queue (or F3) |
 | `/permissions`       | Edit command permissions (security/ask/allowlist) |

@@ -107,6 +107,26 @@ def get_context_window(model_id: str) -> int | None:
     return None
 
 
+def get_pricing(model_id: str) -> tuple[float | None, float | None] | None:
+    """Look up a model's (USD per 1M input, USD per 1M output) from any cached
+    catalog. Synchronous, cache-only (no network) — mirrors
+    :func:`get_context_window`, including the dash/dot version normalization.
+
+    Returns ``None`` when the model isn't in any cached catalog or reports no
+    pricing (e.g. BYOK native providers whose catalog omits it) — the caller
+    then shows tokens without a cost estimate.
+    """
+    if not model_id:
+        return None
+    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
+    candidates.discard("")
+    for models in _CACHE.values():
+        for m in models:
+            if m.id in candidates and (m.pricing_in is not None or m.pricing_out is not None):
+                return (m.pricing_in, m.pricing_out)
+    return None
+
+
 # ── id normalization ──────────────────────────────────────────────
 
 

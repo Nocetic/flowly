@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import time
 from typing import Any
 
 from textual import events, on, work
@@ -253,6 +254,15 @@ class FlowlyTUI(App[None]):
         self._account = None
         self._account_ref: list = [None]
         self._account_refresh_task: asyncio.Task[None] | None = None
+        # Cumulative session usage (billed view) — summed across turns for
+        # /usage and the live cost badge. Distinct from the status bar's
+        # context-window numbers, which show only the LATEST turn's occupancy.
+        # Reset alongside context on /clear and /new (see _reset_context_usage).
+        self._usage_totals: dict[str, float] = {
+            "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+            "turns": 0, "cost_usd": 0.0, "cost_known": 0,
+        }
+        self._session_started = time.monotonic()
         # Crash-safe: write state on interpreter exit even if Textual's
         # on_unmount didn't run (segfault, SIGKILL is unrecoverable; SIGTERM,
         # uncaught exception, MemoryError all hit atexit).
@@ -618,10 +628,42 @@ class FlowlyTUI(App[None]):
         return True
 
     def _reset_context_usage(self) -> None:
+        self._usage_totals = {
+            "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+            "turns": 0, "cost_usd": 0.0, "cost_known": 0,
+        }
         try:
             self.query_one(StatusBar).reset_context_usage()
         except Exception:
             pass
+
+    def _accumulate_usage(
+        self, tin: int, tout: int, cread: int, cwrite: int, model: str
+    ) -> None:
+        """Fold one turn's token counts into the cumulative session totals and
+        estimate its cost from the catalog price of ``model``. Feeds the live
+        cost badge and backs the /usage screen. Cost is billed per-turn (each
+        turn pays for its full input), so input is summed across turns — unlike
+        the context-window bar, which shows only the latest turn's occupancy."""
+        t = self._usage_totals
+        t["input"] += tin
+        t["output"] += tout
+        t["cache_read"] += cread
+        t["cache_write"] += cwrite
+        t["turns"] += 1
+        try:
+            from flowly.integrations.model_catalog import get_pricing
+            pricing = get_pricing(model)
+        except Exception:
+            pricing = None
+        if pricing is not None:
+            pin, pout = pricing
+            t["cost_usd"] += (tin * (pin or 0) + tout * (pout or 0)) / 1_000_000
+            t["cost_known"] += 1
+            try:
+                self.query_one(StatusBar).cost_usd = t["cost_usd"]
+            except Exception:
+                pass
 
     async def _preload_history(self) -> None:
         # A preload can render an empty session or a history without usage
@@ -805,6 +847,9 @@ class FlowlyTUI(App[None]):
                     status.tokens_in = tin
                 if tout:
                     status.tokens_out = tout
+                cread = int(u.get("cache_read_tokens") or u.get("cache_read_input_tokens") or 0)
+                cwrite = int(u.get("cache_write_tokens") or u.get("cache_creation_input_tokens") or 0)
+                self._accumulate_usage(tin, tout, cread, cwrite, status.model)
             asyncio.create_task(self._drain_queue())
             # First-touch hint: brand-new user just saw their first
             # turn finish — point at /retry and /undo, which they have
@@ -1294,6 +1339,9 @@ class FlowlyTUI(App[None]):
                 f"state={s.state}"
                 + (f" · {provider_source}" if provider_source else "")
             )
+            return
+        if head == "/usage":
+            self.action_open_usage()
             return
 
         # gateway-side commands
@@ -2913,6 +2961,50 @@ class FlowlyTUI(App[None]):
             f"- token:   {fresh}\n"
             f"- storage: {credential_storage_status()}"
         )
+
+    @work
+    async def action_open_usage(self) -> None:
+        """Open the /usage screen — this machine's own token & cost tally for
+        the active provider (any provider, local or remote gateway)."""
+        from flowly.tui.panes.status import _model_budget
+        from flowly.tui.panes.usage_modal import UsageModal
+
+        s = self.query_one(StatusBar)
+        provider, _src = self._active_provider_display()
+        ctx_used = int(s.tokens_in) + int(s.tokens_out)
+        ctx_budget = _model_budget(s.model or "")
+
+        account = self._account
+        if account is None:
+            try:
+                from flowly.account.auth import load_account_refreshing
+                account = await load_account_refreshing()
+            except Exception:
+                account = None
+        email = (
+            getattr(account, "email", None) or getattr(account, "user_id", None)
+            if account else None
+        )
+        # Signed in → pull the same live credit balance Desktop shows
+        # (best-effort; None on any failure so /usage still opens instantly-ish).
+        credits = None
+        if account is not None:
+            try:
+                from flowly.account.billing import fetch_account_credits
+                credits = await fetch_account_credits(account)
+            except Exception:
+                credits = None
+
+        await self._show_inline_screen(UsageModal(
+            totals=dict(self._usage_totals),
+            model=s.model or "",
+            provider=provider or "",
+            ctx_used=ctx_used,
+            ctx_budget=ctx_budget or 0,
+            elapsed=time.monotonic() - self._session_started,
+            account_email=email,
+            credits=credits,
+        ))
 
     @work
     async def action_open_activity(self) -> None:
