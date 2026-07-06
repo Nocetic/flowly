@@ -122,7 +122,10 @@ class SkillViewTool(Tool):
 
     def __init__(self, workspace: Path):
         self._workspace = workspace
-        self._managed_dir = Path.home() / ".flowly" / "skills"
+        # Where sync_skills() materializes bundled skills — honor FLOWLY_HOME /
+        # the active profile, matching SkillsLoader (not a hardcoded ~/.flowly).
+        from flowly.profile import get_flowly_home
+        self._managed_dir = get_flowly_home() / "skills"
         self._builtin_dir = Path(__file__).parent.parent.parent / "skills"
 
     def _find_skill_dir(self, name: str) -> Path | None:
@@ -203,15 +206,28 @@ class SkillViewTool(Tool):
         readiness, missing = _check_readiness(meta)
         linked_files = _discover_linked_files(skill_dir)
 
-        return json.dumps({
+        result = {
             "name": name,
             "description": frontmatter.get("description", ""),
             "content": body,
             "frontmatter": frontmatter,
+            "skill_dir": str(skill_dir),
             "linked_files": linked_files,
             "readiness": readiness,
             "missing_requirements": missing,
-        }, ensure_ascii=False)
+        }
+        # Scripts/templates referenced relatively in the body (e.g. ``scripts/x.py``)
+        # live under ``skill_dir`` on disk — for builtin skills that is the package
+        # directory, NOT the workspace. Tell the model to run them from there so a
+        # bare ``python3 scripts/x.py`` from the default (workspace) cwd doesn't fail.
+        if linked_files:
+            result["run_hint"] = (
+                f"Linked scripts/templates are on disk under skill_dir. Run a script "
+                f"with the exec tool using working_dir=skill_dir, e.g. "
+                f"exec(command=\"python3 scripts/<file>\", working_dir=\"{skill_dir}\"), "
+                f"or invoke it by absolute path \"{skill_dir}/scripts/<file>\"."
+            )
+        return json.dumps(result, ensure_ascii=False)
 
     def _load_linked_file(self, skill_dir: Path, name: str, file_path: str) -> str:
         """Tier 3: Load a specific linked file."""

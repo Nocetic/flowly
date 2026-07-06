@@ -191,3 +191,48 @@ def sync_skills(quiet: bool = True) -> dict[str, list[str] | int]:
         )
 
     return result
+
+
+_SYNCED_THIS_PROCESS = False
+
+
+def _manifest_is_fresh() -> bool:
+    """True when the manifest is newer than every bundled skill file — i.e. a
+    prior sync already reflects the current bundle.
+
+    Lets short-lived entry points (``flowly agent``) skip the full hash-compare
+    on every invocation, while a fresh install / new release (newer bundled
+    mtimes) still trips a re-sync.
+    """
+    manifest = _manifest_path()
+    if not manifest.exists():
+        return False
+    manifest_mtime = manifest.stat().st_mtime
+    for f in _get_bundled_dir().rglob("*"):
+        if f.is_file() and f.stat().st_mtime > manifest_mtime:
+            return False
+    return True
+
+
+def ensure_synced(quiet: bool = True) -> dict[str, list[str] | int] | None:
+    """Entry-point-safe bundled-skill sync into ``~/.flowly/skills``.
+
+    Copies newly-bundled skills and refreshes unmodified ones, preserving user
+    edits (see :func:`sync_skills`). Guarded to run at most once per process and
+    to short-circuit when the manifest already reflects the current bundle, so
+    it's cheap enough to call from every launch path. Never raises — a failure
+    is logged and swallowed (skills still load in place from the package).
+    """
+    global _SYNCED_THIS_PROCESS
+    if _SYNCED_THIS_PROCESS or _manifest_is_fresh():
+        return None
+    try:
+        result = sync_skills(quiet=quiet)
+        _SYNCED_THIS_PROCESS = True
+        copied, updated = result.get("copied", []), result.get("updated", [])
+        if copied or updated:
+            logger.info(f"[SkillSync] {len(copied)} new, {len(updated)} updated skills")
+        return result
+    except Exception as e:
+        logger.warning(f"[SkillSync] Failed (non-critical): {e}")
+        return None

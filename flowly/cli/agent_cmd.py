@@ -34,6 +34,12 @@ def agent(
 
     config = load_config()
 
+    # Materialize bundled skills into ~/.flowly/skills so the agent can find and
+    # run their scripts (manifest-tracked, preserves user edits; cheap no-op once
+    # synced).
+    from flowly.skills.sync import ensure_synced
+    ensure_synced(quiet=True)
+
     from flowly.integrations.active_provider import resolve_active_provider
     active = resolve_active_provider(config)
     if active is None:

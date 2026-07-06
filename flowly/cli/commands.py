@@ -84,6 +84,13 @@ def main(
         run_onboarding()
         raise typer.Exit()
 
+    # Materialize bundled skills into ~/.flowly/skills (manifest-tracked,
+    # preserves user edits) so the TUI's agent can find and run them — builtin
+    # skills otherwise live only in the package and their scripts don't resolve
+    # from the workspace cwd.
+    from flowly.skills.sync import ensure_synced
+    ensure_synced(quiet=True)
+
     # Provider ready → drop straight into the TUI. Defer the import so
     # `flowly --help` etc. don't pay the Textual cost. Use ``run_tui``
     # (the plain-Python launcher), not a Typer command — it takes plain

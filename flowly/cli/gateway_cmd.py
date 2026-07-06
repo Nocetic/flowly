@@ -411,15 +411,8 @@ def gateway(
     )
 
     # Sync bundled skills — manifest-based, respects user edits
-    try:
-        from flowly.skills.sync import sync_skills
-        sync_result = sync_skills(quiet=True)
-        copied = sync_result.get("copied", [])
-        updated = sync_result.get("updated", [])
-        if copied or updated:
-            logger.info(f"[SkillSync] {len(copied)} new, {len(updated)} updated skills")
-    except Exception as e:
-        logger.warning(f"[SkillSync] Failed (non-critical): {e}")
+    from flowly.skills.sync import ensure_synced
+    ensure_synced(quiet=True)
 
     # Create agent with cron service
     agent = AgentLoop(
