@@ -127,6 +127,10 @@ Each skill is a directory containing a `SKILL.md` file with:
 | `ops-runbook` | SOPs, incident playbooks, severity/escalation, blameless postmortems |
 | `chemistry` | Balance equations, molar mass, stoichiometry, molarity + chemistry calculator |
 | `physics-solver` | Kinematics, dynamics, energy, momentum, projectiles + physics solver |
+| `symbolic-math` | Calculus & linear algebra — diff/integrate/solve/limits/series/matrices/ODEs (SymPy) |
+| `astronomy` | Sun rise/set, moon phase, RA/Dec↔alt-az, sidereal/Julian time, angular separation |
+| `epidemiology` | SIR/SEIR outbreak models, R0, herd immunity, final size, doubling time |
+| `uncertainty-propagation` | Error propagation (analytic + Monte Carlo), sig figs, weighted mean |
 | `bioinformatics` | DNA/RNA/protein — GC, rev-comp, translate, ORFs, FASTA + sequence toolkit |
 | `clinical-evidence` | PICO, evidence appraisal, RR/NNT, GRADE (informational, not medical advice) |
 | `medical-literature-review` | PubMed search, PRISMA screening, evidence tables, synthesis |
