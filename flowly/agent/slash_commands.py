@@ -58,6 +58,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("retry", "Re-submit the last user message (drops the stale reply)", "Session"),
     CommandDef("undo", "Pop the last turn (pre-fills the removed prompt)", "Session"),
     CommandDef("status", "Session health summary", "Info"),
+    CommandDef("usage", "Token & cost this session (+ Flowly account credits)", "Info",
+               cli_only=True),
     CommandDef("whoami", "Show user / server / conversation", "Info"),
     # TUI launcher (Ctrl+S) — opens the saved-session picker. cli_only: the
     # desktop manages sessions through its own UI, not a slash command.

@@ -3,31 +3,6 @@ from __future__ import annotations
 from flowly.tui.setup_app import SetupApp
 from flowly.tui.theme import css_for, get_theme, list_themes, resolve_theme_name
 
-BOTTOM_SHEET_SCREENS = (
-    "ActivityModal",
-    "ApprovalModal",
-    "ApprovalsModal",
-    "ArtifactsModal",
-    "AssistantPicker",
-    "BrowserModal",
-    "ConfirmModal",
-    "HelpModal",
-    "IntegrationSetupModal",
-    "IntegrationsModal",
-    "LoginModal",
-    "MCPModal",
-    "MCPSecretModal",
-    "ModelPicker",
-    "PluginsModal",
-    "PolicyModal",
-    "ProviderPicker",
-    "SessionPicker",
-    "SubagentModelsModal",
-    "ThemePicker",
-    "_SpecialistModelPicker",
-)
-
-
 def test_composer_hint_and_attachments_are_themed() -> None:
     amber = get_theme("amber")
     assert amber is not None
@@ -41,13 +16,26 @@ def test_composer_hint_and_attachments_are_themed() -> None:
 
 
 def test_tui_screens_render_as_bottom_sheets() -> None:
+    """Modals are positioned generically off the ``ModalScreen`` base class, so
+    any new modal is a composer-adjacent bottom sheet automatically — no
+    per-name list to fall out of sync (which is how /usage first shipped
+    centered). The generic selector only reaches a screen because it subclasses
+    ModalScreen, so spot-check that too."""
+    from textual.screen import ModalScreen
+
+    from flowly.tui.panes.help_modal import HelpModal
+    from flowly.tui.panes.model_picker import ModelPicker
+    from flowly.tui.panes.usage_modal import UsageModal
+
     css = css_for()
 
-    for screen in BOTTOM_SHEET_SCREENS:
-        assert f"{screen}," in css or f"{screen} {{" in css
-        assert f"{screen} > Vertical," in css or f"{screen} > Vertical {{" in css
+    assert "ModalScreen {" in css
+    assert "ModalScreen > Vertical {" in css
     assert "align: center bottom;" in css
     assert "margin-bottom: 5;" in css
+
+    for cls in (HelpModal, ModelPicker, UsageModal):
+        assert issubclass(cls, ModalScreen)
 
 
 def test_setup_screens_render_as_bottom_sheets() -> None:

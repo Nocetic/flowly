@@ -503,51 +503,15 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     SubagentRow.ok      {{ color: {palette.success}; }}
     SubagentRow.fail    {{ color: {palette.error}; }}
 
-    ActivityModal,
-    ApprovalModal,
-    ApprovalsModal,
-    ArtifactsModal,
-    AssistantPicker,
-    BrowserModal,
-    ConfirmModal,
-    HelpModal,
-    IntegrationSetupModal,
-    IntegrationsModal,
-    LoginModal,
-    MCPModal,
-    MCPSecretModal,
-    ModelPicker,
-    PluginsModal,
-    PolicyModal,
-    ProviderPicker,
-    SessionPicker,
-    SubagentModelsModal,
-    ThemePicker,
-    _SpecialistModelPicker {{
+    /* Every modal renders as a composer-adjacent bottom sheet. Targeting the
+       ModalScreen BASE class (Textual type selectors match base classes) means
+       a newly-added modal is inline automatically — no hand-maintained list to
+       fall out of sync (which is how /usage first shipped centered). */
+    ModalScreen {{
         align: center bottom;
     }}
 
-    ApprovalModal > Vertical,
-    ActivityModal > Vertical,
-    ApprovalsModal > Vertical,
-    ArtifactsModal > Vertical,
-    AssistantPicker > Vertical,
-    BrowserModal > Vertical,
-    ConfirmModal > Vertical,
-    HelpModal > Vertical,
-    IntegrationSetupModal > Vertical,
-    IntegrationsModal > Vertical,
-    LoginModal > Vertical,
-    MCPModal > Vertical,
-    MCPSecretModal > Vertical,
-    ModelPicker > Vertical,
-    PluginsModal > Vertical,
-    PolicyModal > Vertical,
-    ProviderPicker > Vertical,
-    SessionPicker > Vertical,
-    SubagentModelsModal > Vertical,
-    ThemePicker > Vertical,
-    _SpecialistModelPicker > Vertical {{
+    ModalScreen > Vertical {{
         background: {palette.surface};
         border: thick {palette.accent};
         margin-bottom: 5;

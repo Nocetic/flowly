@@ -49,25 +49,19 @@ def _dur(secs: float) -> str:
 
 
 class UsageModal(ModalScreen[None]):
+    # Positioning, border, and background come from the shared ModalScreen
+    # runtime CSS (theme.py) so /usage is a themed bottom sheet like every other
+    # modal. Here we only size the sheet.
     DEFAULT_CSS = """
-    UsageModal {
-        align: center middle;
-    }
     UsageModal > Vertical {
         width: 90%;
         max-width: 84;
         height: auto;
         max-height: 90%;
-        border: thick #00a6c8;
-        background: #050505;
     }
     UsageModal VerticalScroll {
         padding: 1 2;
-        background: #050505;
         height: auto;
-    }
-    UsageModal Static {
-        background: #050505;
     }
     """
 
