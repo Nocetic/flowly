@@ -1,0 +1,185 @@
+[
+  {
+    "id": "peopleconnect",
+    "name": "PeopleConnect cluster",
+    "category": "people_search",
+    "priority": "crucial",
+    "jurisdictions": ["US"],
+    "search_url": "https://www.intelius.com/",
+    "search_by": ["name", "phone", "address"],
+    "covers": ["intelius", "truthfinder", "instantcheckmate", "ussearch", "zabasearch", "addresses", "anywho", "publicrecords"],
+    "optout": {
+      "method": "web_form",
+      "url": "https://suppression.peopleconnect.us/login",
+      "email": "privacy@peopleconnect.us",
+      "inputs": ["contact_email", "full_name", "date_of_birth"],
+      "human_gates": ["email_verification", "date_of_birth"],
+      "est_processing_days": 7
+    },
+    "notes": [
+      "Treat this as a parent cluster: one suppression can cover multiple PeopleConnect front ends.",
+      "For search-visibility removal, prefer maintained suppression over account/data deletion; verify the current portal text before acting.",
+      "The guided flow may require date of birth. Collect it only if the operator explicitly agrees."
+    ],
+    "source": "starter catalog; verify live before use"
+  },
+  {
+    "id": "whitepages",
+    "name": "Whitepages",
+    "category": "people_search",
+    "priority": "crucial",
+    "jurisdictions": ["US"],
+    "search_url": "https://www.whitepages.com/",
+    "search_by": ["name", "phone", "address"],
+    "covers": ["411"],
+    "optout": {
+      "method": "email_or_web_form",
+      "url": "https://www.whitepages.com/suppression_requests",
+      "email": "privacyrequest@whitepages.com",
+      "inputs": ["full_name", "contact_email", "profile_url"],
+      "human_gates": ["email_verification"],
+      "est_processing_days": 15
+    },
+    "notes": [
+      "Email lane avoids phone callback friction when available; include confirmed listing URLs only.",
+      "Re-scan after processing. Hidden from free search is not the same as verified deletion."
+    ],
+    "source": "starter catalog; verify live before use"
+  },
+  {
+    "id": "spokeo",
+    "name": "Spokeo",
+    "category": "people_search",
+    "priority": "crucial",
+    "jurisdictions": ["US"],
+    "search_url": "https://www.spokeo.com/search",
+    "search_by": ["name", "phone", "email", "address"],
+    "covers": ["freepeopledirectory"],
+    "optout": {
+      "method": "web_form",
+      "url": "https://www.spokeo.com/optout",
+      "email": "privacy@spokeo.com",
+      "inputs": ["profile_url", "contact_email"],
+      "human_gates": ["email_verification"],
+      "est_processing_days": 2
+    },
+    "notes": [
+      "Multiple listings per person are common. Submit each confirmed listing URL separately.",
+      "Use a follow-up deletion draft when the goal is broader deletion beyond listing suppression."
+    ],
+    "source": "starter catalog; verify live before use"
+  },
+  {
+    "id": "beenverified",
+    "name": "BeenVerified",
+    "category": "people_search",
+    "priority": "crucial",
+    "jurisdictions": ["US"],
+    "search_url": "https://www.beenverified.com/app/optout/search",
+    "search_by": ["name", "phone", "email", "address"],
+    "covers": ["peoplelooker", "peoplesmart"],
+    "optout": {
+      "method": "web_form",
+      "url": "https://www.beenverified.com/svc/optout/search/optouts",
+      "email": "privacy@beenverified.com",
+      "inputs": ["full_name", "contact_email", "profile_url"],
+      "human_gates": ["email_verification"],
+      "est_processing_days": 7
+    },
+    "notes": [
+      "Parent for several Lifetime Value Co. people-search properties. Re-scan covered children after the parent confirms.",
+      "Use deletion drafts for broader data deletion; do not assume all sister properties cleared automatically."
+    ],
+    "source": "starter catalog; verify live before use"
+  },
+  {
+    "id": "familytreenow",
+    "name": "FamilyTreeNow",
+    "category": "people_search",
+    "priority": "high",
+    "jurisdictions": ["US"],
+    "search_url": "https://www.familytreenow.com/",
+    "search_by": ["name", "phone", "address"],
+    "covers": [],
+    "optout": {
+      "method": "web_form",
+      "url": "https://www.familytreenow.com/optout",
+      "email": null,
+      "inputs": ["full_name"],
+      "human_gates": [],
+      "est_processing_days": 2
+    },
+    "notes": [
+      "Use the public opt-out endpoint after confirming the exact record. Re-listing risk is high, so schedule a re-scan."
+    ],
+    "source": "starter catalog; verify live before use"
+  },
+  {
+    "id": "radaris",
+    "name": "Radaris",
+    "category": "people_search",
+    "priority": "high",
+    "jurisdictions": ["US"],
+    "search_url": "https://radaris.com/",
+    "search_by": ["name", "phone", "address"],
+    "covers": [],
+    "optout": {
+      "method": "web_form_or_email",
+      "url": "https://radaris.com/control-privacy",
+      "email": "customer-service@radaris.com",
+      "inputs": ["profile_url", "contact_email"],
+      "human_gates": ["captcha", "email_verification"],
+      "est_processing_days": 14
+    },
+    "notes": [
+      "The form may require a per-person numbered profile URL. Do not use a relative or namesake URL.",
+      "If the exact profile URL is unavailable, draft an email naming only the subject's own displayed details."
+    ],
+    "source": "starter catalog; verify live before use"
+  },
+  {
+    "id": "truepeoplesearch",
+    "name": "TruePeopleSearch",
+    "category": "people_search",
+    "priority": "high",
+    "jurisdictions": ["US"],
+    "search_url": "https://www.truepeoplesearch.com/",
+    "search_by": ["name", "phone", "address", "email"],
+    "covers": [],
+    "optout": {
+      "method": "web_form",
+      "url": "https://www.truepeoplesearch.com/removal",
+      "email": "support@truepeoplesearch.com",
+      "inputs": ["full_name", "contact_email"],
+      "human_gates": ["captcha", "email_verification"],
+      "est_processing_days": 3
+    },
+    "notes": [
+      "Ignore page titles or intro text that merely echo the query. Record found only on a real result card corroborated by address, phone, or other strong signal.",
+      "Do not bypass anti-bot or CAPTCHA gates. Queue a human task when the form blocks automation."
+    ],
+    "source": "starter catalog; verify live before use"
+  },
+  {
+    "id": "nuwber",
+    "name": "Nuwber",
+    "category": "people_search",
+    "priority": "standard",
+    "jurisdictions": ["US"],
+    "search_url": "https://nuwber.com/",
+    "search_by": ["name", "phone", "address"],
+    "covers": [],
+    "optout": {
+      "method": "web_form",
+      "url": "https://nuwber.com/removal/link",
+      "email": null,
+      "inputs": ["contact_email", "profile_url"],
+      "human_gates": ["email_verification"],
+      "est_processing_days": 3
+    },
+    "notes": [
+      "Needs a confirmed profile URL. Use draft/email fallback only if a current official privacy contact is verified."
+    ],
+    "source": "starter catalog; verify live before use"
+  }
+]

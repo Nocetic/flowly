@@ -1,0 +1,4 @@
+interface:
+  display_name: "Exposure Cleanup"
+  short_description: "Remove exposed personal data safely"
+  default_prompt: "Use $exposure-cleanup to plan and track a consent-based data broker cleanup."
