@@ -25,7 +25,6 @@ def test_tui_screens_render_as_bottom_sheets() -> None:
 
     from flowly.tui.panes.help_modal import HelpModal
     from flowly.tui.panes.model_picker import ModelPicker
-    from flowly.tui.panes.usage_modal import UsageModal
 
     css = css_for()
 
@@ -34,7 +33,7 @@ def test_tui_screens_render_as_bottom_sheets() -> None:
     assert "align: center bottom;" in css
     assert "margin-bottom: 5;" in css
 
-    for cls in (HelpModal, ModelPicker, UsageModal):
+    for cls in (HelpModal, ModelPicker):
         assert issubclass(cls, ModalScreen)
 
 

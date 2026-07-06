@@ -29,6 +29,7 @@ from flowly.tui.attachments import (
 )
 from flowly.tui.clipboard import save_clipboard_image
 from flowly.tui.panes.memory_review import MemoryReviewPanel
+from flowly.tui.panes.usage_panel import UsagePanel
 
 # TUI autocomplete palette — derived from the single command registry (every
 # command not flagged gateway_only). Plugin/bundle/skill commands are merged in
@@ -1276,8 +1277,28 @@ class Composer(Vertical):
     Composer.approval-open > #composer-hint,
     Composer.secret-open > #composer-hint,
     Composer.setup-open > #composer-hint,
-    Composer.review-open > #composer-hint {
+    Composer.review-open > #composer-hint,
+    Composer.usage-open > #composer-input-row,
+    Composer.usage-open > #composer-hint {
         display: none;
+    }
+    Composer > #composer-usage {
+        display: none;
+        height: auto;
+        max-height: 24;
+        padding: 1 2;
+        margin: 0;
+    }
+    Composer.usage-open > #composer-usage {
+        display: block;
+    }
+    Composer > #composer-usage > #usage-scroll {
+        height: auto;
+        max-height: 22;
+    }
+    Composer > #composer-usage > #usage-hint {
+        height: 1;
+        color: #83b8c2;
     }
     Composer > #composer-attachments {
         height: 1;
@@ -1547,6 +1568,7 @@ class Composer(Vertical):
         yield InlineSecretPrompt(id="composer-secret")
         yield InlineSetupPrompt(id="composer-setup")
         yield MemoryReviewPanel(id="composer-review")
+        yield UsagePanel(id="composer-usage")
         with Horizontal(id="composer-input-row"):
             yield Label("❯", id="composer-prompt", markup=False)
             editor = _Editor(id="composer-input", show_line_numbers=False)
@@ -1773,6 +1795,23 @@ class Composer(Vertical):
         except Exception:
             pass
         self.remove_class("setup-open")
+        self.focus_input_safely()
+
+    def show_usage(self, **data: object) -> None:
+        self.remove_class("palette-open")
+        self.remove_class("approval-open")
+        self.remove_class("secret-open")
+        self.remove_class("setup-open")
+        self.remove_class("review-open")
+        self.add_class("usage-open")
+        self.query_one("#composer-usage", UsagePanel).set_data(**data)
+
+    def clear_usage(self) -> None:
+        try:
+            self.query_one("#composer-usage", UsagePanel).clear()
+        except Exception:
+            pass
+        self.remove_class("usage-open")
         self.focus_input_safely()
 
     def focus_setup_prompt(self) -> None:

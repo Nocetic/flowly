@@ -68,6 +68,7 @@ from flowly.tui.panes.help_hint import HelpHint
 from flowly.tui.panes.help_modal import HelpModal
 from flowly.tui.panes.login_modal import LoginModal
 from flowly.tui.panes.memory_review import MemoryReviewPanel
+from flowly.tui.panes.usage_panel import UsagePanel
 from flowly.tui.panes.policy_modal import PolicyModal
 from flowly.tui.panes.session_picker import SessionPicker
 from flowly.tui.panes.status import ContextHeader, StatusBar
@@ -1160,6 +1161,14 @@ class FlowlyTUI(App[None]):
         fut = self._inline_setup_future
         if fut is not None and not fut.done():
             fut.set_result(None)
+
+    @on(UsagePanel.Dismissed)
+    def _on_usage_dismissed(self, event: UsagePanel.Dismissed) -> None:
+        event.stop()
+        try:
+            self.query_one(Composer).clear_usage()
+        except Exception:
+            pass
 
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
@@ -2967,44 +2976,42 @@ class FlowlyTUI(App[None]):
         """Open the /usage screen — this machine's own token & cost tally for
         the active provider (any provider, local or remote gateway)."""
         from flowly.tui.panes.status import _model_budget
-        from flowly.tui.panes.usage_modal import UsageModal
 
         s = self.query_one(StatusBar)
         provider, _src = self._active_provider_display()
         ctx_used = int(s.tokens_in) + int(s.tokens_out)
         ctx_budget = _model_budget(s.model or "")
-
+        composer = self.query_one(Composer)
         account = self._account
-        if account is None:
-            try:
-                from flowly.account.auth import load_account_refreshing
-                account = await load_account_refreshing()
-            except Exception:
-                account = None
         email = (
-            getattr(account, "email", None) or getattr(account, "user_id", None)
+            (getattr(account, "email", None) or getattr(account, "user_id", None))
             if account else None
         )
-        # Signed in → pull the same live credit balance Desktop shows
-        # (best-effort; None on any failure so /usage still opens instantly-ish).
-        credits = None
+
+        def _show(credits: dict | None) -> None:
+            composer.show_usage(
+                totals=dict(self._usage_totals),
+                model=s.model or "",
+                provider=provider or "",
+                ctx_used=ctx_used,
+                ctx_budget=ctx_budget or 0,
+                elapsed=time.monotonic() - self._session_started,
+                account_email=email,
+                credits=credits,
+            )
+
+        # Show instantly with local token/cost; the input row is replaced by the
+        # inline panel (no modal overlay). Then, if signed in, fill in the same
+        # live credit balance Desktop shows (best-effort — never blocks the open).
+        _show(None)
         if account is not None:
             try:
                 from flowly.account.billing import fetch_account_credits
                 credits = await fetch_account_credits(account)
             except Exception:
                 credits = None
-
-        await self._show_inline_screen(UsageModal(
-            totals=dict(self._usage_totals),
-            model=s.model or "",
-            provider=provider or "",
-            ctx_used=ctx_used,
-            ctx_budget=ctx_budget or 0,
-            elapsed=time.monotonic() - self._session_started,
-            account_email=email,
-            credits=credits,
-        ))
+            if credits is not None and composer.has_class("usage-open"):
+                _show(credits)
 
     @work
     async def action_open_activity(self) -> None:
