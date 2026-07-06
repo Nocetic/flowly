@@ -509,6 +509,10 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
        fall out of sync (which is how /usage first shipped centered). */
     ModalScreen {{
         align: center bottom;
+        /* No dimming overlay — modals read as composer-adjacent inline panels,
+           not full-screen popups. (Textual's ModalScreen defaults to a 60%
+           scrim; transparent removes it.) */
+        background: transparent;
     }}
 
     ModalScreen > Vertical {{
