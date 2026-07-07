@@ -139,8 +139,33 @@ class Extractor(Protocol):
 # --------------------------------------------------------------------------
 
 
+# Session-key prefixes the dreamer must NOT learn from: the agent's own
+# autonomous/background runs. Their transcripts are machine-generated (heartbeat
+# ticks, cron jobs, subagent tasks, system announces) — mining them as "user
+# memory" is exactly how the dreamer ends up "proposing memories with no
+# conversation" and treating its own tool output as user facts. Only genuine
+# user-channel conversation should feed memory extraction.
+_AUTOMATION_PREFIXES = ("heartbeat:", "cron:", "subagent:", "system:")
+
+# The SQL clause form (one NOT LIKE per prefix) plus a guard against the stale
+# ``<key>.full`` display-mirror twins that older indexes still hold.
+_DELTA_EXCLUDE_SQL = (
+    " AND " + " AND ".join(f"session_key NOT LIKE '{p}%'" for p in _AUTOMATION_PREFIXES)
+    + " AND session_key NOT LIKE '%.full'"
+)
+
+
+def is_automation_session(session_key: str) -> bool:
+    """True for background/agent-generated sessions the dreamer must skip."""
+    key = session_key or ""
+    return key.endswith(".full") or any(key.startswith(p) for p in _AUTOMATION_PREFIXES)
+
+
 class SessionIndexDeltaSource:
-    """Reads new messages from ``session_index.sqlite`` without mutating it."""
+    """Reads new user-conversation messages from ``session_index.sqlite``
+    without mutating it. Automation/background sessions are filtered in SQL so
+    the ``limit`` applies to real user messages, not to noise the filter would
+    otherwise discard after the fact."""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -151,7 +176,7 @@ class SessionIndexDeltaSource:
             try:
                 rows = conn.execute(
                     "SELECT id, session_key, role, content, timestamp FROM messages "
-                    "WHERE id > ? ORDER BY id ASC LIMIT ?",
+                    "WHERE id > ?" + _DELTA_EXCLUDE_SQL + " ORDER BY id ASC LIMIT ?",
                     (watermark_id, limit),
                 ).fetchall()
             finally:

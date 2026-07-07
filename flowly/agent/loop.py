@@ -64,6 +64,16 @@ _TOOL_MAX_CHARS: dict[str, int] = {
 }
 _DEFAULT_MAX_CHARS = 8000
 
+# Channels that are NOT genuine user activity: the agent's own background runs.
+# Memory learning (idle + turn dreamer triggers) must ignore these so a periodic
+# heartbeat/cron tick never looks like a conversation worth remembering.
+_NON_USER_CHANNELS = ("system", "heartbeat", "cron")
+
+
+def _is_user_activity_channel(channel: str) -> bool:
+    """True when ``channel`` is real user conversation (not a background run)."""
+    return (channel or "") not in _NON_USER_CHANNELS
+
 
 # ── Built-in agent keyword routing ──────────────────────────────────────────
 
@@ -1283,10 +1293,15 @@ class AgentLoop:
                 self._consolidate_turns = 0
                 asyncio.create_task(self._maybe_consolidate("turn"))
 
-        # Cross-session dreamer: coarse turn-based trigger. Cheap when there is no
-        # new session delta (the dreamer short-circuits on its watermark), so it
-        # only does LLM work when fresh cross-session material has accumulated.
-        if self._dreamer is not None and self._dreamer_turn_interval > 0:
+        # Cross-session dreamer: coarse turn-based trigger. Only real user
+        # conversation should drive it — a background heartbeat/cron/subagent
+        # turn must not tick the counter (the idle trigger already gates on the
+        # same channels, loop `_dreamer_last_user_ts`). Without this a 30-min
+        # heartbeat alone would fire dreaming passes with no user activity.
+        if (
+            self._dreamer is not None and self._dreamer_turn_interval > 0
+            and _is_user_activity_channel(getattr(msg, "channel", ""))
+        ):
             self._dreamer_turns += 1
             if self._dreamer_turns >= self._dreamer_turn_interval:
                 self._dreamer_turns = 0
@@ -4484,7 +4499,7 @@ class AgentLoop:
         # NOT shared with _last_activity_ts, which background heartbeat/cron turns
         # also touch (a 30-min heartbeat would otherwise keep resetting a 30-min
         # idle clock, so the idle pass would never fire).
-        if msg.channel not in ("system", "heartbeat", "cron"):
+        if _is_user_activity_channel(msg.channel):
             self._dreamer_last_user_ts = time.time()
 
         # Mark parent session busy so subagent announces are queued, not injected mid-processing
