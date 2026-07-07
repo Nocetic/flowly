@@ -49,6 +49,12 @@ from flowly.memory.governance import (
 _WATERMARK_KEY = "dreamer_watermark"
 _LOCK_KEY = "dreamer_lock"
 
+
+class ExtractionError(Exception):
+    """Extractor infrastructure failure (LLM bridge error / empty after retries),
+    as opposed to a successful extraction that genuinely found nothing. The
+    engine leaves the watermark unadvanced on this so the delta is retried."""
+
 # Default commit thresholds (overridable from config in the live wiring).
 DEFAULT_AUTO_FLOOR = 0.80
 DEFAULT_REVIEW_FLOOR = 0.55
@@ -196,12 +202,13 @@ class SessionIndexDeltaSource:
 
 
 def _default_injection_check(text: str) -> bool:
-    """True if the text looks like a prompt-injection attempt."""
-    try:
-        from flowly.cron.guard import scan_context_file
-        return scan_context_file(text, "memory-candidate") is not None
-    except Exception:
-        return False
+    """True if the text looks like a prompt-injection attempt.
+
+    Does NOT swallow errors: if the scanner is unavailable the exception
+    propagates so the caller can fail closed (route to review) rather than
+    treating unscanned content as clean."""
+    from flowly.cron.guard import scan_context_file
+    return scan_context_file(text, "memory-candidate") is not None
 
 
 def _normalize_text(text: str) -> str:
@@ -362,11 +369,18 @@ class MemoryDreamerService:
         if not delta:
             return DreamResult(ran=True, reason="no_delta", watermark=watermark)
 
-        candidates = list(
-            self.extractor.extract(
-                delta, known=self._known_memory(), profile=self._read_profile()
+        try:
+            candidates = list(
+                self.extractor.extract(
+                    delta, known=self._known_memory(), profile=self._read_profile()
+                )
             )
-        )
+        except ExtractionError as exc:
+            # Infra failure (LLM bridge / empty after retries) — NOT "nothing to
+            # learn". Leave the watermark where it is so this delta is retried
+            # next pass instead of being skipped forever.
+            logger.warning(f"[dreamer] extraction failed; watermark held for retry: {exc}")
+            return DreamResult(ran=True, reason="extract_failed", watermark=watermark)
         res = DreamResult(
             ran=True,
             processed_messages=len(delta),
@@ -400,17 +414,22 @@ class MemoryDreamerService:
         return res
 
     def _commit_candidate(self, cand: Candidate, res: DreamResult) -> None:
-        # 1. Injection scan — reject outright, with an audit trail.
-        if self.injection_check(cand.text):
-            item = self.gov.add_item(
-                kind=cand.kind, text=cand.text, status=STATUS_CANDIDATE,
-                ref_kind=cand.ref_kind, ref_id=cand.ref_id,
-                normalized_key=cand.normalized_key, confidence=cand.confidence,
-                privacy_level=cand.privacy_level, source_session=cand.source_session,
-                source_message_ids=cand.source_message_ids,
-                metadata=cand.metadata,
-                actor=ACTOR_DREAMER, reason="extracted",
+        # 1. Injection scan. A genuine flag → reject outright. A scanner ERROR
+        #    fails closed: the candidate can't be verified, so it parks in review
+        #    (never silently activated, never silently dropped).
+        try:
+            flagged = self.injection_check(cand.text)
+        except Exception as exc:  # noqa: BLE001 — scanner unavailable
+            logger.warning(f"[dreamer] injection scan errored; routing to review: {exc}")
+            item = self._create_item(cand)
+            self.gov.transition(
+                item.id, STATUS_NEEDS_REVIEW, actor=ACTOR_DREAMER,
+                reason="injection_scan_unavailable",
             )
+            res.needs_review += 1
+            return
+        if flagged:
+            item = self._create_item(cand)
             self.gov.transition(
                 item.id, STATUS_REJECTED, actor=ACTOR_DREAMER,
                 reason="prompt_injection_flagged",

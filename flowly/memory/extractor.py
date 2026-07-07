@@ -28,7 +28,7 @@ from typing import Any, Sequence
 
 from loguru import logger
 
-from flowly.memory.dreamer import Candidate, MessageRow
+from flowly.memory.dreamer import Candidate, ExtractionError, MessageRow
 from flowly.memory.governance import VALID_KINDS, VALID_PRIVACY
 
 _EXTRACT_PROMPT = """You extract DURABLE long-term memories from a recent conversation \
@@ -130,9 +130,14 @@ class SubagentExtractor:
                 raw = fut.result(timeout=self._timeout)
             else:
                 raw = asyncio.run(self._extract_async(delta, known, profile))
-        except Exception as exc:  # noqa: BLE001 — extraction must never crash a run
-            logger.warning(f"[dreamer-extract] LLM bridge failed: {exc}")
-            return []
+        except Exception as exc:  # LLM bridge / timeout — an infra failure, not "nothing"
+            raise ExtractionError(f"LLM bridge failed: {exc}") from exc
+        if not raw.strip():
+            # Empty after all retries → the model never produced output. Treat as
+            # an infra failure so the engine holds the watermark and retries,
+            # rather than silently skipping this delta forever. A genuine "nothing
+            # to learn" comes back as a parseable ``[]`` and returns cleanly below.
+            raise ExtractionError("empty extractor response after retries")
         return self._parse(raw, delta)
 
     # -- LLM call (on the loop) ---------------------------------------------
