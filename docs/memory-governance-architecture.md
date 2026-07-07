@@ -197,7 +197,7 @@ workspace.
 | `<state_dir>/knowledge_graph.sqlite3` | KG tool + `SqliteKGMirror` | pre-existing; mirror only closes/reopens triples |
 | `<workspace>/memory/MEMORY.md` | `regenerate_memory_md` + legacy `memory_append` | generated block + manual content |
 | `<workspace>/memory/MEMORY.md.bak-<runid>` | `migrate_memory_md` | backup before the one-time import |
-| `<state_dir>/session_index.sqlite` | `SessionIndexer` | pre-existing; the dreamer's watermark source |
+| `<state_dir>/session_index.sqlite` | `SessionIndexer` | pre-existing; the dreamer's watermark source. Indexing is **incremental / id-stable** — a save or a startup rebuild appends only new tail rows and preserves existing `messages.id`, re-id'ing a session only when its stored prefix diverges (compaction/edit). This is what makes the id-based watermark reliable; the old delete-all + reinsert churned ids and made the dreamer reprocess history forever. |
 
 > **`state_dir` gotcha (caused a real bug).** `state_dir` is **not**
 > `workspace/.flowly_state`. The gateway constructs `AgentLoop(state_dir=get_data_dir())`
@@ -421,6 +421,11 @@ class MemoryDreamerService(gov, delta_source, extractor, *, auto_floor, review_f
 DeltaSource(Protocol): read_since(watermark_id, limit) -> Sequence[MessageRow]
 Extractor(Protocol):   extract(delta) -> Sequence[Candidate]
 SessionIndexDeltaSource(db_path)   # live adapter, read-only over session_index.sqlite
+                                   # filters automation sessions in SQL
+                                   # (heartbeat:/cron:/subagent:/system: + .full
+                                   # mirror twins) so the dreamer only learns from
+                                   # real user conversation, and the row limit
+                                   # applies to user messages, not noise
 ```
 
 See [Wiring the offline dreamer](#wiring-the-offline-dreamer).
@@ -597,6 +602,8 @@ The audit table is the full forensic trail; nothing was ever deleted.
 | `on_committed` / MEMORY.md refresh raises | caught + logged; the governance write already committed. |
 | Crash mid-consolidation | `apply_operations` commits per transition; partial progress is valid (each op is independent). Dirty stays set → next pass finishes. |
 | Crash mid-dreamer-run | watermark only advances after the commit pass → re-run reprocesses the same delta safely (idempotent via dedup). |
+| Extractor infra failure (LLM bridge / empty after retries) | raises `ExtractionError`; the engine **holds the watermark** (no advance) so the delta is retried, instead of being silently skipped forever. A genuine empty extraction (parseable `[]`) advances normally. |
+| Injection scanner unavailable (raises) | **fails closed** — the candidate is routed to `needs_review` (never silently activated, never silently dropped); a genuine injection flag still rejects. |
 | Migration interrupted | `memory_md_migrated` flag is set only at the end; a re-run re-imports. The original is already backed up. Internal + KG dedup keep it from duplicating. |
 | User edits inside the generated block | overwritten on next `refresh()`. The block carries a "edits inside the markers are overwritten" warning; manual notes belong outside the sentinels (preserved by `splice`). |
 | Governance DB deleted | recreated empty on next start; capture resumes; existing KG/MEMORY.md intact. Pure rollback. |
@@ -658,7 +665,14 @@ The audit table is the full forensic trail; nothing was ever deleted.
   prompts) and never returned by `recall` — defense in depth on top of the dreamer
   never auto-activating sensitive candidates.
 - **Prompt-injection** candidates are rejected with an audit trail (`scan_context_file`
-  patterns from `flowly/cron/guard.py`), never activated.
+  patterns from `flowly/cron/guard.py`), never activated. The scan is applied on
+  **both** write paths — the dreamer and the live `ingest_append`/`ingest_kg_fact`
+  hook — and **fails closed**: if the scanner errors, the candidate is routed to
+  `needs_review` rather than trusted as clean.
+- **Autonomous live writes are not auto-trusted.** A `memory_append` /
+  `knowledge_graph` write the agent makes during its own background run
+  (heartbeat / cron / subagent — detected via the source session key) lands in
+  `needs_review`, not `active`; only real user-channel writes stay auto-active.
 - **The consolidation LLM only proposes.** `apply_operations` validates every op
   and never deletes — a hallucinated op targeting a missing/non-active id is
   skipped, not obeyed. The LLM cannot escalate beyond merge/supersede/stale on

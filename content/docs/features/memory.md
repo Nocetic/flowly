@@ -175,13 +175,24 @@ messages and appends genuinely-new facts via `memory_append` / `knowledge_graph`
 Fast and greedy — it captures facts you state explicitly the moment you say them,
 straight to **active**.
 
+Memory the agent saves from a **real conversation** is trusted this way. But a
+write the agent makes during its **own background run** — a scheduled cron job or
+an idle heartbeat tick, where the "decision" to save is the agent's inference and
+not something you said — is routed to the **review queue** instead of going
+active. Any content the **prompt-injection scanner** flags is routed to review
+too. So the agent's own automated activity never silently becomes active memory.
+
 ### Cross-session "dreaming" (offline, across sessions)
 
-A separate pass that reads conversation **deltas across sessions** (watermarked,
-so it never re-reads the same messages), extracts durable candidates the live
-path missed, and **reconciles them against what's already known** — both the
-governed store and your `USER.md` profile — before committing. On by default
-(`agents.defaults.memoryDreaming.enabled = true`), it fires:
+A separate pass that reads conversation **deltas across sessions** — only your
+**real conversations**. The agent's own background runs (idle heartbeats,
+scheduled cron jobs, subagents) are excluded from what it learns, so it never
+mines its own automated activity as if it were something you said. The pass is
+**watermarked over stable message ids**, so it processes each new message exactly
+once and never re-reads history it has already seen. It extracts durable
+candidates the live path missed and **reconciles them against what's already
+known** — both the governed store and your `USER.md` profile — before committing.
+On by default (`agents.defaults.memoryDreaming.enabled = true`), it fires:
 
 - after **30 min** with no user activity (idle — background heartbeats don't count),
 - once **daily** at 03:30 local,
