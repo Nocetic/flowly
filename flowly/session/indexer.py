@@ -123,7 +123,24 @@ class SessionIndexer:
     # ── Indexing ───────────────────────────────────────────────────
 
     def index_session(self, key: str, messages: list[dict[str, Any]]) -> None:
-        """Index (or re-index) all messages for a session."""
+        """Index (or re-index) a session's messages, preserving row ids.
+
+        INCREMENTAL by design. Sessions are saved by fully rewriting the
+        canonical jsonl on every turn, so a naive delete-all + reinsert
+        reassigned every message a NEW autoincrement id on every save AND on
+        every startup rebuild. That churned the ids the cross-session memory
+        dreamer watermarks against (``messages.id``), so old messages kept
+        reappearing as "new" and the dreamer reprocessed the whole history
+        forever (the "proposes memories with no conversation" bug).
+
+        Fix: only APPEND genuinely-new tail messages, leaving existing rows —
+        and their ids — untouched. This makes the common append-only save (and
+        the whole startup rebuild) idempotent: unchanged sessions touch no rows.
+        A DELETE+reinsert happens only when the stored prefix DIVERGES from the
+        incoming one (history compacted or a message edited in place), and only
+        for that one session — so at most its recent tail is re-id'd, not the
+        entire store.
+        """
         now = time.time()
         content_messages = [
             m for m in messages
@@ -131,31 +148,45 @@ class SessionIndexer:
         ]
         try:
             with self._conn:
-                # Delete old messages for this session (triggers FTS delete)
-                self._conn.execute(
-                    "DELETE FROM messages WHERE session_key = ?", (key,)
-                )
-                # Insert fresh
-                for m in content_messages:
-                    ts_str = m.get("timestamp", "")
-                    try:
-                        from datetime import datetime
-                        ts = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError):
-                        ts = now
+                existing = self._conn.execute(
+                    "SELECT role, content FROM messages WHERE session_key = ? "
+                    "ORDER BY id",
+                    (key,),
+                ).fetchall()
+
+                # Longest common prefix by (role, content). Timestamps are
+                # excluded from the match — a missing-timestamp fallback must
+                # not force a needless reindex.
+                common = 0
+                for old, new in zip(existing, content_messages):
+                    if old["role"] == new.get("role") and old["content"] == new.get("content"):
+                        common += 1
+                    else:
+                        break
+
+                if common < len(existing):
+                    # Divergence (compaction rewrote the head, or a message was
+                    # edited): re-index this session only. New rows get fresh
+                    # high ids, so the dreamer reprocesses just this tail once.
+                    self._conn.execute(
+                        "DELETE FROM messages WHERE session_key = ?", (key,)
+                    )
+                    to_insert = content_messages
+                else:
+                    # Existing rows are a prefix of the incoming set → append
+                    # only the new tail, preserving every existing id.
+                    to_insert = content_messages[common:]
+
+                for m in to_insert:
                     self._conn.execute(
                         "INSERT INTO messages (session_key, role, content, timestamp) "
                         "VALUES (?, ?, ?, ?)",
-                        (key, m["role"], m["content"], ts),
+                        (key, m["role"], m["content"], self._parse_ts(m, now)),
                     )
-                # Upsert session record
+
                 created_at = now
                 if content_messages:
-                    try:
-                        first_ts = content_messages[0].get("timestamp", "")
-                        created_at = datetime.fromisoformat(first_ts).timestamp()
-                    except (ValueError, TypeError):
-                        pass
+                    created_at = self._parse_ts(content_messages[0], now)
                 self._conn.execute(
                     "INSERT INTO sessions (key, created_at, updated_at, msg_count) "
                     "VALUES (?, ?, ?, ?) "
@@ -165,6 +196,15 @@ class SessionIndexer:
                 )
         except Exception as e:
             logger.debug("Session index failed for %s: %s", key, e)
+
+    @staticmethod
+    def _parse_ts(msg: dict[str, Any], fallback: float) -> float:
+        """Message timestamp as epoch seconds, or ``fallback`` if unparseable."""
+        from datetime import datetime
+        try:
+            return datetime.fromisoformat(msg.get("timestamp", "")).timestamp()
+        except (ValueError, TypeError):
+            return fallback
 
     # ── Search ─────────────────────────────────────────────────────
 
