@@ -784,10 +784,17 @@ class AgentLoop:
         name = getattr(ctx, "tool_name", "")
         params = getattr(ctx, "params", {}) or {}
         session = getattr(ctx, "session_id", "") or ""
+        # Autonomous/background runs (heartbeat/cron/subagent/system) save on the
+        # agent's own inference, not a user statement — those writes go to review
+        # instead of silently becoming active memory. Real user-channel writes
+        # stay trusted (auto-active), as before.
+        from flowly.memory.dreamer import is_automation_session
+        auto_activate = not is_automation_session(session)
         try:
             if name == "memory_append":
                 self._memory_gov.ingest_append(
-                    params.get("content", ""), source_session=session
+                    params.get("content", ""), source_session=session,
+                    auto_activate=auto_activate,
                 )
             elif name == "knowledge_graph" and params.get("action") == "add":
                 import re
@@ -797,6 +804,7 @@ class AgentLoop:
                 self._memory_gov.ingest_kg_fact(
                     params.get("subject", ""), params.get("predicate", ""),
                     params.get("object", ""), m.group(1), source_session=session,
+                    auto_activate=auto_activate,
                 )
         except Exception as exc:
             logger.warning(f"[memory-gov] post_tool sync failed: {exc}")

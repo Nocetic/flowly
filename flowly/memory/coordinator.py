@@ -26,6 +26,17 @@ from flowly.memory.governance import (
 )
 
 
+def _injection_flagged(text: str) -> bool:
+    """True if ``text`` trips the prompt-injection scanner. Fail-CLOSED: if the
+    guard can't run, treat the content as flagged (→ review, never auto-active)
+    rather than trusting unscanned content into live memory."""
+    try:
+        from flowly.cron.guard import scan_context_file
+        return scan_context_file(text, "memory-live") is not None
+    except Exception:
+        return True
+
+
 class MemoryGovernance:
     def __init__(
         self,
@@ -267,13 +278,20 @@ class MemoryGovernance:
         return "-".join(words)
 
     def ingest_append(
-        self, content: str, *, source_session: str = ""
+        self, content: str, *, source_session: str = "", auto_activate: bool = True
     ) -> Optional[MemoryItem]:
-        """Record a memory_append as an active governed item + refresh MEMORY.md.
+        """Record a memory_append as a governed item + refresh MEMORY.md.
 
-        The agent chose to save this, so it's trusted → active. Deduplicates
-        against existing active items (same normalized text). Returns the new
-        item, or None if it was a duplicate.
+        Deduplicates against existing active items (same normalized text).
+        Returns the new item, or None if it was a duplicate.
+
+        ``auto_activate`` (default True) keeps the trusted behaviour for real
+        user-channel writes: the agent chose to save it → active. Set it False
+        for autonomous/background runs (heartbeat/cron/subagent) — there the
+        "decision" is the agent's own inference, so the item parks in
+        ``needs_review`` instead of silently becoming active memory. A write
+        that trips the prompt-injection scanner is always routed to review too,
+        never auto-activated.
         """
         content = (content or "").strip()
         if not content:
@@ -283,13 +301,18 @@ class MemoryGovernance:
             if " ".join(it.text.split()).lower() == norm:
                 self.gov.touch_seen(it.id)
                 return None
+        flagged = _injection_flagged(content)
         item = self.gov.add_item(
             kind="preference", text=content, status="candidate",
             ref_kind="memory_md", normalized_key="pref:" + self._slug(content),
             confidence=0.85, source_session=source_session,
             actor="system", reason="memory_append",
         )
-        self.gov.transition(item.id, STATUS_ACTIVE, actor="system", reason="memory_append")
+        if auto_activate and not flagged:
+            self.gov.transition(item.id, STATUS_ACTIVE, actor="system", reason="memory_append")
+        else:
+            reason = "injection_flagged" if flagged else "unreviewed_autonomous_write"
+            self.gov.transition(item.id, STATUS_NEEDS_REVIEW, actor="system", reason=reason)
         self._summary_dirty = True   # coalesced regen at end of turn
         self.mark_dirty()
         return self.gov.get_item(item.id)
@@ -302,12 +325,17 @@ class MemoryGovernance:
         triple_id: str,
         *,
         source_session: str = "",
+        auto_activate: bool = True,
     ) -> Optional[MemoryItem]:
-        """Record a knowledge_graph add as an active governed fact item.
+        """Record a knowledge_graph add as a governed fact item.
 
         If an active fact with the same subject+predicate already exists with a
         different triple, supersede it (and close its KG triple) so the new fact
-        wins — the live, chat-visible version of the dreamer's arbitration.
+        wins — the live, chat-visible version of the dreamer's arbitration. The
+        supersede only happens when the newcomer itself activates: an unreviewed
+        autonomous fact must not evict a known one before the user sees it.
+
+        ``auto_activate``/injection handling mirror :meth:`ingest_append`.
         """
         subject, obj = subject.strip(), obj.strip()
         # Skip self-referential garbage (e.g. the agent set subject=object=email
@@ -319,22 +347,30 @@ class MemoryGovernance:
         # Already recorded this exact triple?
         if triple_id and self.gov.find_by_ref("kg_triple", triple_id):
             return None
-        # Supersede any active fact on the same key with a different triple.
-        for sib in self.gov.find_by_key(key, statuses={STATUS_ACTIVE}):
-            if sib.ref_id == triple_id:
-                continue
-            self.gov.transition(sib.id, STATUS_SUPERSEDED, actor="system",
-                                reason="superseded_by_newer_kg_fact")
-            if self.kg_mirror is not None and sib.ref_kind == "kg_triple" and sib.ref_id:
-                self.kg_mirror.supersede(sib.ref_id)
+        flagged = _injection_flagged(text)
+        activate = auto_activate and not flagged
+        # Supersede any active fact on the same key with a different triple —
+        # only when the newcomer is actually activating.
+        if activate:
+            for sib in self.gov.find_by_key(key, statuses={STATUS_ACTIVE}):
+                if sib.ref_id == triple_id:
+                    continue
+                self.gov.transition(sib.id, STATUS_SUPERSEDED, actor="system",
+                                    reason="superseded_by_newer_kg_fact")
+                if self.kg_mirror is not None and sib.ref_kind == "kg_triple" and sib.ref_id:
+                    self.kg_mirror.supersede(sib.ref_id)
         item = self.gov.add_item(
             kind="fact", text=text, status="candidate",
             ref_kind="kg_triple", ref_id=triple_id or None, normalized_key=key,
             confidence=0.9, source_session=source_session,
             actor="system", reason="knowledge_graph_add",
         )
-        self.gov.transition(item.id, STATUS_ACTIVE, actor="system",
-                            reason="knowledge_graph_add")
+        if activate:
+            self.gov.transition(item.id, STATUS_ACTIVE, actor="system",
+                                reason="knowledge_graph_add")
+        else:
+            reason = "injection_flagged" if flagged else "unreviewed_autonomous_write"
+            self.gov.transition(item.id, STATUS_NEEDS_REVIEW, actor="system", reason=reason)
         self._summary_dirty = True   # coalesced regen at end of turn
         self.mark_dirty()
         return self.gov.get_item(item.id)
