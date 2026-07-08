@@ -229,7 +229,6 @@ class FlowlyTUI(App[None]):
         Binding("f2", "open_activity", "Activity", priority=True),
         Binding("f3", "open_approvals", "Approvals", priority=True),
         Binding("f4", "open_artifacts", "Artifacts", priority=True),
-        Binding("f5", "cycle_permission", "Permission", priority=True),
         Binding("ctrl+y", "copy_last", "Copy", priority=True),
     ]
 
@@ -342,6 +341,8 @@ class FlowlyTUI(App[None]):
         asyncio.create_task(self._preload_history())
         asyncio.create_task(self._check_gateway_capabilities())
         asyncio.create_task(self._load_account_on_mount())
+        # Seed the permission badge from the live exec policy.
+        asyncio.create_task(self._sync_permission_badge())
         # Prefetch the OpenRouter catalog in the background so the
         # context-window bar can size itself from the model's real
         # context_length (no hardcoded family tables). Also seeds the
@@ -3115,12 +3116,12 @@ class FlowlyTUI(App[None]):
         """Cycle the standing permission level (Ask → Auto → YOLO) and apply it
         LIVE to both the exec tool and the codex_session runtime over RPC.
 
-        A one-key way to exercise exec.policy.set + codex.policy.set end to end:
-        the change takes effect on the next command / codex turn with no gateway
-        restart. The exec side is the easiest to observe — flip to Ask, run a
-        shell command and watch it prompt; flip to YOLO and it runs unattended.
+        Bound to Tab in the composer (palette-closed). The change takes effect on
+        the next command / codex turn with no gateway restart; the current level
+        shows as the colored badge at the left of the status bar rather than in
+        the transcript. Easiest to observe: flip to Ask, run a shell command and
+        watch it prompt; flip to YOLO and it runs unattended.
         """
-        transcript = self.query_one(TranscriptPane)
         idx = getattr(self, "_perm_level_idx", None)
         if idx is None:
             # Sync the starting point from the live policy so the first press
@@ -3130,24 +3131,38 @@ class FlowlyTUI(App[None]):
             except Exception:
                 idx = -1
         idx = (idx + 1) % len(_PERMISSION_LEVELS)
-        self._perm_level_idx = idx
 
-        _key, label, (security, ask), (approval, sandbox) = _PERMISSION_LEVELS[idx]
+        key, _label, (security, ask), (approval, sandbox) = _PERMISSION_LEVELS[idx]
         try:
             await self._client.exec_policy_set(security=security, ask=ask)
-            codex = await self._client.codex_policy_set(
+            await self._client.codex_policy_set(
                 approval_policy=approval, sandbox=sandbox
             )
         except Exception as exc:
-            transcript.add_error(f"permission cycle failed: {exc}")
+            self.query_one(TranscriptPane).add_error(f"permission cycle failed: {exc}")
             return
 
-        note = (
-            f"{label}  ·  exec {security}/{ask}  ·  codex {approval}/{sandbox}"
-        )
-        if isinstance(codex, dict) and codex.get("willRestart"):
-            note += "  · codex: restart gerekiyor"
-        transcript.add_system(note)
+        self._perm_level_idx = idx
+        self._set_permission_badge(key)
+
+    def _set_permission_badge(self, level_key: str) -> None:
+        """Reflect the standing permission level in the status-bar badge."""
+        try:
+            self.query_one(StatusBar).permission = level_key
+        except Exception:
+            pass
+
+    async def _sync_permission_badge(self) -> None:
+        """Seed the badge from the live exec policy at startup so it shows the
+        current level before the user cycles. A custom policy that matches no
+        preset leaves the badge hidden until the first Tab cycle."""
+        try:
+            idx = _match_permission_level(await self._client.exec_policy_get())
+        except Exception:
+            return
+        self._perm_level_idx = idx
+        if idx >= 0:
+            self._set_permission_badge(_PERMISSION_LEVELS[idx][0])
 
     def action_copy_last(self) -> None:
         """Copy the most recent assistant message to the system clipboard

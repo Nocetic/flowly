@@ -478,6 +478,40 @@ class _MetaBadges(Static):
         self.display = self._has_content
 
 
+# Standing permission level, leftmost in the bar. Colored by risk so the
+# current stance is readable at a glance (traffic-light): green = Ask (prompts,
+# safest), yellow = Auto, red = YOLO (runs unattended). The "●" glyph is
+# single-width and renders on every terminal we target (already used above for
+# offline/error), so no emoji-width drift across OSes.
+_PERMISSION_BADGE: dict[str, tuple[str, str]] = {
+    "ask":  ("#6ee7a0", "● ASK"),
+    "auto": ("#f2c94c", "● AUTO"),
+    "yolo": ("#ff5d6c", "● YOLO"),
+}
+
+
+class _PermissionBadge(Static):
+    """Standing exec/codex permission level indicator (leftmost segment)."""
+
+    DEFAULT_CSS = "_PermissionBadge { width: auto; height: 1; }"
+
+    level: reactive[str] = reactive("", layout=False)
+
+    def __init__(self) -> None:
+        super().__init__("", markup=True)
+        self.display = False  # hidden until we know the level
+
+    def watch_level(self, _old: str, new: str) -> None:
+        meta = _PERMISSION_BADGE.get(new)
+        if not meta:
+            self.update("")
+            self.display = False
+            return
+        color, label = meta
+        self.update(f"[{color}][b]{label}[/b][/]")
+        self.display = True
+
+
 # ── Composite ──────────────────────────────────────────────────────
 
 
@@ -496,6 +530,7 @@ class StatusBar(Horizontal):
 
     state:             reactive[str] = reactive("idle")
     session:           reactive[str] = reactive("")
+    permission:        reactive[str] = reactive("")
     provider:          reactive[str] = reactive("")
     model:             reactive[str] = reactive("")
     hint:              reactive[str] = reactive("")
@@ -508,6 +543,7 @@ class StatusBar(Horizontal):
     bg_count:          reactive[int] = reactive(0)
 
     def compose(self) -> ComposeResult:
+        self._perm = _PermissionBadge()
         self._face = _FaceTicker()
         self._provider = _ProviderLabel()
         self._model = _ModelLabel()
@@ -519,6 +555,7 @@ class StatusBar(Horizontal):
         self._state_sep.display = False
         self._sync = _SyncBadge()
         self._cwd = _CwdLabel()
+        yield self._perm
         yield self._face
         yield self._state_sep
         yield self._provider
@@ -535,6 +572,9 @@ class StatusBar(Horizontal):
 
     # Forward reactive writes from app code → child widgets. Only the
     # child whose data changed re-renders.
+    def watch_permission(self, _o: str, n: str) -> None:
+        if hasattr(self, "_perm"):
+            self._perm.level = n
     def watch_state(self, _o: str, n: str) -> None:
         if hasattr(self, "_face"):
             self._face.state = n

@@ -464,6 +464,20 @@ class _Editor(TextArea):
                 self.post_message(self.PaletteEnter())
                 return
 
+        if key == "tab":
+            # Palette closed → Tab cycles the standing permission level
+            # (Ask/Auto/YOLO). When the palette IS open the block above already
+            # consumed Tab to apply the autocomplete pick, so we never reach
+            # here in that case. Tab is a portable key across terminals/OSes, so
+            # this behaves the same everywhere.
+            event.stop()
+            event.prevent_default()
+            try:
+                self.app.run_action("cycle_permission")
+            except Exception:
+                pass
+            return
+
         if key == "enter":
             event.stop()
             event.prevent_default()
