@@ -49,6 +49,9 @@ read its current definition, then send the full updated definition with
   goal 3 liters").
 - `query` — `{flowlet_id, series, agg, window}` → one number, to answer a
   question without dumping the whole flowlet.
+- `notify` — `{flowlet_id, title, body}` — send a reminder that deep-links to
+  the flowlet (push on mobile, a native notification on desktop). Use it from a
+  cron job to nudge the user (e.g. "you haven't logged water today").
 
 ## Component catalog (catalog: 1)
 
@@ -146,10 +149,12 @@ count), weight/budget/reading trackers.
 
 ## Pairing with a reminder
 
-If the user wants a nudge ("remind me every 2 hours"), also create a `cron` job
-whose message tells you to read the flowlet and write a short reminder — e.g.
-*"Read the Water flowlet (flowlet tool, action=get) and, based on how much is
-left, send one short line."* Deliver it to the user's chat.
+If the user wants a nudge ("remind me every 2 hours"), create a `cron` job whose
+message tells you to check the flowlet and, if warranted, notify — e.g. *"Read
+the Water flowlet (flowlet tool, action=get). If today's intake is behind the
+goal for this hour, call flowlet notify with a short, kind reminder."* The
+`notify` action pushes to the user's phone and pops a desktop notification that
+opens the flowlet on tap — better than a chat message for a reminder.
 
 ## Language
 

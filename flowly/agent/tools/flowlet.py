@@ -118,7 +118,7 @@ class FlowletTool(Tool):
                 "action": {
                     "type": "string",
                     "enum": ["create", "update", "get", "list",
-                             "delete", "log", "set_state", "query"],
+                             "delete", "log", "set_state", "query", "notify"],
                     "description": "The action to perform",
                 },
                 "flowlet_id": {
@@ -139,6 +139,8 @@ class FlowletTool(Tool):
                 },
                 "series": {"type": "string", "description": "Series name (log/query)"},
                 "key": {"type": "string", "description": "State key (set_state)"},
+                "title": {"type": "string", "description": "Notification title (notify)"},
+                "body": {"type": "string", "description": "Notification body (notify)"},
                 "value": {
                     "description": "Value to log / set (number for log, any for set_state)",
                 },
@@ -166,6 +168,7 @@ class FlowletTool(Tool):
             "log": self._log,
             "set_state": self._set_state,
             "query": self._query,
+            "notify": self._notify_action,
         }
         handler = handlers.get(action)
         if not handler:
@@ -337,6 +340,23 @@ class FlowletTool(Tool):
             "action": "query", "flowletId": flowlet_id, "series": series,
             "agg": kw.get("agg", "sum"), "window": kw.get("window", "today"),
             "result": result,
+        })
+
+    async def _notify_action(self, **kw: Any) -> str:
+        """Send a reminder notification that deep-links to a flowlet — APNs/FCM
+        to mobile, a native notification on desktop. Use from a cron job (or
+        directly) to nudge the user about a screen."""
+        flowlet_id = kw.get("flowlet_id", "")
+        flowlet = self._store.get(flowlet_id)
+        if not flowlet:
+            return json.dumps({"error": f"Flowlet not found: {flowlet_id}"})
+        title = str(kw.get("title") or flowlet.get("name") or "Flowlet")
+        body = str(kw.get("body") or "")
+        from flowly.push.flowlet_push import notify_flowlet
+        await notify_flowlet(flowlet_id, title, body, broadcast=self._on_change)
+        return json.dumps({
+            "action": "notify", "flowletId": flowlet_id, "sent": True,
+            "message": f"Reminder sent for '{flowlet.get('name')}'",
         })
 
     # ── broadcast ─────────────────────────────────────────────────────────────
