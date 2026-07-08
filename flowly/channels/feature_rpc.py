@@ -1038,6 +1038,82 @@ async def model_set(params: dict) -> dict:
     return {"ok": True, "model": model, "willRestart": True}
 
 
+# ── Exec approval policy ─────────────────────────────────────────────────────
+# The standing shell/exec approval policy lives in its OWN store
+# (~/.flowly/credentials/exec-approvals.json), not config.json — the running
+# executor reads that store and picks up edits live via
+# ``ExecApprovalStore.refresh_if_changed()``. So these RPCs NEVER need a gateway
+# restart, and (unlike a ``config.set`` on ``tools.exec``, which the executor
+# ignores) they actually take effect. Served over BOTH transports so
+# Desktop-direct and iOS-over-relay share one shape.
+
+_EXEC_SECURITY = ("deny", "allowlist", "full")
+_EXEC_ASK = ("off", "on-miss", "always")
+
+
+def _exec_policy_payload(store) -> dict:
+    cfg = store.config
+    return {
+        "security": cfg.security,
+        "ask": cfg.ask,
+        "allowlist": [
+            {
+                "pattern": e.pattern,
+                "command": e.last_used_command,
+                "lastUsedAt": e.last_used_at,
+            }
+            for e in cfg.allowlist
+        ],
+    }
+
+
+def exec_policy_get() -> dict:
+    """Standing exec approval policy (security/ask + allowlist patterns)."""
+    from flowly.exec.approvals import ExecApprovalStore
+    store = ExecApprovalStore()
+    store.load()
+    return _exec_policy_payload(store)
+
+
+def exec_policy_set(params: dict) -> dict:
+    """Set the standing exec security/ask policy.
+
+    Writes the approvals store; the long-lived executor reloads it on its next
+    command (mtime check), so this never returns ``willRestart``.
+    """
+    security = params.get("security")
+    ask = params.get("ask")
+    if security is not None and security not in _EXEC_SECURITY:
+        raise FeatureRpcError("INVALID", "Invalid security")
+    if ask is not None and ask not in _EXEC_ASK:
+        raise FeatureRpcError("INVALID", "Invalid ask")
+    if security is None and ask is None:
+        raise FeatureRpcError("INVALID", "Nothing to set")
+    from flowly.exec.approvals import ExecApprovalStore
+    store = ExecApprovalStore()
+    cfg = store.load()
+    if security is not None:
+        cfg.security = security
+    if ask is not None:
+        cfg.ask = ask
+    store.save()
+    return _exec_policy_payload(store)
+
+
+def exec_policy_allowlist_remove(params: dict) -> dict:
+    """Drop a pattern from the exec allowlist."""
+    pattern = params.get("pattern") or ""
+    if not pattern:
+        raise FeatureRpcError("INVALID", "Missing pattern")
+    from flowly.exec.approvals import ExecApprovalStore
+    store = ExecApprovalStore()
+    store.load()
+    removed = store.remove_from_allowlist(pattern)
+    payload = _exec_policy_payload(store)
+    payload["removed"] = removed
+    return payload
+
+
 # ── Providers (BYOK) ─────────────────────────────────────────────────────────
 
 # Display metadata for the desktop's BYOK panel. ``keyable`` = takes a raw API
@@ -2364,6 +2440,9 @@ _DISPATCH: dict[str, tuple] = {
     "chat.inflight":      (chat_inflight, True, False),
     "config.get":         (config_get, False, False),
     "config.set":         (config_set, True, True),
+    "exec.policy.get":              (exec_policy_get, False, False),
+    "exec.policy.set":              (exec_policy_set, True, False),
+    "exec.policy.allowlist.remove": (exec_policy_allowlist_remove, True, False),
     "pet.info":           (pet_info, True, False),
     "pet.gallery":        (pet_gallery, True, False),
     "pet.select":         (pet_select, True, False),

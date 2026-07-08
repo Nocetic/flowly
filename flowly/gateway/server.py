@@ -1014,15 +1014,6 @@ class GatewayServer:
             elif method == "agent.clarify.list":
                 await self._ws_rpc_clarify_list(ws, rpc_id, params)
 
-            elif method == "exec.policy.get":
-                await self._ws_rpc_exec_policy_get(ws, rpc_id, params)
-
-            elif method == "exec.policy.set":
-                await self._ws_rpc_exec_policy_set(ws, rpc_id, params)
-
-            elif method == "exec.policy.allowlist.remove":
-                await self._ws_rpc_exec_policy_allowlist_remove(ws, rpc_id, params)
-
             # Board
             elif method == "board.snapshot":
                 await self._ws_rpc_board_snapshot(ws, rpc_id, params)
@@ -1181,67 +1172,10 @@ class GatewayServer:
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 
-    # --- RPC: exec.policy (standing approval policy) ---
-
-    @staticmethod
-    def _exec_policy_payload(store) -> dict:
-        cfg = store.config
-        return {
-            "security": cfg.security,
-            "ask": cfg.ask,
-            "allowlist": [
-                {
-                    "pattern": e.pattern,
-                    "command": e.last_used_command,
-                    "lastUsedAt": e.last_used_at,
-                }
-                for e in cfg.allowlist
-            ],
-        }
-
-    async def _ws_rpc_exec_policy_get(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
-        from flowly.exec.approvals import ExecApprovalStore
-        store = ExecApprovalStore()
-        store.load()
-        await self._ws_rpc_reply(ws, rpc_id, self._exec_policy_payload(store))
-
-    async def _ws_rpc_exec_policy_set(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
-        security = params.get("security")
-        ask = params.get("ask")
-        if security is not None and security not in ("deny", "allowlist", "full"):
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Invalid security")
-            return
-        if ask is not None and ask not in ("off", "on-miss", "always"):
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Invalid ask")
-            return
-        if security is None and ask is None:
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Nothing to set")
-            return
-
-        from flowly.exec.approvals import ExecApprovalStore
-        store = ExecApprovalStore()
-        cfg = store.load()
-        if security is not None:
-            cfg.security = security
-        if ask is not None:
-            cfg.ask = ask
-        store.save()
-        await self._ws_rpc_reply(ws, rpc_id, self._exec_policy_payload(store))
-
-    async def _ws_rpc_exec_policy_allowlist_remove(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
-        pattern = params.get("pattern", "")
-        if not pattern:
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Missing pattern")
-            return
-        from flowly.exec.approvals import ExecApprovalStore
-        store = ExecApprovalStore()
-        store.load()
-        removed = store.remove_from_allowlist(pattern)
-        if removed:
-            store.save()
-        payload = self._exec_policy_payload(store)
-        payload["removed"] = removed
-        await self._ws_rpc_reply(ws, rpc_id, payload)
+    # exec.policy.* (standing approval policy) is served from the shared
+    # flowly.channels.feature_rpc surface — dispatched at the top of
+    # _ws_dispatch via ``method in feature_rpc.FEATURE_METHODS`` so it lights
+    # up over BOTH the direct gateway and the relay with one implementation.
 
     # --- RPC: audit.* ---
 
