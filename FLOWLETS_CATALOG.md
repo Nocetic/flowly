@@ -38,9 +38,11 @@ aggregate. `catalog: 1` is required at the top of every definition.
   (≤ 200) and resolves to an array of `{id, ...fields}` rows, rendered by the
   `repeater` component and mutated by the `item_*` ops.
 - **series** — append-only event logs (`{unit?}`). Charts and totals read these.
-- **computed** — derived scalars. Either a series aggregation
-  (`{series, agg, window}`) or a safe arithmetic `expr` over other scalar keys.
-  Resolved in dependency order (declaration order doesn't matter).
+- **computed** — derived scalars, one of: a series aggregation
+  (`{series, agg, window}`); a **list** aggregation (`{list, agg, field?, where?}`
+  → count/sum/avg/min/max over a dynamic list, `where` an expr over item fields);
+  a safe arithmetic **`expr`**; or conditional text **`cases`**. Resolved in
+  dependency order (declaration order doesn't matter).
 - **layout** — the component tree.
 
 **aggregations** (`agg`): `sum · count · avg · min · max · last`
@@ -48,8 +50,12 @@ aggregate. `catalog: 1` is required at the top of every definition.
 at the user's midnight — no reset job).
 **buckets** (chart `data.bucket`): `hour · day · week`
 
-`expr` grammar is `+ - * / % ** //`, numeric literals, scalar key names, and the
-functions `min max abs round floor ceil`. No attribute access, indexing, or
+`expr` grammar is `+ - * / % ** //`, comparisons `< <= > >= == !=` (chained like
+Python), `and / or / not`, numeric literals, scalar key names, the functions
+`min max abs round floor ceil`, and the date functions `now() weekday()
+days_until(d) days_since(d)` (`d` = a `"YYYY-MM-DD"` string literal or a key;
+day math is a DST-free calendar-day count, identical on bot/desktop/iOS). String
+literals are legal only as a date-fn argument. No attribute access, indexing, or
 other calls — anything else is rejected at author time.
 
 ## Values & interpolation

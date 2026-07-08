@@ -212,6 +212,20 @@ The rules:
   schema has a bool field.
 - A journal = a list of `{text: "string", day: "date"}` rendered the same way.
 
+**Reason about a list** with a `computed` that aggregates it —
+`{ "list": "<key>", "agg": "count|sum|avg|min|max", "field?": "...", "where?": "<expr>" }`
+→ a number you can show or gate on. `where` runs per item with its fields (and
+date fns) in scope:
+```json
+"computed": {
+  "open":   { "list": "tasks", "agg": "count", "where": "done == 0" },
+  "overdue":{ "list": "tasks", "agg": "count", "where": "days_until(due) < 0" },
+  "total":  { "list": "cart",  "agg": "sum",   "field": "price" }
+}
+```
+Then: `stat value="open"`, `visibleWhen="open == 0"` (all done → hide the list,
+show a "hepsi tamam 🎉" callout), or a watch `when="open == 0"`.
+
 ## Adaptive screens — `visibleWhen` + conditional text
 
 Two tools make a screen react to its own data instead of looking static:
@@ -227,6 +241,12 @@ sections that only matter sometimes:
 
 Names must be declared state/computed keys (same grammar as watch `when`:
 arithmetic, comparisons, `and/or/not`, `min/max/abs/round`).
+
+**Dates.** The grammar also has `now()`, `weekday()` (0=Mon…6=Sun), and
+`days_until("YYYY-MM-DD" | key)` / `days_since(...)` — so a deadline reacts to
+time: `visibleWhen: "days_until(due) <= 1"` (a `due` string state key or a
+`date` item field), a `cases` "bugün!" / "{n} gün kaldı", or a watch
+`when: "days_until(due) == 0"`.
 
 **Conditional text** — a `computed` entry with `cases` resolves to a *string*:
 the first truthy `when` wins, `{key}` templating works, `else` is the fallback.
