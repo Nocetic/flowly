@@ -229,6 +229,11 @@ class FlowlyTUI(App[None]):
         Binding("f2", "open_activity", "Activity", priority=True),
         Binding("f3", "open_approvals", "Approvals", priority=True),
         Binding("f4", "open_artifacts", "Artifacts", priority=True),
+        # Shift+Tab cycles the permission level. App-level (not composer on_key)
+        # so Textual awaits the async action; priority so it fires over the
+        # focused composer. Plain Tab is left alone — the composer binds it to
+        # apply slash/path autocomplete.
+        Binding("shift+tab", "cycle_permission", "Permission", priority=True),
         Binding("ctrl+y", "copy_last", "Copy", priority=True),
     ]
 

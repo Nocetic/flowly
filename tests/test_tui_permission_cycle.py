@@ -1,5 +1,5 @@
-"""The TUI F5 permission-cycle levels must stay in lockstep with what the
-exec.policy.set / codex.policy.set RPCs actually accept — a typo in a level
+"""The TUI permission-cycle levels (Shift+Tab) must stay in lockstep with what
+the exec.policy.set / codex.policy.set RPCs actually accept — a typo in a level
 would make the live apply fail at runtime, which a unit test should catch first.
 """
 
@@ -28,7 +28,7 @@ def test_match_permission_level_finds_current_by_exec_policy():
 
 
 def test_match_permission_level_unknown_is_minus_one():
-    # A custom/unrecognised policy → -1, so the first F5 press lands on level 0.
+    # A custom/unrecognised policy → -1, so the first cycle lands on level 0.
     assert _match_permission_level({"security": "deny", "ask": "off"}) == -1
     assert _match_permission_level({}) == -1
 
@@ -141,7 +141,7 @@ async def test_status_bar_renders_colored_badge():
     # colors by level — the visual half of the feature, OS-independent.
     from textual.app import App, ComposeResult
 
-    from flowly.tui.panes.status import StatusBar, _PermissionBadge, _PERMISSION_BADGE
+    from flowly.tui.panes.status import _PERMISSION_BADGE, StatusBar, _PermissionBadge
 
     class _Harness(App):
         def compose(self) -> ComposeResult:
@@ -161,3 +161,36 @@ async def test_status_bar_renders_colored_badge():
         bar.permission = ""
         await pilot.pause()
         assert badge.display is False
+
+
+@pytest.mark.asyncio
+async def test_shift_tab_dispatches_cycle_in_the_real_app():
+    # The key binding must actually fire in the real app: Shift+Tab is an
+    # app-level binding (so Textual awaits the async action) and plain Tab is
+    # left to the composer's autocomplete. Mount offline so no gateway/config
+    # is needed.
+    from flowly.tui.client import GatewayUnavailable
+
+    class _OfflineClient:
+        async def connect(self):
+            raise GatewayUnavailable("no gateway (test)")
+
+        async def close(self):
+            pass
+
+    class _Probe(FlowlyTUI):
+        fired = 0
+
+        async def action_cycle_permission(self):  # avoid real RPC
+            _Probe.fired += 1
+
+    app = _Probe(client=_OfflineClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        assert _Probe.fired == 1
+        # Plain Tab must NOT cycle — it belongs to composer autocomplete.
+        await pilot.press("tab")
+        await pilot.pause()
+        assert _Probe.fired == 1
