@@ -163,3 +163,20 @@ def test_resolve_exposes_items_and_preview_counts(store):
     assert [t["id"] for t in values["tasks"]] == ["i1", "i2"]
     pv = flowlet_preview(TODO, values)
     assert pv == {"text": "1/2", "pct": 0.5}
+
+
+async def test_envelope_unwrapped_for_non_item_ops(store):
+    """A non-item op inside a repeater row still works when the client wraps
+    its value in the row envelope (templates stay fully general)."""
+    d = copy.deepcopy(TODO)
+    d["state"]["note"] = {"type": "string", "default": ""}
+    d["layout"][1]["item"]["children"].append(
+        {"id": "note_in", "type": "input",
+         "action": {"op": "set", "key": "note"}})
+    f = store.create("Görevler", d)
+    fid = f["id"]
+    await _add(store, fid, "x")
+    item_id = (await apply_action(store, fid, "new_task", value="y", tz=UTC))["values"]["tasks"][0]["id"]
+    res = await apply_action(store, fid, "note_in",
+                             value={"itemId": item_id, "value": "hello"}, tz=UTC)
+    assert res["values"]["note"] == "hello"

@@ -188,6 +188,17 @@ async def _apply_op(
 ) -> None:
     op = action.get("op")
 
+    # Inside a repeater template the client wraps EVERY action value in the
+    # row envelope {"itemId", "value"}. Row-scoped ops consume it whole; any
+    # other op (an agent button in a row, an item_add) just wants the inner
+    # value — unwrap here so templates stay fully general.
+    if (
+        isinstance(passed_value, dict)
+        and "itemId" in passed_value
+        and op not in ("item_update", "item_toggle", "item_remove", "item_move")
+    ):
+        passed_value = passed_value.get("value")
+
     # A fixed value in the action (e.g. "drink 250ml" button) always wins over
     # whatever the client passed — the client can only supply a value when the
     # component is a free input (slider / number_input / input / rating).
