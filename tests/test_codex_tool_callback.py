@@ -266,6 +266,91 @@ class TestMigration:
         assert text.index(tm._MARKER) < text.index("[a]")
 
 
+class TestPolicyMigration:
+    """Sandbox + approval policy: the only place these settings take effect
+    (thread/start can't carry them), and the policy-only path used when the
+    runtime is kept isolated (expose_flowly_tools=False)."""
+
+    def test_approval_mapping(self):
+        assert tm._approval_to_codex("on-request") == "on-request"
+        assert tm._approval_to_codex("never") == "never"
+        assert tm._approval_to_codex("auto-review") == "untrusted"
+        # No 1:1 codex equivalent → safest prompt-first policy.
+        assert tm._approval_to_codex("granular") == "on-request"
+        assert tm._approval_to_codex("bogus") == "on-request"
+        assert tm._approval_to_codex(None) == "on-request"
+
+    def test_sandbox_mapping_only_emits_valid_profiles(self):
+        # codex refuses the whole config on an unknown profile, so we only ever
+        # emit the three it recognises.
+        assert tm._sandbox_to_permission("read-only") == ":read-only"
+        assert tm._sandbox_to_permission("workspace-write") == ":workspace"
+        assert tm._sandbox_to_permission("full-access") == ":danger-full-access"
+        assert tm._sandbox_to_permission("bogus") == ":workspace"
+
+    def test_render_writes_approval_policy_root_level(self):
+        block = tm.render_managed_block(
+            python_bin="/py", env={}, approval_policy="untrusted",
+            default_permissions=":read-only",
+        )
+        assert 'approval_policy = "untrusted"' in block
+        # Root keys must precede the first table (the callback block).
+        assert block.index("approval_policy") < block.index("[mcp_servers.flowly-tools]")
+
+    def test_render_policy_only_omits_callback(self):
+        block = tm.render_managed_block(
+            python_bin="/py", env={"A": "B"},
+            approval_policy="never", default_permissions=":workspace",
+            include_callback=False,
+        )
+        assert "[mcp_servers.flowly-tools]" not in block
+        assert 'approval_policy = "never"' in block
+        assert 'default_permissions = ":workspace"' in block
+        # Markers still present so strip/insert round-trips the block.
+        assert tm._MARKER in block and tm._END_MARKER in block
+
+    def test_migrate_callback_path_also_writes_approval(self, tmp_path):
+        target = tm.migrate_flowly_tools_to_codex(
+            codex_home=str(tmp_path), python_bin="/p",
+            approval_policy="on-request",
+        )
+        text = target.read_text()
+        assert "[mcp_servers.flowly-tools]" in text
+        assert 'approval_policy = "on-request"' in text
+
+    def test_migrate_policy_only_writes_policy_without_callback(self, tmp_path):
+        target = tm.migrate_flowly_tools_to_codex(
+            codex_home=str(tmp_path), python_bin="/p",
+            default_permissions=":read-only", approval_policy="never",
+            include_callback=False,
+        )
+        text = target.read_text()
+        assert "[mcp_servers.flowly-tools]" not in text
+        assert 'approval_policy = "never"' in text
+        assert 'default_permissions = ":read-only"' in text
+
+    def test_migrate_approval_policy_before_first_table(self, tmp_path):
+        cfg = tmp_path / "config.toml"
+        cfg.write_text('[projects."/x"]\ntrust_level = "trusted"\n')
+        tm.migrate_flowly_tools_to_codex(
+            codex_home=str(tmp_path), python_bin="/p",
+            approval_policy="on-request",
+        )
+        text = cfg.read_text()
+        assert text.index("approval_policy") < text.index('[projects."/x"]')
+
+    def test_migrate_policy_only_is_valid_toml(self, tmp_path):
+        import tomllib
+        target = tm.migrate_flowly_tools_to_codex(
+            codex_home=str(tmp_path), python_bin="/p",
+            default_permissions=":workspace", approval_policy="untrusted",
+            include_callback=False,
+        )
+        parsed = tomllib.loads(target.read_text())
+        assert parsed["approval_policy"] == "untrusted"
+        assert parsed["default_permissions"] == ":workspace"
+
+
 # ---------------------------------------------------------------------------
 # Elicitation handling (session server-request dialect)
 # ---------------------------------------------------------------------------

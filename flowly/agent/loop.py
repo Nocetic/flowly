@@ -585,7 +585,7 @@ class AgentLoop:
             # Rebuild index from existing sessions on first run
             self._session_indexer.rebuild_from_sessions_dir(self.sessions.sessions_dir)
         except Exception as e:
-            logger.warning("Session indexer init failed (search disabled): %s", e)
+            logger.warning("Session indexer init failed (search disabled): {}", e)
 
         self._running = False
         self._on_compaction: Callable | None = None  # set by CLI after creation
@@ -1877,7 +1877,7 @@ class AgentLoop:
                             tool_registry=self.tools,
                         )
                     except Exception as exc:  # pragma: no cover — defensive
-                        logger.warning("MCP discovery failed: %s", exc)
+                        logger.warning("MCP discovery failed: {}", exc)
 
                 threading.Thread(
                     target=_discover_mcp_background,
@@ -1885,7 +1885,7 @@ class AgentLoop:
                     daemon=True,
                 ).start()
         except Exception as exc:  # pragma: no cover — defensive
-            logger.warning("MCP discovery could not start: %s", exc)
+            logger.warning("MCP discovery could not start: {}", exc)
 
         # Wire the finished registry to ContextBuilder so per-tool
         # guidance blocks (trello, docker, voice_call, computer,
@@ -1909,7 +1909,7 @@ class AgentLoop:
             )
             self._plugin_manager.discover_and_load()
         except Exception as exc:  # pragma: no cover — defensive
-            logger.warning("plugin discovery failed: %s", exc)
+            logger.warning("plugin discovery failed: {}", exc)
             self._plugin_manager = None
 
     def _register_codex_session_tool(self) -> None:
@@ -1963,24 +1963,31 @@ class AgentLoop:
         # Codex subprocess via an MCP callback registered in
         # ~/.codex/config.toml. Non-fatal — a migration failure must
         # not block the (otherwise fully functional) codex_session tool.
-        if getattr(codex_cfg, "expose_flowly_tools", True):
-            try:
-                from flowly.codex.tool_migration import (
-                    _sandbox_to_permission,
-                    migrate_flowly_tools_to_codex,
-                )
-                # Boot path: migrate the callback + the user's MCP servers +
-                # the sandbox permission profile. Plugin discovery is OFF here
-                # (it spawns a codex subprocess) — `flowly codex enable` does
-                # the full discovery instead.
-                migrate_flowly_tools_to_codex(
-                    codex_home=codex_cfg.codex_home or None,
-                    config=self._main_config,
-                    default_permissions=_sandbox_to_permission(codex_cfg.sandbox),
-                    discover_plugins=False,
-                )
-            except Exception:
-                logger.debug("codex tool-callback migration skipped", exc_info=True)
+        try:
+            from flowly.codex.tool_migration import (
+                _approval_to_codex,
+                _sandbox_to_permission,
+                migrate_flowly_tools_to_codex,
+            )
+            expose = getattr(codex_cfg, "expose_flowly_tools", True)
+            # Boot path: write the sandbox + approval policy to
+            # ~/.codex/config.toml — thread/start can't carry them, so this is
+            # the ONLY place they take effect. When tools are exposed, also
+            # register the flowly-tools callback + the user's MCP servers
+            # (plugin discovery is OFF here — it spawns a codex subprocess; the
+            # `flowly codex enable` CLI does the full discovery). Otherwise the
+            # write is policy-only, so the sandbox/approval settings still apply
+            # even when the runtime is kept fully isolated.
+            migrate_flowly_tools_to_codex(
+                codex_home=codex_cfg.codex_home or None,
+                config=self._main_config,
+                default_permissions=_sandbox_to_permission(codex_cfg.sandbox),
+                approval_policy=_approval_to_codex(codex_cfg.approval_policy),
+                discover_plugins=False,
+                include_callback=expose,
+            )
+        except Exception:
+            logger.debug("codex config migration skipped", exc_info=True)
 
         def _codex_session_accessor(sk: str) -> dict[str, Any]:
             return self.sessions.get_or_create(sk).metadata
@@ -2011,7 +2018,7 @@ class AgentLoop:
             active_session_key_getter=lambda: self._codex_active_session_key,
             approval_callback=approval_cb,
         ))
-        logger.info("codex_session tool registered (sandbox=%s)", runtime_cfg.sandbox)
+        logger.info(f"codex_session tool registered (sandbox={runtime_cfg.sandbox})")
 
     def sync_codex_session_tool(self) -> bool:
         """Register/unregister ``codex_session`` to match current config.
@@ -2030,24 +2037,62 @@ class AgentLoop:
         self._register_codex_session_tool()
         return self.tools.has("codex_session")
 
-    async def _close_warm_codex_sessions(self) -> None:
+    async def _close_warm_codex_sessions(self, *, exclude_key: str | None = None) -> None:
         """Close + drop any warm Codex subprocesses for this loop.
 
         Called when the runtime is disabled or a setting that the warm
-        session captured at spawn time (sandbox, cwd) changes, so the
-        next turn respawns Codex with the new config instead of riding
+        session captured at spawn time (sandbox, cwd, approval) changes, so
+        the next turn respawns Codex with the new config instead of riding
         a stale subprocess.
+
+        ``exclude_key`` — when set, that session is DROPPED from the pool but
+        NOT closed. A live policy reload can fire while that Flowly session is
+        mid-turn, and ``CodexSessionTool.execute`` holds its own local
+        ``CodexSession`` reference for the duration of ``run_turn`` — so
+        closing the subprocess would break the in-flight turn. Dropping it
+        (without close) lets that turn finish on the existing subprocess while
+        the NEXT turn respawns with the new config.
         """
         sessions = getattr(self, "_codex_sessions", None)
         if not sessions:
             return
-        for _sk, sess in list(sessions.items()):
-            if sess is not None:
+        for sk, sess in list(sessions.items()):
+            if sk != exclude_key and sess is not None:
                 try:
                     await sess.close()
                 except Exception:
                     logger.debug("codex warm-session close failed", exc_info=True)
-        sessions.clear()
+            sessions.pop(sk, None)
+
+    async def reload_codex_session_config(self) -> dict[str, Any]:
+        """Apply a live ``tools.codex_session`` change without a gateway restart.
+
+        Re-reads config, drops the warm Codex subprocesses (so the next turn
+        respawns with the new sandbox/approval — which
+        :meth:`sync_codex_session_tool` rewrites into ``~/.codex/config.toml``
+        via the migration), and re-registers the tool. A codex turn in flight
+        for the currently-active Flowly session is not interrupted: that
+        session is dropped from the pool but its subprocess is left running for
+        the current turn (see :meth:`_close_warm_codex_sessions`).
+
+        The gateway wires this to ``feature_rpc.set_codex_reload_callback`` so a
+        ``codex.policy.set`` RPC applies live. Returns a status dict for the
+        caller; raising propagates so the caller falls back to a restart.
+        """
+        from flowly.config.loader import load_config
+        self._main_config = load_config()
+        await self._close_warm_codex_sessions(
+            exclude_key=self._codex_active_session_key or None,
+        )
+        registered = self.sync_codex_session_tool()
+        ccfg = getattr(self._main_config.tools, "codex_session", None)
+        return {
+            "ok": True,
+            "enabled": bool(getattr(ccfg, "enabled", False)),
+            "registered": registered,
+            "sandbox": getattr(ccfg, "sandbox", None),
+            "approvalPolicy": getattr(ccfg, "approval_policy", None),
+        }
 
     def _persist_codex_config(self) -> None:
         """Write the in-memory config back to disk after a /codex change."""
@@ -4794,7 +4839,7 @@ class AgentLoop:
                 from flowly.agent.skill_bundles import maybe_expand
                 msg.content = maybe_expand(msg.content, workspace=self.workspace)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("slash skill/bundle expansion skipped: %s", exc)
+                logger.warning("slash skill/bundle expansion skipped: {}", exc)
 
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
@@ -4828,7 +4873,7 @@ class AgentLoop:
                 _pending_user["media"] = list(msg.media)
             self.sessions.save(session, extra_messages=[_pending_user])
         except Exception as exc:  # noqa: BLE001
-            logger.debug("early session save skipped: %s", exc)
+            logger.debug("early session save skipped: {}", exc)
 
         # Resolve the channel/chat coordinates tools should see. A cron
         # fire's InboundMessage arrives with channel="cron" (derived from

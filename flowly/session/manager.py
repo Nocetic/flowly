@@ -561,7 +561,7 @@ class SessionManager:
                     f.write(json.dumps(msg) + "\n")
             session.metadata[self._FULL_WATERMARK_KEY] = total
         except Exception as e:  # pragma: no cover - disk best-effort
-            logger.debug("Display-log flush failed for %s: %s", session.key, e)
+            logger.debug("Display-log flush failed for {}: {}", session.key, e)
 
     def mark_full_synced(self, session: "Session") -> None:
         """Declare the current ``session.messages`` as already represented in the
@@ -598,7 +598,7 @@ class SessionManager:
                 if out:
                     return out
             except Exception as e:  # pragma: no cover
-                logger.debug("Display-log read failed for %s: %s", key, e)
+                logger.debug("Display-log read failed for {}: {}", key, e)
         # Fallback for sessions predating the display log: filter internal
         # triggers the same way flush_full does.
         return [
@@ -747,7 +747,7 @@ class SessionManager:
             try:
                 self._indexer.index_session(session.key, session.messages)
             except Exception as e:
-                logger.debug("Session index update failed: %s", e)
+                logger.debug("Session index update failed: {}", e)
 
     def delete(self, key: str) -> bool:
         """

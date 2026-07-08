@@ -189,6 +189,32 @@ def _inline_setup_field(field: Field, value: object) -> InlineSetupField:
     )
 
 
+# Quick permission-level cycle (F5). One keystroke sets BOTH the exec tool
+# policy and the codex_session runtime policy to a coherent level, live over
+# RPC — a fast way to exercise exec.policy.set / codex.policy.set without a
+# settings screen. Each entry: (key, label, (exec_security, exec_ask),
+# (codex_approval, codex_sandbox)).
+# codex approval values are the FLOWLY policy names (on-request / never /
+# auto-review / granular) — codex.policy.set maps them to codex's own
+# ask_for_approval vocabulary. auto-review → codex "untrusted" (prompt for
+# everything but safe reads); never → run unattended.
+_PERMISSION_LEVELS: tuple[tuple[str, str, tuple[str, str], tuple[str, str]], ...] = (
+    ("ask",  "🔒 Ask",  ("full", "always"),       ("auto-review", "workspace-write")),
+    ("auto", "⚖️ Auto", ("allowlist", "on-miss"), ("on-request",  "workspace-write")),
+    ("yolo", "🚀 YOLO", ("full", "off"),          ("never",       "full-access")),
+)
+
+
+def _match_permission_level(policy: dict) -> int:
+    """Index of the level whose exec (security, ask) matches ``policy``, else -1
+    (so the first cycle lands on the first level)."""
+    sec, ask = policy.get("security"), policy.get("ask")
+    for i, (_key, _label, (s, a), _codex) in enumerate(_PERMISSION_LEVELS):
+        if s == sec and a == ask:
+            return i
+    return -1
+
+
 class FlowlyTUI(App[None]):
     CSS = css_for()
 
@@ -203,6 +229,11 @@ class FlowlyTUI(App[None]):
         Binding("f2", "open_activity", "Activity", priority=True),
         Binding("f3", "open_approvals", "Approvals", priority=True),
         Binding("f4", "open_artifacts", "Artifacts", priority=True),
+        # Shift+Tab cycles the permission level. App-level (not composer on_key)
+        # so Textual awaits the async action; priority so it fires over the
+        # focused composer. Plain Tab is left alone — the composer binds it to
+        # apply slash/path autocomplete.
+        Binding("shift+tab", "cycle_permission", "Permission", priority=True),
         Binding("ctrl+y", "copy_last", "Copy", priority=True),
     ]
 
@@ -315,6 +346,8 @@ class FlowlyTUI(App[None]):
         asyncio.create_task(self._preload_history())
         asyncio.create_task(self._check_gateway_capabilities())
         asyncio.create_task(self._load_account_on_mount())
+        # Seed the permission badge from the live exec policy.
+        asyncio.create_task(self._sync_permission_badge())
         # Prefetch the OpenRouter catalog in the background so the
         # context-window bar can size itself from the model's real
         # context_length (no hardcoded family tables). Also seeds the
@@ -3083,6 +3116,58 @@ class FlowlyTUI(App[None]):
 
         await self._show_inline_screen(PolicyModal(policy, apply))
         await self._poll_badges()
+
+    async def action_cycle_permission(self) -> None:
+        """Cycle the standing permission level (Ask → Auto → YOLO) and apply it
+        LIVE to both the exec tool and the codex_session runtime over RPC.
+
+        Bound to Tab in the composer (palette-closed). The change takes effect on
+        the next command / codex turn with no gateway restart; the current level
+        shows as the colored badge at the left of the status bar rather than in
+        the transcript. Easiest to observe: flip to Ask, run a shell command and
+        watch it prompt; flip to YOLO and it runs unattended.
+        """
+        idx = getattr(self, "_perm_level_idx", None)
+        if idx is None:
+            # Sync the starting point from the live policy so the first press
+            # advances from where we actually are.
+            try:
+                idx = _match_permission_level(await self._client.exec_policy_get())
+            except Exception:
+                idx = -1
+        idx = (idx + 1) % len(_PERMISSION_LEVELS)
+
+        key, _label, (security, ask), (approval, sandbox) = _PERMISSION_LEVELS[idx]
+        try:
+            await self._client.exec_policy_set(security=security, ask=ask)
+            await self._client.codex_policy_set(
+                approval_policy=approval, sandbox=sandbox
+            )
+        except Exception as exc:
+            self.query_one(TranscriptPane).add_error(f"permission cycle failed: {exc}")
+            return
+
+        self._perm_level_idx = idx
+        self._set_permission_badge(key)
+
+    def _set_permission_badge(self, level_key: str) -> None:
+        """Reflect the standing permission level in the status-bar badge."""
+        try:
+            self.query_one(StatusBar).permission = level_key
+        except Exception:
+            pass
+
+    async def _sync_permission_badge(self) -> None:
+        """Seed the badge from the live exec policy at startup so it shows the
+        current level before the user cycles. A custom policy that matches no
+        preset leaves the badge hidden until the first Tab cycle."""
+        try:
+            idx = _match_permission_level(await self._client.exec_policy_get())
+        except Exception:
+            return
+        self._perm_level_idx = idx
+        if idx >= 0:
+            self._set_permission_badge(_PERMISSION_LEVELS[idx][0])
 
     def action_copy_last(self) -> None:
         """Copy the most recent assistant message to the system clipboard

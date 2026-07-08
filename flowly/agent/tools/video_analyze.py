@@ -295,7 +295,7 @@ class VideoAnalyzeTool(Tool):
             )
 
         except Exception as e:  # noqa: BLE001
-            logger.error("[video_analyze] %s", e, exc_info=True)
+            logger.opt(exception=True).error("[video_analyze] {}", e)
             return json.dumps(
                 {
                     "success": False,
