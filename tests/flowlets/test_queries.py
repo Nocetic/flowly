@@ -153,3 +153,59 @@ def test_computed_order_independent():
     values = resolve_values(defn, {}, [], _ms(2026, 7, 8), UTC)
     assert values["a"] == 20
     assert values["b"] == 21
+
+
+# ── render_template + computed `cases` (conditional text) ─────────────────────
+
+def test_render_template():
+    from flowly.flowlets.queries import render_template
+    vals = {"n": 3.0, "goal": 8, "ratio": 0.5, "done": True,
+            "t": {"running": True, "elapsed": 12.0}}
+    assert render_template("{n}/{goal}", vals) == "3/8"
+    assert render_template("{ratio}", vals) == "0.5"
+    assert render_template("{done}", vals) == "yes"
+    assert render_template("{t}s", vals) == "12s"
+    assert render_template("{missing} left", vals) == "{missing} left"
+    assert render_template(None, vals) == ""
+
+
+def _cases_defn():
+    return {
+        "catalog": 1,
+        "name": "X",
+        "state": {"goal": {"type": "number", "default": 8}},
+        "series": {"cups": {}},
+        "computed": {
+            "today": {"series": "cups", "agg": "sum", "window": "today"},
+            "statusText": {"cases": [
+                {"when": "today >= goal", "text": "Done — {today}/{goal} 🎉"},
+                {"when": "today >= goal / 2", "text": "Halfway ({today})"},
+            ], "else": "Just {today} so far"},
+        },
+        "layout": [{"type": "text", "text": "{statusText}"}],
+    }
+
+
+def test_cases_first_truthy_wins_and_templates():
+    now = _ms(2026, 7, 9)
+    d = _cases_defn()
+    # 0 cups → else
+    assert resolve_values(d, {}, [], now, UTC)["statusText"] == "Just 0 so far"
+    # 5 cups → halfway (depends on the `today` computed — fixpoint ordering)
+    ev = [{"series": "cups", "value": 5, "ts": now - 1000}]
+    assert resolve_values(d, {}, ev, now, UTC)["statusText"] == "Halfway (5)"
+    # 9 cups → first case wins even though the second is also true
+    ev = [{"series": "cups", "value": 9, "ts": now - 1000}]
+    assert resolve_values(d, {}, ev, now, UTC)["statusText"] == "Done — 9/8 🎉"
+
+
+def test_cases_unresolvable_falls_back_to_empty_string():
+    now = _ms(2026, 7, 9)
+    d = _cases_defn()
+    # a `when` referencing a name that never resolves → "" (not 0.0)
+    d["computed"]["statusText"]["cases"][0]["when"] = "ghost > 1"
+    d["computed"]["statusText"]["cases"][1]["when"] = "ghost > 1"
+    d["computed"]["statusText"]["else"] = "fallback"
+    # ghost never resolves → the whole cases computed defers forever → ""
+    out = resolve_values(d, {}, [], now, UTC)
+    assert out["statusText"] == ""

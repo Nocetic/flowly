@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import operator
+import re
 from datetime import date, datetime, timedelta, tzinfo
 from typing import Any, Iterable
 
@@ -186,6 +187,46 @@ def _eval_node(node: ast.AST, ns: dict[str, Any]) -> float:
     if isinstance(node, ast.Constant):
         return node.value
     raise ValueError(f"unexpected node {type(node).__name__}")
+
+
+# ── String templating (computed `cases` text + watch notify share this) ───────
+
+_TEMPLATE_RE = re.compile(r"\{([a-zA-Z][a-zA-Z0-9_]*)\}")
+
+
+def _fmt_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, (int, float)):
+        f = float(v)
+        return str(int(f)) if f == int(f) else f"{f:.1f}"
+    if isinstance(v, dict):  # a timer resolves to {running, elapsed}
+        return _fmt_value(v.get("elapsed", ""))
+    return str(v)
+
+
+def render_template(text: Any, values: dict) -> str:
+    """Substitute ``{key}`` placeholders in a string with formatted values.
+    Unknown keys are left verbatim so a stray brace never explodes."""
+    if not text:
+        return ""
+
+    def repl(m: "re.Match[str]") -> str:
+        key = m.group(1)
+        return _fmt_value(values[key]) if key in values else m.group(0)
+
+    return _TEMPLATE_RE.sub(repl, str(text))
+
+
+def _resolve_cases(spec: dict, values: dict) -> str:
+    """A conditional-text computed: the first case whose ``when`` is truthy
+    wins; its ``text`` (templated with ``{key}``) becomes the value. Falls back
+    to ``else`` (default empty). Raises ``_UnresolvedNameError`` to defer in
+    the fixpoint when a referenced name isn't resolved yet."""
+    for case in spec.get("cases") or []:
+        if eval_expr(str(case.get("when", "")), values) != 0:
+            return render_template(case.get("text", ""), values)
+    return render_template(spec.get("else", ""), values)
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
@@ -420,6 +461,13 @@ def resolve_values(
                 )
                 del pending[key]
                 progressed = True
+            elif "cases" in spec:  # conditional text
+                try:
+                    values[key] = _resolve_cases(spec, values)
+                    del pending[key]
+                    progressed = True
+                except _UnresolvedNameError:
+                    continue
             else:  # expr
                 try:
                     values[key] = eval_expr(spec["expr"], values)
@@ -429,8 +477,8 @@ def resolve_values(
                     continue
         if not progressed:
             break
-    for key in pending:  # unresolved (cycle / bad ref) → safe zero
-        values[key] = 0.0
+    for key, spec in pending.items():  # unresolved (cycle / bad ref) → safe fallback
+        values[key] = "" if isinstance(spec, dict) and "cases" in spec else 0.0
 
     # 3. per-component series data (chart / sparkline / heatmap)
     for comp in _iter_components(definition.get("layout", [])):

@@ -25,21 +25,23 @@ survives restarts and is shared between the heartbeat and the tap path.
 from __future__ import annotations
 
 import asyncio
-import re
 from datetime import datetime, tzinfo
 from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
 from flowly.flowlets import catalog
-from flowly.flowlets.queries import eval_expr, resolve_values
+from flowly.flowlets.queries import eval_expr, render_template, resolve_values
 from flowly.flowlets.store import FlowletStore
 from flowly.flowlets.store import now_ms as _now_ms
 
 # ── Pure helpers (no I/O — unit-tested directly) ──────────────────────────────
 
 _WEEKDAY = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")  # datetime.weekday()
-_TEMPLATE_RE = re.compile(r"\{([a-zA-Z][a-zA-Z0-9_]*)\}")
+
+#: `{key}` substitution for notify title/body — the same templating computed
+#: `cases` text uses (single implementation lives in queries).
+render = render_template
 
 NotifyFn = Callable[[str, str, str], Awaitable[None]]
 AgentFn = Callable[[dict, str], Awaitable[None]]
@@ -83,30 +85,6 @@ def _eval_cond(watch: dict, values: dict, now_min: int) -> bool:
     if after is not None and now_min < after:
         return False
     return True
-
-
-def _fmt(v: Any) -> str:
-    if isinstance(v, bool):
-        return "yes" if v else "no"
-    if isinstance(v, (int, float)):
-        f = float(v)
-        return str(int(f)) if f == int(f) else f"{f:.1f}"
-    if isinstance(v, dict):  # a timer resolves to {running, elapsed}
-        return _fmt(v.get("elapsed", ""))
-    return str(v)
-
-
-def render(text: Any, values: dict) -> str:
-    """Substitute ``{key}`` placeholders in a notify string with formatted
-    values. Unknown keys are left verbatim so a stray brace never explodes."""
-    if not text:
-        return ""
-
-    def repl(m: "re.Match[str]") -> str:
-        key = m.group(1)
-        return _fmt(values[key]) if key in values else m.group(0)
-
-    return _TEMPLATE_RE.sub(repl, str(text))
 
 
 def _decide(

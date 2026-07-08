@@ -190,11 +190,14 @@ def _validate_state_spec(key: str, spec: Any) -> None:
 
 def _validate_computed_spec(key: str, spec: Any, series_keys: set[str]) -> None:
     if not isinstance(spec, dict):
-        raise _err(f"computed '{key}' must be an object with `series` or `expr`")
-    has_series = "series" in spec
-    has_expr = "expr" in spec
-    if has_series == has_expr:
-        raise _err(f"computed '{key}' must have exactly one of `series` or `expr`")
+        raise _err(f"computed '{key}' must be an object with `series`, `expr`, or `cases`")
+    forms = [f for f in ("series", "expr", "cases") if f in spec]
+    if len(forms) != 1:
+        raise _err(f"computed '{key}' must have exactly one of `series`, `expr`, or `cases`")
+    if forms[0] == "cases":
+        _validate_cases_spec(key, spec)
+        return
+    has_series = forms[0] == "series"
     if has_series:
         s = spec["series"]
         if s not in series_keys:
@@ -219,6 +222,32 @@ def _validate_computed_spec(key: str, spec: Any, series_keys: set[str]) -> None:
             validate_expr(expr)
         except ValueError as exc:
             raise _err(f"computed '{key}': {exc}")
+
+
+def _validate_cases_spec(key: str, spec: dict) -> None:
+    """Conditional text: ``{cases: [{when, text}], else?}`` resolves to a string
+    (the first truthy ``when`` wins; ``text`` may template ``{key}``)."""
+    from flowly.flowlets.queries import validate_expr
+
+    cases = spec["cases"]
+    if not isinstance(cases, list) or not cases:
+        raise _err(f"computed '{key}': `cases` must be a non-empty array of {{when, text}}")
+    for i, case in enumerate(cases):
+        where = f"computed '{key}' case #{i + 1}"
+        if not isinstance(case, dict):
+            raise _err(f"{where} must be an object with `when` and `text`")
+        when = case.get("when")
+        if not isinstance(when, str) or not when.strip():
+            raise _err(f"{where}: `when` must be a non-empty expression string")
+        try:
+            validate_expr(when)
+        except ValueError as exc:
+            raise _err(f"{where}: when {exc}")
+        if not isinstance(case.get("text"), str):
+            raise _err(f"{where}: `text` must be a string")
+    els = spec.get("else")
+    if els is not None and not isinstance(els, str):
+        raise _err(f"computed '{key}': `else` must be a string")
 
 
 # ── layout tree validation ───────────────────────────────────────────────────
@@ -272,6 +301,28 @@ def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
         ctx.component_ids.add(cid)
     if has_action and cid is None:
         raise _err(f"{ctype} carries an action, so it needs a unique `id`")
+
+    # Optional conditional visibility — any component may carry
+    # `visibleWhen: "<expr>"`, evaluated client-side against live values (a
+    # falsy result hides the node; on any evaluation error the client fails
+    # open and shows it). Validated here so a typo'd key or bad grammar is
+    # caught at author time instead of silently always-showing.
+    vw = node.get("visibleWhen")
+    if vw is not None:
+        if not isinstance(vw, str) or not vw.strip():
+            raise _err(f"{ctype} (id={cid}): `visibleWhen` must be a non-empty expression string")
+        from flowly.flowlets.queries import validate_expr
+        try:
+            validate_expr(vw)
+        except ValueError as exc:
+            raise _err(f"{ctype} (id={cid}): visibleWhen {exc}")
+        import ast as _ast
+        for _n in _ast.walk(_ast.parse(vw, mode="eval")):
+            if isinstance(_n, _ast.Name) and _n.id not in ctx.scalar_keys:
+                raise _err(
+                    f"{ctype} (id={cid}): visibleWhen references unknown key '{_n.id}' — "
+                    "it must be a declared state or computed key"
+                )
 
     # required props
     for prop in spec.get("required", []):

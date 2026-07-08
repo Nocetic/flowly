@@ -171,6 +171,36 @@ Other easy builds with the same pieces: habit checklist (bool state keys +
 `checklist`), mood log (`rating` → `log`, `sparkline`), pomodoro (`ring` +
 count), weight/budget/reading trackers.
 
+## Adaptive screens — `visibleWhen` + conditional text
+
+Two tools make a screen react to its own data instead of looking static:
+
+**`visibleWhen`** — any component may carry a boolean expression; the client
+hides it while the expression is falsy. Use it for warnings, celebrations, and
+sections that only matter sometimes:
+
+```json
+{ "type": "callout", "tone": "warn", "text": "Over budget by {over} ₺",
+  "visibleWhen": "over > 0" }
+```
+
+Names must be declared state/computed keys (same grammar as watch `when`:
+arithmetic, comparisons, `and/or/not`, `min/max/abs/round`).
+
+**Conditional text** — a `computed` entry with `cases` resolves to a *string*:
+the first truthy `when` wins, `{key}` templating works, `else` is the fallback.
+Consume it like any value: `"text": "{statusText}"`.
+
+```json
+"statusText": { "cases": [
+    { "when": "today_ml >= goal_ml", "text": "Hedef tamam — {today_ml} ml 🎉" },
+    { "when": "today_ml >= goal_ml / 2", "text": "Yarıyı geçtin ({today_ml} ml)" }
+  ], "else": "Şimdilik {today_ml} ml — devam" }
+```
+
+Prefer these over always-visible static text: a screen that says "geridesin" /
+"harikasın" at the right moment feels alive.
+
 ## Reminders that fire themselves — `watches`
 
 A flowlet can watch itself and push a reminder with **no cron job and no LLM

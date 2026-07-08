@@ -143,6 +143,23 @@ A button with a fixed `value` ignores any client-sent value. Free inputs
 (slider/input/number_input/rating) supply their value, validated to the
 component's and the state key's bounds.
 
+## Adaptive screens — `visibleWhen` + conditional text
+
+**`visibleWhen`** (any component): a boolean expression over declared
+state/computed keys, evaluated client-side against live values — falsy hides
+the node, any evaluation error fails open (shows it). Same safe grammar as
+watch `when` (arith, `< <= > >= == !=`, `and/or/not`, `min/max/abs/round`).
+Validated at author time (grammar + key existence).
+
+**Conditional text** — a third `computed` form resolving to a *string*:
+
+```json
+"statusText": { "cases": [{ "when": "expr", "text": "… {key} …" }], "else": "…" }
+```
+
+First truthy `when` wins; `text`/`else` template `{key}` server-side. Consumed
+like any scalar (`"text": "{statusText}"`). Unresolvable → `""`.
+
 ## Watches (reactive reminders — evaluated LLM-free)
 
 A top-level `watches: [...]` array turns a flowlet from a passive screen into a

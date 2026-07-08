@@ -193,3 +193,66 @@ def test_accent_hex_validation():
     bad["accent"] = "turquoise"
     with pytest.raises(FlowletValidationError, match="hex color"):
         validate_definition(bad)
+
+
+# ── visibleWhen (conditional visibility) ──────────────────────────────────────
+
+def _base_with(extra_layout=None, computed=None):
+    d = {
+        "catalog": 1,
+        "name": "X",
+        "state": {"count": {"type": "number", "default": 0},
+                  "goal": {"type": "number", "default": 8}},
+        "layout": [{"type": "text", "text": "hi"}],
+    }
+    if computed:
+        d["computed"] = computed
+    if extra_layout:
+        d["layout"] += extra_layout
+    return d
+
+
+def test_visible_when_accepts_state_and_computed_refs():
+    d = _base_with(
+        extra_layout=[{"type": "callout", "text": "Over!", "visibleWhen": "count > goal"},
+                      {"type": "text", "text": "done", "visibleWhen": "pct >= 100"}],
+        computed={"pct": {"expr": "count / goal * 100"}},
+    )
+    validate_definition(d)
+
+
+def test_visible_when_rejects_unknown_key():
+    d = _base_with(extra_layout=[{"type": "text", "text": "x", "visibleWhen": "typo > 1"}])
+    with pytest.raises(FlowletValidationError, match="unknown key 'typo'"):
+        validate_definition(d)
+
+
+def test_visible_when_rejects_bad_grammar_and_type():
+    d = _base_with(extra_layout=[{"type": "text", "text": "x", "visibleWhen": "count.__class__"}])
+    with pytest.raises(FlowletValidationError, match="visibleWhen"):
+        validate_definition(d)
+    d2 = _base_with(extra_layout=[{"type": "text", "text": "x", "visibleWhen": 5}])
+    with pytest.raises(FlowletValidationError, match="visibleWhen"):
+        validate_definition(d2)
+
+
+# ── computed `cases` (conditional text) ───────────────────────────────────────
+
+def test_cases_accepted():
+    validate_definition(_base_with(computed={
+        "statusText": {"cases": [{"when": "count >= goal", "text": "Done 🎉"}],
+                        "else": "{count}/{goal} — keep going"},
+    }))
+
+
+def test_cases_rejects_bad_shapes():
+    for bad in (
+        {"cases": []},                                          # empty
+        {"cases": [{"text": "x"}]},                             # no when
+        {"cases": [{"when": "count > 1"}]},                     # no text
+        {"cases": [{"when": "count.__x__", "text": "x"}]},      # bad grammar
+        {"cases": [{"when": "count > 1", "text": "x"}], "else": 5},  # bad else
+        {"cases": [{"when": "count > 1", "text": "x"}], "expr": "1"},  # two forms
+    ):
+        with pytest.raises(FlowletValidationError):
+            validate_definition(_base_with(computed={"s": bad}))
