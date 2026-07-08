@@ -227,7 +227,7 @@ def render_managed_block(
     servers: dict[str, dict] | None = None,
     plugins: list[dict] | None = None,
     default_permissions: str | None = None,
-    ask_for_approval: str | None = None,
+    approval_policy: str | None = None,
     include_callback: bool = True,
 ) -> str:
     """Render the managed codex config block.
@@ -236,7 +236,9 @@ def render_managed_block(
     document-root scoped) when provided:
 
       * ``default_permissions`` — codex sandbox profile
-      * ``ask_for_approval`` — codex approval policy
+      * ``approval_policy`` — codex approval policy (the config.toml key; the
+        ``--ask-for-approval`` CLI flag is a separate spelling codex does NOT
+        accept in config)
 
     With ``include_callback`` (the default), also writes the
     ``[mcp_servers.flowly-tools]`` callback entry plus, when provided, the
@@ -257,8 +259,8 @@ def render_managed_block(
         )
         lines.append(f"default_permissions = {_toml_str(norm)}")
         lines.append("")
-    if ask_for_approval:
-        lines.append(f"ask_for_approval = {_toml_str(ask_for_approval)}")
+    if approval_policy:
+        lines.append(f"approval_policy = {_toml_str(approval_policy)}")
         lines.append("")
 
     if include_callback:
@@ -461,7 +463,7 @@ def migrate_flowly_tools_to_codex(
     python_bin: str | None = None,
     config=None,
     default_permissions: str | None = ":workspace",
-    ask_for_approval: str | None = None,
+    approval_policy: str | None = None,
     discover_plugins: bool = False,
     include_callback: bool = True,
 ) -> Path:
@@ -481,8 +483,8 @@ def migrate_flowly_tools_to_codex(
         config: a Flowly ``Config`` (loaded if None) — source of mcp_servers.
         default_permissions: codex sandbox profile (``:workspace`` etc.); None
             to skip. Map from a Flowly sandbox with ``_sandbox_to_permission``.
-        ask_for_approval: codex approval policy (``on-request`` etc.); None to
-            skip. Map from a Flowly policy with ``_approval_to_codex``.
+        approval_policy: codex ``approval_policy`` value (``on-request`` etc.);
+            None to skip. Map from a Flowly policy with ``_approval_to_codex``.
         discover_plugins: query ``plugin/list`` and migrate installed plugins.
             Off by default (boot path); the CLI enables it. Auto-skips inside
             a running event loop. Ignored when ``include_callback=False``.
@@ -538,7 +540,7 @@ def migrate_flowly_tools_to_codex(
         servers=servers,
         plugins=plugins,
         default_permissions=default_permissions,
-        ask_for_approval=ask_for_approval,
+        approval_policy=approval_policy,
         include_callback=include_callback,
     )
 

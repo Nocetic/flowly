@@ -1982,7 +1982,7 @@ class AgentLoop:
                 codex_home=codex_cfg.codex_home or None,
                 config=self._main_config,
                 default_permissions=_sandbox_to_permission(codex_cfg.sandbox),
-                ask_for_approval=_approval_to_codex(codex_cfg.approval_policy),
+                approval_policy=_approval_to_codex(codex_cfg.approval_policy),
                 discover_plugins=False,
                 include_callback=expose,
             )

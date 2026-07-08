@@ -288,23 +288,23 @@ class TestPolicyMigration:
         assert tm._sandbox_to_permission("full-access") == ":danger-full-access"
         assert tm._sandbox_to_permission("bogus") == ":workspace"
 
-    def test_render_writes_ask_for_approval_root_level(self):
+    def test_render_writes_approval_policy_root_level(self):
         block = tm.render_managed_block(
-            python_bin="/py", env={}, ask_for_approval="untrusted",
+            python_bin="/py", env={}, approval_policy="untrusted",
             default_permissions=":read-only",
         )
-        assert 'ask_for_approval = "untrusted"' in block
+        assert 'approval_policy = "untrusted"' in block
         # Root keys must precede the first table (the callback block).
-        assert block.index("ask_for_approval") < block.index("[mcp_servers.flowly-tools]")
+        assert block.index("approval_policy") < block.index("[mcp_servers.flowly-tools]")
 
     def test_render_policy_only_omits_callback(self):
         block = tm.render_managed_block(
             python_bin="/py", env={"A": "B"},
-            ask_for_approval="never", default_permissions=":workspace",
+            approval_policy="never", default_permissions=":workspace",
             include_callback=False,
         )
         assert "[mcp_servers.flowly-tools]" not in block
-        assert 'ask_for_approval = "never"' in block
+        assert 'approval_policy = "never"' in block
         assert 'default_permissions = ":workspace"' in block
         # Markers still present so strip/insert round-trips the block.
         assert tm._MARKER in block and tm._END_MARKER in block
@@ -312,42 +312,42 @@ class TestPolicyMigration:
     def test_migrate_callback_path_also_writes_approval(self, tmp_path):
         target = tm.migrate_flowly_tools_to_codex(
             codex_home=str(tmp_path), python_bin="/p",
-            ask_for_approval="on-request",
+            approval_policy="on-request",
         )
         text = target.read_text()
         assert "[mcp_servers.flowly-tools]" in text
-        assert 'ask_for_approval = "on-request"' in text
+        assert 'approval_policy = "on-request"' in text
 
     def test_migrate_policy_only_writes_policy_without_callback(self, tmp_path):
         target = tm.migrate_flowly_tools_to_codex(
             codex_home=str(tmp_path), python_bin="/p",
-            default_permissions=":read-only", ask_for_approval="never",
+            default_permissions=":read-only", approval_policy="never",
             include_callback=False,
         )
         text = target.read_text()
         assert "[mcp_servers.flowly-tools]" not in text
-        assert 'ask_for_approval = "never"' in text
+        assert 'approval_policy = "never"' in text
         assert 'default_permissions = ":read-only"' in text
 
-    def test_migrate_ask_for_approval_before_first_table(self, tmp_path):
+    def test_migrate_approval_policy_before_first_table(self, tmp_path):
         cfg = tmp_path / "config.toml"
         cfg.write_text('[projects."/x"]\ntrust_level = "trusted"\n')
         tm.migrate_flowly_tools_to_codex(
             codex_home=str(tmp_path), python_bin="/p",
-            ask_for_approval="on-request",
+            approval_policy="on-request",
         )
         text = cfg.read_text()
-        assert text.index("ask_for_approval") < text.index('[projects."/x"]')
+        assert text.index("approval_policy") < text.index('[projects."/x"]')
 
     def test_migrate_policy_only_is_valid_toml(self, tmp_path):
         import tomllib
         target = tm.migrate_flowly_tools_to_codex(
             codex_home=str(tmp_path), python_bin="/p",
-            default_permissions=":workspace", ask_for_approval="untrusted",
+            default_permissions=":workspace", approval_policy="untrusted",
             include_callback=False,
         )
         parsed = tomllib.loads(target.read_text())
-        assert parsed["ask_for_approval"] == "untrusted"
+        assert parsed["approval_policy"] == "untrusted"
         assert parsed["default_permissions"] == ":workspace"
 
 
