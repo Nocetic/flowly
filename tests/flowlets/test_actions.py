@@ -76,6 +76,18 @@ async def test_stepper_increment(store):
     assert res["values"]["sessions_goal"] == 20
 
 
+async def test_stepper_direction(store):
+    # A stepper's − button passes -1, + passes +1; magnitude stays the `by`.
+    f_def = load_fixture("pomodoro")
+    f = store.create("Pomodoro", f_def)
+    res = await apply_action(store, f["id"], "goalStep", value=1, tz=UTC)
+    assert res["values"]["sessions_goal"] == 9
+    res = await apply_action(store, f["id"], "goalStep", value=-1, tz=UTC)
+    assert res["values"]["sessions_goal"] == 8
+    res = await apply_action(store, f["id"], "goalStep", value=-1, tz=UTC)
+    assert res["values"]["sessions_goal"] == 7
+
+
 async def test_checklist_toggle(store):
     f_def = load_fixture("habits")
     f = store.create("Alışkanlıklar", f_def)

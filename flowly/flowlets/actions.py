@@ -159,6 +159,11 @@ async def _apply_op(
         by = action.get("by", 1)
         if not _is_number(by):
             raise FlowletActionError("INVALID", f"`{op}` `by` must be a number")
+        # A stepper serves both its − and + buttons with one action by passing a
+        # signed direction (−1 / +1); the magnitude stays the declared `by`. A
+        # plain button passes nothing and just uses `by`.
+        if passed_value is not None and _is_number(passed_value):
+            by = abs(by) * (1 if passed_value >= 0 else -1)
         cur = _current_scalar(store, flowlet_id, definition, key)
         cur = cur if _is_number(cur) else 0
         new = cur + by if op == "increment" else cur - by
