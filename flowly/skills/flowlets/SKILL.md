@@ -33,10 +33,22 @@ To change an existing flowlet, **first call `flowlet` with `action:"get"`** to
 read its current definition, then send the full updated definition with
 `action:"update"`. Never guess the current shape.
 
+## Reminders belong to the flowlet — never a cron job
+
+If the user asks for a reminder, nudge, or notification tied to a flowlet
+("her gün hatırlat", "1 dakikada bir haber ver", "geride kalırsam uyar",
+"hedefi tutunca kutla") that goes in the flowlet's own **`watches`** array (see
+below) — put it in the `definition` when you `create`/`update`. **Do NOT create
+a `cron` job for it.** A watch is evaluated by the bot itself (no model turn),
+so it's cheaper, instant, and the user sees it on the screen. Only fall back to
+`cron` when the reminder needs logic no `when` expression can express (a web
+lookup, cross-flowlet reasoning).
+
 ## Actions on the tool
 
 - `create` — `{definition}` → builds it. The definition holds `catalog`,
-  `name`, `icon`, `accent`, `state`, `series`, `computed`, `layout`.
+  `name`, `icon`, `accent`, `state`, `series`, `computed`, `layout`, and
+  `watches` (reminders — include them here when the user asks for any).
 - `update` — `{flowlet_id, definition}` (full replace, versioned) or
   `{flowlet_id, pinned}`.
 - `get` — `{flowlet_id}` → definition **and current live values**. Use this to
@@ -49,9 +61,10 @@ read its current definition, then send the full updated definition with
   goal 3 liters").
 - `query` — `{flowlet_id, series, agg, window}` → one number, to answer a
   question without dumping the whole flowlet.
-- `notify` — `{flowlet_id, title, body}` — send a reminder that deep-links to
-  the flowlet (push on mobile, a native notification on desktop). Use it from a
-  cron job to nudge the user (e.g. "you haven't logged water today").
+- `notify` — `{flowlet_id, title, body}` — fire a one-off reminder right now
+  (push on mobile, native notification on desktop). For *recurring* or
+  *conditional* reminders use `watches` instead (they fire themselves); reach
+  for `notify` only for a single immediate ping.
 
 ## Component catalog (catalog: 1)
 
@@ -139,9 +152,20 @@ bounds.
     ]},
     { "id": "goal", "type": "slider", "min": 1000, "max": 4000, "step": 250, "label": "Daily goal", "value": "goal_ml", "action": { "op": "set", "key": "goal_ml" } },
     { "id": "week", "type": "chart", "kind": "bar", "data": { "series": "water", "agg": "sum", "bucket": "day", "window": "7d" } }
+  ],
+  "watches": [
+    { "id": "behind", "trigger": "condition", "when": "today_ml < goal_ml", "after": "18:00",
+      "notify": { "title": "Su hatırlatması", "body": "{today_ml} / {goal_ml} ml — biraz geridesin" } },
+    { "id": "reached", "trigger": "goal", "when": "today_ml >= goal_ml", "once": true,
+      "notify": { "title": "Hedef tamam 🎉", "body": "{today_ml} ml — harika gidiyorsun" } }
   ]
 }
 ```
+
+The user asked for a water tracker *and* a reminder → both live in this one
+definition. A "remind me every day at 9" would instead be
+`{ "id": "morning", "trigger": "schedule", "at": "09:00", "notify": {...} }`;
+"every 2 minutes" → `"everyMinutes": 2`. Never a separate cron job.
 
 Other easy builds with the same pieces: habit checklist (bool state keys +
 `checklist`), mood log (`rating` → `log`, `sparkline`), pomodoro (`ring` +
