@@ -29,8 +29,14 @@ aggregate. `catalog: 1` is required at the top of every definition.
 }
 ```
 
-- **state** — mutable values. `type` ∈ `number | bool | string`; `number` takes
-  `default`/`min`/`max`, `string` takes `default`/`maxLength` (≤ 500).
+- **state** — mutable values. `type` ∈ `number | bool | string | timer | list`;
+  `number` takes `default`/`min`/`max`, `string` takes `default`/`maxLength`
+  (≤ 500). `timer` is bot-managed (`timer_toggle` drives it; resolves to
+  `{running, elapsed}`). `list` is a dynamic collection — it declares an
+  `item` field schema (`{"title": "string", "done": "bool"}`; types
+  `string|number|bool|date`, ≤ 8 fields, `id` reserved) plus optional `max`
+  (≤ 200) and resolves to an array of `{id, ...fields}` rows, rendered by the
+  `repeater` component and mutated by the `item_*` ops.
 - **series** — append-only event logs (`{unit?}`). Charts and totals read these.
 - **computed** — derived scalars. Either a series aggregation
   (`{series, agg, window}`) or a safe arithmetic `expr` over other scalar keys.
@@ -60,7 +66,7 @@ Common props: `id` (required on anything with an `action` or a chart), `type`.
 A `value`/`max`/`min` prop is either a number literal or the name of a
 scalar key. Unknown component types render a neutral placeholder.
 
-### Layout (7)
+### Layout (8)
 | type | notes |
 |---|---|
 | `card` | rounded container; `children` |
@@ -70,6 +76,7 @@ scalar key. Unknown component types render a neutral placeholder.
 | `list` | stacked rows; `children` |
 | `divider` | hairline |
 | `spacer` | `size` px |
+| `repeater` | one row per item of a `list` state key: `source`, `item` (row template — `$.field` binds, `{$.field}` interpolates), `empty?` |
 
 ### Display (14)
 | type | key props |
@@ -136,8 +143,18 @@ time persists across sessions. For billable hours, an experiment, a workout.
 | `log` | `series`, `value?` | append an event (fixed `value` on a button; passed value for a rating) |
 | `remove_last` | `series` | undo the last event |
 | `reset` | `key?` / `series?` | reset a state key or clear a series |
-| `agent` | `message` | run a normal agent turn (e.g. "analyze my week"); the reply lands in chat |
+| `agent` | `message` | run a normal agent turn; `message` templates `{value}` (typed/tapped value, ≤500 chars) + live `{key}`s — free text can reach the model |
 | `batch` | `ops: [...]` | apply several ops in order (no nesting) |
+| `item_add` | `key`, `item?` | append a row to a `list` (fixed fields + client value; bare string → the single string field) |
+| `item_update` | `key`, `field` / `fields` | set a row field from the control, or fixed `fields` |
+| `item_toggle` | `key`, `field` | flip a bool field on the tapped row |
+| `item_remove` | `key` | delete the tapped row |
+| `item_move` | `key` | reorder (value = new index) |
+
+Row-scoped ops (`item_update/toggle/remove/move`) must sit inside the repeater
+bound to the same list; the client sends their value as `{"itemId", "value"}`
+(the bot unwraps that envelope for every other op, so any component works
+inside a row template).
 
 A button with a fixed `value` ignores any client-sent value. Free inputs
 (slider/input/number_input/rating) supply their value, validated to the
@@ -175,7 +192,10 @@ no model call.
 | `goal` | `when` target reached (edge) | `when`, opt. `once` |
 | `stale` | no activity for N minutes | `idleMinutes` |
 
-Every watch: `id` (stable) + `notify:{title, body}`. `title`/`body` template
+Every watch: `id` (stable) + `notify:{title, body, compose?}`. With
+`compose: true` the agent writes the notification at fire time (live data in
+its prompt, sent via the flowlet notify action, ≥30-min throttle; the static
+title/body are the fallback). `title`/`body` template
 current values with `{key}`. `when` uses the safe expr grammar — arithmetic
 `+ - * / % min max abs round`, comparisons `< <= > >= == !=`, and `and/or/not`
 over declared state/computed keys. Fires are **edge-triggered** and
@@ -206,7 +226,8 @@ activity`
 
 ## Limits
 
-definition ≤ 64 KB · ≤ 200 components · nesting depth ≤ 8 · ≤ 50 computed keys ·
+definition ≤ 64 KB · ≤ 200 components · nesting depth ≤ 8 · ≤ 200 list items ·
+≤ 8 item fields · ≤ 50 computed keys ·
 ≤ 50 state keys · ≤ 20 series · input value ≤ 500 chars.
 
 ## Sync surface

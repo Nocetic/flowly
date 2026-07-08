@@ -122,6 +122,10 @@ Put an `action` on an input component. Ops:
 - `reset` — `{op:"reset", key}` or `{op:"reset", series}`.
 - `agent` — `{op:"agent", message}` — hands `message` to you as a normal turn
   (e.g. an "Analyze my week" button). Your reply is delivered to the chat.
+  The message templates `{value}` (what the user typed/tapped) and any `{key}`
+  live value — so a free-text input can say
+  `{"op":"agent","message":"Log this meal and estimate calories: {value}"}`
+  and you'll receive the user's own words to interpret.
 - `timer_toggle` — `{op:"timer_toggle", key}` — start/stop a `timer` state key.
 - `batch` — `{op:"batch", ops:[...]}` — several ops at once.
 
@@ -170,6 +174,43 @@ definition. A "remind me every day at 9" would instead be
 Other easy builds with the same pieces: habit checklist (bool state keys +
 `checklist`), mood log (`rating` → `log`, `sparkline`), pomodoro (`ring` +
 count), weight/budget/reading trackers.
+
+## Dynamic lists — todo / shopping / journal screens
+
+A `list` state key holds living rows the user adds and removes; a `repeater`
+renders them. This is how you build a todo list, shopping list, or note log:
+
+```json
+{
+  "catalog": 1, "name": "Görevler", "icon": "check", "accent": "#7C6FF0",
+  "state": {
+    "tasks": { "type": "list", "item": { "title": "string", "done": "bool" }, "max": 100 }
+  },
+  "layout": [
+    { "id": "new_task", "type": "input", "placeholder": "Yeni görev…",
+      "action": { "op": "item_add", "key": "tasks" } },
+    { "type": "repeater", "source": "tasks", "empty": "Henüz görev yok",
+      "item": { "type": "row", "children": [
+        { "id": "tgl", "type": "toggle", "value": "$.done",
+          "action": { "op": "item_toggle", "key": "tasks", "field": "done" } },
+        { "type": "text", "text": "{$.title}" },
+        { "id": "del", "type": "icon_button", "icon": "trash",
+          "action": { "op": "item_remove", "key": "tasks" } } ] } }
+  ]
+}
+```
+
+The rules:
+- `item` declares the field schema (`string` / `number` / `bool` / `date`,
+  ≤ 8 fields; `id` is reserved — assigned automatically).
+- Inside the repeater's `item` template, `$.field` binds a prop to the current
+  row and `{$.field}` interpolates it into text. Row actions
+  (`item_toggle` / `item_update` / `item_remove` / `item_move`) must live
+  inside the repeater; `item_add` can sit anywhere (the quick-add input above
+  maps its text to the single string field).
+- The screen's grid card automatically previews as "done/total" when the item
+  schema has a bool field.
+- A journal = a list of `{text: "string", day: "date"}` rendered the same way.
 
 ## Adaptive screens — `visibleWhen` + conditional text
 
@@ -238,6 +279,13 @@ title/body may template current values with `{key}` — e.g. `"{today_ml} / {goa
     "notify": { "title": "New day", "body": "Fresh water goal for today." } }
 ]
 ```
+
+**Composed notifications:** add `"compose": true` inside `notify` and *you*
+write the notification when the watch fires — you get the live screen data and
+send a short, personal push via the flowlet notify action ("Dün 3L içmiştin,
+bugün yavaşsın — bir bardak?"). The static `title`/`body` stay as the fallback
+when composing isn't possible. Use it where a personal touch beats a template;
+plain templated pushes are cheaper and instant.
 
 Guidance: keep reminders kind and rare. `when` expressions support
 `+ - * / min() max() abs() round()`, comparisons `< <= > >= == !=`, and
