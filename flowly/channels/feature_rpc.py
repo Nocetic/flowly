@@ -885,6 +885,22 @@ def set_provider_reload_callback(cb) -> None:
     _provider_reload_cb = cb
 
 
+# Coroutine the host registers so a tools.codex_session change (approval policy
+# / sandbox) can be applied LIVE — re-reading config, dropping the warm Codex
+# subprocesses that captured the old policy at spawn, and re-registering the
+# tool (which rewrites ~/.codex/config.toml). Unset → codex_policy_set falls
+# back to signalling a restart.
+_codex_reload_cb = None
+
+
+def set_codex_reload_callback(cb) -> None:
+    """Register an async ``() -> dict`` the host calls to live-reload the
+    codex_session runtime after a policy change (the gateway points this at
+    on_codex_reload)."""
+    global _codex_reload_cb
+    _codex_reload_cb = cb
+
+
 # Returns ``(board_store, board_orchestrator)`` — the agent's single-writer
 # board. Wired at startup so board.snapshot/action work over relay AND gateway
 # (the gateway also has its own direct handlers; this lights up the relay).
@@ -1112,6 +1128,69 @@ def exec_policy_allowlist_remove(params: dict) -> dict:
     payload = _exec_policy_payload(store)
     payload["removed"] = removed
     return payload
+
+
+# ── Codex session policy ─────────────────────────────────────────────────────
+# tools.codex_session.approvalPolicy / sandbox. Unlike exec policy these live in
+# config.json, but a plain config.set is not enough: the warm Codex subprocess
+# captured the sandbox at spawn and the approval policy only reaches Codex via
+# ~/.codex/config.toml. So codex_policy_set writes config, then live-reloads via
+# the host callback (drop warm sessions + re-register the tool → rewrite
+# config.toml). Reload success ⇒ no restart; missing/failed callback ⇒ restart.
+
+_CODEX_APPROVAL = ("on-request", "never", "auto-review", "granular")
+_CODEX_SANDBOX = ("read-only", "workspace-write", "full-access")
+
+
+def codex_policy_get() -> dict:
+    """Current codex_session approval policy + sandbox (for the settings UI)."""
+    from flowly.config.loader import load_config
+    cs = load_config().tools.codex_session
+    return {
+        "enabled": cs.enabled,
+        "sandbox": cs.sandbox,
+        "approvalPolicy": cs.approval_policy,
+        "exposeFlowlyTools": cs.expose_flowly_tools,
+    }
+
+
+async def codex_policy_set(params: dict) -> dict:
+    """Set tools.codex_session.approvalPolicy / sandbox and apply it live.
+
+    Live-reloads the running codex_session runtime when the host wired
+    :func:`set_codex_reload_callback` (gateway); otherwise (or if the reload
+    raises) returns ``willRestart`` so the transport restarts the bot to pick
+    up the change.
+    """
+    approval = params.get("approvalPolicy")
+    sandbox = params.get("sandbox")
+    if approval is not None and approval not in _CODEX_APPROVAL:
+        raise FeatureRpcError("INVALID", "Invalid approvalPolicy")
+    if sandbox is not None and sandbox not in _CODEX_SANDBOX:
+        raise FeatureRpcError("INVALID", "Invalid sandbox")
+    if approval is None and sandbox is None:
+        raise FeatureRpcError("INVALID", "Nothing to set")
+
+    from flowly.config.loader import load_config, save_config
+    cfg = load_config()
+    if approval is not None:
+        cfg.tools.codex_session.approval_policy = approval
+    if sandbox is not None:
+        cfg.tools.codex_session.sandbox = sandbox
+    save_config(cfg)
+
+    if _codex_reload_cb is not None:
+        try:
+            status = await _codex_reload_cb()
+            result = {"ok": True, "willRestart": False}
+            if isinstance(status, dict):
+                result.update(status)
+                result["willRestart"] = False
+            return result
+        except Exception:
+            # Live reload failed — fall back to a restart so the change lands.
+            pass
+    return {"ok": True, "willRestart": True}
 
 
 # ── Providers (BYOK) ─────────────────────────────────────────────────────────
@@ -2443,6 +2522,8 @@ _DISPATCH: dict[str, tuple] = {
     "exec.policy.get":              (exec_policy_get, False, False),
     "exec.policy.set":              (exec_policy_set, True, False),
     "exec.policy.allowlist.remove": (exec_policy_allowlist_remove, True, False),
+    "codex.policy.get":             (codex_policy_get, False, False),
+    "codex.policy.set":             (codex_policy_set, True, True),
     "pet.info":           (pet_info, True, False),
     "pet.gallery":        (pet_gallery, True, False),
     "pet.select":         (pet_select, True, False),
