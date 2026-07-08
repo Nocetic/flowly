@@ -224,8 +224,23 @@ async def _apply_op(
         if agent_runner is None:
             raise FlowletActionError("UNAVAILABLE", "this flowlet action can't run right now")
         flowlet = store.get(flowlet_id)
+        # Template the message with live values plus `{value}` = whatever the
+        # user typed/tapped — this is what lets a free-text input reach the
+        # model ("Log this meal: {value}" → "…: iki dilim pizza"). The agent
+        # only ever sees the declared message shape, never a raw client string
+        # outside its {value} slot.
+        ns = resolve_values(
+            definition, store.get_state(flowlet_id), store.get_events(flowlet_id),
+            queries_now_ms(), None,
+        )
+        if passed_value is not None and not isinstance(passed_value, (dict, list)):
+            v = passed_value
+            if isinstance(v, str):
+                v = v.strip()[:500]  # same cap as the `input` component
+            ns = {**ns, "value": v}
+        message = queries.render_template(message, ns)
         try:
-            await agent_runner(flowlet, str(message))
+            await agent_runner(flowlet, message)
         except Exception as exc:  # noqa: BLE001 — never crash the action path
             logger.warning("Flowlet agent action failed: {}", exc)
             raise FlowletActionError("UNAVAILABLE", "the agent couldn't handle that just now")

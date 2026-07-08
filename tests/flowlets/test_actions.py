@@ -159,3 +159,58 @@ async def test_timer_toggle_starts_and_stops(store):
     res = await apply_action(store, f["id"], "billableTimer", tz=UTC)
     assert res["values"]["billable"]["running"] is False
     assert res["values"]["billable"]["elapsed"] >= 1.0
+
+
+async def test_agent_op_templates_value_and_live_values(store):
+    """`{value}` carries the typed/tapped value into the message; `{key}`
+    templates live values — this is the free-text → model bridge."""
+    defn = {
+        "catalog": 1, "name": "Yemek",
+        "state": {"goal_kcal": {"type": "number", "default": 2000}},
+        "layout": [
+            {"id": "meal", "type": "input",
+             "action": {"op": "agent",
+                        "message": "Log this meal ({goal_kcal} kcal goal): {value}"}},
+        ],
+    }
+    f = store.create("Yemek", defn)
+    called = {}
+
+    async def runner(flowlet, message):
+        called["msg"] = message
+
+    await apply_action(store, f["id"], "meal", value="iki dilim pizza",
+                       tz=UTC, agent_runner=runner)
+    assert called["msg"] == "Log this meal (2000 kcal goal): iki dilim pizza"
+
+
+async def test_agent_op_value_absent_leaves_placeholder(store):
+    defn = {
+        "catalog": 1, "name": "X", "state": {},
+        "layout": [{"id": "b", "type": "button", "text": "go",
+                    "action": {"op": "agent", "message": "do {value}"}}],
+    }
+    f = store.create("X", defn)
+    called = {}
+
+    async def runner(flowlet, message):
+        called["msg"] = message
+
+    await apply_action(store, f["id"], "b", tz=UTC, agent_runner=runner)
+    assert called["msg"] == "do {value}"  # no value passed → verbatim, never crashes
+
+
+async def test_agent_op_value_capped_at_500(store):
+    defn = {
+        "catalog": 1, "name": "X", "state": {},
+        "layout": [{"id": "t", "type": "textarea",
+                    "action": {"op": "agent", "message": "{value}"}}],
+    }
+    f = store.create("X", defn)
+    called = {}
+
+    async def runner(flowlet, message):
+        called["msg"] = message
+
+    await apply_action(store, f["id"], "t", value="a" * 2000, tz=UTC, agent_runner=runner)
+    assert len(called["msg"]) == 500

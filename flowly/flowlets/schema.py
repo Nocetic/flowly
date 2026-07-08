@@ -576,6 +576,10 @@ def _validate_watch(i: int, w: Any, scalar_keys: set[str], seen: set[str]) -> No
         raise _err(f"{where}: notify.body must be a string")
     if isinstance(body, str) and len(body) > catalog.MAX_LABEL_LEN:
         raise _err(f"{where}: notify.body must be ≤ {catalog.MAX_LABEL_LEN} characters")
+    # compose: the agent writes the notification text with live context when
+    # the watch fires (title/body above stay as the deterministic fallback).
+    if "compose" in notify and not isinstance(notify["compose"], bool):
+        raise _err(f"{where}: notify.compose must be true or false")
 
     # trigger-specific fields
     if trigger == "schedule":

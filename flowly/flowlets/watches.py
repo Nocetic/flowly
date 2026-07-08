@@ -87,6 +87,32 @@ def _eval_cond(watch: dict, values: dict, now_min: int) -> bool:
     return True
 
 
+def _compose_prompt(flowlet: dict, watch: dict, title: str, body: str, values: dict) -> str:
+    """The agent-facing instruction for a ``notify.compose`` watch: write ONE
+    short, contextual notification and send it via the flowlet tool, replying
+    silently so nothing lands in the chat. Series arrays are stripped from the
+    snapshot — scalars are what a one-line notification needs."""
+    import json as _json
+
+    scalars = {k: v for k, v in values.items() if not isinstance(v, list)}
+    try:
+        snapshot = _json.dumps(scalars, ensure_ascii=False, default=str)[:1200]
+    except (TypeError, ValueError):
+        snapshot = "{}"
+    name = flowlet.get("name") or "Flowlet"
+    return (
+        f"[Flowlet reminder — {name}]\n"
+        f"The reminder rule '{watch.get('id')}' on the user's '{name}' screen just fired.\n"
+        f"Rule intent (fallback text): {title}" + (f" — {body}" if body else "") + "\n"
+        f"Live screen data: {snapshot}\n\n"
+        "Compose ONE short notification in the user's language — title ≤ 50 chars, "
+        "body ≤ 120 chars, warm and specific to the data above (mention real numbers, "
+        "not placeholders). Send it with the flowlet tool: action=notify, "
+        f"flowlet_id={flowlet.get('id')}, title=..., body=...\n"
+        "Then reply with exactly [SILENT] so nothing is posted to the chat."
+    )
+
+
 def _decide(
     watch: dict,
     values: dict,
@@ -256,11 +282,19 @@ class WatchEngine:
                 title = render(notify.get("title"), values) or (flowlet.get("name") or "Flowlet")
                 body = render(notify.get("body"), values)
                 also = w.get("also")
-                wake = bool(also) and (
-                    prev_fired is None
-                    or now - prev_fired >= catalog.WATCH_AGENT_MIN_COOLDOWN_MIN * 60_000
+                # A model turn (compose or `also`) is gated by a hard minimum
+                # window regardless of the watch's own cooldown.
+                agent_ok = prev_fired is None or (
+                    now - prev_fired >= catalog.WATCH_AGENT_MIN_COOLDOWN_MIN * 60_000
                 )
-                pending.append((title, body, also if wake else None, True))
+                compose = bool(notify.get("compose")) and agent_ok
+                pending.append({
+                    "title": title,
+                    "body": body,
+                    "also": also if (also and agent_ok) else None,
+                    "compose_prompt": _compose_prompt(flowlet, w, title, body, values)
+                    if compose else None,
+                })
                 # DEBUG + opaque ids only: a fired watch is an internal event and
                 # the flowlet name is user content — neither belongs in prod logs.
                 logger.debug("[flowlet] watch '{}' fired on {} ({})", wid, fid, reason)
@@ -270,15 +304,25 @@ class WatchEngine:
 
         # ── side effects: outside the lock (network push / agent turn) ────────
         fired_ids: list[str] = []
-        for title, body, also, _ in pending:
+        for p in pending:
             fired_ids.append(fid)
-            if self._notify is not None:
+            # Composed notification: the agent writes + sends the push itself
+            # (with live context). The static templated title/body remain the
+            # deterministic fallback if the agent is unavailable or errors.
+            composed = False
+            if p["compose_prompt"] and self._agent_runner is not None:
                 try:
-                    await self._notify(fid, title, body)
+                    await self._agent_runner(flowlet, p["compose_prompt"])
+                    composed = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[flowlet] composed notify failed for {}: {}", fid, exc)
+            if not composed and self._notify is not None:
+                try:
+                    await self._notify(fid, p["title"], p["body"])
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[flowlet] watch notify failed for {}: {}", fid, exc)
-            if also and self._agent_runner is not None:
-                msg = str(also.get("message") or "").strip()
+            if p["also"] and self._agent_runner is not None:
+                msg = str(p["also"].get("message") or "").strip()
                 if msg:
                     try:
                         await self._agent_runner(flowlet, msg)

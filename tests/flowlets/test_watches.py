@@ -387,3 +387,83 @@ async def test_engine_schedule_daily(store):
     # same day again → no repeat
     assert await eng.evaluate_one(fid, now_ms=at(11, 0)) == []
     assert len(cap.notifications) == 1
+
+
+# ── notify.compose (agent-written notifications) ─────────────────────────────
+
+
+def _compose_def(**notify_extra):
+    return {
+        "catalog": 1, "name": "Water",
+        "state": {"glasses": {"type": "number", "default": 0},
+                  "goal": {"type": "number", "default": 8}},
+        "layout": [{"type": "text", "text": "hi"}],
+        "watches": [{"id": "hit", "trigger": "goal", "when": "glasses >= goal",
+                     "notify": {"title": "Goal!", "body": "{glasses}/{goal}",
+                                "compose": True, **notify_extra}}],
+    }
+
+
+def test_schema_compose_bool_only():
+    validate_definition(_compose_def())
+    bad = _compose_def()
+    bad["watches"][0]["notify"]["compose"] = "yes"
+    with pytest.raises(FlowletValidationError, match="compose"):
+        validate_definition(bad)
+
+
+async def test_compose_runs_agent_and_skips_static_notify(store):
+    cap = _Capture()
+    eng = WatchEngine(store, notify=cap.notify, agent_runner=cap.agent, tz=UTC)
+    f = store.create("Water", _compose_def())
+    store.set_state(f["id"], "glasses", 8)
+    assert await eng.evaluate_one(f["id"]) == [f["id"]]
+    # the agent composed + sent it — no static push
+    assert cap.notifications == []
+    assert len(cap.agent_calls) == 1
+    fid, prompt = cap.agent_calls[0]
+    assert fid == f["id"]
+    assert f["id"] in prompt              # flowlet_id for the notify call
+    assert "glasses" in prompt            # live data snapshot
+    assert "[SILENT]" in prompt           # stays out of the chat
+
+
+async def test_compose_falls_back_without_runner(store):
+    cap = _Capture()
+    eng = WatchEngine(store, notify=cap.notify, tz=UTC)  # no agent_runner
+    f = store.create("Water", _compose_def())
+    store.set_state(f["id"], "glasses", 8)
+    await eng.evaluate_one(f["id"])
+    assert cap.notifications == [(f["id"], "Goal!", "8/8")]  # static fallback
+
+
+async def test_compose_falls_back_when_runner_raises(store):
+    cap = _Capture()
+
+    async def broken(flowlet, message):
+        raise RuntimeError("model down")
+
+    eng = WatchEngine(store, notify=cap.notify, agent_runner=broken, tz=UTC)
+    f = store.create("Water", _compose_def())
+    store.set_state(f["id"], "glasses", 8)
+    await eng.evaluate_one(f["id"])
+    assert cap.notifications == [(f["id"], "Goal!", "8/8")]
+
+
+async def test_compose_throttled_uses_static(store):
+    """Within the agent min-cooldown window compose degrades to the static
+    push — a model call must never be cheap to trigger on a tight loop."""
+    cap = _Capture()
+    eng = WatchEngine(store, notify=cap.notify, agent_runner=cap.agent, tz=UTC)
+    d = _compose_def()
+    d["watches"][0]["cooldownMinutes"] = 0  # watch itself refires freely
+    f = store.create("Water", d)
+    fid = f["id"]
+    store.set_state(fid, "glasses", 8)
+    await eng.evaluate_one(fid)             # 1st: composed
+    store.set_state(fid, "glasses", 2)
+    await eng.evaluate_one(fid)             # falling edge
+    store.set_state(fid, "glasses", 9)
+    await eng.evaluate_one(fid)             # 2nd fire, inside 30-min window
+    assert len(cap.agent_calls) == 1        # no second model call
+    assert len(cap.notifications) == 1      # static push took over
