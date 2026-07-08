@@ -389,6 +389,13 @@ def coerce_state(value: Any, spec: dict) -> Any:
         return s[: int(ml)]
     if stype == "timer":
         return value if isinstance(value, dict) else {"running": False, "since_ms": 0, "accum_s": 0.0}
+    if stype == "list":
+        # An array of {id, ...fields} dicts; anything malformed drops out so a
+        # client can iterate blindly. Capped defensively (writes cap too).
+        if not isinstance(value, list):
+            return []
+        items = [it for it in value if isinstance(it, dict) and it.get("id")]
+        return items[: catalog.MAX_LIST_ITEMS]
     return value
 
 
@@ -403,6 +410,10 @@ def _iter_components(layout: list) -> Iterable[dict]:
             children = node.get("children")
             if isinstance(children, list):
                 stack.extend(children)
+            # A repeater's row template lives under `item`, not `children` —
+            # its components (toggle/delete buttons) must be findable too.
+            if node.get("type") == "repeater" and isinstance(node.get("item"), dict):
+                stack.append(node["item"])
 
 
 def resolve_values(
@@ -568,4 +579,18 @@ def flowlet_preview(definition: dict, values: dict) -> dict | None:
             else:
                 text = str(_clean_number(val))
             return {"text": text, "pct": None}
+        if t == "repeater":
+            # A list screen headlines as its progress: "done/total" when the
+            # item schema has a bool field, plain count otherwise.
+            items = values.get(comp.get("source") or "")
+            if not isinstance(items, list):
+                continue
+            spec = (definition.get("state", {}) or {}).get(comp.get("source") or "")
+            fields = (spec or {}).get("item") or {}
+            bool_field = next((f for f, ft in fields.items() if ft == "bool"), None)
+            total = len(items)
+            if bool_field is not None and total:
+                done = sum(1 for it in items if isinstance(it, dict) and it.get(bool_field))
+                return {"text": f"{done}/{total}", "pct": done / total}
+            return {"text": str(total), "pct": None}
     return None

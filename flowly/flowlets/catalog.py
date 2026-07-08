@@ -36,12 +36,23 @@ WINDOWS = frozenset({"today", "7d", "30d", "90d", "all"})
 # ── State value types ─────────────────────────────────────────────────────────
 # `timer` is a structured state: {running, since_ms, accum_s}; resolve_values
 # exposes it to clients as {running, elapsed} so a running timer ticks live.
-STATE_TYPES = frozenset({"number", "bool", "string", "timer"})
+# `list` is a dynamic collection: an array of {id, ...fields} items whose field
+# schema the definition declares — the foundation for todo/shopping/journal
+# screens. Rendered by the `repeater` component; mutated by the item_* ops.
+STATE_TYPES = frozenset({"number", "bool", "string", "timer", "list"})
+
+#: Field types a `list` item schema may declare.
+ITEM_FIELD_TYPES = frozenset({"string", "number", "bool", "date"})
+MAX_LIST_ITEMS = 200
+MAX_ITEM_FIELDS = 8
 
 # ── Action ops the interpreter understands (see actions.py) ───────────────────
 ACTION_OPS = frozenset({
     "set", "increment", "decrement", "toggle",
     "log", "remove_last", "reset", "agent", "batch", "timer_toggle",
+    # dynamic-list ops — item_add anywhere; the rest live inside a repeater's
+    # item template (they need the tapped row's itemId from the client).
+    "item_add", "item_update", "item_remove", "item_toggle", "item_move",
 })
 
 # ── Watches (declarative reactive rules; evaluated LLM-free) ──────────────────
@@ -100,6 +111,11 @@ COMPONENTS: dict[str, dict] = {
     "list":     {"category": "layout", "container": True,  "action": False},
     "divider":  {"category": "layout", "container": False, "action": False},
     "spacer":   {"category": "layout", "container": False, "action": False},
+    # Renders its `item` template once per item of a `list` state key. Inside
+    # the template, `$.field` binds to the current item and `{$.field}`
+    # interpolates it; inner actions automatically carry the row's itemId.
+    "repeater": {"category": "layout", "container": False, "action": False,
+                 "required": ["source", "item"]},
 
     # ── Display (14) ──────────────────────────────────────────────────────────
     "header":    {"category": "display", "container": False, "action": False,

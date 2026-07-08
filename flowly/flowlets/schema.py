@@ -87,6 +87,7 @@ def validate_definition(defn: Any) -> dict:
     if len(state_defs) > catalog.MAX_STATE_KEYS:
         raise _err(f"too many state keys (max {catalog.MAX_STATE_KEYS})")
     scalar_keys: set[str] = set()
+    list_keys: dict[str, dict] = {}  # list state key → {field: type}
     for key, spec in state_defs.items():
         if not _KEY_RE.match(key):
             raise _err(
@@ -94,7 +95,12 @@ def validate_definition(defn: Any) -> dict:
                 "and contain only letters, digits, and underscores"
             )
         _validate_state_spec(key, spec)
-        scalar_keys.add(key)
+        if isinstance(spec, dict) and spec.get("type") == "list":
+            # A list resolves to an item array, not a scalar — it may not be
+            # referenced by exprs/binds, only by a repeater / item ops.
+            list_keys[key] = dict(spec.get("item") or {})
+        else:
+            scalar_keys.add(key)
 
     # ── series schema ─────────────────────────────────────────────────────────
     series_defs = defn.get("series", {})
@@ -120,7 +126,7 @@ def validate_definition(defn: Any) -> dict:
     for key, spec in computed_defs.items():
         if not _KEY_RE.match(key):
             raise _err(f"computed key '{key}' is invalid (letters/digits/underscore)")
-        if key in scalar_keys:
+        if key in scalar_keys or key in list_keys:
             raise _err(f"computed key '{key}' collides with a state key of the same name")
         _validate_computed_spec(key, spec, series_keys)
         computed_keys.add(key)
@@ -137,6 +143,7 @@ def validate_definition(defn: Any) -> dict:
         series_keys=series_keys,
         component_ids=set(),
         count=0,
+        list_keys=list_keys,
     )
     for node in layout:
         _validate_node(node, ctx, depth=1)
@@ -186,6 +193,31 @@ def _validate_state_spec(key: str, spec: Any) -> None:
         # Structured, managed state ({running, since_ms, accum_s}); the agent
         # doesn't set a default — a timer_toggle action drives it.
         pass
+    elif stype == "list":
+        item = spec.get("item")
+        if not isinstance(item, dict) or not item:
+            raise _err(
+                f"state '{key}': a list needs an `item` field schema, e.g. "
+                '{"title": "string", "done": "bool"}'
+            )
+        if len(item) > catalog.MAX_ITEM_FIELDS:
+            raise _err(f"state '{key}': at most {catalog.MAX_ITEM_FIELDS} item fields")
+        for fname, ftype in item.items():
+            if not _KEY_RE.match(fname):
+                raise _err(f"state '{key}': item field '{fname}' is an invalid name")
+            if fname == "id":
+                raise _err(f"state '{key}': `id` is reserved (assigned automatically)")
+            if ftype not in catalog.ITEM_FIELD_TYPES:
+                raise _err(
+                    f"state '{key}': item field '{fname}' type must be one of "
+                    f"{sorted(catalog.ITEM_FIELD_TYPES)}, got {ftype!r}"
+                )
+        mx = spec.get("max")
+        if mx is not None and (
+            not isinstance(mx, int) or isinstance(mx, bool)
+            or not 1 <= mx <= catalog.MAX_LIST_ITEMS
+        ):
+            raise _err(f"state '{key}': `max` must be an integer 1..{catalog.MAX_LIST_ITEMS}")
 
 
 def _validate_computed_spec(key: str, spec: Any, series_keys: set[str]) -> None:
@@ -253,13 +285,19 @@ def _validate_cases_spec(key: str, spec: dict) -> None:
 # ── layout tree validation ───────────────────────────────────────────────────
 
 class _Ctx:
-    __slots__ = ("scalar_keys", "series_keys", "component_ids", "count")
+    __slots__ = (
+        "scalar_keys", "series_keys", "component_ids", "count",
+        "list_keys", "item_fields", "item_source",
+    )
 
-    def __init__(self, scalar_keys, series_keys, component_ids, count):
+    def __init__(self, scalar_keys, series_keys, component_ids, count, list_keys=None):
         self.scalar_keys = scalar_keys
         self.series_keys = series_keys
         self.component_ids = component_ids
         self.count = count
+        self.list_keys = list_keys or {}   # list state key → {field: type}
+        self.item_fields = None            # {field: type} while inside a repeater template
+        self.item_source = None            # the repeater's source key, ditto
 
 
 def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
@@ -349,7 +387,7 @@ def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
         _validate_data(ctype, cid, node.get("data"), ctx)
 
     # component-specific extra checks
-    _validate_component_extras(ctype, cid, node, ctx)
+    _validate_component_extras(ctype, cid, node, ctx, depth)
 
     # children
     children = node.get("children")
@@ -367,6 +405,20 @@ def _validate_scalar_ref(ctype, cid, prop, value, ctx: _Ctx) -> None:
     if _is_number(value):
         return
     if isinstance(value, str):
+        if value.startswith("$."):
+            # An item-field bind, valid only inside a repeater's item template.
+            if ctx.item_fields is None:
+                raise _err(
+                    f"{ctype} (id={cid}) `{prop}` uses '{value}' outside a repeater "
+                    "item template"
+                )
+            field = value[2:]
+            if field not in ctx.item_fields:
+                raise _err(
+                    f"{ctype} (id={cid}) `{prop}` references unknown item field "
+                    f"'{field}' (declared: {sorted(ctx.item_fields)})"
+                )
+            return
         if value not in ctx.scalar_keys:
             raise _err(
                 f"{ctype} (id={cid}) `{prop}` references unknown key '{value}'. "
@@ -427,6 +479,59 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
             raise _err(f"{ctype} (id={cid}) action `agent` needs a non-empty `message`")
         if len(msg) > 2000:
             raise _err(f"{ctype} (id={cid}) action `agent` message is too long (max 2000)")
+    elif op == "item_add":
+        key = action.get("key")
+        if not isinstance(key, str) or key not in ctx.list_keys:
+            raise _err(
+                f"{ctype} (id={cid}) action `item_add` needs `key` naming a declared "
+                f"list state key; got {key!r}"
+            )
+        fixed = action.get("item")
+        if fixed is not None:
+            if not isinstance(fixed, dict):
+                raise _err(f"{ctype} (id={cid}) `item_add` `item` must be an object of fields")
+            for f in fixed:
+                if f not in ctx.list_keys[key]:
+                    raise _err(
+                        f"{ctype} (id={cid}) `item_add` sets unknown field '{f}' "
+                        f"(declared: {sorted(ctx.list_keys[key])})"
+                    )
+    elif op in ("item_update", "item_toggle", "item_remove", "item_move"):
+        key = action.get("key")
+        if not isinstance(key, str) or key not in ctx.list_keys:
+            raise _err(
+                f"{ctype} (id={cid}) action `{op}` needs `key` naming a declared "
+                f"list state key; got {key!r}"
+            )
+        # These need the tapped row's itemId, which only a repeater bound to the
+        # same list can supply.
+        if ctx.item_source != key:
+            raise _err(
+                f"{ctype} (id={cid}) action `{op}` must sit inside the repeater whose "
+                f"`source` is '{key}'"
+            )
+        if op == "item_toggle":
+            field = action.get("field")
+            if field not in ctx.list_keys[key]:
+                raise _err(f"{ctype} (id={cid}) `item_toggle` needs a declared `field`")
+            if ctx.list_keys[key][field] != "bool":
+                raise _err(f"{ctype} (id={cid}) `item_toggle` field '{field}' must be bool")
+        elif op == "item_update":
+            field = action.get("field")
+            fields = action.get("fields")
+            if (field is None) == (fields is None):
+                raise _err(
+                    f"{ctype} (id={cid}) `item_update` needs exactly one of `field` "
+                    "(client value) or `fields` (fixed values)"
+                )
+            if field is not None and field not in ctx.list_keys[key]:
+                raise _err(f"{ctype} (id={cid}) `item_update` unknown field '{field}'")
+            if fields is not None:
+                if not isinstance(fields, dict) or not fields:
+                    raise _err(f"{ctype} (id={cid}) `item_update` `fields` must be a non-empty object")
+                for f in fields:
+                    if f not in ctx.list_keys[key]:
+                        raise _err(f"{ctype} (id={cid}) `item_update` unknown field '{f}'")
     elif op == "batch":
         ops = action.get("ops")
         if not isinstance(ops, list) or not ops:
@@ -458,7 +563,32 @@ def _validate_data(ctype, cid, data, ctx: _Ctx) -> None:
         raise _err(f"{ctype} (id={cid}) `data.window` must be one of {sorted(catalog.WINDOWS)}")
 
 
-def _validate_component_extras(ctype, cid, node, ctx: _Ctx) -> None:
+def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> None:
+    if ctype == "repeater":
+        source = node.get("source")
+        if not isinstance(source, str) or source not in ctx.list_keys:
+            raise _err(
+                f"repeater (id={cid}) `source` must name a declared list state key; "
+                f"got {source!r}"
+            )
+        if ctx.item_fields is not None:
+            raise _err(f"repeater (id={cid}) cannot nest inside another repeater")
+        empty = node.get("empty")
+        if empty is not None and not isinstance(empty, str):
+            raise _err(f"repeater (id={cid}) `empty` must be a string")
+        item = node.get("item")
+        if not isinstance(item, dict):
+            raise _err(f"repeater (id={cid}) `item` must be a component object (the row template)")
+        # Validate the row template with the item scope open so `$.field` binds
+        # and item_* ops resolve against this list's fields.
+        ctx.item_fields = ctx.list_keys[source]
+        ctx.item_source = source
+        try:
+            _validate_node(item, ctx, depth + 1)
+        finally:
+            ctx.item_fields = None
+            ctx.item_source = None
+        return
     if ctype == "slider":
         mn, mx = node.get("min"), node.get("max")
         if not _is_number(mn) or not _is_number(mx):
