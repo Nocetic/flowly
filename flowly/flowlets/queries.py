@@ -400,3 +400,60 @@ def _clean_number(v: Any) -> Any:
     if isinstance(v, float) and v.is_integer():
         return int(v)
     return v
+
+
+def _iter_ordered(layout: list) -> Iterable[dict]:
+    """Preorder walk (reading order) — for picking the 'headline' component."""
+    for node in layout:
+        if isinstance(node, dict):
+            yield node
+            children = node.get("children")
+            if isinstance(children, list):
+                yield from _iter_ordered(children)
+
+
+def _num(v: Any, values: dict, default: float = 0.0) -> float:
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    if isinstance(v, str):
+        r = values.get(v)
+        if isinstance(r, (int, float)) and not isinstance(r, bool):
+            return float(r)
+    return default
+
+
+def _interp(text: Any, values: dict) -> str:
+    if not isinstance(text, str):
+        return ""
+    import re as _re
+    return _re.sub(
+        r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}",
+        lambda m: str(_clean_number(values.get(m.group(1), ""))),
+        text,
+    )
+
+
+def flowlet_preview(definition: dict, values: dict) -> dict | None:
+    """A compact headline for a list card: the first progress/ring/gauge (with a
+    percent for a mini bar) or the first stat — as ready-to-show ``text`` plus an
+    optional ``pct`` (0..1). Lets a tile read as content, not just an icon."""
+    for comp in _iter_ordered(definition.get("layout", []) or []):
+        t = comp.get("type")
+        if t in ("progress", "ring", "gauge"):
+            val = _num(comp.get("value"), values)
+            mx = _num(comp.get("max"), values, 100.0)
+            label = _interp(comp.get("label"), values)
+            text = label or f"{_clean_number(val)} / {_clean_number(mx)}"
+            pct = min(1.0, max(0.0, val / mx)) if mx else 0.0
+            return {"text": text, "pct": pct}
+        if t == "stat" and comp.get("value") is not None:
+            val = _num(comp.get("value"), values)
+            label = comp.get("label")
+            if isinstance(label, str) and "{" in label:
+                text = _interp(label, values)
+            elif isinstance(label, str) and label:
+                text = f"{_clean_number(val)} · {label}"
+            else:
+                text = str(_clean_number(val))
+            return {"text": text, "pct": None}
+    return None

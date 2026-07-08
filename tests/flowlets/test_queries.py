@@ -119,6 +119,26 @@ def test_resolve_respects_state_override(water_def):
     assert values["remaining"] == 3000        # nothing logged yet
 
 
+def test_flowlet_preview_progress(water_def):
+    from flowly.flowlets.queries import flowlet_preview
+    values = {"today_ml": 750, "goal_ml": 2000}
+    p = flowlet_preview(water_def, values)
+    assert p is not None
+    assert p["text"] == "750 / 2000 ml"        # the interpolated progress label
+    assert abs(p["pct"] - 0.375) < 1e-9         # 750 / 2000
+
+
+def test_flowlet_preview_stat_fallback():
+    from flowly.flowlets.queries import flowlet_preview
+    defn = {
+        "catalog": 1, "name": "x",
+        "state": {"n": {"type": "number", "default": 42}},
+        "layout": [{"type": "stat", "value": "n", "label": "toplam"}],
+    }
+    p = flowlet_preview(defn, {"n": 42})
+    assert p == {"text": "42 · toplam", "pct": None}
+
+
 def test_computed_order_independent():
     # `b` depends on `a` but is declared first — fixpoint resolve handles it.
     defn = {

@@ -46,6 +46,9 @@ def _summary(flowlet: dict, values: dict | None = None) -> dict:
     }
     if values is not None:
         s["values"] = values
+        preview = queries.flowlet_preview(flowlet.get("definition") or {}, values)
+        if preview is not None:
+            s["preview"] = preview
     return s
 
 
