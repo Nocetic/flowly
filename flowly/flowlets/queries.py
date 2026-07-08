@@ -72,6 +72,56 @@ _FUNCS = {
     "ceil": lambda x: float(__import__("math").ceil(x)),
 }
 
+# Date/time functions. `now`/`weekday` take no args; `days_until`/`days_since`
+# take one "YYYY-MM-DD" string (a literal or a name resolving to a date value).
+# They read the reserved `__now__` (epoch ms) + `__tz__` from the namespace,
+# injected at every eval site (resolve_values / watches / list `where`), and are
+# mirrored 1:1 on the clients so an expr evaluates identically everywhere.
+_DATE_FUNCS = frozenset({"now", "weekday", "days_until", "days_since"})
+_DATE_RE = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})\s*$")
+_EPOCH_ORD = date(1970, 1, 1).toordinal()
+
+
+def _daynum_from_str(s: str) -> int:
+    """A "YYYY-MM-DD" string → days since 1970-01-01 (a pure calendar-day count,
+    identical on every platform — no DST/tz drift). Raises on a bad date."""
+    m = _DATE_RE.match(s)
+    if not m:
+        raise _UnresolvedNameError("date")
+    try:
+        return date(int(m[1]), int(m[2]), int(m[3])).toordinal() - _EPOCH_ORD
+    except ValueError:
+        raise _UnresolvedNameError("date")
+
+
+def _today_daynum(now_ms: int, tz: tzinfo | None) -> int:
+    return _local_dt(now_ms, tz).date().toordinal() - _EPOCH_ORD
+
+
+def _eval_date_fn(name: str, arg_nodes: list, ns: dict) -> float:
+    now = ns.get("__now__")
+    if not isinstance(now, (int, float)) or isinstance(now, bool):
+        raise _UnresolvedNameError("__now__")
+    now = int(now)
+    tz = ns.get("__tz__")
+    if name == "now":
+        return float(now)
+    if name == "weekday":
+        return float(_local_dt(now, tz).weekday())  # 0=Mon .. 6=Sun
+    # days_until / days_since — a single date argument (literal or name)
+    a = arg_nodes[0]
+    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+        s = a.value
+    elif isinstance(a, ast.Name):
+        v = ns.get(a.id)
+        if not isinstance(v, str):
+            raise _UnresolvedNameError(a.id)
+        s = v
+    else:
+        raise _UnresolvedNameError(name)
+    delta = _daynum_from_str(s) - _today_daynum(now, tz)
+    return float(delta if name == "days_until" else -delta)
+
 
 def validate_expr(expr: str) -> None:
     """Confirm ``expr`` parses under the safe grammar. Raises ``ValueError`` with
@@ -109,12 +159,27 @@ def _check_node(node: ast.AST) -> None:
         for v in node.values:
             _check_node(v)
     elif isinstance(node, ast.Call):
-        if not isinstance(node.func, ast.Name) or node.func.id not in _FUNCS:
-            raise ValueError(
-                f"only these functions are allowed: {sorted(_FUNCS)}"
-            )
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("only named functions are allowed")
         if node.keywords:
             raise ValueError("keyword arguments are not allowed in expr")
+        fn = node.func.id
+        if fn in _DATE_FUNCS:
+            if fn in ("now", "weekday"):
+                if node.args:
+                    raise ValueError(f"{fn}() takes no arguments")
+            else:  # days_until / days_since — one "YYYY-MM-DD" string or a name
+                if len(node.args) != 1:
+                    raise ValueError(f"{fn}() takes one date argument")
+                a = node.args[0]
+                if isinstance(a, ast.Constant):
+                    if not isinstance(a.value, str):
+                        raise ValueError(f'{fn}() argument must be a "YYYY-MM-DD" string or a date key')
+                elif not isinstance(a, ast.Name):
+                    raise ValueError(f'{fn}() argument must be a "YYYY-MM-DD" string or a date key')
+            return  # args validated above; don't recurse (a string arg is only legal here)
+        if fn not in _FUNCS:
+            raise ValueError(f"only these functions are allowed: {sorted(set(_FUNCS) | _DATE_FUNCS)}")
         for arg in node.args:
             _check_node(arg)
     elif isinstance(node, ast.Name):
@@ -173,8 +238,11 @@ def _eval_node(node: ast.AST, ns: dict[str, Any]) -> float:
                 return 1.0
         return 0.0
     if isinstance(node, ast.Call):
+        fn = node.func.id
+        if fn in _DATE_FUNCS:
+            return _eval_date_fn(fn, node.args, ns)
         args = [_eval_node(a, ns) for a in node.args]
-        return _FUNCS[node.func.id](*args)
+        return _FUNCS[fn](*args)
     if isinstance(node, ast.Name):
         if node.id not in ns:
             raise _UnresolvedNameError(node.id)
@@ -216,6 +284,44 @@ def render_template(text: Any, values: dict) -> str:
         return _fmt_value(values[key]) if key in values else m.group(0)
 
     return _TEMPLATE_RE.sub(repl, str(text))
+
+
+def _aggregate_list(spec: dict, values: dict, now_ms: int, tz: tzinfo | None) -> float:
+    """Aggregate a dynamic ``list`` state into a scalar so stat / visibleWhen /
+    watches can reason about it: ``{list, agg, field?, where?}``. ``where`` is an
+    expr evaluated per item with the item's own fields (plus ``__now__`` for date
+    fns) in scope. Makes lists first-class in the value system."""
+    key = spec.get("list")
+    items = values.get(key)
+    if not isinstance(items, list):
+        raise _UnresolvedNameError(str(key))
+    where = spec.get("where")
+    if where:
+        selected = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            ns = {**it, "__now__": now_ms, "__tz__": tz}
+            try:
+                if eval_expr(str(where), ns) != 0:
+                    selected.append(it)
+            except _UnresolvedNameError:
+                continue  # an item lacking a field the filter needs is excluded
+        items = selected
+    agg = spec.get("agg", "count")
+    if agg == "count":
+        return float(len(items))
+    field = spec.get("field")
+    nums = [
+        float(it[field])
+        for it in items
+        if isinstance(it, dict)
+        and isinstance(it.get(field), (int, float))
+        and not isinstance(it.get(field), bool)
+    ]
+    if not nums:
+        return 0.0
+    return float(_apply_agg(nums, agg))
 
 
 def _resolve_cases(spec: dict, values: dict) -> str:
@@ -452,6 +558,12 @@ def resolve_values(
     for e in events:
         by_series.setdefault(e["series"], []).append(e)
 
+    # `now`/`days_until` etc. read these from the eval namespace. Reserved
+    # (double-underscore) so no user key can collide; stripped before we return
+    # so they never reach the client or the preview.
+    values["__now__"] = now_ms
+    values["__tz__"] = tz
+
     # 2. computed (dependency-order resolve; order-independent via fixpoint)
     computed_defs = definition.get("computed", {}) or {}
     pending = dict(computed_defs)
@@ -472,6 +584,13 @@ def resolve_values(
                 )
                 del pending[key]
                 progressed = True
+            elif "list" in spec:  # aggregate a dynamic list (count/sum/... + where)
+                try:
+                    values[key] = _aggregate_list(spec, values, now_ms, tz)
+                    del pending[key]
+                    progressed = True
+                except _UnresolvedNameError:
+                    continue
             elif "cases" in spec:  # conditional text
                 try:
                     values[key] = _resolve_cases(spec, values)
@@ -490,6 +609,9 @@ def resolve_values(
             break
     for key, spec in pending.items():  # unresolved (cycle / bad ref) → safe fallback
         values[key] = "" if isinstance(spec, dict) and "cases" in spec else 0.0
+
+    values.pop("__now__", None)
+    values.pop("__tz__", None)
 
     # 3. per-component series data (chart / sparkline / heatmap)
     for comp in _iter_components(definition.get("layout", [])):

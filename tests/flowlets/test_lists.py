@@ -180,3 +180,87 @@ async def test_envelope_unwrapped_for_non_item_ops(store):
     res = await apply_action(store, fid, "note_in",
                              value={"itemId": item_id, "value": "hello"}, tz=UTC)
     assert res["values"]["note"] == "hello"
+
+
+# ── list aggregation (T2) — lists become first-class in the value system ──────
+
+def _agg_def():
+    return {
+        "catalog": 1, "name": "T",
+        "state": {"cart": {"type": "list",
+                           "item": {"name": "string", "price": "number", "bought": "bool"}}},
+        "computed": {
+            "count":     {"list": "cart", "agg": "count"},
+            "unbought":  {"list": "cart", "agg": "count", "where": "bought == 0"},
+            "total":     {"list": "cart", "agg": "sum", "field": "price"},
+            "todo_total":{"list": "cart", "agg": "sum", "field": "price", "where": "bought == 0"},
+            "max_price": {"list": "cart", "agg": "max", "field": "price"},
+            "all_done":  {"list": "cart", "agg": "count", "where": "bought == 0"},  # ==0 → all bought
+        },
+        "layout": [{"type": "text", "text": "{count}"}],
+    }
+
+
+def test_list_agg_valid():
+    validate_definition(_agg_def())
+
+
+@pytest.mark.parametrize("mut, match", [
+    (lambda c: c["count"].update({"list": "ghost"}), "list"),
+    (lambda c: c["total"].update({"field": "name"}), "number"),
+    (lambda c: c["total"].pop("field"), "field"),                     # sum w/o field
+    (lambda c: c["count"].update({"agg": "median"}), "agg"),
+    (lambda c: c["unbought"].update({"where": "typo > 0"}), "unknown item field"),
+    (lambda c: c["count"].update({"expr": "1"}), "exactly one"),      # two forms
+])
+def test_list_agg_schema_rejects(mut, match):
+    d = _agg_def()
+    mut(d["computed"])
+    with pytest.raises(FlowletValidationError, match=match):
+        validate_definition(d)
+
+
+def test_list_agg_resolves(store):
+    d = _agg_def()
+    f = store.create("T", d)
+    store.set_state(f["id"], "cart", [
+        {"id": "a", "name": "süt", "price": 30, "bought": True},
+        {"id": "b", "name": "ekmek", "price": 15, "bought": False},
+        {"id": "c", "name": "yumurta", "price": 45, "bought": False},
+    ])
+    v = resolve_values(d, store.get_state(f["id"]), [], now_ms(), UTC)
+    assert v["count"] == 3
+    assert v["unbought"] == 2
+    assert v["total"] == 90
+    assert v["todo_total"] == 60
+    assert v["max_price"] == 45
+    assert v["all_done"] == 2   # not all bought
+
+
+def test_list_agg_empty_and_visiblewhen_usable(store):
+    d = _agg_def()
+    # a computed that drives visibleWhen: hide a banner when the cart is empty
+    f = store.create("T", d)
+    v = resolve_values(d, store.get_state(f["id"]), [], now_ms(), UTC)
+    assert v["count"] == 0 and v["total"] == 0 and v["all_done"] == 0
+
+
+def test_list_agg_with_date_where(store):
+    """A `where` can use date fns on a `date` item field — overdue count."""
+    d = {
+        "catalog": 1, "name": "Deadlines",
+        "state": {"tasks": {"type": "list", "item": {"title": "string", "due": "date"}}},
+        "computed": {"overdue": {"list": "tasks", "agg": "count", "where": "days_until(due) < 0"}},
+        "layout": [{"type": "text", "text": "{overdue}"}],
+    }
+    validate_definition(d)
+    f = store.create("Deadlines", d)
+    from datetime import datetime
+    now = int(datetime(2026, 7, 9, 12, 0, tzinfo=UTC).timestamp() * 1000)
+    store.set_state(f["id"], "tasks", [
+        {"id": "a", "title": "geç", "due": "2026-07-01"},   # overdue
+        {"id": "b", "title": "yarın", "due": "2026-07-10"},  # future
+        {"id": "c", "title": "dün", "due": "2026-07-08"},    # overdue
+    ])
+    v = resolve_values(d, store.get_state(f["id"]), [], now, UTC)
+    assert v["overdue"] == 2

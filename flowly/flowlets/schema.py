@@ -32,6 +32,22 @@ def _is_number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _expr_key_refs(expr: str) -> set[str]:
+    """The names an expr references that must be declared keys — i.e. every
+    ``Name`` except those used as a function (``min``, ``days_until``, …). Lets
+    author-time validation flag a typo'd key without mistaking a function for
+    one."""
+    import ast
+
+    tree = ast.parse(expr, mode="eval")
+    funcs = {
+        c.func.id
+        for c in ast.walk(tree)
+        if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+    }
+    return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id not in funcs}
+
+
 def validate_definition(defn: Any) -> dict:
     """Validate a flowlet definition. Returns the (unchanged) definition dict on
     success; raises :class:`FlowletValidationError` with actionable guidance.
@@ -128,7 +144,7 @@ def validate_definition(defn: Any) -> dict:
             raise _err(f"computed key '{key}' is invalid (letters/digits/underscore)")
         if key in scalar_keys or key in list_keys:
             raise _err(f"computed key '{key}' collides with a state key of the same name")
-        _validate_computed_spec(key, spec, series_keys)
+        _validate_computed_spec(key, spec, series_keys, list_keys)
         computed_keys.add(key)
 
     scalar_keys |= computed_keys  # both resolve to scalars in `values`
@@ -220,14 +236,20 @@ def _validate_state_spec(key: str, spec: Any) -> None:
             raise _err(f"state '{key}': `max` must be an integer 1..{catalog.MAX_LIST_ITEMS}")
 
 
-def _validate_computed_spec(key: str, spec: Any, series_keys: set[str]) -> None:
+def _validate_computed_spec(
+    key: str, spec: Any, series_keys: set[str], list_keys: dict[str, dict] | None = None
+) -> None:
+    list_keys = list_keys or {}
     if not isinstance(spec, dict):
-        raise _err(f"computed '{key}' must be an object with `series`, `expr`, or `cases`")
-    forms = [f for f in ("series", "expr", "cases") if f in spec]
+        raise _err(f"computed '{key}' must be an object with `series`, `list`, `expr`, or `cases`")
+    forms = [f for f in ("series", "list", "expr", "cases") if f in spec]
     if len(forms) != 1:
-        raise _err(f"computed '{key}' must have exactly one of `series`, `expr`, or `cases`")
+        raise _err(f"computed '{key}' must have exactly one of `series`, `list`, `expr`, or `cases`")
     if forms[0] == "cases":
         _validate_cases_spec(key, spec)
+        return
+    if forms[0] == "list":
+        _validate_list_agg_spec(key, spec, list_keys)
         return
     has_series = forms[0] == "series"
     if has_series:
@@ -254,6 +276,42 @@ def _validate_computed_spec(key: str, spec: Any, series_keys: set[str]) -> None:
             validate_expr(expr)
         except ValueError as exc:
             raise _err(f"computed '{key}': {exc}")
+
+
+def _validate_list_agg_spec(key: str, spec: dict, list_keys: dict[str, dict]) -> None:
+    """Conditional aggregation of a dynamic list: ``{list, agg, field?, where?}``
+    → a scalar. ``where`` is an expr over the item's own fields."""
+    from flowly.flowlets.queries import validate_expr
+
+    lk = spec["list"]
+    if lk not in list_keys:
+        raise _err(f"computed '{key}': `list` must name a declared list state key; got {lk!r}")
+    fields = list_keys[lk]
+    agg = spec.get("agg", "count")
+    if agg not in ("count", "sum", "avg", "min", "max"):
+        raise _err(f"computed '{key}': agg must be one of count/sum/avg/min/max, got {agg!r}")
+    if agg != "count":
+        field = spec.get("field")
+        if field not in fields:
+            raise _err(f"computed '{key}': `{agg}` needs a declared numeric `field` of '{lk}'")
+        if fields[field] != "number":
+            raise _err(f"computed '{key}': field '{field}' must be a number to `{agg}` it")
+    where = spec.get("where")
+    if where is not None:
+        if not isinstance(where, str) or not where.strip():
+            raise _err(f"computed '{key}': `where` must be a non-empty expression")
+        try:
+            validate_expr(where)
+        except ValueError as exc:
+            raise _err(f"computed '{key}': where {exc}")
+        # names in `where` are item fields (or a date literal); a typo is caught
+        # here rather than silently excluding every row.
+        for name in _expr_key_refs(where):
+            if name not in fields:
+                raise _err(
+                    f"computed '{key}': where references unknown item field '{name}' "
+                    f"(declared: {sorted(fields)})"
+                )
 
 
 def _validate_cases_spec(key: str, spec: dict) -> None:
@@ -354,11 +412,10 @@ def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
             validate_expr(vw)
         except ValueError as exc:
             raise _err(f"{ctype} (id={cid}): visibleWhen {exc}")
-        import ast as _ast
-        for _n in _ast.walk(_ast.parse(vw, mode="eval")):
-            if isinstance(_n, _ast.Name) and _n.id not in ctx.scalar_keys:
+        for _name in _expr_key_refs(vw):
+            if _name not in ctx.scalar_keys:
                 raise _err(
-                    f"{ctype} (id={cid}): visibleWhen references unknown key '{_n.id}' — "
+                    f"{ctype} (id={cid}): visibleWhen references unknown key '{_name}' — "
                     "it must be a declared state or computed key"
                 )
 
@@ -776,12 +833,10 @@ def _validate_watch_expr(where: str, w: dict, scalar_keys: set[str]) -> None:
         raise _err(f"{where}: when {exc}")
     # every referenced name must be a declared scalar (state or computed key),
     # so a typo is caught at author time rather than silently never firing.
-    import ast
-
-    for node in ast.walk(ast.parse(when, mode="eval")):
-        if isinstance(node, ast.Name) and node.id not in scalar_keys:
+    for name in _expr_key_refs(when):
+        if name not in scalar_keys:
             raise _err(
-                f"{where}: `when` references unknown key '{node.id}' — it must be a "
+                f"{where}: `when` references unknown key '{name}' — it must be a "
                 "declared state or computed key"
             )
     after = w.get("after")

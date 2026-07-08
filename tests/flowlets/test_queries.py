@@ -209,3 +209,61 @@ def test_cases_unresolvable_falls_back_to_empty_string():
     # ghost never resolves → the whole cases computed defers forever → ""
     out = resolve_values(d, {}, [], now, UTC)
     assert out["statusText"] == ""
+
+
+# ── date/time functions (T5) ──────────────────────────────────────────────────
+# NOW = 2026-07-09 12:00 UTC (a Thursday → weekday()==3). These vectors are the
+# SHARED PARITY LIST — the desktop (flowletExpr.test.ts) and iOS
+# (FlowletExprTests) suites assert the identical (expr → result) pairs so all
+# three evaluators agree. When you touch a date fn, update all three together.
+
+_DATE_NOW = int(datetime(2026, 7, 9, 12, 0, tzinfo=UTC).timestamp() * 1000)
+_DATE_NS = {"due": "2026-07-15", "past": "2026-07-01",
+            "__now__": _DATE_NOW, "__tz__": UTC}
+
+# (expr, expected) — keep in sync with the client suites.
+DATE_VECTORS = [
+    ('days_until("2026-07-15")', 6),
+    ("days_until(due)", 6),
+    ('days_since("2026-07-01")', 8),
+    ("days_since(past)", 8),
+    ("days_until(past)", -8),
+    ('days_until("2026-07-09")', 0),   # today
+    ("weekday()", 3),                   # Thursday
+    ("days_until(due) <= 1", 0),
+    ("days_until(due) > 0", 1),
+    ("min(3, days_until(due))", 3),
+    ("days_until(due) > 3 and weekday() < 5", 1),
+]
+
+
+@pytest.mark.parametrize("expr, expected", DATE_VECTORS)
+def test_date_fn_vectors(expr, expected):
+    assert eval_expr(expr, dict(_DATE_NS)) == expected
+
+
+def test_now_returns_epoch_ms():
+    assert eval_expr("now()", dict(_DATE_NS)) == float(_DATE_NOW)
+
+
+def test_date_fn_bad_date_is_unresolved():
+    from flowly.flowlets.queries import _UnresolvedNameError
+    with pytest.raises(_UnresolvedNameError):
+        eval_expr('days_until("nope")', dict(_DATE_NS))
+    # a name that isn't a string date → unresolved (fails safe)
+    with pytest.raises(_UnresolvedNameError):
+        eval_expr("days_until(missing)", dict(_DATE_NS))
+
+
+@pytest.mark.parametrize("bad", [
+    "now(1)", "weekday(1)", "days_until()", "days_until(1)", "days_until(a, b)",
+])
+def test_date_fn_shapes_rejected(bad):
+    with pytest.raises(ValueError):
+        validate_expr(bad)
+
+
+def test_date_fn_validate_accepts():
+    for e in ("days_until(due)", 'days_since("2026-01-01")', "weekday()", "now()",
+              "min(days_until(due), 2)"):
+        validate_expr(e)

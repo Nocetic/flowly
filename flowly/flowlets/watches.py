@@ -133,6 +133,11 @@ def _decide(
     last_cond = bool(ws.get("last_cond"))
     tracks_edge = trigger in ("condition", "goal")
 
+    # Let a `when` use date fns (days_until(due) <= 1) — inject the clock the
+    # same way resolve_values does. Extra reserved keys are ignored elsewhere.
+    if "__now__" not in values:
+        values = {**values, "__now__": now_ms, "__tz__": tz}
+
     if watch.get("once") and last_fired is not None:
         return False, (last_cond if tracks_edge else None)
 
