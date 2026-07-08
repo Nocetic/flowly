@@ -63,10 +63,29 @@ Always start the definition with `"catalog": 1`.
 line/bar/area), `sparkline` (data), `heatmap` (data), `table` (rows),
 `clock`, `countdown` (target).
 
+**Display — structured / professional:**
+- `metric` — a headline number: `value` (bind), `unit?`, `label?`, plus an
+  optional trend `delta` (bind) and `deltaLabel?` (e.g. "vs last hour"); set
+  `invert:true` when down is good.
+- `status` — a semantic pill: `text` + `tone` (`ok`/`warn`/`bad`/`neutral`).
+- `keyvalue` — labeled pairs: `rows:[{label, value}]` (value interpolates `{key}`).
+- `timeline` — dated events: `events:[{title, time?, tone?}]` (tone: done/now/wait).
+- `callout` — a toned note box: `text` + `tone` (`info`/`success`/`warn`/`bad`) + `icon?`.
+- `code` — a monospaced block: `text` (+ `language?`).
+- `link` — opens a URL: `text` + `url` (http/https).
+- `image` — `src` (http/https/data) + `alt?`.
+
 **Input (carry an `action`, need an `id`):** `button` (text), `icon_button`
 (icon), `stepper` (value), `slider` (min, max, value), `toggle` (value),
 `checklist` (items — each `{key,label}`, toggles a bool state key), `segmented`
-(options), `input`, `number_input`, `rating` (max).
+(options), `input`, `number_input`, `rating` (max), `select` (options, for
+more than ~4 choices), `date` (a date → `set`), `textarea` (long text → `set`),
+`timer` (a stopwatch — see below).
+
+**Timer** — for billable time, an experiment, a workout. Declare a state key of
+`type:"timer"`, and a `timer` component with `value:"<key>"` and
+`action:{op:"timer_toggle", key:"<key>"}`. It ticks live while running; the bot
+persists elapsed seconds across sessions.
 
 `value`/`max`/`min` on a display component are either a number or the name of a
 state/computed key. A `chart`/`sparkline`/`heatmap` `data` object is
@@ -87,6 +106,7 @@ Put an `action` on an input component. Ops:
 - `reset` — `{op:"reset", key}` or `{op:"reset", series}`.
 - `agent` — `{op:"agent", message}` — hands `message` to you as a normal turn
   (e.g. an "Analyze my week" button). Your reply is delivered to the chat.
+- `timer_toggle` — `{op:"timer_toggle", key}` — start/stop a `timer` state key.
 - `batch` — `{op:"batch", ops:[...]}` — several ops at once.
 
 A button with a fixed `value` (like drink-250) ignores any client value. Free

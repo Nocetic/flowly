@@ -176,6 +176,10 @@ def _validate_state_spec(key: str, spec: Any) -> None:
         ml = spec.get("maxLength")
         if ml is not None and (not isinstance(ml, int) or isinstance(ml, bool) or ml <= 0):
             raise _err(f"state '{key}': maxLength must be a positive integer")
+    elif stype == "timer":
+        # Structured, managed state ({running, since_ms, accum_s}); the agent
+        # doesn't set a default — a timer_toggle action drives it.
+        pass
 
 
 def _validate_computed_spec(key: str, spec: Any, series_keys: set[str]) -> None:
@@ -353,6 +357,13 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
             raise _err(f"{ctype} (id={cid}) action `reset` key '{key}' is not a state key")
         if series is not None and series not in ctx.series_keys:
             raise _err(f"{ctype} (id={cid}) action `reset` series '{series}' is not declared")
+    elif op == "timer_toggle":
+        key = action.get("key")
+        if not isinstance(key, str) or key not in ctx.scalar_keys:
+            raise _err(
+                f"{ctype} (id={cid}) action `timer_toggle` needs `key` naming a "
+                f"declared timer state; got {key!r}"
+            )
     elif op == "agent":
         msg = action.get("message")
         if not isinstance(msg, str) or not msg.strip():
@@ -428,3 +439,33 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx) -> None:
         target = node.get("target")
         if not (_is_number(target) or isinstance(target, str)):
             raise _err(f"countdown (id={cid}) `target` must be a timestamp or ISO string")
+    elif ctype == "keyvalue":
+        rows = node.get("rows")
+        if not isinstance(rows, list) or not rows:
+            raise _err(f"keyvalue (id={cid}) needs a non-empty `rows` array")
+        for r in rows:
+            if not isinstance(r, dict) or "label" not in r:
+                raise _err(f"keyvalue (id={cid}) each row needs a `label`")
+    elif ctype == "timeline":
+        events = node.get("events")
+        if not isinstance(events, list) or not events:
+            raise _err(f"timeline (id={cid}) needs a non-empty `events` array")
+        for e in events:
+            if not isinstance(e, dict) or "title" not in e:
+                raise _err(f"timeline (id={cid}) each event needs a `title`")
+    elif ctype == "link":
+        url = node.get("url")
+        if not isinstance(url, str) or not (url.startswith("http://") or url.startswith("https://")):
+            raise _err(f"link (id={cid}) `url` must be an http(s) URL")
+    elif ctype == "image":
+        src = node.get("src")
+        if not isinstance(src, str) or not src.startswith(("http://", "https://", "data:")):
+            raise _err(f"image (id={cid}) `src` must be an http(s) or data URL")
+    elif ctype == "select":
+        opts = node.get("options")
+        if not isinstance(opts, list) or not opts:
+            raise _err(f"select (id={cid}) needs a non-empty `options` array")
+    elif ctype == "timer":
+        val = node.get("value")
+        if not isinstance(val, str) or val not in ctx.scalar_keys:
+            raise _err(f"timer (id={cid}) `value` must name a declared timer state key")

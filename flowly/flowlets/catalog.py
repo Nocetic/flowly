@@ -34,12 +34,14 @@ BUCKETS = frozenset({"hour", "day", "week"})
 WINDOWS = frozenset({"today", "7d", "30d", "90d", "all"})
 
 # ── State value types ─────────────────────────────────────────────────────────
-STATE_TYPES = frozenset({"number", "bool", "string"})
+# `timer` is a structured state: {running, since_ms, accum_s}; resolve_values
+# exposes it to clients as {running, elapsed} so a running timer ticks live.
+STATE_TYPES = frozenset({"number", "bool", "string", "timer"})
 
 # ── Action ops the interpreter understands (see actions.py) ───────────────────
 ACTION_OPS = frozenset({
     "set", "increment", "decrement", "toggle",
-    "log", "remove_last", "reset", "agent", "batch",
+    "log", "remove_last", "reset", "agent", "batch", "timer_toggle",
 })
 
 # ── Icon names (platform-neutral; mapped to SF Symbols / lucide per client) ───
@@ -107,6 +109,25 @@ COMPONENTS: dict[str, dict] = {
     "countdown": {"category": "display", "container": False, "action": False,
                   "required": ["target"]},
 
+    # ── Display v2 (structured / professional) ────────────────────────────────
+    "metric":    {"category": "display", "container": False, "action": False,
+                  "required": ["value"], "binds": ["value", "delta"]},
+    "status":    {"category": "display", "container": False, "action": False,
+                  "required": ["text"]},
+    "keyvalue":  {"category": "display", "container": False, "action": False,
+                  "required": ["rows"]},
+    "timeline":  {"category": "display", "container": False, "action": False,
+                  "required": ["events"]},
+    "callout":   {"category": "display", "container": False, "action": False,
+                  "required": ["text"]},
+    "code":      {"category": "display", "container": False, "action": False,
+                  "required": ["text"]},
+    "link":      {"category": "display", "container": False, "action": False,
+                  "required": ["text", "url"]},
+    "image":     {"category": "display", "container": False, "action": False,
+                  "required": ["src"]},
+    "timer":     {"category": "display", "container": False, "action": True},
+
     # ── Input / interaction (10) ──────────────────────────────────────────────
     "button":       {"category": "input", "container": False, "action": True,
                      "required": ["text"]},
@@ -127,6 +148,11 @@ COMPONENTS: dict[str, dict] = {
                      "binds": ["value"]},
     "rating":       {"category": "input", "container": False, "action": True,
                      "binds": ["value"]},
+    # ── Input v2 ──────────────────────────────────────────────────────────────
+    "select":       {"category": "input", "container": False, "action": True,
+                     "required": ["options"]},
+    "date":         {"category": "input", "container": False, "action": True},
+    "textarea":     {"category": "input", "container": False, "action": True},
 }
 
 #: Chart-family components whose ``data`` prop resolves to a per-bucket series.

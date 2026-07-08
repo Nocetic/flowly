@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "flowlets"
-FIXTURE_NAMES = ["water", "habits", "mood", "pomodoro"]
+FIXTURE_NAMES = ["water", "habits", "mood", "pomodoro", "matter"]
 
 
 def load_fixture(name: str) -> dict:

@@ -293,6 +293,8 @@ def coerce_state(value: Any, spec: dict) -> Any:
         s = "" if value is None else str(value)
         ml = spec.get("maxLength", catalog.MAX_STRING_INPUT)
         return s[: int(ml)]
+    if stype == "timer":
+        return value if isinstance(value, dict) else {"running": False, "since_ms": 0, "accum_s": 0.0}
     return value
 
 
@@ -328,8 +330,17 @@ def resolve_values(
     # 1. state (declared defaults, overridden by persisted values)
     state_defs = definition.get("state", {}) or {}
     for key, spec in state_defs.items():
-        raw = state_map.get(key, spec.get("default"))
-        values[key] = coerce_state(raw, spec) if isinstance(spec, dict) else raw
+        if isinstance(spec, dict) and spec.get("type") == "timer":
+            # Expose a timer as {running, elapsed} so a running one ticks live.
+            t = state_map.get(key) or {}
+            running = bool(t.get("running"))
+            accum = float(t.get("accum_s", 0) or 0)
+            since = int(t.get("since_ms", 0) or 0)
+            elapsed = accum + (max(0, now_ms - since) / 1000.0 if running else 0.0)
+            values[key] = {"running": running, "elapsed": round(elapsed, 1)}
+        else:
+            raw = state_map.get(key, spec.get("default") if isinstance(spec, dict) else None)
+            values[key] = coerce_state(raw, spec) if isinstance(spec, dict) else raw
 
     # group events by series once
     by_series: dict[str, list[dict]] = {}

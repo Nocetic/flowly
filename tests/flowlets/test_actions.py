@@ -140,3 +140,22 @@ async def test_agent_op_unavailable_without_runner(store, water_def):
     with pytest.raises(FlowletActionError) as ei:
         await apply_action(store, f["id"], "coach", tz=UTC, agent_runner=None)
     assert ei.value.code == "UNAVAILABLE"
+
+
+async def test_timer_toggle_starts_and_stops(store):
+    import time as _time
+    f_def = load_fixture("matter")
+    f = store.create("Dava", f_def)
+    # starts stopped
+    res = await apply_action(store, f["id"], "billableTimer", tz=UTC)
+    assert res["values"]["billable"]["running"] is True
+    _time.sleep(1.1)
+    # while running, elapsed grows
+    from flowly.flowlets import queries
+    from flowly.flowlets.store import now_ms
+    v = queries.resolve_values(f_def, store.get_state(f["id"]), store.get_events(f["id"]), now_ms(), UTC)
+    assert v["billable"]["elapsed"] >= 1.0
+    # stopping accumulates and freezes
+    res = await apply_action(store, f["id"], "billableTimer", tz=UTC)
+    assert res["values"]["billable"]["running"] is False
+    assert res["values"]["billable"]["elapsed"] >= 1.0

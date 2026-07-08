@@ -175,6 +175,21 @@ async def _apply_op(
         cur = _current_scalar(store, flowlet_id, definition, key)
         store.set_state(flowlet_id, key, coerce_state(not bool(cur), spec))
 
+    elif op == "timer_toggle":
+        key = action["key"]
+        _state_spec(definition, key)  # ensure declared
+        cur = store.get_state(flowlet_id).get(key) or {}
+        running = bool(cur.get("running"))
+        accum = float(cur.get("accum_s", 0) or 0)
+        since = int(cur.get("since_ms", 0) or 0)
+        now = queries_now_ms()
+        if running:
+            accum += max(0, now - since) / 1000.0
+            new = {"running": False, "since_ms": 0, "accum_s": accum}
+        else:
+            new = {"running": True, "since_ms": now, "accum_s": accum}
+        store.set_state(flowlet_id, key, new)
+
     elif op == "log":
         series = action.get("series")
         if not series:

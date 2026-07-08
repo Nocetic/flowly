@@ -1,0 +1,74 @@
+{
+  "catalog": 1,
+  "name": "Dava Takibi",
+  "icon": "book",
+  "accent": "#7B61FF",
+  "state": {
+    "billable": { "type": "timer" },
+    "stage": { "type": "string", "default": "İtiraz" },
+    "evidence_done": { "type": "bool", "default": false },
+    "draft_done": { "type": "bool", "default": false }
+  },
+  "layout": [
+    {
+      "id": "deadline",
+      "type": "callout",
+      "tone": "warn",
+      "icon": "bell",
+      "text": "İtiraz dilekçesi 11 Temmuz'da teslim edilmeli."
+    },
+    {
+      "id": "status",
+      "type": "status",
+      "text": "Aktif dava",
+      "tone": "ok"
+    },
+    {
+      "id": "history",
+      "type": "timeline",
+      "events": [
+        { "title": "Dava açıldı", "time": "18 Haz", "tone": "done" },
+        { "title": "Cevap dilekçesi dosyalandı", "time": "2 Tem", "tone": "done" },
+        { "title": "İtiraz süresi", "time": "11 Tem", "tone": "now" },
+        { "title": "Duruşma", "time": "14 Tem", "tone": "wait" }
+      ]
+    },
+    {
+      "id": "details",
+      "type": "keyvalue",
+      "rows": [
+        { "label": "Dosya No", "value": "2026/418" },
+        { "label": "Mahkeme", "value": "3. Asliye Hukuk" },
+        { "label": "Aşama", "value": "{stage}" }
+      ]
+    },
+    {
+      "id": "stagePick",
+      "type": "select",
+      "label": "Aşama",
+      "options": ["Soruşturma", "İtiraz", "Duruşma", "Karar"],
+      "action": { "op": "set", "key": "stage" }
+    },
+    {
+      "id": "billableTimer",
+      "type": "timer",
+      "value": "billable",
+      "label": "Bugünkü mesai",
+      "action": { "op": "timer_toggle", "key": "billable" }
+    },
+    {
+      "id": "tasks",
+      "type": "checklist",
+      "items": [
+        { "key": "evidence_done", "label": "Deliller derlendi", "icon": "check" },
+        { "key": "draft_done", "label": "İtiraz taslağı hazır", "icon": "pen" }
+      ]
+    },
+    {
+      "id": "openDoc",
+      "type": "link",
+      "text": "Dava dosyasını aç",
+      "url": "https://example.com/matter/2026-418"
+    }
+  ]
+}
