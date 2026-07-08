@@ -143,6 +143,40 @@ A button with a fixed `value` ignores any client-sent value. Free inputs
 (slider/input/number_input/rating) supply their value, validated to the
 component's and the state key's bounds.
 
+## Watches (reactive reminders — evaluated LLM-free)
+
+A top-level `watches: [...]` array turns a flowlet from a passive screen into a
+proactive one. Each rule is evaluated deterministically by the bot — on a 60s
+heartbeat and immediately after any state change — and pushes a reminder
+(APNs/FCM on mobile, native notification on desktop) when it fires. No cron job,
+no model call.
+
+| trigger | fires when | key fields |
+|---|---|---|
+| `schedule` | a time/interval arrives | `at:"HH:MM"` or `everyMinutes`, opt. `days:[...]` |
+| `condition` | `when` expr flips false→true (edge) | `when`, opt. `after:"HH:MM"` |
+| `goal` | `when` target reached (edge) | `when`, opt. `once` |
+| `stale` | no activity for N minutes | `idleMinutes` |
+
+Every watch: `id` (stable) + `notify:{title, body}`. `title`/`body` template
+current values with `{key}`. `when` uses the safe expr grammar — arithmetic
+`+ - * / % min max abs round`, comparisons `< <= > >= == !=`, and `and/or/not`
+over declared state/computed keys. Fires are **edge-triggered** and
+cooldown-gated (defaults: condition 6h, goal 12h, stale 12h; override with
+`cooldownMinutes`). Optional `also:{op:"agent", message}` wakes the agent
+(throttled ≥30 min) for reminders that must *do* something.
+
+```json
+"watches": [
+  { "id": "nudge", "trigger": "condition", "when": "today_ml < goal_ml",
+    "after": "18:00", "notify": { "title": "Water", "body": "{today_ml}/{goal_ml} ml" } },
+  { "id": "win", "trigger": "goal", "when": "today_ml >= goal_ml", "once": true,
+    "notify": { "title": "Goal 🎉" } }
+]
+```
+
+Limits: ≤ 20 watches per flowlet · notify.body ≤ 500 chars · also.message ≤ 300 chars.
+
 ## Icons
 
 Platform-neutral names mapped to SF Symbols (iOS) / lucide (Desktop); unknown →
@@ -162,5 +196,7 @@ definition ≤ 64 KB · ≤ 200 components · nesting depth ≤ 8 · ≤ 50 comp
 
 `flowlets.list · flowlets.get · flowlets.state · flowlets.action · flowlets.pin
 · flowlets.delete` over feature_rpc (gateway + relay). Events:
-`flowlet.created · flowlet.updated · flowlet.deleted · flowlet.state`.
-Creation/definition edits are agent-only (via the `flowlet` tool).
+`flowlet.created · flowlet.updated · flowlet.deleted · flowlet.state ·
+flowlet.reminder` (a watch fired → desktop notification). Creation/definition
+edits are agent-only (via the `flowlet` tool); reactive `watches` fire on the
+bot's 60s heartbeat + on every state change.

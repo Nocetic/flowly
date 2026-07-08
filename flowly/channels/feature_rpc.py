@@ -976,6 +976,11 @@ def _cron():
 #     "analyze my week" button). ``None`` ⇒ that op reports UNAVAILABLE.
 _flowlet_broadcast_cb = None
 _flowlet_agent_runner_cb = None
+#   * watch hook — evaluate a flowlet's reactive watches right after a tap
+#     mutates its state, so a goal celebration / threshold nudge fires
+#     instantly instead of waiting for the next heartbeat. ``None`` ⇒ the
+#     heartbeat (up to 60s later) is the only trigger.
+_flowlet_watch_hook_cb = None
 
 
 def set_flowlet_broadcast(cb) -> None:
@@ -990,6 +995,13 @@ def set_flowlet_agent_runner(cb) -> None:
     for a flowlet ``agent`` action."""
     global _flowlet_agent_runner_cb
     _flowlet_agent_runner_cb = cb
+
+
+def set_flowlet_watch_hook(cb) -> None:
+    """Register an async ``(flowlet_id) -> None`` that evaluates a flowlet's
+    watches immediately after a client tap changes its state."""
+    global _flowlet_watch_hook_cb
+    _flowlet_watch_hook_cb = cb
 
 
 def provider_active() -> dict:
@@ -1480,6 +1492,13 @@ async def flowlets_action(params: dict) -> dict:
             if preview is not None:
                 data["preview"] = preview
             await _flowlet_broadcast_cb("flowlet.state", data)
+        except Exception:
+            pass
+    # Evaluate reactive watches immediately (goal celebration / threshold nudge
+    # shouldn't wait for the next heartbeat). Best-effort — never fail the tap.
+    if _flowlet_watch_hook_cb is not None:
+        try:
+            await _flowlet_watch_hook_cb(flowlet_id)
         except Exception:
             pass
     return result

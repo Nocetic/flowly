@@ -147,14 +147,55 @@ Other easy builds with the same pieces: habit checklist (bool state keys +
 `checklist`), mood log (`rating` → `log`, `sparkline`), pomodoro (`ring` +
 count), weight/budget/reading trackers.
 
-## Pairing with a reminder
+## Reminders that fire themselves — `watches`
 
-If the user wants a nudge ("remind me every 2 hours"), create a `cron` job whose
-message tells you to check the flowlet and, if warranted, notify — e.g. *"Read
-the Water flowlet (flowlet tool, action=get). If today's intake is behind the
-goal for this hour, call flowlet notify with a short, kind reminder."* The
-`notify` action pushes to the user's phone and pops a desktop notification that
-opens the flowlet on tap — better than a chat message for a reminder.
+A flowlet can watch itself and push a reminder with **no cron job and no LLM
+turn**. Add a top-level `watches` array. The bot evaluates each rule
+deterministically (on a 60-second heartbeat and the instant the user taps), and
+when one fires it pushes to the phone + pops a desktop notification that opens
+the flowlet on tap. **Prefer this over a cron+notify pairing** — it's cheaper,
+instant, and the user can see the rule on the screen.
+
+Four triggers:
+
+- `schedule` — a time of day (`"at": "20:00"`), an interval (`"everyMinutes": 120`),
+  optionally limited to `"days": ["mon","wed","fri"]`. Fires once per day for `at`
+  (catches up if the bot was offline). *"Daily 9am summary."*
+- `condition` — a boolean `when` expression over your state/computed keys, e.g.
+  `"today_ml < goal_ml"`. **Edge-triggered**: fires once when it flips false→true,
+  never again until it drops and rises again. Add `"after": "18:00"` to only nag
+  in the evening. *"Behind on water after 6pm."*
+- `goal` — same as condition but for celebrating a target: `"when": "today_ml >= goal_ml"`.
+  Use `"once": true` for a one-time congratulations. *"You hit your goal 🎉"*
+- `stale` — no activity for `"idleMinutes": 180`. Re-arms only after fresh
+  activity. *"Haven't logged in 3 hours."*
+
+Each watch needs a stable `"id"` and a `"notify": { "title", "body" }`. The
+title/body may template current values with `{key}` — e.g. `"{today_ml} / {goal_ml} ml"`.
+
+```json
+"watches": [
+  { "id": "evening_nudge", "trigger": "condition",
+    "when": "today_ml < goal_ml", "after": "18:00",
+    "notify": { "title": "Water check", "body": "{today_ml}/{goal_ml} ml — a bit behind" } },
+  { "id": "goal_hit", "trigger": "goal", "when": "today_ml >= goal_ml", "once": true,
+    "notify": { "title": "Goal reached 🎉", "body": "{today_ml} ml today — nice." } },
+  { "id": "morning", "trigger": "schedule", "at": "09:00",
+    "notify": { "title": "New day", "body": "Fresh water goal for today." } }
+]
+```
+
+Guidance: keep reminders kind and rare. `when` expressions support
+`+ - * / min() max() abs() round()`, comparisons `< <= > >= == !=`, and
+`and / or / not`. Names must be declared state or computed keys. Default
+cooldowns already stop nagging (condition 6h, goal 12h, stale 12h); override
+with `"cooldownMinutes"`. Only add `"also": { "op": "agent", "message": "…" }` when
+the reminder genuinely needs you to *do* something (draft a message, look
+something up) — it costs a model turn and is throttled to ≥30 min.
+
+For logic too rich for a `when` expression (needs a web lookup, cross-flowlet
+reasoning), fall back to a `cron` job that reads the flowlet (action=get) and
+calls the `notify` action.
 
 ## Language
 

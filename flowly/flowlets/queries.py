@@ -44,6 +44,19 @@ _UNARY_OPS = {
     ast.USub: operator.neg,
 }
 
+# Comparison + boolean ops make the grammar expressive enough for watch `when`
+# conditions (``glasses < goal and hour >= 18``). They evaluate to 1.0 / 0.0 so
+# the same evaluator still returns a float; existing arithmetic-only computed
+# exprs are unaffected.
+_CMP_OPS = {
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+}
+
 
 def _safe_round(x, ndigits=0):
     return round(x, int(ndigits))
@@ -76,9 +89,24 @@ def _check_node(node: ast.AST) -> None:
         _check_node(node.left)
         _check_node(node.right)
     elif isinstance(node, ast.UnaryOp):
-        if type(node.op) not in _UNARY_OPS:
+        if isinstance(node.op, ast.Not):
+            _check_node(node.operand)
+        elif type(node.op) in _UNARY_OPS:
+            _check_node(node.operand)
+        else:
             raise ValueError(f"unary operator {type(node.op).__name__} is not allowed")
-        _check_node(node.operand)
+    elif isinstance(node, ast.Compare):
+        for op in node.ops:
+            if type(op) not in _CMP_OPS:
+                raise ValueError(f"comparison {type(op).__name__} is not allowed")
+        _check_node(node.left)
+        for comp in node.comparators:
+            _check_node(comp)
+    elif isinstance(node, ast.BoolOp):
+        if not isinstance(node.op, (ast.And, ast.Or)):
+            raise ValueError("only `and` / `or` boolean operators are allowed")
+        for v in node.values:
+            _check_node(v)
     elif isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name) or node.func.id not in _FUNCS:
             raise ValueError(
@@ -96,7 +124,8 @@ def _check_node(node: ast.AST) -> None:
     else:
         raise ValueError(
             f"{type(node).__name__} is not allowed in expr "
-            "(only + - * / % ** // , numbers, names, and min/max/abs/round/floor/ceil)"
+            "(only + - * / % ** // , comparisons < <= > >= == !=, and/or/not, "
+            "numbers, names, and min/max/abs/round/floor/ceil)"
         )
 
 
@@ -117,7 +146,31 @@ def _eval_node(node: ast.AST, ns: dict[str, Any]) -> float:
         except ZeroDivisionError:
             return 0.0
     if isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.Not):
+            return 0.0 if _eval_node(node.operand, ns) != 0 else 1.0
         return _UNARY_OPS[type(node.op)](_eval_node(node.operand, ns))
+    if isinstance(node, ast.Compare):
+        left = _eval_node(node.left, ns)
+        ok = True
+        for op, comp in zip(node.ops, node.comparators):
+            right = _eval_node(comp, ns)
+            ok = ok and bool(_CMP_OPS[type(op)](left, right))
+            left = right  # chained: 0 < x < 10
+            if not ok:
+                break
+        return 1.0 if ok else 0.0
+    if isinstance(node, ast.BoolOp):
+        # Short-circuit like Python so an unresolved name in the untaken branch
+        # doesn't raise (a watch `when` fails safe to false either way).
+        if isinstance(node.op, ast.And):
+            for v in node.values:
+                if _eval_node(v, ns) == 0:
+                    return 0.0
+            return 1.0
+        for v in node.values:
+            if _eval_node(v, ns) != 0:
+                return 1.0
+        return 0.0
     if isinstance(node, ast.Call):
         args = [_eval_node(a, ns) for a in node.args]
         return _FUNCS[node.func.id](*args)

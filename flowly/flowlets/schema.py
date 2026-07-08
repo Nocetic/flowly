@@ -17,6 +17,7 @@ from flowly.flowlets import catalog
 
 _HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 _KEY_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")  # 24h "HH:MM"
 
 
 class FlowletValidationError(ValueError):
@@ -142,6 +143,11 @@ def validate_definition(defn: Any) -> dict:
 
     if ctx.count > catalog.MAX_COMPONENTS:
         raise _err(f"too many components ({ctx.count}); the limit is {catalog.MAX_COMPONENTS}")
+
+    # ── watches (reactive rules; evaluated LLM-free — see watches.py) ─────────
+    watches = defn.get("watches")
+    if watches is not None:
+        _validate_watches(watches, scalar_keys)
 
     return defn
 
@@ -469,3 +475,130 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx) -> None:
         val = node.get("value")
         if not isinstance(val, str) or val not in ctx.scalar_keys:
             raise _err(f"timer (id={cid}) `value` must name a declared timer state key")
+
+
+# ── watches (reactive rules) ─────────────────────────────────────────────────
+
+def _validate_watches(watches: Any, scalar_keys: set[str]) -> None:
+    if not isinstance(watches, list):
+        raise _err("`watches` must be an array of rule objects")
+    if len(watches) > catalog.MAX_WATCHES:
+        raise _err(f"too many watches ({len(watches)}); the limit is {catalog.MAX_WATCHES}")
+    seen: set[str] = set()
+    for i, w in enumerate(watches):
+        _validate_watch(i, w, scalar_keys, seen)
+
+
+def _validate_watch(i: int, w: Any, scalar_keys: set[str], seen: set[str]) -> None:
+    where = f"watch #{i + 1}"
+    if not isinstance(w, dict):
+        raise _err(f"{where} must be an object")
+
+    wid = w.get("id")
+    if not isinstance(wid, str) or not _KEY_RE.match(wid):
+        raise _err(
+            f"{where} needs a stable string `id` (starts with a letter; "
+            "letters, digits, underscore) — it keys the fire/cooldown state"
+        )
+    if wid in seen:
+        raise _err(f"duplicate watch id '{wid}'")
+    seen.add(wid)
+    where = f"watch '{wid}'"
+
+    trigger = w.get("trigger")
+    if trigger not in catalog.WATCH_TRIGGERS:
+        raise _err(
+            f"{where}: `trigger` must be one of {sorted(catalog.WATCH_TRIGGERS)}, got {trigger!r}"
+        )
+
+    # notify — a watch that fires must have something to say.
+    notify = w.get("notify")
+    if not isinstance(notify, dict):
+        raise _err(f"{where}: a `notify` object with a `title` is required")
+    title = notify.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise _err(f"{where}: notify.title must be a non-empty string")
+    if len(title) > catalog.MAX_NAME_LEN:
+        raise _err(f"{where}: notify.title must be ≤ {catalog.MAX_NAME_LEN} characters")
+    body = notify.get("body")
+    if body is not None and not isinstance(body, str):
+        raise _err(f"{where}: notify.body must be a string")
+    if isinstance(body, str) and len(body) > catalog.MAX_LABEL_LEN:
+        raise _err(f"{where}: notify.body must be ≤ {catalog.MAX_LABEL_LEN} characters")
+
+    # trigger-specific fields
+    if trigger == "schedule":
+        _validate_watch_schedule(where, w)
+    elif trigger in ("condition", "goal"):
+        _validate_watch_expr(where, w, scalar_keys)
+    elif trigger == "stale":
+        idle = w.get("idleMinutes")
+        if not isinstance(idle, int) or isinstance(idle, bool) or idle <= 0:
+            raise _err(f"{where}: a stale watch needs a positive integer `idleMinutes`")
+
+    # optional common fields
+    days = w.get("days")
+    if days is not None:
+        if not isinstance(days, list) or not days or not all(
+            isinstance(d, str) and d.lower() in catalog.WATCH_DAYS for d in days
+        ):
+            raise _err(f"{where}: `days` must be a non-empty list of {sorted(catalog.WATCH_DAYS)}")
+
+    cooldown = w.get("cooldownMinutes")
+    if cooldown is not None and (
+        not isinstance(cooldown, int) or isinstance(cooldown, bool) or cooldown < 0
+    ):
+        raise _err(f"{where}: cooldownMinutes must be a non-negative integer")
+
+    if "once" in w and not isinstance(w["once"], bool):
+        raise _err(f"{where}: `once` must be true or false")
+
+    # optional agent escape hatch — the ONLY side-effect a watch may trigger
+    # besides the push itself.
+    also = w.get("also")
+    if also is not None:
+        if not isinstance(also, dict):
+            raise _err(f"{where}: `also` must be an object")
+        if also.get("op") != "agent":
+            raise _err(f'{where}: `also.op` must be "agent" (the only action a watch may trigger)')
+        msg = also.get("message")
+        if not isinstance(msg, str) or not msg.strip():
+            raise _err(f"{where}: also.message must be a non-empty string")
+        if len(msg) > catalog.MAX_WATCH_MESSAGE_LEN:
+            raise _err(f"{where}: also.message must be ≤ {catalog.MAX_WATCH_MESSAGE_LEN} characters")
+
+
+def _validate_watch_schedule(where: str, w: dict) -> None:
+    at = w.get("at")
+    every = w.get("everyMinutes")
+    if at is None and every is None:
+        raise _err(f'{where}: a schedule watch needs `at` ("HH:MM") or `everyMinutes`')
+    if at is not None and (not isinstance(at, str) or not _HHMM_RE.match(at)):
+        raise _err(f'{where}: `at` must be a 24-hour time like "20:00"')
+    if every is not None and (not isinstance(every, int) or isinstance(every, bool) or every <= 0):
+        raise _err(f"{where}: everyMinutes must be a positive integer")
+
+
+def _validate_watch_expr(where: str, w: dict, scalar_keys: set[str]) -> None:
+    when = w.get("when")
+    if not isinstance(when, str) or not when.strip():
+        raise _err(f"{where}: a `when` boolean expression is required (e.g. \"glasses < goal\")")
+    from flowly.flowlets.queries import validate_expr
+
+    try:
+        validate_expr(when)
+    except ValueError as exc:
+        raise _err(f"{where}: when {exc}")
+    # every referenced name must be a declared scalar (state or computed key),
+    # so a typo is caught at author time rather than silently never firing.
+    import ast
+
+    for node in ast.walk(ast.parse(when, mode="eval")):
+        if isinstance(node, ast.Name) and node.id not in scalar_keys:
+            raise _err(
+                f"{where}: `when` references unknown key '{node.id}' — it must be a "
+                "declared state or computed key"
+            )
+    after = w.get("after")
+    if after is not None and (not isinstance(after, str) or not _HHMM_RE.match(after)):
+        raise _err(f'{where}: `after` must be a 24-hour time like "18:00"')

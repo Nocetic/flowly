@@ -62,11 +62,18 @@ class FlowletTool(Tool):
     ):
         self._store = store
         self._on_change = on_change
+        self._watch_hook: Callable[[str], Awaitable[None]] | None = None
         self._channel = ""
         self._chat_id = ""
 
     def set_on_change(self, callback: Callable[[str, dict], Awaitable[None]]) -> None:
         self._on_change = callback
+
+    def set_watch_hook(self, callback: Callable[[str], Awaitable[None]]) -> None:
+        """Register an async ``(flowlet_id) -> None`` invoked after the agent
+        mutates a flowlet's state, so reactive watches fire promptly (a goal it
+        just logged for you celebrates now, not at the next heartbeat)."""
+        self._watch_hook = callback
 
     def set_context(self, channel: str, chat_id: str) -> None:
         """Record the current chat so a created flowlet knows where an
@@ -367,3 +374,11 @@ class FlowletTool(Tool):
                 await self._on_change(event_name, data)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Flowlet broadcast error: {}", exc)
+        # A state change may satisfy a reactive watch — evaluate it now.
+        if event_name == "flowlet.state" and self._watch_hook:
+            fid = data.get("id")
+            if fid:
+                try:
+                    await self._watch_hook(str(fid))
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Flowlet watch hook error: {}", exc)

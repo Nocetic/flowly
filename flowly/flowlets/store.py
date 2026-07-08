@@ -71,9 +71,17 @@ CREATE TABLE IF NOT EXISTS flowlet_events (
 
 CREATE INDEX IF NOT EXISTS idx_flowlet_events
     ON flowlet_events(flowlet_id, series, ts);
+
+CREATE TABLE IF NOT EXISTS flowlet_watch_state (
+    flowlet_id    TEXT NOT NULL REFERENCES flowlets(id) ON DELETE CASCADE,
+    watch_id      TEXT NOT NULL,
+    last_fired_ms INTEGER,
+    last_cond     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (flowlet_id, watch_id)
+);
 """
 
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
 
 
 def now_ms() -> int:
@@ -351,6 +359,71 @@ class FlowletStore:
                 (flowlet_id, series),
             )
             return int(cur.rowcount)
+
+    def last_activity_ms(self, flowlet_id: str) -> int | None:
+        """Newest state-write or event timestamp for a flowlet, or ``None`` if it
+        has neither yet. Backs ``stale`` watches ("no activity for N minutes")."""
+        with self._lock:
+            r1 = self._conn.execute(
+                "SELECT MAX(updated_at) AS m FROM flowlet_state WHERE flowlet_id = ?",
+                (flowlet_id,),
+            ).fetchone()
+            r2 = self._conn.execute(
+                "SELECT MAX(ts) AS m FROM flowlet_events WHERE flowlet_id = ?",
+                (flowlet_id,),
+            ).fetchone()
+        cands = [r["m"] for r in (r1, r2) if r and r["m"] is not None]
+        return max(cands) if cands else None
+
+    # ── Watch runtime state (edge detection + cooldown for reactive rules) ──────
+
+    def get_watch_state(self, flowlet_id: str) -> dict[str, dict]:
+        """``{watch_id: {"last_fired_ms": int|None, "last_cond": bool}}`` for a
+        flowlet. Missing rows mean "never evaluated" (the engine treats absent as
+        last_cond=False, last_fired=None)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT watch_id, last_fired_ms, last_cond
+                   FROM flowlet_watch_state WHERE flowlet_id = ?""",
+                (flowlet_id,),
+            ).fetchall()
+        return {
+            r["watch_id"]: {
+                "last_fired_ms": r["last_fired_ms"],
+                "last_cond": bool(r["last_cond"]),
+            }
+            for r in rows
+        }
+
+    def set_watch_state(
+        self,
+        flowlet_id: str,
+        watch_id: str,
+        *,
+        last_fired_ms: int | None = None,
+        last_cond: bool | None = None,
+    ) -> None:
+        """Upsert a watch's runtime state, overwriting only the fields provided
+        (a ``None`` argument leaves the stored value untouched)."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """SELECT last_fired_ms, last_cond FROM flowlet_watch_state
+                   WHERE flowlet_id = ? AND watch_id = ?""",
+                (flowlet_id, watch_id),
+            ).fetchone()
+            cur_fired = row["last_fired_ms"] if row else None
+            cur_cond = row["last_cond"] if row else 0
+            new_fired = last_fired_ms if last_fired_ms is not None else cur_fired
+            new_cond = (1 if last_cond else 0) if last_cond is not None else cur_cond
+            self._conn.execute(
+                """INSERT INTO flowlet_watch_state
+                       (flowlet_id, watch_id, last_fired_ms, last_cond)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(flowlet_id, watch_id)
+                   DO UPDATE SET last_fired_ms = excluded.last_fired_ms,
+                                 last_cond    = excluded.last_cond""",
+                (flowlet_id, watch_id, new_fired, new_cond),
+            )
 
     # ── Row conversion ────────────────────────────────────────────────────────
 

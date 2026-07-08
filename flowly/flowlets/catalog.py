@@ -44,6 +44,27 @@ ACTION_OPS = frozenset({
     "log", "remove_last", "reset", "agent", "batch", "timer_toggle",
 })
 
+# ── Watches (declarative reactive rules; evaluated LLM-free) ──────────────────
+# A definition may carry a top-level `watches` array. Each rule is evaluated by
+# the bot on a heartbeat (and on client taps) and, when it fires, sends a push /
+# desktop reminder. See flowly/flowlets/watches.py.
+WATCH_TRIGGERS = frozenset({"schedule", "condition", "goal", "stale"})
+WATCH_DAYS = frozenset({"mon", "tue", "wed", "thu", "fri", "sat", "sun"})
+MAX_WATCHES = 20
+MAX_WATCH_MESSAGE_LEN = 300
+#: Default minimum gap between two fires of the same watch (minutes), by trigger.
+#: `schedule` is de-duped per local day (`at`) or by its own `everyMinutes`, so
+#: it needs no default cooldown.
+WATCH_DEFAULT_COOLDOWN_MIN: dict[str, int] = {
+    "condition": 360,   # 6h — a threshold nudge shouldn't nag
+    "goal": 720,        # 12h — a celebration fires once per real achievement
+    "stale": 720,       # 12h — pair with idleMinutes; re-fires only after new activity
+}
+#: Agent-wake watches (`also: {op: "agent"}`) are throttled at least this hard,
+#: regardless of the watch's own cooldown — a model call must never be cheap to
+#: trigger on a tight loop.
+WATCH_AGENT_MIN_COOLDOWN_MIN = 30
+
 # ── Icon names (platform-neutral; mapped to SF Symbols / lucide per client) ───
 # Unknown names are allowed — the client falls back to a neutral dot — but
 # these are the vetted set documented in docs/flowlets-catalog.md.

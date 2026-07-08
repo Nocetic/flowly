@@ -1389,6 +1389,20 @@ Respond to the user now:"""
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Flowlet outbound failed: {}", exc)
 
+    # The reactive watch engine (Wave 2 / "Jarvis"): evaluates each flowlet's
+    # declarative `watches` LLM-free and pushes a reminder when one fires. Built
+    # here so it shares the agent tool's exact store instance (single writer).
+    _watch_engine = None
+
+    async def _watch_notify(flowlet_id: str, title: str, body: str) -> None:
+        """A watch fired → APNs/FCM (mobile) + flowlet.reminder (desktop)."""
+        from flowly.push.flowlet_push import notify_flowlet
+        await notify_flowlet(flowlet_id, title, body, broadcast=_broadcast_flowlet)
+
+    async def _watch_hook(flowlet_id: str) -> None:
+        if _watch_engine is not None:
+            await _watch_engine.evaluate_one(flowlet_id, reason="tap")
+
     try:
         from flowly.channels import feature_rpc as _frpc_flowlet
         _frpc_flowlet.set_flowlet_broadcast(_broadcast_flowlet)
@@ -1396,6 +1410,19 @@ Respond to the user now:"""
         _flowlet_tool = agent.tools.get("flowlet")
         if _flowlet_tool and hasattr(_flowlet_tool, "set_on_change"):
             _flowlet_tool.set_on_change(_broadcast_flowlet)
+
+        # Build the watch engine on the tool's store (falls back to the shared
+        # singleton) and wire the immediate-eval hooks on both mutation paths:
+        # client taps (feature_rpc) and agent-driven state changes (the tool).
+        from flowly.flowlets.store import get_store as _get_flowlet_store
+        from flowly.flowlets.watches import WatchEngine
+        _fl_store = getattr(_flowlet_tool, "_store", None) or _get_flowlet_store()
+        _watch_engine = WatchEngine(
+            _fl_store, notify=_watch_notify, agent_runner=_flowlet_agent_runner,
+        )
+        _frpc_flowlet.set_flowlet_watch_hook(_watch_hook)
+        if _flowlet_tool and hasattr(_flowlet_tool, "set_watch_hook"):
+            _flowlet_tool.set_watch_hook(_watch_hook)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Flowlet wiring skipped: {}", exc)
 
@@ -1550,10 +1577,17 @@ Respond to the user now:"""
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, signal_handler)
 
+        _watch_task: asyncio.Task | None = None
         try:
             await gateway_server.start()
             await cron.start()
             await heartbeat.start(run_on_start=True)
+
+            # Flowlet reactive watches — a lightweight 60s heartbeat that fires
+            # schedule/stale/condition reminders LLM-free (client taps trigger an
+            # immediate eval via the watch hook; this catches time-of-day rules).
+            if _watch_engine is not None:
+                _watch_task = asyncio.create_task(_watch_engine.run_heartbeat(interval_s=60))
 
             # Start voice plugin if available
             if voice_plugin:
@@ -1686,6 +1720,8 @@ Respond to the user now:"""
             console.print("[dim]Cleaning up...[/dim]")
             if voice_plugin:
                 await voice_plugin.stop()
+            if _watch_task is not None:
+                _watch_task.cancel()
             await gateway_server.stop()
             heartbeat.stop()
             cron.stop()
