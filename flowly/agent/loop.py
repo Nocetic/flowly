@@ -585,7 +585,7 @@ class AgentLoop:
             # Rebuild index from existing sessions on first run
             self._session_indexer.rebuild_from_sessions_dir(self.sessions.sessions_dir)
         except Exception as e:
-            logger.warning("Session indexer init failed (search disabled): %s", e)
+            logger.warning("Session indexer init failed (search disabled): {}", e)
 
         self._running = False
         self._on_compaction: Callable | None = None  # set by CLI after creation
@@ -1877,7 +1877,7 @@ class AgentLoop:
                             tool_registry=self.tools,
                         )
                     except Exception as exc:  # pragma: no cover — defensive
-                        logger.warning("MCP discovery failed: %s", exc)
+                        logger.warning("MCP discovery failed: {}", exc)
 
                 threading.Thread(
                     target=_discover_mcp_background,
@@ -1885,7 +1885,7 @@ class AgentLoop:
                     daemon=True,
                 ).start()
         except Exception as exc:  # pragma: no cover — defensive
-            logger.warning("MCP discovery could not start: %s", exc)
+            logger.warning("MCP discovery could not start: {}", exc)
 
         # Wire the finished registry to ContextBuilder so per-tool
         # guidance blocks (trello, docker, voice_call, computer,
@@ -1909,7 +1909,7 @@ class AgentLoop:
             )
             self._plugin_manager.discover_and_load()
         except Exception as exc:  # pragma: no cover — defensive
-            logger.warning("plugin discovery failed: %s", exc)
+            logger.warning("plugin discovery failed: {}", exc)
             self._plugin_manager = None
 
     def _register_codex_session_tool(self) -> None:
@@ -4839,7 +4839,7 @@ class AgentLoop:
                 from flowly.agent.skill_bundles import maybe_expand
                 msg.content = maybe_expand(msg.content, workspace=self.workspace)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("slash skill/bundle expansion skipped: %s", exc)
+                logger.warning("slash skill/bundle expansion skipped: {}", exc)
 
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
@@ -4873,7 +4873,7 @@ class AgentLoop:
                 _pending_user["media"] = list(msg.media)
             self.sessions.save(session, extra_messages=[_pending_user])
         except Exception as exc:  # noqa: BLE001
-            logger.debug("early session save skipped: %s", exc)
+            logger.debug("early session save skipped: {}", exc)
 
         # Resolve the channel/chat coordinates tools should see. A cron
         # fire's InboundMessage arrives with channel="cron" (derived from

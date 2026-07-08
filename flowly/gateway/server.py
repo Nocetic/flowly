@@ -402,7 +402,7 @@ class GatewayServer:
                     app, token=self._control_token, on_send=self.on_send,
                 )
             except Exception as exc:  # pragma: no cover — never block boot
-                logger.warning("MCP control routes unavailable: %s", exc)
+                logger.warning("MCP control routes unavailable: {}", exc)
         return app
 
     # ------------------------------------------------------------------
@@ -2508,7 +2508,7 @@ class GatewayServer:
                 from flowly.mcp.server.control import write_api_file
                 write_api_file(self.host, self.port, self._control_token)
             except Exception as exc:  # pragma: no cover
-                logger.debug("MCP control advertise failed: %s", exc)
+                logger.debug("MCP control advertise failed: {}", exc)
         logger.info(f"Gateway API listening on http://{self.host}:{self.port}")
         if self.on_chat_message:
             logger.info(f"Desktop WebSocket available at ws://{self.host}:{self.port}/ws")

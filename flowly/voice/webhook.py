@@ -245,7 +245,7 @@ def create_voice_app(
         from_number = form.get("From", "")
         to_number = form.get("To", "")
 
-        logger.info("Incoming call: %s from %s", call_sid, from_number)
+        logger.info("Incoming call: {} from {}", call_sid, from_number)
 
         call_manager.create_call(
             call_sid=call_sid,
@@ -320,7 +320,7 @@ def create_voice_app(
         call_sid = form.get("CallSid", "")
         call_status = form.get("CallStatus", "")
 
-        logger.info("Call status update: %s -> %s", call_sid, call_status)
+        logger.info("Call status update: {} -> {}", call_sid, call_status)
 
         if call_status in ("completed", "failed", "busy", "no-answer", "canceled"):
             await call_manager.handle_call_ended(call_sid)
@@ -343,13 +343,13 @@ def create_voice_app(
                 event = data.get("event")
 
                 if event != "media":
-                    logger.info("WebSocket event: %s", event)
+                    logger.info("WebSocket event: {}", event)
 
                 if event == "start":
                     stream_sid = data.get("streamSid")
                     start_data = data.get("start", {})
                     call_sid = start_data.get("customParameters", {}).get("callSid")
-                    logger.info("Media stream started: %s for call %s", stream_sid, call_sid)
+                    logger.info("Media stream started: {} for call {}", stream_sid, call_sid)
 
                     if stream_sid:
                         call_manager.register_stream(stream_sid, websocket)
@@ -364,12 +364,12 @@ def create_voice_app(
                         await call_manager.handle_audio(call_sid, payload)
 
                 elif event == "stop":
-                    logger.info("Media stream stopped: %s", stream_sid)
+                    logger.info("Media stream stopped: {}", stream_sid)
                     if call_sid:
                         await call_manager.handle_call_ended(call_sid)
 
         except Exception as e:
-            logger.error("Media stream error: %s", e)
+            logger.error("Media stream error: {}", e)
         finally:
             if stream_sid:
                 call_manager.unregister_stream(stream_sid)
@@ -445,7 +445,7 @@ class TwilioClient:
                 pending_greeting=pending_greeting,
             )
 
-            logger.info("Outbound call initiated: %s to %s", call_sid, to_number)
+            logger.info("Outbound call initiated: {} to {}", call_sid, to_number)
             return call_sid
 
     async def end_call(self, call_sid: str) -> bool:
@@ -462,8 +462,8 @@ class TwilioClient:
             )
 
             if response.status_code != 200:
-                logger.error("Failed to end call: HTTP %s", response.status_code)
+                logger.error("Failed to end call: HTTP {}", response.status_code)
                 return False
 
-            logger.info("Call ended via API: %s", call_sid)
+            logger.info("Call ended via API: {}", call_sid)
             return True

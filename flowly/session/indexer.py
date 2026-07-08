@@ -195,7 +195,7 @@ class SessionIndexer:
                     (key, created_at, now, len(content_messages)),
                 )
         except Exception as e:
-            logger.debug("Session index failed for %s: %s", key, e)
+            logger.debug("Session index failed for {}: {}", key, e)
 
     @staticmethod
     def _parse_ts(msg: dict[str, Any], fallback: float) -> float:
@@ -475,8 +475,8 @@ class SessionIndexer:
                     self.index_session(key, messages)
                     count += 1
             except Exception as e:
-                logger.debug("Skipped %s during rebuild: %s", path.name, e)
-        logger.info("Session index rebuilt: %d sessions", count)
+                logger.debug("Skipped {} during rebuild: {}", path.name, e)
+        logger.info("Session index rebuilt: {} sessions", count)
         return count
 
     def close(self) -> None:
