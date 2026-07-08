@@ -59,9 +59,24 @@ class FlowletTool(Tool):
     ):
         self._store = store
         self._on_change = on_change
+        self._channel = ""
+        self._chat_id = ""
 
     def set_on_change(self, callback: Callable[[str, dict], Awaitable[None]]) -> None:
         self._on_change = callback
+
+    def set_context(self, channel: str, chat_id: str) -> None:
+        """Record the current chat so a created flowlet knows where an
+        ``agent``-action reply should land. Wired per-message by the agent loop."""
+        self._channel = channel or ""
+        self._chat_id = chat_id or ""
+
+    def _origin_session(self, kw: dict) -> str | None:
+        # Prefer the live per-message context; fall back to an explicit
+        # session_key kwarg then None.
+        if self._channel and self._chat_id:
+            return f"{self._channel}:{self._chat_id}"
+        return kw.get("session_key")
 
     @property
     def name(self) -> str:
@@ -187,7 +202,7 @@ class FlowletTool(Tool):
             accent=meta["accent"],
             catalog=meta["catalog"],
             pinned=bool(kw.get("pinned", False)),
-            origin_session=kw.get("session_key"),
+            origin_session=self._origin_session(kw),
         )
         values = self._values(flowlet)
         await self._notify("flowlet.created", _summary(flowlet, values))

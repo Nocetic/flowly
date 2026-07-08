@@ -4880,6 +4880,13 @@ class AgentLoop:
             if _bt is not None and hasattr(_bt, "set_context"):
                 _bt.set_context(tool_channel, tool_chat_id)
 
+        # Flowlet tool — capture origin so a flowlet stamps the chat it was
+        # created in; an `agent`-action button (e.g. "summarise my week") then
+        # replies back into THAT chat instead of an orphan session.
+        _flowlet_tool = self.tools.get("flowlet")
+        if _flowlet_tool is not None and hasattr(_flowlet_tool, "set_context"):
+            _flowlet_tool.set_context(tool_channel, tool_chat_id)
+
         # Set voice_call tool context for Telegram linking
         voice_tool = self.tools.get("voice_call")
         if voice_tool and hasattr(voice_tool, "set_context"):
