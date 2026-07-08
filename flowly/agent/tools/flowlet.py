@@ -296,7 +296,11 @@ class FlowletTool(Tool):
             return json.dumps({"error": "value must be a number"})
         self._store.add_event(flowlet_id, series, value)
         values = self._values(flowlet)
-        await self._notify("flowlet.state", {"id": flowlet_id, "values": values})
+        _ev = {"id": flowlet_id, "values": values}
+        _pv = queries.flowlet_preview(flowlet["definition"], values)
+        if _pv is not None:
+            _ev["preview"] = _pv
+        await self._notify("flowlet.state", _ev)
         return json.dumps({"action": "log", "flowletId": flowlet_id, "values": values})
 
     async def _set_state(self, **kw: Any) -> str:
@@ -310,7 +314,11 @@ class FlowletTool(Tool):
             return json.dumps({"error": f"state key '{key}' is not declared"})
         self._store.set_state(flowlet_id, key, queries.coerce_state(kw.get("value"), spec))
         values = self._values(flowlet)
-        await self._notify("flowlet.state", {"id": flowlet_id, "values": values})
+        _ev = {"id": flowlet_id, "values": values}
+        _pv = queries.flowlet_preview(flowlet["definition"], values)
+        if _pv is not None:
+            _ev["preview"] = _pv
+        await self._notify("flowlet.state", _ev)
         return json.dumps({"action": "set_state", "flowletId": flowlet_id, "values": values})
 
     async def _query(self, **kw: Any) -> str:

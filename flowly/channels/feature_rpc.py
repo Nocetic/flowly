@@ -1467,13 +1467,19 @@ async def flowlets_action(params: dict) -> dict:
         )
     except FlowletActionError as exc:
         raise FeatureRpcError(exc.code, exc.message)
-    # Broadcast the new state to all connected clients (best-effort).
+    # Recompute the card headline so list tiles update live (not just the open
+    # screen) — carry it in both the reply and the broadcast.
+    from flowly.flowlets.queries import flowlet_preview
+    flowlet = store.get(flowlet_id)
+    preview = flowlet_preview(flowlet.get("definition") or {}, result["values"]) if flowlet else None
+    if preview is not None:
+        result["preview"] = preview
     if _flowlet_broadcast_cb is not None:
         try:
-            await _flowlet_broadcast_cb(
-                "flowlet.state",
-                {"id": flowlet_id, "values": result["values"]},
-            )
+            data = {"id": flowlet_id, "values": result["values"]}
+            if preview is not None:
+                data["preview"] = preview
+            await _flowlet_broadcast_cb("flowlet.state", data)
         except Exception:
             pass
     return result
