@@ -91,7 +91,7 @@ scalar key. Unknown component types render a neutral placeholder.
 
 `data` = `{ series, agg, bucket, window }`.
 
-### Input (10) — carry an `action`, need an `id`
+### Input (13) — carry an `action`, need an `id`
 | type | key props | typical action |
 |---|---|---|
 | `button` | `text`, `style` (`primary`/`secondary`/`ghost`/`destructive`) | any op |
@@ -104,6 +104,27 @@ scalar key. Unknown component types render a neutral placeholder.
 | `input` | `label?`, `maxLength?` | `set` |
 | `number_input` | `label?`, `min?`, `max?` | `set` |
 | `rating` | `max` (default 5), `value?` (bind) | `log` or `set` |
+| `select` | `options: [str \| {value,label}]`, `label?` | `set` (use over segmented for many options) |
+| `date` | `label?` | `set` (stores `YYYY-MM-DD`) |
+| `textarea` | `label?`, `maxLength?`, `rows?` | `set` |
+
+### Display v2 — structured / professional (9)
+| type | key props |
+|---|---|
+| `metric` | `value` (bind), `unit?`, `label?`, `delta?` (bind), `deltaLabel?`, `invert?` |
+| `status` | `text`, `tone` (`ok`/`warn`/`bad`/`neutral`) |
+| `keyvalue` | `rows: [{label, value}]` (value interpolates `{key}`) |
+| `timeline` | `events: [{title, time?, tone?}]` (tone: `done`/`now`/`wait`) |
+| `callout` | `text`, `tone` (`info`/`success`/`warn`/`bad`), `icon?` |
+| `code` | `text`, `language?` |
+| `link` | `text`, `url` (http/https) |
+| `image` | `src` (http/https/data), `alt?`, `height?` |
+| `timer` | `value` (a `timer` state key), `label?` · action `timer_toggle` |
+
+**Timer** — declare a state key of `type:"timer"` and a `timer` component bound
+to it with `action:{op:"timer_toggle", key}`. `resolve_values` exposes it as
+`{running, elapsed}` (seconds); a running timer ticks live and the accumulated
+time persists across sessions. For billable hours, an experiment, a workout.
 
 ## Actions (declared; applied deterministically on the bot — no LLM)
 
