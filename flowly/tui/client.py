@@ -535,6 +535,28 @@ class GatewayClient:
         rid = await self._rpc("exec.policy.allowlist.remove", {"pattern": pattern})
         return await self._await_reply(rid, timeout=5.0)
 
+    async def codex_policy_get(self) -> dict[str, Any]:
+        """Current codex_session policy: {enabled, sandbox, approvalPolicy, ...}."""
+        rid = await self._rpc("codex.policy.get", {})
+        return await self._await_reply(rid, timeout=5.0)
+
+    async def codex_policy_set(
+        self, *, approval_policy: str | None = None, sandbox: str | None = None
+    ) -> dict[str, Any]:
+        """Set codex approval policy / sandbox. Applied live by the gateway
+        (warm-session drop + tool re-register); ``willRestart`` in the reply
+        means no live-reload callback was wired so a restart is needed instead.
+        A little more headroom than the exec calls: the live reload drops warm
+        Codex subprocesses, which can take a moment.
+        """
+        params: dict[str, Any] = {}
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
+        if sandbox is not None:
+            params["sandbox"] = sandbox
+        rid = await self._rpc("codex.policy.set", params)
+        return await self._await_reply(rid, timeout=10.0)
+
     # --- event consumption -----------------------------------------
 
     async def events(self) -> AsyncIterator[Event]:
