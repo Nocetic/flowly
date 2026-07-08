@@ -128,8 +128,9 @@ def tool_factory():
         )
 
         # Replace _build_codex_session so it returns the test's stub
-        # rather than spawning a real CodexSession.
-        def fake_build(*, metadata, cwd_override):
+        # rather than spawning a real CodexSession. Mirror the real
+        # signature (session_key was added for the cwd-pin path).
+        def fake_build(*, metadata, cwd_override, session_key=""):
             stub = FakeCodexSession()
             if codex_session_factory is not None:
                 codex_session_factory(stub, metadata)
@@ -469,9 +470,11 @@ class TestCwdValidation:
         tool, _ = tool_factory()
         original_build = tool._build_codex_session
 
-        def capture_build(*, metadata, cwd_override):
+        def capture_build(*, metadata, cwd_override, session_key=""):
             seen["cwd"] = cwd_override
-            return original_build(metadata=metadata, cwd_override=cwd_override)
+            return original_build(
+                metadata=metadata, cwd_override=cwd_override, session_key=session_key
+            )
 
         tool._build_codex_session = capture_build  # type: ignore[method-assign]
         await tool.execute(task="inspect", cwd="~")
