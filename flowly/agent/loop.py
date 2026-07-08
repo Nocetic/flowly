@@ -2018,7 +2018,7 @@ class AgentLoop:
             active_session_key_getter=lambda: self._codex_active_session_key,
             approval_callback=approval_cb,
         ))
-        logger.info("codex_session tool registered (sandbox=%s)", runtime_cfg.sandbox)
+        logger.info(f"codex_session tool registered (sandbox={runtime_cfg.sandbox})")
 
     def sync_codex_session_tool(self) -> bool:
         """Register/unregister ``codex_session`` to match current config.
