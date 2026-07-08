@@ -1092,26 +1092,43 @@ def exec_policy_get() -> dict:
 
 
 def exec_policy_set(params: dict) -> dict:
-    """Set the standing exec security/ask policy.
+    """Set the standing exec security/ask policy (and optionally replace the
+    allowlist).
 
     Writes the approvals store; the long-lived executor reloads it on its next
-    command (mtime check), so this never returns ``willRestart``.
+    command (mtime check), so this never returns ``willRestart``. ``allowlist``,
+    when given, is the FULL desired list (each item a ``{"pattern": str}`` or a
+    bare string) and replaces the stored one — this matches how a settings
+    screen manages the list, and (unlike a local file write) works whether the
+    bot is local or reached over the relay.
     """
     security = params.get("security")
     ask = params.get("ask")
+    allowlist = params.get("allowlist")
     if security is not None and security not in _EXEC_SECURITY:
         raise FeatureRpcError("INVALID", "Invalid security")
     if ask is not None and ask not in _EXEC_ASK:
         raise FeatureRpcError("INVALID", "Invalid ask")
-    if security is None and ask is None:
+    if allowlist is not None and not isinstance(allowlist, list):
+        raise FeatureRpcError("INVALID", "allowlist must be a list")
+    if security is None and ask is None and allowlist is None:
         raise FeatureRpcError("INVALID", "Nothing to set")
     from flowly.exec.approvals import ExecApprovalStore
+    from flowly.exec.types import AllowlistEntry
     store = ExecApprovalStore()
     cfg = store.load()
     if security is not None:
         cfg.security = security
     if ask is not None:
         cfg.ask = ask
+    if allowlist is not None:
+        entries = []
+        for item in allowlist:
+            pattern = item.get("pattern") if isinstance(item, dict) else item
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise FeatureRpcError("INVALID", "allowlist entries need a pattern")
+            entries.append(AllowlistEntry(pattern=pattern.strip()))
+        cfg.allowlist = entries
     store.save()
     return _exec_policy_payload(store)
 

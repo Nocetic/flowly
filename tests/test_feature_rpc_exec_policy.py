@@ -106,3 +106,39 @@ def test_allowlist_remove_requires_pattern():
     with pytest.raises(feature_rpc.FeatureRpcError) as exc:
         _dispatch("exec.policy.allowlist.remove", {})
     assert exc.value.code == "INVALID"
+
+
+def test_set_replaces_allowlist():
+    # A settings screen manages the whole list; sending it via set replaces the
+    # stored one (works local AND over the relay, unlike a local file write).
+    result, restart = _dispatch(
+        "exec.policy.set",
+        {"security": "allowlist", "allowlist": [{"pattern": "/usr/bin/git"}, {"pattern": "/bin/ls"}]},
+    )
+    assert restart is False
+    assert result["security"] == "allowlist"
+    assert [e["pattern"] for e in result["allowlist"]] == ["/usr/bin/git", "/bin/ls"]
+    assert [e.pattern for e in ExecApprovalStore().load().allowlist] == ["/usr/bin/git", "/bin/ls"]
+
+
+def test_set_allowlist_accepts_bare_strings():
+    result, _ = _dispatch("exec.policy.set", {"allowlist": ["/opt/tool"]})
+    assert [e["pattern"] for e in result["allowlist"]] == ["/opt/tool"]
+
+
+def test_set_allowlist_can_clear():
+    _dispatch("exec.policy.set", {"allowlist": [{"pattern": "/x"}]})
+    result, _ = _dispatch("exec.policy.set", {"allowlist": []})
+    assert result["allowlist"] == []
+
+
+def test_set_rejects_non_list_allowlist():
+    with pytest.raises(feature_rpc.FeatureRpcError) as exc:
+        _dispatch("exec.policy.set", {"allowlist": "nope"})
+    assert exc.value.code == "INVALID"
+
+
+def test_set_rejects_allowlist_entry_without_pattern():
+    with pytest.raises(feature_rpc.FeatureRpcError) as exc:
+        _dispatch("exec.policy.set", {"allowlist": [{"cmd": "x"}]})
+    assert exc.value.code == "INVALID"
