@@ -227,20 +227,27 @@ def render_managed_block(
     servers: dict[str, dict] | None = None,
     plugins: list[dict] | None = None,
     default_permissions: str | None = None,
+    ask_for_approval: str | None = None,
+    include_callback: bool = True,
 ) -> str:
     """Render the managed codex config block.
 
-    Always includes the ``[mcp_servers.flowly-tools]`` callback entry. When
-    provided, also writes:
+    Root-level policy keys (emitted before any table so they stay
+    document-root scoped) when provided:
 
-      * ``default_permissions`` (top-level root key — must precede tables)
-      * extra ``[mcp_servers.<name>]`` entries (the user's flowly MCP servers
-        translated to codex's format)
-      * ``[plugins."<name>@<marketplace>"]`` entries (installed codex plugins)
+      * ``default_permissions`` — codex sandbox profile
+      * ``ask_for_approval`` — codex approval policy
+
+    With ``include_callback`` (the default), also writes the
+    ``[mcp_servers.flowly-tools]`` callback entry plus, when provided, the
+    user's translated ``[mcp_servers.<name>]`` servers and any installed
+    ``[plugins."<name>@<marketplace>"]``. With ``include_callback=False`` the
+    block is policy-only — sandbox/approval get written even when the runtime
+    is kept fully isolated (``expose_flowly_tools=False``).
     """
     lines = [_MARKER, ""]
 
-    # Root-level key first so it stays document-root scoped (it precedes all
+    # Root-level keys first so they stay document-root scoped (they precede all
     # table headers within the block, and the whole block is inserted before
     # the user's first table).
     if default_permissions:
@@ -250,34 +257,41 @@ def render_managed_block(
         )
         lines.append(f"default_permissions = {_toml_str(norm)}")
         lines.append("")
-
-    # The flowly-tools callback (always present).
-    lines.append(f"[mcp_servers.{_MCP_SERVER_NAME}]")
-    lines.append(f"command = {_toml_str(python_bin)}")
-    lines.append('args = ["-m", "flowly.codex.tools_mcp_server"]')
-    if env:
-        lines.append(f"env = {_toml_inline_env(env)}")
-    lines.append("startup_timeout_sec = 30.0")
-    lines.append("tool_timeout_sec = 600.0")
-
-    # The user's own flowly MCP servers, translated.
-    for name in sorted(servers or {}):
-        cfg = servers[name]
+    if ask_for_approval:
+        lines.append(f"ask_for_approval = {_toml_str(ask_for_approval)}")
         lines.append("")
-        lines.append(f"[mcp_servers.{_quote_key(name)}]")
-        for k, v in cfg.items():
-            lines.append(f"{_quote_key(k)} = {_toml_value(v)}")
 
-    # Installed codex plugins.
-    for plugin in sorted(
-        plugins or [],
-        key=lambda p: f"{p.get('name', '')}@{p.get('marketplace', '')}",
-    ):
-        qualified = f"{plugin.get('name', '')}@{plugin.get('marketplace', 'openai-curated')}"
-        lines.append("")
-        lines.append(f"[plugins.{_quote_key(qualified)}]")
-        lines.append(f"enabled = {_toml_value(bool(plugin.get('enabled', True)))}")
+    if include_callback:
+        # The flowly-tools callback.
+        lines.append(f"[mcp_servers.{_MCP_SERVER_NAME}]")
+        lines.append(f"command = {_toml_str(python_bin)}")
+        lines.append('args = ["-m", "flowly.codex.tools_mcp_server"]')
+        if env:
+            lines.append(f"env = {_toml_inline_env(env)}")
+        lines.append("startup_timeout_sec = 30.0")
+        lines.append("tool_timeout_sec = 600.0")
 
+        # The user's own flowly MCP servers, translated.
+        for name in sorted(servers or {}):
+            cfg = servers[name]
+            lines.append("")
+            lines.append(f"[mcp_servers.{_quote_key(name)}]")
+            for k, v in cfg.items():
+                lines.append(f"{_quote_key(k)} = {_toml_value(v)}")
+
+        # Installed codex plugins.
+        for plugin in sorted(
+            plugins or [],
+            key=lambda p: f"{p.get('name', '')}@{p.get('marketplace', '')}",
+        ):
+            qualified = f"{plugin.get('name', '')}@{plugin.get('marketplace', 'openai-curated')}"
+            lines.append("")
+            lines.append(f"[plugins.{_quote_key(qualified)}]")
+            lines.append(f"enabled = {_toml_value(bool(plugin.get('enabled', True)))}")
+
+    # Exactly one blank line before the end marker, whichever sections ran.
+    while lines and lines[-1] == "":
+        lines.pop()
     lines.append("")
     lines.append(_END_MARKER)
     return "\n".join(lines) + "\n"
@@ -423,28 +437,57 @@ def _sandbox_to_permission(sandbox: str | None) -> str:
     }.get((sandbox or "").strip(), ":workspace")
 
 
+def _approval_to_codex(policy: str | None) -> str:
+    """Map a Flowly ``codex_session`` approval policy to codex's
+    ``ask_for_approval`` config value.
+
+    Codex CLI accepts ``untrusted``, ``on-request`` and ``never``
+    (``on-failure`` is deprecated). Flowly exposes ``on-request`` / ``never`` /
+    ``auto-review`` / ``granular``; ``granular`` has no 1:1 codex equivalent, so
+    it maps to the safest prompt-first policy. Unknown values fall back to
+    ``on-request``.
+    """
+    return {
+        "on-request": "on-request",
+        "never": "never",
+        "auto-review": "untrusted",
+        "granular": "on-request",
+    }.get((policy or "").strip(), "on-request")
+
+
 def migrate_flowly_tools_to_codex(
     *,
     codex_home: str | None = None,
     python_bin: str | None = None,
     config=None,
     default_permissions: str | None = ":workspace",
+    ask_for_approval: str | None = None,
     discover_plugins: bool = False,
+    include_callback: bool = True,
 ) -> Path:
     """Write the managed codex config block to ``config.toml``.
 
-    Always registers the ``flowly-tools`` callback. Additionally migrates the
-    user's Flowly MCP servers, writes a ``default_permissions`` profile, and
-    (when ``discover_plugins``) discovers installed codex plugins.
+    With ``include_callback`` (the default), registers the ``flowly-tools``
+    callback and migrates the user's Flowly MCP servers (and, when
+    ``discover_plugins``, installed codex plugins). Always writes the policy
+    keys — ``default_permissions`` (sandbox) and ``ask_for_approval`` — when
+    they are provided. With ``include_callback=False`` the write is policy-only:
+    sandbox/approval land even when the runtime is kept fully isolated
+    (``expose_flowly_tools=False``), while nothing is exposed to codex.
 
     Args:
         codex_home: override for ``$CODEX_HOME`` (defaults to env / ~/.codex).
         python_bin: python the callback is spawned with (defaults to current).
         config: a Flowly ``Config`` (loaded if None) — source of mcp_servers.
-        default_permissions: codex profile (``:workspace`` etc.); None to skip.
+        default_permissions: codex sandbox profile (``:workspace`` etc.); None
+            to skip. Map from a Flowly sandbox with ``_sandbox_to_permission``.
+        ask_for_approval: codex approval policy (``on-request`` etc.); None to
+            skip. Map from a Flowly policy with ``_approval_to_codex``.
         discover_plugins: query ``plugin/list`` and migrate installed plugins.
             Off by default (boot path); the CLI enables it. Auto-skips inside
-            a running event loop.
+            a running event loop. Ignored when ``include_callback=False``.
+        include_callback: expose Flowly's tool callback + MCP servers to codex.
+            False writes only the sandbox/approval policy.
 
     Returns the path to the written ``config.toml``.
     """
@@ -456,36 +499,38 @@ def migrate_flowly_tools_to_codex(
     target = home / "config.toml"
     python_bin = python_bin or sys.executable or "python3"
 
-    # Load config for the user's MCP servers (best-effort).
-    if config is None:
-        try:
-            from flowly.config.loader import load_config
-            config = load_config()
-        except Exception:
-            config = None
-
-    # Translate the user's flowly MCP servers.
+    # Translate the user's flowly MCP servers + discover plugins ONLY when the
+    # callback is being written; a policy-only pass exposes nothing to codex.
     servers: dict[str, dict] = {}
-    raw_servers = getattr(config, "mcp_servers", None) or {}
-    if isinstance(raw_servers, dict):
-        for name, scfg in raw_servers.items():
-            entry, skipped = _translate_mcp_server(str(name), scfg)
-            if entry is None:
-                logger.debug("codex migration: skipping MCP server %s (%s)", name, skipped)
-                continue
-            servers[str(name)] = entry
-            if skipped:
-                logger.debug("codex migration: %s dropped keys: %s", name, skipped)
-
-    # Discover installed codex plugins (best-effort, off on the boot path).
     plugins: list[dict] = []
     plugin_query_ok = False
-    if discover_plugins:
-        plugins, perr = _discover_codex_plugins(str(home) if codex_home else None)
-        if perr:
-            logger.debug("codex plugin discovery: %s", perr)
-        else:
-            plugin_query_ok = True
+    if include_callback:
+        # Load config for the user's MCP servers (best-effort).
+        if config is None:
+            try:
+                from flowly.config.loader import load_config
+                config = load_config()
+            except Exception:
+                config = None
+
+        raw_servers = getattr(config, "mcp_servers", None) or {}
+        if isinstance(raw_servers, dict):
+            for name, scfg in raw_servers.items():
+                entry, skipped = _translate_mcp_server(str(name), scfg)
+                if entry is None:
+                    logger.debug("codex migration: skipping MCP server %s (%s)", name, skipped)
+                    continue
+                servers[str(name)] = entry
+                if skipped:
+                    logger.debug("codex migration: %s dropped keys: %s", name, skipped)
+
+        # Discover installed codex plugins (best-effort, off on the boot path).
+        if discover_plugins:
+            plugins, perr = _discover_codex_plugins(str(home) if codex_home else None)
+            if perr:
+                logger.debug("codex plugin discovery: %s", perr)
+            else:
+                plugin_query_ok = True
 
     block = render_managed_block(
         python_bin=python_bin,
@@ -493,6 +538,8 @@ def migrate_flowly_tools_to_codex(
         servers=servers,
         plugins=plugins,
         default_permissions=default_permissions,
+        ask_for_approval=ask_for_approval,
+        include_callback=include_callback,
     )
 
     if target.exists():
@@ -520,7 +567,10 @@ def migrate_flowly_tools_to_codex(
         except Exception:
             pass
         raise
-    logger.info("registered flowly-tools MCP callback in %s", target)
+    if include_callback:
+        logger.info("registered flowly-tools MCP callback in %s", target)
+    else:
+        logger.info("wrote codex sandbox/approval policy (policy-only) in %s", target)
     return target
 
 

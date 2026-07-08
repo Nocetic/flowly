@@ -1963,24 +1963,31 @@ class AgentLoop:
         # Codex subprocess via an MCP callback registered in
         # ~/.codex/config.toml. Non-fatal — a migration failure must
         # not block the (otherwise fully functional) codex_session tool.
-        if getattr(codex_cfg, "expose_flowly_tools", True):
-            try:
-                from flowly.codex.tool_migration import (
-                    _sandbox_to_permission,
-                    migrate_flowly_tools_to_codex,
-                )
-                # Boot path: migrate the callback + the user's MCP servers +
-                # the sandbox permission profile. Plugin discovery is OFF here
-                # (it spawns a codex subprocess) — `flowly codex enable` does
-                # the full discovery instead.
-                migrate_flowly_tools_to_codex(
-                    codex_home=codex_cfg.codex_home or None,
-                    config=self._main_config,
-                    default_permissions=_sandbox_to_permission(codex_cfg.sandbox),
-                    discover_plugins=False,
-                )
-            except Exception:
-                logger.debug("codex tool-callback migration skipped", exc_info=True)
+        try:
+            from flowly.codex.tool_migration import (
+                _approval_to_codex,
+                _sandbox_to_permission,
+                migrate_flowly_tools_to_codex,
+            )
+            expose = getattr(codex_cfg, "expose_flowly_tools", True)
+            # Boot path: write the sandbox + approval policy to
+            # ~/.codex/config.toml — thread/start can't carry them, so this is
+            # the ONLY place they take effect. When tools are exposed, also
+            # register the flowly-tools callback + the user's MCP servers
+            # (plugin discovery is OFF here — it spawns a codex subprocess; the
+            # `flowly codex enable` CLI does the full discovery). Otherwise the
+            # write is policy-only, so the sandbox/approval settings still apply
+            # even when the runtime is kept fully isolated.
+            migrate_flowly_tools_to_codex(
+                codex_home=codex_cfg.codex_home or None,
+                config=self._main_config,
+                default_permissions=_sandbox_to_permission(codex_cfg.sandbox),
+                ask_for_approval=_approval_to_codex(codex_cfg.approval_policy),
+                discover_plugins=False,
+                include_callback=expose,
+            )
+        except Exception:
+            logger.debug("codex config migration skipped", exc_info=True)
 
         def _codex_session_accessor(sk: str) -> dict[str, Any]:
             return self.sessions.get_or_create(sk).metadata
