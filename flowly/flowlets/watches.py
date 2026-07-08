@@ -283,9 +283,9 @@ class WatchEngine:
                     or now - prev_fired >= catalog.WATCH_AGENT_MIN_COOLDOWN_MIN * 60_000
                 )
                 pending.append((title, body, also if wake else None, True))
-                logger.info(
-                    "[flowlet] watch '{}' fired on {} ({})", wid, flowlet.get("name"), reason
-                )
+                # DEBUG + opaque ids only: a fired watch is an internal event and
+                # the flowlet name is user content — neither belongs in prod logs.
+                logger.debug("[flowlet] watch '{}' fired on {} ({})", wid, fid, reason)
 
         if not pending:
             return []

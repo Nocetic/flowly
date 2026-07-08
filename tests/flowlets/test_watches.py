@@ -347,6 +347,30 @@ async def test_engine_agent_escape_throttled(store):
     assert len(cap.notifications) == 1
 
 
+async def test_delete_stops_watch_and_clears_state(store):
+    """Deleting a flowlet must cascade its watch state and stop the heartbeat
+    from ever firing it again (no lingering reminders)."""
+    cap = _Capture()
+    eng = WatchEngine(store, notify=cap.notify, tz=UTC)
+    d = {"catalog": 1, "name": "X", "state": {},
+         "layout": [{"type": "text", "text": "x"}],
+         "watches": [{"id": "ping", "trigger": "schedule", "everyMinutes": 1,
+                      "notify": {"title": "hi"}}]}
+    f = store.create("X", d)
+    fid = f["id"]
+
+    # fires once, writes watch state
+    assert await eng.evaluate_all() == [fid]
+    assert "ping" in store.get_watch_state(fid)
+
+    # delete → watch state cascaded away, heartbeat no longer fires it
+    assert store.delete(fid) is True
+    assert store.get_watch_state(fid) == {}
+    cap.notifications.clear()
+    assert await eng.evaluate_all() == []
+    assert cap.notifications == []
+
+
 async def test_engine_schedule_daily(store):
     cap = _Capture()
     eng = WatchEngine(store, notify=cap.notify, tz=UTC)
