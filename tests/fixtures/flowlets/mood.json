@@ -1,0 +1,41 @@
+{
+  "catalog": 1,
+  "name": "Ruh Hâli",
+  "icon": "smile",
+  "state": {
+    "note": { "type": "string", "default": "", "maxLength": 200 }
+  },
+  "series": {
+    "mood": { "unit": "puan" }
+  },
+  "computed": {
+    "avg7": { "series": "mood", "agg": "avg", "window": "7d" }
+  },
+  "layout": [
+    { "type": "header", "text": "Bugün nasılsın?" },
+    {
+      "id": "rate",
+      "type": "rating",
+      "max": 5,
+      "action": { "op": "log", "series": "mood" }
+    },
+    {
+      "id": "note",
+      "type": "input",
+      "label": "Not",
+      "maxLength": 200,
+      "action": { "op": "set", "key": "note" }
+    },
+    {
+      "id": "avgStat",
+      "type": "stat",
+      "value": "avg7",
+      "label": "Son 7 gün ortalaması"
+    },
+    {
+      "id": "trend",
+      "type": "sparkline",
+      "data": { "series": "mood", "agg": "avg", "bucket": "day", "window": "30d" }
+    }
+  ]
+}

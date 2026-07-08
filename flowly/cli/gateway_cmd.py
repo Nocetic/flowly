@@ -1330,6 +1330,75 @@ Respond to the user now:"""
             # Share with SubagentManager so subagent artifacts also sync to S3
             agent.subagents._artifact_on_change = _broadcast_artifact
 
+    # Wire flowlet broadcast + agent-action runner — same desktop(gateway)+relay
+    # fan-out as artifacts. The broadcast callback also backs feature_rpc's
+    # flowlets.action / flowlets.delete so a tap on one client updates the rest.
+    async def _broadcast_flowlet(event_name: str, data: dict) -> None:
+        await gateway_server.broadcast_event(event_name, data)
+        _web = channels.get_channel("web")
+        if _web and hasattr(_web, "_ws") and _web._ws:
+            import json as _json
+            try:
+                await _web._ws.send(_json.dumps({
+                    "type": "event", "event": event_name, "data": data,
+                }))
+            except Exception:
+                pass  # relay sync is best-effort
+
+    async def _flowlet_agent_runner(flowlet: dict, message: str) -> None:
+        """Run an agent turn for a flowlet `agent` action and deliver the reply
+        back to the screen's origin chat. Best-effort: never raises into the
+        action path."""
+        origin = flowlet.get("origin_session") or ""
+        channel, _, chat_id = origin.partition(":")
+        name = flowlet.get("name") or "flowlet"
+        prompt = (
+            f"[Flowlet action — {name}]\n"
+            f"The user tapped an action on their '{name}' mini-screen. "
+            f"Their request:\n{message}\n\n"
+            "Reply in plain text; it is delivered directly to the user. "
+            "You can read the screen's live data with the flowlet tool "
+            "(action=get). Keep it short and useful."
+        )
+        session_key = origin if origin else f"flowlet:{flowlet.get('id')}"
+        try:
+            response = await agent.process_direct(
+                prompt,
+                session_key=session_key,
+                origin_channel=channel or None,
+                origin_chat_id=chat_id or None,
+                skip_memory=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Flowlet agent action failed: {}", exc)
+            return
+        if not response or is_silent_response(response):
+            return
+        _local = channel in ("cli", "tui", "desktop", "ios")
+        if _local and hasattr(gateway_server, "push_session_message"):
+            try:
+                await gateway_server.push_session_message(session_key, response)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Flowlet push failed: {}", exc)
+        elif chat_id:
+            from flowly.bus.events import OutboundMessage
+            try:
+                await bus.publish_outbound(OutboundMessage(
+                    channel=channel or "telegram", chat_id=chat_id, content=response,
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Flowlet outbound failed: {}", exc)
+
+    try:
+        from flowly.channels import feature_rpc as _frpc_flowlet
+        _frpc_flowlet.set_flowlet_broadcast(_broadcast_flowlet)
+        _frpc_flowlet.set_flowlet_agent_runner(_flowlet_agent_runner)
+        _flowlet_tool = agent.tools.get("flowlet")
+        if _flowlet_tool and hasattr(_flowlet_tool, "set_on_change"):
+            _flowlet_tool.set_on_change(_broadcast_flowlet)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Flowlet wiring skipped: {}", exc)
+
     # Wire auto-compaction notification — push to relay (web channel) + desktop (gateway)
     async def _on_auto_compaction(
         session_key: str, tokens_before: int, tokens_after: int, messages_removed: int,

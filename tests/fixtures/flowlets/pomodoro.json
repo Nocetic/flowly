@@ -1,0 +1,57 @@
+{
+  "catalog": 1,
+  "name": "Pomodoro",
+  "icon": "clock",
+  "state": {
+    "sessions_goal": { "type": "number", "default": 8, "min": 1, "max": 20 }
+  },
+  "series": {
+    "focus": { "unit": "seans" }
+  },
+  "computed": {
+    "done_today": { "series": "focus", "agg": "count", "window": "today" },
+    "left": { "expr": "max(0, sessions_goal - done_today)" }
+  },
+  "layout": [
+    { "type": "header", "text": "Odak seansları" },
+    {
+      "id": "ring",
+      "type": "ring",
+      "value": "done_today",
+      "max": "sessions_goal",
+      "label": "{done_today} / {sessions_goal}"
+    },
+    {
+      "id": "leftStat",
+      "type": "stat",
+      "value": "left",
+      "label": "Kalan seans"
+    },
+    {
+      "type": "row",
+      "children": [
+        {
+          "id": "logSession",
+          "type": "button",
+          "text": "Seans bitti",
+          "style": "primary",
+          "action": { "op": "log", "series": "focus", "value": 1 }
+        },
+        {
+          "id": "goalStep",
+          "type": "stepper",
+          "min": 1,
+          "max": 20,
+          "value": "sessions_goal",
+          "action": { "op": "increment", "key": "sessions_goal", "by": 1 }
+        }
+      ]
+    },
+    {
+      "id": "week",
+      "type": "chart",
+      "kind": "bar",
+      "data": { "series": "focus", "agg": "count", "bucket": "day", "window": "7d" }
+    }
+  ]
+}

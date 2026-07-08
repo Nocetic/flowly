@@ -1,0 +1,23 @@
+{
+  "catalog": 1,
+  "name": "Alışkanlıklar",
+  "icon": "check",
+  "accent": "#35D5EF",
+  "state": {
+    "water": { "type": "bool", "default": false },
+    "exercise": { "type": "bool", "default": false },
+    "read": { "type": "bool", "default": false }
+  },
+  "layout": [
+    { "type": "header", "text": "Bugünkü alışkanlıklar" },
+    {
+      "id": "habits",
+      "type": "checklist",
+      "items": [
+        { "key": "water", "label": "Su içtim", "icon": "droplet" },
+        { "key": "exercise", "label": "Egzersiz", "icon": "dumbbell" },
+        { "key": "read", "label": "Okuma", "icon": "book" }
+      ]
+    }
+  ]
+}

@@ -969,6 +969,29 @@ def _cron():
         return None
 
 
+# Flowlet wiring. Two callbacks the host (gateway) registers at startup:
+#   * broadcast — push ``flowlet.*`` events to desktop (gateway) + relay (web),
+#     so ``flowlets.action`` and ``flowlets.delete`` fan out to every client.
+#   * agent runner — run an agent turn for a flowlet ``agent`` action (a
+#     "analyze my week" button). ``None`` ⇒ that op reports UNAVAILABLE.
+_flowlet_broadcast_cb = None
+_flowlet_agent_runner_cb = None
+
+
+def set_flowlet_broadcast(cb) -> None:
+    """Register an async ``(event_name, data) -> None`` used to fan flowlet
+    state changes out to all connected clients."""
+    global _flowlet_broadcast_cb
+    _flowlet_broadcast_cb = cb
+
+
+def set_flowlet_agent_runner(cb) -> None:
+    """Register an async ``(flowlet, message) -> None`` that runs an agent turn
+    for a flowlet ``agent`` action."""
+    global _flowlet_agent_runner_cb
+    _flowlet_agent_runner_cb = cb
+
+
 def provider_active() -> dict:
     """Resolved active LLM provider (no secrets) + the current default model —
     for the Settings display and the model picker's current selection."""
@@ -1328,6 +1351,151 @@ def artifacts_versions(params: dict) -> dict:
     if not artifact_id:
         raise FeatureRpcError("INVALID", "id required")
     return {"versions": _artifact_store().get_versions(artifact_id)}
+
+
+# ── Flowlets ─────────────────────────────────────────────────────────────────
+# Agent-generated dynamic mini-screens. Read + interact over BOTH transports.
+# Creation/definition edits are agent-only (via the flowlet tool); the client
+# surface is list / get / state / action / pin / delete — the same shape the
+# artifact surface uses (no client-side authoring). `flowlets.action` is the
+# deterministic tap handler: it never calls the LLM.
+
+def _flowlet_store():
+    from flowly.flowlets.store import get_store
+    return get_store()
+
+
+def _flowlet_values(flowlet: dict) -> dict:
+    from flowly.flowlets import queries
+    from flowly.flowlets.store import get_store, now_ms
+    store = get_store()
+    return queries.resolve_values(
+        flowlet["definition"],
+        store.get_state(flowlet["id"]),
+        store.get_events(flowlet["id"]),
+        now_ms(),
+        None,
+    )
+
+
+def _flowlet_summary(flowlet: dict, values: dict | None = None) -> dict:
+    s = {
+        "id": flowlet["id"],
+        "name": flowlet.get("name"),
+        "icon": flowlet.get("icon"),
+        "accent": flowlet.get("accent"),
+        "pinned": flowlet.get("pinned"),
+        "version": flowlet.get("version"),
+        "catalog": flowlet.get("catalog"),
+        "updatedAt": flowlet.get("updated_at"),
+    }
+    if values is not None:
+        s["values"] = values
+    return s
+
+
+def flowlets_list(params: dict) -> dict:
+    """Flowlet cards with their current live values (so a card can show progress
+    without opening the screen). No full definition — that comes from get."""
+    store = _flowlet_store()
+    limit = max(1, min(int(params.get("limit", 50) or 50), 200))
+    out = []
+    for f in store.list(limit=limit):
+        try:
+            out.append(_flowlet_summary(f, _flowlet_values(f)))
+        except Exception:
+            out.append(_flowlet_summary(f))
+    return {"flowlets": out}
+
+
+def flowlets_get(params: dict) -> dict:
+    """One flowlet WITH its definition and current values — what a client needs
+    to render the full screen."""
+    flowlet_id = str(params.get("id", "") or "")
+    if not flowlet_id:
+        raise FeatureRpcError("INVALID", "id required")
+    flowlet = _flowlet_store().get(flowlet_id)
+    if not flowlet:
+        raise FeatureRpcError("NOT_FOUND", "Flowlet not found")
+    return {
+        "flowlet": {
+            "id": flowlet["id"],
+            "name": flowlet["name"],
+            "icon": flowlet.get("icon"),
+            "accent": flowlet.get("accent"),
+            "pinned": flowlet.get("pinned"),
+            "version": flowlet.get("version"),
+            "catalog": flowlet.get("catalog"),
+            "definition": flowlet["definition"],
+            "updatedAt": flowlet.get("updated_at"),
+        },
+        "values": _flowlet_values(flowlet),
+    }
+
+
+def flowlets_state(params: dict) -> dict:
+    """Just the live values — the poll fallback when a client can't get the
+    pushed ``flowlet.state`` event."""
+    flowlet_id = str(params.get("id", "") or "")
+    if not flowlet_id:
+        raise FeatureRpcError("INVALID", "id required")
+    flowlet = _flowlet_store().get(flowlet_id)
+    if not flowlet:
+        raise FeatureRpcError("NOT_FOUND", "Flowlet not found")
+    return {"id": flowlet_id, "values": _flowlet_values(flowlet)}
+
+
+async def flowlets_action(params: dict) -> dict:
+    """Apply a user tap deterministically (no LLM). ``{id, componentId, value?}``.
+    Returns the new values; the transport also broadcasts ``flowlet.state`` so
+    the OTHER connected clients update too (the caller gets it in this reply)."""
+    from flowly.flowlets.actions import FlowletActionError, apply_action
+    store = _flowlet_store()
+    flowlet_id = str(params.get("id", "") or "")
+    component_id = str(params.get("componentId", "") or "")
+    if not flowlet_id or not component_id:
+        raise FeatureRpcError("INVALID", "id and componentId required")
+    try:
+        result = await apply_action(
+            store, flowlet_id, component_id,
+            value=params.get("value"),
+            agent_runner=_flowlet_agent_runner_cb,
+        )
+    except FlowletActionError as exc:
+        raise FeatureRpcError(exc.code, exc.message)
+    # Broadcast the new state to all connected clients (best-effort).
+    if _flowlet_broadcast_cb is not None:
+        try:
+            await _flowlet_broadcast_cb(
+                "flowlet.state",
+                {"id": flowlet_id, "values": result["values"]},
+            )
+        except Exception:
+            pass
+    return result
+
+
+def flowlets_pin(params: dict) -> dict:
+    flowlet_id = str(params.get("id", "") or "")
+    if not flowlet_id:
+        raise FeatureRpcError("INVALID", "id required")
+    flowlet = _flowlet_store().pin(flowlet_id, bool(params.get("pinned", True)))
+    if not flowlet:
+        raise FeatureRpcError("NOT_FOUND", "Flowlet not found")
+    return {"ok": True, "flowlet": _flowlet_summary(flowlet)}
+
+
+async def flowlets_delete(params: dict) -> dict:
+    flowlet_id = str(params.get("id", "") or "")
+    if not flowlet_id:
+        raise FeatureRpcError("INVALID", "id required")
+    ok = _flowlet_store().delete(flowlet_id)
+    if ok and _flowlet_broadcast_cb is not None:
+        try:
+            await _flowlet_broadcast_cb("flowlet.deleted", {"id": flowlet_id})
+        except Exception:
+            pass
+    return {"ok": ok}
 
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
@@ -2405,6 +2573,12 @@ _DISPATCH: dict[str, tuple] = {
     "artifacts.delete":   (artifacts_delete, True, False),
     "artifacts.pin":      (artifacts_pin, True, False),
     "artifacts.versions": (artifacts_versions, True, False),
+    "flowlets.list":      (flowlets_list, True, False),
+    "flowlets.get":       (flowlets_get, True, False),
+    "flowlets.state":     (flowlets_state, True, False),
+    "flowlets.action":    (flowlets_action, True, False),
+    "flowlets.pin":       (flowlets_pin, True, False),
+    "flowlets.delete":    (flowlets_delete, True, False),
     "model.list":         (model_list, True, False),
     "model.set":          (model_set, True, True),
     "assistants.list":    (assistants_list, False, False),

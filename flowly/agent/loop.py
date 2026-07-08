@@ -1694,6 +1694,16 @@ class AgentLoop:
         else:
             self._artifact_store = None
 
+        # Flowlet tool — agent-generated dynamic screens (enabled by default).
+        try:
+            from flowly.agent.tools.flowlet import FlowletTool
+            from flowly.flowlets.store import get_store as get_flowlet_store
+            self._flowlet_store = get_flowlet_store(self._state_dir)
+            self.tools.register(FlowletTool(store=self._flowlet_store))
+        except Exception as exc:  # noqa: BLE001 — never block agent startup
+            logger.debug("Flowlet tool unavailable: {}", exc)
+            self._flowlet_store = None
+
         # Browser tab tool (if enabled — requires Chrome extension)
         browser_tab_enabled = False
         if self._main_config and hasattr(self._main_config, "tools"):

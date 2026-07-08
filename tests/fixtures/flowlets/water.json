@@ -1,0 +1,67 @@
+{
+  "catalog": 1,
+  "name": "Su Takibi",
+  "icon": "droplet",
+  "accent": "#00A6C8",
+  "state": {
+    "goal_ml": { "type": "number", "default": 2000, "min": 250, "max": 10000 }
+  },
+  "series": {
+    "water": { "unit": "ml" }
+  },
+  "computed": {
+    "today_ml": { "series": "water", "agg": "sum", "window": "today" },
+    "remaining": { "expr": "max(0, goal_ml - today_ml)" }
+  },
+  "layout": [
+    { "type": "header", "text": "Bugün" },
+    {
+      "id": "bar",
+      "type": "progress",
+      "value": "today_ml",
+      "max": "goal_ml",
+      "label": "{today_ml} / {goal_ml} ml"
+    },
+    {
+      "type": "row",
+      "children": [
+        {
+          "id": "drink250",
+          "type": "button",
+          "text": "İçtim (250 ml)",
+          "style": "primary",
+          "action": { "op": "log", "series": "water", "value": 250 }
+        },
+        {
+          "id": "undo",
+          "type": "icon_button",
+          "icon": "undo",
+          "action": { "op": "remove_last", "series": "water" }
+        }
+      ]
+    },
+    {
+      "id": "goalSlider",
+      "type": "slider",
+      "min": 1000,
+      "max": 4000,
+      "step": 250,
+      "label": "Günlük hedef",
+      "value": "goal_ml",
+      "action": { "op": "set", "key": "goal_ml" }
+    },
+    {
+      "id": "week",
+      "type": "chart",
+      "kind": "bar",
+      "data": { "series": "water", "agg": "sum", "bucket": "day", "window": "7d" }
+    },
+    {
+      "id": "coach",
+      "type": "button",
+      "text": "Haftamı yorumla",
+      "style": "ghost",
+      "action": { "op": "agent", "message": "Su içme alışkanlığımın son haftasını yorumla." }
+    }
+  ]
+}
