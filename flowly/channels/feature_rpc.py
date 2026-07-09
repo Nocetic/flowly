@@ -1004,6 +1004,18 @@ def set_flowlet_watch_hook(cb) -> None:
     _flowlet_watch_hook_cb = cb
 
 
+#   * refresh hook — resolve a flowlet's live data sources on demand (a client
+#     opened the screen → due sources; tapped refresh → force all).
+_flowlet_refresh_cb = None
+
+
+def set_flowlet_refresh_hook(cb) -> None:
+    """Register an async ``(flowlet_id, force: bool) -> int`` that refreshes a
+    flowlet's data sources."""
+    global _flowlet_refresh_cb
+    _flowlet_refresh_cb = cb
+
+
 def provider_active() -> dict:
     """Resolved active LLM provider (no secrets) + the current default model —
     for the Settings display and the model picker's current selection."""
@@ -1433,6 +1445,14 @@ def flowlets_get(params: dict) -> dict:
     flowlet = _flowlet_store().get(flowlet_id)
     if not flowlet:
         raise FeatureRpcError("NOT_FOUND", "Flowlet not found")
+    # Opening the screen refreshes its due data sources in the background — the
+    # fresh values arrive as a `flowlet.state` broadcast a moment later.
+    if _flowlet_refresh_cb is not None and (flowlet.get("definition") or {}).get("sources"):
+        try:
+            import asyncio as _asyncio
+            _asyncio.get_running_loop().create_task(_flowlet_refresh_cb(flowlet_id, False))
+        except Exception:
+            pass  # no loop / best-effort
     return {
         "flowlet": {
             "id": flowlet["id"],
@@ -1447,6 +1467,26 @@ def flowlets_get(params: dict) -> dict:
         },
         "values": _flowlet_values(flowlet),
     }
+
+
+async def flowlets_refresh(params: dict) -> dict:
+    """Force-refresh a flowlet's live data sources (a pull-to-refresh tap).
+    Returns the freshly-resolved values; a `flowlet.state` broadcast also fans
+    the update to the other clients."""
+    flowlet_id = str(params.get("id", "") or "")
+    if not flowlet_id:
+        raise FeatureRpcError("INVALID", "id required")
+    flowlet = _flowlet_store().get(flowlet_id)
+    if not flowlet:
+        raise FeatureRpcError("NOT_FOUND", "Flowlet not found")
+    refreshed = 0
+    if _flowlet_refresh_cb is not None:
+        try:
+            refreshed = await _flowlet_refresh_cb(flowlet_id, True)
+        except Exception as exc:
+            raise FeatureRpcError("UNAVAILABLE", f"couldn't refresh: {exc}")
+    fresh = _flowlet_store().get(flowlet_id) or flowlet  # re-read post-refresh
+    return {"id": flowlet_id, "refreshed": refreshed, "values": _flowlet_values(fresh)}
 
 
 def flowlets_state(params: dict) -> dict:
@@ -2606,6 +2646,7 @@ _DISPATCH: dict[str, tuple] = {
     "flowlets.get":       (flowlets_get, True, False),
     "flowlets.state":     (flowlets_state, True, False),
     "flowlets.action":    (flowlets_action, True, False),
+    "flowlets.refresh":   (flowlets_refresh, True, False),
     "flowlets.pin":       (flowlets_pin, True, False),
     "flowlets.delete":    (flowlets_delete, True, False),
     "model.list":         (model_list, True, False),

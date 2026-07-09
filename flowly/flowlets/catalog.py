@@ -76,6 +76,22 @@ WATCH_DEFAULT_COOLDOWN_MIN: dict[str, int] = {
 #: trigger on a tight loop.
 WATCH_AGENT_MIN_COOLDOWN_MIN = 30
 
+# ── Live data sources (bring the outside world onto a flowlet) ────────────────
+# A top-level `sources` object declares named bindings the bot refreshes on a
+# schedule (LLM-free where possible) and writes into a *source-owned* state key
+# a component then renders. See flowly/flowlets/sources.py.
+#   * agent  — a model turn returns structured data (reuses the agent's tools;
+#              same privilege as a cron self-prompt). Shipping first.
+#   * tool   — a whitelisted read-only tool called directly, LLM-free (Phase 3).
+#   * device — a client-side OS sensor synced up (HealthKit/location; Phase 3).
+SOURCE_KINDS = frozenset({"agent"})            # `tool`/`device` land in later phases
+MAX_SOURCES = 8
+MAX_SOURCE_PROMPT_LEN = 1000
+#: Minimum refresh interval per kind (minutes) — a scheduled fetch must never be
+#: cheap to hammer. `manual` (refresh only on tap/open) is always allowed.
+SOURCE_MIN_REFRESH_MIN = {"agent": 10}
+SOURCE_DEFAULT_REFRESH_MIN = 30
+
 # ── Icon names (platform-neutral; mapped to SF Symbols / lucide per client) ───
 # Unknown names are allowed — the client falls back to a neutral dot — but
 # these are the vetted set documented in docs/flowlets-catalog.md.

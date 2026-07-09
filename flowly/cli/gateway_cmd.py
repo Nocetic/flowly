@@ -1393,6 +1393,7 @@ Respond to the user now:"""
     # declarative `watches` LLM-free and pushes a reminder when one fires. Built
     # here so it shares the agent tool's exact store instance (single writer).
     _watch_engine = None
+    _source_engine = None
 
     async def _watch_notify(flowlet_id: str, title: str, body: str) -> None:
         """A watch fired → APNs/FCM (mobile) + flowlet.reminder (desktop)."""
@@ -1402,6 +1403,25 @@ Respond to the user now:"""
     async def _watch_hook(flowlet_id: str) -> None:
         if _watch_engine is not None:
             await _watch_engine.evaluate_one(flowlet_id, reason="tap")
+
+    async def _flowlet_source_runner(flowlet: dict, prompt: str) -> str | None:
+        """Run an agent turn to FETCH data for a flowlet source and return its
+        raw reply (JSON). Unlike the action runner, nothing lands in chat — a
+        dedicated per-flowlet session keeps it isolated from the user's threads."""
+        try:
+            return await agent.process_direct(
+                prompt,
+                session_key=f"flowlet_source:{flowlet.get('id')}",
+                skip_memory=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Flowlet source agent run failed: {}", exc)
+            return None
+
+    async def _flowlet_refresh(flowlet_id: str, force: bool) -> int:
+        if _source_engine is None:
+            return 0
+        return await _source_engine.refresh_flowlet(flowlet_id, force=force)
 
     try:
         from flowly.channels import feature_rpc as _frpc_flowlet
@@ -1423,6 +1443,14 @@ Respond to the user now:"""
         _frpc_flowlet.set_flowlet_watch_hook(_watch_hook)
         if _flowlet_tool and hasattr(_flowlet_tool, "set_watch_hook"):
             _flowlet_tool.set_watch_hook(_watch_hook)
+
+        # Live data sources — same store; refreshed on a slower heartbeat and on
+        # demand (screen open / pull-to-refresh via feature_rpc).
+        from flowly.flowlets.sources import SourceEngine
+        _source_engine = SourceEngine(
+            _fl_store, broadcast=_broadcast_flowlet, agent_runner=_flowlet_source_runner,
+        )
+        _frpc_flowlet.set_flowlet_refresh_hook(_flowlet_refresh)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Flowlet wiring skipped: {}", exc)
 
@@ -1578,6 +1606,7 @@ Respond to the user now:"""
                 loop.add_signal_handler(sig, signal_handler)
 
         _watch_task: asyncio.Task | None = None
+        _source_task: asyncio.Task | None = None
         try:
             await gateway_server.start()
             await cron.start()
@@ -1588,6 +1617,10 @@ Respond to the user now:"""
             # immediate eval via the watch hook; this catches time-of-day rules).
             if _watch_engine is not None:
                 _watch_task = asyncio.create_task(_watch_engine.run_heartbeat(interval_s=60))
+            # Flowlet live data sources — a slower 2-min heartbeat that refreshes
+            # due sources (screen-open / pull-to-refresh trigger the rest).
+            if _source_engine is not None:
+                _source_task = asyncio.create_task(_source_engine.run_heartbeat(interval_s=120))
 
             # Start voice plugin if available
             if voice_plugin:
@@ -1722,6 +1755,8 @@ Respond to the user now:"""
                 await voice_plugin.stop()
             if _watch_task is not None:
                 _watch_task.cancel()
+            if _source_task is not None:
+                _source_task.cancel()
             await gateway_server.stop()
             heartbeat.stop()
             cron.stop()

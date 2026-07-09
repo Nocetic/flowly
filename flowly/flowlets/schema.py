@@ -104,6 +104,7 @@ def validate_definition(defn: Any) -> dict:
         raise _err(f"too many state keys (max {catalog.MAX_STATE_KEYS})")
     scalar_keys: set[str] = set()
     list_keys: dict[str, dict] = {}  # list state key → {field: type}
+    source_keys: set[str] = set()    # state keys a `source` owns (user-read-only)
     for key, spec in state_defs.items():
         if not _KEY_RE.match(key):
             raise _err(
@@ -111,6 +112,11 @@ def validate_definition(defn: Any) -> dict:
                 "and contain only letters, digits, and underscores"
             )
         _validate_state_spec(key, spec)
+        if isinstance(spec, dict) and spec.get("source") is not None:
+            if not isinstance(spec["source"], bool):
+                raise _err(f"state '{key}': `source` must be true or false")
+            if spec["source"]:
+                source_keys.add(key)
         if isinstance(spec, dict) and spec.get("type") == "list":
             # A list resolves to an item array, not a scalar — it may not be
             # referenced by exprs/binds, only by a repeater / item ops.
@@ -161,6 +167,7 @@ def validate_definition(defn: Any) -> dict:
         count=0,
         list_keys=list_keys,
     )
+    ctx.source_keys = source_keys
     for node in layout:
         _validate_node(node, ctx, depth=1)
 
@@ -171,6 +178,17 @@ def validate_definition(defn: Any) -> dict:
     watches = defn.get("watches")
     if watches is not None:
         _validate_watches(watches, scalar_keys)
+
+    # ── sources (live/external data bindings — see sources.py) ────────────────
+    sources = defn.get("sources")
+    if sources is not None:
+        _validate_sources(sources, state_defs, source_keys)
+    # Every source-owned key must actually be written by a source (else it's a
+    # dead read-only key the user can never fill).
+    written = {s.get("into") for s in (sources or {}).values() if isinstance(s, dict)}
+    for k in source_keys:
+        if k not in written:
+            raise _err(f"state '{k}' is marked `source:true` but no source writes it")
 
     return defn
 
@@ -278,6 +296,63 @@ def _validate_computed_spec(
             raise _err(f"computed '{key}': {exc}")
 
 
+def _validate_sources(sources: Any, state_defs: dict, source_keys: set[str]) -> None:
+    """Live data bindings: ``{name: {kind, prompt, into, refresh?, limit?}}``.
+    Each writes a source-owned state key on a schedule (see sources.py)."""
+    if not isinstance(sources, dict):
+        raise _err("`sources` must be an object of {name: {kind, prompt, into, …}}")
+    if len(sources) > catalog.MAX_SOURCES:
+        raise _err(f"too many sources ({len(sources)}); the limit is {catalog.MAX_SOURCES}")
+    seen_into: set[str] = set()
+    for name, spec in sources.items():
+        where = f"source '{name}'"
+        if not _KEY_RE.match(name):
+            raise _err(f"source name '{name}' is invalid (letters/digits/underscore)")
+        if not isinstance(spec, dict):
+            raise _err(f"{where} must be an object")
+        kind = spec.get("kind")
+        if kind not in catalog.SOURCE_KINDS:
+            raise _err(f"{where}: kind must be one of {sorted(catalog.SOURCE_KINDS)}, got {kind!r}")
+        prompt = spec.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise _err(f"{where}: a non-empty `prompt` is required (what data to fetch)")
+        if len(prompt) > catalog.MAX_SOURCE_PROMPT_LEN:
+            raise _err(f"{where}: prompt must be ≤ {catalog.MAX_SOURCE_PROMPT_LEN} characters")
+        into = spec.get("into")
+        if into not in source_keys:
+            raise _err(
+                f"{where}: `into` must name a state key declared with `source: true`; got {into!r}"
+            )
+        if into in seen_into:
+            raise _err(f"{where}: two sources both write '{into}'")
+        seen_into.add(into)
+        refresh = spec.get("refresh", "manual")
+        if refresh != "manual":
+            mins = _parse_refresh_minutes(refresh)
+            if mins is None:
+                raise _err(f'{where}: refresh must be "manual" or like "15m" / "1h"')
+            floor = catalog.SOURCE_MIN_REFRESH_MIN.get(kind, 10)
+            if mins < floor:
+                raise _err(f"{where}: refresh for a {kind} source must be ≥ {floor}m")
+        limit = spec.get("limit")
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool)
+            or not 1 <= limit <= catalog.MAX_LIST_ITEMS
+        ):
+            raise _err(f"{where}: limit must be an integer 1..{catalog.MAX_LIST_ITEMS}")
+
+
+def _parse_refresh_minutes(v: Any) -> int | None:
+    """"15m" / "2h" → minutes; None if malformed."""
+    if not isinstance(v, str):
+        return None
+    m = re.match(r"^\s*(\d+)\s*([mh])\s*$", v)
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if m.group(2) == "m" else n * 60
+
+
 def _validate_list_agg_spec(key: str, spec: dict, list_keys: dict[str, dict]) -> None:
     """Conditional aggregation of a dynamic list: ``{list, agg, field?, where?}``
     → a scalar. ``where`` is an expr over the item's own fields."""
@@ -345,7 +420,7 @@ def _validate_cases_spec(key: str, spec: dict) -> None:
 class _Ctx:
     __slots__ = (
         "scalar_keys", "series_keys", "component_ids", "count",
-        "list_keys", "item_fields", "item_source",
+        "list_keys", "item_fields", "item_source", "source_keys",
     )
 
     def __init__(self, scalar_keys, series_keys, component_ids, count, list_keys=None):
@@ -356,6 +431,7 @@ class _Ctx:
         self.list_keys = list_keys or {}   # list state key → {field: type}
         self.item_fields = None            # {field: type} while inside a repeater template
         self.item_source = None            # the repeater's source key, ditto
+        self.source_keys = set()           # state keys a `source` owns (user-read-only)
 
 
 def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
@@ -493,6 +569,18 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
         raise _err(
             f"{ctype} (id={cid}) action op must be one of {sorted(catalog.ACTION_OPS)}, "
             f"got {op!r}"
+        )
+
+    # A source owns its state key; the user can't write it (the source snapshot
+    # would be clobbered / re-overwritten). Read-only from the UI.
+    tgt = action.get("key")
+    if isinstance(tgt, str) and tgt in ctx.source_keys and op in (
+        "set", "increment", "decrement", "toggle", "reset", "timer_toggle",
+        "item_add", "item_update", "item_remove", "item_toggle", "item_move",
+    ):
+        raise _err(
+            f"{ctype} (id={cid}) action `{op}` targets '{tgt}', which is owned by a "
+            "data source and is read-only"
         )
 
     if op in ("set", "increment", "decrement", "toggle"):

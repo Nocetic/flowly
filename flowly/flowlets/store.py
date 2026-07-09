@@ -79,9 +79,19 @@ CREATE TABLE IF NOT EXISTS flowlet_watch_state (
     last_cond     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (flowlet_id, watch_id)
 );
+
+CREATE TABLE IF NOT EXISTS flowlet_source_state (
+    flowlet_id   TEXT NOT NULL REFERENCES flowlets(id) ON DELETE CASCADE,
+    source_id    TEXT NOT NULL,
+    last_ok_ms   INTEGER,
+    last_err_ms  INTEGER,
+    fail_count   INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT,
+    PRIMARY KEY (flowlet_id, source_id)
+);
 """
 
-_SCHEMA_VERSION = "2"
+_SCHEMA_VERSION = "3"
 
 
 def now_ms() -> int:
@@ -423,6 +433,64 @@ class FlowletStore:
                    DO UPDATE SET last_fired_ms = excluded.last_fired_ms,
                                  last_cond    = excluded.last_cond""",
                 (flowlet_id, watch_id, new_fired, new_cond),
+            )
+
+    # ── Source runtime state (refresh scheduling + backoff) ─────────────────────
+
+    def get_source_state(self, flowlet_id: str) -> dict[str, dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT source_id, last_ok_ms, last_err_ms, fail_count, last_error
+                   FROM flowlet_source_state WHERE flowlet_id = ?""",
+                (flowlet_id,),
+            ).fetchall()
+        return {
+            r["source_id"]: {
+                "last_ok_ms": r["last_ok_ms"],
+                "last_err_ms": r["last_err_ms"],
+                "fail_count": r["fail_count"],
+                "last_error": r["last_error"],
+            }
+            for r in rows
+        }
+
+    def set_source_state(
+        self,
+        flowlet_id: str,
+        source_id: str,
+        *,
+        last_ok_ms: int | None = None,
+        last_err_ms: int | None = None,
+        fail_count: int | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Upsert a source's runtime state, overwriting only provided fields."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """SELECT last_ok_ms, last_err_ms, fail_count, last_error
+                   FROM flowlet_source_state WHERE flowlet_id = ? AND source_id = ?""",
+                (flowlet_id, source_id),
+            ).fetchone()
+            cur = dict(row) if row else {
+                "last_ok_ms": None, "last_err_ms": None, "fail_count": 0, "last_error": None,
+            }
+            new = {
+                "last_ok_ms": last_ok_ms if last_ok_ms is not None else cur["last_ok_ms"],
+                "last_err_ms": last_err_ms if last_err_ms is not None else cur["last_err_ms"],
+                "fail_count": fail_count if fail_count is not None else cur["fail_count"],
+                "last_error": last_error if last_error is not None else cur["last_error"],
+            }
+            self._conn.execute(
+                """INSERT INTO flowlet_source_state
+                       (flowlet_id, source_id, last_ok_ms, last_err_ms, fail_count, last_error)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(flowlet_id, source_id) DO UPDATE SET
+                       last_ok_ms = excluded.last_ok_ms,
+                       last_err_ms = excluded.last_err_ms,
+                       fail_count = excluded.fail_count,
+                       last_error = excluded.last_error""",
+                (flowlet_id, source_id, new["last_ok_ms"], new["last_err_ms"],
+                 new["fail_count"], new["last_error"]),
             )
 
     # ── Row conversion ────────────────────────────────────────────────────────
