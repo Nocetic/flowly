@@ -43,6 +43,15 @@ aggregate. `catalog: 1` is required at the top of every definition.
   → count/sum/avg/min/max over a dynamic list, `where` an expr over item fields);
   a safe arithmetic **`expr`**; or conditional text **`cases`**. Resolved in
   dependency order (declaration order doesn't matter).
+- **sources** — live/external data bindings (optional). Each
+  `{kind:"agent", prompt, into, refresh?, limit?}` refreshes a **source-owned**
+  state key (declared with `"source": true`) on a schedule: an agent turn
+  fetches the data with its tools and returns JSON matching the target's schema
+  (a `list`'s item fields, or a scalar). `refresh` is `"manual"` or `"15m"`/
+  `"1h"` (min 10 m; throttled + backoff, keeps stale data on failure). A
+  source key is read-only to the user (no `set`/`item_*` on it). Privilege = a
+  cron self-prompt; shown transparently in the screen's "Data sources" section.
+  (`tool`/`device` kinds — LLM-free / HealthKit — arrive in a later phase.)
 - **layout** — the component tree.
 
 **aggregations** (`agg`): `sum · count · avg · min · max · last`
@@ -238,8 +247,10 @@ definition ≤ 64 KB · ≤ 200 components · nesting depth ≤ 8 · ≤ 200 lis
 
 ## Sync surface
 
-`flowlets.list · flowlets.get · flowlets.state · flowlets.action · flowlets.pin
-· flowlets.delete` over feature_rpc (gateway + relay). Events:
+`flowlets.list · flowlets.get · flowlets.state · flowlets.action ·
+flowlets.refresh · flowlets.pin · flowlets.delete` over feature_rpc (gateway +
+relay). `flowlets.get` also kicks a background refresh of due data sources;
+`flowlets.refresh` force-refreshes them (pull-to-refresh). Events:
 `flowlet.created · flowlet.updated · flowlet.deleted · flowlet.state ·
 flowlet.reminder` (a watch fired → desktop notification). Creation/definition
 edits are agent-only (via the `flowlet` tool); reactive `watches` fire on the

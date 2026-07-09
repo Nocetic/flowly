@@ -226,6 +226,57 @@ date fns) in scope:
 Then: `stat value="open"`, `visibleWhen="open == 0"` (all done → hide the list,
 show a "hepsi tamam 🎉" callout), or a watch `when="open == 0"`.
 
+## Live data — bind a screen to the outside world (`sources`)
+
+A flowlet doesn't have to hold only what the user logs. A top-level `sources`
+object binds a **source-owned** state key to live data you fetch on a schedule —
+so "show my repo's commits, hourly" is a self-refreshing panel, not a chore.
+This is what makes a flowlet feel like it *knows the user's world*.
+
+```json
+{
+  "catalog": 1, "name": "Repo", "icon": "activity", "accent": "#7C6FF0",
+  "state": {
+    "repo": { "type": "string", "default": "Nocetic/flowly" },
+    "commits": { "type": "list", "item": { "title": "string", "who": "string", "at": "date" },
+                 "source": true }
+  },
+  "sources": {
+    "commits": { "kind": "agent",
+                 "prompt": "the last 10 commits to {repo} in the past hour, newest first",
+                 "into": "commits", "refresh": "1h", "limit": 10 }
+  },
+  "layout": [
+    { "id": "repo", "type": "input", "placeholder": "owner/repo",
+      "action": { "op": "set", "key": "repo" } },
+    { "type": "repeater", "source": "commits", "empty": "No recent commits",
+      "item": { "type": "row", "children": [
+        { "type": "text", "text": "{$.title}" },
+        { "type": "badge", "text": "{$.who}" } ] } }
+  ]
+}
+```
+
+The rules:
+- Declare the target key with **`"source": true`** — it's owned by the source,
+  read-only to the user (no `set`/`item_add` on it; the snapshot is replaced
+  each refresh).
+- **`kind: "agent"`** — a normal turn of yours (with all your tools) fetches the
+  data and returns JSON matching the target's schema. Same privilege as a cron
+  self-prompt; it runs on a schedule, isolated from chat.
+- `prompt` — what to fetch, templated with `{key}` live values (e.g. `{repo}`
+  from an input, so the user can retarget it).
+- `into` — the source-owned key; a `list` → an array of `{item fields}`, a
+  scalar (number/string) → one value. `limit` caps a list.
+- `refresh` — `"manual"` (only on open / a refresh tap) or `"15m"` / `"1h"`
+  (min 10 m; sources are throttled and back off on failure, keeping stale data).
+- A source panel refreshes when the user opens the screen and on its interval;
+  the client can pull-to-refresh. The user sees every source in plain language
+  in the screen's "Data sources" section — keep prompts honest.
+
+Use this for dashboards over the user's real world (repos, calendar, tasks,
+weather, metrics) — anything you can fetch with your tools.
+
 ## Adaptive screens — `visibleWhen` + conditional text
 
 Two tools make a screen react to its own data instead of looking static:
