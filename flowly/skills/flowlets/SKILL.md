@@ -47,8 +47,9 @@ lookup, cross-flowlet reasoning).
 ## Actions on the tool
 
 - `create` — `{definition}` → builds it. The definition holds `catalog`,
-  `name`, `icon`, `accent`, `state`, `series`, `computed`, `layout`, and
-  `watches` (reminders — include them here when the user asks for any).
+  `name`, `icon`, `accent`, `state`, `series`, `computed`, `layout`,
+  `watches` (reminders — include them here when the user asks for any),
+  optional `sources` (live data) and `screens` (drill-down fragments).
 - `update` — `{flowlet_id, definition}` (full replace, versioned) or
   `{flowlet_id, pinned}`.
 - `get` — `{flowlet_id}` → definition **and current live values**. Use this to
@@ -132,6 +133,14 @@ list item; the user taps a header to re-sort. Pairs naturally with a live source
 and `sortBy`. For a live search box, add `{"type":"search","target":"<that
 component's id>","fields":["title"],"placeholder":"Ara…"}` — the user types and
 the target's rows filter instantly (on-device, nothing sent anywhere).
+
+**Drill-down (tap a row → a detail screen).** Add a top-level `screens` map of
+named fragments, and put `navigate` on the repeater/table:
+`{"type":"repeater","source":"commits","navigate":"detail","item":{…}}` with
+`"screens":{"detail":{"title":"{$.title}","layout":[{"type":"text","text":"{$.who}
+· {$.at}"}]}}`. Tapping a row pushes that screen with the row's item in scope
+(`$.field`). Keep the list row a summary and put the details (and any row
+actions like delete) in the screen. One level deep.
 
 ## Actions (what a tap does — declared, deterministic, no LLM)
 

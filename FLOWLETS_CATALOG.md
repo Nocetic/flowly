@@ -165,6 +165,14 @@ platform.
   substring over `fields` (default: all string fields). The query is never sent
   to the bot.
 
+**Drill-down (`screens` + `navigate`).** A top-level `screens` map holds named
+layout fragments: `"screens": {"detail": {"title?": "{$.title}", "layout": [...]}}`.
+A repeater or data-bound table carries `navigate: "<screenId>"` → each row
+becomes tappable and pushes that screen **with the row's item in scope**
+(`$.field` binds, `{$.field}` interpolates, inner actions carry the row's
+itemId). v1 is one level deep: a screen may not contain a repeater or a nested
+`navigate`. Max 6 screens; every screen must be navigated to.
+
 ### Display v2 — structured / professional (9)
 | type | key props |
 |---|---|
