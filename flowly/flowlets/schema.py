@@ -174,6 +174,23 @@ def validate_definition(defn: Any) -> dict:
     if ctx.count > catalog.MAX_COMPONENTS:
         raise _err(f"too many components ({ctx.count}); the limit is {catalog.MAX_COMPONENTS}")
 
+    # search targets are checked after the walk (a `search` may precede its
+    # target repeater/table in reading order).
+    for cid, target, fields in ctx.searches:
+        if target not in ctx.filterable:
+            raise _err(
+                f"search (id={cid}) `target` must name a repeater or data-bound table id; "
+                f"got {target!r}"
+            )
+        if fields is not None:
+            list_fields = ctx.list_keys.get(ctx.filterable[target], {})
+            for f in fields:
+                if f not in list_fields:
+                    raise _err(
+                        f"search (id={cid}) `fields` entry '{f}' is not a field of the "
+                        f"target's list (declared: {sorted(list_fields)})"
+                    )
+
     # ── watches (reactive rules; evaluated LLM-free — see watches.py) ─────────
     watches = defn.get("watches")
     if watches is not None:
@@ -421,6 +438,7 @@ class _Ctx:
     __slots__ = (
         "scalar_keys", "series_keys", "component_ids", "count",
         "list_keys", "item_fields", "item_source", "source_keys",
+        "filterable", "searches",
     )
 
     def __init__(self, scalar_keys, series_keys, component_ids, count, list_keys=None):
@@ -432,6 +450,8 @@ class _Ctx:
         self.item_fields = None            # {field: type} while inside a repeater template
         self.item_source = None            # the repeater's source key, ditto
         self.source_keys = set()           # state keys a `source` owns (user-read-only)
+        self.filterable = {}               # id of a repeater/source-table → its list key
+        self.searches = []                 # (cid, target, fields) — checked after the walk
 
 
 def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
@@ -847,6 +867,8 @@ def _validate_table(cid, node, ctx: _Ctx) -> None:
             f"table (id={cid}) `source` must name a declared list state key; got {src!r}"
         )
     fields = ctx.list_keys[src]
+    if cid:
+        ctx.filterable[cid] = src   # a `search` may target this table
     cols = node.get("columns")
     if not isinstance(cols, list) or not (1 <= len(cols) <= catalog.MAX_TABLE_COLUMNS):
         raise _err(
@@ -885,6 +907,37 @@ def _validate_table(cid, node, ctx: _Ctx) -> None:
     empty = node.get("empty")
     if empty is not None and not isinstance(empty, str):
         raise _err(f"table (id={cid}) `empty` must be a string")
+    where = node.get("where")
+    if where is not None:
+        _validate_item_where(f"table (id={cid})", where, fields)
+
+
+def _validate_item_where(label: str, where: Any, fields: dict) -> None:
+    """A per-item filter expr — evaluated client-side per row; its key refs must
+    be fields of the list it filters."""
+    if not isinstance(where, str) or not where.strip():
+        raise _err(f"{label} `where` must be a non-empty expression string")
+    from flowly.flowlets.queries import validate_expr
+    try:
+        validate_expr(where)
+    except ValueError as exc:
+        raise _err(f"{label} where {exc}")
+    for name in _expr_key_refs(where):
+        if name not in fields:
+            raise _err(
+                f"{label} `where` references unknown field '{name}' "
+                f"(declared: {sorted(fields)})"
+            )
+
+
+def _validate_item_sortby(label: str, sort_by: Any, fields: dict) -> None:
+    if not isinstance(sort_by, dict):
+        raise _err(f"{label} `sortBy` must be an object {{field, dir}}")
+    f = sort_by.get("field")
+    if f not in fields:
+        raise _err(f"{label} `sortBy.field` must be a field of the list; got {f!r}")
+    if sort_by.get("dir", "asc") not in catalog.SORT_DIRS:
+        raise _err(f"{label} `sortBy.dir` must be asc or desc")
 
 
 def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> None:
@@ -900,6 +953,13 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> N
         empty = node.get("empty")
         if empty is not None and not isinstance(empty, str):
             raise _err(f"repeater (id={cid}) `empty` must be a string")
+        fields = ctx.list_keys[source]
+        if cid:
+            ctx.filterable[cid] = source   # a `search` may target this repeater
+        if node.get("where") is not None:
+            _validate_item_where(f"repeater (id={cid})", node["where"], fields)
+        if node.get("sortBy") is not None:
+            _validate_item_sortby(f"repeater (id={cid})", node["sortBy"], fields)
         item = node.get("item")
         if not isinstance(item, dict):
             raise _err(f"repeater (id={cid}) `item` must be a component object (the row template)")
@@ -912,6 +972,20 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> N
         finally:
             ctx.item_fields = None
             ctx.item_source = None
+        return
+    if ctype == "search":
+        target = node.get("target")
+        if not isinstance(target, str) or not target.strip():
+            raise _err(f"search (id={cid}) needs a `target` (a repeater/table id)")
+        fields = node.get("fields")
+        if fields is not None:
+            if not isinstance(fields, list) or not all(isinstance(f, str) for f in fields):
+                raise _err(f"search (id={cid}) `fields` must be an array of field names")
+        placeholder = node.get("placeholder")
+        if placeholder is not None and not isinstance(placeholder, str):
+            raise _err(f"search (id={cid}) `placeholder` must be a string")
+        # target/fields are cross-checked after the full walk (forward refs).
+        ctx.searches.append((cid, target, fields))
         return
     if ctype == "slider":
         mn, mx = node.get("min"), node.get("max")

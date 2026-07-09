@@ -240,6 +240,9 @@ COMPONENTS: dict[str, dict] = {
                      "required": ["options"]},
     "date":         {"category": "input", "container": False, "action": True},
     "textarea":     {"category": "input", "container": False, "action": True},
+    # Filters a target repeater/table's rows client-side (never hits the bot).
+    "search":       {"category": "input", "container": False, "action": False,
+                     "required": ["target"]},
 }
 
 #: Chart-family components whose ``data`` prop resolves to a per-bucket series.
