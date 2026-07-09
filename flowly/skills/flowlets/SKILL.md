@@ -127,6 +127,12 @@ by what you're showing:
 list item; the user taps a header to re-sort. Pairs naturally with a live source
 (a source writes the list, the table shows it).
 
+**Search & filter a long list.** A `repeater` or source `table` can carry
+`where` (a per-item filter expr — `"where":"done == 0"`, `"days_until(due)<=1"`)
+and `sortBy`. For a live search box, add `{"type":"search","target":"<that
+component's id>","fields":["title"],"placeholder":"Ara…"}` — the user types and
+the target's rows filter instantly (on-device, nothing sent anywhere).
+
 ## Actions (what a tap does — declared, deterministic, no LLM)
 
 Put an `action` on an input component. Ops:

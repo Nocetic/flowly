@@ -93,7 +93,7 @@ scalar key. Unknown component types render a neutral placeholder.
 | `list` | stacked rows; `children` |
 | `divider` | hairline |
 | `spacer` | `size` px |
-| `repeater` | one row per item of a `list` state key: `source`, `item` (row template — `$.field` binds, `{$.field}` interpolates), `empty?` |
+| `repeater` | one row per item of a `list` state key: `source`, `item` (row template — `$.field` binds, `{$.field}` interpolates), `empty?`, `where?`, `sortBy?` |
 
 ### Display (14)
 | type | key props |
@@ -154,6 +154,16 @@ platform.
 | `select` | `options: [str \| {value,label}]`, `label?` | `set` (use over segmented for many options) |
 | `date` | `label?` | `set` (stores `YYYY-MM-DD`) |
 | `textarea` | `label?`, `maxLength?`, `rows?` | `set` |
+| `search` | `target` (a repeater/table id), `fields?`, `placeholder?` | filters that list client-side (no bot round-trip) |
+
+**Filtering & sorting a list** (all client-local, deterministic, LLM-free):
+- A `repeater` or source-mode `table` may carry `where` (a per-item filter expr —
+  same safe grammar as elsewhere, referencing item fields, e.g.
+  `"where":"done == 0"` or `"days_until(due) <= 1"`) and `sortBy`
+  (`{field, dir:"asc|desc"}`).
+- A `search` component filters its `target`'s rendered rows by case-folded
+  substring over `fields` (default: all string fields). The query is never sent
+  to the bot.
 
 ### Display v2 — structured / professional (9)
 | type | key props |
