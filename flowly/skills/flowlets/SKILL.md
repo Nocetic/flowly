@@ -121,6 +121,12 @@ by what you're showing:
   `{"list":"runs","x":"km","y":"pace"}` with `kind:"scatter"`. No series needed —
   it reads the list rows.
 
+**Tables over data.** A `table` can bind to a `list` instead of static rows:
+`{"type":"table","source":"prs","columns":[{"field":"title","label":"Başlık"},
+{"field":"n","align":"right"}],"sortBy":{"field":"n","dir":"desc"}}`. One row per
+list item; the user taps a header to re-sort. Pairs naturally with a live source
+(a source writes the list, the table shows it).
+
 ## Actions (what a tap does — declared, deterministic, no LLM)
 
 Put an `action` on an input component. Ops:

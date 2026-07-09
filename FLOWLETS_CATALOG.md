@@ -109,7 +109,7 @@ scalar key. Unknown component types render a neutral placeholder.
 | `chart` | `data` + `kind` (`bar`/`line`/`area`/`pie`/`scatter`) |
 | `sparkline` | `data` (single series only) |
 | `heatmap` | `data` (single series only) |
-| `table` | `rows` (array of rows) |
+| `table` | static `rows`, **or** data-bound `source` (a list key) + `columns` |
 | `clock` | `seconds?` |
 | `countdown` | `target` (epoch-ms or ISO), `label?` |
 
@@ -129,6 +129,14 @@ multi are `chart`-only):
 - **Colours** — a fixed 8-hex palette (`#8b5cf6 #22c55e #f59e0b #ef4444 #3b82f6
   #ec4899 #14b8a6 #a3a3a3`), same on every platform; series/slice 0 uses the
   flowlet accent, an explicit `color` on a series overrides.
+
+**Data-bound `table`** — instead of static `rows`, bind to a list:
+`{ "source": "<list key>", "columns": [{"field","label?","align?","width?"}],
+"sortBy?": {"field","dir":"asc|desc"}, "empty?": "…" }` (1–6 columns; each
+`field` must exist in the list's item schema). One row per item; tapping a
+header sorts (client-local). Sort is deterministic + locale-independent
+(numbers numerically, strings case-folded, missing last) — identical on every
+platform.
 
 ### Input (13) — carry an `action`, need an `id`
 | type | key props | typical action |
