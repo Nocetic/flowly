@@ -108,6 +108,19 @@ state/computed key. A `chart`/`sparkline`/`heatmap` `data` object is
 `{"series": "...", "agg": "sum|count|avg|min|max|last", "bucket": "hour|day|week",
 "window": "today|7d|30d|90d|all"}`.
 
+**Rich charts** (a `chart` only — `sparkline`/`heatmap` stay single-series). Pick
+by what you're showing:
+- **Compare trends** → multi-series overlay: `data.series` becomes a list,
+  `[{"key":"weight","label":"Kilo"},{"key":"goal","color":"#8b5cf6"}]` (2–4). Use
+  `kind:"line"`/`"area"`, or `kind:"bar"` with `"stacked":true` to stack.
+- **Show a breakdown** → pie/donut: `{"series":"spend","by":"category","agg":"sum",
+  "donut":true}` with `kind:"pie"`. Tag each event with a category on the log
+  action: `{"op":"log","series":"spend","value":"{amount}","category":"{cat}"}`
+  (a literal or a `{token}`). Slices are the per-category totals (top 8 + other).
+- **Plot pairs** → scatter over a `list`'s two number fields:
+  `{"list":"runs","x":"km","y":"pace"}` with `kind:"scatter"`. No series needed —
+  it reads the list rows.
+
 ## Actions (what a tap does — declared, deterministic, no LLM)
 
 Put an `action` on an input component. Ops:

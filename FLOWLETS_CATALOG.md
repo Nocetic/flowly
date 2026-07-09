@@ -70,7 +70,9 @@ other calls — anything else is rejected at author time.
 ## Values & interpolation
 
 Renderers receive `values`: a flat map of scalar keys (state + computed) plus,
-for each chart/sparkline/heatmap, its `id` → `[{t, v}]` buckets. A label
+for each chart/sparkline/heatmap, its `id` → its resolved data (single series →
+`[{t,v}]`; multi → `{multi:[{k,points}]}`; categorical → `[{k,v}]`; a scatter
+chart writes nothing — it reads its list directly). A label
 interpolates any scalar with `{key}` (e.g. `"{today_ml} / {goal_ml} ml"`).
 Whole numbers arrive as integers (rendered `750`, not `750.0`); locale
 formatting (separators/units) is the client's job.
@@ -104,14 +106,29 @@ scalar key. Unknown component types render a neutral placeholder.
 | `progress` | `value`, `max` (binds), `label?` |
 | `ring` | `value`, `max`, `label?` |
 | `gauge` | `value`, `min`, `max`, `label?` |
-| `chart` | `data` + `kind` (`bar`/`line`/`area`) |
-| `sparkline` | `data` |
-| `heatmap` | `data` |
+| `chart` | `data` + `kind` (`bar`/`line`/`area`/`pie`/`scatter`) |
+| `sparkline` | `data` (single series only) |
+| `heatmap` | `data` (single series only) |
 | `table` | `rows` (array of rows) |
 | `clock` | `seconds?` |
 | `countdown` | `target` (epoch-ms or ISO), `label?` |
 
-`data` = `{ series, agg, bucket, window }`.
+A chart's `data` takes **one of four forms** (detected by shape; `pie`/`scatter`/
+multi are `chart`-only):
+
+| form | `data` | resolves to |
+|---|---|---|
+| single time series | `{ series:"k", agg?, bucket?, window? }` | `[{t,v}]` |
+| multi-series overlay | `{ series:[{key,label?,color?}], agg?, bucket?, window?, stacked? }` (2–4) | `{multi:[{k,points:[{t,v}]}]}` |
+| categorical pie/donut | `{ series:"k", by:"category", agg:sum\|count, window?, donut? }` | `[{k,v}]` (top 8 + "other") |
+| list scatter | `{ list:"k", x, y }` (`x`/`y` = number item fields) | client reads the list rows |
+
+- **Categories** come from an event's `category`, set on the `log` op:
+  `{op:"log", series:"spend", value:"…", category:"food"}` (a literal or a
+  `"{token}"` templated from live values). `stacked:true` is bar-only.
+- **Colours** — a fixed 8-hex palette (`#8b5cf6 #22c55e #f59e0b #ef4444 #3b82f6
+  #ec4899 #14b8a6 #a3a3a3`), same on every platform; series/slice 0 uses the
+  flowlet accent, an explicit `color` on a series overrides.
 
 ### Input (13) — carry an `action`, need an `id`
 | type | key props | typical action |
