@@ -47,6 +47,11 @@ MAX_PIE_SLICES = 8              # slices shown; the tail folds into "other"
 MAX_CATEGORY_LEN = 40           # a logged event's category label, after render
 #: Aggs valid for a categorical breakdown (a slice is a total or a tally).
 CATEGORY_AGGS = frozenset({"sum", "count"})
+
+# ── Data-bound table (catalog 2) ──────────────────────────────────────────────
+MAX_TABLE_COLUMNS = 6
+TABLE_ALIGNS = frozenset({"left", "center", "right"})
+SORT_DIRS = frozenset({"asc", "desc"})
 #: The shared categorical palette — the SAME hexes on bot docs, Desktop, iOS, so
 #: a series/slice keeps its colour across platforms. Series/slice N (0-based) →
 #: CHART_PALETTE[N % len]; an explicit `color` on a series overrides.
@@ -184,8 +189,9 @@ COMPONENTS: dict[str, dict] = {
                   "required": ["data"]},
     "heatmap":   {"category": "display", "container": False, "action": False,
                   "required": ["data"]},
-    "table":     {"category": "display", "container": False, "action": False,
-                  "required": ["rows"]},
+    # Either static `rows` (array of rows) or a data-bound `source` + `columns`
+    # (validated in schema — exactly one mode). See MAX_TABLE_COLUMNS.
+    "table":     {"category": "display", "container": False, "action": False},
     "clock":     {"category": "display", "container": False, "action": False},
     "countdown": {"category": "display", "container": False, "action": False,
                   "required": ["target"]},

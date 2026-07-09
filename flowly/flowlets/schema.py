@@ -825,6 +825,68 @@ def _validate_scatter_data(cid, data, ctx: _Ctx) -> None:
             )
 
 
+def _validate_table(cid, node, ctx: _Ctx) -> None:
+    """A table is either static `rows` or a data-bound `source` + `columns`
+    (exactly one). Source mode renders one row per item of a `list` state key,
+    with header-tap sorting on the client."""
+    has_rows = "rows" in node
+    src = node.get("source")
+    has_source = isinstance(src, str)
+    if has_rows == has_source:
+        raise _err(
+            f"table (id={cid}) needs exactly one of `rows` (static) or `source` (data-bound)"
+        )
+    if has_rows:
+        if not isinstance(node["rows"], list):
+            raise _err(f"table (id={cid}) `rows` must be an array")
+        return
+
+    # ── data-bound mode ──
+    if src not in ctx.list_keys:
+        raise _err(
+            f"table (id={cid}) `source` must name a declared list state key; got {src!r}"
+        )
+    fields = ctx.list_keys[src]
+    cols = node.get("columns")
+    if not isinstance(cols, list) or not (1 <= len(cols) <= catalog.MAX_TABLE_COLUMNS):
+        raise _err(
+            f"table (id={cid}) `columns` must be 1–{catalog.MAX_TABLE_COLUMNS} column objects"
+        )
+    col_fields: set[str] = set()
+    for c in cols:
+        if not isinstance(c, dict):
+            raise _err(f"table (id={cid}) each column must be an object with a `field`")
+        f = c.get("field")
+        if not isinstance(f, str) or f not in fields:
+            raise _err(
+                f"table (id={cid}) column `field` must name a field of list '{src}'; got {f!r}"
+            )
+        col_fields.add(f)
+        align = c.get("align")
+        if align is not None and align not in catalog.TABLE_ALIGNS:
+            raise _err(f"table (id={cid}) column `align` must be one of {sorted(catalog.TABLE_ALIGNS)}")
+        label = c.get("label")
+        if label is not None and (not isinstance(label, str) or len(label) > catalog.MAX_LABEL_LEN):
+            raise _err(f"table (id={cid}) column `label` must be a short string")
+        width = c.get("width")
+        if width is not None and not isinstance(width, str):
+            raise _err(f'table (id={cid}) column `width` must be a percent string like "20%"')
+    sort_by = node.get("sortBy")
+    if sort_by is not None:
+        if not isinstance(sort_by, dict):
+            raise _err(f"table (id={cid}) `sortBy` must be an object {{field, dir}}")
+        sf = sort_by.get("field")
+        if sf not in col_fields:
+            raise _err(
+                f"table (id={cid}) `sortBy.field` must be one of the table's columns; got {sf!r}"
+            )
+        if sort_by.get("dir", "asc") not in catalog.SORT_DIRS:
+            raise _err(f"table (id={cid}) `sortBy.dir` must be asc or desc")
+    empty = node.get("empty")
+    if empty is not None and not isinstance(empty, str):
+        raise _err(f"table (id={cid}) `empty` must be a string")
+
+
 def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> None:
     if ctype == "repeater":
         source = node.get("source")
@@ -880,9 +942,7 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> N
         # input writes to a state key via a `set` action; enforced by _validate_action
         pass
     elif ctype == "table":
-        rows = node.get("rows")
-        if not isinstance(rows, list):
-            raise _err(f"table (id={cid}) `rows` must be an array")
+        _validate_table(cid, node, ctx)
     elif ctype == "countdown":
         # target is an epoch-ms number or an ISO string; accept both
         target = node.get("target")
