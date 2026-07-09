@@ -168,6 +168,7 @@ def validate_definition(defn: Any) -> dict:
         list_keys=list_keys,
     )
     ctx.source_keys = source_keys
+    ctx.screens = _validate_screens_structure(defn.get("screens"))
     for node in layout:
         _validate_node(node, ctx, depth=1)
 
@@ -190,6 +191,16 @@ def validate_definition(defn: Any) -> dict:
                         f"search (id={cid}) `fields` entry '{f}' is not a field of the "
                         f"target's list (declared: {sorted(list_fields)})"
                     )
+
+    # ── drill-down screens — validated against their navigator's item scope ────
+    for sid in ctx.screens:
+        if sid not in ctx.navigations:
+            raise _err(
+                f"screen '{sid}' is never navigated to — add `navigate: \"{sid}\"` on a "
+                "repeater or data-bound table"
+            )
+    for sid, list_key in ctx.navigations.items():
+        _validate_screen_layout(sid, ctx.screens[sid], ctx, list_key)
 
     # ── watches (reactive rules; evaluated LLM-free — see watches.py) ─────────
     watches = defn.get("watches")
@@ -438,7 +449,7 @@ class _Ctx:
     __slots__ = (
         "scalar_keys", "series_keys", "component_ids", "count",
         "list_keys", "item_fields", "item_source", "source_keys",
-        "filterable", "searches",
+        "filterable", "searches", "screens", "navigations",
     )
 
     def __init__(self, scalar_keys, series_keys, component_ids, count, list_keys=None):
@@ -452,6 +463,8 @@ class _Ctx:
         self.source_keys = set()           # state keys a `source` owns (user-read-only)
         self.filterable = {}               # id of a repeater/source-table → its list key
         self.searches = []                 # (cid, target, fields) — checked after the walk
+        self.screens = {}                  # screenId → screen def (drill-down fragments)
+        self.navigations = {}              # screenId → the list key that navigates to it
 
 
 def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
@@ -869,6 +882,8 @@ def _validate_table(cid, node, ctx: _Ctx) -> None:
     fields = ctx.list_keys[src]
     if cid:
         ctx.filterable[cid] = src   # a `search` may target this table
+    if node.get("navigate") is not None:
+        _register_navigate(f"table (id={cid})", node["navigate"], src, ctx)
     cols = node.get("columns")
     if not isinstance(cols, list) or not (1 <= len(cols) <= catalog.MAX_TABLE_COLUMNS):
         raise _err(
@@ -910,6 +925,62 @@ def _validate_table(cid, node, ctx: _Ctx) -> None:
     where = node.get("where")
     if where is not None:
         _validate_item_where(f"table (id={cid})", where, fields)
+
+
+def _validate_screens_structure(screens: Any) -> dict:
+    """Shape-check the top-level `screens` map (drill-down fragments). The layout
+    of each screen is validated later, against its navigator's item scope."""
+    if screens is None:
+        return {}
+    if not isinstance(screens, dict):
+        raise _err("`screens` must be an object of {screenId: {title?, layout}}")
+    if len(screens) > catalog.MAX_SCREENS:
+        raise _err(f"too many screens (max {catalog.MAX_SCREENS})")
+    for sid, sdef in screens.items():
+        if not _KEY_RE.match(sid):
+            raise _err(f"screen id '{sid}' is invalid (start with a letter; letters/digits/_)")
+        if not isinstance(sdef, dict):
+            raise _err(f"screen '{sid}' must be an object with a `layout`")
+        title = sdef.get("title")
+        if title is not None and not isinstance(title, str):
+            raise _err(f"screen '{sid}' `title` must be a string")
+        layout = sdef.get("layout")
+        if not isinstance(layout, list) or not layout:
+            raise _err(f"screen '{sid}' `layout` must be a non-empty array of components")
+    return screens
+
+
+def _register_navigate(label: str, nav: Any, list_key: str, ctx: _Ctx) -> None:
+    """A repeater/table row carries `navigate: <screenId>`; the tapped item is
+    pushed into that screen. Only at top level — never inside a screen/row."""
+    if ctx.item_fields is not None:
+        raise _err(f"{label} `navigate` isn't allowed inside a screen (v1 is one level deep)")
+    if not isinstance(nav, str) or nav not in ctx.screens:
+        raise _err(
+            f"{label} `navigate` must name a screen declared in top-level `screens`; got {nav!r}"
+        )
+    ctx.navigations.setdefault(nav, list_key)
+
+
+def _validate_screen_layout(sid: str, sdef: dict, ctx: _Ctx, list_key: str) -> None:
+    """Validate a screen's layout with the navigating list's item in scope, so
+    `$.field` binds and the row's item ops resolve. A fresh id namespace (a
+    screen is a separate fragment) that never collides with the main layout."""
+    sub = _Ctx(
+        scalar_keys=ctx.scalar_keys,
+        series_keys=ctx.series_keys,
+        component_ids=set(),
+        count=0,
+        list_keys=ctx.list_keys,
+    )
+    sub.source_keys = ctx.source_keys
+    sub.screens = ctx.screens
+    sub.item_fields = ctx.list_keys.get(list_key, {})
+    sub.item_source = list_key
+    for node in sdef["layout"]:
+        _validate_node(node, sub, depth=2)  # already one level in (pushed from a row)
+    if sub.count > catalog.MAX_COMPONENTS:
+        raise _err(f"screen '{sid}' has too many components (max {catalog.MAX_COMPONENTS})")
 
 
 def _validate_item_where(label: str, where: Any, fields: dict) -> None:
@@ -960,6 +1031,8 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> N
             _validate_item_where(f"repeater (id={cid})", node["where"], fields)
         if node.get("sortBy") is not None:
             _validate_item_sortby(f"repeater (id={cid})", node["sortBy"], fields)
+        if node.get("navigate") is not None:
+            _register_navigate(f"repeater (id={cid})", node["navigate"], source, ctx)
         item = node.get("item")
         if not isinstance(item, dict):
             raise _err(f"repeater (id={cid}) `item` must be a component object (the row template)")

@@ -52,6 +52,11 @@ CATEGORY_AGGS = frozenset({"sum", "count"})
 MAX_TABLE_COLUMNS = 6
 TABLE_ALIGNS = frozenset({"left", "center", "right"})
 SORT_DIRS = frozenset({"asc", "desc"})
+
+# ── Drill-down screens (catalog 2) ────────────────────────────────────────────
+#: Named layout fragments a repeater/table row can push (`navigate`). v1 is a
+#: single level: a screen may not itself contain a repeater or a `navigate`.
+MAX_SCREENS = 6
 #: The shared categorical palette — the SAME hexes on bot docs, Desktop, iOS, so
 #: a series/slice keeps its colour across platforms. Series/slice N (0-based) →
 #: CHART_PALETTE[N % len]; an explicit `color` on a series overrides.
