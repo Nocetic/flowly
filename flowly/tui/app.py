@@ -346,8 +346,11 @@ class FlowlyTUI(App[None]):
         asyncio.create_task(self._preload_history())
         asyncio.create_task(self._check_gateway_capabilities())
         asyncio.create_task(self._load_account_on_mount())
-        # Seed the permission badge from the live exec policy.
+        # Seed the permission badge from the live exec policy, then keep it in
+        # sync on a slow poll so a mode changed elsewhere (Desktop, another
+        # client) shows up here without a restart.
         asyncio.create_task(self._sync_permission_badge())
+        self.set_interval(8.0, self._sync_permission_badge)
         # Prefetch the OpenRouter catalog in the background so the
         # context-window bar can size itself from the model's real
         # context_length (no hardcoded family tables). Also seeds the
@@ -3121,16 +3124,16 @@ class FlowlyTUI(App[None]):
         """Cycle the standing permission level (Ask → Auto → YOLO) and apply it
         LIVE to both the exec tool and the codex_session runtime over RPC.
 
-        Bound to Tab in the composer (palette-closed). The change takes effect on
-        the next command / codex turn with no gateway restart; the current level
-        shows as the colored badge at the left of the status bar rather than in
-        the transcript. Easiest to observe: flip to Ask, run a shell command and
-        watch it prompt; flip to YOLO and it runs unattended.
+        Bound to Shift+Tab (app-level). The change takes effect on the next
+        command / codex turn with no gateway restart; the current level shows as
+        the colored badge at the left of the status bar. A slow poll
+        (_sync_permission_badge) keeps that badge in sync when the mode is
+        changed elsewhere — the Desktop app or another client.
         """
         idx = getattr(self, "_perm_level_idx", None)
-        if idx is None:
+        if idx is None or idx < 0:
             # Sync the starting point from the live policy so the first press
-            # advances from where we actually are.
+            # advances from where we actually are (or from -1 → Ask).
             try:
                 idx = _match_permission_level(await self._client.exec_policy_get())
             except Exception:
@@ -3138,6 +3141,9 @@ class FlowlyTUI(App[None]):
         idx = (idx + 1) % len(_PERMISSION_LEVELS)
 
         key, _label, (security, ask), (approval, sandbox) = _PERMISSION_LEVELS[idx]
+        # Mute the sync poll while we apply, so it can't read a half-written
+        # store and clobber the badge mid-cycle.
+        self._perm_cycling = True
         try:
             await self._client.exec_policy_set(security=security, ask=ask)
             await self._client.codex_policy_set(
@@ -3146,6 +3152,8 @@ class FlowlyTUI(App[None]):
         except Exception as exc:
             self.query_one(TranscriptPane).add_error(f"permission cycle failed: {exc}")
             return
+        finally:
+            self._perm_cycling = False
 
         self._perm_level_idx = idx
         self._set_permission_badge(key)
@@ -3158,16 +3166,18 @@ class FlowlyTUI(App[None]):
             pass
 
     async def _sync_permission_badge(self) -> None:
-        """Seed the badge from the live exec policy at startup so it shows the
-        current level before the user cycles. A custom policy that matches no
-        preset leaves the badge hidden until the first Tab cycle."""
+        """Reflect the live exec policy in the badge — on mount AND on a slow
+        poll, so a mode changed elsewhere (the Desktop app, another client)
+        shows up here without a restart. Skips while a manual cycle is applying
+        so it can't clobber it. A policy matching no preset hides the badge."""
+        if getattr(self, "_perm_cycling", False):
+            return
         try:
             idx = _match_permission_level(await self._client.exec_policy_get())
         except Exception:
             return
         self._perm_level_idx = idx
-        if idx >= 0:
-            self._set_permission_badge(_PERMISSION_LEVELS[idx][0])
+        self._set_permission_badge(_PERMISSION_LEVELS[idx][0] if idx >= 0 else "")
 
     def action_copy_last(self) -> None:
         """Copy the most recent assistant message to the system clipboard

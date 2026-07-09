@@ -194,3 +194,36 @@ async def test_shift_tab_dispatches_cycle_in_the_real_app():
         await pilot.press("tab")
         await pilot.pause()
         assert _Probe.fired == 1
+
+
+# --- _sync_permission_badge: live poll picks up out-of-band changes ----------
+
+
+@pytest.mark.asyncio
+async def test_sync_reflects_a_mode_changed_elsewhere():
+    # The poll re-reads the live exec policy, so a mode set from the Desktop app
+    # (or another client) shows up on the badge without a restart.
+    app = _FakeApp(_FakeClient({"security": "full", "ask": "always"}))  # Ask
+    await FlowlyTUI._sync_permission_badge(app)
+    assert app._status.permission == "ask"
+
+    app._client._current = {"security": "full", "ask": "off"}  # → YOLO elsewhere
+    await FlowlyTUI._sync_permission_badge(app)
+    assert app._status.permission == "yolo"
+
+
+@pytest.mark.asyncio
+async def test_sync_hides_badge_when_policy_matches_no_preset():
+    app = _FakeApp(_FakeClient({"security": "deny", "ask": "off"}))
+    app._status.permission = "yolo"  # stale
+    await FlowlyTUI._sync_permission_badge(app)
+    assert app._status.permission == ""  # hidden (custom/unknown)
+
+
+@pytest.mark.asyncio
+async def test_sync_skips_while_a_manual_cycle_is_applying():
+    app = _FakeApp(_FakeClient({"security": "full", "ask": "off"}))  # YOLO on disk
+    app._status.permission = "ask"  # a manual cycle just set this optimistically
+    app._perm_cycling = True
+    await FlowlyTUI._sync_permission_badge(app)
+    assert app._status.permission == "ask"  # poll skipped, no clobber
