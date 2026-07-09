@@ -262,7 +262,22 @@ async def _apply_op(
             v = 1  # a bare "log" with no value counts as one occurrence
         if not _is_number(v):
             raise FlowletActionError("INVALID", "action `log` value must be a number")
-        store.add_event(flowlet_id, series, float(v))
+        # An optional `category` tags the event for pie/donut charts. It may be a
+        # literal ("food") or a "{token}" that templates from live values plus
+        # `{value}` (what the user tapped/typed) — same rule as the agent op.
+        meta = None
+        cat_tpl = action.get("category")
+        if isinstance(cat_tpl, str) and cat_tpl.strip():
+            ns = resolve_values(
+                definition, store.get_state(flowlet_id), store.get_events(flowlet_id),
+                queries_now_ms(), None,
+            )
+            if passed_value is not None and not isinstance(passed_value, (dict, list)):
+                ns = {**ns, "value": passed_value}
+            cat = queries.render_template(cat_tpl, ns).strip()[: catalog.MAX_CATEGORY_LEN]
+            if cat:
+                meta = {"category": cat}
+        store.add_event(flowlet_id, series, float(v), meta=meta)
 
     elif op == "remove_last":
         series = action.get("series")

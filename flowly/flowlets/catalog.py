@@ -15,7 +15,9 @@ from __future__ import annotations
 
 #: Bump when component types or props change. Definitions carry ``catalog``;
 #: a client hides / placeholders anything it doesn't understand.
-CATALOG_VERSION = 1
+#: v2 — rich charts (multi-series overlay, categorical pie/donut, list scatter),
+#: data-bound tables, list search/sort/filter, and drill-down screens.
+CATALOG_VERSION = 2
 
 # ── Structural limits (defence against runaway / malformed definitions) ───────
 MAX_DEFINITION_BYTES = 64 * 1024
@@ -32,6 +34,32 @@ MAX_LABEL_LEN = 500
 AGGS = frozenset({"sum", "count", "avg", "min", "max", "last"})
 BUCKETS = frozenset({"hour", "day", "week"})
 WINDOWS = frozenset({"today", "7d", "30d", "90d", "all"})
+
+# ── Rich charts (catalog 2) ───────────────────────────────────────────────────
+#: A chart's `data` takes one of four forms, detected by shape (see schema):
+#:   single   — `series: "<key>"`                 → [{t, v}]        (unchanged)
+#:   multi    — `series: [{key,label?,color?}]`   → {multi:[{k,points:[{t,v}]}]}
+#:   category — `series:"<key>", by:"category"`   → [{k, v}]  (pie/donut/stacked)
+#:   scatter  — `list:"<key>", x, y`              → client reads the list rows
+CHART_MULTI_KINDS = frozenset({"line", "bar", "area"})   # kinds a multi overlay allows
+MAX_CHART_SERIES = 4            # overlaid series on one chart
+MAX_PIE_SLICES = 8              # slices shown; the tail folds into "other"
+MAX_CATEGORY_LEN = 40           # a logged event's category label, after render
+#: Aggs valid for a categorical breakdown (a slice is a total or a tally).
+CATEGORY_AGGS = frozenset({"sum", "count"})
+#: The shared categorical palette — the SAME hexes on bot docs, Desktop, iOS, so
+#: a series/slice keeps its colour across platforms. Series/slice N (0-based) →
+#: CHART_PALETTE[N % len]; an explicit `color` on a series overrides.
+CHART_PALETTE = (
+    "#8b5cf6",  # violet (accent-ish)
+    "#22c55e",  # green
+    "#f59e0b",  # amber
+    "#ef4444",  # red
+    "#3b82f6",  # blue
+    "#ec4899",  # pink
+    "#14b8a6",  # teal
+    "#a3a3a3",  # neutral (typically "other")
+)
 
 # ── State value types ─────────────────────────────────────────────────────────
 # `timer` is a structured state: {running, since_ms, accum_s}; resolve_values

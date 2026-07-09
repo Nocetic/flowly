@@ -470,6 +470,45 @@ def aggregate_buckets(
     return [{"t": k, "v": _apply_agg(v, agg)} for k, v in grouped.items()]
 
 
+def _category_breakdown(
+    events: Iterable[dict],
+    agg: str,
+    window: str,
+    now_ms: int,
+    tz: tzinfo | None = None,
+) -> list[dict]:
+    """A categorical breakdown for a pie/donut/stacked chart:
+    ``[{"k": category, "v": number}, …]`` sorted high→low, capped at
+    ``MAX_PIE_SLICES`` with the tail folded into an "other" slice.
+
+    An event's category is ``meta.category`` (missing → "other"). ``agg`` is
+    ``sum`` (slice = total) or ``count`` (slice = tally). Percentages are a
+    drawing concern the client computes from the totals.
+    """
+    start_ms, end_ms = _window_bounds(window, now_ms, tz)
+    grouped: dict[str, list[float]] = {}
+    for e in events:
+        if start_ms is not None and (e["ts"] < start_ms or e["ts"] > end_ms):
+            continue
+        cat = ((e.get("meta") or {}).get("category") or "other")
+        cat = str(cat).strip()[: catalog.MAX_CATEGORY_LEN] or "other"
+        grouped.setdefault(cat, []).append(float(e["value"]))
+    rows = [{"k": k, "v": _clean_number(_apply_agg(v, agg))} for k, v in grouped.items()]
+    rows.sort(key=lambda r: (-r["v"], r["k"]))
+    if len(rows) > catalog.MAX_PIE_SLICES:
+        head = rows[: catalog.MAX_PIE_SLICES - 1]
+        tail_total = sum(r["v"] for r in rows[catalog.MAX_PIE_SLICES - 1 :])
+        # Merge into an existing "other" slice if one is already in the head.
+        for r in head:
+            if r["k"] == "other":
+                r["v"] = _clean_number(r["v"] + tail_total)
+                break
+        else:
+            head.append({"k": "other", "v": _clean_number(float(tail_total))})
+        rows = head
+    return rows
+
+
 # ── State coercion ────────────────────────────────────────────────────────────
 
 def coerce_state(value: Any, spec: dict) -> Any:
@@ -613,22 +652,54 @@ def resolve_values(
     values.pop("__now__", None)
     values.pop("__tz__", None)
 
-    # 3. per-component series data (chart / sparkline / heatmap)
+    # 3. per-component series data (chart / sparkline / heatmap).
+    #    Four `data` forms (see catalog): single → [{t,v}]; multi → {multi:[…]};
+    #    category → [{k,v}]; scatter → skipped (the client reads the list rows).
     for comp in _iter_components(definition.get("layout", [])):
-        if comp.get("type") in catalog.SERIES_COMPONENTS and comp.get("id"):
-            data = comp.get("data", {}) or {}
-            series = data.get("series")
-            buckets = aggregate_buckets(
-                by_series.get(series, []),
+        if comp.get("type") not in catalog.SERIES_COMPONENTS or not comp.get("id"):
+            continue
+        cid = comp["id"]
+        data = comp.get("data", {}) or {}
+        if "list" in data:
+            continue  # scatter: the list is already in `values`; nothing to resolve
+        if data.get("by") == "category":
+            values[cid] = _category_breakdown(
+                by_series.get(data.get("series"), []),
                 data.get("agg", "sum"),
-                data.get("bucket", "day"),
-                data.get("window", "7d"),
+                data.get("window", "30d"),
                 now_ms,
                 tz,
             )
-            for b in buckets:
-                b["v"] = _clean_number(b["v"])
-            values[comp["id"]] = buckets
+            continue
+        series = data.get("series")
+        if isinstance(series, list):  # multi-series overlay
+            multi = []
+            for entry in series:
+                k = entry.get("key") if isinstance(entry, dict) else None
+                pts = aggregate_buckets(
+                    by_series.get(k, []),
+                    data.get("agg", "sum"),
+                    data.get("bucket", "day"),
+                    data.get("window", "7d"),
+                    now_ms,
+                    tz,
+                )
+                for b in pts:
+                    b["v"] = _clean_number(b["v"])
+                multi.append({"k": k, "points": pts})
+            values[cid] = {"multi": multi}
+            continue
+        buckets = aggregate_buckets(
+            by_series.get(series, []),
+            data.get("agg", "sum"),
+            data.get("bucket", "day"),
+            data.get("window", "7d"),
+            now_ms,
+            tz,
+        )
+        for b in buckets:
+            b["v"] = _clean_number(b["v"])
+        values[cid] = buckets
 
     # Present whole numbers as ints so a label like "{today_ml} / {goal_ml}"
     # renders "750 / 2000" not "750.0 / 2000.0". Locale formatting (separators,

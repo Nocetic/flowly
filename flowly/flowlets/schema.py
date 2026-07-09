@@ -517,7 +517,7 @@ def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
 
     # series data (chart / sparkline / heatmap)
     if ctype in catalog.SERIES_COMPONENTS:
-        _validate_data(ctype, cid, node.get("data"), ctx)
+        _validate_data(ctype, cid, node.get("data"), ctx, node.get("kind"))
 
     # component-specific extra checks
     _validate_component_extras(ctype, cid, node, ctx, depth)
@@ -602,6 +602,15 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
             )
         if op == "log" and "value" in action and not _is_number(action["value"]):
             raise _err(f"{ctype} (id={cid}) action `log` `value` must be a number")
+        # A logged event may carry a `category` (a literal or a "{token}" that
+        # templates from live values) → it feeds categorical pie/donut charts.
+        if op == "log" and "category" in action:
+            cat = action["category"]
+            if not isinstance(cat, str) or not cat.strip() or len(cat) > 120:
+                raise _err(
+                    f"{ctype} (id={cid}) action `log` `category` must be a non-empty string "
+                    "(≤120 chars; may contain {tokens})"
+                )
     elif op == "reset":
         key = action.get("key")
         series = action.get("series")
@@ -689,14 +698,46 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
             _validate_action(ctype, cid, sub, ctx)
 
 
-def _validate_data(ctype, cid, data, ctx: _Ctx) -> None:
+def _validate_data(ctype, cid, data, ctx: _Ctx, kind=None) -> None:
+    """Validate a chart-family `data` prop. Four forms, detected by shape:
+
+    * scatter  — ``{list, x, y}``                     (chart only; client-drawn)
+    * category — ``{series:"k", by:"category", agg?}`` (chart only; pie/donut)
+    * multi    — ``{series:[{key,label?,color?}], …}`` (chart only; overlay)
+    * single   — ``{series:"k", agg?, bucket?, window?}`` (unchanged; all three)
+    """
     if not isinstance(data, dict):
         raise _err(f"{ctype} (id={cid}) `data` must be an object")
+
+    is_chart = ctype == "chart"
+    if "list" in data:  # ── scatter (list-backed) ──
+        if not is_chart:
+            raise _err(f"{ctype} (id={cid}) list-backed `data` is only for `chart`")
+        _validate_scatter_data(cid, data, ctx)
+        return
+    if data.get("by") is not None:  # ── categorical breakdown ──
+        if not is_chart:
+            raise _err(f"{ctype} (id={cid}) categorical `data.by` is only for `chart`")
+        _validate_category_data(cid, data, ctx)
+        return
+
     series = data.get("series")
+    if isinstance(series, list):  # ── multi-series overlay ──
+        if not is_chart:
+            raise _err(f"{ctype} (id={cid}) a multi-series `data.series` is only for `chart`")
+        _validate_multi_series_data(cid, data, ctx, kind)
+        _validate_time_axis(ctype, cid, data)
+        return
+
+    # ── single time series (sparkline / heatmap / plain chart) ──
     if not isinstance(series, str) or series not in ctx.series_keys:
         raise _err(
             f"{ctype} (id={cid}) `data.series` must name a declared series; got {series!r}"
         )
+    _validate_time_axis(ctype, cid, data)
+
+
+def _validate_time_axis(ctype, cid, data) -> None:
     agg = data.get("agg", "sum")
     if agg not in catalog.AGGS:
         raise _err(f"{ctype} (id={cid}) `data.agg` must be one of {sorted(catalog.AGGS)}")
@@ -706,6 +747,82 @@ def _validate_data(ctype, cid, data, ctx: _Ctx) -> None:
     window = data.get("window", "7d")
     if window not in catalog.WINDOWS:
         raise _err(f"{ctype} (id={cid}) `data.window` must be one of {sorted(catalog.WINDOWS)}")
+
+
+def _validate_multi_series_data(cid, data, ctx: _Ctx, kind=None) -> None:
+    entries = data["series"]
+    if not (2 <= len(entries) <= catalog.MAX_CHART_SERIES):
+        raise _err(
+            f"chart (id={cid}) a multi-series `data.series` needs 2–"
+            f"{catalog.MAX_CHART_SERIES} entries; got {len(entries)}"
+        )
+    seen: set[str] = set()
+    for e in entries:
+        if not isinstance(e, dict):
+            raise _err(f"chart (id={cid}) each `data.series` entry must be an object with a `key`")
+        key = e.get("key")
+        if not isinstance(key, str) or key not in ctx.series_keys:
+            raise _err(
+                f"chart (id={cid}) series entry `key` must name a declared series; got {key!r}"
+            )
+        if key in seen:
+            raise _err(f"chart (id={cid}) series '{key}' is listed twice")
+        seen.add(key)
+        label = e.get("label")
+        if label is not None and (not isinstance(label, str) or len(label) > catalog.MAX_LABEL_LEN):
+            raise _err(f"chart (id={cid}) series '{key}' `label` must be a short string")
+        color = e.get("color")
+        if color is not None and not (isinstance(color, str) and _HEX_RE.match(color)):
+            raise _err(f"chart (id={cid}) series '{key}' `color` must be a #hex value")
+    stacked = data.get("stacked")
+    if stacked is not None:
+        if not isinstance(stacked, bool):
+            raise _err(f"chart (id={cid}) `data.stacked` must be true/false")
+        if stacked and kind not in ("bar", None):
+            raise _err(f"chart (id={cid}) `stacked` is only valid for a bar chart")
+
+
+def _validate_category_data(cid, data, ctx: _Ctx) -> None:
+    series = data.get("series")
+    if not isinstance(series, str) or series not in ctx.series_keys:
+        raise _err(
+            f"chart (id={cid}) a categorical chart needs `data.series` naming a declared "
+            f"series; got {series!r}"
+        )
+    if data.get("by") != "category":
+        raise _err(f"chart (id={cid}) `data.by` must be \"category\"")
+    agg = data.get("agg", "sum")
+    if agg not in catalog.CATEGORY_AGGS:
+        raise _err(
+            f"chart (id={cid}) a categorical `data.agg` must be one of "
+            f"{sorted(catalog.CATEGORY_AGGS)} (a slice is a total or a tally)"
+        )
+    if "bucket" in data:
+        raise _err(f"chart (id={cid}) a categorical chart has no time axis — drop `bucket`")
+    window = data.get("window", "30d")
+    if window not in catalog.WINDOWS:
+        raise _err(f"chart (id={cid}) `data.window` must be one of {sorted(catalog.WINDOWS)}")
+
+
+def _validate_scatter_data(cid, data, ctx: _Ctx) -> None:
+    lk = data.get("list")
+    if not isinstance(lk, str) or lk not in ctx.list_keys:
+        raise _err(
+            f"chart (id={cid}) a scatter `data.list` must name a declared list state key; "
+            f"got {lk!r}"
+        )
+    fields = ctx.list_keys[lk]
+    for axis in ("x", "y"):
+        f = data.get(axis)
+        if not isinstance(f, str) or f not in fields:
+            raise _err(
+                f"chart (id={cid}) scatter `data.{axis}` must name a field of list '{lk}'; got {f!r}"
+            )
+        if fields[f] != "number":
+            raise _err(
+                f"chart (id={cid}) scatter `data.{axis}` field '{f}' must be a number "
+                f"(is {fields[f]})"
+            )
 
 
 def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> None:
