@@ -566,6 +566,43 @@ async def test_artifact_hint_compacts_on_narrow_terminal() -> None:
         assert "A very long artifact title that cannot fit" not in rendered
 
 
+def test_safe_is_dir_swallows_tcc_permission_errors() -> None:
+    class _ProtectedPath:
+        def is_dir(self) -> bool:
+            raise PermissionError(1, "Operation not permitted", ".aws")
+
+    assert Composer._safe_is_dir(_ProtectedPath()) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_path_palette_survives_stat_protected_entries() -> None:
+    """macOS TCC: a listable entry whose stat() raises EPERM must not
+    crash the TUI while the path palette renders (regression: '.aws')."""
+    from pathlib import Path
+
+    from textual.app import App
+
+    class _ProtectedPath:
+        def __str__(self) -> str:
+            return ".aws"
+
+        def is_dir(self) -> bool:
+            raise PermissionError(1, "Operation not permitted", ".aws")
+
+    class _Host(App):
+        def compose(self):
+            yield Composer(id="composer")
+
+    app = _Host()
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        composer = app.query_one(Composer)
+        composer._show_path_matches(
+            ".", [Path("real-dir"), _ProtectedPath()]  # type: ignore[list-item]
+        )
+        await pilot.pause()
+
+
 @pytest.mark.asyncio
 async def test_artifact_selection_flips_hint_background_class() -> None:
     from textual.app import App

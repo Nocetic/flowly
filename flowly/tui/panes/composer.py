@@ -2551,6 +2551,20 @@ class Composer(Vertical):
         if added:
             ol.highlighted = 0
 
+    @staticmethod
+    def _safe_is_dir(path: Path) -> bool:
+        """``Path.is_dir`` that never raises.
+
+        macOS TCC-protected entries (~/.Trash, sandboxed dot-dirs, …) can be
+        *listed* by their parent yet raise ``PermissionError: Operation not
+        permitted`` on ``stat`` — pathlib only swallows ENOENT-style errors,
+        so an unguarded ``is_dir()`` on such an entry kills the whole TUI.
+        """
+        try:
+            return path.is_dir()
+        except OSError:
+            return False
+
     def _path_complete(self, token: str) -> list[Path]:
         """Return up to 30 filesystem matches for ``token``.
 
@@ -2566,7 +2580,7 @@ class Composer(Vertical):
             return []
         # If the user typed a complete dir name + slash, list its contents.
         if raw.endswith("/") or raw in ("", ".", "..", "~", "~/"):
-            base = expanded if expanded.is_dir() else expanded.parent
+            base = expanded if self._safe_is_dir(expanded) else expanded.parent
             try:
                 entries = sorted(base.iterdir())[:30]
             except (OSError, PermissionError):
@@ -2594,7 +2608,7 @@ class Composer(Vertical):
                     display = "~" + display[len(home):]
             except Exception:
                 display = str(p)
-            suffix = "/" if p.is_dir() else ""
+            suffix = "/" if self._safe_is_dir(p) else ""
             label = display + suffix
             # Encode action in id: prefix "PATH:" then full replacement
             ol.add_option(Option(f"📄 {label}", id=f"PATH:{label}"))
