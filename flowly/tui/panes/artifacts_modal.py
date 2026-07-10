@@ -16,6 +16,7 @@ from rich.table import Table
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Label, ListItem, ListView, Static
 
@@ -86,39 +87,43 @@ def _render_csv(body: str) -> Table | str:
     return table
 
 
-class ArtifactsModal(ModalScreen[None]):
+class ArtifactsPanel(Vertical):
+    can_focus = True
+
+    class Dismissed(Message):
+        pass
+
     DEFAULT_CSS = """
-    ArtifactsModal { align: center middle; }
-    ArtifactsModal > Vertical {
-        width: 95%;
-        max-width: 140;
-        height: 90%;
-        max-height: 40;
-        border: thick #00a6c8;
-        background: #050505;
+    ArtifactsPanel {
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+        max-height: 24;
+        border: none;
+        background: transparent;
     }
-    ArtifactsModal .title { text-style: bold; color: #00a6c8; height: 1; padding: 1 2 0 2; }
-    ArtifactsModal .hint  { color: #83b8c2; text-style: italic; height: 1; padding: 0 2 1 2; }
-    ArtifactsModal > Vertical > Horizontal {
-        height: 1fr;
+    ArtifactsPanel .title { text-style: bold; color: #00a6c8; height: 1; }
+    ArtifactsPanel .hint  { color: #83b8c2; text-style: italic; height: 1; }
+    ArtifactsPanel > Horizontal {
+        height: 20;
     }
-    ArtifactsModal ListView {
+    ArtifactsPanel ListView {
         width: 38;
         border-right: solid #0f4c5c;
-        background: #050505;
+        background: transparent;
     }
-    ArtifactsModal ListItem { padding: 0 1; }
-    ArtifactsModal VerticalScroll {
+    ArtifactsPanel ListItem { padding: 0 1; background: transparent; }
+    ArtifactsPanel VerticalScroll {
         width: 1fr;
-        background: #0a0a0a;
-        padding: 1 2;
+        background: transparent;
+        padding: 0 1;
     }
-    ArtifactsModal Static { background: transparent; }
+    ArtifactsPanel Static { background: transparent; }
     """
 
     BINDINGS = [
-        ("escape", "dismiss(None)", "Close"),
-        ("q", "dismiss(None)", "Close"),
+        ("escape", "cancel", "Close"),
+        ("q", "cancel", "Close"),
         ("left", "cycle(-1)", "Previous"),
         ("right", "cycle(1)", "Next"),
     ]
@@ -140,27 +145,23 @@ class ArtifactsModal(ModalScreen[None]):
         self._fetcher = fetcher
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label(f"Artifacts ({len(self._artifacts)})", classes="title")
-            yield Label(
-                "↑/↓ · ←/→ navigate · Esc close",
-                classes="hint",
-            )
-            with Horizontal():
-                items: list[ListItem] = []
-                for idx, a in enumerate(self._artifacts):
-                    title = str(a.get("title") or a.get("id", "?"))
-                    atype = str(a.get("type", "?"))
-                    pinned = "★ " if a.get("pinned") else "  "
-                    items.append(
-                        ListItem(
-                            Static(f"{pinned}[b]{title[:30]}[/b]\n   [dim]{atype}[/dim]"),
-                            id=f"art-{idx}",
-                        )
+        yield Label(f"Artifacts ({len(self._artifacts)})", classes="title")
+        yield Label("↑/↓ · ←/→ navigate · Esc close", classes="hint")
+        with Horizontal():
+            items: list[ListItem] = []
+            for idx, artifact in enumerate(self._artifacts):
+                title = str(artifact.get("title") or artifact.get("id", "?"))
+                atype = str(artifact.get("type", "?"))
+                pinned = "★ " if artifact.get("pinned") else "  "
+                items.append(
+                    ListItem(
+                        Static(f"{pinned}[b]{title[:30]}[/b]\n   [dim]{atype}[/dim]"),
+                        id=f"art-{idx}",
                     )
-                yield ListView(*items, id="artifact-list")
-                with VerticalScroll(id="artifact-view"):
-                    yield Static(self._initial_preview(), id="art-body")
+                )
+            yield ListView(*items, id="artifact-list")
+            with VerticalScroll(id="artifact-view"):
+                yield Static(self._initial_preview(), id="art-body")
 
     def _initial_preview(self):
         if not self._artifacts:
@@ -173,6 +174,16 @@ class ArtifactsModal(ModalScreen[None]):
                 self.query_one("#artifact-list", ListView).index = self._initial_index
             except Exception:
                 pass
+        try:
+            self.query_one("#artifact-list", ListView).focus()
+        except Exception:
+            self.focus()
+
+    def on_focus(self) -> None:
+        try:
+            self.query_one("#artifact-list", ListView).focus()
+        except Exception:
+            pass
 
     def action_cycle(self, direction: int) -> None:
         if not self._artifacts:
@@ -217,3 +228,53 @@ class ArtifactsModal(ModalScreen[None]):
             if self._current_index() != idx:
                 return
         body.update(_render_artifact(artifact))
+
+    def action_cancel(self) -> None:
+        self.post_message(self.Dismissed())
+
+
+class ArtifactsModal(ModalScreen[None]):
+    """Compatibility wrapper; the chat TUI mounts :class:`ArtifactsPanel`."""
+
+    BINDINGS = ArtifactsPanel.BINDINGS
+
+    DEFAULT_CSS = """
+    ArtifactsModal { align: center middle; }
+    ArtifactsModal > ArtifactsPanel {
+        width: 95%;
+        max-width: 140;
+        padding: 1 2;
+        border: thick #00a6c8;
+        background: #050505;
+    }
+    """
+
+    def __init__(
+        self,
+        artifacts: list[dict[str, Any]],
+        *,
+        initial_index: int = 0,
+        fetcher: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
+    ) -> None:
+        super().__init__()
+        self._artifacts = artifacts
+        self._initial_index = initial_index
+        self._fetcher = fetcher
+
+    def compose(self) -> ComposeResult:
+        yield ArtifactsPanel(
+            self._artifacts,
+            initial_index=self._initial_index,
+            fetcher=self._fetcher,
+        )
+
+    @on(ArtifactsPanel.Dismissed)
+    def _on_dismissed(self, event: ArtifactsPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(None)
+
+    def action_cycle(self, direction: int) -> None:
+        self.query_one(ArtifactsPanel).action_cycle(direction)
+
+    def action_cancel(self) -> None:
+        self.query_one(ArtifactsPanel).action_cancel()

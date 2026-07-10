@@ -56,7 +56,7 @@ from flowly.tui.first_touch import (
 from flowly.tui.media_upload import AttachmentPreparationError, prepare_media_attachments
 from flowly.tui.panes.activity_modal import ActivityPanel
 from flowly.tui.panes.approvals_modal import ApprovalsPanel
-from flowly.tui.panes.artifacts_modal import ArtifactsModal
+from flowly.tui.panes.artifacts_modal import ArtifactsPanel
 from flowly.tui.panes.assistant_picker import AssistantPicker
 from flowly.tui.panes.browser_modal import BrowserPanel
 from flowly.tui.panes.composer import (
@@ -1345,6 +1345,11 @@ class FlowlyTUI(App[None]):
         event.stop()
         self._finish_composer_picker(None)
 
+    @on(ArtifactsPanel.Dismissed)
+    def _on_artifacts_panel_dismissed(self, event: ArtifactsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(None)
+
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
         # navigation, and push_screen_wait results. Runtime CSS renders these
@@ -1432,12 +1437,13 @@ class FlowlyTUI(App[None]):
             siblings, initial = [artifact], 0
         else:
             siblings[initial] = dict(artifact)
-        await self._show_inline_screen(
-            ArtifactsModal(
+        await self._show_composer_picker(
+            ArtifactsPanel(
                 siblings,
                 initial_index=initial,
                 fetcher=self._client.artifacts_get,
-            )
+            ),
+            inline=True,
         )
         self.query_one(Composer).focus_input_safely()
 
@@ -3457,7 +3463,7 @@ class FlowlyTUI(App[None]):
         except Exception as exc:
             transcript.add_error(f"artifacts fetch failed: {exc}")
             return
-        await self._show_inline_screen(ArtifactsModal(arts))
+        await self._show_composer_picker(ArtifactsPanel(arts), inline=True)
 
     @work
     async def action_open_assistants(self) -> None:

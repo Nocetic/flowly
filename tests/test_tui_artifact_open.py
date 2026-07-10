@@ -76,14 +76,13 @@ def test_artifact_open_screen_runs_in_a_textual_worker() -> None:
 
 
 @pytest.mark.asyncio
-async def test_enter_opens_artifact_modal_end_to_end(monkeypatch) -> None:
+async def test_enter_opens_artifact_inline_end_to_end(monkeypatch) -> None:
     """Drive the real FlowlyTUI: ↓ selects the chat's artifact, Enter must
-    open the viewer modal, Esc must close it back to the input
-    (regression: NoActiveWorker from push_screen_wait in a handler)."""
+    replace the composer input with the viewer, then Esc must restore input."""
     import asyncio
 
     from flowly.tui import app as app_mod
-    from flowly.tui.panes.artifacts_modal import ArtifactsModal
+    from flowly.tui.panes.artifacts_modal import ArtifactsPanel
     from flowly.tui.panes.composer import Composer
 
     monkeypatch.setattr(app_mod, "load_state", lambda: {})
@@ -152,8 +151,12 @@ async def test_enter_opens_artifact_modal_end_to_end(monkeypatch) -> None:
 
         await pilot.press("enter")
         await pilot.pause(0.3)
-        assert isinstance(app.screen_stack[-1], ArtifactsModal)
+        assert len(app.query(ArtifactsPanel)) == 1
+        assert composer.has_class("picker-inline-open")
+        assert not app.query_one("#composer-input-row").display
 
         await pilot.press("escape")
         await pilot.pause(0.2)
-        assert not isinstance(app.screen_stack[-1], ArtifactsModal)
+        assert len(app.query(ArtifactsPanel)) == 0
+        assert not composer.has_class("picker-inline-open")
+        assert app.query_one("#composer-input-row").display
