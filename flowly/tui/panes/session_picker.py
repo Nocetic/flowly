@@ -19,11 +19,17 @@ def _to_epoch(ts: float | int | str | None) -> float | None:
     Session timestamps land here as ISO strings (``created_at`` is written
     as ``datetime.isoformat()``), so the old ``float(ts)`` path always threw
     and the age column came up blank/stale.
+
+    Numbers may arrive in **milliseconds**: the gateway serves sessions.list
+    through the shared feature_rpc surface, whose ``updatedAt`` is
+    ``st_mtime * 1000``. Treating those as seconds put every session in the
+    future and the whole list rendered as "0s ago".
     """
     if ts is None or ts == "":
         return None
     if isinstance(ts, (int, float)):
-        return float(ts)
+        value = float(ts)
+        return value / 1000 if value > 1e11 else value
     if isinstance(ts, str):
         try:
             return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
@@ -107,9 +113,10 @@ class SessionPicker(ModalScreen[dict[str, Any] | None]):
                 if not key:
                     continue
                 name = str(s.get("displayName") or key)
-                # Show the session's *original start* time, not last-touched
-                # (the active session's updatedAt is ~now -> always "0s").
-                age = _fmt_age(s.get("createdAt") or s.get("updatedAt"))
+                # Last-activity age, matching `flowly --resume` — showing the
+                # start time here made a months-old-but-active session look
+                # stale next to the resume menu's fresh timestamps.
+                age = _fmt_age(s.get("updatedAt") or s.get("createdAt"))
                 marker = " ★" if key == self._current else "  "
                 age_col = f" [dim]{age:>8}[/dim]" if age else ""
                 ol.add_option(Option(f"{marker} {name:<40}{age_col}  [dim]{key}[/dim]", id=key))
