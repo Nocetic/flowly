@@ -1424,13 +1424,21 @@ Respond to the user now:"""
         return await _source_engine.refresh_flowlet(flowlet_id, force=force)
 
     async def _flowlet_vision_runner(flowlet: dict, prompt: str, image_data_uri: str) -> str | None:
-        """One isolated model turn over a captured photo → its reply (JSON).
-        Like the source runner, it never lands in chat (dedicated session)."""
+        """One isolated, TOOL-LESS model turn over a captured photo → its reply
+        (JSON). Tools are disabled so the model just looks at the image and
+        answers in one shot (no exploring/looping); never lands in chat
+        (dedicated session)."""
+        try:
+            no_tools = agent.tools.tool_names()
+        except Exception:  # noqa: BLE001
+            no_tools = None
         return await agent.process_direct(
             prompt,
             session_key=f"flowlet_vision:{flowlet.get('id')}",
             media=[image_data_uri],
             skip_memory=True,
+            skip_context_files=True,
+            disabled_tools=no_tools,
         )
 
     try:

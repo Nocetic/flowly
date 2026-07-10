@@ -69,6 +69,23 @@ def test_vision_cannot_target_a_source_key():
         validate_definition(d)
 
 
+def test_image_src_allows_item_field_ref():
+    # the calorie recipe shows the photo via `image src="$.shot"` in a row
+    d = _meal_def()
+    d["layout"][1]["item"] = {"type": "row", "children": [
+        {"type": "image", "src": "$.shot", "height": 44},
+        {"type": "text", "text": "{$.name}"},
+    ]}
+    validate_definition(d)
+
+
+def test_image_src_still_rejects_garbage():
+    d = _meal_def()
+    d["layout"].append({"type": "image", "src": "not a url or ref!"})
+    with pytest.raises(FlowletValidationError, match="src"):
+        validate_definition(d)
+
+
 # ── capture orchestration ─────────────────────────────────────────────────────
 
 async def test_capture_adds_item_with_photo(store):

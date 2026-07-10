@@ -1135,8 +1135,18 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> N
             raise _err(f"link (id={cid}) `url` must be an http(s) URL")
     elif ctype == "image":
         src = node.get("src")
-        if not isinstance(src, str) or not src.startswith(("http://", "https://", "data:")):
-            raise _err(f"image (id={cid}) `src` must be an http(s) or data URL")
+        # An http(s)/data URL, OR a `$.field` item ref (resolves per-row to a URL
+        # or a stored-photo attachment id — the client fetches it), OR a state key
+        # holding one.
+        ok = isinstance(src, str) and (
+            src.startswith(("http://", "https://", "data:", "$."))
+            or _KEY_RE.match(src) is not None
+        )
+        if not ok:
+            raise _err(
+                f"image (id={cid}) `src` must be an http(s)/data URL, a `$.field` ref, "
+                "or a state/computed key"
+            )
     elif ctype == "select":
         opts = node.get("options")
         if not isinstance(opts, list) or not opts:
