@@ -1,9 +1,8 @@
 """Inline /usage panel — token & cost for the active provider, plus Flowly
 account credits when signed in.
 
-Unlike a ModalScreen (a separate full-screen overlay), this mounts INTO the
-composer and renders in place of the input row — a true inline panel, like the
-approval / setup prompts. Esc closes it and returns to the input.
+Unlike a ModalScreen (a separate full-screen overlay), this mounts into the
+composer above the input row. Esc closes it and returns focus to the input.
 """
 
 from __future__ import annotations
@@ -106,51 +105,51 @@ def build_usage_body(
 ) -> str:
     """Rich-markup body for the /usage panel."""
     t = totals
-    L: list[str] = []
+    lines: list[str] = []
 
     # ── Session ────────────────────────────────────────────────────
-    L.append(f"[b {_PINK}]Session[/]")
+    lines.append(f"[b {_PINK}]Session[/]")
     if t.get("cost_known"):
         cost = f"[b]${t['cost_usd']:.4f}[/]"
     else:
         cost = "[dim]n/a — no catalog price for this model[/]"
-    L.append(f"  Total cost:   {cost}")
-    L.append(f"  Duration:     {_dur(elapsed)}")
-    L.append(f"  Turns:        {int(t['turns'])}")
-    L.append(f"  Tokens:       {_human(t['input'])} input · {_human(t['output'])} output")
-    L.append(
+    lines.append(f"  Total cost:   {cost}")
+    lines.append(f"  Duration:     {_dur(elapsed)}")
+    lines.append(f"  Turns:        {int(t['turns'])}")
+    lines.append(f"  Tokens:       {_human(t['input'])} input · {_human(t['output'])} output")
+    lines.append(
         f"                {_human(t['cache_read'])} cache read · "
         f"{_human(t['cache_write'])} cache write"
     )
-    L.append("")
+    lines.append("")
 
     # ── Context window (current turn) ──────────────────────────────
-    L.append(f"[b {_PINK}]Context window[/]  [dim](current turn)[/]")
+    lines.append(f"[b {_PINK}]Context window[/]  [dim](current turn)[/]")
     if ctx_budget:
         pct = ctx_used / ctx_budget * 100
-        L.append(
+        lines.append(
             f"  [{_CYAN}]{_bar(ctx_used, ctx_budget)}[/]  [b]{pct:.0f}%[/]  "
             f"[dim]{_human(ctx_used)} / {_human(ctx_budget)} tokens[/]"
         )
     else:
-        L.append("  [dim]context window unknown for this model[/]")
-    L.append(f"  [dim]◈ {provider or '?'} · {model or '?'}[/]")
-    L.append("")
+        lines.append("  [dim]context window unknown for this model[/]")
+    lines.append(f"  [dim]◈ {provider or '?'} · {model or '?'}[/]")
+    lines.append("")
 
     # ── Flowly account ─────────────────────────────────────────────
-    L.append(f"[b {_PINK}]Flowly account[/]")
+    lines.append(f"[b {_PINK}]Flowly account[/]")
     if account_email:
-        L.append(f"  Signed in as [b]{account_email}[/]")
-        L.extend(_credit_lines(credits))
+        lines.append(f"  Signed in as [b]{account_email}[/]")
+        lines.extend(_credit_lines(credits))
     else:
-        L.append("  [dim]Not signed in — /login to link a Flowly account.[/]")
-    L.append(f"  [{_MUTE}]The tokens & cost above are your own, tallied locally.[/]")
-    L.append("")
-    L.append(
+        lines.append("  [dim]Not signed in — /login to link a Flowly account.[/]")
+    lines.append(f"  [{_MUTE}]The tokens & cost above are your own, tallied locally.[/]")
+    lines.append("")
+    lines.append(
         "[dim]Cost is an estimate from the OpenRouter catalog price for the "
         "active model (cached tokens billed at full rate).[/]"
     )
-    return "\n".join(L)
+    return "\n".join(lines)
 
 
 class UsagePanel(Vertical):

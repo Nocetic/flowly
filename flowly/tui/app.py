@@ -71,14 +71,18 @@ from flowly.tui.panes.composer import (
 from flowly.tui.panes.confirm_modal import ConfirmModal
 from flowly.tui.panes.help_hint import HelpHint
 from flowly.tui.panes.help_modal import HelpModal
+from flowly.tui.panes.integrations_modal import IntegrationsPanel
 from flowly.tui.panes.login_modal import LoginModal
 from flowly.tui.panes.memory_review import MemoryReviewPanel
-from flowly.tui.panes.usage_panel import UsagePanel
+from flowly.tui.panes.model_picker import ModelPickerPanel
 from flowly.tui.panes.policy_modal import PolicyModal
+from flowly.tui.panes.provider_picker import ProviderPickerPanel
 from flowly.tui.panes.session_picker import SessionPicker
 from flowly.tui.panes.status import ContextHeader, StatusBar
+from flowly.tui.panes.status_panel import SessionStatusPanel
 from flowly.tui.panes.subagents import SubagentPane
 from flowly.tui.panes.transcript import Bubble, TranscriptPane
+from flowly.tui.panes.usage_panel import UsagePanel
 from flowly.tui.panes.welcome import build_welcome
 from flowly.tui.state import fresh_session_key, load_state, save_state
 from flowly.tui.theme import (
@@ -285,6 +289,7 @@ class FlowlyTUI(App[None]):
         self._approval_choice_future: asyncio.Future[str] | None = None
         self._inline_secret_future: asyncio.Future[str | None] | None = None
         self._inline_setup_future: asyncio.Future[dict[str, object] | None] | None = None
+        self._composer_picker_future: asyncio.Future[Any] | None = None
         # Inline memory-review queue (the on-open "review new memories" panel).
         self._memory_review_items: list[dict] = []
         self._memory_review_idx = 0
@@ -1250,6 +1255,52 @@ class FlowlyTUI(App[None]):
         except Exception:
             pass
 
+    @on(SessionStatusPanel.Dismissed)
+    def _on_status_panel_dismissed(self, event: SessionStatusPanel.Dismissed) -> None:
+        event.stop()
+        try:
+            self.query_one(Composer).clear_status()
+        except Exception:
+            pass
+
+    async def _show_composer_picker(self, picker: Any, *, inline: bool = False) -> Any:
+        prev = self._composer_picker_future
+        if prev is not None and not prev.done():
+            prev.set_result(None)
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        self._composer_picker_future = fut
+        composer = self.query_one(Composer)
+        await composer.show_picker(picker, inline=inline)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            return None
+        finally:
+            if self._composer_picker_future is fut:
+                self._composer_picker_future = None
+                await composer.clear_picker()
+
+    def _finish_composer_picker(self, result: Any) -> None:
+        fut = self._composer_picker_future
+        if fut is not None and not fut.done():
+            fut.set_result(result)
+
+    @on(ProviderPickerPanel.Dismissed)
+    def _on_provider_picker_dismissed(self, event: ProviderPickerPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(ModelPickerPanel.Dismissed)
+    def _on_model_picker_dismissed(self, event: ModelPickerPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(IntegrationsPanel.Dismissed)
+    def _on_integrations_panel_dismissed(self, event: IntegrationsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
         # navigation, and push_screen_wait results. Runtime CSS renders these
@@ -1493,13 +1544,18 @@ class FlowlyTUI(App[None]):
             return
         if head == "/status":
             s = self.query_one(StatusBar)
+            composer = self.query_one(Composer)
             provider, provider_source = self._active_provider_display()
-            self.query_one(TranscriptPane).add_system(
-                f"session={s.session or self._session_key} "
-                f"provider={provider} "
-                f"model={s.model or '?'} "
-                f"state={s.state}"
-                + (f" · {provider_source}" if provider_source else "")
+            composer.show_status(
+                session=s.session or self._session_key,
+                provider=provider,
+                provider_source=provider_source,
+                model=s.model or "",
+                state=s.state,
+                tokens_in=int(s.tokens_in),
+                tokens_out=int(s.tokens_out),
+                cost_usd=float(s.cost_usd),
+                queued=len(getattr(composer, "_queue", [])),
             )
             return
         if head == "/usage":
@@ -1984,6 +2040,10 @@ class FlowlyTUI(App[None]):
         if setup_fut is not None and not setup_fut.done():
             setup_fut.set_result(None)
             return
+        picker_fut = self._composer_picker_future
+        if picker_fut is not None and not picker_fut.done():
+            picker_fut.set_result(None)
+            return
         if self._current_run:
             await self._client.chat_abort(self._current_run)
         else:
@@ -2060,15 +2120,15 @@ class FlowlyTUI(App[None]):
     ) -> None:
         """Open a filtered connection catalog and then the selected setup form."""
         from flowly.integrations import get_card
-        from flowly.tui.panes.integrations_modal import IntegrationsModal
 
         while True:
-            result = await self._show_inline_screen(
-                IntegrationsModal(
+            result = await self._show_composer_picker(
+                IntegrationsPanel(
                     categories=categories,
                     title=title,
                     item_label=item_label,
-                )
+                ),
+                inline=True,
             )
             if not result or result.get("action") != "opened":
                 return
@@ -2463,14 +2523,13 @@ class FlowlyTUI(App[None]):
             _build_for,
             set_active_provider,
         )
-        from flowly.tui.panes.provider_picker import ProviderPicker
 
         transcript = self.query_one(TranscriptPane)
         rest = (rest or "").strip()
 
         # No-arg → open the arrow-key picker.
         if not rest:
-            result = await self._show_inline_screen(ProviderPicker())
+            result = await self._show_composer_picker(ProviderPickerPanel(), inline=True)
             if not result:
                 return
             if result.get("action") == "switched":
@@ -2953,7 +3012,6 @@ class FlowlyTUI(App[None]):
         from flowly.config.loader import load_config
         from flowly.integrations import get_card
         from flowly.integrations.active_provider import resolve_active_provider
-        from flowly.tui.panes.model_picker import ModelPicker
 
         transcript = self.query_one(TranscriptPane)
         cfg = load_config()
@@ -2979,12 +3037,15 @@ class FlowlyTUI(App[None]):
 
         # Picker path.
         card = get_card(active.key)
-        result = await self._show_inline_screen(ModelPicker(
-            provider_key=active.key,
-            provider_label=card.label if card else active.key,
-            current_model=cfg.agents.defaults.model or "",
-            docs_url=card.docs_url if card else "",
-        ))
+        result = await self._show_composer_picker(
+            ModelPickerPanel(
+                provider_key=active.key,
+                provider_label=card.label if card else active.key,
+                current_model=cfg.agents.defaults.model or "",
+                docs_url=card.docs_url if card else "",
+            ),
+            inline=True,
+        )
         if result and result.get("action") == "switched":
             transcript.add_system(f"✓ model → [b]{result['model']}[/b]")
 

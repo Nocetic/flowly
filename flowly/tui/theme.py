@@ -387,11 +387,44 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,
     Composer.review-open > #composer-input-row,
+    Composer.usage-open > #composer-input-row,
+    Composer.status-open > #composer-input-row,
+    Composer.picker-inline-open > #composer-input-row,
     Composer.approval-open > #composer-hint,
     Composer.secret-open > #composer-hint,
     Composer.setup-open > #composer-hint,
-    Composer.review-open > #composer-hint {{
+    Composer.review-open > #composer-hint,
+    Composer.usage-open > #composer-hint,
+    Composer.status-open > #composer-hint,
+    Composer.picker-inline-open > #composer-hint {{
         display: none;
+    }}
+    Composer.picker-inline-open > #composer-picker {{
+        background: {palette.bg};
+    }}
+    Composer.picker-inline-open > #composer-picker > ProviderPickerPanel,
+    Composer.picker-inline-open > #composer-picker > ModelPickerPanel,
+    Composer.picker-inline-open > #composer-picker > IntegrationsPanel {{
+        background: transparent;
+        border: none;
+    }}
+    Composer.picker-inline-open > #composer-picker > IntegrationsPanel OptionList {{
+        background: transparent;
+    }}
+    Composer > #composer-usage,
+    Composer > #composer-status-panel {{
+        background: {palette.bg};
+    }}
+    Composer > #composer-status-panel > #status-panel-title {{
+        color: {palette.accent};
+    }}
+    Composer > #composer-status-panel > #status-panel-session,
+    Composer > #composer-status-panel > #status-panel-provider,
+    Composer > #composer-status-panel > #status-panel-model,
+    Composer > #composer-status-panel > #status-panel-state,
+    Composer > #composer-status-panel > #status-panel-usage,
+    Composer > #composer-status-panel > #status-panel-hint {{
+        color: {palette.text_muted};
     }}
     Composer > #composer-attachments {{
         background: {palette.bg}; color: {palette.accent};
@@ -533,6 +566,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ConfirmModal .title,
     HelpModal Markdown,
     IntegrationSetupModal .title,
+    IntegrationsPanel .title,
     IntegrationsModal .title,
     LoginModal .title,
     MCPModal .title,
@@ -583,6 +617,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     IntegrationSetupModal .field-row > Label,
     IntegrationSetupModal .field-help,
     IntegrationSetupModal #status-line,
+    IntegrationsPanel .hint,
+    IntegrationsPanel .footer,
     IntegrationsModal .hint,
     IntegrationsModal .footer,
     LoginModal .hint,
@@ -599,6 +635,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     AssistantPicker OptionList,
     ArtifactsModal ListView,
     IntegrationSetupModal VerticalScroll,
+    IntegrationsPanel OptionList,
     IntegrationsModal OptionList,
     MCPModal OptionList,
     ModelPicker OptionList,

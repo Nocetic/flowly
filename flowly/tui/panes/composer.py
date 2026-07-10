@@ -7,7 +7,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 
 from rich.markup import escape
@@ -16,9 +17,16 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.message import Message
+from textual.widget import Widget
 from textual.widgets import Input, Label, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
+# TUI autocomplete palette — derived from the single command registry (every
+# command not flagged gateway_only). Plugin/bundle/skill commands are merged in
+# at runtime from the gateway's commands.list (see _refresh_command_palette).
+# One source of truth: a command added to flowly/agent/slash_commands.py shows
+# up here and in the gateway/desktop catalogue automatically.
+from flowly.agent.slash_commands import cli_commands as _cli_commands
 from flowly.tui.attachments import (
     FileDrop,
     detect_media_drop,
@@ -29,14 +37,8 @@ from flowly.tui.attachments import (
 )
 from flowly.tui.clipboard import save_clipboard_image
 from flowly.tui.panes.memory_review import MemoryReviewPanel
+from flowly.tui.panes.status_panel import SessionStatusPanel
 from flowly.tui.panes.usage_panel import UsagePanel
-
-# TUI autocomplete palette — derived from the single command registry (every
-# command not flagged gateway_only). Plugin/bundle/skill commands are merged in
-# at runtime from the gateway's commands.list (see _refresh_command_palette).
-# One source of truth: a command added to flowly/agent/slash_commands.py shows
-# up here and in the gateway/desktop catalogue automatically.
-from flowly.agent.slash_commands import cli_commands as _cli_commands
 
 LOCAL_SLASH_COMMANDS: list[tuple[str, str]] = [
     (f"/{_c.name}", _c.description) for _c in _cli_commands()
@@ -1235,6 +1237,10 @@ class Composer(Vertical):
         min-height: 5;
         max-height: 24;
         background: #000000;
+        layers: base overlay;
+    }
+    Composer.usage-open {
+        max-height: 32;
     }
     Composer > .composer-rule {
         height: 1;
@@ -1285,29 +1291,95 @@ class Composer(Vertical):
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,
     Composer.review-open > #composer-input-row,
+    Composer.usage-open > #composer-input-row,
+    Composer.status-open > #composer-input-row,
+    Composer.picker-inline-open > #composer-input-row,
     Composer.approval-open > #composer-hint,
     Composer.secret-open > #composer-hint,
     Composer.setup-open > #composer-hint,
     Composer.review-open > #composer-hint,
-    Composer.usage-open > #composer-input-row,
-    Composer.usage-open > #composer-hint {
+    Composer.usage-open > #composer-hint,
+    Composer.status-open > #composer-hint,
+    Composer.picker-inline-open > #composer-hint {
         display: none;
+    }
+    Composer > #composer-picker {
+        display: none;
+        height: auto;
+        max-height: 24;
+        padding: 0 2;
+        margin: 0;
+        background: transparent;
+    }
+    Composer.picker-floating-open > #composer-picker {
+        overlay: screen;
+        layer: overlay;
+        offset-y: -100%;
+        width: 100%;
+        padding: 0 1;
+        align: left top;
+    }
+    Composer.picker-open > #composer-picker {
+        display: block;
+    }
+    Composer.picker-inline-open > #composer-picker {
+        background: #000000;
+    }
+    Composer > #composer-picker > ProviderPickerPanel,
+    Composer > #composer-picker > ModelPickerPanel,
+    Composer > #composer-picker > IntegrationsPanel {
+        height: auto;
+        max-height: 24;
+    }
+    Composer.picker-inline-open > #composer-picker > ProviderPickerPanel,
+    Composer.picker-inline-open > #composer-picker > ModelPickerPanel,
+    Composer.picker-inline-open > #composer-picker > IntegrationsPanel {
+        width: 100%;
+        max-width: 100%;
+        border: none;
+        padding: 0;
+        background: transparent;
     }
     Composer > #composer-usage {
         display: none;
         height: auto;
-        max-height: 24;
-        padding: 1 2;
+        max-height: 18;
+        padding: 0 2;
         margin: 0;
+        background: #000000;
     }
     Composer.usage-open > #composer-usage {
         display: block;
     }
     Composer > #composer-usage > #usage-scroll {
         height: auto;
-        max-height: 22;
+        max-height: 16;
     }
     Composer > #composer-usage > #usage-hint {
+        height: 1;
+        color: #83b8c2;
+    }
+    Composer > #composer-status-panel {
+        display: none;
+        height: auto;
+        padding: 0 2;
+        margin: 0;
+        background: #000000;
+    }
+    Composer.status-open > #composer-status-panel {
+        display: block;
+    }
+    Composer > #composer-status-panel > #status-panel-title {
+        height: 1;
+        text-style: bold;
+        color: #00a6c8;
+    }
+    Composer > #composer-status-panel > #status-panel-session,
+    Composer > #composer-status-panel > #status-panel-provider,
+    Composer > #composer-status-panel > #status-panel-model,
+    Composer > #composer-status-panel > #status-panel-state,
+    Composer > #composer-status-panel > #status-panel-usage,
+    Composer > #composer-status-panel > #status-panel-hint {
         height: 1;
         color: #83b8c2;
     }
@@ -1587,6 +1659,8 @@ class Composer(Vertical):
         yield InlineSetupPrompt(id="composer-setup")
         yield MemoryReviewPanel(id="composer-review")
         yield UsagePanel(id="composer-usage")
+        yield SessionStatusPanel(id="composer-status-panel")
+        yield Vertical(id="composer-picker")
         with Horizontal(id="composer-input-row"):
             yield Label("❯", id="composer-prompt", markup=False)
             editor = _Editor(id="composer-input", show_line_numbers=False)
@@ -1858,11 +1932,19 @@ class Composer(Vertical):
     def focus_input(self) -> None:
         self.query_one("#composer-input", _Editor).focus()
 
+    def _remove_picker_classes(self) -> None:
+        self.remove_class("picker-open")
+        self.remove_class("picker-floating-open")
+        self.remove_class("picker-inline-open")
+
     def show_approval(self, request: ApprovalPromptRequest) -> None:
         self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("approval-open")
         prompt = self.query_one("#composer-approval", ApprovalPrompt)
         prompt.set_request(request)
@@ -1894,6 +1976,9 @@ class Composer(Vertical):
         self.remove_class("approval-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("review-open")
         panel = self.query_one("#composer-review", MemoryReviewPanel)
         panel.set_item(item, idx, total)
@@ -1911,6 +1996,9 @@ class Composer(Vertical):
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("setup-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("secret-open")
         prompt = self.query_one("#composer-secret", InlineSecretPrompt)
         prompt.set_request(request)
@@ -1934,6 +2022,9 @@ class Composer(Vertical):
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("secret-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("setup-open")
         prompt = self.query_one("#composer-setup", InlineSetupPrompt)
         prompt.set_request(request)
@@ -1953,6 +2044,8 @@ class Composer(Vertical):
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("review-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("usage-open")
         self.query_one("#composer-usage", UsagePanel).set_data(**data)
 
@@ -1962,6 +2055,61 @@ class Composer(Vertical):
         except Exception:
             pass
         self.remove_class("usage-open")
+        self.focus_input_safely()
+
+    def show_status(self, **data: object) -> None:
+        self.remove_class("palette-open")
+        self.remove_class("approval-open")
+        self.remove_class("secret-open")
+        self.remove_class("setup-open")
+        self.remove_class("review-open")
+        self.remove_class("usage-open")
+        self._remove_picker_classes()
+        self.add_class("status-open")
+        self.query_one("#composer-status-panel", SessionStatusPanel).set_data(**data)
+
+    def clear_status(self) -> None:
+        try:
+            self.query_one("#composer-status-panel", SessionStatusPanel).clear()
+        except Exception:
+            pass
+        self.remove_class("status-open")
+        self.focus_input_safely()
+
+    async def show_picker(self, picker: Widget, *, inline: bool = False) -> None:
+        self.remove_class("palette-open")
+        self.remove_class("approval-open")
+        self.remove_class("secret-open")
+        self.remove_class("setup-open")
+        self.remove_class("review-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        host = self.query_one("#composer-picker", Vertical)
+        await host.remove_children()
+        self.add_class("picker-open")
+        self.add_class("picker-inline-open" if inline else "picker-floating-open")
+        await host.mount(picker)
+        self._focus_picker(picker)
+        self.call_after_refresh(self._focus_picker, picker)
+
+    def _focus_picker(self, picker: Widget) -> None:
+        if not picker.is_mounted:
+            return
+        try:
+            self.app.set_focus(picker, scroll_visible=False)
+        except Exception:
+            try:
+                picker.focus(scroll_visible=False)
+            except Exception:
+                pass
+
+    async def clear_picker(self) -> None:
+        try:
+            host = self.query_one("#composer-picker", Vertical)
+            await host.remove_children()
+        except Exception:
+            pass
+        self._remove_picker_classes()
         self.focus_input_safely()
 
     def focus_setup_prompt(self) -> None:
