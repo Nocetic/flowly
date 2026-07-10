@@ -73,6 +73,7 @@ from flowly.tui.panes.help_hint import HelpHint
 from flowly.tui.panes.help_modal import HelpModal
 from flowly.tui.panes.integrations_modal import IntegrationsPanel
 from flowly.tui.panes.login_modal import LoginPanel
+from flowly.tui.panes.mcp_modal import MCPPanel
 from flowly.tui.panes.memory_review import MemoryReviewPanel
 from flowly.tui.panes.model_picker import ModelPickerPanel
 from flowly.tui.panes.plugins_modal import PluginsPanel
@@ -1309,6 +1310,11 @@ class FlowlyTUI(App[None]):
 
     @on(PluginsPanel.Dismissed)
     def _on_plugins_panel_dismissed(self, event: PluginsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(MCPPanel.Dismissed)
+    def _on_mcp_panel_dismissed(self, event: MCPPanel.Dismissed) -> None:
         event.stop()
         self._finish_composer_picker(event.result)
 
@@ -3008,12 +3014,11 @@ class FlowlyTUI(App[None]):
 
     @work
     async def action_mcp(self) -> None:
-        """Open the MCP modal — list configured MCP servers + catalog
+        """Open the inline MCP panel — list configured servers + catalog
         entries, toggle enable/disable, install no-secret catalog servers,
         remove servers. MCP tools register at agent boot, so the gateway
         is auto-restarted after each change (same as plugins)."""
-        from flowly.tui.panes.mcp_modal import MCPModal
-        result = await self._show_inline_screen(MCPModal())
+        result = await self._show_composer_picker(MCPPanel(), inline=True)
         transcript = self.query_one(TranscriptPane)
         if result and result.get("action") == "changed":
             n = int(result.get("count") or 0)
