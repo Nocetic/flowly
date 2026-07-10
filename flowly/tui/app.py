@@ -2335,9 +2335,8 @@ class FlowlyTUI(App[None]):
     ) -> bool:
         """Collect the primary provider API key in the composer tray.
 
-        This is the fast path for BYOK providers. The full
-        IntegrationSetupModal remains available from the picker with ``E`` for
-        fallback keys or other advanced edits.
+        This is the fast path for BYOK providers. ``Ctrl+E`` in the provider
+        picker opens the all-fields composer wizard for advanced edits.
         """
         field = _inline_provider_key_field(card)
         if field is None:
@@ -2439,6 +2438,38 @@ class FlowlyTUI(App[None]):
             self._safe_transcript_system(f"{card.label} setup cancelled")
             return False
 
+        probe_note = ""
+        if card.category == "provider" and card.probe is not None:
+            from flowly.integrations.probes import run_with_timeout
+
+            result = await run_with_timeout(card.probe(values))
+            if result.status not in {"ok", "unknown"}:
+                detail = result.detail or "the connection check did not pass"
+                confirmation = await self._show_inline_setup(
+                    InlineSetupPromptRequest(
+                        title=f"{card.label} connection check failed",
+                        subtitle=f"{result.status}: {detail}",
+                        fields=[
+                            InlineSetupField(
+                                key="decision",
+                                label="Save these values anyway?",
+                                kind="select",
+                                value="cancel",
+                                choices=[
+                                    ("cancel", "Cancel without saving"),
+                                    ("save", "Save anyway"),
+                                ],
+                            )
+                        ],
+                    )
+                )
+                if confirmation is None or confirmation.get("decision") != "save":
+                    self._safe_transcript_system(
+                        f"{card.label} configuration was not saved"
+                    )
+                    return False
+                probe_note = f" · probe: {result.status} ({detail})"
+
         try:
             await asyncio.to_thread(apply_card_values, card, values)
         except Exception as exc:
@@ -2452,7 +2483,7 @@ class FlowlyTUI(App[None]):
         else:
             tail = "takes effect on next request"
         self._safe_transcript_system(
-            f"✓ {card.label} configuration saved · {tail}"
+            f"✓ {card.label} configuration saved · {tail}{probe_note}"
         )
         return True
 
@@ -2555,9 +2586,6 @@ class FlowlyTUI(App[None]):
                 if card is not None:
                     await self._configure_provider_inline(card, make_active=True)
             elif result.get("action") == "opened_setup":
-                from flowly.tui.panes.integration_setup_modal import (
-                    IntegrationSetupModal,
-                )
                 card = get_card(result["key"])
                 if card is not None and card.custom_action == "xai_login":
                     # Browser OAuth instead of a pasted-credentials form.
@@ -2570,8 +2598,8 @@ class FlowlyTUI(App[None]):
                 elif card is not None and card.custom_action == "zai_coding_login":
                     await self.action_zai_coding_login()
                 elif card is not None:
-                    saved = await self._show_inline_screen(IntegrationSetupModal(card))
-                    if saved and saved.get("action") == "saved":
+                    saved = await self._configure_card_inline(card)
+                    if saved:
                         self._refresh_active_provider_status()
             elif result.get("action") == "disconnect":
                 if result.get("key") == "openai_codex":

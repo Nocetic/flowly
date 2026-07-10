@@ -41,7 +41,7 @@ class ProviderPickerPanel(Vertical):
     """Dismisses with one of:
       {'action': 'switched', 'key': '<provider>'}
       {'action': 'inline_setup', 'key': '<provider>'}  (paste primary key)
-      {'action': 'opened_setup', 'key': '<provider>'}   (user wants to edit)
+      {'action': 'opened_setup', 'key': '<provider>'}   (all-fields inline edit)
       None                                              (cancel)
     """
 
