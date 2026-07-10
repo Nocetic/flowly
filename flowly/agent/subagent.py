@@ -810,8 +810,14 @@ class SubagentManager:
                         _tool_t0 = time.monotonic()
                         _tool_status = "ok"
                         try:
+                            tool_args = dict(tool_call.arguments)
+                            if (
+                                tool_call.name == "artifact"
+                                and "session_key" not in tool_args
+                            ):
+                                tool_args["session_key"] = f"{origin_channel}:{origin_chat_id}"
                             result = await asyncio.wait_for(
-                                tools.execute(tool_call.name, tool_call.arguments),
+                                tools.execute(tool_call.name, tool_args),
                                 timeout=120,  # Per-tool timeout
                             )
                         except asyncio.TimeoutError:
@@ -1031,6 +1037,7 @@ class SubagentManager:
             ):
                 artifact_id = await self._save_result_as_artifact(
                     run_id, label, task, final_result, art_type=_art_type,
+                    session_key=f"{origin_channel}:{origin_chat_id}",
                 )
                 if artifact_id:
                     final_result = (
@@ -1080,6 +1087,7 @@ class SubagentManager:
                         task,
                         final_result,
                         source="subagent_result",
+                        session_key=f"{origin_channel}:{origin_chat_id}",
                     )
                 if artifact_id_for_cap:
                     _total = len(final_result)
@@ -1375,6 +1383,7 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
         art_type: str | None = None,
         internal: bool = False,
         source: str = "assistant_output",
+        session_key: str | None = None,
     ) -> str | None:
         """Auto-save assistant output as an artifact. Returns artifact ID or None.
 
@@ -1429,6 +1438,7 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
                 content=result,
                 metadata=metadata,
                 tags=tags,
+                session_key=session_key,
             )
             artifact_id = artifact["id"]
             if self._artifact_on_change and not internal:

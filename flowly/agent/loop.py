@@ -3973,8 +3973,25 @@ class AgentLoop:
                         except Exception:
                             pass
                     try:
-                        # Inject session_key for tools that need approval routing
-                        if tool_call.name in ("exec", "email", "google_calendar", "google_drive", "google_tasks", "linear", "github", "sentry", "process", "clarify") and "session_key" not in call_args:
+                        # Inject the active session for approval routing and
+                        # conversation-scoped persistence.
+                        if (
+                            tool_call.name
+                            in (
+                                "exec",
+                                "email",
+                                "google_calendar",
+                                "google_drive",
+                                "google_tasks",
+                                "linear",
+                                "github",
+                                "sentry",
+                                "process",
+                                "clarify",
+                                "artifact",
+                            )
+                            and "session_key" not in call_args
+                        ):
                             call_args["session_key"] = _current_session_key
 
                         # Spawn interception: redirect spawn → builtin_agent

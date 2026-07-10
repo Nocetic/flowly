@@ -15,7 +15,7 @@ HELP_BODY = """
 |---|---|
 | `Enter`        | Send message |
 | `Shift+Enter`  | New line in draft |
-| `↑` / `↓`      | History prev/next (single-line draft) |
+| `↑` / `↓`      | History prev/next; `↓` on an empty draft selects this chat's artifacts |
 | `Ctrl+E`       | Open draft in `$EDITOR` (vim/nvim/nano) |
 | `Ctrl+S`       | Open sessions picker |
 | `Ctrl+M`       | Open assistants / persona picker |

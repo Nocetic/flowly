@@ -8,10 +8,12 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
 import aiohttp
+
+from flowly.artifacts.summary import artifact_summary
 
 
 class GatewayUnavailable(Exception):
@@ -123,6 +125,12 @@ class CompactionEvent:
     raw: dict[str, Any]
 
 
+@dataclass
+class ArtifactEvent:
+    action: str
+    artifact: dict[str, Any]
+
+
 Event = (
     StreamDelta
     | ChatFinal
@@ -137,6 +145,7 @@ Event = (
     | SubagentStarted
     | SubagentCompleted
     | CompactionEvent
+    | ArtifactEvent
     | dict[str, Any]
 )
 
@@ -468,14 +477,38 @@ class GatewayClient:
         return reply.get("item")
 
     async def artifacts_list(
-        self, *, limit: int = 50, search: str | None = None, type: str | None = None
+        self,
+        *,
+        limit: int = 50,
+        search: str | None = None,
+        type: str | None = None,
+        session_key: str | None = None,
+        include_content: bool = True,
     ) -> list[dict[str, Any]]:
-        params: dict[str, Any] = {"limit": limit}
-        if search: params["search"] = search
-        if type: params["type"] = type
+        params: dict[str, Any] = {
+            "limit": limit,
+            "includeContent": include_content,
+        }
+        if search:
+            params["search"] = search
+        if type:
+            params["type"] = type
+        if session_key is not None:
+            params["sessionKey"] = session_key
         rid = await self._rpc("artifacts.list", params)
         reply = await self._await_reply(rid, timeout=10.0)
-        return reply.get("artifacts", [])
+        artifacts = list(reply.get("artifacts", []))
+        # Defensive compatibility with older gateways that ignore sessionKey
+        # and includeContent. Never leak another chat's rows into the hint.
+        if session_key is not None:
+            artifacts = [
+                artifact
+                for artifact in artifacts
+                if artifact.get("session_key") == session_key
+            ]
+        if not include_content:
+            artifacts = [artifact_summary(artifact) for artifact in artifacts]
+        return artifacts
 
     async def artifacts_get(self, artifact_id: str) -> dict[str, Any] | None:
         rid = await self._rpc("artifacts.get", {"id": artifact_id})
@@ -753,6 +786,15 @@ class GatewayClient:
                     error=payload.get("error"),
                     raw=payload,
                 )
+            )
+            return
+
+        if ev_name in ("artifact.created", "artifact.updated", "artifact.deleted"):
+            artifact = payload
+            if ev_name != "artifact.deleted" and payload.get("id"):
+                artifact = artifact_summary(payload)
+            await self._inbox.put(
+                ArtifactEvent(action=ev_name.removeprefix("artifact."), artifact=artifact)
             )
             return
 

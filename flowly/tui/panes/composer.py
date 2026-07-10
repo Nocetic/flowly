@@ -403,6 +403,13 @@ class _Editor(TextArea):
             event.prevent_default()
             return
 
+        if composer is not None and composer.artifact_navigation_active():
+            if composer.route_artifact_key(key):
+                event.stop()
+                event.prevent_default()
+                return
+            composer.cancel_artifact_navigation()
+
         if self._is_insert_newline_key(key):
             event.stop()
             event.prevent_default()
@@ -1270,6 +1277,10 @@ class Composer(Vertical):
         background: #000000;
         color: #83b8c2;
     }
+    Composer.artifact-nav > #composer-hint {
+        background: #00a6c8;
+        color: #001318;
+    }
     Composer.approval-open > #composer-input-row,
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,
@@ -1538,6 +1549,11 @@ class Composer(Vertical):
             super().__init__()
             self.command = command
 
+    class ArtifactOpen(Message):
+        def __init__(self, artifact: dict[str, object]) -> None:
+            super().__init__()
+            self.artifact = artifact
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._palette: list[tuple[str, str]] = list(LOCAL_SLASH_COMMANDS)
@@ -1549,6 +1565,8 @@ class Composer(Vertical):
         self._queue_edit_idx: int | None = None  # which queue item is being edited
         self._draft_before_queue_edit: str = ""
         self._draft_before_queue_edit_attachments: list[Path] = []
+        self._artifacts: list[dict[str, object]] = []
+        self._artifact_idx: int | None = None
         # Connection / activity state used to choose the hint text shown
         # below the editor. Driven from the app via :meth:`set_state`.
         # ``"idle"``, ``"busy"``, ``"reconnecting"``, ``"offline"``.
@@ -1588,6 +1606,9 @@ class Composer(Vertical):
         self._refresh_palette("")
         self._refresh_hint()
 
+    def on_resize(self) -> None:
+        self._refresh_hint()
+
     # --- hint line ----------------------------------------------------
 
     def set_state(self, state: str) -> None:
@@ -1602,6 +1623,8 @@ class Composer(Vertical):
             state = "idle"
         if state == self._state:
             return
+        if state != "idle":
+            self._artifact_idx = None
         self._state = state
         self._refresh_hint()
 
@@ -1613,7 +1636,15 @@ class Composer(Vertical):
             return  # not mounted yet
         n_queued = len(self._queue)
 
-        if self._state == "offline":
+        # Flip the hint row onto the accent background while the artifact
+        # selector owns the arrow keys, so "where am I?" is answered by
+        # color, not just text.
+        nav_active = self._artifact_idx is not None and bool(self._artifacts)
+        self.set_class(nav_active, "artifact-nav")
+
+        if nav_active:
+            text = self._artifact_hint(active=True)
+        elif self._state == "offline":
             text = "[b]offline[/] · gateway unreachable — run [b]flowly gateway[/]"
         elif self._state == "reconnecting":
             text = "[b]reconnecting…[/] · messages typed here will queue locally"
@@ -1634,12 +1665,39 @@ class Composer(Vertical):
                     f"[b]{n_queued}[/] queued · ↑/↓ to edit · "
                     "Enter to replace · [dim]/ for commands · ! for shell · F1 help[/]"
                 )
+            elif self._artifacts:
+                text = self._artifact_hint(active=False)
             else:
                 text = (
                     "[dim]Type a message · / for commands · ! for shell · "
                     "Shift+Enter newline · F1 help[/]"
                 )
         hint_widget.update(text)
+
+    def _artifact_hint(self, *, active: bool) -> str:
+        count = len(self._artifacts)
+        width = max(30, self.size.width or 80)
+
+        if not active:
+            noun = "artifact" if count == 1 else "artifacts"
+            text = f"[#00a6c8][b]◆ {count} {noun}[/b][/] · [b]↓[/] open"
+            if width >= 80:
+                text += " · [dim]/ commands · F1 help[/]"
+            return text
+
+        # Selection mode: the hint row flips to the accent background (the
+        # ``artifact-nav`` class), so the text stays plain and just names
+        # the mode, the pick, and the keys.
+        idx = max(0, min(self._artifact_idx or 0, count - 1))
+        artifact = self._artifacts[idx]
+        title = " ".join(
+            str(artifact.get("title") or artifact.get("id") or "artifact").split()
+        )
+        keys = "↑/↓ · Enter open · Esc" if width >= 76 else "↑/↓ · Enter · Esc"
+        limit = max(10, width - len(keys) - 22)
+        if len(title) > limit:
+            title = title[: max(1, limit - 1)] + "…"
+        return f"[b]◆ artifacts {idx + 1}/{count}[/b] · {escape(title)} · {keys}"
 
     @staticmethod
     def _input_height_for_line_count(line_count: int) -> int:
@@ -1710,10 +1768,98 @@ class Composer(Vertical):
         prefix = current if (current.startswith("/") and "\n" not in current) else ""
         self._refresh_palette(prefix)
 
+    def set_artifacts(self, artifacts: list[dict[str, object]]) -> None:
+        """Replace the current session's lightweight artifact summaries."""
+        selected_id = None
+        if self._artifact_idx is not None and self._artifacts:
+            selected_id = self._artifacts[self._artifact_idx].get("id")
+
+        def _updated_at(item: dict[str, object]) -> float:
+            try:
+                return float(item.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        self._artifacts = sorted(
+            (dict(item) for item in artifacts if item.get("id")),
+            key=_updated_at,
+            reverse=True,
+        )
+        if not self._artifacts:
+            self._artifact_idx = None
+        elif selected_id is not None:
+            self._artifact_idx = next(
+                (
+                    i
+                    for i, item in enumerate(self._artifacts)
+                    if item.get("id") == selected_id
+                ),
+                0,
+            )
+        self._refresh_hint()
+
+    def session_artifacts(self) -> list[dict[str, object]]:
+        """Current chat's artifact summaries, most recently updated first."""
+        return [dict(item) for item in self._artifacts]
+
+    def upsert_artifact(self, artifact: dict[str, object]) -> None:
+        artifact_id = artifact.get("id")
+        if not artifact_id:
+            return
+        items = [
+            item for item in self._artifacts if item.get("id") != artifact_id
+        ]
+        items.append(dict(artifact))
+        self.set_artifacts(items)
+
+    def remove_artifact(self, artifact_id: str) -> None:
+        self.set_artifacts(
+            [item for item in self._artifacts if item.get("id") != artifact_id]
+        )
+
+    def artifact_navigation_active(self) -> bool:
+        return self._artifact_idx is not None
+
+    def enter_artifact_navigation(self) -> bool:
+        if self._state != "idle" or not self._artifacts:
+            return False
+        self._artifact_idx = 0
+        self._refresh_hint()
+        return True
+
+    def cancel_artifact_navigation(self) -> None:
+        if self._artifact_idx is None:
+            return
+        self._artifact_idx = None
+        self._refresh_hint()
+
+    def route_artifact_key(self, key: str) -> bool:
+        if self._artifact_idx is None or not self._artifacts:
+            return False
+        if key == "down":
+            self._artifact_idx = (self._artifact_idx + 1) % len(self._artifacts)
+            self._refresh_hint()
+            return True
+        if key == "up":
+            self._artifact_idx = (self._artifact_idx - 1) % len(self._artifacts)
+            self._refresh_hint()
+            return True
+        if key == "enter":
+            artifact = dict(self._artifacts[self._artifact_idx])
+            self._artifact_idx = None
+            self._refresh_hint()
+            self.post_message(self.ArtifactOpen(artifact))
+            return True
+        if key == "escape":
+            self.cancel_artifact_navigation()
+            return True
+        return False
+
     def focus_input(self) -> None:
         self.query_one("#composer-input", _Editor).focus()
 
     def show_approval(self, request: ApprovalPromptRequest) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
@@ -1743,6 +1889,7 @@ class Composer(Vertical):
         return prompt.route_editor_key(key)
 
     def show_memory_review(self, item: dict, idx: int, total: int) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("secret-open")
@@ -1760,6 +1907,7 @@ class Composer(Vertical):
         self.focus_input_safely()
 
     def show_secret_prompt(self, request: InlineSecretPromptRequest) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("setup-open")
@@ -1782,6 +1930,7 @@ class Composer(Vertical):
             pass
 
     def show_setup_prompt(self, request: InlineSetupPromptRequest) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("secret-open")
@@ -1798,6 +1947,7 @@ class Composer(Vertical):
         self.focus_input_safely()
 
     def show_usage(self, **data: object) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("secret-open")
@@ -1829,6 +1979,7 @@ class Composer(Vertical):
         except Exception:
             return
         if not enabled:
+            self.cancel_artifact_navigation()
             self.remove_class("palette-open")
 
     def clear_attachments(self) -> None:
@@ -2230,6 +2381,12 @@ class Composer(Vertical):
         if event.direction > 0:
             self._history_prev()
         else:
+            if self._history_idx is not None:
+                self._history_next()
+                return
+            editor = self.query_one("#composer-input", _Editor)
+            if not editor.text and self.enter_artifact_navigation():
+                return
             self._history_next()
 
     @on(_Editor.QueueDelete)

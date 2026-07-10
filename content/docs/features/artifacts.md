@@ -119,7 +119,10 @@ You have several ways to see your artifacts:
 
 - **Terminal UI** — open the artifacts gallery with the `/artifacts` command or
   the **F4** key. It shows a pinned-aware list (a ★ marks pinned items) with a
-  preview pane.
+  preview pane. Artifacts created in the active chat also appear in the hint
+  below the input; press **↓** on an empty draft, choose with **↑/↓**, then press
+  **Enter** to open one. In the opened view, **←/→** moves between the chat's
+  artifacts and **Esc** returns to the input.
 - **Desktop / web apps** — artifacts are served over a small local HTTP API the
   gateway exposes, so the desktop and web galleries can fetch and render them:
   - `GET /api/artifacts` — list (supports `type`, `pinned`, `search`, `limit`,

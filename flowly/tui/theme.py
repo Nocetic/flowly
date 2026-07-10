@@ -380,6 +380,9 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer > #composer-hint {{
         background: {palette.bg}; color: {palette.text_muted};
     }}
+    Composer.artifact-nav > #composer-hint {{
+        background: {palette.accent}; color: {palette.bg};
+    }}
     Composer.approval-open > #composer-input-row,
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,

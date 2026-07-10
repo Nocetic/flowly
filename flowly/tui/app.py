@@ -12,12 +12,17 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 
 from flowly.integrations import Field, FieldType, IntegrationCard
+from flowly.tui.artifact_open import (
+    is_external_artifact_type,
+    open_artifact_external,
+)
 from flowly.tui.attachments import (
     is_video_path,
     render_message_with_attachments,
 )
 from flowly.tui.client import (
     ApprovalRequest,
+    ArtifactEvent,
     ChatAborted,
     ChatError,
     ChatFinal,
@@ -344,6 +349,7 @@ class FlowlyTUI(App[None]):
         # Fire background bootstrap tasks in parallel.
         asyncio.create_task(self._refresh_command_palette())
         asyncio.create_task(self._preload_history())
+        asyncio.create_task(self._refresh_session_artifacts())
         asyncio.create_task(self._check_gateway_capabilities())
         asyncio.create_task(self._load_account_on_mount())
         # Seed the permission badge from the live exec policy, then keep it in
@@ -513,17 +519,37 @@ class FlowlyTUI(App[None]):
             )
 
     async def _poll_badges(self) -> None:
-        try:
-            pending = await self._client.approval_list()
-        except Exception:
-            pending = []
-        try:
-            arts = await self._client.artifacts_list(limit=200)
-        except Exception:
-            arts = []
+        session_key = self._session_key
+        pending, arts, session_arts = await asyncio.gather(
+            self._client.approval_list(),
+            self._client.artifacts_list(limit=200, include_content=False),
+            self._client.artifacts_list(
+                limit=200,
+                session_key=session_key,
+                include_content=False,
+            ),
+            return_exceptions=True,
+        )
         status = self.query_one(StatusBar)
-        status.approvals_pending = len(pending)
-        status.artifacts_count = len(arts)
+        if not isinstance(pending, BaseException):
+            status.approvals_pending = len(pending)
+        if not isinstance(arts, BaseException):
+            status.artifacts_count = len(arts)
+        if session_key == self._session_key and not isinstance(session_arts, BaseException):
+            self.query_one(Composer).set_artifacts(session_arts)
+
+    async def _refresh_session_artifacts(self) -> None:
+        session_key = self._session_key
+        try:
+            artifacts = await self._client.artifacts_list(
+                limit=200,
+                session_key=session_key,
+                include_content=False,
+            )
+        except Exception:
+            return
+        if session_key == self._session_key:
+            self.query_one(Composer).set_artifacts(artifacts)
 
     async def _check_gateway_capabilities(self) -> None:
         """Probe /health for capabilities; warn if running gateway is stale."""
@@ -924,6 +950,19 @@ class FlowlyTUI(App[None]):
             self._enqueue_approval(ev)
             return
 
+        if isinstance(ev, ArtifactEvent):
+            artifact_id = str(ev.artifact.get("id") or "")
+            composer = self.query_one(Composer)
+            if ev.action == "deleted":
+                if artifact_id:
+                    composer.remove_artifact(artifact_id)
+                return
+            session_key = str(ev.artifact.get("session_key") or "")
+            if session_key != self._session_key:
+                return
+            composer.upsert_artifact(ev.artifact)
+            return
+
         if isinstance(ev, ToolStart):
             if ev.session_key and ev.session_key != self._session_key:
                 return
@@ -1229,6 +1268,78 @@ class FlowlyTUI(App[None]):
             pass
 
     # --- composer handlers ----------------------------------------
+
+    @on(Composer.ArtifactOpen)
+    def _on_artifact_open(self, event: Composer.ArtifactOpen) -> None:
+        # push_screen_wait below requires a worker context (Textual raises
+        # NoActiveWorker from a plain message handler), so delegate.
+        self._open_artifact_screen(dict(event.artifact))
+
+    @work
+    async def _open_artifact_screen(self, artifact_ref: dict) -> None:
+        artifact_id = str(artifact_ref.get("id") or "")
+        if not artifact_id:
+            return
+        transcript = self.query_one(TranscriptPane)
+        try:
+            artifact = await self._client.artifacts_get(artifact_id)
+        except Exception as exc:
+            transcript.add_error(f"artifact fetch failed: {exc}")
+            return
+        if not artifact:
+            transcript.add_error("artifact not found")
+            return
+
+        artifact_type = str(artifact.get("type") or "").lower()
+        if is_external_artifact_type(artifact_type):
+            result = await asyncio.to_thread(open_artifact_external, artifact)
+            if result.status == "opened":
+                self.notify(
+                    f"opened {artifact_type} artifact in the default app",
+                    severity="information",
+                    timeout=3,
+                )
+            elif result.status == "headless":
+                message = (
+                    f"no graphical session; cannot open {artifact_type}. "
+                    "Press F4 for source preview."
+                )
+                self.notify(message, severity="warning", timeout=6)
+                transcript.add_system(message)
+            else:
+                detail = f" ({result.detail})" if result.detail else ""
+                message = (
+                    f"could not open {artifact_type} artifact{detail}; "
+                    "press F4 for source preview"
+                )
+                self.notify(message, severity="warning", timeout=6)
+                transcript.add_system(message)
+            self.query_one(Composer).focus_input_safely()
+            return
+
+        # Open with the whole chat's artifacts so ←/→ can move between them;
+        # siblings are summaries and the modal lazy-loads their content.
+        siblings = self.query_one(Composer).session_artifacts()
+        initial = next(
+            (
+                i
+                for i, item in enumerate(siblings)
+                if str(item.get("id") or "") == artifact_id
+            ),
+            None,
+        )
+        if initial is None:
+            siblings, initial = [artifact], 0
+        else:
+            siblings[initial] = dict(artifact)
+        await self._show_inline_screen(
+            ArtifactsModal(
+                siblings,
+                initial_index=initial,
+                fetcher=self._client.artifacts_get,
+            )
+        )
+        self.query_one(Composer).focus_input_safely()
 
     @on(Composer.Submitted)
     async def _on_send(self, event: Composer.Submitted) -> None:
@@ -1817,11 +1928,13 @@ class FlowlyTUI(App[None]):
             child.remove()
         self._current_bubble = None
         self._current_run = None
+        self.query_one(Composer).set_artifacts([])
         # Persist immediately so a Ctrl+D right after switch still resumes here.
         state = load_state()
         state["last_session_key"] = new_key
         save_state(state)
         await self._preload_history()
+        await self._refresh_session_artifacts()
 
     def _discard_skill_notice(self, run_id: str | None) -> None:
         if run_id:

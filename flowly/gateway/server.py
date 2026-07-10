@@ -15,6 +15,7 @@ from loguru import logger
 
 from flowly.agent.subagent_registry import SubagentRegistry
 from flowly.artifacts.context import is_internal_context_artifact
+from flowly.artifacts.summary import artifact_summary
 from flowly.channels import feature_rpc
 from flowly.gateway.auth import (
     WsTicketStore,
@@ -2268,6 +2269,7 @@ class GatewayServer:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         limit = int(params.get("limit", 50))
         include_internal = bool(params.get("includeInternal", False))
+        include_content = bool(params.get("includeContent", True))
         # Fetch extra rows so we can drop internal artifacts without
         # shrinking the visible page below the caller's limit. Matches
         # the pattern ArtifactTool._list already uses for its own filter.
@@ -2276,12 +2278,15 @@ class GatewayServer:
             type=params.get("type"),
             pinned=params.get("pinned"),
             search=params.get("search"),
+            session_key=params.get("sessionKey"),
             limit=fetch_limit,
             offset=params.get("offset", 0),
         )
         if not include_internal:
             results = [a for a in results if not is_internal_context_artifact(a)]
         results = results[:limit]
+        if not include_content:
+            results = [artifact_summary(a) for a in results]
         await self._ws_rpc_reply(ws, rpc_id, {"artifacts": results})
 
     async def _ws_rpc_artifacts_get(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
@@ -2305,6 +2310,7 @@ class GatewayServer:
             pinned=params.get("pinned", False),
             dashboard_size=params.get("dashboardSize", "medium"),
             tags=params.get("tags"),
+            session_key=params.get("sessionKey"),
         )
         await self._broadcast_artifact_event("artifact.created", artifact)
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
@@ -2418,17 +2424,21 @@ class GatewayServer:
         params = dict(request.query)
         limit = int(params.get("limit", 50))
         include_internal = params.get("includeInternal") == "true"
+        include_content = params.get("includeContent", "true").lower() == "true"
         fetch_limit = limit if include_internal else max(limit * 5, 100)
         results = self.artifact_store.list(
             type=params.get("type"),
             pinned=params.get("pinned") == "true" if "pinned" in params else None,
             search=params.get("search"),
+            session_key=params.get("sessionKey"),
             limit=fetch_limit,
             offset=int(params.get("offset", 0)),
         )
         if not include_internal:
             results = [a for a in results if not is_internal_context_artifact(a)]
         results = results[:limit]
+        if not include_content:
+            results = [artifact_summary(a) for a in results]
         return web.json_response({"artifacts": results})
 
     async def _handle_artifacts_get(self, request: web.Request) -> web.Response:

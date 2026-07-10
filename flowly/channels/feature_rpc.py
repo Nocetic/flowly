@@ -1416,6 +1416,7 @@ def artifacts_list(params: dict) -> dict:
     over-fetch then drop internal/context artifacts so the visible page
     doesn't shrink below the caller's limit."""
     from flowly.artifacts.context import is_internal_context_artifact
+    from flowly.artifacts.summary import artifact_summary
     store = _artifact_store()
     limit = max(1, min(int(params.get("limit", 50) or 50), 200))
     include_internal = bool(params.get("includeInternal", False))
@@ -1424,12 +1425,13 @@ def artifacts_list(params: dict) -> dict:
         type=params.get("type"),
         pinned=params.get("pinned"),
         search=params.get("search"),
+        session_key=params.get("sessionKey"),
         limit=fetch_limit,
         offset=int(params.get("offset", 0) or 0),
     )
     if not include_internal:
         results = [a for a in results if not is_internal_context_artifact(a)]
-    return {"artifacts": results[:limit]}
+    return {"artifacts": [artifact_summary(a) for a in results[:limit]]}
 
 
 def artifacts_get(params: dict) -> dict:

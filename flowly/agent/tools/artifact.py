@@ -14,6 +14,7 @@ from flowly.artifacts.context import (
     INTERNAL_CONTEXT_TAGS,
     is_internal_context_artifact,
 )
+from flowly.artifacts.summary import artifact_summary
 from flowly.agent.tools.base import Tool
 
 
@@ -535,18 +536,4 @@ class ArtifactTool(Tool):
 
 def _summarize(artifact: dict) -> dict:
     """Return artifact summary without full content (for list views)."""
-    summary = {
-        "id": artifact["id"],
-        "type": artifact.get("type"),
-        "title": artifact.get("title"),
-        "version": artifact.get("version"),
-        "pinned": artifact.get("pinned"),
-        "dashboard_size": artifact.get("dashboard_size"),
-        "tags": artifact.get("tags", []),
-        "created_at": artifact.get("created_at"),
-        "updated_at": artifact.get("updated_at"),
-    }
-    metadata = artifact.get("metadata", {})
-    if metadata:
-        summary["metadata"] = metadata
-    return summary
+    return artifact_summary(artifact)
