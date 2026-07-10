@@ -13,9 +13,10 @@ does; the bytes live in the store's attachment dir and are served on demand.
 
 from __future__ import annotations
 
-import base64
 import os
+import tempfile
 from datetime import tzinfo
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from flowly.flowlets import catalog
@@ -24,7 +25,10 @@ from flowly.flowlets.sources import _coerce_field, _extract_json
 from flowly.flowlets.store import FlowletStore
 from flowly.flowlets.store import now_ms as _now_ms
 
-# (flowlet, prompt, image_data_uri) → the model's reply text (JSON expected)
+# (flowlet, prompt, image_path) → the model's reply text (JSON expected).
+# The image travels as a LOCAL FILE PATH — the agent's media pipeline consumes
+# file paths / http URLs (exactly like chat attachments, which are saved to
+# ``~/.flowly/media`` first); a data URI would be dropped.
 VisionRunner = Callable[[dict, str, str], Awaitable[str | None]]
 
 
@@ -79,15 +83,28 @@ async def apply_capture(
     # Store the photo only if the list has somewhere to hold it — otherwise this
     # is an analyze-only capture and keeping the file would orphan it.
     att_id = store.put_attachment(flowlet_id, image_bytes) if keeps_photo else None
+    # The model turn needs the image as a local FILE PATH (the media pipeline's
+    # contract). Reuse the stored attachment's file; analyze-only captures get a
+    # temp file that is removed after the turn.
+    image_path = store.attachment_path(flowlet_id, att_id) if att_id else None
+    tmp: Path | None = None
+    if image_path is None:
+        fd, name = tempfile.mkstemp(suffix=".jpg")
+        with os.fdopen(fd, "wb") as f:
+            f.write(image_bytes)
+        tmp = Path(name)
+        image_path = tmp
     try:
         prompt = _build_vision_prompt(action.get("prompt", ""), fields)
-        data_uri = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
-        reply = await runner(flowlet, prompt, data_uri)
+        reply = await runner(flowlet, prompt, str(image_path))
         parsed = _extract_json(reply or "")
     except Exception as exc:  # noqa: BLE001 — model/parse failure: don't keep the orphan
         if att_id:
             store.delete_attachment(flowlet_id, att_id)
         raise FlowletCaptureError("UNAVAILABLE", f"couldn't read the photo ({exc})")
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
     # Shape the reply into the item schema (lenient — bad fields drop).
     item: dict[str, Any] = {}

@@ -32,8 +32,17 @@ def _photo_component(defn: dict) -> dict:
     return defn["layout"][0]
 
 
-async def _runner_ok(flowlet, prompt, image):
-    assert image.startswith("data:image/jpeg;base64,")
+_SEEN_PATHS: list[str] = []
+
+
+async def _runner_ok(flowlet, prompt, image_path):
+    # The media contract: a LOCAL FILE PATH to the captured JPEG (never a data
+    # URI — the agent's pipeline would drop/choke on one).
+    from pathlib import Path
+    p = Path(image_path)
+    assert p.is_file() and p.suffix == ".jpg"
+    assert p.read_bytes() == _JPEG
+    _SEEN_PATHS.append(image_path)
     return '{"name": "Tavuklu salata", "kcal": 420}'
 
 
@@ -102,13 +111,17 @@ async def test_capture_adds_item_with_photo(store):
 
 
 async def test_analyze_only_keeps_no_photo(store):
+    from pathlib import Path
+    _SEEN_PATHS.clear()
     f = store.create("Kalori", _meal_def(keep_photo=False))
     fl = store.get(f["id"])
     values = await apply_capture(store, fl, _photo_component(fl["definition"]), _JPEG, runner=_runner_ok)
     meals = values["meals"]
     assert len(meals) == 1 and "shot" not in meals[0]
-    # nothing stored on disk (no image field to hold it)
+    # nothing stored on disk (no image field to hold it)…
     assert not store._attach_dir(f["id"]).exists()
+    # …and the temp file the model turn read is cleaned up too
+    assert _SEEN_PATHS and not Path(_SEEN_PATHS[-1]).exists()
 
 
 async def test_runner_failure_cleans_up_orphan(store):

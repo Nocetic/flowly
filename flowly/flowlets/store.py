@@ -304,6 +304,14 @@ class FlowletStore:
         except OSError:
             return None
 
+    def attachment_path(self, flowlet_id: str, att_id: str) -> Path | None:
+        """The on-disk path of a stored photo — for the agent's media pipeline,
+        which consumes local file paths (same contract as chat attachments)."""
+        if not _SAFE_ATTACH_ID.match(att_id or ""):
+            return None
+        p = self._attach_dir(flowlet_id) / f"{att_id}.jpg"
+        return p if p.is_file() else None
+
     def delete_attachment(self, flowlet_id: str, att_id: str) -> None:
         if not _SAFE_ATTACH_ID.match(att_id or ""):
             return

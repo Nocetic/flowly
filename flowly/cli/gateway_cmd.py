@@ -1423,10 +1423,11 @@ Respond to the user now:"""
             return 0
         return await _source_engine.refresh_flowlet(flowlet_id, force=force)
 
-    async def _flowlet_vision_runner(flowlet: dict, prompt: str, image_data_uri: str) -> str | None:
+    async def _flowlet_vision_runner(flowlet: dict, prompt: str, image_path: str) -> str | None:
         """One isolated, TOOL-LESS model turn over a captured photo → its reply
-        (JSON). Tools are disabled so the model just looks at the image and
-        answers in one shot (no exploring/looping); never lands in chat
+        (JSON). The image arrives as a LOCAL FILE PATH (the media pipeline's
+        contract — same as chat attachments); tools are disabled so the model
+        just looks at the image and answers in one shot; never lands in chat
         (dedicated session)."""
         try:
             no_tools = agent.tools.tool_names()
@@ -1435,7 +1436,7 @@ Respond to the user now:"""
         return await agent.process_direct(
             prompt,
             session_key=f"flowlet_vision:{flowlet.get('id')}",
-            media=[image_data_uri],
+            media=[image_path],
             skip_memory=True,
             skip_context_files=True,
             disabled_tools=no_tools,

@@ -2047,8 +2047,14 @@ When in doubt, ASK FIRST. A wrong action can't be undone.
                     )
                 continue
 
-            p = Path(file_path)
-            if not p.is_file():
+            try:
+                p = Path(file_path)
+                if not p.is_file():
+                    continue
+            except (OSError, ValueError):
+                # A media ref that isn't a real path (oversized/garbage string —
+                # e.g. an accidental data URI) must never crash the turn; skip it
+                # like any missing file.
                 continue
             mime, _ = mimetypes.guess_type(file_path)
             mime = mime or ""
