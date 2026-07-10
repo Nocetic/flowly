@@ -1463,6 +1463,10 @@ def flowlets_get(params: dict) -> dict:
             _asyncio.get_running_loop().create_task(_flowlet_refresh_cb(flowlet_id, False))
         except Exception:
             pass  # no loop / best-effort
+    # Serving-time guarantee: a list with an `image` field always DISPLAYS its
+    # photos, even when the authoring agent forgot the `image` component (a row
+    # thumbnail + a full photo on the drill-down). Never persisted.
+    from flowly.flowlets.normalize import ensure_photo_display
     return {
         "flowlet": {
             "id": flowlet["id"],
@@ -1472,7 +1476,7 @@ def flowlets_get(params: dict) -> dict:
             "pinned": flowlet.get("pinned"),
             "version": flowlet.get("version"),
             "catalog": flowlet.get("catalog"),
-            "definition": flowlet["definition"],
+            "definition": ensure_photo_display(flowlet["definition"]),
             "updatedAt": flowlet.get("updated_at"),
         },
         "values": _flowlet_values(flowlet),
