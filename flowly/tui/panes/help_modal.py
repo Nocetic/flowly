@@ -122,7 +122,7 @@ Run these from a regular shell — they work without launching the TUI.
 ## Sessions
 - Sessions persist at `~/.flowly/data/sessions/`.
 - TUI remembers your last session in `~/.flowly/tui_state.json`.
-- Launch with `flowly --new` to start fresh, or `-s key` for a custom key.
+- Each launch starts fresh; `flowly --resume` lists recent sessions to reopen, `-s key` opens one directly.
 
 ## Sync scope
 - **CLI sessions stay local.** Everything you type here is saved only

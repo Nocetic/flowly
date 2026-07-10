@@ -46,10 +46,14 @@ def main(
     port: int = typer.Option(18790, "--port", "-P", help="Gateway port"),
     session: str = typer.Option(
         "", "--session", "-s",
-        help="Session key (default: resume last-used; --new for fresh)",
+        help="Open a specific session key (default: start a fresh session)",
     ),
     new: bool = typer.Option(
-        False, "--new", "-n", help="Start a fresh session ignoring last state",
+        False, "--new", "-n",
+        help="Start a fresh session (now the default; kept for compatibility)",
+    ),
+    resume: bool = typer.Option(
+        False, "--resume", "-r", help="Resume the last-used session",
     ),
     theme: str = typer.Option(
         "", "--theme",
@@ -61,7 +65,7 @@ def main(
     Run with no subcommand to start chatting (the TUI) when a provider is
     configured, or open the first-run onboarding picker when none is set yet.
     The session/theme/gateway flags above apply to that bare-``flowly`` launch
-    — e.g. ``flowly --new`` or ``flowly --theme hacker``.
+    — e.g. ``flowly --resume`` or ``flowly --theme hacker``.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -96,7 +100,9 @@ def main(
     # (the plain-Python launcher), not a Typer command — it takes plain
     # values rather than OptionInfo defaults.
     from flowly.tui.entry import run_tui
-    run_tui(host=host, port=port, session=session, new=new, theme=theme)
+    run_tui(
+        host=host, port=port, session=session, new=new, resume=resume, theme=theme
+    )
 
 
 # ── Register command groups from sub-modules ──────────────────────

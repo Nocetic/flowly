@@ -38,11 +38,15 @@ It uses SQLite **FTS5** for full-text search across message content.
 
 ## Resuming sessions in the TUI
 
-By default, opening the TUI **resumes your last session** so the conversation continues where you left off.
+By default, opening the TUI **starts a fresh session**. Your earlier chats are
+never lost — `--resume` shows an arrow-key menu of recent sessions right in the
+terminal (newest first, before the TUI opens) and launches your pick. Inside
+the TUI, **Ctrl+S** opens the same list as a panel, and `-s <key>` targets a
+session directly.
 
 ```bash
-flowly                  # resume last session
-flowly --new            # start a fresh session
+flowly                  # start a fresh session (default)
+flowly --resume         # pick a recent session from a menu and continue it
 flowly -s <key>         # open a specific session by key
 ```
 

@@ -271,6 +271,10 @@ class FlowlyTUI(App[None]):
         # Optional modal to auto-open after launch (e.g. `flowly setup`
         # passes "integrations" so the catalogue surfaces immediately).
         self._auto_open_modal: str | None = auto_open_modal
+        # Set once the user actually sends a message here. Gates the
+        # ``last_session_key`` write so ``--resume`` reopens the last chat
+        # that was *used*, not an empty session from an idle launch+quit.
+        self._session_used = False
         self._current_run: str | None = None
         self._current_bubble: Bubble | None = None
         self._event_task: asyncio.Task[None] | None = None
@@ -586,7 +590,8 @@ class FlowlyTUI(App[None]):
         """
         try:
             state = load_state()
-            state["last_session_key"] = self._session_key
+            if self._session_used:
+                state["last_session_key"] = self._session_key
             try:
                 draft = self.query_one("#composer-input").text  # type: ignore[attr-defined]
             except Exception:
@@ -1343,6 +1348,7 @@ class FlowlyTUI(App[None]):
 
     @on(Composer.Submitted)
     async def _on_send(self, event: Composer.Submitted) -> None:
+        self._session_used = True
         # Non-blocking queue: if a turn is already running, push onto the
         # queue and let _drain_queue() pick it up when the current turn
         # ends. Input is NEVER disabled — user can keep typing or queue

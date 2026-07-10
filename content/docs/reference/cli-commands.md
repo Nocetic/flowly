@@ -49,8 +49,9 @@ Bare `flowly` opens the terminal chat (TUI) once a provider/account is configure
 |---|---|
 | `--host` | Gateway host (default `127.0.0.1`). |
 | `--port`, `-P` | Gateway port (default `18790`). |
-| `--session`, `-s` | Session key (default: resume last; use `--new` for fresh). |
-| `--new`, `-n` | Start a fresh session, ignoring last state. |
+| `--session`, `-s` | Open a specific session key (default: start fresh). |
+| `--resume`, `-r` | Pick a recent session from an arrow-key menu and resume it. |
+| `--new`, `-n` | Start a fresh session (now the default; kept for compatibility). |
 | `--theme` | TUI theme: `flowly`, `moonfly`, `catppuccin`, `tokyo-night`, `synthwave`, `mono`, `amber`, `hacker`. |
 
 ## flowly agent
