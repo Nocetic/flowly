@@ -83,6 +83,7 @@ from flowly.tui.panes.provider_picker import ProviderPickerPanel
 from flowly.tui.panes.session_picker import SessionPickerPanel
 from flowly.tui.panes.status import ContextHeader, StatusBar
 from flowly.tui.panes.status_panel import SessionStatusPanel
+from flowly.tui.panes.subagent_models import SubagentModelsPanel
 from flowly.tui.panes.subagents import SubagentPane
 from flowly.tui.panes.theme_picker import ThemePickerPanel
 from flowly.tui.panes.transcript import Bubble, TranscriptPane
@@ -1365,6 +1366,11 @@ class FlowlyTUI(App[None]):
         event.stop()
         self._finish_composer_picker(None)
 
+    @on(SubagentModelsPanel.Dismissed)
+    def _on_subagent_models_dismissed(self, event: SubagentModelsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(None)
+
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
         # navigation, and push_screen_wait results. Runtime CSS renders these
@@ -2125,8 +2131,10 @@ class FlowlyTUI(App[None]):
     @work
     async def action_subagent_models(self) -> None:
         """``/subagents models`` — open the per-specialist model editor."""
-        from flowly.tui.panes.subagent_models import SubagentModelsModal
-        await self._show_inline_screen(SubagentModelsModal(self._client))
+        await self._show_composer_picker(
+            SubagentModelsPanel(self._client),
+            inline=True,
+        )
 
     @work
     async def action_spawn_subagent(self, task: str) -> None:

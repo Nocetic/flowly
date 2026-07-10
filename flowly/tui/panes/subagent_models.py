@@ -16,9 +16,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from textual import on, work
+from textual import on
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, OptionList
 from textual.widgets.option_list import Option
@@ -35,33 +36,45 @@ def _short(model_id: str) -> str:
 _SPEC_PREFIX = "SPEC:"
 
 
-class SubagentModelsModal(ModalScreen[None]):
+class SpecialistModelChoice(Message):
+    def __init__(self, choice: str | None) -> None:
+        super().__init__()
+        self.choice = choice
+
+
+class SubagentModelsPanel(Vertical):
     """Specialist → model editor. Talks to the gateway via the passed client."""
 
+    can_focus = True
+
+    class Dismissed(Message):
+        pass
+
     DEFAULT_CSS = """
-    SubagentModelsModal { align: center middle; }
-    SubagentModelsModal > Vertical {
-        width: 80%;
-        max-width: 96;
-        height: 80%;
-        max-height: 30;
-        padding: 1 2;
-        border: thick $primary;
-        background: $surface;
+    SubagentModelsPanel {
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+        max-height: 24;
+        padding: 0;
+        border: none;
+        background: transparent;
     }
-    SubagentModelsModal .title { text-style: bold; color: $primary; height: 1; }
-    SubagentModelsModal .hint {
+    SubagentModelsPanel .title { text-style: bold; color: $primary; height: 1; }
+    SubagentModelsPanel .hint {
         color: $text-muted; text-style: italic; height: auto; margin-bottom: 1;
     }
-    SubagentModelsModal OptionList {
-        height: 1fr; border: none; background: $surface;
+    SubagentModelsPanel OptionList {
+        height: 18; border: none; background: transparent;
     }
-    SubagentModelsModal .footer {
+    SubagentModelsPanel .footer {
         color: $text-muted; text-style: italic; height: auto; margin-top: 1;
     }
+    SubagentModelsPanel #spec-overview,
+    SubagentModelsPanel #spec-editor-host { height: auto; }
     """
 
-    BINDINGS = [("escape", "dismiss(None)", "Close")]
+    BINDINGS = [("escape", "cancel", "Close")]
 
     def __init__(self, client: Any) -> None:
         super().__init__()
@@ -70,7 +83,7 @@ class SubagentModelsModal(ModalScreen[None]):
         self._bot_model: str = ""
 
     def compose(self) -> ComposeResult:
-        with Vertical():
+        with Vertical(id="spec-overview"):
             yield Label("Subagent models", classes="title")
             yield Label(
                 "Pick the model each specialist runs on when your assistant "
@@ -79,9 +92,22 @@ class SubagentModelsModal(ModalScreen[None]):
             )
             yield OptionList(id="spec-list")
             yield Label("", id="spec-footer", classes="footer")
+        yield Vertical(id="spec-editor-host")
 
     async def on_mount(self) -> None:
+        self.query_one("#spec-editor-host", Vertical).display = False
         await self._load()
+        self._focus_list()
+
+    def on_focus(self) -> None:
+        if self.query_one("#spec-overview", Vertical).display:
+            self._focus_list()
+
+    def _focus_list(self) -> None:
+        try:
+            self.query_one("#spec-list", OptionList).focus()
+        except Exception:
+            pass
 
     async def _load(self) -> None:
         self._set_footer("loading specialists…")
@@ -119,30 +145,43 @@ class SubagentModelsModal(ModalScreen[None]):
         return f"[b]{a['name']}[/b]{builtin}  →  {chosen}"
 
     @on(OptionList.OptionSelected, "#spec-list")
-    def _on_pick(self, event: OptionList.OptionSelected) -> None:
+    async def _on_pick(self, event: OptionList.OptionSelected) -> None:
         opt_id = str(event.option.id or "")
         if opt_id.startswith(_SPEC_PREFIX):
-            self._edit_specialist(opt_id[len(_SPEC_PREFIX):])
+            await self._open_editor(opt_id[len(_SPEC_PREFIX):])
 
-    @work
-    async def _edit_specialist(self, name: str) -> None:
+    async def _open_editor(self, name: str) -> None:
         a = next((x for x in self._assistants if x["name"] == name), None)
         if a is None:
             return
-        picker = _SpecialistModelPicker(
+        overview = self.query_one("#spec-overview", Vertical)
+        host = self.query_one("#spec-editor-host", Vertical)
+        await host.remove_children()
+        overview.display = False
+        host.display = True
+        await host.mount(SpecialistModelPickerPanel(
             specialist=name,
             default_model=str(a.get("defaultModel") or ""),
             bot_model=self._bot_model,
             override=str(a.get("override") or ""),
-        )
-        show_inline = getattr(self.app, "_show_inline_screen", None)
-        choice = (
-            await show_inline(picker)
-            if callable(show_inline)
-            else await self.app.push_screen_wait(picker)
-        )
+        ))
+
+    @on(SpecialistModelChoice)
+    async def _on_model_choice(self, event: SpecialistModelChoice) -> None:
+        event.stop()
+        choice = event.choice
+        host = self.query_one("#spec-editor-host", Vertical)
+        editor = next(iter(host.children), None)
+        name = str(getattr(editor, "_specialist", ""))
+        await host.remove_children()
+        host.display = False
+        self.query_one("#spec-overview", Vertical).display = True
+        self._focus_list()
         if choice is None:
             return  # cancelled
+        a = next((x for x in self._assistants if x["name"] == name), None)
+        if a is None:
+            return
         self._set_footer(f"saving {name}…")
         try:
             res = await self._client.subagents_set_model(name, choice)
@@ -157,6 +196,9 @@ class SubagentModelsModal(ModalScreen[None]):
         eff = _short(str(res.get("effectiveModel") or ""))
         self._set_footer(f"✓ {name} → [b]{eff}[/b]")
 
+    def action_cancel(self) -> None:
+        self.post_message(self.Dismissed())
+
     def _set_footer(self, text: str) -> None:
         try:
             self.query_one("#spec-footer", Label).update(text)
@@ -168,7 +210,7 @@ _OVR_PREFIX = "OVR:"
 _MODEL_PREFIX = "MODEL:"
 
 
-class _SpecialistModelPicker(ModalScreen[str | None]):
+class SpecialistModelPickerPanel(Vertical):
     """Pick a model for one specialist.
 
     Dismisses with the override string to persist:
@@ -176,25 +218,25 @@ class _SpecialistModelPicker(ModalScreen[str | None]):
     ``None`` ⇒ cancelled.
     """
 
+    can_focus = True
+
     DEFAULT_CSS = """
-    _SpecialistModelPicker { align: center middle; }
-    _SpecialistModelPicker > Vertical {
-        width: 75%; max-width: 90; height: 80%; max-height: 32;
-        padding: 1 2; border: thick $primary; background: $surface;
+    SpecialistModelPickerPanel {
+        width: 100%; max-width: 100%; height: auto; max-height: 24;
+        padding: 0; border: none; background: transparent;
     }
-    _SpecialistModelPicker .title { text-style: bold; color: $primary; height: 1; }
-    _SpecialistModelPicker .hint {
+    SpecialistModelPickerPanel .title { text-style: bold; color: $primary; height: 1; }
+    SpecialistModelPickerPanel .hint {
         color: $text-muted; text-style: italic; height: 1; margin-bottom: 1;
     }
-    _SpecialistModelPicker Input { height: 3; margin-bottom: 1; }
-    _SpecialistModelPicker OptionList { height: 1fr; border: none; background: $surface; }
-    _SpecialistModelPicker .footer {
+    SpecialistModelPickerPanel Input { height: 3; margin-bottom: 1; }
+    SpecialistModelPickerPanel OptionList { height: 16; border: none; background: transparent; }
+    SpecialistModelPickerPanel .footer {
         color: $text-muted; text-style: italic; height: auto; margin-top: 1;
     }
     """
 
-    BINDINGS = [("escape", "dismiss(None)", "Close")]
-    AUTO_FOCUS = "Input"
+    BINDINGS = [("escape", "cancel", "Close")]
 
     def __init__(
         self, specialist: str, default_model: str, bot_model: str, override: str
@@ -208,18 +250,24 @@ class _SpecialistModelPicker(ModalScreen[str | None]):
         self._filtered: list[Model] = []
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label(f"Model — {self._specialist}", classes="title")
-            yield Label(
-                "type to filter · ↑/↓ navigate · Enter select · Esc close",
-                classes="hint",
-            )
-            yield Input(placeholder="filter by id / vendor / tag…", id="spm-filter")
-            yield OptionList(id="spm-list")
-            yield Label("", id="spm-footer", classes="footer")
+        yield Label(f"Model — {self._specialist}", classes="title")
+        yield Label(
+            "type to filter · ↑/↓ navigate · Enter select · Esc back",
+            classes="hint",
+        )
+        yield Input(placeholder="filter by id / vendor / tag…", id="spm-filter")
+        yield OptionList(id="spm-list")
+        yield Label("", id="spm-footer", classes="footer")
 
     async def on_mount(self) -> None:
         await self._load()
+        self.query_one("#spm-filter", Input).focus()
+
+    def on_focus(self) -> None:
+        try:
+            self.query_one("#spm-filter", Input).focus()
+        except Exception:
+            pass
 
     async def _load(self) -> None:
         # Resolve the active provider locally and fetch its catalogue (same
@@ -291,12 +339,70 @@ class _SpecialistModelPicker(ModalScreen[str | None]):
 
     def _select(self, opt_id: str) -> None:
         if opt_id.startswith(_OVR_PREFIX):
-            self.dismiss(opt_id[len(_OVR_PREFIX):])  # "inherit" or ""
+            self.post_message(SpecialistModelChoice(opt_id[len(_OVR_PREFIX):]))
         elif opt_id.startswith(_MODEL_PREFIX):
-            self.dismiss(opt_id[len(_MODEL_PREFIX):])
+            self.post_message(SpecialistModelChoice(opt_id[len(_MODEL_PREFIX):]))
+
+    def action_cancel(self) -> None:
+        self.post_message(SpecialistModelChoice(None))
 
     def _set_footer(self, text: str) -> None:
         try:
             self.query_one("#spm-footer", Label).update(text)
         except Exception:
             pass
+
+
+class _SpecialistModelPicker(ModalScreen[str | None]):
+    """Compatibility wrapper for the specialist model picker."""
+
+    BINDINGS = SpecialistModelPickerPanel.BINDINGS
+
+    def __init__(
+        self, specialist: str, default_model: str, bot_model: str, override: str
+    ) -> None:
+        super().__init__()
+        self._args = (specialist, default_model, bot_model, override)
+
+    def compose(self) -> ComposeResult:
+        yield SpecialistModelPickerPanel(*self._args)
+
+    @on(SpecialistModelChoice)
+    def _on_choice(self, event: SpecialistModelChoice) -> None:
+        event.stop()
+        self.dismiss(event.choice)
+
+    def action_cancel(self) -> None:
+        self.query_one(SpecialistModelPickerPanel).action_cancel()
+
+
+class SubagentModelsModal(ModalScreen[None]):
+    """Compatibility wrapper; the chat TUI mounts :class:`SubagentModelsPanel`."""
+
+    BINDINGS = SubagentModelsPanel.BINDINGS
+
+    DEFAULT_CSS = """
+    SubagentModelsModal { align: center middle; }
+    SubagentModelsModal > SubagentModelsPanel {
+        width: 80%;
+        max-width: 96;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
+
+    def __init__(self, client: Any) -> None:
+        super().__init__()
+        self._client = client
+
+    def compose(self) -> ComposeResult:
+        yield SubagentModelsPanel(self._client)
+
+    @on(SubagentModelsPanel.Dismissed)
+    def _on_dismissed(self, event: SubagentModelsPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.query_one(SubagentModelsPanel).action_cancel()

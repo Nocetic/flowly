@@ -416,7 +416,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker > ArtifactsPanel,
     Composer.picker-inline-open > #composer-picker > AssistantPickerPanel,
     Composer.picker-inline-open > #composer-picker > SessionPickerPanel,
-    Composer.picker-inline-open > #composer-picker > HelpPanel {{
+    Composer.picker-inline-open > #composer-picker > HelpPanel,
+    Composer.picker-inline-open > #composer-picker > SubagentModelsPanel {{
         background: transparent;
         border: none;
     }}
@@ -599,9 +600,11 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ProviderPicker .title,
     SessionPickerPanel .title,
     SessionPicker .title,
+    SubagentModelsPanel .title,
     SubagentModelsModal .title,
     ThemePickerPanel .title,
     ThemePicker .title,
+    SpecialistModelPickerPanel .title,
     _SpecialistModelPicker .title {{
         color: {palette.accent};
     }}
@@ -645,8 +648,12 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ProviderPicker .footer,
     SessionPickerPanel .hint,
     SessionPicker .hint,
+    SubagentModelsPanel .hint,
+    SubagentModelsPanel .footer,
     SubagentModelsModal .hint,
     SubagentModelsModal .footer,
+    SpecialistModelPickerPanel .hint,
+    SpecialistModelPickerPanel .footer,
     _SpecialistModelPicker .hint,
     _SpecialistModelPicker .footer,
     IntegrationSetupModal .field-row > Label,
@@ -694,9 +701,11 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ProviderPicker OptionList,
     SessionPickerPanel OptionList,
     SessionPicker OptionList,
+    SubagentModelsPanel OptionList,
     SubagentModelsModal OptionList,
     ThemePickerPanel OptionList,
     ThemePicker OptionList,
+    SpecialistModelPickerPanel OptionList,
     _SpecialistModelPicker OptionList,
     HelpPanel VerticalScroll,
     HelpPanel Markdown,
