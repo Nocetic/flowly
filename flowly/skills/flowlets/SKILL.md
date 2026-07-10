@@ -142,6 +142,32 @@ named fragments, and put `navigate` on the repeater/table:
 (`$.field`). Keep the list row a summary and put the details (and any row
 actions like delete) in the screen. One level deep.
 
+**Photo → structured data (`photo` + `vision`).** For anything the user
+photographs — a meal, a receipt, a plant, a whiteboard — add a `photo` component
+with a `vision` action into a `list`. You write the prompt; the list's item
+schema is the output contract. Give the list an `image` field to keep the photo
+(a visual journal); omit it for analyze-only. The result is an **editable** row
+(the user can fix a wrong estimate via a normal `item_update`). The turn runs on
+the user's own keys/machine — say so if the UI mentions it.
+
+Calorie journal:
+```json
+{ "state": { "meals": { "type": "list",
+    "item": { "name": "string", "kcal": "number", "shot": "image" } } },
+  "layout": [
+    { "type": "photo", "id": "add", "label": "Öğün ekle",
+      "action": { "op": "vision", "into": "meals",
+        "prompt": "This is a photo of a meal. Estimate its name and calories." } },
+    { "type": "repeater", "source": "meals", "navigate": "meal",
+      "item": { "type": "row", "children": [
+        { "type": "image", "src": "$.shot", "height": 44 },
+        { "type": "text", "text": "{$.name}" },
+        { "type": "text", "text": "{$.kcal} kcal" } ] } } ],
+  "screens": { "meal": { "title": "{$.name}", "layout": [
+    { "type": "image", "src": "$.shot" },
+    { "type": "stat", "value": "$.kcal", "label": "kcal" } ] } } }
+```
+
 ## Actions (what a tap does — declared, deterministic, no LLM)
 
 Put an `action` on an input component. Ops:

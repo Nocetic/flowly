@@ -34,9 +34,11 @@ aggregate. `catalog: 1` is required at the top of every definition.
   (≤ 500). `timer` is bot-managed (`timer_toggle` drives it; resolves to
   `{running, elapsed}`). `list` is a dynamic collection — it declares an
   `item` field schema (`{"title": "string", "done": "bool"}`; types
-  `string|number|bool|date`, ≤ 8 fields, `id` reserved) plus optional `max`
+  `string|number|bool|date|image`, ≤ 8 fields, `id` reserved) plus optional `max`
   (≤ 200) and resolves to an array of `{id, ...fields}` rows, rendered by the
-  `repeater` component and mutated by the `item_*` ops.
+  `repeater` component and mutated by the `item_*` ops. An `image` field holds a
+  stored-photo attachment id (written by the `vision` op, shown by the `image`
+  component).
 - **series** — append-only event logs (`{unit?}`). Charts and totals read these.
 - **computed** — derived scalars, one of: a series aggregation
   (`{series, agg, window}`); a **list** aggregation (`{list, agg, field?, where?}`
@@ -155,6 +157,7 @@ platform.
 | `date` | `label?` | `set` (stores `YYYY-MM-DD`) |
 | `textarea` | `label?`, `maxLength?`, `rows?` | `set` |
 | `search` | `target` (a repeater/table id), `fields?`, `placeholder?` | filters that list client-side (no bot round-trip) |
+| `photo` | `label?`, `busyLabel?` | `vision` — capture a photo, the bot interprets it into a new list item |
 
 **Filtering & sorting a list** (all client-local, deterministic, LLM-free):
 - A `repeater` or source-mode `table` may carry `where` (a per-item filter expr —
@@ -208,6 +211,16 @@ time persists across sessions. For billable hours, an experiment, a workout.
 | `item_toggle` | `key`, `field` | flip a bool field on the tapped row |
 | `item_remove` | `key` | delete the tapped row |
 | `item_move` | `key` | reorder (value = new index) |
+| `vision` | `prompt`, `into` | on a `photo`: interpret the captured image (one model turn) into a new `into`-list row |
+
+**Photo capture (`photo` + `vision`).** A `photo` component carries
+`{op:"vision", prompt, into}` (`into` = a `list` key). On tap the client
+downscales the image and calls `flowlets.capture`; the bot stores the photo (iff
+the list has an `image` field — else analyze-only), runs one isolated model turn
+over it (never in chat), coerces the reply into the list's item schema (the
+schema is the output contract), writes the attachment id into the `image` field,
+and appends an **editable** row. The photo never enters state/broadcast — only
+the attachment id; bytes are served on demand via `flowlets.attachment`.
 
 Row-scoped ops (`item_update/toggle/remove/move`) must sit inside the repeater
 bound to the same list; the client sends their value as `{"itemId", "value"}`
@@ -291,9 +304,11 @@ definition ≤ 64 KB · ≤ 200 components · nesting depth ≤ 8 · ≤ 200 lis
 ## Sync surface
 
 `flowlets.list · flowlets.get · flowlets.state · flowlets.action ·
-flowlets.refresh · flowlets.pin · flowlets.delete` over feature_rpc (gateway +
-relay). `flowlets.get` also kicks a background refresh of due data sources;
-`flowlets.refresh` force-refreshes them (pull-to-refresh). Events:
+flowlets.refresh · flowlets.capture · flowlets.attachment · flowlets.pin ·
+flowlets.delete` over feature_rpc (gateway + relay). `flowlets.get` also kicks a
+background refresh of due data sources; `flowlets.refresh` force-refreshes them
+(pull-to-refresh). `flowlets.capture` runs a `photo`'s vision turn;
+`flowlets.attachment` serves a stored photo's bytes. Events:
 `flowlet.created · flowlet.updated · flowlet.deleted · flowlet.state ·
 flowlet.reminder` (a watch fired → desktop notification). Creation/definition
 edits are agent-only (via the `flowlet` tool); reactive `watches` fire on the
