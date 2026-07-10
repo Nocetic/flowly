@@ -1338,7 +1338,8 @@ class Composer(Vertical):
     Composer > #composer-picker > PolicyPanel,
     Composer > #composer-picker > ArtifactsPanel,
     Composer > #composer-picker > AssistantPickerPanel,
-    Composer > #composer-picker > SessionPickerPanel {
+    Composer > #composer-picker > SessionPickerPanel,
+    Composer > #composer-picker > HelpPanel {
         height: auto;
         max-height: 24;
     }
@@ -1355,7 +1356,8 @@ class Composer(Vertical):
     Composer.picker-inline-open > #composer-picker > PolicyPanel,
     Composer.picker-inline-open > #composer-picker > ArtifactsPanel,
     Composer.picker-inline-open > #composer-picker > AssistantPickerPanel,
-    Composer.picker-inline-open > #composer-picker > SessionPickerPanel {
+    Composer.picker-inline-open > #composer-picker > SessionPickerPanel,
+    Composer.picker-inline-open > #composer-picker > HelpPanel {
         width: 100%;
         max-width: 100%;
         border: none;

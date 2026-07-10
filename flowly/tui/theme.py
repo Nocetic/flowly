@@ -415,7 +415,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker > PolicyPanel,
     Composer.picker-inline-open > #composer-picker > ArtifactsPanel,
     Composer.picker-inline-open > #composer-picker > AssistantPickerPanel,
-    Composer.picker-inline-open > #composer-picker > SessionPickerPanel {{
+    Composer.picker-inline-open > #composer-picker > SessionPickerPanel,
+    Composer.picker-inline-open > #composer-picker > HelpPanel {{
         background: transparent;
         border: none;
     }}
@@ -580,6 +581,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     BrowserPanel .title,
     BrowserModal .title,
     ConfirmModal .title,
+    HelpPanel Markdown,
     HelpModal Markdown,
     IntegrationSetupModal .title,
     IntegrationsPanel .title,
@@ -696,6 +698,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ThemePickerPanel OptionList,
     ThemePicker OptionList,
     _SpecialistModelPicker OptionList,
+    HelpPanel VerticalScroll,
+    HelpPanel Markdown,
     HelpModal VerticalScroll,
     HelpModal Markdown {{
         background: {palette.surface};

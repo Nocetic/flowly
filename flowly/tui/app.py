@@ -71,7 +71,7 @@ from flowly.tui.panes.composer import (
 )
 from flowly.tui.panes.confirm_modal import ConfirmModal
 from flowly.tui.panes.help_hint import HelpHint
-from flowly.tui.panes.help_modal import HelpModal
+from flowly.tui.panes.help_modal import HelpPanel
 from flowly.tui.panes.integrations_modal import IntegrationsPanel
 from flowly.tui.panes.login_modal import LoginPanel
 from flowly.tui.panes.mcp_modal import MCPPanel
@@ -1360,6 +1360,11 @@ class FlowlyTUI(App[None]):
         event.stop()
         self._finish_composer_picker(event.result)
 
+    @on(HelpPanel.Dismissed)
+    def _on_help_panel_dismissed(self, event: HelpPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(None)
+
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
         # navigation, and push_screen_wait results. Runtime CSS renders these
@@ -2145,7 +2150,7 @@ class FlowlyTUI(App[None]):
 
     @work
     async def action_open_help(self) -> None:
-        await self._show_inline_screen(HelpModal())
+        await self._show_composer_picker(HelpPanel(), inline=True)
 
     # ── Connection catalogs ──────────────────────────────────────
 
