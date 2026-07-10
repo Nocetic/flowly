@@ -1376,12 +1376,6 @@ class FlowlyTUI(App[None]):
         event.stop()
         self._finish_composer_picker(event.confirmed)
 
-    async def _show_inline_screen(self, screen: Any) -> Any:
-        # Keep Textual's screen stack for focus, Esc bindings, OptionList
-        # navigation, and push_screen_wait results. Runtime CSS renders these
-        # screens as composer-adjacent bottom sheets instead of centered modals.
-        return await self.push_screen_wait(screen)
-
     def _safe_transcript_system(self, text: str) -> None:
         try:
             transcript = self.query_one(TranscriptPane)
@@ -1402,8 +1396,7 @@ class FlowlyTUI(App[None]):
 
     @on(Composer.ArtifactOpen)
     def _on_artifact_open(self, event: Composer.ArtifactOpen) -> None:
-        # push_screen_wait below requires a worker context (Textual raises
-        # NoActiveWorker from a plain message handler), so delegate.
+        # Fetching and external-open work must not block message dispatch.
         self._open_artifact_screen(dict(event.artifact))
 
     @work
@@ -1774,7 +1767,7 @@ class FlowlyTUI(App[None]):
             )
         await self._send_as_message(cmd, skill_notice=skill_notice)
 
-    # legacy inline help removed in favor of HelpModal (Ctrl+? / /help / F1)
+    # Help is handled by the composer-inline HelpPanel (Ctrl+? / /help / F1).
 
     @work
     async def _board_command(self, rest: str) -> None:

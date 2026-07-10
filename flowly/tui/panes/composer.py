@@ -1325,43 +1325,11 @@ class Composer(Vertical):
     Composer.picker-inline-open > #composer-picker {
         background: #000000;
     }
-    Composer > #composer-picker > ProviderPickerPanel,
-    Composer > #composer-picker > ModelPickerPanel,
-    Composer > #composer-picker > IntegrationsPanel,
-    Composer > #composer-picker > LoginPanel,
-    Composer > #composer-picker > PluginsPanel,
-    Composer > #composer-picker > MCPPanel,
-    Composer > #composer-picker > BrowserPanel,
-    Composer > #composer-picker > ThemePickerPanel,
-    Composer > #composer-picker > ActivityPanel,
-    Composer > #composer-picker > ApprovalsPanel,
-    Composer > #composer-picker > PolicyPanel,
-    Composer > #composer-picker > ArtifactsPanel,
-    Composer > #composer-picker > AssistantPickerPanel,
-    Composer > #composer-picker > SessionPickerPanel,
-    Composer > #composer-picker > HelpPanel,
-    Composer > #composer-picker > SubagentModelsPanel,
-    Composer > #composer-picker > ConfirmPanel {
+    Composer > #composer-picker > * {
         height: auto;
         max-height: 24;
     }
-    Composer.picker-inline-open > #composer-picker > ProviderPickerPanel,
-    Composer.picker-inline-open > #composer-picker > ModelPickerPanel,
-    Composer.picker-inline-open > #composer-picker > IntegrationsPanel,
-    Composer.picker-inline-open > #composer-picker > LoginPanel,
-    Composer.picker-inline-open > #composer-picker > PluginsPanel,
-    Composer.picker-inline-open > #composer-picker > MCPPanel,
-    Composer.picker-inline-open > #composer-picker > BrowserPanel,
-    Composer.picker-inline-open > #composer-picker > ThemePickerPanel,
-    Composer.picker-inline-open > #composer-picker > ActivityPanel,
-    Composer.picker-inline-open > #composer-picker > ApprovalsPanel,
-    Composer.picker-inline-open > #composer-picker > PolicyPanel,
-    Composer.picker-inline-open > #composer-picker > ArtifactsPanel,
-    Composer.picker-inline-open > #composer-picker > AssistantPickerPanel,
-    Composer.picker-inline-open > #composer-picker > SessionPickerPanel,
-    Composer.picker-inline-open > #composer-picker > HelpPanel,
-    Composer.picker-inline-open > #composer-picker > SubagentModelsPanel,
-    Composer.picker-inline-open > #composer-picker > ConfirmPanel {
+    Composer.picker-inline-open > #composer-picker > * {
         width: 100%;
         max-width: 100%;
         border: none;

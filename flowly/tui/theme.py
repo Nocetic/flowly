@@ -402,23 +402,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker {{
         background: {palette.bg};
     }}
-    Composer.picker-inline-open > #composer-picker > ProviderPickerPanel,
-    Composer.picker-inline-open > #composer-picker > ModelPickerPanel,
-    Composer.picker-inline-open > #composer-picker > IntegrationsPanel,
-    Composer.picker-inline-open > #composer-picker > LoginPanel,
-    Composer.picker-inline-open > #composer-picker > PluginsPanel,
-    Composer.picker-inline-open > #composer-picker > MCPPanel,
-    Composer.picker-inline-open > #composer-picker > BrowserPanel,
-    Composer.picker-inline-open > #composer-picker > ThemePickerPanel,
-    Composer.picker-inline-open > #composer-picker > ActivityPanel,
-    Composer.picker-inline-open > #composer-picker > ApprovalsPanel,
-    Composer.picker-inline-open > #composer-picker > PolicyPanel,
-    Composer.picker-inline-open > #composer-picker > ArtifactsPanel,
-    Composer.picker-inline-open > #composer-picker > AssistantPickerPanel,
-    Composer.picker-inline-open > #composer-picker > SessionPickerPanel,
-    Composer.picker-inline-open > #composer-picker > HelpPanel,
-    Composer.picker-inline-open > #composer-picker > SubagentModelsPanel,
-    Composer.picker-inline-open > #composer-picker > ConfirmPanel {{
+    Composer.picker-inline-open > #composer-picker > * {{
         background: transparent;
         border: none;
     }}
