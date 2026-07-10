@@ -1016,6 +1016,16 @@ def set_flowlet_refresh_hook(cb) -> None:
     _flowlet_refresh_cb = cb
 
 
+_flowlet_vision_runner_cb = None
+
+
+def set_flowlet_vision_runner(cb) -> None:
+    """Register an async ``(flowlet, prompt, image_data_uri) -> str`` — a single
+    isolated model turn over a captured photo (see flowlets.capture)."""
+    global _flowlet_vision_runner_cb
+    _flowlet_vision_runner_cb = cb
+
+
 def provider_active() -> dict:
     """Resolved active LLM provider (no secrets) + the current default model —
     for the Settings display and the model picker's current selection."""
@@ -1542,6 +1552,85 @@ async def flowlets_action(params: dict) -> dict:
         except Exception:
             pass
     return result
+
+
+def _decode_capture_image(image: Any) -> bytes | None:
+    """Accept a ``data:image/…;base64,…`` URI or a bare base64 string → bytes."""
+    if not isinstance(image, str) or not image:
+        return None
+    b64 = image
+    if b64.startswith("data:"):
+        comma = b64.find(",")
+        if comma == -1:
+            return None
+        b64 = b64[comma + 1:]
+    try:
+        import base64 as _b64
+        return _b64.b64decode(b64, validate=False)
+    except Exception:
+        return None
+
+
+async def flowlets_capture(params: dict) -> dict:
+    """A `photo` tap: the client sends a downscaled image; the bot interprets it
+    (one isolated model turn) into a new list item and broadcasts the update.
+    ``{id, componentId, image}`` → ``{id, values, preview?}``."""
+    from flowly.flowlets.actions import _find_component
+    from flowly.flowlets.vision import FlowletCaptureError, apply_capture
+
+    store = _flowlet_store()
+    flowlet_id = str(params.get("id", "") or "")
+    component_id = str(params.get("componentId", "") or "")
+    if not flowlet_id or not component_id:
+        raise FeatureRpcError("INVALID", "id and componentId required")
+    data = _decode_capture_image(params.get("image"))
+    if data is None:
+        raise FeatureRpcError("INVALID", "image must be a base64 (data URI)")
+    from flowly.flowlets import catalog as _fcat
+    if len(data) > _fcat.MAX_IMAGE_BYTES:
+        raise FeatureRpcError("INVALID", "image is too large")
+    flowlet = store.get(flowlet_id)
+    if not flowlet:
+        raise FeatureRpcError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
+    component = _find_component(flowlet.get("definition") or {}, component_id)
+    if not component:
+        raise FeatureRpcError("NOT_FOUND", f"component '{component_id}' not found")
+    try:
+        values = await apply_capture(
+            store, flowlet, component, data, runner=_flowlet_vision_runner_cb
+        )
+    except FlowletCaptureError as exc:
+        raise FeatureRpcError(exc.code, exc.message)
+
+    from flowly.flowlets.queries import flowlet_preview
+    preview = flowlet_preview(flowlet.get("definition") or {}, values)
+    result = {"id": flowlet_id, "values": values}
+    if preview is not None:
+        result["preview"] = preview
+    if _flowlet_broadcast_cb is not None:
+        try:
+            msg = {"id": flowlet_id, "values": values}
+            if preview is not None:
+                msg["preview"] = preview
+            await _flowlet_broadcast_cb("flowlet.state", msg)
+        except Exception:
+            pass
+    return result
+
+
+def flowlets_attachment(params: dict) -> dict:
+    """Serve a stored photo (base64) so remote clients can render an `image`
+    field. ``{id, attachmentId}`` → ``{id, mime, data}``."""
+    store = _flowlet_store()
+    flowlet_id = str(params.get("id", "") or "")
+    att_id = str(params.get("attachmentId", "") or "")
+    if not flowlet_id or not att_id:
+        raise FeatureRpcError("INVALID", "id and attachmentId required")
+    data = store.get_attachment(flowlet_id, att_id)
+    if data is None:
+        raise FeatureRpcError("NOT_FOUND", "attachment not found")
+    import base64 as _b64
+    return {"id": att_id, "mime": "image/jpeg", "data": _b64.b64encode(data).decode("ascii")}
 
 
 def flowlets_pin(params: dict) -> dict:
@@ -2647,6 +2736,8 @@ _DISPATCH: dict[str, tuple] = {
     "flowlets.state":     (flowlets_state, True, False),
     "flowlets.action":    (flowlets_action, True, False),
     "flowlets.refresh":   (flowlets_refresh, True, False),
+    "flowlets.capture":   (flowlets_capture, True, False),
+    "flowlets.attachment": (flowlets_attachment, True, False),
     "flowlets.pin":       (flowlets_pin, True, False),
     "flowlets.delete":    (flowlets_delete, True, False),
     "model.list":         (model_list, True, False),

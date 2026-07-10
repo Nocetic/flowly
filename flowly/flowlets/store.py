@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -18,6 +20,12 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+from flowly.flowlets import catalog
+
+#: An attachment id is server-minted (`att_<hex>`); validated on every read/delete
+#: so a client-supplied field value can never escape the flowlet's own dir.
+_SAFE_ATTACH_ID = re.compile(r"^att_[0-9a-f]{8,}$")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -260,7 +268,52 @@ class FlowletStore:
                 "DELETE FROM flowlets WHERE id = ?", (flowlet_id,)
             )
             # ON DELETE CASCADE clears state/events/versions
-            return cur.rowcount > 0
+            deleted = cur.rowcount > 0
+        if deleted:
+            self.delete_flowlet_attachments(flowlet_id)  # photos live on disk, not in the DB
+        return deleted
+
+    # ── Attachments (captured photos for `vision` / `image` item fields) ──────
+    # Stored as one JPEG per capture under the DB's own dir; the flowlet DB holds
+    # only the id. Kept out of the DB (and out of state broadcasts) so images
+    # never bloat sync or the row payload.
+
+    def _attach_dir(self, flowlet_id: str) -> Path:
+        return self._db_path.parent / "flowlet_attachments" / flowlet_id
+
+    def put_attachment(self, flowlet_id: str, data: bytes) -> str:
+        """Store one image and return its attachment id. Raises if the per-flowlet
+        cap is reached (bounds disk use)."""
+        d = self._attach_dir(flowlet_id)
+        with self._lock:
+            d.mkdir(parents=True, exist_ok=True)
+            if sum(1 for _ in d.glob("*.jpg")) >= catalog.MAX_ATTACHMENTS_PER_FLOWLET:
+                raise ValueError(
+                    f"attachment limit ({catalog.MAX_ATTACHMENTS_PER_FLOWLET}) reached "
+                    f"for flowlet {flowlet_id}"
+                )
+            att_id = f"att_{os.urandom(8).hex()}"
+            (d / f"{att_id}.jpg").write_bytes(data)
+        return att_id
+
+    def get_attachment(self, flowlet_id: str, att_id: str) -> bytes | None:
+        if not _SAFE_ATTACH_ID.match(att_id or ""):
+            return None
+        try:
+            return (self._attach_dir(flowlet_id) / f"{att_id}.jpg").read_bytes()
+        except OSError:
+            return None
+
+    def delete_attachment(self, flowlet_id: str, att_id: str) -> None:
+        if not _SAFE_ATTACH_ID.match(att_id or ""):
+            return
+        try:
+            (self._attach_dir(flowlet_id) / f"{att_id}.jpg").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def delete_flowlet_attachments(self, flowlet_id: str) -> None:
+        shutil.rmtree(self._attach_dir(flowlet_id), ignore_errors=True)
 
     def pin(self, flowlet_id: str, pinned: bool = True) -> dict | None:
         return self.update(flowlet_id, pinned=pinned)

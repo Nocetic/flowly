@@ -1423,6 +1423,16 @@ Respond to the user now:"""
             return 0
         return await _source_engine.refresh_flowlet(flowlet_id, force=force)
 
+    async def _flowlet_vision_runner(flowlet: dict, prompt: str, image_data_uri: str) -> str | None:
+        """One isolated model turn over a captured photo → its reply (JSON).
+        Like the source runner, it never lands in chat (dedicated session)."""
+        return await agent.process_direct(
+            prompt,
+            session_key=f"flowlet_vision:{flowlet.get('id')}",
+            media=[image_data_uri],
+            skip_memory=True,
+        )
+
     try:
         from flowly.channels import feature_rpc as _frpc_flowlet
         _frpc_flowlet.set_flowlet_broadcast(_broadcast_flowlet)
@@ -1451,6 +1461,8 @@ Respond to the user now:"""
             _fl_store, broadcast=_broadcast_flowlet, agent_runner=_flowlet_source_runner,
         )
         _frpc_flowlet.set_flowlet_refresh_hook(_flowlet_refresh)
+        # Photo capture → vision turn (same isolated-session pattern as sources).
+        _frpc_flowlet.set_flowlet_vision_runner(_flowlet_vision_runner)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Flowlet wiring skipped: {}", exc)
 

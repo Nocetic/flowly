@@ -719,6 +719,26 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
                 for f in fields:
                     if f not in ctx.list_keys[key]:
                         raise _err(f"{ctype} (id={cid}) `item_update` unknown field '{f}'")
+    elif op == "vision":
+        prompt = action.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise _err(f"{ctype} (id={cid}) action `vision` needs a non-empty `prompt`")
+        if len(prompt) > catalog.MAX_VISION_PROMPT_LEN:
+            raise _err(
+                f"{ctype} (id={cid}) action `vision` prompt is too long "
+                f"(max {catalog.MAX_VISION_PROMPT_LEN})"
+            )
+        into = action.get("into")
+        if not isinstance(into, str) or into not in ctx.list_keys:
+            raise _err(
+                f"{ctype} (id={cid}) action `vision` `into` must name a declared list "
+                f"state key; got {into!r}"
+            )
+        if into in ctx.source_keys:
+            raise _err(
+                f"{ctype} (id={cid}) action `vision` `into` targets '{into}', which is "
+                "owned by a data source and is read-only"
+            )
     elif op == "batch":
         ops = action.get("ops")
         if not isinstance(ops, list) or not ops:

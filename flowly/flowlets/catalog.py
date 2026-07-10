@@ -79,8 +79,10 @@ CHART_PALETTE = (
 # screens. Rendered by the `repeater` component; mutated by the item_* ops.
 STATE_TYPES = frozenset({"number", "bool", "string", "timer", "list"})
 
-#: Field types a `list` item schema may declare.
-ITEM_FIELD_TYPES = frozenset({"string", "number", "bool", "date"})
+#: Field types a `list` item schema may declare. `image` holds an attachment id
+#: (a stored photo) — written by the `vision` op, rendered by the `image`
+#: component, and garbage-collected when the row/flowlet is removed.
+ITEM_FIELD_TYPES = frozenset({"string", "number", "bool", "date", "image"})
 MAX_LIST_ITEMS = 200
 MAX_ITEM_FIELDS = 8
 
@@ -91,7 +93,17 @@ ACTION_OPS = frozenset({
     # dynamic-list ops — item_add anywhere; the rest live inside a repeater's
     # item template (they need the tapped row's itemId from the client).
     "item_add", "item_update", "item_remove", "item_toggle", "item_move",
+    # a `photo` tap: interpret the image (a model turn) into a new list item.
+    "vision",
 })
+
+# ── Photo capture + vision (catalog 2) ────────────────────────────────────────
+#: A captured photo, already downscaled client-side, arrives as a data URI on
+#: `flowlets.capture`. The bot stores one JPEG per capture; the flowlet DB holds
+#: only its attachment id.
+MAX_IMAGE_BYTES = 4 * 1024 * 1024        # reject anything larger (a raw shot)
+MAX_ATTACHMENTS_PER_FLOWLET = 500        # bound disk per flowlet
+MAX_VISION_PROMPT_LEN = 1000
 
 # ── Watches (declarative reactive rules; evaluated LLM-free) ──────────────────
 # A definition may carry a top-level `watches` array. Each rule is evaluated by
@@ -248,6 +260,8 @@ COMPONENTS: dict[str, dict] = {
     # Filters a target repeater/table's rows client-side (never hits the bot).
     "search":       {"category": "input", "container": False, "action": False,
                      "required": ["target"]},
+    # Capture a photo → a `vision` action interprets it into a new list item.
+    "photo":        {"category": "input", "container": False, "action": True},
 }
 
 #: Chart-family components whose ``data`` prop resolves to a per-bucket series.

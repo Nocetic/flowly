@@ -91,6 +91,10 @@ def _coerce_field(key: str, field: str, ftype: str, v: Any) -> Any:
         if not _DATE_RE.match(s):
             raise FlowletActionError("INVALID", f"'{key}.{field}' must be YYYY-MM-DD")
         return s
+    if ftype == "image":
+        # an attachment id (normally written by the `vision` op); an opaque,
+        # bounded token that the `image` component resolves to bytes.
+        return ("" if v is None else str(v)).strip()[:128]
     raise FlowletActionError("INVALID", f"'{key}.{field}' has an unknown type")
 
 
@@ -379,6 +383,10 @@ async def _apply_op(
                     raise FlowletActionError("INVALID", f"`item_update` on '{f}' needs a value")
                 item[f] = _coerce_field(key, f, fields[f], inner_value)
         elif op == "item_remove":
+            # GC any stored photos this row owned before dropping it.
+            for f, ft in fields.items():
+                if ft == "image" and isinstance(item.get(f), str) and item[f]:
+                    store.delete_attachment(flowlet_id, item[f])
             items = [it for it in items if it.get("id") != item_id]
         else:  # item_move
             if not _is_number(inner_value):
