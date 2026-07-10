@@ -76,6 +76,52 @@ def test_artifact_open_screen_runs_in_a_textual_worker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_artifacts_command_opens_lazy_loading_inline_panel() -> None:
+    import inspect
+
+    from flowly.tui.app import FlowlyTUI
+    from flowly.tui.panes.artifacts_modal import ArtifactsPanel
+
+    list_calls: list[dict[str, object]] = []
+    shown: list[tuple[ArtifactsPanel, bool]] = []
+
+    class _Client:
+        async def artifacts_list(self, **kwargs):
+            list_calls.append(kwargs)
+            return [{"id": "art-1", "type": "markdown", "title": "Report"}]
+
+        async def artifacts_get(self, artifact_id: str):
+            return {
+                "id": artifact_id,
+                "type": "markdown",
+                "title": "Report",
+                "content": "# report body",
+            }
+
+    class _App:
+        def __init__(self) -> None:
+            self._client = _Client()
+
+        def query_one(self, _widget_type):
+            return object()
+
+        async def _show_composer_picker(self, picker, *, inline: bool):
+            shown.append((picker, inline))
+
+    app = _App()
+    action = inspect.unwrap(FlowlyTUI.action_open_artifacts)
+
+    await action(app)
+
+    assert list_calls == [{"limit": 200, "include_content": False}]
+    assert len(shown) == 1
+    panel, inline = shown[0]
+    assert inline is True
+    assert panel._fetcher is not None
+    assert (await panel._fetcher("art-1"))["content"] == "# report body"
+
+
+@pytest.mark.asyncio
 async def test_enter_opens_artifact_inline_end_to_end(monkeypatch) -> None:
     """Drive the real FlowlyTUI: ↓ selects the chat's artifact, Enter must
     replace the composer input with the viewer, then Esc must restore input."""

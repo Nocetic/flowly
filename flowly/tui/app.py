@@ -3476,11 +3476,17 @@ class FlowlyTUI(App[None]):
     async def action_open_artifacts(self) -> None:
         transcript = self.query_one(TranscriptPane)
         try:
-            arts = await self._client.artifacts_list(limit=200)
+            arts = await self._client.artifacts_list(
+                limit=200,
+                include_content=False,
+            )
         except Exception as exc:
             transcript.add_error(f"artifacts fetch failed: {exc}")
             return
-        await self._show_composer_picker(ArtifactsPanel(arts), inline=True)
+        await self._show_composer_picker(
+            ArtifactsPanel(arts, fetcher=self._client.artifacts_get),
+            inline=True,
+        )
 
     @work
     async def action_open_assistants(self) -> None:

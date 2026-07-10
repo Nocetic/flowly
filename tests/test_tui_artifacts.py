@@ -192,3 +192,27 @@ async def test_artifacts_modal_lazy_loads_summary_content_once() -> None:
         await pilot.press("right")
         await pilot.pause(0.1)
         assert fetched == ["a2"]  # revisits render from the cache
+
+
+@pytest.mark.asyncio
+async def test_artifacts_modal_lazy_loads_initial_summary_content() -> None:
+    fetched: list[str] = []
+
+    async def fetcher(artifact_id: str) -> dict[str, object]:
+        fetched.append(artifact_id)
+        return {
+            "id": artifact_id,
+            "type": "markdown",
+            "content": "# loaded initial artifact",
+        }
+
+    artifacts: list[dict[str, object]] = [
+        {"id": "a1", "title": "one", "type": "markdown"},
+    ]
+    app = _ArtifactsApp(artifacts, fetcher=fetcher)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause(0.1)
+
+        assert fetched == ["a1"]
+        assert artifacts[0]["content"] == "# loaded initial artifact"
