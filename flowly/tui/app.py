@@ -58,6 +58,7 @@ from flowly.tui.panes.activity_modal import ActivityModal
 from flowly.tui.panes.approvals_modal import ApprovalsModal
 from flowly.tui.panes.artifacts_modal import ArtifactsModal
 from flowly.tui.panes.assistant_picker import AssistantPicker
+from flowly.tui.panes.browser_modal import BrowserPanel
 from flowly.tui.panes.composer import (
     ApprovalPrompt,
     ApprovalPromptRequest,
@@ -1315,6 +1316,11 @@ class FlowlyTUI(App[None]):
 
     @on(MCPPanel.Dismissed)
     def _on_mcp_panel_dismissed(self, event: MCPPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(BrowserPanel.Dismissed)
+    def _on_browser_panel_dismissed(self, event: BrowserPanel.Dismissed) -> None:
         event.stop()
         self._finish_composer_picker(event.result)
 
@@ -3034,11 +3040,10 @@ class FlowlyTUI(App[None]):
 
     @work
     async def action_browser(self) -> None:
-        """Open the Browser Use modal — toggle ``browser_tab`` enable
+        """Open Browser Use inline — toggle ``browser_tab`` enable
         flag, see live extension-connection status, and open the Chrome
         Web Store if the extension isn't installed yet."""
-        from flowly.tui.panes.browser_modal import BrowserModal
-        result = await self._show_inline_screen(BrowserModal())
+        result = await self._show_composer_picker(BrowserPanel(), inline=True)
         transcript = self.query_one(TranscriptPane)
         if result and result.get("action") == "saved":
             state = "enabled" if result.get("enabled") else "disabled"

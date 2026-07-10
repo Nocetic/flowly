@@ -407,7 +407,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker > IntegrationsPanel,
     Composer.picker-inline-open > #composer-picker > LoginPanel,
     Composer.picker-inline-open > #composer-picker > PluginsPanel,
-    Composer.picker-inline-open > #composer-picker > MCPPanel {{
+    Composer.picker-inline-open > #composer-picker > MCPPanel,
+    Composer.picker-inline-open > #composer-picker > BrowserPanel {{
         background: transparent;
         border: none;
     }}
@@ -565,6 +566,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ApprovalsModal .title,
     ArtifactsModal .title,
     AssistantPicker .title,
+    BrowserPanel .title,
     BrowserModal .title,
     ConfirmModal .title,
     HelpModal Markdown,
@@ -603,6 +605,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
 
     AssistantPicker .hint,
     AssistantPicker .footnote,
+    BrowserPanel .description,
+    BrowserPanel #status-line,
     BrowserModal .description,
     BrowserModal #status-line,
     ConfirmModal .hint,
