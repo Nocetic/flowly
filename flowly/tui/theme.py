@@ -410,7 +410,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker > MCPPanel,
     Composer.picker-inline-open > #composer-picker > BrowserPanel,
     Composer.picker-inline-open > #composer-picker > ThemePickerPanel,
-    Composer.picker-inline-open > #composer-picker > ActivityPanel {{
+    Composer.picker-inline-open > #composer-picker > ActivityPanel,
+    Composer.picker-inline-open > #composer-picker > ApprovalsPanel {{
         background: transparent;
         border: none;
     }}
@@ -566,6 +567,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ApprovalModal .title,
     ActivityPanel .title,
     ActivityModal .title,
+    ApprovalsPanel .title,
     ApprovalsModal .title,
     ArtifactsModal .title,
     AssistantPicker .title,
@@ -648,12 +650,19 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ActivityPanel .hint,
     ActivityModal .meta,
     ActivityModal .hint,
+    ApprovalsPanel .hint,
+    ApprovalsPanel .session,
     ArtifactsModal .hint,
     ApprovalsModal .hint,
     ApprovalsModal .session,
     ThemePickerPanel .hint,
     ThemePicker .hint {{
         color: {palette.text_muted};
+    }}
+
+    ApprovalsPanel ListItem {{
+        background: transparent;
+        color: {palette.text};
     }}
 
     AssistantPicker OptionList,

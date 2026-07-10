@@ -55,7 +55,7 @@ from flowly.tui.first_touch import (
 )
 from flowly.tui.media_upload import AttachmentPreparationError, prepare_media_attachments
 from flowly.tui.panes.activity_modal import ActivityPanel
-from flowly.tui.panes.approvals_modal import ApprovalsModal
+from flowly.tui.panes.approvals_modal import ApprovalsPanel
 from flowly.tui.panes.artifacts_modal import ArtifactsModal
 from flowly.tui.panes.assistant_picker import AssistantPicker
 from flowly.tui.panes.browser_modal import BrowserPanel
@@ -1334,6 +1334,11 @@ class FlowlyTUI(App[None]):
     def _on_activity_panel_dismissed(self, event: ActivityPanel.Dismissed) -> None:
         event.stop()
         self._finish_composer_picker(None)
+
+    @on(ApprovalsPanel.Dismissed)
+    def _on_approvals_panel_dismissed(self, event: ApprovalsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
 
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
@@ -3308,7 +3313,7 @@ class FlowlyTUI(App[None]):
         except Exception as exc:
             transcript.add_error(f"approvals fetch failed: {exc}")
             return
-        result = await self._show_inline_screen(ApprovalsModal(pending))
+        result = await self._show_composer_picker(ApprovalsPanel(pending), inline=True)
         if not result:
             return
         aid = result.get("id", "")
