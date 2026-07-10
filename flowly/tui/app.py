@@ -69,7 +69,7 @@ from flowly.tui.panes.composer import (
     InlineSetupPrompt,
     InlineSetupPromptRequest,
 )
-from flowly.tui.panes.confirm_modal import ConfirmModal
+from flowly.tui.panes.confirm_modal import ConfirmPanel
 from flowly.tui.panes.help_hint import HelpHint
 from flowly.tui.panes.help_modal import HelpPanel
 from flowly.tui.panes.integrations_modal import IntegrationsPanel
@@ -1371,6 +1371,11 @@ class FlowlyTUI(App[None]):
         event.stop()
         self._finish_composer_picker(None)
 
+    @on(ConfirmPanel.Dismissed)
+    def _on_confirm_panel_dismissed(self, event: ConfirmPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.confirmed)
+
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
         # navigation, and push_screen_wait results. Runtime CSS renders these
@@ -1860,13 +1865,8 @@ class FlowlyTUI(App[None]):
 
     @work
     async def _do_clear(self, *, skip_confirm: bool = False) -> None:
-        # ``@work`` is mandatory because Textual now requires
-        # ``push_screen_wait`` to run inside a worker — calling it
-        # from a regular ``async`` method (or the bare slash dispatch
-        # path) raises ``NoActiveWorker``. Callers should NOT ``await``
-        # this; the decorator returns a Worker that runs in the
-        # background, which is the right shape for fire-and-forget
-        # UI side effects.
+        # Keep this in a worker so slash dispatch stays non-blocking while the
+        # inline confirmation owns the composer.
         transcript = self.query_one(TranscriptPane)
         # Count what's about to disappear so the confirmation message
         # is concrete instead of generic "clear session?".
@@ -1882,8 +1882,8 @@ class FlowlyTUI(App[None]):
             pass
 
         if not skip_confirm and msg_count > 0:
-            confirmed = await self._show_inline_screen(
-                ConfirmModal(
+            confirmed = await self._show_composer_picker(
+                ConfirmPanel(
                     title="Clear session?",
                     body=(
                         f"This will discard {msg_count} message(s) from "
@@ -1892,7 +1892,8 @@ class FlowlyTUI(App[None]):
                         "Pass [cyan]/clear --yes[/] to skip this prompt."
                     ),
                     confirm_label="Clear",
-                )
+                ),
+                inline=True,
             )
             if not confirmed:
                 transcript.add_system("clear cancelled")

@@ -417,7 +417,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker > AssistantPickerPanel,
     Composer.picker-inline-open > #composer-picker > SessionPickerPanel,
     Composer.picker-inline-open > #composer-picker > HelpPanel,
-    Composer.picker-inline-open > #composer-picker > SubagentModelsPanel {{
+    Composer.picker-inline-open > #composer-picker > SubagentModelsPanel,
+    Composer.picker-inline-open > #composer-picker > ConfirmPanel {{
         background: transparent;
         border: none;
     }}
@@ -581,6 +582,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     AssistantPicker .title,
     BrowserPanel .title,
     BrowserModal .title,
+    ConfirmPanel .title,
     ConfirmModal .title,
     HelpPanel Markdown,
     HelpModal Markdown,
@@ -609,6 +611,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
         color: {palette.accent};
     }}
 
+    ConfirmPanel .body,
     ConfirmModal .body {{
         color: {palette.text};
     }}
@@ -630,6 +633,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     BrowserPanel #status-line,
     BrowserModal .description,
     BrowserModal #status-line,
+    ConfirmPanel .hint,
     ConfirmModal .hint,
     MCPPanel .hint,
     MCPPanel .footer,
