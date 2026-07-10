@@ -3,6 +3,7 @@ from __future__ import annotations
 from flowly.tui.setup_app import SetupApp
 from flowly.tui.theme import css_for, get_theme, list_themes, resolve_theme_name
 
+
 def test_composer_hint_and_attachments_are_themed() -> None:
     amber = get_theme("amber")
     assert amber is not None
@@ -44,10 +45,11 @@ def test_setup_screens_render_as_bottom_sheets() -> None:
         "ProviderPicker",
         "IntegrationsModal",
         "IntegrationSetupModal",
-        "LoginModal",
     ):
         assert f"{screen}," in css or f"{screen} {{" in css
         assert f"{screen} > Vertical," in css or f"{screen} > Vertical {{" in css
+    assert "LoginModal" in css
+    assert "LoginModal > LoginPanel" in css
     assert "align: center bottom;" in css
     assert "margin-bottom: 5;" in css
 

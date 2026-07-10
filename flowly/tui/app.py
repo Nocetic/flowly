@@ -72,7 +72,7 @@ from flowly.tui.panes.confirm_modal import ConfirmModal
 from flowly.tui.panes.help_hint import HelpHint
 from flowly.tui.panes.help_modal import HelpModal
 from flowly.tui.panes.integrations_modal import IntegrationsPanel
-from flowly.tui.panes.login_modal import LoginModal
+from flowly.tui.panes.login_modal import LoginPanel
 from flowly.tui.panes.memory_review import MemoryReviewPanel
 from flowly.tui.panes.model_picker import ModelPickerPanel
 from flowly.tui.panes.policy_modal import PolicyModal
@@ -1301,6 +1301,11 @@ class FlowlyTUI(App[None]):
         event.stop()
         self._finish_composer_picker(event.result)
 
+    @on(LoginPanel.Dismissed)
+    def _on_login_panel_dismissed(self, event: LoginPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
         # navigation, and push_screen_wait results. Runtime CSS renders these
@@ -2160,7 +2165,7 @@ class FlowlyTUI(App[None]):
                 f"— run /logout first to switch"
             )
             return
-        result = await self._show_inline_screen(LoginModal())
+        result = await self._show_composer_picker(LoginPanel(), inline=True)
         if not result:
             transcript.add_system("login cancelled")
             return
@@ -2579,7 +2584,7 @@ class FlowlyTUI(App[None]):
                     self.action_xai_login()
             elif result.get("action") == "login":
                 # Flowly account picked while signed out → browser sign-in
-                # (LoginModal auto-provisions the key), not a paste form.
+                # (LoginPanel auto-provisions the key), not a paste form.
                 await self.action_login()
             elif result.get("action") == "inline_setup":
                 card = get_card(result["key"])
