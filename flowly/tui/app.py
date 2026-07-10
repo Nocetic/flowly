@@ -78,7 +78,7 @@ from flowly.tui.panes.mcp_modal import MCPPanel
 from flowly.tui.panes.memory_review import MemoryReviewPanel
 from flowly.tui.panes.model_picker import ModelPickerPanel
 from flowly.tui.panes.plugins_modal import PluginsPanel
-from flowly.tui.panes.policy_modal import PolicyModal
+from flowly.tui.panes.policy_modal import PolicyPanel
 from flowly.tui.panes.provider_picker import ProviderPickerPanel
 from flowly.tui.panes.session_picker import SessionPicker
 from flowly.tui.panes.status import ContextHeader, StatusBar
@@ -1339,6 +1339,11 @@ class FlowlyTUI(App[None]):
     def _on_approvals_panel_dismissed(self, event: ApprovalsPanel.Dismissed) -> None:
         event.stop()
         self._finish_composer_picker(event.result)
+
+    @on(PolicyPanel.Dismissed)
+    def _on_policy_panel_dismissed(self, event: PolicyPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(None)
 
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
@@ -3331,7 +3336,7 @@ class FlowlyTUI(App[None]):
     async def action_open_policy(self) -> None:
         """Edit command permissions (security/ask/allowlist).
 
-        The modal stays open and applies each change live through this
+        The panel stays open and applies each change live through this
         callback; it closes on Esc / Close.
         """
         transcript = self.query_one(TranscriptPane)
@@ -3362,7 +3367,7 @@ class FlowlyTUI(App[None]):
                 transcript.add_error(f"permissions update failed: {exc}")
             return None
 
-        await self._show_inline_screen(PolicyModal(policy, apply))
+        await self._show_composer_picker(PolicyPanel(policy, apply), inline=True)
         await self._poll_badges()
 
     async def action_cycle_permission(self) -> None:

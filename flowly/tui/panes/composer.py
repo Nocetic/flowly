@@ -1334,7 +1334,8 @@ class Composer(Vertical):
     Composer > #composer-picker > BrowserPanel,
     Composer > #composer-picker > ThemePickerPanel,
     Composer > #composer-picker > ActivityPanel,
-    Composer > #composer-picker > ApprovalsPanel {
+    Composer > #composer-picker > ApprovalsPanel,
+    Composer > #composer-picker > PolicyPanel {
         height: auto;
         max-height: 24;
     }
@@ -1347,7 +1348,8 @@ class Composer(Vertical):
     Composer.picker-inline-open > #composer-picker > BrowserPanel,
     Composer.picker-inline-open > #composer-picker > ThemePickerPanel,
     Composer.picker-inline-open > #composer-picker > ActivityPanel,
-    Composer.picker-inline-open > #composer-picker > ApprovalsPanel {
+    Composer.picker-inline-open > #composer-picker > ApprovalsPanel,
+    Composer.picker-inline-open > #composer-picker > PolicyPanel {
         width: 100%;
         max-width: 100%;
         border: none;
