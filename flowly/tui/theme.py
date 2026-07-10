@@ -409,7 +409,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker > PluginsPanel,
     Composer.picker-inline-open > #composer-picker > MCPPanel,
     Composer.picker-inline-open > #composer-picker > BrowserPanel,
-    Composer.picker-inline-open > #composer-picker > ThemePickerPanel {{
+    Composer.picker-inline-open > #composer-picker > ThemePickerPanel,
+    Composer.picker-inline-open > #composer-picker > ActivityPanel {{
         background: transparent;
         border: none;
     }}
@@ -563,6 +564,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     }}
 
     ApprovalModal .title,
+    ActivityPanel .title,
     ActivityModal .title,
     ApprovalsModal .title,
     ArtifactsModal .title,
@@ -642,6 +644,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     LoginPanel .status,
     LoginModal .hint,
     LoginModal .status,
+    ActivityPanel .meta,
+    ActivityPanel .hint,
     ActivityModal .meta,
     ActivityModal .hint,
     ArtifactsModal .hint,
@@ -673,6 +677,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
         background: {palette.surface};
     }}
 
+    ActivityPanel DataTable,
     ActivityModal DataTable {{
         background: transparent;
     }}
