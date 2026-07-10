@@ -1336,7 +1336,8 @@ class Composer(Vertical):
     Composer > #composer-picker > ActivityPanel,
     Composer > #composer-picker > ApprovalsPanel,
     Composer > #composer-picker > PolicyPanel,
-    Composer > #composer-picker > ArtifactsPanel {
+    Composer > #composer-picker > ArtifactsPanel,
+    Composer > #composer-picker > AssistantPickerPanel {
         height: auto;
         max-height: 24;
     }
@@ -1351,7 +1352,8 @@ class Composer(Vertical):
     Composer.picker-inline-open > #composer-picker > ActivityPanel,
     Composer.picker-inline-open > #composer-picker > ApprovalsPanel,
     Composer.picker-inline-open > #composer-picker > PolicyPanel,
-    Composer.picker-inline-open > #composer-picker > ArtifactsPanel {
+    Composer.picker-inline-open > #composer-picker > ArtifactsPanel,
+    Composer.picker-inline-open > #composer-picker > AssistantPickerPanel {
         width: 100%;
         max-width: 100%;
         border: none;

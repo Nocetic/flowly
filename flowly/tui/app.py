@@ -57,7 +57,7 @@ from flowly.tui.media_upload import AttachmentPreparationError, prepare_media_at
 from flowly.tui.panes.activity_modal import ActivityPanel
 from flowly.tui.panes.approvals_modal import ApprovalsPanel
 from flowly.tui.panes.artifacts_modal import ArtifactsPanel
-from flowly.tui.panes.assistant_picker import AssistantPicker
+from flowly.tui.panes.assistant_picker import AssistantPickerPanel
 from flowly.tui.panes.browser_modal import BrowserPanel
 from flowly.tui.panes.composer import (
     ApprovalPrompt,
@@ -1349,6 +1349,11 @@ class FlowlyTUI(App[None]):
     def _on_artifacts_panel_dismissed(self, event: ArtifactsPanel.Dismissed) -> None:
         event.stop()
         self._finish_composer_picker(None)
+
+    @on(AssistantPickerPanel.Dismissed)
+    def _on_assistant_picker_dismissed(self, event: AssistantPickerPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
 
     async def _show_inline_screen(self, screen: Any) -> Any:
         # Keep Textual's screen stack for focus, Esc bindings, OptionList
@@ -3478,7 +3483,10 @@ class FlowlyTUI(App[None]):
                 "no assistants registered (registry not wired or empty)"
             )
             return
-        picked = await self._show_inline_screen(AssistantPicker(assistants))
+        picked = await self._show_composer_picker(
+            AssistantPickerPanel(assistants),
+            inline=True,
+        )
         if not picked:
             return
         name = picked["name"]
