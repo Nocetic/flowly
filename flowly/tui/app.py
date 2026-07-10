@@ -84,6 +84,7 @@ from flowly.tui.panes.session_picker import SessionPicker
 from flowly.tui.panes.status import ContextHeader, StatusBar
 from flowly.tui.panes.status_panel import SessionStatusPanel
 from flowly.tui.panes.subagents import SubagentPane
+from flowly.tui.panes.theme_picker import ThemePickerPanel
 from flowly.tui.panes.transcript import Bubble, TranscriptPane
 from flowly.tui.panes.usage_panel import UsagePanel
 from flowly.tui.panes.welcome import build_welcome
@@ -1321,6 +1322,11 @@ class FlowlyTUI(App[None]):
 
     @on(BrowserPanel.Dismissed)
     def _on_browser_panel_dismissed(self, event: BrowserPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(ThemePickerPanel.Dismissed)
+    def _on_theme_picker_panel_dismissed(self, event: ThemePickerPanel.Dismissed) -> None:
         event.stop()
         self._finish_composer_picker(event.result)
 
@@ -3100,14 +3106,15 @@ class FlowlyTUI(App[None]):
     @work
     async def action_theme(self, rest: str) -> None:
         """Switch TUI color theme via picker or direct ``/theme <name>``."""
-        from flowly.tui.panes.theme_picker import ThemePicker
-
         transcript = self.query_one(TranscriptPane)
         name = (rest or "").strip()
 
         if not name:
             original_theme = self._theme_name
-            result = await self._show_inline_screen(ThemePicker(self._theme_name))
+            result = await self._show_composer_picker(
+                ThemePickerPanel(self._theme_name),
+                inline=True,
+            )
             if not result:
                 self._apply_theme(original_theme, persist=False)
                 return

@@ -1331,7 +1331,8 @@ class Composer(Vertical):
     Composer > #composer-picker > LoginPanel,
     Composer > #composer-picker > PluginsPanel,
     Composer > #composer-picker > MCPPanel,
-    Composer > #composer-picker > BrowserPanel {
+    Composer > #composer-picker > BrowserPanel,
+    Composer > #composer-picker > ThemePickerPanel {
         height: auto;
         max-height: 24;
     }
@@ -1341,7 +1342,8 @@ class Composer(Vertical):
     Composer.picker-inline-open > #composer-picker > LoginPanel,
     Composer.picker-inline-open > #composer-picker > PluginsPanel,
     Composer.picker-inline-open > #composer-picker > MCPPanel,
-    Composer.picker-inline-open > #composer-picker > BrowserPanel {
+    Composer.picker-inline-open > #composer-picker > BrowserPanel,
+    Composer.picker-inline-open > #composer-picker > ThemePickerPanel {
         width: 100%;
         max-width: 100%;
         border: none;

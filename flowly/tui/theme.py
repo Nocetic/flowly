@@ -408,7 +408,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker > LoginPanel,
     Composer.picker-inline-open > #composer-picker > PluginsPanel,
     Composer.picker-inline-open > #composer-picker > MCPPanel,
-    Composer.picker-inline-open > #composer-picker > BrowserPanel {{
+    Composer.picker-inline-open > #composer-picker > BrowserPanel,
+    Composer.picker-inline-open > #composer-picker > ThemePickerPanel {{
         background: transparent;
         border: none;
     }}
@@ -585,6 +586,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ProviderPicker .title,
     SessionPicker .title,
     SubagentModelsModal .title,
+    ThemePickerPanel .title,
     ThemePicker .title,
     _SpecialistModelPicker .title {{
         color: {palette.accent};
@@ -645,6 +647,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ArtifactsModal .hint,
     ApprovalsModal .hint,
     ApprovalsModal .session,
+    ThemePickerPanel .hint,
     ThemePicker .hint {{
         color: {palette.text_muted};
     }}
@@ -662,6 +665,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     ProviderPicker OptionList,
     SessionPicker OptionList,
     SubagentModelsModal OptionList,
+    ThemePickerPanel OptionList,
     ThemePicker OptionList,
     _SpecialistModelPicker OptionList,
     HelpModal VerticalScroll,
