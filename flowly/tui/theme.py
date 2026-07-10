@@ -414,7 +414,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker > ApprovalsPanel,
     Composer.picker-inline-open > #composer-picker > PolicyPanel,
     Composer.picker-inline-open > #composer-picker > ArtifactsPanel,
-    Composer.picker-inline-open > #composer-picker > AssistantPickerPanel {{
+    Composer.picker-inline-open > #composer-picker > AssistantPickerPanel,
+    Composer.picker-inline-open > #composer-picker > SessionPickerPanel {{
         background: transparent;
         border: none;
     }}
@@ -594,6 +595,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     PolicyPanel .title,
     PolicyModal .title,
     ProviderPicker .title,
+    SessionPickerPanel .title,
     SessionPicker .title,
     SubagentModelsModal .title,
     ThemePickerPanel .title,
@@ -639,6 +641,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     PolicyModal .hint,
     ProviderPicker .hint,
     ProviderPicker .footer,
+    SessionPickerPanel .hint,
     SessionPicker .hint,
     SubagentModelsModal .hint,
     SubagentModelsModal .footer,
@@ -687,6 +690,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     PluginsPanel OptionList,
     PluginsModal OptionList,
     ProviderPicker OptionList,
+    SessionPickerPanel OptionList,
     SessionPicker OptionList,
     SubagentModelsModal OptionList,
     ThemePickerPanel OptionList,

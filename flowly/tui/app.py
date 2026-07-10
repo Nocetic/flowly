@@ -80,7 +80,7 @@ from flowly.tui.panes.model_picker import ModelPickerPanel
 from flowly.tui.panes.plugins_modal import PluginsPanel
 from flowly.tui.panes.policy_modal import PolicyPanel
 from flowly.tui.panes.provider_picker import ProviderPickerPanel
-from flowly.tui.panes.session_picker import SessionPicker
+from flowly.tui.panes.session_picker import SessionPickerPanel
 from flowly.tui.panes.status import ContextHeader, StatusBar
 from flowly.tui.panes.status_panel import SessionStatusPanel
 from flowly.tui.panes.subagents import SubagentPane
@@ -1352,6 +1352,11 @@ class FlowlyTUI(App[None]):
 
     @on(AssistantPickerPanel.Dismissed)
     def _on_assistant_picker_dismissed(self, event: AssistantPickerPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(SessionPickerPanel.Dismissed)
+    def _on_session_picker_dismissed(self, event: SessionPickerPanel.Dismissed) -> None:
         event.stop()
         self._finish_composer_picker(event.result)
 
@@ -3511,7 +3516,10 @@ class FlowlyTUI(App[None]):
         if not sessions:
             transcript.add_system("no saved sessions")
             return
-        result = await self._show_inline_screen(SessionPicker(sessions, self._session_key))
+        result = await self._show_composer_picker(
+            SessionPickerPanel(sessions, self._session_key),
+            inline=True,
+        )
         if not result:
             return
         action = result.get("action")

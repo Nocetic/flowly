@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from textual import events
+from textual import events, on
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Label, OptionList
 from textual.widgets.option_list import Option
@@ -52,83 +53,95 @@ def _fmt_age(ts: float | int | str | None) -> str:
     return f"{seconds // 86_400}d ago"
 
 
-class SessionPicker(ModalScreen[dict[str, Any] | None]):
+class SessionPickerPanel(Vertical):
     """Returns one of:
        {'action': 'switch', 'sessionKey': str}
        {'action': 'delete', 'sessionKey': str}
        None  (cancel)
     """
 
+    can_focus = True
+
+    class Dismissed(Message):
+        def __init__(self, result: dict[str, Any] | None) -> None:
+            super().__init__()
+            self.result = result
+
     DEFAULT_CSS = """
-    SessionPicker {
-        align: center middle;
+    SessionPickerPanel {
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+        max-height: 24;
+        padding: 0;
+        border: none;
+        background: transparent;
     }
-    SessionPicker > Vertical {
-        width: 75%;
-        max-width: 90;
-        height: 70%;
-        max-height: 25;
-        padding: 1 2;
-        border: thick $primary;
-        background: $surface;
-    }
-    SessionPicker .title {
+    SessionPickerPanel .title {
         text-style: bold;
         color: $primary;
         height: 1;
     }
-    SessionPicker .hint {
+    SessionPickerPanel .hint {
         color: $text-muted;
         text-style: italic;
         height: 1;
         margin-bottom: 1;
     }
-    SessionPicker OptionList {
-        height: 1fr;
+    SessionPickerPanel OptionList {
+        height: 20;
         border: none;
+        background: transparent;
     }
     """
 
     BINDINGS = [
-        ("escape", "dismiss(None)", "Close"),
-        ("q", "dismiss(None)", "Close"),
+        ("escape", "cancel", "Close"),
+        ("q", "cancel", "Close"),
+        ("d", "delete", "Delete"),
     ]
 
     def __init__(self, sessions: list[dict[str, Any]], current: str) -> None:
         super().__init__()
         self._sessions = sessions
+        self._visible_sessions = [s for s in sessions if str(s.get("key", ""))]
         self._current = current
         self._pending_delete: str | None = None  # press 'd' twice to confirm
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("Sessions", classes="title")
-            yield Label(
-                "↑/↓ navigate · Enter switch · D delete (press twice) · Esc close",
-                classes="hint",
+        yield Label("Sessions", classes="title")
+        yield Label(
+            "↑/↓ navigate · Enter switch · D delete (press twice) · Esc close",
+            classes="hint",
+        )
+        ol = OptionList(id="session-list")
+        for session in self._visible_sessions:
+            key = str(session.get("key", ""))
+            name = str(session.get("displayName") or key)
+            age = _fmt_age(session.get("updatedAt") or session.get("createdAt"))
+            marker = " ★" if key == self._current else "  "
+            age_col = f" [dim]{age:>8}[/dim]" if age else ""
+            ol.add_option(
+                Option(f"{marker} {name:<40}{age_col}  [dim]{key}[/dim]", id=key)
             )
-            ol = OptionList(id="session-list")
-            for s in self._sessions:
-                key = str(s.get("key", ""))
-                if not key:
-                    continue
-                name = str(s.get("displayName") or key)
-                # Last-activity age, matching `flowly --resume` — showing the
-                # start time here made a months-old-but-active session look
-                # stale next to the resume menu's fresh timestamps.
-                age = _fmt_age(s.get("updatedAt") or s.get("createdAt"))
-                marker = " ★" if key == self._current else "  "
-                age_col = f" [dim]{age:>8}[/dim]" if age else ""
-                ol.add_option(Option(f"{marker} {name:<40}{age_col}  [dim]{key}[/dim]", id=key))
-            yield ol
+        yield ol
 
     def on_mount(self) -> None:
         ol = self.query_one(OptionList)
         # focus current session if visible
-        for idx, s in enumerate(self._sessions):
-            if s.get("key") == self._current:
+        for idx, session in enumerate(self._visible_sessions):
+            if session.get("key") == self._current:
                 ol.highlighted = idx
                 break
+        if ol.highlighted is None and ol.options:
+            ol.highlighted = 0
+        ol.focus()
+
+    def on_focus(self) -> None:
+        try:
+            self.query_one(OptionList).focus()
+        except Exception:
+            pass
 
     def on_key(self, event: events.Key) -> None:
         if event.key != "d":
@@ -138,9 +151,9 @@ class SessionPicker(ModalScreen[dict[str, Any] | None]):
         key = str(event.option.id or "")
         if not key:
             return
-        self.dismiss({"action": "switch", "sessionKey": key})
+        self.post_message(self.Dismissed({"action": "switch", "sessionKey": key}))
 
-    def key_d(self) -> None:
+    def action_delete(self) -> None:
         ol = self.query_one(OptionList)
         if ol.highlighted is None:
             return
@@ -149,7 +162,46 @@ class SessionPicker(ModalScreen[dict[str, Any] | None]):
         if not key:
             return
         if self._pending_delete == key:
-            self.dismiss({"action": "delete", "sessionKey": key})
+            self.post_message(self.Dismissed({"action": "delete", "sessionKey": key}))
         else:
             self._pending_delete = key
             self.notify(f"press 'd' again to delete {key}", severity="warning", timeout=3)
+
+    def action_cancel(self) -> None:
+        self.post_message(self.Dismissed(None))
+
+
+class SessionPicker(ModalScreen[dict[str, Any] | None]):
+    """Compatibility wrapper; the chat TUI mounts :class:`SessionPickerPanel`."""
+
+    BINDINGS = SessionPickerPanel.BINDINGS
+
+    DEFAULT_CSS = """
+    SessionPicker { align: center middle; }
+    SessionPicker > SessionPickerPanel {
+        width: 75%;
+        max-width: 90;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
+
+    def __init__(self, sessions: list[dict[str, Any]], current: str) -> None:
+        super().__init__()
+        self._sessions = sessions
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        yield SessionPickerPanel(self._sessions, self._current)
+
+    @on(SessionPickerPanel.Dismissed)
+    def _on_dismissed(self, event: SessionPickerPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(event.result)
+
+    def action_delete(self) -> None:
+        self.query_one(SessionPickerPanel).action_delete()
+
+    def action_cancel(self) -> None:
+        self.query_one(SessionPickerPanel).action_cancel()
