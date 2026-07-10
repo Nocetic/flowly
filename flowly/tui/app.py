@@ -75,6 +75,7 @@ from flowly.tui.panes.integrations_modal import IntegrationsPanel
 from flowly.tui.panes.login_modal import LoginPanel
 from flowly.tui.panes.memory_review import MemoryReviewPanel
 from flowly.tui.panes.model_picker import ModelPickerPanel
+from flowly.tui.panes.plugins_modal import PluginsPanel
 from flowly.tui.panes.policy_modal import PolicyModal
 from flowly.tui.panes.provider_picker import ProviderPickerPanel
 from flowly.tui.panes.session_picker import SessionPicker
@@ -1303,6 +1304,11 @@ class FlowlyTUI(App[None]):
 
     @on(LoginPanel.Dismissed)
     def _on_login_panel_dismissed(self, event: LoginPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(PluginsPanel.Dismissed)
+    def _on_plugins_panel_dismissed(self, event: PluginsPanel.Dismissed) -> None:
         event.stop()
         self._finish_composer_picker(event.result)
 
@@ -2987,12 +2993,11 @@ class FlowlyTUI(App[None]):
 
     @work
     async def action_plugins(self) -> None:
-        """Open the plugins modal — list bundled + user plugins, toggle
+        """Open the inline plugins panel — list bundled + user plugins, toggle
         enabled state, surface manifest errors. Mirrors desktop's plugin
         tab; gateway restart is auto-triggered after every toggle so
         the tool registry picks up the change without a manual reload."""
-        from flowly.tui.panes.plugins_modal import PluginsModal
-        result = await self._show_inline_screen(PluginsModal())
+        result = await self._show_composer_picker(PluginsPanel(), inline=True)
         transcript = self.query_one(TranscriptPane)
         if result and result.get("action") == "changed":
             n = int(result.get("count") or 0)

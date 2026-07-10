@@ -405,7 +405,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer.picker-inline-open > #composer-picker > ProviderPickerPanel,
     Composer.picker-inline-open > #composer-picker > ModelPickerPanel,
     Composer.picker-inline-open > #composer-picker > IntegrationsPanel,
-    Composer.picker-inline-open > #composer-picker > LoginPanel {{
+    Composer.picker-inline-open > #composer-picker > LoginPanel,
+    Composer.picker-inline-open > #composer-picker > PluginsPanel {{
         background: transparent;
         border: none;
     }}
@@ -574,6 +575,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     MCPModal .title,
     MCPSecretModal .title,
     ModelPicker .title,
+    PluginsPanel .title,
     PluginsModal .title,
     PolicyModal .title,
     ProviderPicker .title,
@@ -607,6 +609,8 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     MCPSecretModal .hint,
     ModelPicker .hint,
     ModelPicker .footer,
+    PluginsPanel .hint,
+    PluginsPanel .footer,
     PluginsModal .hint,
     PluginsModal .footer,
     PolicyModal .hint,
@@ -644,6 +648,7 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     IntegrationsModal OptionList,
     MCPModal OptionList,
     ModelPicker OptionList,
+    PluginsPanel OptionList,
     PluginsModal OptionList,
     ProviderPicker OptionList,
     SessionPicker OptionList,

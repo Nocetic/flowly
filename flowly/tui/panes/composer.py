@@ -1328,14 +1328,16 @@ class Composer(Vertical):
     Composer > #composer-picker > ProviderPickerPanel,
     Composer > #composer-picker > ModelPickerPanel,
     Composer > #composer-picker > IntegrationsPanel,
-    Composer > #composer-picker > LoginPanel {
+    Composer > #composer-picker > LoginPanel,
+    Composer > #composer-picker > PluginsPanel {
         height: auto;
         max-height: 24;
     }
     Composer.picker-inline-open > #composer-picker > ProviderPickerPanel,
     Composer.picker-inline-open > #composer-picker > ModelPickerPanel,
     Composer.picker-inline-open > #composer-picker > IntegrationsPanel,
-    Composer.picker-inline-open > #composer-picker > LoginPanel {
+    Composer.picker-inline-open > #composer-picker > LoginPanel,
+    Composer.picker-inline-open > #composer-picker > PluginsPanel {
         width: 100%;
         max-width: 100%;
         border: none;
