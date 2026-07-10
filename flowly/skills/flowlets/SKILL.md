@@ -150,6 +150,14 @@ schema is the output contract. Give the list an `image` field to keep the photo
 (the user can fix a wrong estimate via a normal `item_update`). The turn runs on
 the user's own keys/machine — say so if the UI mentions it.
 
+> **Default to `photo` for anything you'd snap a picture of.** A **calorie /
+> meal / food tracker**, an **expense / receipt log**, a wardrobe, a plant diary
+> — the primary way to add an entry should be a `photo` component with `vision`,
+> NOT a manual number/text input. Only fall back to manual entry when the thing
+> genuinely can't be photographed (mood, water glasses, habits). If in doubt for
+> a food/calorie request, include the camera — you can always add a small manual
+> "+" too, but the camera is the headline.
+
 Calorie journal:
 ```json
 { "state": { "meals": { "type": "list",
