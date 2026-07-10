@@ -153,12 +153,16 @@ the user's own keys/machine — say so if the UI mentions it.
 > **Default to `photo` for anything you'd snap a picture of.** A **calorie /
 > meal / food tracker**, an **expense / receipt log**, a wardrobe, a plant diary
 > — the primary way to add an entry should be a `photo` component with `vision`,
-> NOT a manual number/text input. Only fall back to manual entry when the thing
-> genuinely can't be photographed (mood, water glasses, habits). If in doubt for
-> a food/calorie request, include the camera — you can always add a small manual
-> "+" too, but the camera is the headline.
+> NOT a manual number/text input. Only skip the camera when the thing genuinely
+> can't be photographed (mood, water glasses, habits).
+>
+> **ALWAYS pair the camera with a manual path.** The vision result is an
+> estimate; users must be able to (a) add an entry WITHOUT a photo (a
+> `number_input`/`input` with `item_add` — use fixed `item` values for the other
+> fields) and (b) FIX any row (a drill-down screen with `item_update` inputs +
+> a delete button). A camera-only screen is incomplete.
 
-Calorie journal:
+Calorie journal (camera + manual add + editable rows — the full pattern):
 ```json
 { "state": { "meals": { "type": "list",
     "item": { "name": "string", "kcal": "number", "shot": "image" } } },
@@ -166,15 +170,26 @@ Calorie journal:
     { "type": "photo", "id": "add", "label": "Öğün ekle",
       "action": { "op": "vision", "into": "meals",
         "prompt": "This is a photo of a meal. Estimate its name and calories." } },
-    { "type": "repeater", "source": "meals", "navigate": "meal",
+    { "type": "number_input", "id": "manualKcal", "label": "Manuel kalori ekle",
+      "action": { "op": "item_add", "key": "meals",
+                  "item": { "name": "Manuel giriş" } } },
+    { "type": "repeater", "id": "mealList", "source": "meals", "navigate": "meal",
       "item": { "type": "row", "children": [
         { "type": "image", "src": "$.shot", "height": 44 },
         { "type": "text", "text": "{$.name}" },
         { "type": "text", "text": "{$.kcal} kcal" } ] } } ],
   "screens": { "meal": { "title": "{$.name}", "layout": [
     { "type": "image", "src": "$.shot" },
-    { "type": "stat", "value": "$.kcal", "label": "kcal" } ] } } }
+    { "type": "input", "id": "editName", "label": "İsim",
+      "action": { "op": "item_update", "key": "meals", "field": "name" } },
+    { "type": "number_input", "id": "editKcal", "label": "kcal",
+      "action": { "op": "item_update", "key": "meals", "field": "kcal" } },
+    { "type": "button", "id": "del", "text": "Sil", "style": "destructive",
+      "action": { "op": "item_remove", "key": "meals" } } ] } } }
 ```
+(The manual `number_input` uses the quick-add rule: its number lands in the
+first free number field — `kcal` — and the fixed `item` fills `name`; the user
+renames/fixes it in the drill-down.)
 
 ## Actions (what a tap does — declared, deterministic, no LLM)
 
