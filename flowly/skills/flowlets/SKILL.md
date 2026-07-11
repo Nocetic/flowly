@@ -36,8 +36,8 @@ read its current definition, then send the full updated definition with
 ## Reminders belong to the flowlet — never a cron job
 
 If the user asks for a reminder, nudge, or notification tied to a flowlet
-("her gün hatırlat", "1 dakikada bir haber ver", "geride kalırsam uyar",
-"hedefi tutunca kutla") that goes in the flowlet's own **`watches`** array (see
+("remind me every day", "ping me once a minute", "warn me if I fall behind",
+"celebrate when I hit the goal") that goes in the flowlet's own **`watches`** array (see
 below) — put it in the `definition` when you `create`/`update`. **Do NOT create
 a `cron` job for it.** A watch is evaluated by the bot itself (no model turn),
 so it's cheaper, instant, and the user sees it on the screen. Only fall back to
@@ -123,7 +123,7 @@ by what you're showing:
   it reads the list rows.
 
 **Tables over data.** A `table` can bind to a `list` instead of static rows:
-`{"type":"table","source":"prs","columns":[{"field":"title","label":"Başlık"},
+`{"type":"table","source":"prs","columns":[{"field":"title","label":"Title"},
 {"field":"n","align":"right"}],"sortBy":{"field":"n","dir":"desc"}}`. One row per
 list item; the user taps a header to re-sort. Pairs naturally with a live source
 (a source writes the list, the table shows it).
@@ -131,7 +131,7 @@ list item; the user taps a header to re-sort. Pairs naturally with a live source
 **Search & filter a long list.** A `repeater` or source `table` can carry
 `where` (a per-item filter expr — `"where":"done == 0"`, `"days_until(due)<=1"`)
 and `sortBy`. For a live search box, add `{"type":"search","target":"<that
-component's id>","fields":["title"],"placeholder":"Ara…"}` — the user types and
+component's id>","fields":["title"],"placeholder":"Search…"}` — the user types and
 the target's rows filter instantly (on-device, nothing sent anywhere).
 
 **Drill-down (tap a row → a detail screen).** Add a top-level `screens` map of
@@ -186,12 +186,12 @@ Calorie journal (camera + manual add + editable rows — the full pattern):
 { "state": { "meals": { "type": "list",
     "item": { "name": "string", "kcal": "number", "shot": "image" } } },
   "layout": [
-    { "type": "photo", "id": "add", "label": "Öğün ekle",
+    { "type": "photo", "id": "add", "label": "Add meal",
       "action": { "op": "vision", "into": "meals",
         "prompt": "This is a photo of a meal. Estimate its name and calories." } },
-    { "type": "number_input", "id": "manualKcal", "label": "Manuel kalori ekle",
+    { "type": "number_input", "id": "manualKcal", "label": "Add calories manually",
       "action": { "op": "item_add", "key": "meals",
-                  "item": { "name": "Manuel giriş" } } },
+                  "item": { "name": "Manual entry" } } },
     { "type": "repeater", "id": "mealList", "source": "meals", "navigate": "meal",
       "item": { "type": "row", "children": [
         { "type": "image", "src": "$.shot", "height": 44 },
@@ -199,7 +199,7 @@ Calorie journal (camera + manual add + editable rows — the full pattern):
         { "type": "text", "text": "{$.kcal} kcal" } ] } } ],
   "screens": { "meal": { "title": "{$.name}", "layout": [
     { "type": "image", "src": "$.shot" },
-    { "type": "input", "id": "editName", "label": "İsim", "value": "$.name",
+    { "type": "input", "id": "editName", "label": "Name", "value": "$.name",
       "action": { "op": "item_update", "key": "meals", "field": "name" } },
     { "type": "number_input", "id": "editKcal", "label": "kcal", "value": "$.kcal",
       "action": { "op": "item_update", "key": "meals", "field": "kcal" } } ] } } }
@@ -234,6 +234,55 @@ A button with a fixed `value` (like drink-250) ignores any client value. Free
 inputs (slider/input/rating) supply their value, validated to the component's
 bounds.
 
+## Input seeding — `value` vs `placeholder` (get this right)
+
+The `value` prop is a BINDING, not a literal — it must be a declared state/
+computed key or, inside a repeater/drill row, a `$.field` ref. A literal string
+is rejected (it used to leak into the UI, e.g. a box showing "manual_title").
+
+- **Fresh-entry input** (a quick-add / a new value): use **`placeholder`** only,
+  NO `value`. Seeding it would echo the current state back into the box.
+- **Edit input inside a drill/repeater row**: use **`value: "$.field"`** so the
+  box shows the row's current value (`item_update`).
+- A `set` input reflects its state key automatically — you don't need `value`.
+- **`rating` that should PERSIST** (show N stars later): bind a scalar and use
+  `set` — `{type:"rating", value:"mood", action:{op:"set", key:"mood"}}` with a
+  `number` state key. Use `op:"log"` ONLY for a time-series of ratings feeding a
+  chart, never to hold "the current rating" (a series can't be read back as N).
+
+## Manual multi-field form — `item_add` with `fields`
+
+To add ONE row from SEVERAL inputs (e.g. an expense = amount + title + category
++ date), give `item_add` a **`fields`** map of templates. `{value}` is what the
+tapped/typed input supplied; `{state_key}` pulls a live value (a title/category
+set by other inputs); `today` on a `date` field becomes the current date. A lone
+`{token}` keeps its type (a number stays numeric).
+
+```json
+{ "state": {
+    "draftTitle": { "type": "string", "default": "" },
+    "draftCat":   { "type": "string", "default": "Other" },
+    "expenses": { "type": "list", "item": {
+      "title": "string", "amount": "number", "category": "string", "date": "date" } } },
+  "layout": [
+    { "id": "titleIn", "type": "input", "placeholder": "e.g. coffee",
+      "action": { "op": "set", "key": "draftTitle" } },
+    { "id": "catSeg", "type": "segmented",
+      "options": ["Food", "Transport", "Bills", "Other"],
+      "action": { "op": "set", "key": "draftCat" } },
+    { "id": "amountIn", "type": "number_input", "placeholder": "amount",
+      "action": { "op": "item_add", "key": "expenses", "fields": {
+        "title": "{draftTitle}", "amount": "{value}",
+        "category": "{draftCat}", "date": "today" } } },
+    { "type": "repeater", "source": "expenses", "navigate": "expense",
+      "item": { "type": "row", "children": [
+        { "type": "text", "text": "{$.title}" },
+        { "type": "badge", "text": "{$.amount}" } ] } } ] }
+```
+The typed amount + the title/category the user set + today's date all land in one
+row. (For a SINGLE-field add, the fixed-`item` + first-free-field quick-add is
+simpler — see the todo example.)
+
 ## Worked example — water tracker
 
 ```json
@@ -260,9 +309,9 @@ bounds.
   ],
   "watches": [
     { "id": "behind", "trigger": "condition", "when": "today_ml < goal_ml", "after": "18:00",
-      "notify": { "title": "Su hatırlatması", "body": "{today_ml} / {goal_ml} ml — biraz geridesin" } },
+      "notify": { "title": "Water reminder", "body": "{today_ml} / {goal_ml} ml — a bit behind" } },
     { "id": "reached", "trigger": "goal", "when": "today_ml >= goal_ml", "once": true,
-      "notify": { "title": "Hedef tamam 🎉", "body": "{today_ml} ml — harika gidiyorsun" } }
+      "notify": { "title": "Goal reached 🎉", "body": "{today_ml} ml — great going" } }
   ]
 }
 ```
@@ -283,14 +332,14 @@ renders them. This is how you build a todo list, shopping list, or note log:
 
 ```json
 {
-  "catalog": 1, "name": "Görevler", "icon": "check", "accent": "#7C6FF0",
+  "catalog": 1, "name": "Tasks", "icon": "check", "accent": "#7C6FF0",
   "state": {
     "tasks": { "type": "list", "item": { "title": "string", "done": "bool" }, "max": 100 }
   },
   "layout": [
-    { "id": "new_task", "type": "input", "placeholder": "Yeni görev…",
+    { "id": "new_task", "type": "input", "placeholder": "New task…",
       "action": { "op": "item_add", "key": "tasks" } },
-    { "type": "repeater", "source": "tasks", "empty": "Henüz görev yok",
+    { "type": "repeater", "source": "tasks", "empty": "No tasks yet",
       "item": { "type": "row", "children": [
         { "id": "tgl", "type": "toggle", "value": "$.done",
           "action": { "op": "item_toggle", "key": "tasks", "field": "done" } },
@@ -325,7 +374,7 @@ date fns) in scope:
 }
 ```
 Then: `stat value="open"`, `visibleWhen="open == 0"` (all done → hide the list,
-show a "hepsi tamam 🎉" callout), or a watch `when="open == 0"`.
+show an "All done 🎉" callout), or a watch `when="open == 0"`.
 
 ## Live data — bind a screen to the outside world (`sources`)
 
@@ -397,7 +446,7 @@ arithmetic, comparisons, `and/or/not`, `min/max/abs/round`).
 **Dates.** The grammar also has `now()`, `weekday()` (0=Mon…6=Sun), and
 `days_until("YYYY-MM-DD" | key)` / `days_since(...)` — so a deadline reacts to
 time: `visibleWhen: "days_until(due) <= 1"` (a `due` string state key or a
-`date` item field), a `cases` "bugün!" / "{n} gün kaldı", or a watch
+`date` item field), a `cases` "Today!" / "{n} days left", or a watch
 `when: "days_until(due) == 0"`.
 
 **Conditional text** — a `computed` entry with `cases` resolves to a *string*:
@@ -406,13 +455,13 @@ Consume it like any value: `"text": "{statusText}"`.
 
 ```json
 "statusText": { "cases": [
-    { "when": "today_ml >= goal_ml", "text": "Hedef tamam — {today_ml} ml 🎉" },
-    { "when": "today_ml >= goal_ml / 2", "text": "Yarıyı geçtin ({today_ml} ml)" }
-  ], "else": "Şimdilik {today_ml} ml — devam" }
+    { "when": "today_ml >= goal_ml", "text": "Goal reached — {today_ml} ml 🎉" },
+    { "when": "today_ml >= goal_ml / 2", "text": "Past halfway ({today_ml} ml)" }
+  ], "else": "So far {today_ml} ml — keep going" }
 ```
 
-Prefer these over always-visible static text: a screen that says "geridesin" /
-"harikasın" at the right moment feels alive.
+Prefer these over always-visible static text: a screen that says "behind" /
+"you're crushing it" at the right moment feels alive.
 
 ## Reminders that fire themselves — `watches`
 
@@ -454,8 +503,8 @@ title/body may template current values with `{key}` — e.g. `"{today_ml} / {goa
 
 **Composed notifications:** add `"compose": true` inside `notify` and *you*
 write the notification when the watch fires — you get the live screen data and
-send a short, personal push via the flowlet notify action ("Dün 3L içmiştin,
-bugün yavaşsın — bir bardak?"). The static `title`/`body` stay as the fallback
+send a short, personal push via the flowlet notify action ("You drank 3L
+yesterday, slower today — grab a glass?"). The static `title`/`body` stay as the fallback
 when composing isn't possible. Use it where a personal touch beats a template;
 plain templated pushes are cheaper and instant.
 
@@ -473,9 +522,8 @@ calls the `notify` action.
 
 ## Language
 
-Write all user-facing text (`name`, labels, button text) in the user's
-language. Keep it plain and warm — no jargon like "component" or "state".
-
-## Write text in the user's language
-
-All labels the user sees should match the language they speak to you in.
+Write all user-facing text (`name`, labels, button text, placeholders, notify
+copy) in the user's language. Keep it plain and warm — no jargon like
+"component" or "state". **The examples in this skill are in English for
+readability — never copy their literal strings; translate every label to the
+language the user speaks to you in.**
