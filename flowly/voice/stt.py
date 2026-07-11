@@ -93,10 +93,10 @@ class GroqWhisperSTT(STTProvider):
 
             if attempt < _MAX_RETRIES:
                 delay = _RETRY_BASE_DELAY_S * (2 ** attempt)
-                logger.warning("Groq STT attempt %d failed (HTTP %s), retrying in %.1fs", attempt + 1, last_status, delay)
+                logger.warning("Groq STT attempt {} failed (HTTP {}), retrying in {:.1f}s", attempt + 1, last_status, delay)
                 await asyncio.sleep(delay)
 
-        logger.error("Groq STT failed after %d attempts (last HTTP %s)", _MAX_RETRIES + 1, last_status)
+        logger.error("Groq STT failed after {} attempts (last HTTP {})", _MAX_RETRIES + 1, last_status)
         return None
 
     def _create_wav(self, pcm_data: bytes) -> bytes:
@@ -199,10 +199,10 @@ class ElevenLabsSTT(STTProvider):
 
             if attempt < _MAX_RETRIES:
                 delay = _RETRY_BASE_DELAY_S * (2 ** attempt)
-                logger.warning("ElevenLabs STT attempt %d failed (HTTP %s), retrying in %.1fs", attempt + 1, last_status, delay)
+                logger.warning("ElevenLabs STT attempt {} failed (HTTP {}), retrying in {:.1f}s", attempt + 1, last_status, delay)
                 await asyncio.sleep(delay)
 
-        logger.error("ElevenLabs STT failed after %d attempts (last HTTP %s)", _MAX_RETRIES + 1, last_status)
+        logger.error("ElevenLabs STT failed after {} attempts (last HTTP {})", _MAX_RETRIES + 1, last_status)
         return None
 
     def _create_wav(self, pcm_data: bytes) -> bytes:

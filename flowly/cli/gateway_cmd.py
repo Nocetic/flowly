@@ -1253,9 +1253,19 @@ Respond to the user now:"""
     # Let the shared feature_rpc model.set apply a model change LIVE (swap the
     # running provider + model) instead of restarting — same path the model
     # picker + /provider reload use.
+    async def on_codex_reload() -> dict:
+        # Live-apply a tools.codex_session policy change (approval / sandbox):
+        # drop the warm subprocesses that captured the old policy and
+        # re-register the tool (rewrites ~/.codex/config.toml). Lets
+        # feature_rpc.codex_policy_set avoid a gateway restart.
+        return await agent.reload_codex_session_config()
+
     try:
         from flowly.channels import feature_rpc as _feature_rpc
         _feature_rpc.set_provider_reload_callback(on_provider_reload)
+        # Codex policy (codex.policy.set) applied live — drop warm sessions +
+        # re-register the tool so the next turn spawns with the new config.
+        _feature_rpc.set_codex_reload_callback(on_codex_reload)
         # Board RPC (board.snapshot / board.action) over relay + gateway.
         _feature_rpc.set_board_provider(
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None))

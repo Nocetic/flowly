@@ -454,3 +454,187 @@ async def test_inline_setup_prompt_escape_backs_out_of_select() -> None:
         await pilot.press("escape")
         await pilot.pause()
         assert composer.query_one("#setup-value", Input).value == "first"
+
+
+@pytest.mark.asyncio
+async def test_empty_draft_down_selects_chat_artifact_and_enter_opens() -> None:
+    from textual import on
+    from textual.app import App
+    from textual.widgets import Static
+
+    opened: list[dict[str, object]] = []
+
+    class _Host(App):
+        def compose(self):
+            yield Composer(id="composer")
+
+        def on_mount(self) -> None:
+            composer = self.query_one(Composer)
+            composer.set_artifacts(
+                [
+                    {
+                        "id": "art-1",
+                        "type": "markdown",
+                        "title": "Session report",
+                        "updated_at": 1.0,
+                    }
+                ]
+            )
+            composer.focus_input()
+
+        @on(Composer.ArtifactOpen)
+        def capture_artifact(self, event: Composer.ArtifactOpen) -> None:
+            opened.append(event.artifact)
+
+    app = _Host()
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        composer = app.query_one(Composer)
+        hint = composer.query_one("#composer-hint", Static)
+        assert "1 artifact" in str(hint.render())
+
+        await pilot.press("down")
+        await pilot.pause()
+        assert composer.artifact_navigation_active() is True
+        assert "1/1" in str(hint.render())
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert opened == [
+        {
+            "id": "art-1",
+            "type": "markdown",
+            "title": "Session report",
+            "updated_at": 1.0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_down_does_not_select_artifact_when_draft_has_text() -> None:
+    from textual.app import App
+
+    class _Host(App):
+        def compose(self):
+            yield Composer(id="composer")
+
+        def on_mount(self) -> None:
+            composer = self.query_one(Composer)
+            composer.set_artifacts(
+                [{"id": "art-1", "type": "markdown", "title": "Report"}]
+            )
+            editor = composer.query_one("#composer-input", _Editor)
+            editor.text = "draft"
+            editor.focus()
+
+    app = _Host()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one(Composer)
+        await pilot.press("down")
+        await pilot.pause()
+        assert composer.artifact_navigation_active() is False
+
+
+@pytest.mark.asyncio
+async def test_artifact_hint_compacts_on_narrow_terminal() -> None:
+    from textual.app import App
+    from textual.widgets import Static
+
+    class _Host(App):
+        def compose(self):
+            yield Composer(id="composer")
+
+        def on_mount(self) -> None:
+            self.query_one(Composer).set_artifacts(
+                [
+                    {
+                        "id": "art-1",
+                        "type": "markdown",
+                        "title": "A very long artifact title that cannot fit",
+                    }
+                ]
+            )
+
+    app = _Host()
+    async with app.run_test(size=(50, 20)) as pilot:
+        await pilot.pause()
+        hint = app.query_one("#composer-hint", Static)
+        rendered = str(hint.render())
+        assert "commands" not in rendered
+        assert "A very long artifact title that cannot fit" not in rendered
+
+
+def test_safe_is_dir_swallows_tcc_permission_errors() -> None:
+    class _ProtectedPath:
+        def is_dir(self) -> bool:
+            raise PermissionError(1, "Operation not permitted", ".aws")
+
+    assert Composer._safe_is_dir(_ProtectedPath()) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_path_palette_survives_stat_protected_entries() -> None:
+    """macOS TCC: a listable entry whose stat() raises EPERM must not
+    crash the TUI while the path palette renders (regression: '.aws')."""
+    from pathlib import Path
+
+    from textual.app import App
+
+    class _ProtectedPath:
+        def __str__(self) -> str:
+            return ".aws"
+
+        def is_dir(self) -> bool:
+            raise PermissionError(1, "Operation not permitted", ".aws")
+
+    class _Host(App):
+        def compose(self):
+            yield Composer(id="composer")
+
+    app = _Host()
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        composer = app.query_one(Composer)
+        composer._show_path_matches(
+            ".", [Path("real-dir"), _ProtectedPath()]  # type: ignore[list-item]
+        )
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_artifact_selection_flips_hint_background_class() -> None:
+    from textual.app import App
+    from textual.widgets import Static
+
+    class _Host(App):
+        def compose(self):
+            yield Composer(id="composer")
+
+        def on_mount(self) -> None:
+            composer = self.query_one(Composer)
+            composer.set_artifacts(
+                [
+                    {"id": "art-1", "title": "Report", "updated_at": 2.0},
+                    {"id": "art-2", "title": "Chart", "updated_at": 1.0},
+                ]
+            )
+            composer.focus_input()
+
+    app = _Host()
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        composer = app.query_one(Composer)
+        assert composer.has_class("artifact-nav") is False
+
+        await pilot.press("down")
+        await pilot.pause()
+        assert composer.has_class("artifact-nav") is True
+        hint = str(composer.query_one("#composer-hint", Static).render())
+        assert "artifacts 1/2" in hint
+        assert "markdown" not in hint  # type names stay out of the hint
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert composer.has_class("artifact-nav") is False

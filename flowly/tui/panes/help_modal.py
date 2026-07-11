@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from textual import on
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Markdown
 
@@ -15,24 +17,24 @@ HELP_BODY = """
 |---|---|
 | `Enter`        | Send message |
 | `Shift+Enter`  | New line in draft |
-| `↑` / `↓`      | History prev/next (single-line draft) |
+| `↑` / `↓`      | History prev/next; `↓` on an empty draft selects this chat's artifacts |
 | `Ctrl+E`       | Open draft in `$EDITOR` (vim/nvim/nano) |
 | `Ctrl+S`       | Open sessions picker |
 | `Ctrl+M`       | Open assistants / persona picker |
 | `Ctrl+A`       | Toggle subagent tree sidebar |
-| `F1`           | This help modal |
+| `F1`           | This help panel |
 | `F2`           | Activity / audit log |
 | `F3`           | Pending approvals queue |
 | `F4`           | Artifacts gallery |
 | `Ctrl+C`       | Abort current run, or quit if idle |
 | `Ctrl+L`       | Clear session (gateway-side) |
 | `Ctrl+D`       | Quit (also persists current session) |
-| `Esc`          | Close modals |
+| `Esc`          | Close inline panels |
 
 ## Slash commands
 | Command | What it does |
 |---|---|
-| `/help`              | Show this modal |
+| `/help`              | Show this help panel |
 | `/clear`             | Wipe the current session's history (asks confirmation) · `/clear --yes` skips prompt |
 | `/new`               | Start a fresh session — leaves the current one intact |
 | `/retry`             | Re-submit the last user message (drops stale assistant reply) |
@@ -122,7 +124,7 @@ Run these from a regular shell — they work without launching the TUI.
 ## Sessions
 - Sessions persist at `~/.flowly/data/sessions/`.
 - TUI remembers your last session in `~/.flowly/tui_state.json`.
-- Launch with `flowly --new` to start fresh, or `-s key` for a custom key.
+- Each launch starts fresh; `flowly --resume` lists recent sessions to reopen, `-s key` opens one directly.
 
 ## Sync scope
 - **CLI sessions stay local.** Everything you type here is saved only
@@ -136,39 +138,81 @@ Run these from a regular shell — they work without launching the TUI.
 - The status bar's `🔒 local` badge is a permanent reminder that
   the active CLI session is on-disk-only.
 
-_Press Esc or click outside to close this help._
+_Press Esc to close this help._
 """
 
 
-class HelpModal(ModalScreen[None]):
+class HelpPanel(Vertical):
+    can_focus = True
+
+    class Dismissed(Message):
+        pass
+
     DEFAULT_CSS = """
-    HelpModal {
-        align: center middle;
+    HelpPanel {
+        width: 100%;
+        max-width: 100%;
+        height: 24;
+        max-height: 24;
+        border: none;
+        background: transparent;
     }
-    HelpModal > Vertical {
-        width: 90%;
-        max-width: 110;
-        height: 90%;
-        max-height: 40;
-        border: thick #00a6c8;
-        background: #050505;
+    HelpPanel VerticalScroll {
+        height: 24;
+        padding: 0 1;
+        background: transparent;
     }
-    HelpModal VerticalScroll {
-        padding: 1 2;
-        background: #050505;
-    }
-    HelpModal Markdown {
-        background: #050505;
+    HelpPanel Markdown {
+        background: transparent;
     }
     """
 
     BINDINGS = [
-        ("escape", "dismiss(None)", "Close"),
-        ("q", "dismiss(None)", "Close"),
-        ("?", "dismiss(None)", "Close"),
+        ("escape", "cancel", "Close"),
+        ("q", "cancel", "Close"),
+        ("?", "cancel", "Close"),
     ]
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            with VerticalScroll():
-                yield Markdown(HELP_BODY)
+        with VerticalScroll(id="help-scroll", can_focus=True):
+            yield Markdown(HELP_BODY)
+
+    def on_mount(self) -> None:
+        self.query_one("#help-scroll", VerticalScroll).focus()
+
+    def on_focus(self) -> None:
+        try:
+            self.query_one("#help-scroll", VerticalScroll).focus()
+        except Exception:
+            pass
+
+    def action_cancel(self) -> None:
+        self.post_message(self.Dismissed())
+
+
+class HelpModal(ModalScreen[None]):
+    """Compatibility wrapper; the chat TUI mounts :class:`HelpPanel`."""
+
+    BINDINGS = HelpPanel.BINDINGS
+
+    DEFAULT_CSS = """
+    HelpModal { align: center middle; }
+    HelpModal > HelpPanel {
+        width: 90%;
+        max-width: 110;
+        padding: 1 2;
+        border: thick #00a6c8;
+        background: #050505;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield HelpPanel()
+
+    @on(HelpPanel.Dismissed)
+    def _on_dismissed(self, event: HelpPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.query_one(HelpPanel).action_cancel()

@@ -23,6 +23,7 @@ from typing import Any
 from textual import events, on, work
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Label, OptionList
 from textual.widgets.option_list import Option
@@ -32,7 +33,6 @@ from flowly.integrations.plugins_io import (
     list_plugins,
     set_plugin_enabled,
 )
-
 
 _PREFIX = "PLUGIN:"
 
@@ -55,40 +55,46 @@ def _status_glyph(status: str) -> str:
     }.get(status, "·")
 
 
-class PluginsModal(ModalScreen[dict[str, Any] | None]):
+class PluginsPanel(Vertical):
     """Dismisses with one of:
       {'action': 'changed', 'count': N}  → N plugins toggled this session
       None                                → cancel (no changes)
     """
 
+    can_focus = True
+
+    class Dismissed(Message):
+        def __init__(self, result: dict[str, Any] | None) -> None:
+            super().__init__()
+            self.result = result
+
     DEFAULT_CSS = """
-    PluginsModal { align: center middle; }
-    PluginsModal > Vertical {
-        width: 85%;
-        max-width: 100;
-        height: 80%;
-        max-height: 32;
-        padding: 1 2;
-        border: thick $primary;
-        background: $surface;
+    PluginsPanel {
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+        max-height: 24;
+        padding: 0;
+        border: none;
+        background: transparent;
     }
-    PluginsModal .title {
+    PluginsPanel .title {
         text-style: bold;
         color: $primary;
         height: 1;
     }
-    PluginsModal .hint {
+    PluginsPanel .hint {
         color: $text-muted;
         text-style: italic;
         height: 1;
         margin-bottom: 1;
     }
-    PluginsModal OptionList {
-        height: 1fr;
+    PluginsPanel OptionList {
+        height: 16;
         border: none;
-        background: $surface;
+        background: transparent;
     }
-    PluginsModal .footer {
+    PluginsPanel .footer {
         color: $text-muted;
         text-style: italic;
         height: auto;
@@ -110,20 +116,26 @@ class PluginsModal(ModalScreen[dict[str, Any] | None]):
     # ── layout ────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("Plugins", classes="title")
-            yield Label(
-                "↑/↓ navigate · Space/Enter toggle · R reload · Esc close",
-                classes="hint",
-            )
-            yield OptionList(id="plugins-list")
-            yield Label("", id="plugins-footer", classes="footer")
+        yield Label("Plugins", classes="title")
+        yield Label(
+            "↑/↓ navigate · Space/Enter toggle · R reload · Esc close",
+            classes="hint",
+        )
+        yield OptionList(id="plugins-list")
+        yield Label("", id="plugins-footer", classes="footer")
 
     def on_mount(self) -> None:
         self._rebuild_list()
         ol = self.query_one(OptionList)
         if ol.options:
             ol.highlighted = 0
+        ol.focus()
+
+    def on_focus(self) -> None:
+        try:
+            self.query_one(OptionList).focus()
+        except Exception:
+            pass
 
     def _rebuild_list(self) -> None:
         self._plugins = list_plugins()
@@ -256,10 +268,10 @@ class PluginsModal(ModalScreen[dict[str, Any] | None]):
         self._set_footer("reloaded")
 
     def action_dismiss_with_count(self) -> None:
-        self.dismiss(
+        self.post_message(self.Dismissed(
             {"action": "changed", "count": self._changes}
             if self._changes else None
-        )
+        ))
 
     # ── helpers ──────────────────────────────────────────────────
 
@@ -268,3 +280,26 @@ class PluginsModal(ModalScreen[dict[str, Any] | None]):
             self.query_one("#plugins-footer", Label).update(text)
         except Exception:
             pass
+
+
+class PluginsModal(ModalScreen[dict[str, Any] | None]):
+    """Compatibility wrapper; the chat TUI mounts :class:`PluginsPanel`."""
+
+    DEFAULT_CSS = """
+    PluginsModal { align: center middle; }
+    PluginsModal > PluginsPanel {
+        width: 85%;
+        max-width: 100;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield PluginsPanel()
+
+    @on(PluginsPanel.Dismissed)
+    def _on_dismissed(self, event: PluginsPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(event.result)

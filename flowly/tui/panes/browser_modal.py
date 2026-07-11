@@ -24,8 +24,9 @@ import sys
 from textual import events, on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Label, Static, Switch
+from textual.widgets import Label, Static, Switch
 
 
 class _LinkLabel(Static):
@@ -108,102 +109,104 @@ def _open_browser_detached(url: str) -> bool:
         return False
 
 
-class BrowserModal(ModalScreen[dict | None]):
+class BrowserPanel(Vertical):
     """Dismisses with:
       {'action': 'saved', 'enabled': bool}  → caller can refresh status bar
       None                                  → cancel
     """
 
+    can_focus = True
+
+    class Dismissed(Message):
+        def __init__(self, result: dict | None) -> None:
+            super().__init__()
+            self.result = result
+
     DEFAULT_CSS = """
-    BrowserModal { align: center middle; }
-    BrowserModal > Vertical {
-        width: 75%;
-        max-width: 86;
+    BrowserPanel {
+        width: 100%;
+        max-width: 100%;
         height: auto;
-        max-height: 28;
-        padding: 1 2;
-        border: thick $primary;
-        background: $surface;
+        max-height: 24;
+        padding: 0;
+        border: none;
+        background: transparent;
     }
-    BrowserModal .modal-header {
+    BrowserPanel .modal-header {
         height: auto;
         margin-bottom: 1;
     }
-    BrowserModal .eyebrow {
+    BrowserPanel .eyebrow {
         color: $text-muted;
         height: 1;
     }
-    BrowserModal .title {
+    BrowserPanel .title {
         text-style: bold;
         color: $primary;
         height: 1;
     }
-    BrowserModal .description {
+    BrowserPanel .description {
         color: $text;
         height: auto;
         margin-bottom: 1;
     }
-    BrowserModal .checklist {
+    BrowserPanel .checklist {
         layout: vertical;
         height: auto;
-        padding: 1;
         margin-bottom: 1;
-        background: $boost;
+        background: transparent;
     }
-    BrowserModal .checklist-title {
+    BrowserPanel .checklist-title {
         color: $primary;
         text-style: bold;
         height: 1;
     }
-    BrowserModal .checklist-item {
+    BrowserPanel .checklist-item {
         height: auto;
         color: $text;
     }
-    BrowserModal .toggle-row {
+    BrowserPanel .toggle-row {
         layout: horizontal;
         height: 3;
         margin-bottom: 1;
     }
-    BrowserModal .toggle-row > Switch { margin-right: 2; }
-    BrowserModal .toggle-row > Label { width: 1fr; padding-top: 1; }
-    BrowserModal .install-block {
+    BrowserPanel .toggle-row > Switch { margin-right: 2; }
+    BrowserPanel .toggle-row > Label { width: 1fr; padding-top: 1; }
+    BrowserPanel .install-block {
         layout: vertical;
         height: auto;
-        padding: 1;
         margin-bottom: 1;
-        border: round $accent;
+        border: none;
+        background: transparent;
     }
-    BrowserModal .install-title {
+    BrowserPanel .install-title {
         height: 1;
         color: $primary;
         text-style: bold;
     }
-    BrowserModal #status-line {
+    BrowserPanel #status-line {
         height: auto;
         min-height: 1;
         color: $text-muted;
         margin-top: 1;
-        padding: 1;
-        background: $boost;
+        background: transparent;
     }
-    BrowserModal #status-line.ok    { color: green; }
-    BrowserModal #status-line.warn  { color: yellow; }
-    BrowserModal #status-line.error { color: red; }
-    BrowserModal #button-row {
-        layout: horizontal;
+    BrowserPanel #status-line.ok    { color: green; }
+    BrowserPanel #status-line.warn  { color: yellow; }
+    BrowserPanel #status-line.error { color: red; }
+    BrowserPanel #browser-footer {
         height: auto;
-        align-horizontal: left;
         margin-top: 1;
+        color: $text-muted;
     }
-    BrowserModal #button-row Button { margin-left: 1; }
-    BrowserModal #button-spacer { width: 1fr; }
     """
 
     BINDINGS = [
         ("escape", "close", "Close"),
+        ("s", "save", "Save"),
+        ("r", "refresh", "Refresh"),
+        ("o", "open_store", "Open store"),
     ]
-
-    AUTO_FOCUS = "Switch"
 
     def __init__(self) -> None:
         super().__init__()
@@ -212,55 +215,59 @@ class BrowserModal(ModalScreen[dict | None]):
         self._saved_result: dict | None = None
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            with Vertical(classes="modal-header"):
-                yield Label("Browser controls · local Chrome extension",
-                            id="browser-status-chip", classes="eyebrow")
-                yield Label("Browser Use", classes="title")
-                yield Static(
-                    "Let the agent interact with web pages in your real Chrome "
-                    "via the Flowly extension. Pages animate with a cyan glow "
-                    "while the agent works so you see every action live.",
-                    classes="description", markup=False,
-                )
+        with Vertical(classes="modal-header"):
+            yield Label(
+                "Browser controls · local Chrome extension",
+                id="browser-status-chip",
+                classes="eyebrow",
+            )
+            yield Label("Browser Use", classes="title")
+            yield Static(
+                "Let the agent interact with web pages in your real Chrome "
+                "via the Flowly extension. Pages animate with a cyan glow "
+                "while the agent works so you see every action live.",
+                classes="description",
+                markup=False,
+            )
 
-            with Vertical(classes="checklist"):
-                yield Static("Readiness checklist", classes="checklist-title")
-                yield Label("○ Config loading…", id="item-config", classes="checklist-item")
-                yield Label("○ Gateway checking…", id="item-gateway", classes="checklist-item")
-                yield Label("○ Extension checking…", id="item-extension", classes="checklist-item")
+        with Vertical(classes="checklist"):
+            yield Static("Readiness checklist", classes="checklist-title")
+            yield Label("○ Config loading…", id="item-config", classes="checklist-item")
+            yield Label("○ Gateway checking…", id="item-gateway", classes="checklist-item")
+            yield Label("○ Extension checking…", id="item-extension", classes="checklist-item")
 
-            with Horizontal(classes="toggle-row"):
-                yield Switch(value=False, id="enabled-switch")
-                yield Label("Enable [b]browser_tab[/b] tool", markup=True)
+        with Horizontal(classes="toggle-row"):
+            yield Switch(value=False, id="enabled-switch")
+            yield Label("Enable [b]browser_tab[/b] tool", markup=True)
 
-            with Vertical(classes="install-block"):
-                yield Static("Extension install", classes="install-title")
-                # Click the URL → opens Chrome Web Store. Falls back to a
-                # toast with the copyable URL when the OS browser open
-                # fails (e.g. headless test runs).
-                yield _LinkLabel(_CHROME_STORE_URL, label="Open Chrome Web Store")
-                yield Static(
-                    "[dim]Install the extension, open its side panel, then "
-                    "refresh this status.[/dim]",
-                    markup=True,
-                )
+        with Vertical(classes="install-block"):
+            yield Static("Extension install", classes="install-title")
+            yield _LinkLabel(_CHROME_STORE_URL, label="Open Chrome Web Store")
+            yield Static(
+                "[dim]Install the extension, open its side panel, then "
+                "refresh this status.[/dim]",
+                markup=True,
+            )
 
-            yield Label("", id="status-line")
+        yield Label("", id="status-line")
 
-            with Horizontal(id="button-row"):
-                yield Button("Open Chrome Web Store", id="btn-open",
-                             variant="default")
-                yield Button("Refresh", id="btn-refresh", variant="default")
-                yield Static("", id="button-spacer")
-                yield Button("Save", id="btn-save", variant="primary")
-                yield Button("Close  (Esc)", id="btn-cancel", variant="default")
+        yield Static("", id="browser-footer", markup=False)
 
     # ── lifecycle ────────────────────────────────────────────────
 
     async def on_mount(self) -> None:
         # Hydrate current state from config + live gateway.
         await self._refresh_state()
+        self._focus_toggle()
+
+    def on_focus(self) -> None:
+        self._focus_toggle()
+
+    def _focus_toggle(self) -> None:
+        try:
+            self.query_one("#enabled-switch", Switch).focus()
+        except Exception:
+            pass
 
     async def _refresh_state(self) -> None:
         # 1. Config flag — single source of truth for tool registration.
@@ -301,7 +308,7 @@ class BrowserModal(ModalScreen[dict | None]):
                 count = int(data.get("client_count") or 0)
                 if self._extension_connected:
                     detail = (
-                        f"[green]●[/] Extension connected" +
+                        "[green]●[/] Extension connected" +
                         (f"  [dim]({count} clients)[/]" if count > 1 else "")
                     )
                 else:
@@ -324,10 +331,9 @@ class BrowserModal(ModalScreen[dict | None]):
     # ── actions ──────────────────────────────────────────────────
 
     def action_close(self) -> None:
-        self.dismiss(self._saved_result)
+        self.post_message(self.Dismissed(self._saved_result))
 
-    @on(Button.Pressed, "#btn-open")
-    def _open_store(self) -> None:
+    def action_open_store(self) -> None:
         ok = _open_browser_detached(_CHROME_STORE_URL)
         if ok:
             self._set_status(
@@ -341,8 +347,7 @@ class BrowserModal(ModalScreen[dict | None]):
                 "warn",
             )
 
-    @on(Button.Pressed, "#btn-refresh")
-    def _refresh(self) -> None:
+    def action_refresh(self) -> None:
         self._set_status("refreshing browser status…")
         self._run_refresh()
 
@@ -351,14 +356,9 @@ class BrowserModal(ModalScreen[dict | None]):
         await self._refresh_state()
         self._set_status("status refreshed", "ok")
 
-    @on(Button.Pressed, "#btn-cancel")
-    def _cancel(self) -> None:
-        self.action_close()
-
-    @on(Button.Pressed, "#btn-save")
-    def _save(self) -> None:
+    def action_save(self) -> None:
         if self._saved_result is not None:
-            self.dismiss(self._saved_result)
+            self.post_message(self.Dismissed(self._saved_result))
             return
         self._run_save()
 
@@ -376,7 +376,7 @@ class BrowserModal(ModalScreen[dict | None]):
             return
 
         if new_enabled == self._initial_enabled:
-            self.dismiss(self._saved_result)
+            self.post_message(self.Dismissed(self._saved_result))
             return
 
         # Write atomically through the same path /integrations uses so
@@ -439,24 +439,21 @@ class BrowserModal(ModalScreen[dict | None]):
     def _sync_primary_action(self) -> None:
         try:
             sw = self.query_one("#enabled-switch", Switch)
-            save_btn = self.query_one("#btn-save", Button)
+            footer = self.query_one("#browser-footer", Static)
         except Exception:
             return
         new_enabled = bool(sw.value)
         if self._saved_result is not None or new_enabled == self._initial_enabled:
-            save_btn.label = "Done"
+            action = "no unsaved changes"
         elif new_enabled:
-            save_btn.label = "Enable + restart"
+            action = "S enable + restart"
         else:
-            save_btn.label = "Disable + restart"
+            action = "S disable + restart"
+        footer.update(f"{action} · R refresh · O open store · Esc close")
 
     def _after_saved(self) -> None:
         self._sync_primary_action()
         self._sync_header_status()
-        try:
-            self.query_one("#btn-cancel", Button).label = "Done  (Esc)"
-        except Exception:
-            pass
 
     def _set_status(self, msg: str, kind: str = "") -> None:
         try:
@@ -469,13 +466,43 @@ class BrowserModal(ModalScreen[dict | None]):
             pass
 
 
+class BrowserModal(ModalScreen[dict | None]):
+    """Compatibility wrapper; the chat TUI mounts :class:`BrowserPanel`."""
+
+    BINDINGS = BrowserPanel.BINDINGS
+
+    DEFAULT_CSS = """
+    BrowserModal { align: center middle; }
+    BrowserModal > BrowserPanel {
+        width: 75%;
+        max-width: 86;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield BrowserPanel()
+
+    @on(BrowserPanel.Dismissed)
+    def _on_dismissed(self, event: BrowserPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(event.result)
+
+    def action_close(self) -> None:
+        self.query_one(BrowserPanel).action_close()
+
+
 def _write_browser_tab_enabled(enabled: bool) -> None:
     """Persist ``tools.browser_tab.enabled`` atomically. Mirrors the
     pattern in :func:`set_active_provider` so on-disk writes share one
     helper and never race."""
     from flowly.config.loader import get_config_path
     from flowly.integrations.config_io import (
-        _atomic_write_json, _load_raw, _set_path,
+        _atomic_write_json,
+        _load_raw,
+        _set_path,
     )
     raw = _load_raw()
     _set_path(raw, "tools.browser_tab", {"enabled": enabled}, merge=True)

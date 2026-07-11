@@ -60,7 +60,7 @@ class SetupApp(App[None]):
     ProviderPicker > Vertical,
     IntegrationsModal > Vertical,
     IntegrationSetupModal > Vertical,
-    LoginModal > Vertical {
+    LoginModal > LoginPanel {
         margin-bottom: 5;
     }
     #setup-backdrop {

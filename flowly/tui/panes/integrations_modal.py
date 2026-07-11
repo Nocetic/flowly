@@ -25,9 +25,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from textual import events, work
+from textual import events, on, work
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Label, OptionList
 from textual.widgets.option_list import Option
@@ -39,7 +40,6 @@ from flowly.integrations import (
     read_card_values,
 )
 from flowly.integrations.probes import run_with_timeout
-
 
 _CATEGORY_ORDER: list[tuple[str, str]] = [
     ("channel", "messaging channels"),
@@ -68,49 +68,51 @@ def _badge_color(status: str) -> str:
     }.get(status, "dim")
 
 
-class IntegrationsModal(ModalScreen[dict[str, Any] | None]):
-    """Catalog modal — picks one card to set up."""
+class IntegrationsPanel(Vertical):
+    """Composer-inline catalog panel — picks one card to set up."""
+
+    can_focus = True
 
     DEFAULT_CSS = """
-    IntegrationsModal { align: center middle; }
-    IntegrationsModal > Vertical {
-        width: 85%;
-        max-width: 100;
-        height: 80%;
-        max-height: 32;
-        padding: 1 2;
-        border: thick $primary;
-        background: $surface;
+    IntegrationsPanel {
+        width: 100%;
+        height: auto;
+        max-height: 24;
+        padding: 0;
+        border: none;
+        background: transparent;
     }
-    IntegrationsModal .title {
+    IntegrationsPanel .title {
         text-style: bold;
         color: $primary;
         height: 1;
     }
-    IntegrationsModal .hint {
+    IntegrationsPanel .hint {
         color: $text-muted;
-        text-style: italic;
         height: 1;
-        margin-bottom: 1;
     }
-    IntegrationsModal OptionList {
-        height: 1fr;
+    IntegrationsPanel OptionList {
+        height: 16;
+        max-height: 16;
         border: none;
-        background: $surface;
+        background: transparent;
     }
-    IntegrationsModal .footer {
+    IntegrationsPanel .footer {
         color: $text-muted;
-        text-style: italic;
         height: 1;
-        margin-top: 1;
     }
     """
 
     BINDINGS = [
-        ("escape", "dismiss(None)", "Close"),
-        ("q",      "dismiss(None)", "Close"),
+        ("escape", "cancel",      "Close"),
+        ("q",      "cancel",      "Close"),
         ("r",      "reprobe_all",   "Re-test all"),
     ]
+
+    class Dismissed(Message):
+        def __init__(self, result: dict[str, Any] | None) -> None:
+            super().__init__()
+            self.result = result
 
     def __init__(
         self,
@@ -138,14 +140,13 @@ class IntegrationsModal(ModalScreen[dict[str, Any] | None]):
     # ── layout ────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label(self._title, classes="title")
-            yield Label(
-                "↑/↓ navigate · Enter open · T re-test · D disconnect (×2) · R re-test all · Esc close",
-                classes="hint",
-            )
-            yield OptionList(id="integrations-list")
-            yield Label("", id="integrations-footer", classes="footer")
+        yield Label(self._title, classes="title")
+        yield Label(
+            "↑/↓ navigate · Enter open · T re-test · D disconnect (×2) · R re-test all · Esc close",
+            classes="hint",
+        )
+        yield OptionList(id="integrations-list")
+        yield Label("", id="integrations-footer", classes="footer")
 
     def on_mount(self) -> None:
         if self._shows_providers:
@@ -153,11 +154,24 @@ class IntegrationsModal(ModalScreen[dict[str, Any] | None]):
         self._rebuild_list()
         self._kick_probes()
         # Focus first selectable row.
+        self._focus_list()
+
+    def on_focus(self) -> None:
+        self._focus_list()
+
+    def _focus_list(self) -> None:
         ol = self.query_one(OptionList)
         for i, opt in enumerate(ol.options):
             if not opt.disabled:
                 ol.highlighted = i
                 break
+        try:
+            ol.focus()
+        except Exception:
+            pass
+
+    def _finish(self, result: dict[str, Any] | None) -> None:
+        self.post_message(self.Dismissed(result))
 
     def _resolve_active_provider(self) -> None:
         """Compute which provider serves the next LLM request. Safe to
@@ -289,13 +303,32 @@ class IntegrationsModal(ModalScreen[dict[str, Any] | None]):
         card_key = oid[len(_CARD_PREFIX):]
         # Defer to caller — dismiss with the key. The TUI will open the
         # setup modal, and the user can re-enter this catalog after.
-        self.dismiss({"action": "opened", "key": card_key})
+        self._finish({"action": "opened", "key": card_key})
 
     def on_key(self, event: events.Key) -> None:
+        if event.key in ("escape", "q"):
+            event.stop()
+            event.prevent_default()
+            self.action_cancel()
+            return
+        if event.key == "r":
+            event.stop()
+            event.prevent_default()
+            self.action_reprobe_all()
+            return
+        if event.key == "t":
+            event.stop()
+            event.prevent_default()
+            self.key_t()
+            return
+        if event.key == "d":
+            event.stop()
+            event.prevent_default()
+            self.key_d()
+            return
         # Cancel the two-step delete if the user changes focus or presses
         # anything that isn't another 'd'.
-        if event.key != "d":
-            self._pending_delete = None
+        self._pending_delete = None
 
     def _highlighted_card_key(self) -> str | None:
         ol = self.query_one(OptionList)
@@ -365,3 +398,49 @@ class IntegrationsModal(ModalScreen[dict[str, Any] | None]):
             self.query_one("#integrations-footer", Label).update(text)
         except Exception:
             pass
+
+    def action_cancel(self) -> None:
+        self._finish(None)
+
+
+class IntegrationsModal(ModalScreen[dict[str, Any] | None]):
+    """Modal wrapper kept for setup/onboarding; chat mounts IntegrationsPanel inline."""
+
+    DEFAULT_CSS = """
+    IntegrationsModal { align: center middle; }
+    IntegrationsModal > IntegrationsPanel {
+        width: 85%;
+        max-width: 100;
+        height: 80%;
+        max-height: 32;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    IntegrationsModal > IntegrationsPanel OptionList {
+        height: 1fr;
+        background: $surface;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        categories: tuple[str, ...] | None = None,
+        title: str = "Integrations",
+        item_label: str = "integration",
+    ) -> None:
+        super().__init__()
+        self._panel = IntegrationsPanel(
+            categories=categories,
+            title=title,
+            item_label=item_label,
+        )
+
+    def compose(self) -> ComposeResult:
+        yield self._panel
+
+    @on(IntegrationsPanel.Dismissed)
+    def _on_panel_dismissed(self, event: IntegrationsPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(event.result)

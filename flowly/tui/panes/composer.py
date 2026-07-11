@@ -7,7 +7,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 
 from rich.markup import escape
@@ -16,9 +17,16 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.message import Message
+from textual.widget import Widget
 from textual.widgets import Input, Label, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
+# TUI autocomplete palette — derived from the single command registry (every
+# command not flagged gateway_only). Plugin/bundle/skill commands are merged in
+# at runtime from the gateway's commands.list (see _refresh_command_palette).
+# One source of truth: a command added to flowly/agent/slash_commands.py shows
+# up here and in the gateway/desktop catalogue automatically.
+from flowly.agent.slash_commands import cli_commands as _cli_commands
 from flowly.tui.attachments import (
     FileDrop,
     detect_media_drop,
@@ -29,14 +37,8 @@ from flowly.tui.attachments import (
 )
 from flowly.tui.clipboard import save_clipboard_image
 from flowly.tui.panes.memory_review import MemoryReviewPanel
+from flowly.tui.panes.status_panel import SessionStatusPanel
 from flowly.tui.panes.usage_panel import UsagePanel
-
-# TUI autocomplete palette — derived from the single command registry (every
-# command not flagged gateway_only). Plugin/bundle/skill commands are merged in
-# at runtime from the gateway's commands.list (see _refresh_command_palette).
-# One source of truth: a command added to flowly/agent/slash_commands.py shows
-# up here and in the gateway/desktop catalogue automatically.
-from flowly.agent.slash_commands import cli_commands as _cli_commands
 
 LOCAL_SLASH_COMMANDS: list[tuple[str, str]] = [
     (f"/{_c.name}", _c.description) for _c in _cli_commands()
@@ -402,6 +404,13 @@ class _Editor(TextArea):
             event.stop()
             event.prevent_default()
             return
+
+        if composer is not None and composer.artifact_navigation_active():
+            if composer.route_artifact_key(key):
+                event.stop()
+                event.prevent_default()
+                return
+            composer.cancel_artifact_navigation()
 
         if self._is_insert_newline_key(key):
             event.stop()
@@ -1228,6 +1237,10 @@ class Composer(Vertical):
         min-height: 5;
         max-height: 24;
         background: #000000;
+        layers: base overlay;
+    }
+    Composer.usage-open {
+        max-height: 32;
     }
     Composer > .composer-rule {
         height: 1;
@@ -1270,33 +1283,99 @@ class Composer(Vertical):
         background: #000000;
         color: #83b8c2;
     }
+    Composer.artifact-nav > #composer-hint {
+        background: #00a6c8;
+        color: #001318;
+    }
     Composer.approval-open > #composer-input-row,
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,
     Composer.review-open > #composer-input-row,
+    Composer.usage-open > #composer-input-row,
+    Composer.status-open > #composer-input-row,
+    Composer.picker-inline-open > #composer-input-row,
     Composer.approval-open > #composer-hint,
     Composer.secret-open > #composer-hint,
     Composer.setup-open > #composer-hint,
     Composer.review-open > #composer-hint,
-    Composer.usage-open > #composer-input-row,
-    Composer.usage-open > #composer-hint {
+    Composer.usage-open > #composer-hint,
+    Composer.status-open > #composer-hint,
+    Composer.picker-inline-open > #composer-hint {
         display: none;
+    }
+    Composer > #composer-picker {
+        display: none;
+        height: auto;
+        max-height: 24;
+        padding: 0 2;
+        margin: 0;
+        background: transparent;
+    }
+    Composer.picker-floating-open > #composer-picker {
+        overlay: screen;
+        layer: overlay;
+        offset-y: -100%;
+        width: 100%;
+        padding: 0 1;
+        align: left top;
+    }
+    Composer.picker-open > #composer-picker {
+        display: block;
+    }
+    Composer.picker-inline-open > #composer-picker {
+        background: #000000;
+    }
+    Composer > #composer-picker > * {
+        height: auto;
+        max-height: 24;
+    }
+    Composer.picker-inline-open > #composer-picker > * {
+        width: 100%;
+        max-width: 100%;
+        border: none;
+        padding: 0;
+        background: transparent;
     }
     Composer > #composer-usage {
         display: none;
         height: auto;
-        max-height: 24;
-        padding: 1 2;
+        max-height: 18;
+        padding: 0 2;
         margin: 0;
+        background: #000000;
     }
     Composer.usage-open > #composer-usage {
         display: block;
     }
     Composer > #composer-usage > #usage-scroll {
         height: auto;
-        max-height: 22;
+        max-height: 16;
     }
     Composer > #composer-usage > #usage-hint {
+        height: 1;
+        color: #83b8c2;
+    }
+    Composer > #composer-status-panel {
+        display: none;
+        height: auto;
+        padding: 0 2;
+        margin: 0;
+        background: #000000;
+    }
+    Composer.status-open > #composer-status-panel {
+        display: block;
+    }
+    Composer > #composer-status-panel > #status-panel-title {
+        height: 1;
+        text-style: bold;
+        color: #00a6c8;
+    }
+    Composer > #composer-status-panel > #status-panel-session,
+    Composer > #composer-status-panel > #status-panel-provider,
+    Composer > #composer-status-panel > #status-panel-model,
+    Composer > #composer-status-panel > #status-panel-state,
+    Composer > #composer-status-panel > #status-panel-usage,
+    Composer > #composer-status-panel > #status-panel-hint {
         height: 1;
         color: #83b8c2;
     }
@@ -1538,6 +1617,11 @@ class Composer(Vertical):
             super().__init__()
             self.command = command
 
+    class ArtifactOpen(Message):
+        def __init__(self, artifact: dict[str, object]) -> None:
+            super().__init__()
+            self.artifact = artifact
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._palette: list[tuple[str, str]] = list(LOCAL_SLASH_COMMANDS)
@@ -1549,6 +1633,8 @@ class Composer(Vertical):
         self._queue_edit_idx: int | None = None  # which queue item is being edited
         self._draft_before_queue_edit: str = ""
         self._draft_before_queue_edit_attachments: list[Path] = []
+        self._artifacts: list[dict[str, object]] = []
+        self._artifact_idx: int | None = None
         # Connection / activity state used to choose the hint text shown
         # below the editor. Driven from the app via :meth:`set_state`.
         # ``"idle"``, ``"busy"``, ``"reconnecting"``, ``"offline"``.
@@ -1569,6 +1655,8 @@ class Composer(Vertical):
         yield InlineSetupPrompt(id="composer-setup")
         yield MemoryReviewPanel(id="composer-review")
         yield UsagePanel(id="composer-usage")
+        yield SessionStatusPanel(id="composer-status-panel")
+        yield Vertical(id="composer-picker")
         with Horizontal(id="composer-input-row"):
             yield Label("❯", id="composer-prompt", markup=False)
             editor = _Editor(id="composer-input", show_line_numbers=False)
@@ -1588,6 +1676,9 @@ class Composer(Vertical):
         self._refresh_palette("")
         self._refresh_hint()
 
+    def on_resize(self) -> None:
+        self._refresh_hint()
+
     # --- hint line ----------------------------------------------------
 
     def set_state(self, state: str) -> None:
@@ -1602,6 +1693,8 @@ class Composer(Vertical):
             state = "idle"
         if state == self._state:
             return
+        if state != "idle":
+            self._artifact_idx = None
         self._state = state
         self._refresh_hint()
 
@@ -1613,7 +1706,15 @@ class Composer(Vertical):
             return  # not mounted yet
         n_queued = len(self._queue)
 
-        if self._state == "offline":
+        # Flip the hint row onto the accent background while the artifact
+        # selector owns the arrow keys, so "where am I?" is answered by
+        # color, not just text.
+        nav_active = self._artifact_idx is not None and bool(self._artifacts)
+        self.set_class(nav_active, "artifact-nav")
+
+        if nav_active:
+            text = self._artifact_hint(active=True)
+        elif self._state == "offline":
             text = "[b]offline[/] · gateway unreachable — run [b]flowly gateway[/]"
         elif self._state == "reconnecting":
             text = "[b]reconnecting…[/] · messages typed here will queue locally"
@@ -1634,12 +1735,39 @@ class Composer(Vertical):
                     f"[b]{n_queued}[/] queued · ↑/↓ to edit · "
                     "Enter to replace · [dim]/ for commands · ! for shell · F1 help[/]"
                 )
+            elif self._artifacts:
+                text = self._artifact_hint(active=False)
             else:
                 text = (
                     "[dim]Type a message · / for commands · ! for shell · "
                     "Shift+Enter newline · F1 help[/]"
                 )
         hint_widget.update(text)
+
+    def _artifact_hint(self, *, active: bool) -> str:
+        count = len(self._artifacts)
+        width = max(30, self.size.width or 80)
+
+        if not active:
+            noun = "artifact" if count == 1 else "artifacts"
+            text = f"[#00a6c8][b]◆ {count} {noun}[/b][/] · [b]↓[/] open"
+            if width >= 80:
+                text += " · [dim]/ commands · F1 help[/]"
+            return text
+
+        # Selection mode: the hint row flips to the accent background (the
+        # ``artifact-nav`` class), so the text stays plain and just names
+        # the mode, the pick, and the keys.
+        idx = max(0, min(self._artifact_idx or 0, count - 1))
+        artifact = self._artifacts[idx]
+        title = " ".join(
+            str(artifact.get("title") or artifact.get("id") or "artifact").split()
+        )
+        keys = "↑/↓ · Enter open · Esc" if width >= 76 else "↑/↓ · Enter · Esc"
+        limit = max(10, width - len(keys) - 22)
+        if len(title) > limit:
+            title = title[: max(1, limit - 1)] + "…"
+        return f"[b]◆ artifacts {idx + 1}/{count}[/b] · {escape(title)} · {keys}"
 
     @staticmethod
     def _input_height_for_line_count(line_count: int) -> int:
@@ -1710,13 +1838,109 @@ class Composer(Vertical):
         prefix = current if (current.startswith("/") and "\n" not in current) else ""
         self._refresh_palette(prefix)
 
+    def set_artifacts(self, artifacts: list[dict[str, object]]) -> None:
+        """Replace the current session's lightweight artifact summaries."""
+        selected_id = None
+        if self._artifact_idx is not None and self._artifacts:
+            selected_id = self._artifacts[self._artifact_idx].get("id")
+
+        def _updated_at(item: dict[str, object]) -> float:
+            try:
+                return float(item.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        self._artifacts = sorted(
+            (dict(item) for item in artifacts if item.get("id")),
+            key=_updated_at,
+            reverse=True,
+        )
+        if not self._artifacts:
+            self._artifact_idx = None
+        elif selected_id is not None:
+            self._artifact_idx = next(
+                (
+                    i
+                    for i, item in enumerate(self._artifacts)
+                    if item.get("id") == selected_id
+                ),
+                0,
+            )
+        self._refresh_hint()
+
+    def session_artifacts(self) -> list[dict[str, object]]:
+        """Current chat's artifact summaries, most recently updated first."""
+        return [dict(item) for item in self._artifacts]
+
+    def upsert_artifact(self, artifact: dict[str, object]) -> None:
+        artifact_id = artifact.get("id")
+        if not artifact_id:
+            return
+        items = [
+            item for item in self._artifacts if item.get("id") != artifact_id
+        ]
+        items.append(dict(artifact))
+        self.set_artifacts(items)
+
+    def remove_artifact(self, artifact_id: str) -> None:
+        self.set_artifacts(
+            [item for item in self._artifacts if item.get("id") != artifact_id]
+        )
+
+    def artifact_navigation_active(self) -> bool:
+        return self._artifact_idx is not None
+
+    def enter_artifact_navigation(self) -> bool:
+        if self._state != "idle" or not self._artifacts:
+            return False
+        self._artifact_idx = 0
+        self._refresh_hint()
+        return True
+
+    def cancel_artifact_navigation(self) -> None:
+        if self._artifact_idx is None:
+            return
+        self._artifact_idx = None
+        self._refresh_hint()
+
+    def route_artifact_key(self, key: str) -> bool:
+        if self._artifact_idx is None or not self._artifacts:
+            return False
+        if key == "down":
+            self._artifact_idx = (self._artifact_idx + 1) % len(self._artifacts)
+            self._refresh_hint()
+            return True
+        if key == "up":
+            self._artifact_idx = (self._artifact_idx - 1) % len(self._artifacts)
+            self._refresh_hint()
+            return True
+        if key == "enter":
+            artifact = dict(self._artifacts[self._artifact_idx])
+            self._artifact_idx = None
+            self._refresh_hint()
+            self.post_message(self.ArtifactOpen(artifact))
+            return True
+        if key == "escape":
+            self.cancel_artifact_navigation()
+            return True
+        return False
+
     def focus_input(self) -> None:
         self.query_one("#composer-input", _Editor).focus()
 
+    def _remove_picker_classes(self) -> None:
+        self.remove_class("picker-open")
+        self.remove_class("picker-floating-open")
+        self.remove_class("picker-inline-open")
+
     def show_approval(self, request: ApprovalPromptRequest) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("approval-open")
         prompt = self.query_one("#composer-approval", ApprovalPrompt)
         prompt.set_request(request)
@@ -1743,10 +1967,14 @@ class Composer(Vertical):
         return prompt.route_editor_key(key)
 
     def show_memory_review(self, item: dict, idx: int, total: int) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("review-open")
         panel = self.query_one("#composer-review", MemoryReviewPanel)
         panel.set_item(item, idx, total)
@@ -1760,9 +1988,13 @@ class Composer(Vertical):
         self.focus_input_safely()
 
     def show_secret_prompt(self, request: InlineSecretPromptRequest) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("setup-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("secret-open")
         prompt = self.query_one("#composer-secret", InlineSecretPrompt)
         prompt.set_request(request)
@@ -1782,9 +2014,13 @@ class Composer(Vertical):
             pass
 
     def show_setup_prompt(self, request: InlineSetupPromptRequest) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("secret-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("setup-open")
         prompt = self.query_one("#composer-setup", InlineSetupPrompt)
         prompt.set_request(request)
@@ -1798,11 +2034,14 @@ class Composer(Vertical):
         self.focus_input_safely()
 
     def show_usage(self, **data: object) -> None:
+        self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("review-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
         self.add_class("usage-open")
         self.query_one("#composer-usage", UsagePanel).set_data(**data)
 
@@ -1812,6 +2051,61 @@ class Composer(Vertical):
         except Exception:
             pass
         self.remove_class("usage-open")
+        self.focus_input_safely()
+
+    def show_status(self, **data: object) -> None:
+        self.remove_class("palette-open")
+        self.remove_class("approval-open")
+        self.remove_class("secret-open")
+        self.remove_class("setup-open")
+        self.remove_class("review-open")
+        self.remove_class("usage-open")
+        self._remove_picker_classes()
+        self.add_class("status-open")
+        self.query_one("#composer-status-panel", SessionStatusPanel).set_data(**data)
+
+    def clear_status(self) -> None:
+        try:
+            self.query_one("#composer-status-panel", SessionStatusPanel).clear()
+        except Exception:
+            pass
+        self.remove_class("status-open")
+        self.focus_input_safely()
+
+    async def show_picker(self, picker: Widget, *, inline: bool = False) -> None:
+        self.remove_class("palette-open")
+        self.remove_class("approval-open")
+        self.remove_class("secret-open")
+        self.remove_class("setup-open")
+        self.remove_class("review-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        host = self.query_one("#composer-picker", Vertical)
+        await host.remove_children()
+        self.add_class("picker-open")
+        self.add_class("picker-inline-open" if inline else "picker-floating-open")
+        await host.mount(picker)
+        self._focus_picker(picker)
+        self.call_after_refresh(self._focus_picker, picker)
+
+    def _focus_picker(self, picker: Widget) -> None:
+        if not picker.is_mounted:
+            return
+        try:
+            self.app.set_focus(picker, scroll_visible=False)
+        except Exception:
+            try:
+                picker.focus(scroll_visible=False)
+            except Exception:
+                pass
+
+    async def clear_picker(self) -> None:
+        try:
+            host = self.query_one("#composer-picker", Vertical)
+            await host.remove_children()
+        except Exception:
+            pass
+        self._remove_picker_classes()
         self.focus_input_safely()
 
     def focus_setup_prompt(self) -> None:
@@ -1829,6 +2123,7 @@ class Composer(Vertical):
         except Exception:
             return
         if not enabled:
+            self.cancel_artifact_navigation()
             self.remove_class("palette-open")
 
     def clear_attachments(self) -> None:
@@ -2230,6 +2525,12 @@ class Composer(Vertical):
         if event.direction > 0:
             self._history_prev()
         else:
+            if self._history_idx is not None:
+                self._history_next()
+                return
+            editor = self.query_one("#composer-input", _Editor)
+            if not editor.text and self.enter_artifact_navigation():
+                return
             self._history_next()
 
     @on(_Editor.QueueDelete)
@@ -2394,6 +2695,20 @@ class Composer(Vertical):
         if added:
             ol.highlighted = 0
 
+    @staticmethod
+    def _safe_is_dir(path: Path) -> bool:
+        """``Path.is_dir`` that never raises.
+
+        macOS TCC-protected entries (~/.Trash, sandboxed dot-dirs, …) can be
+        *listed* by their parent yet raise ``PermissionError: Operation not
+        permitted`` on ``stat`` — pathlib only swallows ENOENT-style errors,
+        so an unguarded ``is_dir()`` on such an entry kills the whole TUI.
+        """
+        try:
+            return path.is_dir()
+        except OSError:
+            return False
+
     def _path_complete(self, token: str) -> list[Path]:
         """Return up to 30 filesystem matches for ``token``.
 
@@ -2409,7 +2724,7 @@ class Composer(Vertical):
             return []
         # If the user typed a complete dir name + slash, list its contents.
         if raw.endswith("/") or raw in ("", ".", "..", "~", "~/"):
-            base = expanded if expanded.is_dir() else expanded.parent
+            base = expanded if self._safe_is_dir(expanded) else expanded.parent
             try:
                 entries = sorted(base.iterdir())[:30]
             except (OSError, PermissionError):
@@ -2437,7 +2752,7 @@ class Composer(Vertical):
                     display = "~" + display[len(home):]
             except Exception:
                 display = str(p)
-            suffix = "/" if p.is_dir() else ""
+            suffix = "/" if self._safe_is_dir(p) else ""
             label = display + suffix
             # Encode action in id: prefix "PATH:" then full replacement
             ol.add_option(Option(f"📄 {label}", id=f"PATH:{label}"))

@@ -15,6 +15,7 @@ from loguru import logger
 
 from flowly.agent.subagent_registry import SubagentRegistry
 from flowly.artifacts.context import is_internal_context_artifact
+from flowly.artifacts.summary import artifact_summary
 from flowly.channels import feature_rpc
 from flowly.gateway.auth import (
     WsTicketStore,
@@ -402,7 +403,7 @@ class GatewayServer:
                     app, token=self._control_token, on_send=self.on_send,
                 )
             except Exception as exc:  # pragma: no cover — never block boot
-                logger.warning("MCP control routes unavailable: %s", exc)
+                logger.warning("MCP control routes unavailable: {}", exc)
         return app
 
     # ------------------------------------------------------------------
@@ -1014,15 +1015,6 @@ class GatewayServer:
             elif method == "agent.clarify.list":
                 await self._ws_rpc_clarify_list(ws, rpc_id, params)
 
-            elif method == "exec.policy.get":
-                await self._ws_rpc_exec_policy_get(ws, rpc_id, params)
-
-            elif method == "exec.policy.set":
-                await self._ws_rpc_exec_policy_set(ws, rpc_id, params)
-
-            elif method == "exec.policy.allowlist.remove":
-                await self._ws_rpc_exec_policy_allowlist_remove(ws, rpc_id, params)
-
             # Board
             elif method == "board.snapshot":
                 await self._ws_rpc_board_snapshot(ws, rpc_id, params)
@@ -1181,67 +1173,10 @@ class GatewayServer:
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 
-    # --- RPC: exec.policy (standing approval policy) ---
-
-    @staticmethod
-    def _exec_policy_payload(store) -> dict:
-        cfg = store.config
-        return {
-            "security": cfg.security,
-            "ask": cfg.ask,
-            "allowlist": [
-                {
-                    "pattern": e.pattern,
-                    "command": e.last_used_command,
-                    "lastUsedAt": e.last_used_at,
-                }
-                for e in cfg.allowlist
-            ],
-        }
-
-    async def _ws_rpc_exec_policy_get(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
-        from flowly.exec.approvals import ExecApprovalStore
-        store = ExecApprovalStore()
-        store.load()
-        await self._ws_rpc_reply(ws, rpc_id, self._exec_policy_payload(store))
-
-    async def _ws_rpc_exec_policy_set(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
-        security = params.get("security")
-        ask = params.get("ask")
-        if security is not None and security not in ("deny", "allowlist", "full"):
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Invalid security")
-            return
-        if ask is not None and ask not in ("off", "on-miss", "always"):
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Invalid ask")
-            return
-        if security is None and ask is None:
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Nothing to set")
-            return
-
-        from flowly.exec.approvals import ExecApprovalStore
-        store = ExecApprovalStore()
-        cfg = store.load()
-        if security is not None:
-            cfg.security = security
-        if ask is not None:
-            cfg.ask = ask
-        store.save()
-        await self._ws_rpc_reply(ws, rpc_id, self._exec_policy_payload(store))
-
-    async def _ws_rpc_exec_policy_allowlist_remove(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
-        pattern = params.get("pattern", "")
-        if not pattern:
-            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Missing pattern")
-            return
-        from flowly.exec.approvals import ExecApprovalStore
-        store = ExecApprovalStore()
-        store.load()
-        removed = store.remove_from_allowlist(pattern)
-        if removed:
-            store.save()
-        payload = self._exec_policy_payload(store)
-        payload["removed"] = removed
-        await self._ws_rpc_reply(ws, rpc_id, payload)
+    # exec.policy.* (standing approval policy) is served from the shared
+    # flowly.channels.feature_rpc surface — dispatched at the top of
+    # _ws_dispatch via ``method in feature_rpc.FEATURE_METHODS`` so it lights
+    # up over BOTH the direct gateway and the relay with one implementation.
 
     # --- RPC: audit.* ---
 
@@ -2334,6 +2269,7 @@ class GatewayServer:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         limit = int(params.get("limit", 50))
         include_internal = bool(params.get("includeInternal", False))
+        include_content = bool(params.get("includeContent", True))
         # Fetch extra rows so we can drop internal artifacts without
         # shrinking the visible page below the caller's limit. Matches
         # the pattern ArtifactTool._list already uses for its own filter.
@@ -2342,12 +2278,15 @@ class GatewayServer:
             type=params.get("type"),
             pinned=params.get("pinned"),
             search=params.get("search"),
+            session_key=params.get("sessionKey"),
             limit=fetch_limit,
             offset=params.get("offset", 0),
         )
         if not include_internal:
             results = [a for a in results if not is_internal_context_artifact(a)]
         results = results[:limit]
+        if not include_content:
+            results = [artifact_summary(a) for a in results]
         await self._ws_rpc_reply(ws, rpc_id, {"artifacts": results})
 
     async def _ws_rpc_artifacts_get(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
@@ -2371,6 +2310,7 @@ class GatewayServer:
             pinned=params.get("pinned", False),
             dashboard_size=params.get("dashboardSize", "medium"),
             tags=params.get("tags"),
+            session_key=params.get("sessionKey"),
         )
         await self._broadcast_artifact_event("artifact.created", artifact)
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
@@ -2484,17 +2424,21 @@ class GatewayServer:
         params = dict(request.query)
         limit = int(params.get("limit", 50))
         include_internal = params.get("includeInternal") == "true"
+        include_content = params.get("includeContent", "true").lower() == "true"
         fetch_limit = limit if include_internal else max(limit * 5, 100)
         results = self.artifact_store.list(
             type=params.get("type"),
             pinned=params.get("pinned") == "true" if "pinned" in params else None,
             search=params.get("search"),
+            session_key=params.get("sessionKey"),
             limit=fetch_limit,
             offset=int(params.get("offset", 0)),
         )
         if not include_internal:
             results = [a for a in results if not is_internal_context_artifact(a)]
         results = results[:limit]
+        if not include_content:
+            results = [artifact_summary(a) for a in results]
         return web.json_response({"artifacts": results})
 
     async def _handle_artifacts_get(self, request: web.Request) -> web.Response:
@@ -2574,7 +2518,7 @@ class GatewayServer:
                 from flowly.mcp.server.control import write_api_file
                 write_api_file(self.host, self.port, self._control_token)
             except Exception as exc:  # pragma: no cover
-                logger.debug("MCP control advertise failed: %s", exc)
+                logger.debug("MCP control advertise failed: {}", exc)
         logger.info(f"Gateway API listening on http://{self.host}:{self.port}")
         if self.on_chat_message:
             logger.info(f"Desktop WebSocket available at ws://{self.host}:{self.port}/ws")

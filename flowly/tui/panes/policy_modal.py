@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label, ListItem, ListView, Static
 
@@ -45,33 +46,37 @@ def action_for_button(button_id: str | None) -> dict[str, str] | None:
     return None
 
 
-class PolicyModal(ModalScreen[None]):
+class PolicyPanel(Vertical):
     """Edit command permissions (stays open; applies changes live)."""
 
+    can_focus = True
+
+    class Dismissed(Message):
+        pass
+
     DEFAULT_CSS = """
-    PolicyModal { align: center middle; }
-    PolicyModal > Vertical {
-        width: 90%;
-        max-width: 120;
-        height: 80%;
-        max-height: 34;
-        border: thick #00a6c8;
-        background: #050505;
-        padding: 1 2;
+    PolicyPanel {
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+        max-height: 24;
+        border: none;
+        background: transparent;
+        padding: 0;
     }
-    PolicyModal .title { text-style: bold; color: #00a6c8; height: 1; }
-    PolicyModal .hint  { color: #83b8c2; text-style: italic; height: 1; margin-bottom: 1; }
-    PolicyModal .group { color: #e6fbff; text-style: bold; margin-top: 1; height: 1; }
-    PolicyModal #allowlist-box { height: 1fr; min-height: 3; }
-    PolicyModal ListView { height: auto; max-height: 8; background: #050505; border: none; }
-    PolicyModal ListItem { background: #101010; padding: 0 1; }
-    PolicyModal Horizontal { height: auto; }
-    PolicyModal Button { margin-right: 1; }
+    PolicyPanel .title { text-style: bold; color: #00a6c8; height: 1; }
+    PolicyPanel .hint  { color: #83b8c2; text-style: italic; height: 1; margin-bottom: 1; }
+    PolicyPanel .group { color: #e6fbff; text-style: bold; margin-top: 1; height: 1; }
+    PolicyPanel #allowlist-box { height: auto; min-height: 3; max-height: 8; }
+    PolicyPanel ListView { height: auto; max-height: 8; background: transparent; border: none; }
+    PolicyPanel ListItem { background: transparent; padding: 0 1; }
+    PolicyPanel Horizontal { height: auto; }
+    PolicyPanel Button { margin-right: 1; }
     """
 
     BINDINGS = [
-        ("escape", "dismiss", "Close"),
-        ("q", "dismiss", "Close"),
+        ("escape", "close", "Close"),
+        ("q", "close", "Close"),
         ("r", "remove_selected", "Remove"),
     ]
 
@@ -87,36 +92,48 @@ class PolicyModal(ModalScreen[None]):
         self._allowlist: list[dict[str, Any]] = list(policy.get("allowlist") or [])
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("Command permissions", classes="title")
-            yield Label(
-                "Click to change · ↑/↓ select allowlist · R remove · Esc close",
-                classes="hint",
-            )
+        yield Label("Command permissions", classes="title")
+        yield Label(
+            "Click to change · ↑/↓ select allowlist · R remove · Esc close",
+            classes="hint",
+        )
 
-            yield Static("Security", classes="group")
-            with Horizontal():
-                for value, label in SECURITY_CHOICES:
-                    yield Button(self._btn_label(label, value == self._security),
-                                 id=f"sec-{value}",
-                                 variant="success" if value == self._security else "default")
+        yield Static("Security", classes="group")
+        with Horizontal():
+            for value, label in SECURITY_CHOICES:
+                yield Button(
+                    self._btn_label(label, value == self._security),
+                    id=f"sec-{value}",
+                    variant="success" if value == self._security else "default",
+                )
 
-            yield Static("Approval prompts", classes="group")
-            with Horizontal():
-                for value, label in ASK_CHOICES:
-                    yield Button(self._btn_label(label, value == self._ask),
-                                 id=f"ask-{value}",
-                                 variant="success" if value == self._ask else "default")
+        yield Static("Approval prompts", classes="group")
+        with Horizontal():
+            for value, label in ASK_CHOICES:
+                yield Button(
+                    self._btn_label(label, value == self._ask),
+                    id=f"ask-{value}",
+                    variant="success" if value == self._ask else "default",
+                )
 
-            yield Static(self._allowlist_heading(), id="allowlist-group", classes="group")
-            box = Vertical(id="allowlist-box")
-            yield box
+        yield Static(self._allowlist_heading(), id="allowlist-group", classes="group")
+        yield Vertical(id="allowlist-box")
 
-            with Horizontal():
-                yield Button("Close (esc)", id="close-modal", variant="primary")
+        with Horizontal():
+            yield Button("Close (esc)", id="close-modal", variant="primary")
 
     async def on_mount(self) -> None:
         await self._rebuild_allowlist()
+        self._focus_current_security()
+
+    def on_focus(self) -> None:
+        self._focus_current_security()
+
+    def _focus_current_security(self) -> None:
+        try:
+            self.query_one(f"#sec-{self._security}", Button).focus()
+        except Exception:
+            pass
 
     # --- rendering helpers ----------------------------------------
 
@@ -170,7 +187,7 @@ class PolicyModal(ModalScreen[None]):
     @on(Button.Pressed)
     async def _on_button(self, event: Button.Pressed) -> None:
         if event.button.id == "close-modal":
-            self.dismiss(None)
+            self.action_close()
             return
         action = action_for_button(event.button.id)
         if action is not None:
@@ -189,3 +206,46 @@ class PolicyModal(ModalScreen[None]):
         pattern = self._selected_pattern()
         if pattern:
             await self._do({"action": "remove", "pattern": pattern})
+
+    def action_close(self) -> None:
+        self.post_message(self.Dismissed())
+
+
+class PolicyModal(ModalScreen[None]):
+    """Compatibility wrapper; the chat TUI mounts :class:`PolicyPanel`."""
+
+    BINDINGS = PolicyPanel.BINDINGS
+
+    DEFAULT_CSS = """
+    PolicyModal { align: center middle; }
+    PolicyModal > PolicyPanel {
+        width: 90%;
+        max-width: 120;
+        padding: 1 2;
+        border: thick #00a6c8;
+        background: #050505;
+    }
+    """
+
+    def __init__(self, policy: dict[str, Any] | None, apply: ApplyFn | None = None) -> None:
+        super().__init__()
+        policy = policy or {}
+        self._security = str(policy.get("security", "full"))
+        self._ask = str(policy.get("ask", "off"))
+        self._allowlist: list[dict[str, Any]] = list(policy.get("allowlist") or [])
+        self._policy = policy
+        self._apply = apply
+
+    def compose(self) -> ComposeResult:
+        yield PolicyPanel(self._policy, self._apply)
+
+    @on(PolicyPanel.Dismissed)
+    def _on_dismissed(self, event: PolicyPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(None)
+
+    async def action_remove_selected(self) -> None:
+        await self.query_one(PolicyPanel).action_remove_selected()
+
+    def action_close(self) -> None:
+        self.query_one(PolicyPanel).action_close()

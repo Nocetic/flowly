@@ -380,15 +380,49 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     Composer > #composer-hint {{
         background: {palette.bg}; color: {palette.text_muted};
     }}
+    Composer.artifact-nav > #composer-hint {{
+        background: {palette.accent}; color: {palette.bg};
+    }}
     Composer.approval-open > #composer-input-row,
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,
     Composer.review-open > #composer-input-row,
+    Composer.usage-open > #composer-input-row,
+    Composer.status-open > #composer-input-row,
+    Composer.picker-inline-open > #composer-input-row,
     Composer.approval-open > #composer-hint,
     Composer.secret-open > #composer-hint,
     Composer.setup-open > #composer-hint,
-    Composer.review-open > #composer-hint {{
+    Composer.review-open > #composer-hint,
+    Composer.usage-open > #composer-hint,
+    Composer.status-open > #composer-hint,
+    Composer.picker-inline-open > #composer-hint {{
         display: none;
+    }}
+    Composer.picker-inline-open > #composer-picker {{
+        background: {palette.bg};
+    }}
+    Composer.picker-inline-open > #composer-picker > * {{
+        background: transparent;
+        border: none;
+    }}
+    Composer.picker-inline-open > #composer-picker > IntegrationsPanel OptionList {{
+        background: transparent;
+    }}
+    Composer > #composer-usage,
+    Composer > #composer-status-panel {{
+        background: {palette.bg};
+    }}
+    Composer > #composer-status-panel > #status-panel-title {{
+        color: {palette.accent};
+    }}
+    Composer > #composer-status-panel > #status-panel-session,
+    Composer > #composer-status-panel > #status-panel-provider,
+    Composer > #composer-status-panel > #status-panel-model,
+    Composer > #composer-status-panel > #status-panel-state,
+    Composer > #composer-status-panel > #status-panel-usage,
+    Composer > #composer-status-panel > #status-panel-hint {{
+        color: {palette.text_muted};
     }}
     Composer > #composer-attachments {{
         background: {palette.bg}; color: {palette.accent};
@@ -522,94 +556,153 @@ def css_for(palette: FlowlyPalette | None = None) -> str:
     }}
 
     ApprovalModal .title,
+    ActivityPanel .title,
     ActivityModal .title,
+    ApprovalsPanel .title,
     ApprovalsModal .title,
+    ArtifactsPanel .title,
     ArtifactsModal .title,
+    AssistantPickerPanel .title,
     AssistantPicker .title,
+    BrowserPanel .title,
     BrowserModal .title,
+    ConfirmPanel .title,
     ConfirmModal .title,
+    HelpPanel Markdown,
     HelpModal Markdown,
     IntegrationSetupModal .title,
+    IntegrationsPanel .title,
     IntegrationsModal .title,
+    LoginPanel .title,
     LoginModal .title,
+    MCPPanel .title,
     MCPModal .title,
     MCPSecretModal .title,
     ModelPicker .title,
+    PluginsPanel .title,
     PluginsModal .title,
+    PolicyPanel .title,
     PolicyModal .title,
     ProviderPicker .title,
+    SessionPickerPanel .title,
     SessionPicker .title,
+    SubagentModelsPanel .title,
     SubagentModelsModal .title,
+    ThemePickerPanel .title,
     ThemePicker .title,
+    SpecialistModelPickerPanel .title,
     _SpecialistModelPicker .title {{
         color: {palette.accent};
     }}
 
+    ConfirmPanel .body,
     ConfirmModal .body {{
         color: {palette.text};
     }}
 
     ApprovalModal .cmd,
     IntegrationSetupModal .account-block,
+    LoginPanel .code-box,
     LoginModal .code-box,
     ApprovalsModal ListItem {{
         background: {palette.boost};
         color: {palette.text};
     }}
 
+    AssistantPickerPanel .hint,
+    AssistantPickerPanel .footnote,
     AssistantPicker .hint,
     AssistantPicker .footnote,
+    BrowserPanel .description,
+    BrowserPanel #status-line,
     BrowserModal .description,
     BrowserModal #status-line,
+    ConfirmPanel .hint,
     ConfirmModal .hint,
+    MCPPanel .hint,
+    MCPPanel .footer,
     MCPModal .hint,
     MCPModal .footer,
     MCPSecretModal .hint,
     ModelPicker .hint,
     ModelPicker .footer,
+    PluginsPanel .hint,
+    PluginsPanel .footer,
     PluginsModal .hint,
     PluginsModal .footer,
+    PolicyPanel .hint,
     PolicyModal .hint,
     ProviderPicker .hint,
     ProviderPicker .footer,
+    SessionPickerPanel .hint,
     SessionPicker .hint,
+    SubagentModelsPanel .hint,
+    SubagentModelsPanel .footer,
     SubagentModelsModal .hint,
     SubagentModelsModal .footer,
+    SpecialistModelPickerPanel .hint,
+    SpecialistModelPickerPanel .footer,
     _SpecialistModelPicker .hint,
     _SpecialistModelPicker .footer,
     IntegrationSetupModal .field-row > Label,
     IntegrationSetupModal .field-help,
     IntegrationSetupModal #status-line,
+    IntegrationsPanel .hint,
+    IntegrationsPanel .footer,
     IntegrationsModal .hint,
     IntegrationsModal .footer,
+    LoginPanel .hint,
+    LoginPanel .status,
     LoginModal .hint,
     LoginModal .status,
+    ActivityPanel .meta,
+    ActivityPanel .hint,
     ActivityModal .meta,
     ActivityModal .hint,
+    ApprovalsPanel .hint,
+    ApprovalsPanel .session,
+    ArtifactsPanel .hint,
     ArtifactsModal .hint,
     ApprovalsModal .hint,
     ApprovalsModal .session,
+    ThemePickerPanel .hint,
     ThemePicker .hint {{
         color: {palette.text_muted};
     }}
 
+    ApprovalsPanel ListItem {{
+        background: transparent;
+        color: {palette.text};
+    }}
+
+    AssistantPickerPanel OptionList,
     AssistantPicker OptionList,
     ArtifactsModal ListView,
     IntegrationSetupModal VerticalScroll,
+    IntegrationsPanel OptionList,
     IntegrationsModal OptionList,
+    MCPPanel OptionList,
     MCPModal OptionList,
     ModelPicker OptionList,
+    PluginsPanel OptionList,
     PluginsModal OptionList,
     ProviderPicker OptionList,
+    SessionPickerPanel OptionList,
     SessionPicker OptionList,
+    SubagentModelsPanel OptionList,
     SubagentModelsModal OptionList,
+    ThemePickerPanel OptionList,
     ThemePicker OptionList,
+    SpecialistModelPickerPanel OptionList,
     _SpecialistModelPicker OptionList,
+    HelpPanel VerticalScroll,
+    HelpPanel Markdown,
     HelpModal VerticalScroll,
     HelpModal Markdown {{
         background: {palette.surface};
     }}
 
+    ActivityPanel DataTable,
     ActivityModal DataTable {{
         background: transparent;
     }}

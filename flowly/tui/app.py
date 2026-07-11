@@ -12,12 +12,17 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 
 from flowly.integrations import Field, FieldType, IntegrationCard
+from flowly.tui.artifact_open import (
+    is_external_artifact_type,
+    open_artifact_external,
+)
 from flowly.tui.attachments import (
     is_video_path,
     render_message_with_attachments,
 )
 from flowly.tui.client import (
     ApprovalRequest,
+    ArtifactEvent,
     ChatAborted,
     ChatError,
     ChatFinal,
@@ -49,10 +54,11 @@ from flowly.tui.first_touch import (
     mark_seen as _hint_mark_seen,
 )
 from flowly.tui.media_upload import AttachmentPreparationError, prepare_media_attachments
-from flowly.tui.panes.activity_modal import ActivityModal
-from flowly.tui.panes.approvals_modal import ApprovalsModal
-from flowly.tui.panes.artifacts_modal import ArtifactsModal
-from flowly.tui.panes.assistant_picker import AssistantPicker
+from flowly.tui.panes.activity_modal import ActivityPanel
+from flowly.tui.panes.approvals_modal import ApprovalsPanel
+from flowly.tui.panes.artifacts_modal import ArtifactsPanel
+from flowly.tui.panes.assistant_picker import AssistantPickerPanel
+from flowly.tui.panes.browser_modal import BrowserPanel
 from flowly.tui.panes.composer import (
     ApprovalPrompt,
     ApprovalPromptRequest,
@@ -63,17 +69,25 @@ from flowly.tui.panes.composer import (
     InlineSetupPrompt,
     InlineSetupPromptRequest,
 )
-from flowly.tui.panes.confirm_modal import ConfirmModal
+from flowly.tui.panes.confirm_modal import ConfirmPanel
 from flowly.tui.panes.help_hint import HelpHint
-from flowly.tui.panes.help_modal import HelpModal
-from flowly.tui.panes.login_modal import LoginModal
+from flowly.tui.panes.help_modal import HelpPanel
+from flowly.tui.panes.integrations_modal import IntegrationsPanel
+from flowly.tui.panes.login_modal import LoginPanel
+from flowly.tui.panes.mcp_modal import MCPPanel
 from flowly.tui.panes.memory_review import MemoryReviewPanel
-from flowly.tui.panes.usage_panel import UsagePanel
-from flowly.tui.panes.policy_modal import PolicyModal
-from flowly.tui.panes.session_picker import SessionPicker
+from flowly.tui.panes.model_picker import ModelPickerPanel
+from flowly.tui.panes.plugins_modal import PluginsPanel
+from flowly.tui.panes.policy_modal import PolicyPanel
+from flowly.tui.panes.provider_picker import ProviderPickerPanel
+from flowly.tui.panes.session_picker import SessionPickerPanel
 from flowly.tui.panes.status import ContextHeader, StatusBar
+from flowly.tui.panes.status_panel import SessionStatusPanel
+from flowly.tui.panes.subagent_models import SubagentModelsPanel
 from flowly.tui.panes.subagents import SubagentPane
+from flowly.tui.panes.theme_picker import ThemePickerPanel
 from flowly.tui.panes.transcript import Bubble, TranscriptPane
+from flowly.tui.panes.usage_panel import UsagePanel
 from flowly.tui.panes.welcome import build_welcome
 from flowly.tui.state import fresh_session_key, load_state, save_state
 from flowly.tui.theme import (
@@ -189,6 +203,32 @@ def _inline_setup_field(field: Field, value: object) -> InlineSetupField:
     )
 
 
+# Quick permission-level cycle (F5). One keystroke sets BOTH the exec tool
+# policy and the codex_session runtime policy to a coherent level, live over
+# RPC — a fast way to exercise exec.policy.set / codex.policy.set without a
+# settings screen. Each entry: (key, label, (exec_security, exec_ask),
+# (codex_approval, codex_sandbox)).
+# codex approval values are the FLOWLY policy names (on-request / never /
+# auto-review / granular) — codex.policy.set maps them to codex's own
+# ask_for_approval vocabulary. auto-review → codex "untrusted" (prompt for
+# everything but safe reads); never → run unattended.
+_PERMISSION_LEVELS: tuple[tuple[str, str, tuple[str, str], tuple[str, str]], ...] = (
+    ("ask",  "🔒 Ask",  ("full", "always"),       ("auto-review", "workspace-write")),
+    ("auto", "⚖️ Auto", ("allowlist", "on-miss"), ("on-request",  "workspace-write")),
+    ("yolo", "🚀 YOLO", ("full", "off"),          ("never",       "full-access")),
+)
+
+
+def _match_permission_level(policy: dict) -> int:
+    """Index of the level whose exec (security, ask) matches ``policy``, else -1
+    (so the first cycle lands on the first level)."""
+    sec, ask = policy.get("security"), policy.get("ask")
+    for i, (_key, _label, (s, a), _codex) in enumerate(_PERMISSION_LEVELS):
+        if s == sec and a == ask:
+            return i
+    return -1
+
+
 class FlowlyTUI(App[None]):
     CSS = css_for()
 
@@ -203,6 +243,11 @@ class FlowlyTUI(App[None]):
         Binding("f2", "open_activity", "Activity", priority=True),
         Binding("f3", "open_approvals", "Approvals", priority=True),
         Binding("f4", "open_artifacts", "Artifacts", priority=True),
+        # Shift+Tab cycles the permission level. App-level (not composer on_key)
+        # so Textual awaits the async action; priority so it fires over the
+        # focused composer. Plain Tab is left alone — the composer binds it to
+        # apply slash/path autocomplete.
+        Binding("shift+tab", "cycle_permission", "Permission", priority=True),
         Binding("ctrl+y", "copy_last", "Copy", priority=True),
     ]
 
@@ -235,6 +280,10 @@ class FlowlyTUI(App[None]):
         # Optional modal to auto-open after launch (e.g. `flowly setup`
         # passes "integrations" so the catalogue surfaces immediately).
         self._auto_open_modal: str | None = auto_open_modal
+        # Set once the user actually sends a message here. Gates the
+        # ``last_session_key`` write so ``--resume`` reopens the last chat
+        # that was *used*, not an empty session from an idle launch+quit.
+        self._session_used = False
         self._current_run: str | None = None
         self._current_bubble: Bubble | None = None
         self._event_task: asyncio.Task[None] | None = None
@@ -245,6 +294,7 @@ class FlowlyTUI(App[None]):
         self._approval_choice_future: asyncio.Future[str] | None = None
         self._inline_secret_future: asyncio.Future[str | None] | None = None
         self._inline_setup_future: asyncio.Future[dict[str, object] | None] | None = None
+        self._composer_picker_future: asyncio.Future[Any] | None = None
         # Inline memory-review queue (the on-open "review new memories" panel).
         self._memory_review_items: list[dict] = []
         self._memory_review_idx = 0
@@ -313,8 +363,14 @@ class FlowlyTUI(App[None]):
         # Fire background bootstrap tasks in parallel.
         asyncio.create_task(self._refresh_command_palette())
         asyncio.create_task(self._preload_history())
+        asyncio.create_task(self._refresh_session_artifacts())
         asyncio.create_task(self._check_gateway_capabilities())
         asyncio.create_task(self._load_account_on_mount())
+        # Seed the permission badge from the live exec policy, then keep it in
+        # sync on a slow poll so a mode changed elsewhere (Desktop, another
+        # client) shows up here without a restart.
+        asyncio.create_task(self._sync_permission_badge())
+        self.set_interval(8.0, self._sync_permission_badge)
         # Prefetch the OpenRouter catalog in the background so the
         # context-window bar can size itself from the model's real
         # context_length (no hardcoded family tables). Also seeds the
@@ -477,17 +533,37 @@ class FlowlyTUI(App[None]):
             )
 
     async def _poll_badges(self) -> None:
-        try:
-            pending = await self._client.approval_list()
-        except Exception:
-            pending = []
-        try:
-            arts = await self._client.artifacts_list(limit=200)
-        except Exception:
-            arts = []
+        session_key = self._session_key
+        pending, arts, session_arts = await asyncio.gather(
+            self._client.approval_list(),
+            self._client.artifacts_list(limit=200, include_content=False),
+            self._client.artifacts_list(
+                limit=200,
+                session_key=session_key,
+                include_content=False,
+            ),
+            return_exceptions=True,
+        )
         status = self.query_one(StatusBar)
-        status.approvals_pending = len(pending)
-        status.artifacts_count = len(arts)
+        if not isinstance(pending, BaseException):
+            status.approvals_pending = len(pending)
+        if not isinstance(arts, BaseException):
+            status.artifacts_count = len(arts)
+        if session_key == self._session_key and not isinstance(session_arts, BaseException):
+            self.query_one(Composer).set_artifacts(session_arts)
+
+    async def _refresh_session_artifacts(self) -> None:
+        session_key = self._session_key
+        try:
+            artifacts = await self._client.artifacts_list(
+                limit=200,
+                session_key=session_key,
+                include_content=False,
+            )
+        except Exception:
+            return
+        if session_key == self._session_key:
+            self.query_one(Composer).set_artifacts(artifacts)
 
     async def _check_gateway_capabilities(self) -> None:
         """Probe /health for capabilities; warn if running gateway is stale."""
@@ -524,7 +600,8 @@ class FlowlyTUI(App[None]):
         """
         try:
             state = load_state()
-            state["last_session_key"] = self._session_key
+            if self._session_used:
+                state["last_session_key"] = self._session_key
             try:
                 draft = self.query_one("#composer-input").text  # type: ignore[attr-defined]
             except Exception:
@@ -888,6 +965,19 @@ class FlowlyTUI(App[None]):
             self._enqueue_approval(ev)
             return
 
+        if isinstance(ev, ArtifactEvent):
+            artifact_id = str(ev.artifact.get("id") or "")
+            composer = self.query_one(Composer)
+            if ev.action == "deleted":
+                if artifact_id:
+                    composer.remove_artifact(artifact_id)
+                return
+            session_key = str(ev.artifact.get("session_key") or "")
+            if session_key != self._session_key:
+                return
+            composer.upsert_artifact(ev.artifact)
+            return
+
         if isinstance(ev, ToolStart):
             if ev.session_key and ev.session_key != self._session_key:
                 return
@@ -1170,11 +1260,121 @@ class FlowlyTUI(App[None]):
         except Exception:
             pass
 
-    async def _show_inline_screen(self, screen: Any) -> Any:
-        # Keep Textual's screen stack for focus, Esc bindings, OptionList
-        # navigation, and push_screen_wait results. Runtime CSS renders these
-        # screens as composer-adjacent bottom sheets instead of centered modals.
-        return await self.push_screen_wait(screen)
+    @on(SessionStatusPanel.Dismissed)
+    def _on_status_panel_dismissed(self, event: SessionStatusPanel.Dismissed) -> None:
+        event.stop()
+        try:
+            self.query_one(Composer).clear_status()
+        except Exception:
+            pass
+
+    async def _show_composer_picker(self, picker: Any, *, inline: bool = False) -> Any:
+        prev = self._composer_picker_future
+        if prev is not None and not prev.done():
+            prev.set_result(None)
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        self._composer_picker_future = fut
+        composer = self.query_one(Composer)
+        await composer.show_picker(picker, inline=inline)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            return None
+        finally:
+            if self._composer_picker_future is fut:
+                self._composer_picker_future = None
+                await composer.clear_picker()
+
+    def _finish_composer_picker(self, result: Any) -> None:
+        fut = self._composer_picker_future
+        if fut is not None and not fut.done():
+            fut.set_result(result)
+
+    @on(ProviderPickerPanel.Dismissed)
+    def _on_provider_picker_dismissed(self, event: ProviderPickerPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(ModelPickerPanel.Dismissed)
+    def _on_model_picker_dismissed(self, event: ModelPickerPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(IntegrationsPanel.Dismissed)
+    def _on_integrations_panel_dismissed(self, event: IntegrationsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(LoginPanel.Dismissed)
+    def _on_login_panel_dismissed(self, event: LoginPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(PluginsPanel.Dismissed)
+    def _on_plugins_panel_dismissed(self, event: PluginsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(MCPPanel.Dismissed)
+    def _on_mcp_panel_dismissed(self, event: MCPPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(BrowserPanel.Dismissed)
+    def _on_browser_panel_dismissed(self, event: BrowserPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(ThemePickerPanel.Dismissed)
+    def _on_theme_picker_panel_dismissed(self, event: ThemePickerPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(ActivityPanel.Dismissed)
+    def _on_activity_panel_dismissed(self, event: ActivityPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(None)
+
+    @on(ApprovalsPanel.Dismissed)
+    def _on_approvals_panel_dismissed(self, event: ApprovalsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(PolicyPanel.Dismissed)
+    def _on_policy_panel_dismissed(self, event: PolicyPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(None)
+
+    @on(ArtifactsPanel.Dismissed)
+    def _on_artifacts_panel_dismissed(self, event: ArtifactsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(None)
+
+    @on(AssistantPickerPanel.Dismissed)
+    def _on_assistant_picker_dismissed(self, event: AssistantPickerPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(SessionPickerPanel.Dismissed)
+    def _on_session_picker_dismissed(self, event: SessionPickerPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.result)
+
+    @on(HelpPanel.Dismissed)
+    def _on_help_panel_dismissed(self, event: HelpPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(None)
+
+    @on(SubagentModelsPanel.Dismissed)
+    def _on_subagent_models_dismissed(self, event: SubagentModelsPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(None)
+
+    @on(ConfirmPanel.Dismissed)
+    def _on_confirm_panel_dismissed(self, event: ConfirmPanel.Dismissed) -> None:
+        event.stop()
+        self._finish_composer_picker(event.confirmed)
 
     def _safe_transcript_system(self, text: str) -> None:
         try:
@@ -1194,8 +1394,81 @@ class FlowlyTUI(App[None]):
 
     # --- composer handlers ----------------------------------------
 
+    @on(Composer.ArtifactOpen)
+    def _on_artifact_open(self, event: Composer.ArtifactOpen) -> None:
+        # Fetching and external-open work must not block message dispatch.
+        self._open_artifact_screen(dict(event.artifact))
+
+    @work
+    async def _open_artifact_screen(self, artifact_ref: dict) -> None:
+        artifact_id = str(artifact_ref.get("id") or "")
+        if not artifact_id:
+            return
+        transcript = self.query_one(TranscriptPane)
+        try:
+            artifact = await self._client.artifacts_get(artifact_id)
+        except Exception as exc:
+            transcript.add_error(f"artifact fetch failed: {exc}")
+            return
+        if not artifact:
+            transcript.add_error("artifact not found")
+            return
+
+        artifact_type = str(artifact.get("type") or "").lower()
+        if is_external_artifact_type(artifact_type):
+            result = await asyncio.to_thread(open_artifact_external, artifact)
+            if result.status == "opened":
+                self.notify(
+                    f"opened {artifact_type} artifact in the default app",
+                    severity="information",
+                    timeout=3,
+                )
+            elif result.status == "headless":
+                message = (
+                    f"no graphical session; cannot open {artifact_type}. "
+                    "Press F4 for source preview."
+                )
+                self.notify(message, severity="warning", timeout=6)
+                transcript.add_system(message)
+            else:
+                detail = f" ({result.detail})" if result.detail else ""
+                message = (
+                    f"could not open {artifact_type} artifact{detail}; "
+                    "press F4 for source preview"
+                )
+                self.notify(message, severity="warning", timeout=6)
+                transcript.add_system(message)
+            self.query_one(Composer).focus_input_safely()
+            return
+
+        # Open with the whole chat's artifacts so ←/→ can move between them;
+        # siblings are summaries and the modal lazy-loads their content.
+        siblings = self.query_one(Composer).session_artifacts()
+        initial = next(
+            (
+                i
+                for i, item in enumerate(siblings)
+                if str(item.get("id") or "") == artifact_id
+            ),
+            None,
+        )
+        if initial is None:
+            siblings, initial = [artifact], 0
+        else:
+            siblings[initial] = dict(artifact)
+        await self._show_composer_picker(
+            ArtifactsPanel(
+                siblings,
+                initial_index=initial,
+                fetcher=self._client.artifacts_get,
+            ),
+            inline=True,
+        )
+        self.query_one(Composer).focus_input_safely()
+
     @on(Composer.Submitted)
     async def _on_send(self, event: Composer.Submitted) -> None:
+        self._session_used = True
         # Non-blocking queue: if a turn is already running, push onto the
         # queue and let _drain_queue() pick it up when the current turn
         # ends. Input is NEVER disabled — user can keep typing or queue
@@ -1340,13 +1613,18 @@ class FlowlyTUI(App[None]):
             return
         if head == "/status":
             s = self.query_one(StatusBar)
+            composer = self.query_one(Composer)
             provider, provider_source = self._active_provider_display()
-            self.query_one(TranscriptPane).add_system(
-                f"session={s.session or self._session_key} "
-                f"provider={provider} "
-                f"model={s.model or '?'} "
-                f"state={s.state}"
-                + (f" · {provider_source}" if provider_source else "")
+            composer.show_status(
+                session=s.session or self._session_key,
+                provider=provider,
+                provider_source=provider_source,
+                model=s.model or "",
+                state=s.state,
+                tokens_in=int(s.tokens_in),
+                tokens_out=int(s.tokens_out),
+                cost_usd=float(s.cost_usd),
+                queued=len(getattr(composer, "_queue", [])),
             )
             return
         if head == "/usage":
@@ -1489,7 +1767,7 @@ class FlowlyTUI(App[None]):
             )
         await self._send_as_message(cmd, skill_notice=skill_notice)
 
-    # legacy inline help removed in favor of HelpModal (Ctrl+? / /help / F1)
+    # Help is handled by the composer-inline HelpPanel (Ctrl+? / /help / F1).
 
     @work
     async def _board_command(self, rest: str) -> None:
@@ -1580,13 +1858,8 @@ class FlowlyTUI(App[None]):
 
     @work
     async def _do_clear(self, *, skip_confirm: bool = False) -> None:
-        # ``@work`` is mandatory because Textual now requires
-        # ``push_screen_wait`` to run inside a worker — calling it
-        # from a regular ``async`` method (or the bare slash dispatch
-        # path) raises ``NoActiveWorker``. Callers should NOT ``await``
-        # this; the decorator returns a Worker that runs in the
-        # background, which is the right shape for fire-and-forget
-        # UI side effects.
+        # Keep this in a worker so slash dispatch stays non-blocking while the
+        # inline confirmation owns the composer.
         transcript = self.query_one(TranscriptPane)
         # Count what's about to disappear so the confirmation message
         # is concrete instead of generic "clear session?".
@@ -1602,8 +1875,8 @@ class FlowlyTUI(App[None]):
             pass
 
         if not skip_confirm and msg_count > 0:
-            confirmed = await self._show_inline_screen(
-                ConfirmModal(
+            confirmed = await self._show_composer_picker(
+                ConfirmPanel(
                     title="Clear session?",
                     body=(
                         f"This will discard {msg_count} message(s) from "
@@ -1612,7 +1885,8 @@ class FlowlyTUI(App[None]):
                         "Pass [cyan]/clear --yes[/] to skip this prompt."
                     ),
                     confirm_label="Clear",
-                )
+                ),
+                inline=True,
             )
             if not confirmed:
                 transcript.add_system("clear cancelled")
@@ -1781,11 +2055,13 @@ class FlowlyTUI(App[None]):
             child.remove()
         self._current_bubble = None
         self._current_run = None
+        self.query_one(Composer).set_artifacts([])
         # Persist immediately so a Ctrl+D right after switch still resumes here.
         state = load_state()
         state["last_session_key"] = new_key
         save_state(state)
         await self._preload_history()
+        await self._refresh_session_artifacts()
 
     def _discard_skill_notice(self, run_id: str | None) -> None:
         if run_id:
@@ -1829,6 +2105,10 @@ class FlowlyTUI(App[None]):
         if setup_fut is not None and not setup_fut.done():
             setup_fut.set_result(None)
             return
+        picker_fut = self._composer_picker_future
+        if picker_fut is not None and not picker_fut.done():
+            picker_fut.set_result(None)
+            return
         if self._current_run:
             await self._client.chat_abort(self._current_run)
         else:
@@ -1845,8 +2125,10 @@ class FlowlyTUI(App[None]):
     @work
     async def action_subagent_models(self) -> None:
         """``/subagents models`` — open the per-specialist model editor."""
-        from flowly.tui.panes.subagent_models import SubagentModelsModal
-        await self._show_inline_screen(SubagentModelsModal(self._client))
+        await self._show_composer_picker(
+            SubagentModelsPanel(self._client),
+            inline=True,
+        )
 
     @work
     async def action_spawn_subagent(self, task: str) -> None:
@@ -1870,7 +2152,7 @@ class FlowlyTUI(App[None]):
 
     @work
     async def action_open_help(self) -> None:
-        await self._show_inline_screen(HelpModal())
+        await self._show_composer_picker(HelpPanel(), inline=True)
 
     # ── Connection catalogs ──────────────────────────────────────
 
@@ -1905,15 +2187,15 @@ class FlowlyTUI(App[None]):
     ) -> None:
         """Open a filtered connection catalog and then the selected setup form."""
         from flowly.integrations import get_card
-        from flowly.tui.panes.integrations_modal import IntegrationsModal
 
         while True:
-            result = await self._show_inline_screen(
-                IntegrationsModal(
+            result = await self._show_composer_picker(
+                IntegrationsPanel(
                     categories=categories,
                     title=title,
                     item_label=item_label,
-                )
+                ),
+                inline=True,
             )
             if not result or result.get("action") != "opened":
                 return
@@ -1945,7 +2227,7 @@ class FlowlyTUI(App[None]):
                 f"— run /logout first to switch"
             )
             return
-        result = await self._show_inline_screen(LoginModal())
+        result = await self._show_composer_picker(LoginPanel(), inline=True)
         if not result:
             transcript.add_system("login cancelled")
             return
@@ -2120,9 +2402,8 @@ class FlowlyTUI(App[None]):
     ) -> bool:
         """Collect the primary provider API key in the composer tray.
 
-        This is the fast path for BYOK providers. The full
-        IntegrationSetupModal remains available from the picker with ``E`` for
-        fallback keys or other advanced edits.
+        This is the fast path for BYOK providers. ``Ctrl+E`` in the provider
+        picker opens the all-fields composer wizard for advanced edits.
         """
         field = _inline_provider_key_field(card)
         if field is None:
@@ -2224,6 +2505,38 @@ class FlowlyTUI(App[None]):
             self._safe_transcript_system(f"{card.label} setup cancelled")
             return False
 
+        probe_note = ""
+        if card.category == "provider" and card.probe is not None:
+            from flowly.integrations.probes import run_with_timeout
+
+            result = await run_with_timeout(card.probe(values))
+            if result.status not in {"ok", "unknown"}:
+                detail = result.detail or "the connection check did not pass"
+                confirmation = await self._show_inline_setup(
+                    InlineSetupPromptRequest(
+                        title=f"{card.label} connection check failed",
+                        subtitle=f"{result.status}: {detail}",
+                        fields=[
+                            InlineSetupField(
+                                key="decision",
+                                label="Save these values anyway?",
+                                kind="select",
+                                value="cancel",
+                                choices=[
+                                    ("cancel", "Cancel without saving"),
+                                    ("save", "Save anyway"),
+                                ],
+                            )
+                        ],
+                    )
+                )
+                if confirmation is None or confirmation.get("decision") != "save":
+                    self._safe_transcript_system(
+                        f"{card.label} configuration was not saved"
+                    )
+                    return False
+                probe_note = f" · probe: {result.status} ({detail})"
+
         try:
             await asyncio.to_thread(apply_card_values, card, values)
         except Exception as exc:
@@ -2237,7 +2550,7 @@ class FlowlyTUI(App[None]):
         else:
             tail = "takes effect on next request"
         self._safe_transcript_system(
-            f"✓ {card.label} configuration saved · {tail}"
+            f"✓ {card.label} configuration saved · {tail}{probe_note}"
         )
         return True
 
@@ -2308,14 +2621,13 @@ class FlowlyTUI(App[None]):
             _build_for,
             set_active_provider,
         )
-        from flowly.tui.panes.provider_picker import ProviderPicker
 
         transcript = self.query_one(TranscriptPane)
         rest = (rest or "").strip()
 
         # No-arg → open the arrow-key picker.
         if not rest:
-            result = await self._show_inline_screen(ProviderPicker())
+            result = await self._show_composer_picker(ProviderPickerPanel(), inline=True)
             if not result:
                 return
             if result.get("action") == "switched":
@@ -2334,16 +2646,13 @@ class FlowlyTUI(App[None]):
                     self.action_xai_login()
             elif result.get("action") == "login":
                 # Flowly account picked while signed out → browser sign-in
-                # (LoginModal auto-provisions the key), not a paste form.
+                # (LoginPanel auto-provisions the key), not a paste form.
                 await self.action_login()
             elif result.get("action") == "inline_setup":
                 card = get_card(result["key"])
                 if card is not None:
                     await self._configure_provider_inline(card, make_active=True)
             elif result.get("action") == "opened_setup":
-                from flowly.tui.panes.integration_setup_modal import (
-                    IntegrationSetupModal,
-                )
                 card = get_card(result["key"])
                 if card is not None and card.custom_action == "xai_login":
                     # Browser OAuth instead of a pasted-credentials form.
@@ -2356,8 +2665,8 @@ class FlowlyTUI(App[None]):
                 elif card is not None and card.custom_action == "zai_coding_login":
                     await self.action_zai_coding_login()
                 elif card is not None:
-                    saved = await self._show_inline_screen(IntegrationSetupModal(card))
-                    if saved and saved.get("action") == "saved":
+                    saved = await self._configure_card_inline(card)
+                    if saved:
                         self._refresh_active_provider_status()
             elif result.get("action") == "disconnect":
                 if result.get("key") == "openai_codex":
@@ -2740,12 +3049,11 @@ class FlowlyTUI(App[None]):
 
     @work
     async def action_plugins(self) -> None:
-        """Open the plugins modal — list bundled + user plugins, toggle
+        """Open the inline plugins panel — list bundled + user plugins, toggle
         enabled state, surface manifest errors. Mirrors desktop's plugin
         tab; gateway restart is auto-triggered after every toggle so
         the tool registry picks up the change without a manual reload."""
-        from flowly.tui.panes.plugins_modal import PluginsModal
-        result = await self._show_inline_screen(PluginsModal())
+        result = await self._show_composer_picker(PluginsPanel(), inline=True)
         transcript = self.query_one(TranscriptPane)
         if result and result.get("action") == "changed":
             n = int(result.get("count") or 0)
@@ -2756,12 +3064,11 @@ class FlowlyTUI(App[None]):
 
     @work
     async def action_mcp(self) -> None:
-        """Open the MCP modal — list configured MCP servers + catalog
+        """Open the inline MCP panel — list configured servers + catalog
         entries, toggle enable/disable, install no-secret catalog servers,
         remove servers. MCP tools register at agent boot, so the gateway
         is auto-restarted after each change (same as plugins)."""
-        from flowly.tui.panes.mcp_modal import MCPModal
-        result = await self._show_inline_screen(MCPModal())
+        result = await self._show_composer_picker(MCPPanel(), inline=True)
         transcript = self.query_one(TranscriptPane)
         if result and result.get("action") == "changed":
             n = int(result.get("count") or 0)
@@ -2777,11 +3084,10 @@ class FlowlyTUI(App[None]):
 
     @work
     async def action_browser(self) -> None:
-        """Open the Browser Use modal — toggle ``browser_tab`` enable
+        """Open Browser Use inline — toggle ``browser_tab`` enable
         flag, see live extension-connection status, and open the Chrome
         Web Store if the extension isn't installed yet."""
-        from flowly.tui.panes.browser_modal import BrowserModal
-        result = await self._show_inline_screen(BrowserModal())
+        result = await self._show_composer_picker(BrowserPanel(), inline=True)
         transcript = self.query_one(TranscriptPane)
         if result and result.get("action") == "saved":
             state = "enabled" if result.get("enabled") else "disabled"
@@ -2798,7 +3104,6 @@ class FlowlyTUI(App[None]):
         from flowly.config.loader import load_config
         from flowly.integrations import get_card
         from flowly.integrations.active_provider import resolve_active_provider
-        from flowly.tui.panes.model_picker import ModelPicker
 
         transcript = self.query_one(TranscriptPane)
         cfg = load_config()
@@ -2824,26 +3129,30 @@ class FlowlyTUI(App[None]):
 
         # Picker path.
         card = get_card(active.key)
-        result = await self._show_inline_screen(ModelPicker(
-            provider_key=active.key,
-            provider_label=card.label if card else active.key,
-            current_model=cfg.agents.defaults.model or "",
-            docs_url=card.docs_url if card else "",
-        ))
+        result = await self._show_composer_picker(
+            ModelPickerPanel(
+                provider_key=active.key,
+                provider_label=card.label if card else active.key,
+                current_model=cfg.agents.defaults.model or "",
+                docs_url=card.docs_url if card else "",
+            ),
+            inline=True,
+        )
         if result and result.get("action") == "switched":
             transcript.add_system(f"✓ model → [b]{result['model']}[/b]")
 
     @work
     async def action_theme(self, rest: str) -> None:
         """Switch TUI color theme via picker or direct ``/theme <name>``."""
-        from flowly.tui.panes.theme_picker import ThemePicker
-
         transcript = self.query_one(TranscriptPane)
         name = (rest or "").strip()
 
         if not name:
             original_theme = self._theme_name
-            result = await self._show_inline_screen(ThemePicker(self._theme_name))
+            result = await self._show_composer_picker(
+                ThemePickerPanel(self._theme_name),
+                inline=True,
+            )
             if not result:
                 self._apply_theme(original_theme, persist=False)
                 return
@@ -3022,7 +3331,7 @@ class FlowlyTUI(App[None]):
         except Exception as exc:
             transcript.add_error(f"audit fetch failed: {exc}")
             return
-        await self._show_inline_screen(ActivityModal(entries, stats))
+        await self._show_composer_picker(ActivityPanel(entries, stats), inline=True)
 
     @work
     async def action_open_approvals(self) -> None:
@@ -3032,7 +3341,7 @@ class FlowlyTUI(App[None]):
         except Exception as exc:
             transcript.add_error(f"approvals fetch failed: {exc}")
             return
-        result = await self._show_inline_screen(ApprovalsModal(pending))
+        result = await self._show_composer_picker(ApprovalsPanel(pending), inline=True)
         if not result:
             return
         aid = result.get("id", "")
@@ -3050,7 +3359,7 @@ class FlowlyTUI(App[None]):
     async def action_open_policy(self) -> None:
         """Edit command permissions (security/ask/allowlist).
 
-        The modal stays open and applies each change live through this
+        The panel stays open and applies each change live through this
         callback; it closes on Esc / Close.
         """
         transcript = self.query_one(TranscriptPane)
@@ -3081,8 +3390,67 @@ class FlowlyTUI(App[None]):
                 transcript.add_error(f"permissions update failed: {exc}")
             return None
 
-        await self._show_inline_screen(PolicyModal(policy, apply))
+        await self._show_composer_picker(PolicyPanel(policy, apply), inline=True)
         await self._poll_badges()
+
+    async def action_cycle_permission(self) -> None:
+        """Cycle the standing permission level (Ask → Auto → YOLO) and apply it
+        LIVE to both the exec tool and the codex_session runtime over RPC.
+
+        Bound to Shift+Tab (app-level). The change takes effect on the next
+        command / codex turn with no gateway restart; the current level shows as
+        the colored badge at the left of the status bar. A slow poll
+        (_sync_permission_badge) keeps that badge in sync when the mode is
+        changed elsewhere — the Desktop app or another client.
+        """
+        idx = getattr(self, "_perm_level_idx", None)
+        if idx is None or idx < 0:
+            # Sync the starting point from the live policy so the first press
+            # advances from where we actually are (or from -1 → Ask).
+            try:
+                idx = _match_permission_level(await self._client.exec_policy_get())
+            except Exception:
+                idx = -1
+        idx = (idx + 1) % len(_PERMISSION_LEVELS)
+
+        key, _label, (security, ask), (approval, sandbox) = _PERMISSION_LEVELS[idx]
+        # Mute the sync poll while we apply, so it can't read a half-written
+        # store and clobber the badge mid-cycle.
+        self._perm_cycling = True
+        try:
+            await self._client.exec_policy_set(security=security, ask=ask)
+            await self._client.codex_policy_set(
+                approval_policy=approval, sandbox=sandbox
+            )
+        except Exception as exc:
+            self.query_one(TranscriptPane).add_error(f"permission cycle failed: {exc}")
+            return
+        finally:
+            self._perm_cycling = False
+
+        self._perm_level_idx = idx
+        self._set_permission_badge(key)
+
+    def _set_permission_badge(self, level_key: str) -> None:
+        """Reflect the standing permission level in the status-bar badge."""
+        try:
+            self.query_one(StatusBar).permission = level_key
+        except Exception:
+            pass
+
+    async def _sync_permission_badge(self) -> None:
+        """Reflect the live exec policy in the badge — on mount AND on a slow
+        poll, so a mode changed elsewhere (the Desktop app, another client)
+        shows up here without a restart. Skips while a manual cycle is applying
+        so it can't clobber it. A policy matching no preset hides the badge."""
+        if getattr(self, "_perm_cycling", False):
+            return
+        try:
+            idx = _match_permission_level(await self._client.exec_policy_get())
+        except Exception:
+            return
+        self._perm_level_idx = idx
+        self._set_permission_badge(_PERMISSION_LEVELS[idx][0] if idx >= 0 else "")
 
     def action_copy_last(self) -> None:
         """Copy the most recent assistant message to the system clipboard
@@ -3108,11 +3476,17 @@ class FlowlyTUI(App[None]):
     async def action_open_artifacts(self) -> None:
         transcript = self.query_one(TranscriptPane)
         try:
-            arts = await self._client.artifacts_list(limit=200)
+            arts = await self._client.artifacts_list(
+                limit=200,
+                include_content=False,
+            )
         except Exception as exc:
             transcript.add_error(f"artifacts fetch failed: {exc}")
             return
-        await self._show_inline_screen(ArtifactsModal(arts))
+        await self._show_composer_picker(
+            ArtifactsPanel(arts, fetcher=self._client.artifacts_get),
+            inline=True,
+        )
 
     @work
     async def action_open_assistants(self) -> None:
@@ -3127,7 +3501,10 @@ class FlowlyTUI(App[None]):
                 "no assistants registered (registry not wired or empty)"
             )
             return
-        picked = await self._show_inline_screen(AssistantPicker(assistants))
+        picked = await self._show_composer_picker(
+            AssistantPickerPanel(assistants),
+            inline=True,
+        )
         if not picked:
             return
         name = picked["name"]
@@ -3152,7 +3529,10 @@ class FlowlyTUI(App[None]):
         if not sessions:
             transcript.add_system("no saved sessions")
             return
-        result = await self._show_inline_screen(SessionPicker(sessions, self._session_key))
+        result = await self._show_composer_picker(
+            SessionPickerPanel(sessions, self._session_key),
+            inline=True,
+        )
         if not result:
             return
         action = result.get("action")

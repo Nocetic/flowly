@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from textual import on
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Label, OptionList
 from textual.widgets.option_list import Option
@@ -11,38 +13,44 @@ from textual.widgets.option_list import Option
 from flowly.tui.theme import FlowlyPalette, list_themes
 
 
-class ThemePicker(ModalScreen[str | None]):
+class ThemePickerPanel(Vertical):
     """Dismisses with the selected theme name, or None on cancel."""
 
+    can_focus = True
+
+    class Dismissed(Message):
+        def __init__(self, result: str | None) -> None:
+            super().__init__()
+            self.result = result
+
     DEFAULT_CSS = """
-    ThemePicker { align: center middle; }
-    ThemePicker > Vertical {
-        width: 72%;
-        max-width: 86;
+    ThemePickerPanel {
+        width: 100%;
+        max-width: 100%;
         height: auto;
         max-height: 24;
-        padding: 1 2;
-        border: thick $primary;
-        background: $surface;
+        padding: 0;
+        border: none;
+        background: transparent;
     }
-    ThemePicker .title {
+    ThemePickerPanel .title {
         text-style: bold;
         color: $primary;
         height: 1;
     }
-    ThemePicker .hint {
+    ThemePickerPanel .hint {
         color: $text-muted;
         text-style: italic;
         height: 1;
         margin-bottom: 1;
     }
-    ThemePicker OptionList {
+    ThemePickerPanel OptionList {
         height: auto;
         max-height: 14;
         border: none;
-        background: $surface;
+        background: transparent;
     }
-    ThemePicker .footer {
+    ThemePickerPanel .footer {
         color: $text-muted;
         text-style: italic;
         height: 1;
@@ -51,8 +59,8 @@ class ThemePicker(ModalScreen[str | None]):
     """
 
     BINDINGS = [
-        ("escape", "dismiss(None)", "Close"),
-        ("q", "dismiss(None)", "Close"),
+        ("escape", "cancel", "Close"),
+        ("q", "cancel", "Close"),
     ]
 
     def __init__(self, current: str) -> None:
@@ -63,17 +71,16 @@ class ThemePicker(ModalScreen[str | None]):
         self._row_index: dict[str, int] = {}
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("Theme", classes="title")
-            yield Label("↑/↓ preview live · Enter apply · Esc revert", classes="hint")
-            yield OptionList(
-                *[
-                    Option(self._row_text(theme), id=theme.name)
-                    for theme in self._themes
-                ],
-                id="theme-list",
-            )
-            yield Label("", id="theme-footer", classes="footer")
+        yield Label("Theme", classes="title")
+        yield Label("↑/↓ preview live · Enter apply · Esc revert", classes="hint")
+        yield OptionList(
+            *[
+                Option(self._row_text(theme), id=theme.name)
+                for theme in self._themes
+            ],
+            id="theme-list",
+        )
+        yield Label("", id="theme-footer", classes="footer")
 
     def on_mount(self) -> None:
         self._row_index = {theme.name: idx for idx, theme in enumerate(self._themes)}
@@ -83,6 +90,13 @@ class ThemePicker(ModalScreen[str | None]):
                 ol.highlighted = idx
                 break
         self._set_preview(self._current)
+        ol.focus()
+
+    def on_focus(self) -> None:
+        try:
+            self.query_one("#theme-list", OptionList).focus()
+        except Exception:
+            pass
 
     def _row_text(self, theme: FlowlyPalette) -> str:
         marker = "›" if theme.name == self._preview else " "
@@ -142,4 +156,39 @@ class ThemePicker(ModalScreen[str | None]):
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         name = str(event.option.id or "")
-        self.dismiss(name or None)
+        self.post_message(self.Dismissed(name or None))
+
+    def action_cancel(self) -> None:
+        self.post_message(self.Dismissed(None))
+
+
+class ThemePicker(ModalScreen[str | None]):
+    """Compatibility wrapper; the chat TUI mounts :class:`ThemePickerPanel`."""
+
+    BINDINGS = ThemePickerPanel.BINDINGS
+
+    DEFAULT_CSS = """
+    ThemePicker { align: center middle; }
+    ThemePicker > ThemePickerPanel {
+        width: 72%;
+        max-width: 86;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
+
+    def __init__(self, current: str) -> None:
+        super().__init__()
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        yield ThemePickerPanel(self._current)
+
+    @on(ThemePickerPanel.Dismissed)
+    def _on_dismissed(self, event: ThemePickerPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(event.result)
+
+    def action_cancel(self) -> None:
+        self.query_one(ThemePickerPanel).action_cancel()

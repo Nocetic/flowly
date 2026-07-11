@@ -14,6 +14,7 @@ from textual.widgets import Static
 
 from flowly.integrations import model_catalog as mc
 from flowly.integrations.model_catalog import Model, get_pricing
+from flowly.tui.panes.composer import Composer
 from flowly.tui.panes.usage_panel import UsagePanel, build_usage_body
 
 
@@ -110,3 +111,34 @@ async def test_usage_panel_mounts_populates_and_dismisses():
         await pilot.press("escape")
         await pilot.pause()
         assert dismissed == [True]           # Esc posts Dismissed → app closes it
+
+
+@pytest.mark.asyncio
+async def test_composer_usage_replaces_input_row():
+    class _Host(App):
+        def compose(self):
+            yield Composer()
+
+        @on(UsagePanel.Dismissed)
+        def _on_dismissed(self, event: UsagePanel.Dismissed) -> None:
+            event.stop()
+            self.query_one(Composer).clear_usage()
+
+    app = _Host()
+    async with app.run_test(size=(90, 40)) as pilot:
+        composer = app.query_one(Composer)
+        composer.show_usage(
+            totals=_totals(), model="anthropic/claude-opus-4.8", provider="openrouter",
+            ctx_used=140_400, ctx_budget=200_000, elapsed=5,
+            account_email=None, credits=None,
+        )
+        await pilot.pause()
+
+        assert composer.has_class("usage-open")
+        assert not app.query_one("#composer-input-row").display
+        assert app.focused is app.query_one(UsagePanel)
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert not composer.has_class("usage-open")

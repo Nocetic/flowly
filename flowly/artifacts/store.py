@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS idx_artifacts_type ON artifacts(type);
 CREATE INDEX IF NOT EXISTS idx_artifacts_pinned ON artifacts(pinned) WHERE pinned = 1;
 CREATE INDEX IF NOT EXISTS idx_artifacts_updated ON artifacts(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_artifacts_session_updated
+    ON artifacts(session_key, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS artifact_versions (
     id            TEXT PRIMARY KEY,
@@ -269,6 +271,7 @@ class ArtifactStore:
         pinned: bool | None = None,
         search: str | None = None,
         tags: list[str] | None = None,
+        session_key: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict]:
@@ -281,7 +284,9 @@ class ArtifactStore:
         because tag values are slug-like and the column is small.
         """
         if search:
-            return self._list_fts(search, type, pinned, tags, limit, offset)
+            return self._list_fts(
+                search, type, pinned, tags, session_key, limit, offset
+            )
 
         conditions: list[str] = []
         params: list[Any] = []
@@ -292,6 +297,9 @@ class ArtifactStore:
         if pinned is not None:
             conditions.append("pinned = ?")
             params.append(1 if pinned else 0)
+        if session_key is not None:
+            conditions.append("session_key = ?")
+            params.append(session_key)
         if tags:
             for tag in tags:
                 # Match the JSON-encoded form: "tag" with surrounding quotes.
@@ -314,6 +322,7 @@ class ArtifactStore:
         type: str | None,
         pinned: bool | None,
         tags: list[str] | None,
+        session_key: str | None,
         limit: int,
         offset: int,
     ) -> list[dict]:
@@ -321,10 +330,17 @@ class ArtifactStore:
         # Escape and quote terms for FTS5
         terms = search.strip().split()
         if not terms:
-            return self.list(type=type, pinned=pinned, tags=tags, limit=limit, offset=offset)
+            return self.list(
+                type=type,
+                pinned=pinned,
+                tags=tags,
+                session_key=session_key,
+                limit=limit,
+                offset=offset,
+            )
         fts_query = " OR ".join(f'"{t}"' for t in terms[:20])
 
-        conditions = ["a.id = f.id"]
+        conditions = ["artifacts_fts MATCH ?"]
         params: list[Any] = [fts_query]
 
         if type is not None:
@@ -333,6 +349,9 @@ class ArtifactStore:
         if pinned is not None:
             conditions.append("a.pinned = ?")
             params.append(1 if pinned else 0)
+        if session_key is not None:
+            conditions.append("a.session_key = ?")
+            params.append(session_key)
         if tags:
             for tag in tags:
                 conditions.append("a.tags LIKE ?")
@@ -342,9 +361,9 @@ class ArtifactStore:
         params.extend([limit, offset])
 
         cur = self._conn.execute(
-            f"""SELECT a.* FROM artifacts_fts f
-                JOIN artifacts a ON {where}
-                WHERE artifacts_fts MATCH ?
+            f"""SELECT a.* FROM artifacts_fts
+                JOIN artifacts a ON a.id = artifacts_fts.id
+                WHERE {where}
                 ORDER BY rank
                 LIMIT ? OFFSET ?""",
             params,

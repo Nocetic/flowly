@@ -59,3 +59,29 @@ async def test_allowlist_remove():
     assert sent["method"] == "exec.policy.allowlist.remove"
     assert sent["params"] == {"pattern": "/usr/bin/git"}
     assert out["removed"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_policy_get():
+    reply = {"enabled": True, "sandbox": "workspace-write", "approvalPolicy": "on-request"}
+    client, sent = _client_capturing(reply)
+    out = await client.codex_policy_get()
+    assert sent["method"] == "codex.policy.get"
+    assert sent["params"] == {}
+    assert out == reply
+
+
+@pytest.mark.asyncio
+async def test_codex_policy_set_maps_camelCase_and_omits_unset():
+    client, sent = _client_capturing({"ok": True, "willRestart": False})
+    await client.codex_policy_set(approval_policy="never")
+    assert sent["method"] == "codex.policy.set"
+    # Wire shape is camelCase; sandbox omitted when not provided.
+    assert sent["params"] == {"approvalPolicy": "never"}
+
+
+@pytest.mark.asyncio
+async def test_codex_policy_set_sends_both_fields():
+    client, sent = _client_capturing({"ok": True, "willRestart": False})
+    await client.codex_policy_set(approval_policy="untrusted", sandbox="read-only")
+    assert sent["params"] == {"approvalPolicy": "untrusted", "sandbox": "read-only"}

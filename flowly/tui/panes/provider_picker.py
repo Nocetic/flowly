@@ -12,12 +12,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from textual import events, work
+from textual import events, on, work
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Label, OptionList
-from textual.widgets.option_list import Option
+from textual.widgets import Static
 
 from flowly.integrations import IntegrationCard, ProbeResult, list_cards
 from flowly.integrations.active_provider import (
@@ -26,110 +26,135 @@ from flowly.integrations.active_provider import (
     set_active_provider,
 )
 from flowly.integrations.probes import run_with_timeout
+from flowly.tui.panes.inline_picker import (
+    clamp_index,
+    fuzzy_filter,
+    is_plain_character,
+    picker_width_for_columns,
+    visible_window,
+)
+
+VISIBLE_ROWS = 12
 
 
-_CARD_PREFIX = "CARD:"
-
-
-def _badge_color(status: str) -> str:
-    return {
-        "ok": "green",
-        "auth_failed": "yellow",
-        "down": "red",
-        "disabled": "yellow",
-        "not_configured": "dim",
-        "unknown": "dim",
-    }.get(status, "dim")
-
-
-class ProviderPicker(ModalScreen[dict[str, Any] | None]):
+class ProviderPickerPanel(Vertical):
     """Dismisses with one of:
       {'action': 'switched', 'key': '<provider>'}
       {'action': 'inline_setup', 'key': '<provider>'}  (paste primary key)
-      {'action': 'opened_setup', 'key': '<provider>'}   (user wants to edit)
+      {'action': 'opened_setup', 'key': '<provider>'}   (all-fields inline edit)
       None                                              (cancel)
     """
 
+    can_focus = True
+
     DEFAULT_CSS = """
-    ProviderPicker { align: center middle; }
-    ProviderPicker > Vertical {
-        width: 75%;
+    ProviderPickerPanel {
+        width: auto;
+        min-width: 40;
         max-width: 90;
-        height: 70%;
-        max-height: 26;
-        padding: 1 2;
-        border: thick $primary;
+        height: auto;
+        max-height: 22;
+        padding: 0 1;
+        border: double $primary;
         background: $surface;
     }
-    ProviderPicker .title {
+    ProviderPickerPanel .title {
         text-style: bold;
         color: $primary;
         height: 1;
     }
-    ProviderPicker .hint {
+    ProviderPickerPanel .muted,
+    ProviderPickerPanel .hint,
+    ProviderPickerPanel .scroll-line {
         color: $text-muted;
-        text-style: italic;
         height: 1;
-        margin-bottom: 1;
     }
-    ProviderPicker .active-line {
-        color: $text;
-        height: auto;
-        padding: 1;
-        margin-bottom: 1;
-        background: $boost;
-    }
-    ProviderPicker OptionList {
-        height: 1fr;
-        border: none;
-        background: $surface;
-    }
-    ProviderPicker .footer {
+    ProviderPickerPanel .filter-line {
+        height: 1;
         color: $text-muted;
-        text-style: italic;
+    }
+    ProviderPickerPanel .filter-line.active {
+        color: $primary;
+    }
+    ProviderPickerPanel .warning-line {
         height: 1;
-        margin-top: 1;
+        color: $warning;
+    }
+    ProviderPickerPanel .picker-row {
+        height: 1;
+        color: $text-muted;
+    }
+    ProviderPickerPanel .picker-row.selected {
+        background: $primary;
+        color: $surface;
+        text-style: bold;
+    }
+    ProviderPickerPanel .footer {
+        color: $text-muted;
+        height: 1;
     }
     """
 
-    BINDINGS = [
-        ("escape", "dismiss(None)", "Close"),
-        ("q",      "dismiss(None)", "Close"),
-        ("e",      "open_setup",    "Edit"),
-        ("x",      "disconnect",    "Sign out"),
-    ]
+    BINDINGS = []
+
+    class Dismissed(Message):
+        def __init__(self, result: dict[str, Any] | None) -> None:
+            super().__init__()
+            self.result = result
 
     def __init__(self) -> None:
         super().__init__()
         self._cards: list[IntegrationCard] = list_cards("provider")
         self._results: dict[str, ProbeResult] = {}
-        self._row_index: dict[str, int] = {}
         self._active_key: str | None = None
         self._active_source: str = ""
+        self._filter = ""
+        self._selected_idx = 0
 
     # ── layout ────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("LLM provider", classes="title")
-            yield Label(
-                "↑/↓ navigate · Enter set up / switch · E edit · X sign out · Esc close",
-                classes="hint",
-            )
-            yield Label("", id="active-provider-line", classes="active-line")
-            yield OptionList(id="provider-list")
-            yield Label("", id="provider-footer", classes="footer")
+        yield Static("Select provider", classes="title")
+        yield Static("Full model catalogs stay under /model · Enter set up / switch", classes="muted")
+        yield Static("", id="active-provider-line", classes="muted")
+        yield Static("", id="provider-filter-line", classes="filter-line")
+        yield Static("", id="provider-warning-line", classes="warning-line")
+        yield Static("", id="provider-scroll-top", classes="scroll-line")
+        for i in range(VISIBLE_ROWS):
+            yield Static("", id=f"provider-row-{i}", classes="picker-row")
+        yield Static("", id="provider-scroll-bottom", classes="scroll-line")
+        yield Static("↑/↓ select · Enter choose · Ctrl+E edit · Ctrl+D sign out · Esc clear/back · q close",
+                     id="provider-footer", classes="footer")
 
     def on_mount(self) -> None:
+        self._sync_panel_width()
         self._resolve_active()
-        self._rebuild_list()
+        self._selected_idx = self._active_index()
+        self._render_list()
         self._kick_probes()
-        ol = self.query_one(OptionList)
-        # Land highlight on the current default if any, else the first row.
-        if self._active_key and self._active_key in self._row_index:
-            ol.highlighted = self._row_index[self._active_key]
-        elif ol.options:
-            ol.highlighted = 0
+        self.focus()
+
+    def on_resize(self, _event: events.Resize) -> None:
+        self._sync_panel_width()
+
+    def _sync_panel_width(self) -> None:
+        try:
+            if self._is_composer_inline():
+                self.styles.width = "100%"
+                self.styles.max_width = "100%"
+                return
+            self.styles.width = picker_width_for_columns(self.app.size.width)
+        except Exception:
+            pass
+
+    def _is_composer_inline(self) -> bool:
+        return any(
+            bool(getattr(node, "has_class", lambda _name: False)("picker-inline-open"))
+            for node in self.ancestors
+        )
+
+    def _finish(self, result: dict[str, Any] | None) -> None:
+        self.post_message(self.Dismissed(result))
 
     def _resolve_active(self) -> None:
         try:
@@ -152,55 +177,128 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
         label = self._active_label()
         if self._active_key:
             text = (
-                f"[dim]Active now[/]  [b]{label}[/b]  "
-                f"[dim]{self._active_source}[/dim]"
+                f"Current: [b]{label}[/b]  [dim]{self._active_source}[/dim]"
             )
         else:
-            text = "[yellow]No active provider[/yellow]  [dim]configure one before chatting[/dim]"
+            text = "[yellow]Current: none[/yellow]  [dim]configure one before chatting[/dim]"
         try:
-            self.query_one("#active-provider-line", Label).update(text)
+            self.query_one("#active-provider-line", Static).update(text)
         except Exception:
             pass
 
-    def _rebuild_list(self) -> None:
-        ol = self.query_one(OptionList)
-        ol.clear_options()
-        self._row_index.clear()
-        for i, card in enumerate(self._cards):
-            ol.add_option(Option(self._row_text(card), id=f"{_CARD_PREFIX}{card.key}"))
-            self._row_index[card.key] = i
+    def _active_index(self) -> int:
+        cards = self._filtered_cards()
+        if self._active_key:
+            for i, card in enumerate(cards):
+                if card.key == self._active_key:
+                    return i
+        return 0
 
     def _row_text(self, card: IntegrationCard) -> str:
         res = self._results.get(card.key)
         if res is None:
-            badge = "[dim]·[/dim]"
-            detail = "[dim]probing…[/dim]"
+            mark = "·"
+            detail = "probing..."
         else:
-            color = _badge_color(res.status)
-            badge = f"[{color}]{res.badge}[/{color}]"
-            detail = f"[{color}]{res.detail or res.status}[/{color}]"
-        default = (
-            "  [yellow]ACTIVE[/yellow]"
-            if card.key == self._active_key
-            else ""
-        )
-        return f" {badge}  [b]{card.label:<22}[/b]  {detail}{default}"
+            mark = "*" if card.key == self._active_key else (
+                "○" if res.status in {"auth_failed", "disabled", "not_configured"} else "●"
+            )
+            detail = res.detail or res.status
+        active = " current" if card.key == self._active_key else ""
+        return f"{mark} {card.label} · {detail}{active}"
+
+    def _filtered_cards(self) -> list[IntegrationCard]:
+        return fuzzy_filter(self._cards, self._filter, self._card_search_text)
+
+    def _card_search_text(self, card: IntegrationCard) -> str:
+        res = self._results.get(card.key)
+        return " ".join([
+            card.key,
+            card.label,
+            getattr(card, "description", "") or "",
+            res.detail if res is not None else "",
+            res.status if res is not None else "",
+        ])
+
+    def _selected_card(self) -> IntegrationCard | None:
+        cards = self._filtered_cards()
+        if not cards:
+            return None
+        self._selected_idx = clamp_index(self._selected_idx, len(cards))
+        return cards[self._selected_idx]
+
+    def _selected_key(self) -> str | None:
+        card = self._selected_card()
+        return card.key if card is not None else None
+
+    @staticmethod
+    def _index_for_key(cards: list[IntegrationCard], key: str | None) -> int | None:
+        if not key:
+            return None
+        for idx, card in enumerate(cards):
+            if card.key == key:
+                return idx
+        return None
+
+    def _render_list(self, preferred_key: str | None = None) -> None:
+        cards = self._filtered_cards()
+        preferred_idx = self._index_for_key(cards, preferred_key)
+        if preferred_idx is not None:
+            self._selected_idx = preferred_idx
+        else:
+            self._selected_idx = clamp_index(self._selected_idx, len(cards))
+        start, end = visible_window(self._selected_idx, len(cards), VISIBLE_ROWS)
+        visible = cards[start:end]
+        try:
+            line = self.query_one("#provider-filter-line", Static)
+            if self._filter:
+                line.add_class("active")
+                line.update(f"filter: {self._filter}▎ · {len(cards)}/{len(self._cards)}")
+            else:
+                line.remove_class("active")
+                line.update("type to filter · ↑/↓ select")
+        except Exception:
+            pass
+        try:
+            selected = self._selected_card()
+            res = self._results.get(selected.key) if selected is not None else None
+            warning = res.detail if res is not None and res.status != "ok" else " "
+            self.query_one("#provider-warning-line", Static).update(
+                f"warning: {warning}" if warning.strip() else " "
+            )
+        except Exception:
+            pass
+        try:
+            self.query_one("#provider-scroll-top", Static).update(
+                f" ↑ {start} more" if start > 0 else " "
+            )
+            self.query_one("#provider-scroll-bottom", Static).update(
+                f" ↓ {len(cards) - end} more" if end < len(cards) else " "
+            )
+        except Exception:
+            pass
+        for row in range(VISIBLE_ROWS):
+            widget = self.query_one(f"#provider-row-{row}", Static)
+            idx = start + row
+            if row >= len(visible):
+                widget.remove_class("selected")
+                empty = (
+                    "no providers match filter"
+                    if self._filter
+                    else "no providers available"
+                )
+                widget.update(empty if row == 0 and not cards else " ")
+                continue
+            card = visible[row]
+            selected = idx == self._selected_idx
+            if selected:
+                widget.add_class("selected")
+            else:
+                widget.remove_class("selected")
+            widget.update(f"{'▸' if selected else ' '} {idx + 1}. {self._row_text(card)}")
 
     def _refresh_row(self, key: str) -> None:
-        ol = self.query_one(OptionList)
-        idx = self._row_index.get(key)
-        if idx is None:
-            return
-        card = next((c for c in self._cards if c.key == key), None)
-        if card is None:
-            return
-        try:
-            ol.replace_option_prompt_at_index(idx, self._row_text(card))
-        except (AttributeError, Exception):
-            cur = ol.highlighted
-            self._rebuild_list()
-            if cur is not None and cur < len(ol.options):
-                ol.highlighted = cur
+        self._render_list()
 
     # ── probing ───────────────────────────────────────────────────
 
@@ -228,15 +326,6 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
 
     # ── actions ───────────────────────────────────────────────────
 
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        oid = str(event.option.id or "")
-        if not oid.startswith(_CARD_PREFIX):
-            return
-        key = oid[len(_CARD_PREFIX):]
-        # Refuse the switch if the provider isn't actually usable —
-        # silently dangling default points are how users end up stuck.
-        self._do_switch(key)
-
     @work
     async def _do_switch(self, key: str) -> None:
         from flowly.config.loader import load_config
@@ -250,18 +339,18 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
             ):
                 # Subscription-style provider: selecting it when not connected
                 # should start its dedicated setup flow, not a generic form.
-                self.dismiss({"action": "needs_login", "key": key})
+                self._finish({"action": "needs_login", "key": key})
             elif card is not None and card.custom_action == "login":
                 # Flowly account: browser sign-in (which auto-provisions the
                 # account key), NOT a paste-your-key form. The app opens the
                 # LoginModal on "login".
-                self.dismiss({"action": "login", "key": key})
+                self._finish({"action": "login", "key": key})
             else:
                 # Not configured yet → there's nothing to switch to, so the
                 # only useful action is to set it up. Jump straight to the
                 # credential form (paste-your-key screen) instead of making
                 # the user discover the "E" binding.
-                self.dismiss({"action": "inline_setup", "key": key})
+                self._finish({"action": "inline_setup", "key": key})
             return
         try:
             model_changed = await asyncio.to_thread(set_active_provider, key)
@@ -273,7 +362,7 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
         model_note = f" · model → [b]{model_changed}[/b]" if model_changed else ""
         self._set_footer(f"✓ default → [b]{key}[/b]{model_note} · {tail}")
         await asyncio.sleep(0.9)
-        self.dismiss({"action": "switched", "key": key})
+        self._finish({"action": "switched", "key": key})
 
     async def _reload_gateway(self) -> str:
         """Trigger the gateway hot-swap and push the new model into the
@@ -299,33 +388,18 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
             return "[dim]gateway offline — restart to apply[/dim]"
 
     def action_open_setup(self) -> None:
-        ol = self.query_one(OptionList)
-        if ol.highlighted is None:
+        card = self._selected_card()
+        if card is None:
             return
-        try:
-            opt = ol.get_option_at_index(ol.highlighted)
-        except Exception:
-            return
-        oid = str(opt.id or "")
-        if not oid.startswith(_CARD_PREFIX):
-            return
-        key = oid[len(_CARD_PREFIX):]
-        self.dismiss({"action": "opened_setup", "key": key})
+        self._finish({"action": "opened_setup", "key": card.key})
 
     def action_disconnect(self) -> None:
         """Sign out of a subscription-style provider. For pasted-key providers
         there's nothing to "sign out" of, so we just hint."""
-        ol = self.query_one(OptionList)
-        if ol.highlighted is None:
+        selected = self._selected_card()
+        if selected is None:
             return
-        try:
-            opt = ol.get_option_at_index(ol.highlighted)
-        except Exception:
-            return
-        oid = str(opt.id or "")
-        if not oid.startswith(_CARD_PREFIX):
-            return
-        key = oid[len(_CARD_PREFIX):]
+        key = selected.key
         card = next((c for c in self._cards if c.key == key), None)
         if card is None or card.custom_action not in (
             "xai_login",
@@ -349,10 +423,96 @@ class ProviderPicker(ModalScreen[dict[str, Any] | None]):
                 return
         except Exception:
             pass
-        self.dismiss({"action": "disconnect", "key": key})
+        self._finish({"action": "disconnect", "key": key})
 
     def _set_footer(self, text: str) -> None:
         try:
-            self.query_one("#provider-footer", Label).update(text)
+            self.query_one("#provider-footer", Static).update(text)
         except Exception:
             pass
+
+    def action_cancel(self) -> None:
+        self._finish(None)
+
+    def on_key(self, event: events.Key) -> None:
+        key = event.key
+        char = event.character or ""
+        cards = self._filtered_cards()
+        handled = True
+        is_ctrl_u = key == "ctrl+u" or (getattr(event, "ctrl", False) and char == "u")
+        is_ctrl_e = key == "ctrl+e" or (getattr(event, "ctrl", False) and char == "e")
+        is_ctrl_d = key == "ctrl+d" or (getattr(event, "ctrl", False) and char == "d")
+        if key == "escape":
+            if self._filter:
+                preferred_key = self._selected_key() or self._active_key
+                self._filter = ""
+                self._render_list(preferred_key)
+            else:
+                self.action_cancel()
+        elif key == "q" and not self._filter:
+            self.action_cancel()
+        elif key == "up":
+            if cards:
+                self._selected_idx = max(0, self._selected_idx - 1)
+                self._render_list()
+        elif key == "down":
+            if cards:
+                self._selected_idx = min(len(cards) - 1, self._selected_idx + 1)
+                self._render_list()
+        elif key == "home":
+            if cards:
+                self._selected_idx = 0
+                self._render_list()
+        elif key == "end":
+            if cards:
+                self._selected_idx = len(cards) - 1
+                self._render_list()
+        elif key == "pageup":
+            if cards:
+                self._selected_idx = max(0, self._selected_idx - VISIBLE_ROWS)
+                self._render_list()
+        elif key == "pagedown":
+            if cards:
+                self._selected_idx = min(len(cards) - 1, self._selected_idx + VISIBLE_ROWS)
+                self._render_list()
+        elif key in ("enter", "return"):
+            card = self._selected_card()
+            if card is not None:
+                self._do_switch(card.key)
+        elif key in ("backspace", "delete"):
+            preferred_key = self._selected_key()
+            self._filter = self._filter[:-1]
+            self._render_list(preferred_key)
+        elif is_ctrl_u:
+            preferred_key = self._selected_key()
+            self._filter = ""
+            self._render_list(preferred_key)
+        elif is_ctrl_e:
+            self.action_open_setup()
+        elif is_ctrl_d:
+            self.action_disconnect()
+        elif is_plain_character(event, char):
+            self._filter += char
+            self._selected_idx = 0
+            self._render_list()
+        else:
+            handled = False
+        if handled:
+            event.stop()
+            event.prevent_default()
+
+
+class ProviderPicker(ModalScreen[dict[str, Any] | None]):
+    """Modal wrapper kept for setup flows; chat mounts ProviderPickerPanel inline."""
+
+    DEFAULT_CSS = """
+    ProviderPicker { align: center middle; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield ProviderPickerPanel()
+
+    @on(ProviderPickerPanel.Dismissed)
+    def _on_dismissed(self, event: ProviderPickerPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(event.result)

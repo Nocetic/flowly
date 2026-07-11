@@ -12,19 +12,14 @@ import asyncio
 import subprocess
 import sys
 
-from textual import on
+from textual import events, on
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.reactive import reactive
+from textual.containers import Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Label, Static, Switch
+from textual.widgets import Label, Static
 
-from flowly.account.auth import (
-    Account,
-    LoginTimeout,
-    POLL_TIMEOUT_S,
-    run_login_flow,
-)
+from flowly.account.auth import Account, LoginTimeout, run_login_flow
 from flowly.account.firebase_rest import FirebaseAuthError
 
 
@@ -83,92 +78,75 @@ def _open_browser_detached(url: str) -> bool:
         return False
 
 
-class LoginModal(ModalScreen[Account | None]):
-    """Dismisses with the signed-in Account on success, ``None`` on cancel."""
+class LoginPanel(Vertical):
+    """Composer-inline device authorization state machine."""
+
+    can_focus = True
+
+    class Dismissed(Message):
+        def __init__(self, result: Account | None) -> None:
+            super().__init__()
+            self.result = result
 
     DEFAULT_CSS = """
-    LoginModal { align: center middle; }
-    LoginModal > Vertical {
-        width: 70%;
-        max-width: 80;
+    LoginPanel {
+        width: 100%;
+        max-width: 100%;
         height: auto;
-        max-height: 28;
-        padding: 1 2;
-        border: thick $primary;
-        background: $surface;
+        max-height: 24;
+        padding: 0;
+        border: none;
+        background: transparent;
     }
-    LoginModal .eyebrow {
+    LoginPanel .eyebrow {
         color: $text-muted;
         height: 1;
     }
-    LoginModal .title {
+    LoginPanel .title {
         text-style: bold;
         color: $primary;
         height: 1;
     }
-    LoginModal .hint {
+    LoginPanel .hint {
         color: $text-muted;
         height: auto;
-        margin-bottom: 1;
     }
-    LoginModal .url-line {
+    LoginPanel .url-line {
         color: $accent;
         height: auto;
     }
-    LoginModal .code-box {
-        background: $boost;
+    LoginPanel .code-box {
         color: $accent;
         text-style: bold;
-        text-align: center;
-        padding: 1 2;
-        margin: 1 0;
-        border: round $primary;
-        height: 3;
+        height: 1;
     }
-    LoginModal .steps {
+    LoginPanel .steps {
         height: auto;
-        padding: 1;
-        background: $boost;
-        margin-bottom: 1;
+        margin: 1 0;
     }
-    LoginModal .step {
+    LoginPanel .step {
         height: auto;
         color: $text;
     }
-    LoginModal .status {
+    LoginPanel .status {
         color: $text-muted;
         height: auto;
         min-height: 1;
         margin-top: 1;
-        padding: 1;
-        background: $boost;
     }
-    LoginModal .status.ok    { color: green; }
-    LoginModal .status.error { color: red; }
-    LoginModal #button-row {
-        layout: horizontal;
+    LoginPanel .status.ok    { color: green; }
+    LoginPanel .status.error { color: red; }
+    LoginPanel #login-relay {
         height: auto;
-        align-horizontal: right;
         margin-top: 1;
+        color: $text;
     }
-    LoginModal #button-row Button { margin-left: 1; }
-    LoginModal #relay-row {
-        layout: horizontal;
-        height: auto;
-        margin-bottom: 1;
-    }
-    LoginModal .relay-label {
+    LoginPanel #login-footer {
         height: auto;
         color: $text-muted;
-        margin-left: 1;
-        content-align: left middle;
+        margin-top: 1;
     }
     """
-
-    BINDINGS = [("escape", "close", "Close")]
-
-    status_text:  reactive[str] = reactive("requesting code…", layout=True)
-    status_class: reactive[str] = reactive("status", layout=False)
 
     def __init__(self) -> None:
         super().__init__()
@@ -176,38 +154,44 @@ class LoginModal(ModalScreen[Account | None]):
         self._url: str | None = None
         self._task: asyncio.Task[Account] | None = None
         self._account: Account | None = None
+        self._want_relay = False
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("Account authorization", classes="eyebrow")
-            yield Label("Sign in to Flowly", classes="title")
-            yield Label(
-                "The browser should open automatically. Keep this modal open "
-                "until authorization completes.",
-                classes="hint",
-            )
-            with Horizontal(id="relay-row"):
-                yield Switch(value=False, id="login-relay")
-                yield Label(
-                    "Reachable remotely (phone / Flowly relay) — registers a server",
-                    classes="relay-label",
-                )
-            with Vertical(classes="steps"):
-                yield Label("○ Requesting device code", id="step-code", classes="step")
-                yield Label("○ Opening browser", id="step-browser", classes="step")
-                yield Label("○ Waiting for authorization", id="step-auth", classes="step")
-                yield Label("○ Registering this machine", id="step-machine", classes="step")
-            yield Static("Fetching authorization URL…",
-                         id="login-url", classes="url-line", markup=False)
-            yield Static("[dim]code: …[/dim]", id="login-code", classes="code-box", markup=True)
-            yield Label(self.status_text, id="login-status", classes="status")
-            with Horizontal(id="button-row"):
-                yield Button("Open browser", id="login-open", variant="default")
-                yield Button("Copy code", id="login-copy", variant="default")
-                yield Button("Cancel  (Esc)", id="login-cancel", variant="default")
+        yield Label("Account authorization", classes="eyebrow")
+        yield Label("Sign in to Flowly", classes="title")
+        yield Label(
+            "The browser opens automatically. Keep this prompt open until authorization completes.",
+            classes="hint",
+        )
+        yield Static("", id="login-relay", markup=False)
+        with Vertical(classes="steps"):
+            yield Label("○ Requesting device code", id="step-code", classes="step")
+            yield Label("○ Opening browser", id="step-browser", classes="step")
+            yield Label("○ Waiting for authorization", id="step-auth", classes="step")
+            yield Label("○ Registering this machine", id="step-machine", classes="step")
+        yield Static(
+            "Fetching authorization URL…",
+            id="login-url",
+            classes="url-line",
+            markup=False,
+        )
+        yield Static(
+            "[dim]code: …[/dim]",
+            id="login-code",
+            classes="code-box",
+            markup=True,
+        )
+        yield Label("requesting code…", id="login-status", classes="status")
+        yield Static("", id="login-footer", markup=False)
 
     def on_mount(self) -> None:
+        self._render_relay()
+        self._render_footer()
         self._task = asyncio.create_task(self._drive())
+
+    def on_unmount(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
 
     async def _drive(self) -> None:
         try:
@@ -224,7 +208,7 @@ class LoginModal(ModalScreen[Account | None]):
             self._set_step("step-auth", "error", "Authorization failed")
             return
         except asyncio.CancelledError:
-            raise
+            return
         except Exception as exc:  # pragma: no cover - defensive
             self._set_status(f"unexpected error: {exc}", "error")
             self._set_step("step-auth", "error", "Authorization failed")
@@ -245,14 +229,8 @@ class LoginModal(ModalScreen[Account | None]):
             pass
 
         # Reach: remote / phone access via the relay is OPT-IN (it registers a
-        # server). Honour the modal's toggle — default OFF = provider only.
-        want_relay = False
-        try:
-            want_relay = bool(self.query_one("#login-relay", Switch).value)
-        except Exception:  # noqa: BLE001
-            want_relay = False
-
-        if not want_relay:
+        # server). Honour the inline toggle — default OFF = provider only.
+        if not self._want_relay:
             self._set_step("step-machine", "ok", "Skipped — no relay (provider only)")
             self._set_status(
                 "✓ signed in — Flowly provider ready, billed to your account", "ok"
@@ -337,8 +315,6 @@ class LoginModal(ModalScreen[Account | None]):
         self._set_step("step-auth", "pending", "Waiting for authorization")
 
     def _set_status(self, msg: str, kind: str = "status") -> None:
-        self.status_text = msg
-        self.status_class = "status"
         try:
             label = self.query_one("#login-status", Label)
             label.update(msg)
@@ -350,11 +326,6 @@ class LoginModal(ModalScreen[Account | None]):
         except Exception:
             pass
 
-    @on(Button.Pressed, "#login-cancel")
-    def _cancel(self) -> None:
-        self.action_close()
-
-    @on(Button.Pressed, "#login-open")
     def _open(self) -> None:
         if not self._url:
             self._set_status("authorization URL is not ready yet")
@@ -366,7 +337,6 @@ class LoginModal(ModalScreen[Account | None]):
             self._set_status(f"could not open browser — copy URL manually: {self._url}", "error")
             self._set_step("step-browser", "error", "Browser did not open")
 
-    @on(Button.Pressed, "#login-copy")
     def _copy_code(self) -> None:
         if not self._code:
             self._set_status("device code is not ready yet")
@@ -381,20 +351,55 @@ class LoginModal(ModalScreen[Account | None]):
 
     def action_close(self) -> None:
         if self._account is not None:
-            self.dismiss(self._account)
+            self.post_message(self.Dismissed(self._account))
             return
         if self._task and not self._task.done():
             self._task.cancel()
-        self.dismiss(None)
+        self.post_message(self.Dismissed(None))
 
     def _finish(self, account: Account) -> None:
         self._account = account
+        self._render_footer()
+
+    def _render_relay(self) -> None:
+        mark = "[x]" if self._want_relay else "[ ]"
         try:
-            self.query_one("#login-cancel", Button).label = "Done  (Esc)"
-            self.query_one("#login-open", Button).display = False
-            self.query_one("#login-copy", Button).display = False
+            self.query_one("#login-relay", Static).update(
+                f"{mark} Remote phone / Flowly relay access (R toggle)"
+            )
         except Exception:
             pass
+
+    def _render_footer(self) -> None:
+        hint = (
+            "Enter done · Esc close"
+            if self._account is not None
+            else "R relay · O open browser · C copy code · Esc cancel"
+        )
+        try:
+            self.query_one("#login-footer", Static).update(hint)
+        except Exception:
+            pass
+
+    def on_key(self, event: events.Key) -> None:
+        key = event.key.lower()
+        handled = True
+        if key == "escape":
+            self.action_close()
+        elif key in {"enter", "return"} and self._account is not None:
+            self.action_close()
+        elif key == "r" and self._account is None:
+            self._want_relay = not self._want_relay
+            self._render_relay()
+        elif key == "o" and self._account is None:
+            self._open()
+        elif key == "c" and self._account is None:
+            self._copy_code()
+        else:
+            handled = False
+        if handled:
+            event.stop()
+            event.prevent_default()
 
     def _set_step(self, widget_id: str, kind: str, label: str) -> None:
         mark = {
@@ -406,3 +411,26 @@ class LoginModal(ModalScreen[Account | None]):
             self.query_one(f"#{widget_id}", Label).update(f"{mark} {label}")
         except Exception:
             pass
+
+
+class LoginModal(ModalScreen[Account | None]):
+    """Compatibility wrapper used by the standalone setup application."""
+
+    DEFAULT_CSS = """
+    LoginModal { align: center middle; }
+    LoginModal > LoginPanel {
+        width: 70%;
+        max-width: 80;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield LoginPanel()
+
+    @on(LoginPanel.Dismissed)
+    def _on_dismissed(self, event: LoginPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(event.result)

@@ -23,6 +23,7 @@ from typing import Any
 from textual import events, on, work
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, OptionList
 from textual.widgets.option_list import Option
@@ -35,7 +36,6 @@ from flowly.integrations.mcp_io import (
     remove_mcp_server,
     set_mcp_enabled,
 )
-
 
 _PREFIX = "MCP:"
 
@@ -129,30 +129,36 @@ def _status_glyph(status: str) -> str:
     }.get(status, "·")
 
 
-class MCPModal(ModalScreen[dict[str, Any] | None]):
+class MCPPanel(Vertical):
     """Dismisses with:
       {'action': 'changed', 'count': N}  → N changes this session
       {'action': 'install_secret', 'name': str, 'fields': list[MCPSecretField]}
       None                                → no changes
     """
 
+    can_focus = True
+
+    class Dismissed(Message):
+        def __init__(self, result: dict[str, Any] | None) -> None:
+            super().__init__()
+            self.result = result
+
     DEFAULT_CSS = """
-    MCPModal { align: center middle; }
-    MCPModal > Vertical {
-        width: 85%;
-        max-width: 100;
-        height: 80%;
-        max-height: 32;
-        padding: 1 2;
-        border: thick $primary;
-        background: $surface;
+    MCPPanel {
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+        max-height: 24;
+        padding: 0;
+        border: none;
+        background: transparent;
     }
-    MCPModal .title { text-style: bold; color: $primary; height: 1; }
-    MCPModal .hint {
+    MCPPanel .title { text-style: bold; color: $primary; height: 1; }
+    MCPPanel .hint {
         color: $text-muted; text-style: italic; height: 1; margin-bottom: 1;
     }
-    MCPModal OptionList { height: 1fr; border: none; background: $surface; }
-    MCPModal .footer {
+    MCPPanel OptionList { height: 16; border: none; background: transparent; }
+    MCPPanel .footer {
         color: $text-muted; text-style: italic; height: auto; margin-top: 1;
     }
     """
@@ -172,21 +178,27 @@ class MCPModal(ModalScreen[dict[str, Any] | None]):
     # ── layout ────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("MCP servers", classes="title")
-            yield Label(
-                "↑/↓ navigate · Space/Enter toggle/install · D remove · "
-                "R reload · Esc close",
-                classes="hint",
-            )
-            yield OptionList(id="mcp-list")
-            yield Label("", id="mcp-footer", classes="footer")
+        yield Label("MCP servers", classes="title")
+        yield Label(
+            "↑/↓ navigate · Space/Enter toggle/install · D remove · "
+            "R reload · Esc close",
+            classes="hint",
+        )
+        yield OptionList(id="mcp-list")
+        yield Label("", id="mcp-footer", classes="footer")
 
     def on_mount(self) -> None:
         self._rebuild_list()
         ol = self.query_one(OptionList)
         if ol.options:
             ol.highlighted = 0
+        ol.focus()
+
+    def on_focus(self) -> None:
+        try:
+            self.query_one(OptionList).focus()
+        except Exception:
+            pass
 
     def _rebuild_list(self) -> None:
         self._servers = list_mcp_servers()
@@ -303,11 +315,11 @@ class MCPModal(ModalScreen[dict[str, Any] | None]):
         # Collect any declared secrets/values inside the TUI (no CLI hop).
         env_values: dict[str, str] = {}
         if entry.needs_secrets:
-            self.dismiss({
+            self.post_message(self.Dismissed({
                 "action": "install_secret",
                 "name": entry.name,
                 "fields": entry.secret_fields or [],
-            })
+            }))
             return
         try:
             ok, msg = await asyncio.to_thread(
@@ -364,10 +376,10 @@ class MCPModal(ModalScreen[dict[str, Any] | None]):
         self._set_footer("reloaded")
 
     def action_dismiss_with_count(self) -> None:
-        self.dismiss(
+        self.post_message(self.Dismissed(
             {"action": "changed", "count": self._changes}
             if self._changes else None
-        )
+        ))
 
     # ── helpers ──────────────────────────────────────────────────
 
@@ -376,3 +388,37 @@ class MCPModal(ModalScreen[dict[str, Any] | None]):
             self.query_one("#mcp-footer", Label).update(text)
         except Exception:
             pass
+
+
+class MCPModal(ModalScreen[dict[str, Any] | None]):
+    """Compatibility wrapper; the chat TUI mounts :class:`MCPPanel`."""
+
+    BINDINGS = MCPPanel.BINDINGS
+
+    DEFAULT_CSS = """
+    MCPModal { align: center middle; }
+    MCPModal > MCPPanel {
+        width: 85%;
+        max-width: 100;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield MCPPanel()
+
+    @on(MCPPanel.Dismissed)
+    def _on_dismissed(self, event: MCPPanel.Dismissed) -> None:
+        event.stop()
+        self.dismiss(event.result)
+
+    def action_reload(self) -> None:
+        self.query_one(MCPPanel).action_reload()
+
+    def action_remove(self) -> None:
+        self.query_one(MCPPanel).action_remove()
+
+    def action_dismiss_with_count(self) -> None:
+        self.query_one(MCPPanel).action_dismiss_with_count()

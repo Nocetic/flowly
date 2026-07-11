@@ -108,7 +108,7 @@ This is for *your* quick checks; the agent has its own sandboxed shell tool gove
 | Key | Action |
 |---|---|
 | `Enter` / `Shift+Enter` | Send / new line |
-| `↑` / `↓` | Input history prev / next |
+| `↑` / `↓` | Input history prev / next; `↓` on an empty draft opens this chat's [artifacts](../features/artifacts.md) (`↑/↓` select · `Enter` open · `←/→` switch in the viewer) |
 | `Ctrl+E` | Edit draft in `$EDITOR` |
 | `Ctrl+S` / `Ctrl+M` | Sessions / personas picker |
 | `Ctrl+A` | Toggle subagent sidebar |
