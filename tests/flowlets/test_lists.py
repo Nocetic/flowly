@@ -182,6 +182,42 @@ async def test_envelope_unwrapped_for_non_item_ops(store):
     assert res["values"]["note"] == "hello"
 
 
+async def test_drill_screen_edit_input_dispatches(store):
+    # An item_update input INSIDE a drill screen must be found + applied — it
+    # lives under `screens`, not `layout`, so the lookup has to search screens
+    # (otherwise every drill edit dies with NOT_FOUND → "something went wrong").
+    d = copy.deepcopy(TODO)
+    d["layout"][1]["navigate"] = "task"
+    d["screens"] = {"task": {"title": "{$.title}", "layout": [
+        {"id": "editTitle", "type": "input", "value": "$.title",
+         "action": {"op": "item_update", "key": "tasks", "field": "title"}},
+    ]}}
+    validate_definition(copy.deepcopy(d))
+    f = store.create("Görevler", d)
+    fid = f["id"]
+    item_id = (await _add(store, fid, "eski"))["values"]["tasks"][0]["id"]
+    res = await apply_action(store, fid, "editTitle",
+                             value={"itemId": item_id, "value": "yeni"}, tz=UTC)
+    assert res["values"]["tasks"][0]["title"] == "yeni"
+
+
+async def test_injected_edit_input_dispatches(store):
+    # An edit input the serving-time editable-drill guarantee INJECTED (present
+    # only in the augmented definition, not the stored one) must still dispatch.
+    from flowly.flowlets.actions import _find_component
+    d = copy.deepcopy(TODO)
+    d["layout"][1]["navigate"] = "task"
+    d["screens"] = {"task": {"layout": [{"type": "text", "text": "{$.title}"}]}}  # read-only
+    f = store.create("Görevler", d)
+    fid = f["id"]
+    item_id = (await _add(store, fid, "eski"))["values"]["tasks"][0]["id"]
+    # `edit_title` isn't in the STORED definition — only the augmented one.
+    assert _find_component(store.get(fid)["definition"], "edit_title") is None
+    res = await apply_action(store, fid, "edit_title",
+                             value={"itemId": item_id, "value": "yeni"}, tz=UTC)
+    assert res["values"]["tasks"][0]["title"] == "yeni"
+
+
 # ── list aggregation (T2) — lists become first-class in the value system ──────
 
 def _agg_def():

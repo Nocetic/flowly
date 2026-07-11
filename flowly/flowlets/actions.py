@@ -37,9 +37,17 @@ class FlowletActionError(Exception):
 
 
 def _find_component(definition: dict, component_id: str) -> dict | None:
-    for comp in queries._iter_components(definition.get("layout", [])):
-        if comp.get("id") == component_id:
-            return comp
+    # Search the main layout AND every drill screen's layout: an input inside a
+    # drill screen (an `item_update` editor) must be findable when its action
+    # fires, or every drill-screen edit dies with NOT_FOUND.
+    layouts = [definition.get("layout", [])]
+    for screen in (definition.get("screens") or {}).values():
+        if isinstance(screen, dict) and isinstance(screen.get("layout"), list):
+            layouts.append(screen["layout"])
+    for layout in layouts:
+        for comp in queries._iter_components(layout):
+            if comp.get("id") == component_id:
+                return comp
     return None
 
 
@@ -155,6 +163,18 @@ async def apply_action(
     definition = flowlet["definition"]
 
     component = _find_component(definition, component_id)
+    if component is None:
+        # The client renders the SERVE-augmented definition, so the tapped
+        # component may be an edit input the editable-drill guarantee injected
+        # (present only in the augmented tree, not the stored one). Re-resolve
+        # against the same augmentation; its action targets real state, so the
+        # op below applies normally.
+        from flowly.flowlets.normalize import ensure_editable_drill
+        augmented = ensure_editable_drill(definition)
+        if augmented is not definition:
+            found = _find_component(augmented, component_id)
+            if found is not None:
+                definition, component = augmented, found
     if component is None:
         raise FlowletActionError("NOT_FOUND", f"component '{component_id}' not found")
 
