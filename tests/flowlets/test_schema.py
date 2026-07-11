@@ -88,6 +88,27 @@ def test_timer_component_requires_a_timer_key():
         })
 
 
+def test_input_value_literal_rejected():
+    # A `value` that isn't a declared key / $.field is a mistake (it used to
+    # leak the literal into the UI, e.g. showing "manual_title").
+    with pytest.raises(FlowletValidationError, match="unknown key"):
+        validate_definition({
+            "catalog": 2, "name": "x",
+            "state": {"s": {"type": "string", "default": ""}},
+            "layout": [{"id": "i", "type": "input", "value": "just a literal",
+                        "action": {"op": "set", "key": "s"}}],
+        })
+
+
+def test_input_value_state_key_ok():
+    validate_definition({
+        "catalog": 2, "name": "x",
+        "state": {"s": {"type": "string", "default": ""}},
+        "layout": [{"id": "i", "type": "input", "value": "s",
+                    "action": {"op": "set", "key": "s"}}],
+    })
+
+
 def test_timer_wired_to_a_timer_key_is_valid():
     validate_definition({
         "catalog": 2, "name": "x",

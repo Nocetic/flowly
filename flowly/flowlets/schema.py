@@ -676,7 +676,7 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
         if not isinstance(key, str) or key not in ctx.list_keys:
             raise _err(
                 f"{ctype} (id={cid}) action `item_add` needs `key` naming a declared "
-                f"list state key; got {key!r}"
+                f"list state key; got {key!r} (declared lists: {sorted(ctx.list_keys)})"
             )
         fixed = action.get("item")
         if fixed is not None:
@@ -706,7 +706,7 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
         if not isinstance(key, str) or key not in ctx.list_keys:
             raise _err(
                 f"{ctype} (id={cid}) action `{op}` needs `key` naming a declared "
-                f"list state key; got {key!r}"
+                f"list state key; got {key!r} (declared lists: {sorted(ctx.list_keys)})"
             )
         # These need the tapped row's itemId, which only a repeater bound to the
         # same list can supply.
