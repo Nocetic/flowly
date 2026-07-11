@@ -160,6 +160,41 @@ def test_attachment_id_is_path_safe(store):
     assert store.get_attachment(f["id"], "not-an-att-id") is None
 
 
+def test_flowlet_id_is_path_safe(store, tmp_path):
+    # A crafted flowlet_id must never escape the attachment dir (traversal or
+    # absolute). It's the `flowlets.attachment` RPC's client-supplied field.
+    f = store.create("Kalori", _meal_def())
+    att = store.put_attachment(f["id"], _JPEG)
+    # plant a file OUTSIDE the store dir named like an attachment
+    outside = tmp_path / "secret"
+    outside.mkdir()
+    (outside / f"{att}.jpg").write_bytes(b"\xff\xd8\xffLEAK")
+    assert store.get_attachment("../../secret", att) is None
+    assert store.get_attachment("/etc", att) is None
+    assert store.get_attachment("../secret", att) is None
+    # a real read still works
+    assert store.get_attachment(f["id"], att) == _JPEG
+
+
+def test_put_attachment_rejects_bad_flowlet_id(store):
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        store.put_attachment("../evil", _JPEG)
+
+
+async def test_capture_cap_surfaces_as_capture_error(store, monkeypatch):
+    # When the attachment cap is hit, put_attachment's ValueError must surface as
+    # a clean FlowletCaptureError, not an unhandled INTERNAL error.
+    from flowly.flowlets import catalog
+    monkeypatch.setattr(catalog, "MAX_ATTACHMENTS_PER_FLOWLET", 1)
+    f = store.create("Kalori", _meal_def())
+    fl = store.get(f["id"])
+    comp = _photo_component(fl["definition"])
+    await apply_capture(store, fl, comp, _JPEG, runner=_runner_ok)   # fills the cap
+    with pytest.raises(FlowletCaptureError):
+        await apply_capture(store, fl, comp, _JPEG, runner=_runner_ok)
+
+
 def test_delete_flowlet_removes_attachments(store):
     f = store.create("Kalori", _meal_def())
     att = store.put_attachment(f["id"], _JPEG)

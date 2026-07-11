@@ -1732,8 +1732,14 @@ async def flowlets_action(params: dict) -> dict:
     return result
 
 
-def _decode_capture_image(image: Any) -> bytes | None:
-    """Accept a ``data:image/…;base64,…`` URI or a bare base64 string → bytes."""
+def _decode_capture_image(image: Any, max_bytes: int) -> bytes | None:
+    """A ``data:image/…;base64,…`` URI or bare base64 → the raw JPEG bytes.
+
+    Rejects (returns None) BEFORE decoding when the base64 is too long (so a
+    hostile frame can't force an oversized transient decode), and after decoding
+    when the bytes aren't a JPEG (the only format our clients produce, and what
+    ``flowlets.attachment`` serves) — no arbitrary blob can be stored/served.
+    """
     if not isinstance(image, str) or not image:
         return None
     b64 = image
@@ -1742,11 +1748,43 @@ def _decode_capture_image(image: Any) -> bytes | None:
         if comma == -1:
             return None
         b64 = b64[comma + 1:]
+    # base64 is 4 chars per 3 bytes; reject before allocating the decode.
+    if len(b64) > (max_bytes * 4) // 3 + 4:
+        return None
     try:
         import base64 as _b64
-        return _b64.b64decode(b64, validate=False)
+        data = _b64.b64decode(b64, validate=False)
     except Exception:
         return None
+    if len(data) > max_bytes or not data.startswith(b"\xff\xd8\xff"):  # JPEG magic
+        return None
+    return data
+
+
+# Rolling-window capture rate limit (a vision turn is a paid call). In-process,
+# monotonic; single-user bot, so a plain per-flowlet + global list is enough.
+_capture_hits: dict[str, list[float]] = {}
+_capture_hits_global: list[float] = []
+
+
+def _capture_rate_ok(flowlet_id: str) -> bool:
+    import time as _time
+    from flowly.flowlets import catalog as _fcat
+    now = _time.monotonic()
+    cutoff = now - _fcat.CAPTURE_WINDOW_S
+    g = [t for t in _capture_hits_global if t >= cutoff]
+    f = [t for t in _capture_hits.get(flowlet_id, []) if t >= cutoff]
+    if len(g) >= _fcat.MAX_CAPTURES_GLOBAL_PER_WINDOW:
+        _capture_hits_global[:] = g
+        return False
+    if len(f) >= _fcat.MAX_CAPTURES_PER_FLOWLET_PER_WINDOW:
+        _capture_hits[flowlet_id] = f
+        return False
+    g.append(now)
+    f.append(now)
+    _capture_hits_global[:] = g
+    _capture_hits[flowlet_id] = f
+    return True
 
 
 async def flowlets_capture(params: dict) -> dict:
@@ -1754,6 +1792,7 @@ async def flowlets_capture(params: dict) -> dict:
     (one isolated model turn) into a new list item and broadcasts the update.
     ``{id, componentId, image}`` → ``{id, values, preview?}``."""
     from flowly.flowlets.actions import _find_component
+    from flowly.flowlets import catalog as _fcat
     from flowly.flowlets.vision import FlowletCaptureError, apply_capture
 
     store = _flowlet_store()
@@ -1761,12 +1800,11 @@ async def flowlets_capture(params: dict) -> dict:
     component_id = str(params.get("componentId", "") or "")
     if not flowlet_id or not component_id:
         raise FeatureRpcError("INVALID", "id and componentId required")
-    data = _decode_capture_image(params.get("image"))
+    data = _decode_capture_image(params.get("image"), _fcat.MAX_IMAGE_BYTES)
     if data is None:
-        raise FeatureRpcError("INVALID", "image must be a base64 (data URI)")
-    from flowly.flowlets import catalog as _fcat
-    if len(data) > _fcat.MAX_IMAGE_BYTES:
-        raise FeatureRpcError("INVALID", "image is too large")
+        raise FeatureRpcError("INVALID", "image must be a base64 JPEG within the size limit")
+    if not _capture_rate_ok(flowlet_id):
+        raise FeatureRpcError("RATE_LIMITED", "too many photo captures — try again in a moment")
     flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FeatureRpcError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
@@ -1804,6 +1842,10 @@ def flowlets_attachment(params: dict) -> dict:
     att_id = str(params.get("attachmentId", "") or "")
     if not flowlet_id or not att_id:
         raise FeatureRpcError("INVALID", "id and attachmentId required")
+    # Defense in depth: the store guards the path too, but bind serving to a real
+    # flowlet so a client can't probe arbitrary ids.
+    if store.get(flowlet_id) is None:
+        raise FeatureRpcError("NOT_FOUND", "attachment not found")
     data = store.get_attachment(flowlet_id, att_id)
     if data is None:
         raise FeatureRpcError("NOT_FOUND", "attachment not found")

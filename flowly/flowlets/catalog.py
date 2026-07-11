@@ -104,6 +104,12 @@ ACTION_OPS = frozenset({
 MAX_IMAGE_BYTES = 4 * 1024 * 1024        # reject anything larger (a raw shot)
 MAX_ATTACHMENTS_PER_FLOWLET = 500        # bound disk per flowlet
 MAX_VISION_PROMPT_LEN = 1000
+#: A vision turn is a paid model call. Rate-limit captures (rolling 60 s window)
+#: so a hostile client can't loop `flowlets.capture` to burn the user's quota.
+#: Applies to analyze-only turns too (which don't touch the attachment cap).
+CAPTURE_WINDOW_S = 60
+MAX_CAPTURES_PER_FLOWLET_PER_WINDOW = 8
+MAX_CAPTURES_GLOBAL_PER_WINDOW = 24
 
 # ── Watches (declarative reactive rules; evaluated LLM-free) ──────────────────
 # A definition may carry a top-level `watches` array. Each rule is evaluated by

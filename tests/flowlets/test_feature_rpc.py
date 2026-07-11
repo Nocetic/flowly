@@ -120,3 +120,41 @@ async def test_agent_action_uses_runner(rpc_home):
         assert "su" in called["msg"].lower()
     finally:
         feature_rpc.set_flowlet_agent_runner(None)
+
+
+# ── photo capture: decode guard, magic bytes, rate limit ──────────────────────
+
+def test_decode_capture_image_guards():
+    import base64
+
+    from flowly.channels.feature_rpc import _decode_capture_image
+    jpeg = base64.b64encode(b"\xff\xd8\xff" + b"x" * 100).decode()
+    assert _decode_capture_image("data:image/jpeg;base64," + jpeg, 1_000_000) is not None
+    assert _decode_capture_image(jpeg, 1_000_000) is not None            # bare b64 ok
+    # non-JPEG bytes (valid base64, wrong magic) → rejected
+    png = base64.b64encode(b"\x89PNG\r\n" + b"x" * 100).decode()
+    assert _decode_capture_image(png, 1_000_000) is None
+    # oversized rejected BEFORE decode (b64 longer than the byte budget)
+    big = base64.b64encode(b"\xff\xd8\xff" + b"x" * 5000).decode()
+    assert _decode_capture_image(big, 1000) is None
+    assert _decode_capture_image("not base64!!", 1_000_000) is None
+    assert _decode_capture_image(None, 1_000_000) is None
+
+
+def test_capture_rate_limit(rpc_home, monkeypatch):
+    from flowly.channels import feature_rpc
+    from flowly.flowlets import catalog
+    monkeypatch.setattr(catalog, "MAX_CAPTURES_PER_FLOWLET_PER_WINDOW", 2)
+    # reset the module-level windows so other tests don't bleed in
+    feature_rpc._capture_hits.clear()
+    feature_rpc._capture_hits_global.clear()
+    fid = "flt_dead_beef"
+    assert feature_rpc._capture_rate_ok(fid) is True
+    assert feature_rpc._capture_rate_ok(fid) is True
+    assert feature_rpc._capture_rate_ok(fid) is False   # 3rd within the window → blocked
+
+
+def test_attachment_rpc_rejects_unknown_flowlet(rpc_home):
+    from flowly.channels import feature_rpc
+    with pytest.raises(feature_rpc.FeatureRpcError):
+        feature_rpc.flowlets_attachment({"id": "../../etc", "attachmentId": "att_00000000"})

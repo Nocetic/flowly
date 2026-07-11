@@ -26,6 +26,11 @@ from flowly.flowlets import catalog
 #: An attachment id is server-minted (`att_<hex>`); validated on every read/delete
 #: so a client-supplied field value can never escape the flowlet's own dir.
 _SAFE_ATTACH_ID = re.compile(r"^att_[0-9a-f]{8,}$")
+#: A flowlet id is server-minted (`flt_<hex>_<hex>` via _gen_id). Validated
+#: wherever it's joined into an attachment path — the `flowlets.attachment` RPC
+#: passes it straight from the client, so a bare join would allow `..`/absolute
+#: traversal out of the store dir.
+_SAFE_FLOWLET_ID = re.compile(r"^flt_[0-9a-f]+_[0-9a-f]+$")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -279,6 +284,10 @@ class FlowletStore:
     # never bloat sync or the row payload.
 
     def _attach_dir(self, flowlet_id: str) -> Path:
+        # Reject any id that isn't a server-minted flowlet id BEFORE the join —
+        # a `..`/absolute client string would otherwise escape the store dir.
+        if not _SAFE_FLOWLET_ID.match(flowlet_id or ""):
+            raise ValueError(f"invalid flowlet id {flowlet_id!r}")
         return self._db_path.parent / "flowlet_attachments" / flowlet_id
 
     def put_attachment(self, flowlet_id: str, data: bytes) -> str:
@@ -301,7 +310,7 @@ class FlowletStore:
             return None
         try:
             return (self._attach_dir(flowlet_id) / f"{att_id}.jpg").read_bytes()
-        except OSError:
+        except (OSError, ValueError):  # ValueError = bad flowlet_id (see _attach_dir)
             return None
 
     def attachment_path(self, flowlet_id: str, att_id: str) -> Path | None:
@@ -309,7 +318,10 @@ class FlowletStore:
         which consumes local file paths (same contract as chat attachments)."""
         if not _SAFE_ATTACH_ID.match(att_id or ""):
             return None
-        p = self._attach_dir(flowlet_id) / f"{att_id}.jpg"
+        try:
+            p = self._attach_dir(flowlet_id) / f"{att_id}.jpg"
+        except ValueError:
+            return None
         return p if p.is_file() else None
 
     def delete_attachment(self, flowlet_id: str, att_id: str) -> None:
@@ -317,11 +329,14 @@ class FlowletStore:
             return
         try:
             (self._attach_dir(flowlet_id) / f"{att_id}.jpg").unlink(missing_ok=True)
-        except OSError:
+        except (OSError, ValueError):
             pass
 
     def delete_flowlet_attachments(self, flowlet_id: str) -> None:
-        shutil.rmtree(self._attach_dir(flowlet_id), ignore_errors=True)
+        try:
+            shutil.rmtree(self._attach_dir(flowlet_id), ignore_errors=True)
+        except ValueError:
+            pass  # bad flowlet_id — nothing to remove
 
     def pin(self, flowlet_id: str, pinned: bool = True) -> dict | None:
         return self.update(flowlet_id, pinned=pinned)

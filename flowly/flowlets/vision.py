@@ -82,7 +82,10 @@ async def apply_capture(
 
     # Store the photo only if the list has somewhere to hold it — otherwise this
     # is an analyze-only capture and keeping the file would orphan it.
-    att_id = store.put_attachment(flowlet_id, image_bytes) if keeps_photo else None
+    try:
+        att_id = store.put_attachment(flowlet_id, image_bytes) if keeps_photo else None
+    except ValueError as exc:  # attachment cap reached (or a bad id)
+        raise FlowletCaptureError("INVALID", str(exc))
     # The model turn needs the image as a local FILE PATH (the media pipeline's
     # contract). Reuse the stored attachment's file; analyze-only captures get a
     # temp file that is removed after the turn.

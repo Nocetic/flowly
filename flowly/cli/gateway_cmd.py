@@ -1439,10 +1439,10 @@ Respond to the user now:"""
         contract — same as chat attachments); tools are disabled so the model
         just looks at the image and answers in one shot; never lands in chat
         (dedicated session)."""
-        try:
-            no_tools = agent.tools.tool_names()
-        except Exception:  # noqa: BLE001
-            no_tools = None
+        # Fail CLOSED: the image is attacker-supplied, so a turn must never run
+        # with tools enabled. If we can't enumerate tools to disable, refuse the
+        # turn rather than fall back to a tool-enabled one.
+        no_tools = agent.tools.tool_names()
         return await agent.process_direct(
             prompt,
             session_key=f"flowlet_vision:{flowlet.get('id')}",
