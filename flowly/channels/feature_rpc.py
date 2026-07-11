@@ -1637,10 +1637,13 @@ def flowlets_get(params: dict) -> dict:
             _asyncio.get_running_loop().create_task(_flowlet_refresh_cb(flowlet_id, False))
         except Exception:
             pass  # no loop / best-effort
-    # Serving-time guarantee: a list with an `image` field always DISPLAYS its
-    # photos, even when the authoring agent forgot the `image` component (a row
-    # thumbnail + a full photo on the drill-down). Never persisted.
-    from flowly.flowlets.normalize import ensure_photo_display
+    # Serving-time guarantees (never persisted): every user-owned list row is
+    # EDITABLE (a drill screen with edit inputs — synthesized if the agent
+    # authored none), and a list with an `image` field always DISPLAYS its
+    # photos (row thumbnail + full photo). Editable runs first so a synthesized
+    # drill screen also picks up its full photo from the photo pass.
+    from flowly.flowlets.normalize import ensure_editable_drill, ensure_photo_display
+    definition = ensure_photo_display(ensure_editable_drill(flowlet["definition"]))
     return {
         "flowlet": {
             "id": flowlet["id"],
@@ -1650,7 +1653,7 @@ def flowlets_get(params: dict) -> dict:
             "pinned": flowlet.get("pinned"),
             "version": flowlet.get("version"),
             "catalog": flowlet.get("catalog"),
-            "definition": ensure_photo_display(flowlet["definition"]),
+            "definition": definition,
             "updatedAt": flowlet.get("updated_at"),
         },
         "values": _flowlet_values(flowlet),

@@ -159,10 +159,27 @@ the user's own keys/machine — say so if the UI mentions it.
 > **ALWAYS pair the camera with a manual path.** The vision result is an
 > estimate; users must be able to (a) add an entry WITHOUT a photo (a
 > `number_input`/`input` with `item_add` — use fixed `item` values for the other
-> fields) and (b) FIX any row (a drill-down screen with `item_update` inputs).
-> A camera-only screen is incomplete. **You do NOT need to add a delete button**
-> — every repeater over a mutable list already gets swipe-to-delete for free on
+> fields) and (b) FIX any row. **You do NOT need to add a delete button** —
+> every repeater over a mutable list already gets swipe-to-delete for free on
 > every client. (Deleting a row also removes its photo.)
+>
+> **Row editing is GUARANTEED — but author it well anyway.** Every user-owned
+> list row is made editable at serve time: if a row's drill screen is missing an
+> input for a field (or the list has no drill screen at all), the system injects
+> `item_update`/`item_toggle` inputs automatically, so a wrong value can always
+> be fixed. Rely on that as a safety net, not a substitute — author a proper
+> drill screen with good labels, sensible order, and each edit input **seeded
+> with the current value** (`"value": "$.field"`) so the box shows what's being
+> edited. The injected fallback uses the raw field name as its label; your
+> hand-authored screen should be nicer.
+>
+> **Do NOT add an "estimate / you can edit this" disclaimer text.** The editable
+> drill-down already tells the user they can fix a value, so a caveat like *"This
+> is a photo estimate; edit the kcal if the portion differs"* is noise — and,
+> being a static node, it also shows on **manually** added rows where it's just
+> wrong. Skip it. (If a caveat is genuinely necessary, gate it with
+> `"visibleWhen": "$.<imageField>"` so it only appears on photo-derived rows,
+> never on manual ones — but prefer no disclaimer at all.)
 
 Calorie journal (camera + manual add + editable rows — the full pattern):
 ```json
@@ -182,9 +199,9 @@ Calorie journal (camera + manual add + editable rows — the full pattern):
         { "type": "text", "text": "{$.kcal} kcal" } ] } } ],
   "screens": { "meal": { "title": "{$.name}", "layout": [
     { "type": "image", "src": "$.shot" },
-    { "type": "input", "id": "editName", "label": "İsim",
+    { "type": "input", "id": "editName", "label": "İsim", "value": "$.name",
       "action": { "op": "item_update", "key": "meals", "field": "name" } },
-    { "type": "number_input", "id": "editKcal", "label": "kcal",
+    { "type": "number_input", "id": "editKcal", "label": "kcal", "value": "$.kcal",
       "action": { "op": "item_update", "key": "meals", "field": "kcal" } } ] } } }
 ```
 (No delete button needed — the meal list gets swipe-to-delete automatically. The
