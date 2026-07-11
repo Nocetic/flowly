@@ -257,6 +257,35 @@ def test_list_category_over_an_undated_list_keeps_all_rows():
     assert out["c"] == [{"k": "sci-fi", "v": 1}]
 
 
+def test_today_row_charts_even_when_resolved_before_midday():
+    # Rows are stamped at local MIDDAY of their date; resolving values in the
+    # MORNING must not window a today-dated row out as "future". (The user
+    # added Market 300 dated 2026-07-12 at 01:30 — the stats showed it, the
+    # charts didn't.)
+    now = _ms(2026, 7, 12, 1, 30)
+    rows = [
+        {"id": "a", "title": "", "amount": 300, "category": "Market", "date": "2026-07-12"},
+        {"id": "b", "title": "Cepax", "amount": 5292.5, "category": "Alışveriş",
+         "date": "2026-07-08"},
+    ]
+    out = resolve_values(_EXPENSES_DEF, {"expenses": rows}, [], now, UTC)
+    by_day = {b["t"]: b["v"] for b in out["trend"]}
+    assert by_day["2026-07-12"] == 300           # today's bar exists at 01:30
+    assert by_day["2026-07-08"] == 5292.5
+    assert out["pie"] == [{"k": "Alışveriş", "v": 5292.5}, {"k": "Market", "v": 300}]
+
+
+def test_future_dated_row_stays_out_of_the_charts():
+    # The end bound extends to the END of TODAY — not beyond: a row dated
+    # tomorrow isn't spent yet.
+    now = _ms(2026, 7, 12, 23)
+    rows = [{"id": "a", "title": "yarın", "amount": 99, "category": "Fatura",
+             "date": "2026-07-13"}]
+    out = resolve_values(_EXPENSES_DEF, {"expenses": rows}, [], now, UTC)
+    assert sum(b["v"] for b in out["trend"]) == 0
+    assert out["pie"] == []
+
+
 # ── shadow-series redirect ────────────────────────────────────────────────────
 # Old-pattern flowlets pair item_add with a log into a parallel series and bind
 # their charts to the SERIES. Those charts drift (a vision add never logs; a

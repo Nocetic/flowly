@@ -824,6 +824,13 @@ def resolve_values(
             date_field = data.get("date") or next(
                 (f for f, t in item_schema.items() if t == "date"), None
             )
+            # A row is stamped at local MIDDAY of its date, so a today-dated
+            # row would sit "in the future" when values resolve in the morning
+            # and the window (which closes at `now`) would drop it. For
+            # date-granular list data the window closes at the END of the
+            # current day instead — same calendar day, so the window start and
+            # the bucket keys are identical; only the end bound extends.
+            eod_ms = _date_start_ms(_local_dt(now_ms, tz).date(), tz) + 86_400_000 - 1
             by = data.get("by")
             if isinstance(by, str):
                 events = _rows_as_events(
@@ -831,7 +838,7 @@ def resolve_values(
                 )
                 values[cid] = _category_breakdown(
                     events, data.get("agg", "sum"), data.get("window", "30d"),
-                    now_ms, tz,
+                    eod_ms, tz,
                 )
             else:
                 events = _rows_as_events(
@@ -839,7 +846,7 @@ def resolve_values(
                 )
                 buckets = aggregate_buckets(
                     events, data.get("agg", "sum"), data.get("bucket", "day"),
-                    data.get("window", "7d"), now_ms, tz,
+                    data.get("window", "7d"), eod_ms, tz,
                 )
                 for b in buckets:
                     b["v"] = _clean_number(b["v"])
