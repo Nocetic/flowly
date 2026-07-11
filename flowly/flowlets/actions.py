@@ -267,7 +267,9 @@ async def _apply_op(
     elif op == "timer_toggle":
         key = action["key"]
         _state_spec(definition, key)  # ensure declared
-        cur = store.get_state(flowlet_id).get(key) or {}
+        cur = store.get_state(flowlet_id).get(key)
+        if not isinstance(cur, dict):
+            cur = {}  # a mis-wired (non-timer) key must not crash the action
         running = bool(cur.get("running"))
         accum = float(cur.get("accum_s", 0) or 0)
         since = int(cur.get("since_ms", 0) or 0)
@@ -315,6 +317,8 @@ async def _apply_op(
         key = action.get("key")
         series = action.get("series")
         if key:
+            # `reset` only ever targets a SCALAR key (the validator rejects a
+            # list key), so there are no row photos to GC here.
             store.reset_state(flowlet_id, key)
         if series:
             store.reset_events(flowlet_id, series)

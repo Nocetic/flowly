@@ -103,6 +103,7 @@ def validate_definition(defn: Any) -> dict:
     if len(state_defs) > catalog.MAX_STATE_KEYS:
         raise _err(f"too many state keys (max {catalog.MAX_STATE_KEYS})")
     scalar_keys: set[str] = set()
+    timer_keys: set[str] = set()     # state keys of type "timer"
     list_keys: dict[str, dict] = {}  # list state key → {field: type}
     source_keys: set[str] = set()    # state keys a `source` owns (user-read-only)
     for key, spec in state_defs.items():
@@ -123,6 +124,8 @@ def validate_definition(defn: Any) -> dict:
             list_keys[key] = dict(spec.get("item") or {})
         else:
             scalar_keys.add(key)
+            if isinstance(spec, dict) and spec.get("type") == "timer":
+                timer_keys.add(key)
 
     # ── series schema ─────────────────────────────────────────────────────────
     series_defs = defn.get("series", {})
@@ -168,6 +171,7 @@ def validate_definition(defn: Any) -> dict:
         list_keys=list_keys,
     )
     ctx.source_keys = source_keys
+    ctx.timer_keys = timer_keys
     ctx.screens = _validate_screens_structure(defn.get("screens"))
     for node in layout:
         _validate_node(node, ctx, depth=1)
@@ -449,7 +453,7 @@ class _Ctx:
     __slots__ = (
         "scalar_keys", "series_keys", "component_ids", "count",
         "list_keys", "item_fields", "item_source", "source_keys",
-        "filterable", "searches", "screens", "navigations",
+        "filterable", "searches", "screens", "navigations", "timer_keys",
     )
 
     def __init__(self, scalar_keys, series_keys, component_ids, count, list_keys=None):
@@ -457,6 +461,7 @@ class _Ctx:
         self.series_keys = series_keys
         self.component_ids = component_ids
         self.count = count
+        self.timer_keys = set()            # state keys declared type "timer"
         self.list_keys = list_keys or {}   # list state key → {field: type}
         self.item_fields = None            # {field: type} while inside a repeater template
         self.item_source = None            # the repeater's source key, ditto
@@ -655,7 +660,7 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
             raise _err(f"{ctype} (id={cid}) action `reset` series '{series}' is not declared")
     elif op == "timer_toggle":
         key = action.get("key")
-        if not isinstance(key, str) or key not in ctx.scalar_keys:
+        if not isinstance(key, str) or key not in ctx.timer_keys:
             raise _err(
                 f"{ctype} (id={cid}) action `timer_toggle` needs `key` naming a "
                 f"declared timer state; got {key!r}"
@@ -994,6 +999,7 @@ def _validate_screen_layout(sid: str, sdef: dict, ctx: _Ctx, list_key: str) -> N
         list_keys=ctx.list_keys,
     )
     sub.source_keys = ctx.source_keys
+    sub.timer_keys = ctx.timer_keys
     sub.screens = ctx.screens
     sub.item_fields = ctx.list_keys.get(list_key, {})
     sub.item_source = list_key
@@ -1153,7 +1159,7 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> N
             raise _err(f"select (id={cid}) needs a non-empty `options` array")
     elif ctype == "timer":
         val = node.get("value")
-        if not isinstance(val, str) or val not in ctx.scalar_keys:
+        if not isinstance(val, str) or val not in ctx.timer_keys:
             raise _err(f"timer (id={cid}) `value` must name a declared timer state key")
 
 

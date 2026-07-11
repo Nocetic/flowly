@@ -124,6 +124,17 @@ async def apply_capture(
                 item[f] = att_id
     item["id"] = f"itm_{os.urandom(4).hex()}"
 
+    # Fail closed on an unreadable photo: if nothing but the id/photo survived
+    # coercion (the model returned no usable fields), don't append a data-less
+    # ghost row — surface the failure and drop the orphan attachment. `item_add`
+    # rejects an all-empty add too; vision must not be a backdoor around that.
+    if not any(f != "id" and fields.get(f) != "image" for f in item):
+        if att_id:
+            store.delete_attachment(flowlet_id, att_id)
+        raise FlowletCaptureError(
+            "UNAVAILABLE", "couldn't read the photo — add the details manually"
+        )
+
     items = list(store.get_state(flowlet_id).get(into) or [])
     limit = int(spec.get("max") or catalog.MAX_LIST_ITEMS)
     if len(items) >= limit:

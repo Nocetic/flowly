@@ -110,6 +110,20 @@ async def test_capture_adds_item_with_photo(store):
     assert store.get_attachment(f["id"], meals[0]["shot"]) == _JPEG
 
 
+async def test_capture_fails_closed_on_unreadable_photo(store):
+    # The model returns nothing matching the item schema → no ghost row is
+    # appended, and the stored photo is cleaned up (not orphaned).
+    async def _runner_empty(flowlet, prompt, image_path):
+        return '{"unrelated": "x"}'
+    f = store.create("Kalori", _meal_def())
+    fl = store.get(f["id"])
+    with pytest.raises(FlowletCaptureError, match="couldn't read"):
+        await apply_capture(store, fl, _photo_component(fl["definition"]), _JPEG, runner=_runner_empty)
+    assert not store.get_state(f["id"]).get("meals")   # no data-less row
+    d = store._attach_dir(f["id"])
+    assert not d.exists() or not any(d.iterdir())       # no orphan attachment
+
+
 async def test_analyze_only_keeps_no_photo(store):
     from pathlib import Path
     _SEEN_PATHS.clear()

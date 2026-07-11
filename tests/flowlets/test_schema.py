@@ -67,6 +67,39 @@ def test_action_needs_id():
         })
 
 
+def test_timer_toggle_requires_a_timer_key():
+    # A timer_toggle wired to a NUMBER key validated before, then crashed at
+    # runtime (dict ops on a scalar). Now it's rejected at author time.
+    with pytest.raises(FlowletValidationError, match="timer"):
+        validate_definition({
+            "catalog": 2, "name": "x",
+            "state": {"n": {"type": "number", "default": 0}},
+            "layout": [{"id": "t", "type": "button", "text": "go",
+                        "action": {"op": "timer_toggle", "key": "n"}}],
+        })
+
+
+def test_timer_component_requires_a_timer_key():
+    with pytest.raises(FlowletValidationError, match="timer"):
+        validate_definition({
+            "catalog": 2, "name": "x",
+            "state": {"n": {"type": "number", "default": 0}},
+            "layout": [{"type": "timer", "value": "n"}],
+        })
+
+
+def test_timer_wired_to_a_timer_key_is_valid():
+    validate_definition({
+        "catalog": 2, "name": "x",
+        "state": {"clock": {"type": "timer"}},
+        "layout": [
+            {"type": "timer", "value": "clock"},
+            {"id": "t", "type": "button", "text": "go",
+             "action": {"op": "timer_toggle", "key": "clock"}},
+        ],
+    })
+
+
 def test_action_unknown_state_key():
     with pytest.raises(FlowletValidationError, match="declared state key"):
         validate_definition({
