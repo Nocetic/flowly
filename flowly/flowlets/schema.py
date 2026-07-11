@@ -688,6 +688,19 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
                         f"{ctype} (id={cid}) `item_add` sets unknown field '{f}' "
                         f"(declared: {sorted(ctx.list_keys[key])})"
                     )
+        # `fields` is a TEMPLATED form: each value may carry `{value}` (what the
+        # user typed) / `{state_key}` tokens / a `today` date sentinel, resolved
+        # at write time (like the `log` op's `category`).
+        tpl_fields = action.get("fields")
+        if tpl_fields is not None:
+            if not isinstance(tpl_fields, dict):
+                raise _err(f"{ctype} (id={cid}) `item_add` `fields` must be an object of field templates")
+            for f in tpl_fields:
+                if f not in ctx.list_keys[key]:
+                    raise _err(
+                        f"{ctype} (id={cid}) `item_add` `fields` sets unknown field '{f}' "
+                        f"(declared: {sorted(ctx.list_keys[key])})"
+                    )
     elif op in ("item_update", "item_toggle", "item_remove", "item_move"):
         key = action.get("key")
         if not isinstance(key, str) or key not in ctx.list_keys:

@@ -106,6 +106,32 @@ def _coerce_field(key: str, field: str, ftype: str, v: Any) -> Any:
     raise FlowletActionError("INVALID", f"'{key}.{field}' has an unknown type")
 
 
+_LONE_TOKEN_RE = re.compile(r"^\{([a-zA-Z_][a-zA-Z0-9_]*)\}$")
+
+
+def _today_str(tz: tzinfo | None) -> str:
+    from datetime import datetime
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+
+def _resolve_field_value(tpl: Any, field_type: str, ns: dict, tz: tzinfo | None) -> Any:
+    """Resolve one `item_add`/`fields` template to a TYPED value.
+
+    A lone ``{token}`` yields the RAW resolved value (a number stays numeric, a
+    date string a string) so it coerces cleanly; a mixed/literal string renders
+    via ``render_template``. On a date field, a literal ``today`` (or a token
+    resolving to ``"today"``) becomes the current date.
+    """
+    if isinstance(tpl, str):
+        m = _LONE_TOKEN_RE.match(tpl.strip())
+        val: Any = ns.get(m.group(1)) if m else queries.render_template(tpl, ns)
+    else:
+        val = tpl  # a literal number/bool passes straight through
+    if field_type == "date" and isinstance(val, str) and val.strip().lower() == "today":
+        return _today_str(tz)
+    return val
+
+
 def _item_envelope(passed_value: Any) -> tuple[str, Any]:
     """Row-scoped ops arrive as ``{"itemId": ..., "value": ...}`` — the repeater
     on the client attaches the tapped row's id."""
@@ -193,7 +219,7 @@ async def apply_action(
             )
         await _apply_op(
             store, flowlet_id, definition, component,
-            {"op": "toggle", "key": value}, None, agent_runner=agent_runner,
+            {"op": "toggle", "key": value}, None, agent_runner=agent_runner, tz=tz,
         )
     else:
         action = component.get("action")
@@ -201,7 +227,7 @@ async def apply_action(
             raise FlowletActionError("INVALID", f"component '{component_id}' has no action")
         await _apply_op(
             store, flowlet_id, definition, component, action, value,
-            agent_runner=agent_runner,
+            agent_runner=agent_runner, tz=tz,
         )
 
     # Recompute the full values map from the post-mutation state + events.
@@ -230,6 +256,7 @@ async def _apply_op(
     passed_value: Any,
     *,
     agent_runner: AgentRunner | None,
+    tz: tzinfo | None = None,
     _depth: int = 0,
 ) -> None:
     op = action.get("op")
@@ -385,7 +412,25 @@ async def _apply_op(
         for f, v in (action.get("item") or {}).items():  # fixed values from the action
             new[f] = _coerce_field(key, f, fields[f], v)
         pv = passed_value
-        if isinstance(pv, dict):
+        fields_tpl = action.get("fields")
+        if isinstance(fields_tpl, dict):
+            # A TEMPLATED multi-field form: `{value}` = what the user typed,
+            # `{state_key}` = a live value (e.g. a title/category set by other
+            # inputs), `today` = the current date. This is how a manual-entry
+            # form (amount + title + category + date) writes one row at once.
+            ns = resolve_values(
+                definition, store.get_state(flowlet_id), store.get_events(flowlet_id),
+                queries_now_ms(), tz,
+            )
+            if pv is not None and not isinstance(pv, (dict, list)):
+                ns = {**ns, "value": pv}
+            for f, tpl in fields_tpl.items():
+                if f not in fields:
+                    continue
+                raw = _resolve_field_value(tpl, fields[f], ns, tz)
+                if raw is not None:  # an unresolved token → leave the field unset
+                    new[f] = _coerce_field(key, f, fields[f], raw)
+        elif isinstance(pv, dict):
             # A form of declared fields (e.g. title + due from two inputs).
             for f, v in pv.items():
                 if f in fields:
@@ -445,7 +490,7 @@ async def _apply_op(
         for sub in action.get("ops", []):
             await _apply_op(
                 store, flowlet_id, definition, component, sub, passed_value,
-                agent_runner=agent_runner, _depth=_depth + 1,
+                agent_runner=agent_runner, tz=tz, _depth=_depth + 1,
             )
 
     else:

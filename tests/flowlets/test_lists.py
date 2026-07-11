@@ -218,6 +218,50 @@ async def test_injected_edit_input_dispatches(store):
     assert res["values"]["tasks"][0]["title"] == "yeni"
 
 
+async def test_item_add_fields_templating(store):
+    # A manual multi-field form: {value} = typed amount, {state_key} = title/
+    # category from other inputs, `today` = current date — all written in one row.
+    from datetime import datetime
+    d = {
+        "catalog": 2, "name": "Harcama",
+        "state": {
+            "manual_title": {"type": "string", "default": "x"},
+            "manual_category": {"type": "string", "default": "Other"},
+            "expenses": {"type": "list", "item": {
+                "title": "string", "amount": "number", "category": "string", "date": "date"}},
+        },
+        "layout": [
+            {"id": "title_in", "type": "input", "action": {"op": "set", "key": "manual_title"}},
+            {"id": "cat_seg", "type": "segmented", "options": ["A", "B"],
+             "action": {"op": "set", "key": "manual_category"}},
+            {"id": "amount_in", "type": "number_input",
+             "action": {"op": "item_add", "key": "expenses", "fields": {
+                 "title": "{manual_title}", "amount": "{value}",
+                 "category": "{manual_category}", "date": "today"}}},
+            {"type": "repeater", "source": "expenses",
+             "item": {"type": "text", "text": "{$.title}"}},
+        ],
+    }
+    validate_definition(copy.deepcopy(d))
+    f = store.create("Harcama", d)
+    fid = f["id"]
+    await apply_action(store, fid, "title_in", value="benzin", tz=UTC)
+    await apply_action(store, fid, "cat_seg", value="A", tz=UTC)
+    res = await apply_action(store, fid, "amount_in", value=100, tz=UTC)
+    row = res["values"]["expenses"][0]
+    assert row["title"] == "benzin"       # {manual_title}
+    assert row["amount"] == 100           # {value}, kept numeric
+    assert row["category"] == "A"         # {manual_category}
+    assert row["date"] == datetime.now(UTC).strftime("%Y-%m-%d")  # `today` sentinel
+
+
+def test_item_add_fields_rejects_unknown_field():
+    d = copy.deepcopy(TODO)
+    d["layout"][0]["action"] = {"op": "item_add", "key": "tasks", "fields": {"ghost": "{value}"}}
+    with pytest.raises(FlowletValidationError, match="unknown field"):
+        validate_definition(d)
+
+
 # ── list aggregation (T2) — lists become first-class in the value system ──────
 
 def _agg_def():
