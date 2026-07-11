@@ -122,6 +122,19 @@ by what you're showing:
   `{"list":"runs","x":"km","y":"pace"}` with `kind:"scatter"`. No series needed —
   it reads the list rows.
 
+**A chart ABOUT a list binds to the list — never a parallel series.** If the
+flowlet stores rows in a `list` (expenses, meals, workouts), derive its charts
+from the rows themselves:
+- time trend: `{"list":"expenses","field":"amount","bucket":"day","window":"30d"}`
+  (needs a `date` field on the item schema, or set `"date":"<field>"`);
+- breakdown: `{"list":"expenses","by":"category","field":"amount","agg":"sum"}`
+  (`by` names a string field to group by; `agg:"count"` needs no `field`).
+Do NOT pair `item_add` with a `log` to feed a series-bound chart: a photo
+capture (`vision`) never logs, and deleting/editing a row can't un-log — the
+chart drifts from the list and shows ghost data. List-bound charts stay correct
+through every add, edit and delete. Series charts are for log-based trackers
+that have no list (water, steps, mood).
+
 **Tables over data.** A `table` can bind to a `list` instead of static rows:
 `{"type":"table","source":"prs","columns":[{"field":"title","label":"Title"},
 {"field":"n","align":"right"}],"sortBy":{"field":"n","dir":"desc"}}`. One row per

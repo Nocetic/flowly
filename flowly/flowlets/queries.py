@@ -509,6 +509,73 @@ def _category_breakdown(
     return rows
 
 
+# ── List-backed charts ────────────────────────────────────────────────────────
+#
+# A chart ABOUT a list must aggregate the list's rows directly. The old pattern
+# (a parallel `series` the agent logs alongside every item op) has two sources
+# of truth that drift: a vision-added row never logs, and `item_remove`/
+# `item_update` can't un-log — deleted expenses haunted the charts. Rows are
+# mapped to the pseudo-event shape and fed through the SAME aggregators, so
+# every chart stays a pure function of the list.
+
+
+def _row_ts(v: Any, tz: tzinfo | None) -> int | None:
+    """A row's date field ("YYYY-MM-DD", datetime strings tolerated) → local
+    MIDDAY ms (midday keeps the bucket stable across DST edges). None if the
+    value doesn't parse."""
+    if not isinstance(v, str) or len(v) < 10:
+        return None
+    try:
+        d = date.fromisoformat(v[:10])
+    except ValueError:
+        return None
+    return _date_start_ms(d, tz) + 12 * 3600 * 1000
+
+
+def _rows_as_events(
+    rows: Any,
+    field: str | None,
+    date_field: str | None,
+    cat_field: str | None,
+    now_ms: int,
+    tz: tzinfo | None,
+) -> list[dict]:
+    """List rows → the ``{"ts","value","meta"}`` shape the aggregators consume.
+
+    * ``field`` names the numeric field to aggregate; absent → each row
+      contributes 1.0 (a count). A row whose field isn't numeric is skipped.
+    * ``date_field`` places the row in time; a row with an unparseable date is
+      skipped (it can't be bucketed or window-filtered). With NO date field at
+      all, rows stamp ``now`` so any window keeps them (category charts over
+      undated lists).
+    """
+    out: list[dict] = []
+    if not isinstance(rows, list):
+        return out
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if field is not None:
+            v = r.get(field)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            value = float(v)
+        else:
+            value = 1.0
+        if date_field is not None:
+            ts = _row_ts(r.get(date_field), tz)
+            if ts is None:
+                continue
+        else:
+            ts = now_ms
+        e: dict = {"ts": ts, "value": value}
+        if cat_field is not None:
+            e["meta"] = {"category": r.get(cat_field)}
+        out.append(e)
+    out.sort(key=lambda e: e["ts"])
+    return out
+
+
 # ── State coercion ────────────────────────────────────────────────────────────
 
 def coerce_state(value: Any, spec: dict) -> Any:
@@ -653,15 +720,48 @@ def resolve_values(
     values.pop("__tz__", None)
 
     # 3. per-component series data (chart / sparkline / heatmap).
-    #    Four `data` forms (see catalog): single → [{t,v}]; multi → {multi:[…]};
-    #    category → [{k,v}]; scatter → skipped (the client reads the list rows).
+    #    `data` forms (see catalog): single → [{t,v}]; multi → {multi:[…]};
+    #    category → [{k,v}]; list-backed time/category → same shapes, derived
+    #    from the list's rows; scatter → skipped (the client reads the rows).
     for comp in _iter_components(definition.get("layout", [])):
         if comp.get("type") not in catalog.SERIES_COMPONENTS or not comp.get("id"):
             continue
         cid = comp["id"]
         data = comp.get("data", {}) or {}
         if "list" in data:
-            continue  # scatter: the list is already in `values`; nothing to resolve
+            if "x" in data or "y" in data:
+                continue  # scatter: the list is already in `values`; nothing to resolve
+            # List-backed: aggregate the rows THEMSELVES, so the chart stays a
+            # pure function of the list (edits/deletes/vision adds included).
+            rows = values.get(data["list"])
+            item_schema = (
+                state_defs.get(data["list"], {}).get("item")
+                if isinstance(state_defs.get(data["list"]), dict) else None
+            ) or {}
+            date_field = data.get("date") or next(
+                (f for f, t in item_schema.items() if t == "date"), None
+            )
+            by = data.get("by")
+            if isinstance(by, str):
+                events = _rows_as_events(
+                    rows, data.get("field"), date_field, by, now_ms, tz,
+                )
+                values[cid] = _category_breakdown(
+                    events, data.get("agg", "sum"), data.get("window", "30d"),
+                    now_ms, tz,
+                )
+            else:
+                events = _rows_as_events(
+                    rows, data.get("field"), date_field, None, now_ms, tz,
+                )
+                buckets = aggregate_buckets(
+                    events, data.get("agg", "sum"), data.get("bucket", "day"),
+                    data.get("window", "7d"), now_ms, tz,
+                )
+                for b in buckets:
+                    b["v"] = _clean_number(b["v"])
+                values[cid] = buckets
+            continue
         if data.get("by") == "category":
             values[cid] = _category_breakdown(
                 by_series.get(data.get("series"), []),

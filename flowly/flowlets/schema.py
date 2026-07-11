@@ -770,21 +770,27 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
 
 
 def _validate_data(ctype, cid, data, ctx: _Ctx, kind=None) -> None:
-    """Validate a chart-family `data` prop. Four forms, detected by shape:
+    """Validate a chart-family `data` prop. Six forms, detected by shape:
 
-    * scatter  — ``{list, x, y}``                     (chart only; client-drawn)
-    * category — ``{series:"k", by:"category", agg?}`` (chart only; pie/donut)
-    * multi    — ``{series:[{key,label?,color?}], …}`` (chart only; overlay)
-    * single   — ``{series:"k", agg?, bucket?, window?}`` (unchanged; all three)
+    * scatter    — ``{list, x, y}``                     (chart only; client-drawn)
+    * list time  — ``{list, field?, date?, bucket?, window?}`` (chart only;
+                    aggregates the rows themselves — survives edits/deletes)
+    * list cat.  — ``{list, by:"<string field>", field?, agg?}`` (chart only)
+    * category   — ``{series:"k", by:"category", agg?}`` (chart only; pie/donut)
+    * multi      — ``{series:[{key,label?,color?}], …}`` (chart only; overlay)
+    * single     — ``{series:"k", agg?, bucket?, window?}`` (unchanged; all three)
     """
     if not isinstance(data, dict):
         raise _err(f"{ctype} (id={cid}) `data` must be an object")
 
     is_chart = ctype == "chart"
-    if "list" in data:  # ── scatter (list-backed) ──
+    if "list" in data:  # ── list-backed (scatter / time / category) ──
         if not is_chart:
             raise _err(f"{ctype} (id={cid}) list-backed `data` is only for `chart`")
-        _validate_scatter_data(cid, data, ctx)
+        if "x" in data or "y" in data:
+            _validate_scatter_data(cid, data, ctx)
+        else:
+            _validate_list_chart_data(cid, data, ctx)
         return
     if data.get("by") is not None:  # ── categorical breakdown ──
         if not is_chart:
@@ -873,6 +879,68 @@ def _validate_category_data(cid, data, ctx: _Ctx) -> None:
     window = data.get("window", "30d")
     if window not in catalog.WINDOWS:
         raise _err(f"chart (id={cid}) `data.window` must be one of {sorted(catalog.WINDOWS)}")
+
+
+def _validate_list_chart_data(cid, data, ctx: _Ctx) -> None:
+    """A chart aggregating a list's ROWS (no parallel series to drift):
+
+    * time     — ``{list, field?, date?, bucket?, window?}``; needs a date
+                 field (explicit ``date`` or one declared on the item schema).
+    * category — ``{list, by:"<string field>", field?, agg?, window?}``;
+                 groups rows by a string field (sum a number field, or count).
+    """
+    lk = data["list"]
+    if not isinstance(lk, str) or lk not in ctx.list_keys:
+        raise _err(
+            f"chart (id={cid}) `data.list` must name a declared list state key; got {lk!r}"
+        )
+    fields = ctx.list_keys[lk]
+
+    field = data.get("field")
+    if field is not None and fields.get(field) != "number":
+        raise _err(
+            f"chart (id={cid}) `data.field` must name a number field of list '{lk}'; "
+            f"got {field!r}"
+        )
+    date_f = data.get("date")
+    if date_f is not None and fields.get(date_f) != "date":
+        raise _err(
+            f"chart (id={cid}) `data.date` must name a date field of list '{lk}'; "
+            f"got {date_f!r}"
+        )
+
+    by = data.get("by")
+    if by is not None:  # ── categorical from rows ──
+        if not isinstance(by, str) or fields.get(by) != "string":
+            raise _err(
+                f"chart (id={cid}) `data.by` must name a string field of list '{lk}' "
+                f"to group by; got {by!r}"
+            )
+        agg = data.get("agg", "sum")
+        if agg not in catalog.CATEGORY_AGGS:
+            raise _err(
+                f"chart (id={cid}) a categorical `data.agg` must be one of "
+                f"{sorted(catalog.CATEGORY_AGGS)} (a slice is a total or a tally)"
+            )
+        if agg == "sum" and field is None:
+            raise _err(
+                f"chart (id={cid}) a sum-by-category chart needs `data.field` naming "
+                f"the number field of list '{lk}' to total"
+            )
+        if "bucket" in data:
+            raise _err(f"chart (id={cid}) a categorical chart has no time axis — drop `bucket`")
+        window = data.get("window", "30d")
+        if window not in catalog.WINDOWS:
+            raise _err(f"chart (id={cid}) `data.window` must be one of {sorted(catalog.WINDOWS)}")
+        return
+
+    # ── time series from rows ──
+    if date_f is None and not any(t == "date" for t in fields.values()):
+        raise _err(
+            f"chart (id={cid}) a time chart over list '{lk}' needs a date field "
+            f"(declare one on the item schema or set `data.date`)"
+        )
+    _validate_time_axis("chart", cid, data)
 
 
 def _validate_scatter_data(cid, data, ctx: _Ctx) -> None:

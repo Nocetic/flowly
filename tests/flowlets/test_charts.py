@@ -146,6 +146,117 @@ def test_scatter_is_skipped_in_resolve():
     assert "runs" in out              # the list itself is present
 
 
+# ── list-backed time/category charts ──────────────────────────────────────────
+# A chart ABOUT a list aggregates the rows themselves — no parallel series to
+# drift (a vision add never logged; item_remove couldn't un-log; deleted
+# expenses haunted the charts).
+
+_EXPENSES_DEF = {
+    "catalog": 2, "name": "Harcamalar",
+    "state": {"expenses": {"type": "list", "item": {
+        "title": "string", "amount": "number", "category": "string", "date": "date",
+    }}},
+    "layout": [
+        {"type": "chart", "id": "trend", "kind": "bar",
+         "data": {"list": "expenses", "field": "amount", "bucket": "day", "window": "30d"}},
+        {"type": "chart", "id": "pie", "kind": "donut",
+         "data": {"list": "expenses", "by": "category", "field": "amount",
+                  "agg": "sum", "window": "30d"}},
+    ],
+}
+
+
+def _expense(id, amount, date, category="Fatura"):
+    return {"id": id, "title": id, "amount": amount, "category": category, "date": date}
+
+
+def test_list_time_chart_aggregates_the_rows():
+    now = _ms(2026, 7, 11, 23)
+    rows = [_expense("a", 200, "2026-07-11"), _expense("b", 5292.5, "2026-07-08")]
+    out = resolve_values(_EXPENSES_DEF, {"expenses": rows}, [], now, UTC)
+    by_day = {b["t"]: b["v"] for b in out["trend"]}
+    assert by_day["2026-07-11"] == 200
+    assert by_day["2026-07-08"] == 5292.5
+
+
+def test_list_chart_reflects_a_deleted_row():
+    # THE bug: delete an expense → the charts must forget it (pure function of
+    # the list, unlike a logged series which couldn't be un-logged).
+    now = _ms(2026, 7, 11, 23)
+    rows = [_expense("b", 5292.5, "2026-07-08", category="Alışveriş")]
+    out = resolve_values(_EXPENSES_DEF, {"expenses": rows}, [], now, UTC)
+    by_day = {b["t"]: b["v"] for b in out["trend"]}
+    assert by_day["2026-07-11"] == 0            # the deleted 200 is GONE
+    assert by_day["2026-07-08"] == 5292.5
+    assert out["pie"] == [{"k": "Alışveriş", "v": 5292.5}]
+
+
+def test_list_category_chart_groups_and_sums():
+    now = _ms(2026, 7, 11, 23)
+    rows = [
+        _expense("a", 200, "2026-07-11", category="Fatura"),
+        _expense("b", 100, "2026-07-10", category="Fatura"),
+        _expense("c", 50, "2026-07-09", category="Ulaşım"),
+    ]
+    out = resolve_values(_EXPENSES_DEF, {"expenses": rows}, [], now, UTC)
+    assert out["pie"] == [{"k": "Fatura", "v": 300}, {"k": "Ulaşım", "v": 50}]
+
+
+def test_list_category_count_without_field_tallies_rows():
+    now = _ms(2026, 7, 11, 23)
+    defn = {
+        "catalog": 2, "name": "x",
+        "state": {"tasks": {"type": "list", "item": {"title": "string", "status": "string"}}},
+        "layout": [{"type": "chart", "id": "c", "kind": "pie",
+                    "data": {"list": "tasks", "by": "status", "agg": "count"}}],
+    }
+    rows = [{"id": "1", "title": "a", "status": "open"},
+            {"id": "2", "title": "b", "status": "open"},
+            {"id": "3", "title": "c", "status": "done"}]
+    out = resolve_values(defn, {"tasks": rows}, [], now, UTC)
+    assert out["c"] == [{"k": "open", "v": 2}, {"k": "done", "v": 1}]
+
+
+def test_list_time_chart_skips_undated_and_windowed_out_rows():
+    now = _ms(2026, 7, 11, 23)
+    rows = [
+        _expense("ok", 100, "2026-07-11"),
+        _expense("undated", 999, ""),               # unparseable date → skipped
+        _expense("old", 500, "2025-01-01"),         # outside 30d → excluded
+    ]
+    out = resolve_values(_EXPENSES_DEF, {"expenses": rows}, [], now, UTC)
+    assert sum(b["v"] for b in out["trend"]) == 100
+
+
+def test_list_time_chart_window_filters_the_category_form_too():
+    now = _ms(2026, 7, 11, 23)
+    rows = [_expense("old", 500, "2025-01-01", category="Eski")]
+    out = resolve_values(_EXPENSES_DEF, {"expenses": rows}, [], now, UTC)
+    assert out["pie"] == []
+
+
+def test_list_chart_skips_rows_missing_the_number_field():
+    now = _ms(2026, 7, 11, 23)
+    rows = [{"id": "x", "title": "no amount", "category": "Fatura", "date": "2026-07-11"}]
+    out = resolve_values(_EXPENSES_DEF, {"expenses": rows}, [], now, UTC)
+    assert sum(b["v"] for b in out["trend"]) == 0
+    assert out["pie"] == []
+
+
+def test_list_category_over_an_undated_list_keeps_all_rows():
+    # No date field on the item schema → rows can't be windowed out.
+    now = _ms(2026, 7, 11, 23)
+    defn = {
+        "catalog": 2, "name": "x",
+        "state": {"books": {"type": "list", "item": {"title": "string", "genre": "string"}}},
+        "layout": [{"type": "chart", "id": "c", "kind": "pie",
+                    "data": {"list": "books", "by": "genre", "agg": "count", "window": "7d"}}],
+    }
+    rows = [{"id": "1", "title": "a", "genre": "sci-fi"}]
+    out = resolve_values(defn, {"books": rows}, [], now, UTC)
+    assert out["c"] == [{"k": "sci-fi", "v": 1}]
+
+
 # ── validation ────────────────────────────────────────────────────────────────
 
 def _chart(data, *, series=None, state=None):
@@ -224,6 +335,69 @@ def test_scatter_rejects_non_number_axis():
 def test_scatter_rejects_unknown_list():
     with pytest.raises(FlowletValidationError, match="declared list"):
         validate_definition(_chart({"list": "ghost", "x": "km", "y": "pace"}))
+
+
+_EXP_STATE = {"expenses": {"type": "list", "item": {
+    "title": "string", "amount": "number", "category": "string", "date": "date"}}}
+
+
+def test_valid_list_time_chart_passes():
+    validate_definition(_chart(
+        {"list": "expenses", "field": "amount", "bucket": "day", "window": "30d"},
+        state=_EXP_STATE,
+    ))
+
+
+def test_valid_list_category_chart_passes():
+    validate_definition(_chart(
+        {"list": "expenses", "by": "category", "field": "amount", "agg": "sum"},
+        state=_EXP_STATE,
+    ))
+
+
+def test_list_chart_rejects_unknown_list():
+    with pytest.raises(FlowletValidationError, match="declared list"):
+        validate_definition(_chart({"list": "ghost", "field": "amount"}))
+
+
+def test_list_chart_rejects_non_number_field():
+    with pytest.raises(FlowletValidationError, match="number field"):
+        validate_definition(_chart({"list": "expenses", "field": "title"}, state=_EXP_STATE))
+
+
+def test_list_chart_rejects_non_string_by():
+    with pytest.raises(FlowletValidationError, match="string field"):
+        validate_definition(_chart(
+            {"list": "expenses", "by": "amount", "agg": "count"}, state=_EXP_STATE,
+        ))
+
+
+def test_list_sum_by_category_requires_a_field():
+    with pytest.raises(FlowletValidationError, match="needs `data.field`"):
+        validate_definition(_chart({"list": "expenses", "by": "category"}, state=_EXP_STATE))
+
+
+def test_list_time_chart_requires_a_date_field():
+    with pytest.raises(FlowletValidationError, match="date field"):
+        validate_definition(_chart(
+            {"list": "tasks", "field": "n"},
+            state={"tasks": {"type": "list", "item": {"title": "string", "n": "number"}}},
+        ))
+
+
+def test_list_category_rejects_bucket():
+    with pytest.raises(FlowletValidationError, match="no time axis"):
+        validate_definition(_chart(
+            {"list": "expenses", "by": "category", "field": "amount", "bucket": "day"},
+            state=_EXP_STATE,
+        ))
+
+
+def test_list_chart_rejects_bad_explicit_date():
+    with pytest.raises(FlowletValidationError, match="date field"):
+        validate_definition(_chart(
+            {"list": "expenses", "field": "amount", "date": "title"}, state=_EXP_STATE,
+        ))
 
 
 def test_new_forms_rejected_on_sparkline():
