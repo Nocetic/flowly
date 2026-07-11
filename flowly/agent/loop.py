@@ -2555,6 +2555,24 @@ class AgentLoop:
                 return match.group(1).strip().lower()
         return content.lower()
 
+    def _all_tools_disabled(self, disabled_tools: object) -> bool:
+        """True when ``disabled_tools`` leaves NO tool callable this turn.
+
+        Action-turn enforcement demands a tool call; with zero available tools
+        that is impossible, so the caller must not enforce it. The flowlet
+        vision runner disables every tool by name — this is how we detect that
+        and avoid the retry/alarm/fallback spin. Fails safe: if the tool set
+        can't be read, assume tools exist (keep enforcing)."""
+        if not disabled_tools:
+            return False
+        try:
+            all_names = set(self.tools.tool_names)
+        except Exception:  # noqa: BLE001 — never let this guard break the turn
+            return False
+        if not all_names:
+            return False
+        return not (all_names - set(disabled_tools))
+
     def _is_action_turn(self, channel: str, content: str) -> bool:
         """Detect whether this turn is an action request that should execute tools strictly."""
         lowered = content.lower()
@@ -5131,6 +5149,19 @@ class AgentLoop:
         on_iteration = msg.metadata.get("on_iteration")
         model_override = msg.metadata.get("model_override")
         disabled_tools = msg.metadata.get("disabled_tools")
+
+        # A tool-less turn can NEVER satisfy action-turn enforcement — the loop
+        # would spin retrying for a tool call that is impossible, alarm, and fall
+        # back to a summary. The flowlet vision runner deliberately disables ALL
+        # tools and feeds an attacker-supplied photo whose prompt may contain
+        # action words ("card statement screenshot" hit the \bscreenshot\b
+        # pattern). If every tool is disabled, drop the action-turn flag.
+        if action_turn and self._all_tools_disabled(disabled_tools):
+            action_turn = False
+            logger.info(
+                "Action-turn flag cleared: all tools disabled this turn "
+                "(nothing to enforce)."
+            )
 
         # Mark the boundary between prior history and this turn's
         # additions. ``_run_llm_tool_loop`` mutates ``messages`` in
