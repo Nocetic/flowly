@@ -304,11 +304,14 @@ definition ≤ 64 KB · ≤ 200 components · nesting depth ≤ 8 · ≤ 200 lis
 ## Sync surface
 
 `flowlets.list · flowlets.get · flowlets.state · flowlets.action ·
-flowlets.refresh · flowlets.capture · flowlets.attachment · flowlets.pin ·
-flowlets.delete` over feature_rpc (gateway + relay). `flowlets.get` also kicks a
-background refresh of due data sources; `flowlets.refresh` force-refreshes them
-(pull-to-refresh). `flowlets.capture` runs a `photo`'s vision turn;
-`flowlets.attachment` serves a stored photo's bytes. Events:
+flowlets.refresh · flowlets.capture · flowlets.attachment · flowlets.itemRemove ·
+flowlets.pin · flowlets.delete` over feature_rpc (gateway + relay).
+`flowlets.get` also kicks a background refresh of due data sources;
+`flowlets.refresh` force-refreshes them (pull-to-refresh). `flowlets.capture`
+runs a `photo`'s vision turn; `flowlets.attachment` serves a stored photo's
+bytes; `flowlets.itemRemove` backs the clients' swipe-to-delete (a mutable
+list's rows are always deletable — the client renders swipe-to-delete for any
+repeater over a non-source-owned list, no delete button needed). Events:
 `flowlet.created · flowlet.updated · flowlet.deleted · flowlet.state ·
 flowlet.reminder` (a watch fired → desktop notification). Creation/definition
 edits are agent-only (via the `flowlet` tool); reactive `watches` fire on the

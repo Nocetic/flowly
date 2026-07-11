@@ -159,8 +159,10 @@ the user's own keys/machine — say so if the UI mentions it.
 > **ALWAYS pair the camera with a manual path.** The vision result is an
 > estimate; users must be able to (a) add an entry WITHOUT a photo (a
 > `number_input`/`input` with `item_add` — use fixed `item` values for the other
-> fields) and (b) FIX any row (a drill-down screen with `item_update` inputs +
-> a delete button). A camera-only screen is incomplete.
+> fields) and (b) FIX any row (a drill-down screen with `item_update` inputs).
+> A camera-only screen is incomplete. **You do NOT need to add a delete button**
+> — every repeater over a mutable list already gets swipe-to-delete for free on
+> every client. (Deleting a row also removes its photo.)
 
 Calorie journal (camera + manual add + editable rows — the full pattern):
 ```json
@@ -183,13 +185,12 @@ Calorie journal (camera + manual add + editable rows — the full pattern):
     { "type": "input", "id": "editName", "label": "İsim",
       "action": { "op": "item_update", "key": "meals", "field": "name" } },
     { "type": "number_input", "id": "editKcal", "label": "kcal",
-      "action": { "op": "item_update", "key": "meals", "field": "kcal" } },
-    { "type": "button", "id": "del", "text": "Sil", "style": "destructive",
-      "action": { "op": "item_remove", "key": "meals" } } ] } } }
+      "action": { "op": "item_update", "key": "meals", "field": "kcal" } } ] } } }
 ```
-(The manual `number_input` uses the quick-add rule: its number lands in the
-first free number field — `kcal` — and the fixed `item` fills `name`; the user
-renames/fixes it in the drill-down.)
+(No delete button needed — the meal list gets swipe-to-delete automatically. The
+manual `number_input` uses the quick-add rule: its number lands in the first free
+number field — `kcal` — and the fixed `item` fills `name`; the user renames/fixes
+it in the drill-down.)
 
 ## Actions (what a tap does — declared, deterministic, no LLM)
 
