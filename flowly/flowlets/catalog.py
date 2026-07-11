@@ -111,6 +111,13 @@ CAPTURE_WINDOW_S = 60
 MAX_CAPTURES_PER_FLOWLET_PER_WINDOW = 8
 MAX_CAPTURES_GLOBAL_PER_WINDOW = 24
 
+#: A tapped `agent` action op is also a paid model turn (every other model path
+#: — vision, watch `also` — is throttled), so bound it the same way: a held or
+#: hostile client can't loop an "Analyze my week" button into a paid-call flood.
+AGENT_ACTION_WINDOW_S = 60
+MAX_AGENT_ACTIONS_PER_FLOWLET_PER_WINDOW = 6
+MAX_AGENT_ACTIONS_GLOBAL_PER_WINDOW = 20
+
 # ── Watches (declarative reactive rules; evaluated LLM-free) ──────────────────
 # A definition may carry a top-level `watches` array. Each rule is evaluated by
 # the bot on a heartbeat (and on client taps) and, when it fires, sends a push /

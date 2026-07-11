@@ -122,6 +122,30 @@ async def test_agent_action_uses_runner(rpc_home):
         feature_rpc.set_flowlet_agent_runner(None)
 
 
+async def test_agent_action_is_rate_limited(rpc_home, monkeypatch):
+    # A tapped `agent` op is a paid model turn — throttled like captures.
+    from flowly.channels import feature_rpc
+    from flowly.flowlets import catalog
+    monkeypatch.setattr(catalog, "MAX_AGENT_ACTIONS_PER_FLOWLET_PER_WINDOW", 2)
+    feature_rpc._agent_action_hits.clear()
+    feature_rpc._agent_action_hits_global.clear()
+
+    async def runner(flowlet, message):
+        pass
+
+    feature_rpc.set_flowlet_agent_runner(runner)
+    try:
+        f = _seed_flowlet()
+        p = {"id": f["id"], "componentId": "coach"}
+        await feature_rpc.dispatch("flowlets.action", p)
+        await feature_rpc.dispatch("flowlets.action", p)
+        with pytest.raises(feature_rpc.FeatureRpcError) as ei:
+            await feature_rpc.dispatch("flowlets.action", p)   # 3rd within window → blocked
+        assert ei.value.code == "RATE_LIMITED"
+    finally:
+        feature_rpc.set_flowlet_agent_runner(None)
+
+
 # ── photo capture: decode guard, magic bytes, rate limit ──────────────────────
 
 def test_decode_capture_image_guards():

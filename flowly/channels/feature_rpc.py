@@ -1702,6 +1702,14 @@ async def flowlets_action(params: dict) -> dict:
     component_id = str(params.get("componentId", "") or "")
     if not flowlet_id or not component_id:
         raise FeatureRpcError("INVALID", "id and componentId required")
+    # A tapped `agent` op runs a paid model turn — throttle it (every other
+    # model path already is). Best-effort component lookup; a component in a
+    # drill screen isn't found here and simply isn't throttled (rare).
+    from flowly.flowlets.actions import _find_component
+    _fl = store.get(flowlet_id)
+    _comp = _find_component(_fl.get("definition") or {}, component_id) if _fl else None
+    if ((_comp or {}).get("action") or {}).get("op") == "agent" and not _agent_action_rate_ok(flowlet_id):
+        raise FeatureRpcError("RATE_LIMITED", "too many requests; try again in a moment")
     try:
         result = await apply_action(
             store, flowlet_id, component_id,
@@ -1768,6 +1776,30 @@ def _decode_capture_image(image: Any, max_bytes: int) -> bytes | None:
 # monotonic; single-user bot, so a plain per-flowlet + global list is enough.
 _capture_hits: dict[str, list[float]] = {}
 _capture_hits_global: list[float] = []
+
+# Same idea for tapped `agent` action ops (also paid model turns).
+_agent_action_hits: dict[str, list[float]] = {}
+_agent_action_hits_global: list[float] = []
+
+
+def _agent_action_rate_ok(flowlet_id: str) -> bool:
+    import time as _time
+    from flowly.flowlets import catalog as _fcat
+    now = _time.monotonic()
+    cutoff = now - _fcat.AGENT_ACTION_WINDOW_S
+    g = [t for t in _agent_action_hits_global if t >= cutoff]
+    f = [t for t in _agent_action_hits.get(flowlet_id, []) if t >= cutoff]
+    if len(g) >= _fcat.MAX_AGENT_ACTIONS_GLOBAL_PER_WINDOW:
+        _agent_action_hits_global[:] = g
+        return False
+    if len(f) >= _fcat.MAX_AGENT_ACTIONS_PER_FLOWLET_PER_WINDOW:
+        _agent_action_hits[flowlet_id] = f
+        return False
+    g.append(now)
+    f.append(now)
+    _agent_action_hits_global[:] = g
+    _agent_action_hits[flowlet_id] = f
+    return True
 
 
 def _capture_rate_ok(flowlet_id: str) -> bool:
