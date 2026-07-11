@@ -1834,6 +1834,49 @@ async def flowlets_capture(params: dict) -> dict:
     return result
 
 
+async def flowlets_item_remove(params: dict) -> dict:
+    """Delete one row from a list — the client's swipe-to-delete. ``{id, source,
+    itemId}`` → ``{id, values, preview?}``. A list a data source owns is
+    read-only, so a client can't swipe-delete it."""
+    from flowly.flowlets.actions import remove_list_item
+
+    store = _flowlet_store()
+    flowlet_id = str(params.get("id", "") or "")
+    source = str(params.get("source", "") or "")
+    item_id = str(params.get("itemId", "") or "")
+    if not flowlet_id or not source or not item_id:
+        raise FeatureRpcError("INVALID", "id, source and itemId required")
+    flowlet = store.get(flowlet_id)
+    if not flowlet:
+        raise FeatureRpcError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
+    defn = flowlet.get("definition") or {}
+    spec = (defn.get("state") or {}).get(source)
+    if not isinstance(spec, dict) or spec.get("type") != "list":
+        raise FeatureRpcError("INVALID", f"'{source}' is not a list")
+    if spec.get("source"):
+        raise FeatureRpcError("INVALID", f"'{source}' is owned by a data source and is read-only")
+    try:
+        remove_list_item(store, flowlet_id, defn, source, item_id)
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureRpcError("INVALID", str(exc))
+
+    from flowly.flowlets.queries import flowlet_preview
+    values = _flowlet_values(flowlet)
+    preview = flowlet_preview(defn, values)
+    result = {"id": flowlet_id, "values": values}
+    if preview is not None:
+        result["preview"] = preview
+    if _flowlet_broadcast_cb is not None:
+        try:
+            msg = {"id": flowlet_id, "values": values}
+            if preview is not None:
+                msg["preview"] = preview
+            await _flowlet_broadcast_cb("flowlet.state", msg)
+        except Exception:
+            pass
+    return result
+
+
 def flowlets_attachment(params: dict) -> dict:
     """Serve a stored photo (base64) so remote clients can render an `image`
     field. ``{id, attachmentId}`` → ``{id, mime, data}``."""
@@ -2963,6 +3006,7 @@ _DISPATCH: dict[str, tuple] = {
     "flowlets.refresh":   (flowlets_refresh, True, False),
     "flowlets.capture":   (flowlets_capture, True, False),
     "flowlets.attachment": (flowlets_attachment, True, False),
+    "flowlets.itemRemove": (flowlets_item_remove, True, False),
     "flowlets.pin":       (flowlets_pin, True, False),
     "flowlets.delete":    (flowlets_delete, True, False),
     "model.list":         (model_list, True, False),

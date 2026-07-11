@@ -204,6 +204,20 @@ def test_delete_flowlet_removes_attachments(store):
     assert store.get_attachment(f["id"], att) is None
 
 
+async def test_swipe_delete_helper_gcs_the_photo(store):
+    # remove_list_item (the swipe-to-delete path) GCs the row's photo too.
+    from flowly.flowlets.actions import remove_list_item
+    f = store.create("Kalori", _meal_def())
+    fl = store.get(f["id"])
+    values = await apply_capture(store, fl, _photo_component(fl["definition"]), _JPEG, runner=_runner_ok)
+    att = values["meals"][0]["shot"]
+    item_id = values["meals"][0]["id"]
+    assert store.get_attachment(f["id"], att) == _JPEG
+    assert remove_list_item(store, f["id"], fl["definition"], "meals", item_id) is True
+    assert store.get_attachment(f["id"], att) is None
+    assert store.get_state(f["id"]).get("meals") == []
+
+
 async def test_item_remove_gcs_the_photo(store):
     f = store.create("Kalori", _meal_def())
     fl = store.get(f["id"])

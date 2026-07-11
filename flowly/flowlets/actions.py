@@ -106,6 +106,28 @@ def _item_envelope(passed_value: Any) -> tuple[str, Any]:
     return str(passed_value["itemId"]), passed_value.get("value")
 
 
+def _gc_item_photos(store, flowlet_id: str, fields: dict, item: dict) -> None:
+    """Delete any stored photos an item's `image` fields reference."""
+    for f, ft in fields.items():
+        if ft == "image" and isinstance(item.get(f), str) and item[f]:
+            store.delete_attachment(flowlet_id, item[f])
+
+
+def remove_list_item(store, flowlet_id: str, definition: dict, key: str, item_id: str) -> bool:
+    """Remove one row from a list state key by id (GC-ing its photos). Shared by
+    the `item_remove` op and the client's swipe-to-delete RPC. Returns True if a
+    row was removed. Raises FlowletActionError if `key` isn't a declared list."""
+    spec = _list_spec(definition, key)
+    fields = spec.get("item") or {}
+    items = _load_items(store, flowlet_id, key, spec)
+    match = next((it for it in items if it.get("id") == item_id), None)
+    if match is None:
+        return False
+    _gc_item_photos(store, flowlet_id, fields, match)
+    store.set_state(flowlet_id, key, [it for it in items if it.get("id") != item_id])
+    return True
+
+
 def _find_item(items: list[dict], item_id: str) -> dict:
     for it in items:
         if it.get("id") == item_id:
@@ -383,10 +405,7 @@ async def _apply_op(
                     raise FlowletActionError("INVALID", f"`item_update` on '{f}' needs a value")
                 item[f] = _coerce_field(key, f, fields[f], inner_value)
         elif op == "item_remove":
-            # GC any stored photos this row owned before dropping it.
-            for f, ft in fields.items():
-                if ft == "image" and isinstance(item.get(f), str) and item[f]:
-                    store.delete_attachment(flowlet_id, item[f])
+            _gc_item_photos(store, flowlet_id, fields, item)
             items = [it for it in items if it.get("id") != item_id]
         else:  # item_move
             if not _is_number(inner_value):

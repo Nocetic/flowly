@@ -158,3 +158,66 @@ def test_attachment_rpc_rejects_unknown_flowlet(rpc_home):
     from flowly.channels import feature_rpc
     with pytest.raises(feature_rpc.FeatureRpcError):
         feature_rpc.flowlets_attachment({"id": "../../etc", "attachmentId": "att_00000000"})
+
+
+# ── swipe-to-delete (flowlets.itemRemove) ─────────────────────────────────────
+
+def _seed_list_flowlet():
+    from flowly.flowlets.schema import validate_definition
+    from flowly.flowlets.store import get_store
+    defn = {
+        "catalog": 2, "name": "Kalori",
+        "state": {"meals": {"type": "list", "item": {"name": "string", "kcal": "number"}}},
+        "layout": [
+            {"type": "repeater", "id": "list", "source": "meals",
+             "item": {"type": "text", "text": "{$.name}"}},
+        ],
+    }
+    validate_definition(defn)
+    store = get_store()
+    f = store.create(defn["name"], defn, catalog=2)
+    store.set_state(f["id"], "meals", [
+        {"id": "itm_a", "name": "Tost", "kcal": 300},
+        {"id": "itm_b", "name": "Salata", "kcal": 120},
+    ])
+    return store, f
+
+
+async def test_item_remove_rpc_deletes_a_row(rpc_home):
+    from flowly.channels import feature_rpc
+    store, f = _seed_list_flowlet()
+    r, _ = await feature_rpc.dispatch(
+        "flowlets.itemRemove", {"id": f["id"], "source": "meals", "itemId": "itm_a"}
+    )
+    names = [m["name"] for m in r["values"]["meals"]]
+    assert names == ["Salata"]
+    # persisted, not just in the reply
+    assert [m["id"] for m in store.get_state(f["id"])["meals"]] == ["itm_b"]
+
+
+async def test_item_remove_rpc_rejects_source_owned_list(rpc_home):
+    from flowly.channels import feature_rpc
+    from flowly.flowlets.schema import validate_definition
+    from flowly.flowlets.store import get_store
+    defn = {
+        "catalog": 2, "name": "Commits",
+        "state": {"commits": {"type": "list", "item": {"title": "string"}, "source": True}},
+        "sources": {"commits": {"kind": "agent", "prompt": "recent commits", "into": "commits"}},
+        "layout": [{"type": "repeater", "id": "list", "source": "commits",
+                    "item": {"type": "text", "text": "{$.title}"}}],
+    }
+    validate_definition(defn)
+    f = get_store().create(defn["name"], defn, catalog=2)
+    with pytest.raises(feature_rpc.FeatureRpcError):
+        await feature_rpc.dispatch(
+            "flowlets.itemRemove", {"id": f["id"], "source": "commits", "itemId": "x"}
+        )
+
+
+async def test_item_remove_rpc_unknown_row_is_noop(rpc_home):
+    from flowly.channels import feature_rpc
+    store, f = _seed_list_flowlet()
+    r, _ = await feature_rpc.dispatch(
+        "flowlets.itemRemove", {"id": f["id"], "source": "meals", "itemId": "nope"}
+    )
+    assert len(r["values"]["meals"]) == 2  # nothing removed, no error
