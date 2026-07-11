@@ -85,6 +85,18 @@ def test_sanitize_small_result_untouched():
     assert _sanitize_tool_result(raw, "exec") == raw
 
 
+def test_sanitize_skill_view_not_truncated():
+    """A whole skill body (~25 KB) must land intact — at the 8000 default it
+    was truncated to a third + spilled, so the model reassembled it over dozens
+    of reads and acted on partial guidance."""
+    from flowly.agent.loop import _sanitize_tool_result
+
+    raw = "skill guidance line\n" * 1300  # ~26 KB, over the old 8000 cap
+    sanitized = _sanitize_tool_result(raw, "skill_view")
+    assert sanitized == raw                      # untouched (under the 40000 cap)
+    assert SPILL_POINTER_MARKER not in sanitized
+
+
 # ── Layer 3: read_file path policy + offset/limit ─────────────────────────
 
 def test_spill_dir_is_readable_by_policy(tmp_path):

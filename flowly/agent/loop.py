@@ -61,6 +61,12 @@ _TOOL_MAX_CHARS: dict[str, int] = {
     "web_search": 4000,
     "web_fetch": 6000,
     "process": 6000,
+    # A skill body is authoritative, self-contained guidance the model must read
+    # WHOLE. At the 8000 default a large skill (e.g. flowlets, ~25 KB) gets
+    # truncated to a third and spilled to a temp file — the model then burns
+    # dozens of follow-up reads reassembling it AND acts on partial guidance. A
+    # generous cap lets the whole skill land in one clean result.
+    "skill_view": 40000,
 }
 _DEFAULT_MAX_CHARS = 8000
 
