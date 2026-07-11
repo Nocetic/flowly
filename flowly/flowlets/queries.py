@@ -519,6 +519,64 @@ def _category_breakdown(
 # every chart stays a pure function of the list.
 
 
+def _shadow_series(definition: dict) -> dict[str, dict]:
+    """Series that are mere SHADOWS of a list → ``{series: {list, field, by}}``.
+
+    The give-away is an authored ``batch`` that pairs ``item_add`` into a list
+    with a ``log`` into a series — every manual add writes both, but a vision
+    capture only writes the list and a delete can't un-log, so any chart bound
+    to that series drifts from the list (ghost slices for deleted rows, missing
+    receipts). Charts on a shadow series are resolved FROM THE LIST instead.
+
+    Field mapping is by template identity: the ``log`` op's ``value`` template
+    matching exactly one ``item_add`` field names the number field; likewise its
+    ``category`` template names the group-by field (falling back to a field
+    literally called ``category``).
+    """
+    out: dict[str, dict] = {}
+
+    def scan(node: Any) -> None:
+        if isinstance(node, list):
+            for n in node:
+                scan(n)
+            return
+        if not isinstance(node, dict):
+            return
+        action = node.get("action")
+        if isinstance(action, dict) and action.get("op") == "batch":
+            ops = [o for o in action.get("ops") or [] if isinstance(o, dict)]
+            adds = [o for o in ops if o.get("op") == "item_add" and isinstance(o.get("key"), str)]
+            logs = [o for o in ops if o.get("op") == "log" and isinstance(o.get("series"), str)]
+            for add in adds:
+                fields = add.get("fields") if isinstance(add.get("fields"), dict) else {}
+
+                def field_matching(tpl: Any) -> str | None:
+                    if not isinstance(tpl, str):
+                        return None
+                    hits = [f for f, t in fields.items() if t == tpl]
+                    return hits[0] if len(hits) == 1 else None
+
+                for log in logs:
+                    by = field_matching(log.get("category"))
+                    if by is None and "category" in fields:
+                        by = "category"
+                    out.setdefault(log["series"], {
+                        "list": add["key"],
+                        "field": field_matching(log.get("value")),
+                        "by": by,
+                    })
+        scan(node.get("children"))
+        item = node.get("item")
+        if isinstance(item, dict):
+            scan(item)
+
+    scan(definition.get("layout"))
+    for screen in (definition.get("screens") or {}).values():
+        if isinstance(screen, dict):
+            scan(screen.get("layout"))
+    return out
+
+
 def _row_ts(v: Any, tz: tzinfo | None) -> int | None:
     """A row's date field ("YYYY-MM-DD", datetime strings tolerated) → local
     MIDDAY ms (midday keeps the bucket stable across DST edges). None if the
@@ -723,21 +781,46 @@ def resolve_values(
     #    `data` forms (see catalog): single → [{t,v}]; multi → {multi:[…]};
     #    category → [{k,v}]; list-backed time/category → same shapes, derived
     #    from the list's rows; scatter → skipped (the client reads the rows).
+    shadows = _shadow_series(definition)
+
+    def _item_schema(list_key: str) -> dict:
+        spec = state_defs.get(list_key)
+        return (spec.get("item") or {}) if isinstance(spec, dict) else {}
+
     for comp in _iter_components(definition.get("layout", [])):
         if comp.get("type") not in catalog.SERIES_COMPONENTS or not comp.get("id"):
             continue
         cid = comp["id"]
         data = comp.get("data", {}) or {}
+
+        # A chart bound to a SHADOW series (one only ever logged in lockstep
+        # with a list's item_add) resolves from the LIST instead — the series
+        # drifts (a vision add never logs; a delete can't un-log), the list is
+        # the truth. The stored definition is untouched; only resolution
+        # redirects, so every caller (get/action/broadcast/watch) heals alike.
+        sref = data.get("series")
+        if isinstance(sref, str) and sref in shadows:
+            sh = shadows[sref]
+            schema_ = _item_schema(sh["list"])
+            nums = [f for f, t in schema_.items() if t == "number"]
+            num_field = sh["field"] or (nums[0] if len(nums) == 1 else None)
+            if data.get("by") == "category":
+                if sh["by"] and (num_field or data.get("agg") == "count"):
+                    data = {"list": sh["list"], "by": sh["by"],
+                            **({"field": num_field} if num_field else {}),
+                            **{k: data[k] for k in ("agg", "window") if k in data}}
+            elif num_field and any(t == "date" for t in schema_.values()):
+                data = {"list": sh["list"], "field": num_field,
+                        **{k: data[k] for k in ("agg", "bucket", "window") if k in data}}
+            # (no usable mapping → fall through to the event-based resolve)
+
         if "list" in data:
             if "x" in data or "y" in data:
                 continue  # scatter: the list is already in `values`; nothing to resolve
             # List-backed: aggregate the rows THEMSELVES, so the chart stays a
             # pure function of the list (edits/deletes/vision adds included).
             rows = values.get(data["list"])
-            item_schema = (
-                state_defs.get(data["list"], {}).get("item")
-                if isinstance(state_defs.get(data["list"]), dict) else None
-            ) or {}
+            item_schema = _item_schema(data["list"])
             date_field = data.get("date") or next(
                 (f for f, t in item_schema.items() if t == "date"), None
             )

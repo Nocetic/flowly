@@ -257,6 +257,100 @@ def test_list_category_over_an_undated_list_keeps_all_rows():
     assert out["c"] == [{"k": "sci-fi", "v": 1}]
 
 
+# ── shadow-series redirect ────────────────────────────────────────────────────
+# Old-pattern flowlets pair item_add with a log into a parallel series and bind
+# their charts to the SERIES. Those charts drift (a vision add never logs; a
+# delete can't un-log) — so resolution detects the shadow pairing and computes
+# the chart from the LIST rows, healing existing flowlets with zero re-author.
+
+def _shadow_defn():
+    # Mirrors the user's real "Harcama Takibi": batch[item_add expenses,
+    # log spend], charts bound to `spend`.
+    return {
+        "catalog": 2, "name": "Harcama Takibi",
+        "series": {"spend": {"unit": "₺"}},
+        "state": {
+            "draftTitle": {"type": "string", "default": ""},
+            "draftCategory": {"type": "string", "default": "Market"},
+            "expenses": {"type": "list", "item": {
+                "title": "string", "amount": "number",
+                "category": "string", "date": "date"}},
+        },
+        "layout": [
+            {"id": "amountIn", "type": "number_input",
+             "action": {"op": "batch", "ops": [
+                 {"op": "item_add", "key": "expenses", "fields": {
+                     "title": "{draftTitle}", "amount": "{value}",
+                     "category": "{draftCategory}", "date": "today"}},
+                 {"op": "log", "series": "spend", "value": "{value}",
+                  "category": "{draftCategory}"},
+             ]}},
+            {"type": "chart", "id": "dailySpend", "kind": "bar",
+             "data": {"series": "spend", "agg": "sum", "bucket": "day", "window": "30d"}},
+            {"type": "chart", "id": "categoryBreakdown", "kind": "pie",
+             "data": {"series": "spend", "by": "category", "agg": "sum", "donut": True}},
+        ],
+    }
+
+
+def test_shadow_series_chart_resolves_from_the_list():
+    # The user's exact bug: Fatura 200 + Market 3000 were logged then their
+    # rows DELETED; only Cepax 5292.5 remains in the list. The stale events
+    # must not haunt the charts.
+    now = _ms(2026, 7, 12, 12)
+    stale_events = [_ev("spend", 200, _ms(2026, 7, 11), "Fatura"),
+                    _ev("spend", 3000, _ms(2026, 7, 12), "Market")]
+    rows = [{"id": "i1", "title": "Cepax Bilişim alışveriş", "amount": 5292.5,
+             "category": "Alışveriş", "date": "2026-07-08"}]
+    out = resolve_values(_shadow_defn(), {"expenses": rows}, stale_events, now, UTC)
+    assert out["categoryBreakdown"] == [{"k": "Alışveriş", "v": 5292.5}]
+    by_day = {b["t"]: b["v"] for b in out["dailySpend"]}
+    assert by_day["2026-07-08"] == 5292.5
+    assert by_day["2026-07-11"] == 0     # deleted Fatura: gone
+    assert by_day["2026-07-12"] == 0     # deleted Market: gone
+
+
+def test_shadow_redirect_sees_a_vision_added_row():
+    # A receipt lands in the list WITHOUT a log — the chart must still count it.
+    now = _ms(2026, 7, 12, 12)
+    rows = [{"id": "i1", "title": "fiş", "amount": 750,
+             "category": "Market", "date": "2026-07-12"}]
+    out = resolve_values(_shadow_defn(), {"expenses": rows}, [], now, UTC)
+    assert out["categoryBreakdown"] == [{"k": "Market", "v": 750}]
+
+
+def test_non_shadow_series_stays_event_based():
+    # A plain log tracker (no item_add pairing) keeps its event math.
+    now = _ms(2026, 7, 12, 12)
+    defn = {
+        "catalog": 2, "name": "Su", "series": {"water": {}},
+        "layout": [
+            {"id": "drink", "type": "button", "text": "250",
+             "action": {"op": "log", "series": "water", "value": 250}},
+            {"type": "chart", "id": "week",
+             "data": {"series": "water", "agg": "sum", "bucket": "day", "window": "7d"}},
+        ],
+    }
+    events = [_ev("water", 250, _ms(2026, 7, 12, 9))]
+    out = resolve_values(defn, {}, events, now, UTC)
+    assert {b["t"]: b["v"] for b in out["week"]}["2026-07-12"] == 250
+
+
+def test_shadow_without_a_date_field_falls_back_to_events():
+    # A dateless list can't be time-bucketed — better a stale chart than an
+    # empty one; the redirect abandons and the event math stays.
+    now = _ms(2026, 7, 12, 12)
+    d = _shadow_defn()
+    d["state"]["expenses"]["item"] = {"title": "string", "amount": "number",
+                                      "category": "string"}  # no date
+    events = [_ev("spend", 100, _ms(2026, 7, 12, 9))]
+    out = resolve_values(d, {"expenses": []}, events, now, UTC)
+    assert {b["t"]: b["v"] for b in out["dailySpend"]}["2026-07-12"] == 100
+    # ...but the category chart needs no dates → it DOES redirect (empty list
+    # → no slices, the stale Fatura/Market events are ignored).
+    assert out["categoryBreakdown"] == []
+
+
 # ── validation ────────────────────────────────────────────────────────────────
 
 def _chart(data, *, series=None, state=None):
