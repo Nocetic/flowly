@@ -1442,7 +1442,11 @@ Respond to the user now:"""
         # Fail CLOSED: the image is attacker-supplied, so a turn must never run
         # with tools enabled. If we can't enumerate tools to disable, refuse the
         # turn rather than fall back to a tool-enabled one.
-        no_tools = agent.tools.tool_names()
+        # NOTE: `tool_names` is a PROPERTY (a list), not a method. Calling it
+        # raised TypeError on every capture; the original fail-open try/except
+        # silently swallowed that and ran the turn with tools ENABLED — the
+        # exact hole the fail-closed hardening was for.
+        no_tools = list(agent.tools.tool_names)
         return await agent.process_direct(
             prompt,
             session_key=f"flowlet_vision:{flowlet.get('id')}",

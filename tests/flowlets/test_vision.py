@@ -110,6 +110,21 @@ async def test_capture_adds_item_with_photo(store):
     assert store.get_attachment(f["id"], meals[0]["shot"]) == _JPEG
 
 
+def test_vision_runner_uses_tool_names_as_property():
+    """`ToolRegistry.tool_names` is a PROPERTY (a list). gateway_cmd's vision
+    runner once called it as a method — TypeError on EVERY capture, surfaced as
+    "couldn't read the photo ('list' object is not callable)" (and before the
+    fail-closed hardening, silently ran the vision turn with tools ENABLED)."""
+    from pathlib import Path
+
+    import flowly.cli.gateway_cmd as gw
+    from flowly.agent.tools.registry import ToolRegistry
+
+    assert isinstance(ToolRegistry().tool_names, list)  # the property contract
+    src = Path(gw.__file__).read_text()
+    assert "tool_names()" not in src, "tool_names is a property — don't call it"
+
+
 async def test_capture_fails_closed_on_unreadable_photo(store):
     # The model returns nothing matching the item schema → no ghost row is
     # appended, and the stored photo is cleaned up (not orphaned).
