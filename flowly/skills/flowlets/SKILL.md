@@ -374,6 +374,12 @@ The rules:
 - The screen's grid card automatically previews as "done/total" when the item
   schema has a bool field.
 - A journal = a list of `{text: "string", day: "date"}` rendered the same way.
+- **Row anatomy — keep it to two lines.** Line 1: the description (`{$.title}`).
+  Line 2: the date or ONE short fact, directly below (the renderer draws texts
+  after the first as a small secondary line automatically). Trailing value
+  (amount, kcal) as a `badge` on the right. Never repeat the description in
+  another field, and never put more than two text lines in a row — rows are
+  height-capped and extra lines get cropped.
 
 **Reason about a list** with a `computed` that aggregates it —
 `{ "list": "<key>", "agg": "count|sum|avg|min|max", "field?": "...", "where?": "<expr>" }`
