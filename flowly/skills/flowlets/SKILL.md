@@ -69,10 +69,18 @@ lookup, cross-flowlet reasoning).
 
 ## Component catalog (catalog: 1)
 
-Always start the definition with `"catalog": 1`.
+Start the definition with `"catalog": 1` (bump to `2` only if you use rich
+charts / data tables / drill screens, `3` only if you use a composite like
+`list_row`). A higher catalog is fine — old clients still render.
 
 **Layout:** `card`, `row`, `column`, `grid`, `list` (all take `children`),
 `divider`, `spacer`.
+
+**Composites (catalog 3) — prefer these; they own their own layout:**
+- `list_row` — one display row of a list: `title` (line 1), `subtitle?` (muted
+  line 2), `value?` (right-aligned), `badge?`, `thumb?` (image field). Only as a
+  `repeater`'s `item`. See "Row display" below — reach for this instead of
+  hand-building a `row` of texts.
 
 **Display:** `header` (text), `text` (text, interpolates `{key}`), `badge`
 (text), `icon` (name), `stat` (value, label), `progress` (value, max),
@@ -374,12 +382,31 @@ The rules:
 - The screen's grid card automatically previews as "done/total" when the item
   schema has a bool field.
 - A journal = a list of `{text: "string", day: "date"}` rendered the same way.
-- **Row anatomy — keep it to two lines.** Line 1: the description (`{$.title}`).
-  Line 2: the date or ONE short fact, directly below (the renderer draws texts
-  after the first as a small secondary line automatically). Trailing value
-  (amount, kcal) as a `badge` on the right. Never repeat the description in
-  another field, and never put more than two text lines in a row — rows are
-  height-capped and extra lines get cropped.
+
+**Row display — prefer `list_row` (catalog 3), don't hand-build the layout.**
+For a row that just SHOWS an item (expense, meal, transaction — no per-row
+toggle), use the `list_row` composite as the repeater's `item`. You name which
+field is which; the system owns the layout (thumbnail, title/subtitle hierarchy,
+right-aligned value, truncation, height). This is the reliable way — a
+hand-rolled `row` of `text`/`badge` is where rows come out lopsided.
+
+```json
+{ "type": "repeater", "source": "expenses", "navigate": "expenseDetail",
+  "empty": "Henüz harcama yok",
+  "item": { "type": "list_row",
+    "thumb": "$.receipt",          // optional image field → 44px leading thumb
+    "title": "$.title",            // line 1, primary
+    "subtitle": "$.merchant",      // line 2, small + muted (omit for one line)
+    "badge": "$.category",         // a pill on the right
+    "value": "{$.amount} ₺" } }    // the trailing value, right-aligned
+```
+Every prop is optional except `title`; a bare `$.field` interpolates, a
+`{$.field} unit` template is kept verbatim, a plain word is a literal. `title`
+missing at render (e.g. a vision row with no title) auto-promotes the subtitle.
+A row WITH an interactive control (a shopping-list checkbox) still uses a plain
+`row` — put the `toggle` first, then the text; see the todo example above.
+(`list_row` renders one clean row on every client; the bot expands it to
+primitives before serving.)
 
 **Reason about a list** with a `computed` that aggregates it —
 `{ "list": "<key>", "agg": "count|sum|avg|min|max", "field?": "...", "where?": "<expr>" }`

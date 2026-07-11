@@ -1242,6 +1242,35 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> N
         val = node.get("value")
         if not isinstance(val, str) or val not in ctx.timer_keys:
             raise _err(f"timer (id={cid}) `value` must name a declared timer state key")
+    elif ctype == "list_row":
+        _validate_list_row(cid, node, ctx)
+
+
+_LIST_ROW_PROPS = ("title", "subtitle", "value", "badge", "thumb")
+_ITEM_REF_RE = re.compile(r"\$\.([a-zA-Z][a-zA-Z0-9_]*)")
+
+
+def _validate_list_row(cid, node, ctx: _Ctx) -> None:
+    """A ``list_row`` composite is ONLY valid as a repeater's row template, and
+    every ``$.field`` it names must be a field of that list. It expands (see
+    composites.py) to the canonical row — the agent never lays it out."""
+    if ctx.item_fields is None:
+        raise _err(
+            f"list_row (id={cid}) is only valid as a repeater's `item` template "
+            "(it renders one list row); put it inside a repeater"
+        )
+    for prop in _LIST_ROW_PROPS:
+        v = node.get(prop)
+        if v is None:
+            continue
+        if not isinstance(v, str) or not v.strip():
+            raise _err(f"list_row (id={cid}) `{prop}` must be a non-empty string")
+        for field in _ITEM_REF_RE.findall(v):
+            if field not in ctx.item_fields:
+                raise _err(
+                    f"list_row (id={cid}) `{prop}` references unknown item field "
+                    f"'{field}' (declared: {sorted(ctx.item_fields)})"
+                )
 
 
 # ── watches (reactive rules) ─────────────────────────────────────────────────

@@ -1642,8 +1642,14 @@ def flowlets_get(params: dict) -> dict:
     # authored none), and a list with an `image` field always DISPLAYS its
     # photos (row thumbnail + full photo). Editable runs first so a synthesized
     # drill screen also picks up its full photo from the photo pass.
+    from flowly.flowlets.composites import expand_composites
     from flowly.flowlets.normalize import ensure_editable_drill, ensure_photo_display
-    definition = ensure_photo_display(ensure_editable_drill(flowlet["definition"]))
+    # Composites (catalog 3) expand to primitives FIRST, so the photo/edit
+    # augmentation and the client both see plain v2 nodes; an old client renders
+    # the expansion with no changes.
+    definition = ensure_photo_display(
+        ensure_editable_drill(expand_composites(flowlet["definition"]))
+    )
     return {
         "flowlet": {
             "id": flowlet["id"],

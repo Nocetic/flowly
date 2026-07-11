@@ -17,7 +17,11 @@ from __future__ import annotations
 #: a client hides / placeholders anything it doesn't understand.
 #: v2 — rich charts (multi-series overlay, categorical pie/donut, list scatter),
 #: data-bound tables, list search/sort/filter, and drill-down screens.
-CATALOG_VERSION = 2
+#: v3 — semantic composites (``list_row`` …) that the bot EXPANDS to v2
+#: primitives at serve time, so the agent states intent and the system owns
+#: layout. Old clients render the expansion with no changes; newer clients may
+#: render composites natively. See ``composites.py``.
+CATALOG_VERSION = 3
 
 # ── Structural limits (defence against runaway / malformed definitions) ───────
 MAX_DEFINITION_BYTES = 64 * 1024
@@ -278,10 +282,22 @@ COMPONENTS: dict[str, dict] = {
                      "required": ["target"]},
     # Capture a photo → a `vision` action interprets it into a new list item.
     "photo":        {"category": "input", "container": False, "action": True},
+
+    # ── Composites (catalog 3) — semantic, EXPANDED to primitives at serve
+    #    time (see composites.py). The agent states intent (which field is the
+    #    title, which is the value); the system owns layout. ──────────────────
+    # A whole list row: title (line 1) / subtitle (muted line 2) on the left,
+    # a badge + a trailing value on the right, an optional leading thumbnail.
+    # Only valid as a `repeater`'s `item`; props reference the item's fields.
+    "list_row":  {"category": "composite", "container": False, "action": False,
+                  "required": ["title"], "composite": True},
 }
 
 #: Chart-family components whose ``data`` prop resolves to a per-bucket series.
 SERIES_COMPONENTS = frozenset({"chart", "sparkline", "heatmap"})
+
+#: Semantic components the bot expands to primitives before a client renders.
+COMPOSITE_TYPES = frozenset(t for t, s in COMPONENTS.items() if s.get("composite"))
 
 #: Component types that exist (for the renderer-agnostic membership check).
 COMPONENT_TYPES = frozenset(COMPONENTS)
