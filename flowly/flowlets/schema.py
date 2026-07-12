@@ -609,6 +609,15 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
             f"got {op!r}"
         )
 
+    # `once` — a server-side latch: the action fires at most once per local day
+    # / ISO week / ever. The GUARANTEE for "complete the day" buttons —
+    # visibleWhen alone can't prevent a re-fire once the state resets.
+    once = action.get("once")
+    if once is not None and once not in ("day", "week", True):
+        raise _err(
+            f"{ctype} (id={cid}) `once` must be \"day\", \"week\", or true; got {once!r}"
+        )
+
     # A source owns its state key; the user can't write it (the source snapshot
     # would be clobbered / re-overwritten). Read-only from the UI.
     tgt = action.get("key")

@@ -298,6 +298,93 @@ def ensure_editable_drill(defn: dict) -> dict:
     return defn
 
 
+# ── missing ids (assign, never reject) ────────────────────────────────────────
+
+#: Types that need an id to FUNCTION even without an `action`: chart-family ids
+#: key their resolved series in `values`; a checklist dispatches taps by id.
+_NEEDS_ID_TYPES = frozenset({"chart", "sparkline", "heatmap", "checklist"})
+
+
+def assign_missing_ids(defn: dict) -> dict:
+    """Auto-assign a deterministic id to every component that needs one.
+
+    The agent forgetting an id was a whole failure class: a button with an
+    action got rejected at create ("needs a unique `id`"), and an id-less
+    chart passed validation but silently rendered "No data yet" (its resolved
+    series is keyed by id in ``values``). The system fills the gap instead:
+    ``{type}_{n}`` in document order, skipping every existing id and state/
+    computed key (chart ids share the scalar namespace).
+
+    Deterministic and idempotent, so the tool persists the SAME ids the serve
+    path derives for older stored definitions. Cheap no-op (no copy) when
+    nothing is missing.
+    """
+    used: set[str] = set(defn.get("state") or {}) | set(defn.get("computed") or {})
+
+    def needs_id(node: dict) -> bool:
+        if node.get("id") is not None:
+            return False
+        return bool(node.get("action")) or node.get("type") in _NEEDS_ID_TYPES
+
+    missing = False
+
+    def scan(node: Any) -> None:
+        nonlocal missing
+        if isinstance(node, list):
+            for n in node:
+                scan(n)
+            return
+        if not isinstance(node, dict):
+            return
+        cid = node.get("id")
+        if isinstance(cid, str):
+            used.add(cid)
+        if needs_id(node):
+            missing = True
+        scan(node.get("children"))
+        item = node.get("item")
+        if isinstance(item, dict):
+            scan(item)
+
+    scan(defn.get("layout"))
+    for screen in (defn.get("screens") or {}).values():
+        if isinstance(screen, dict):
+            scan(screen.get("layout"))
+    if not missing:
+        return defn
+
+    out = copy.deepcopy(defn)
+    counters: dict[str, int] = {}
+
+    def fill(node: Any) -> None:
+        if isinstance(node, list):
+            for n in node:
+                fill(n)
+            return
+        if not isinstance(node, dict):
+            return
+        if needs_id(node):
+            base = str(node.get("type") or "c")
+            n = counters.get(base, 0) + 1
+            cid = f"{base}_{n}"
+            while cid in used:
+                n += 1
+                cid = f"{base}_{n}"
+            counters[base] = n
+            used.add(cid)
+            node["id"] = cid
+        fill(node.get("children"))
+        item = node.get("item")
+        if isinstance(item, dict):
+            fill(item)
+
+    fill(out.get("layout"))
+    for screen in (out.get("screens") or {}).values():
+        if isinstance(screen, dict):
+            fill(screen.get("layout"))
+    return out
+
+
 # ── chart layout (never cram a chart into columns) ────────────────────────────
 
 def _contains_chart(node: Any) -> bool:

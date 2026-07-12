@@ -262,6 +262,21 @@ Put an `action` on an input component. Ops:
 - `timer_toggle` — `{op:"timer_toggle", key}` — start/stop a `timer` state key.
 - `batch` — `{op:"batch", ops:[...]}` — several ops at once.
 
+**`once` — an at-most-once latch (server-enforced).** Any action may carry
+`"once": "day"` (or `"week"`, or `true` = ever): the bot refuses a second fire
+inside the window — a repeat tap is a silent no-op. REQUIRED on a
+"complete the day" button: `visibleWhen` alone can't stop a re-fire (the user
+re-checks the boxes, the button reappears, and a second "day" gets logged).
+
+```json
+{ "id": "complete_day", "type": "button", "text": "Günü Tamamla",
+  "visibleWhen": "both_done > 0",
+  "action": { "op": "batch", "once": "day", "ops": [
+    { "op": "log", "series": "days", "value": 1 },
+    { "op": "reset", "key": "read_done" },
+    { "op": "reset", "key": "code_done" } ] } }
+```
+
 A button with a fixed `value` (like drink-250) ignores any client value. Free
 inputs (slider/input/rating) supply their value, validated to the component's
 bounds.

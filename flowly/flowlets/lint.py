@@ -220,6 +220,21 @@ def lint_definition(defn: dict) -> list[dict]:
                         "leaked template token. It will render blank.",
                     ))
 
+    # ── L13 — a complete-the-day batch without a `once` latch ─────────────────
+    for comp in _all_components(defn):
+        a = comp.get("action")
+        if not (isinstance(a, dict) and a.get("op") == "batch"):
+            continue
+        ops = [o.get("op") for o in a.get("ops") or [] if isinstance(o, dict)]
+        if "log" in ops and "reset" in ops and not a.get("once"):
+            out.append(_finding(
+                "L13",
+                f"'{comp.get('id')}' logs and resets in one batch — the "
+                "complete-the-day idiom — but has no `once`. Without "
+                "`\"once\": \"day\"` the user can re-check the boxes and "
+                "complete the same day again (and again). Add it.",
+            ))
+
     # ── L10 — a declared state key never referenced ───────────────────────────
     for key in state:
         # count>1 means the name appears somewhere beyond its own declaration.

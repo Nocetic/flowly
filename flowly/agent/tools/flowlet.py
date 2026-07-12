@@ -245,6 +245,11 @@ class FlowletTool(Tool):
         definition = kw.get("definition")
         if not isinstance(definition, dict):
             return json.dumps({"error": "definition (object) is required"})
+        # Forgotten ids are ASSIGNED, not rejected — "button carries an action,
+        # so it needs a unique `id`" was a whole authoring-failure class, and an
+        # id-less chart silently rendered empty. Persist the assigned ids.
+        from flowly.flowlets.normalize import assign_missing_ids
+        definition = assign_missing_ids(definition)
         validate_definition(definition)
         meta = _extract_meta(definition)
         flowlet = self._store.create(
@@ -277,6 +282,8 @@ class FlowletTool(Tool):
         if definition is not None:
             if not isinstance(definition, dict):
                 return json.dumps({"error": "definition must be an object"})
+            from flowly.flowlets.normalize import assign_missing_ids
+            definition = assign_missing_ids(definition)
             validate_definition(definition)
             meta = _extract_meta(definition)
             name, icon, accent = meta["name"], meta["icon"], meta["accent"]

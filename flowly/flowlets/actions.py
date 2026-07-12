@@ -189,9 +189,12 @@ async def apply_action(
     # Expand composites first: a form's submit / a tracker's quick-add lives
     # inside a composite in the STORED definition, so _find_component (and the
     # injected draft-state specs it coerces against) only see it after
-    # expansion. Idempotent + a no-op when the definition has no composite.
+    # expansion. Then assign the ids the author forgot — the client renders the
+    # SERVED definition (same deterministic assignment), so a tap can arrive
+    # for an auto-assigned id. Both idempotent no-ops when clean.
     from flowly.flowlets.composites import expand_composites
-    definition = expand_composites(flowlet["definition"])
+    from flowly.flowlets.normalize import assign_missing_ids
+    definition = assign_missing_ids(expand_composites(flowlet["definition"]))
 
     component = _find_component(definition, component_id)
     if component is None:
@@ -230,10 +233,26 @@ async def apply_action(
         action = component.get("action")
         if not isinstance(action, dict):
             raise FlowletActionError("INVALID", f"component '{component_id}' has no action")
-        await _apply_op(
-            store, flowlet_id, definition, component, action, value,
-            agent_runner=agent_runner, tz=tz,
-        )
+        # `once` latch — the SERVER-side guarantee that a "complete the day"
+        # button can't fire twice in its window. visibleWhen alone can't stop a
+        # re-fire (re-check the boxes → the button reappears → tap → a second
+        # day logged; a user did 8 "days" in 14 seconds). A repeat tap is a
+        # silent no-op returning fresh values — idempotent, no error toast.
+        once = action.get("once")
+        bucket = _once_bucket(once, tz) if once else None
+        guard_key = f"__once__{component_id}"
+        if bucket is not None and store.get_state(flowlet_id).get(guard_key) == bucket:
+            logger.debug(
+                "flowlet {} action '{}' suppressed by once={} (already fired {})",
+                flowlet_id, component_id, once, bucket,
+            )
+        else:
+            await _apply_op(
+                store, flowlet_id, definition, component, action, value,
+                agent_runner=agent_runner, tz=tz,
+            )
+            if bucket is not None:
+                store.set_state(flowlet_id, guard_key, bucket)
 
     # Recompute the full values map from the post-mutation state + events.
     values = resolve_values(
@@ -250,6 +269,19 @@ def queries_now_ms() -> int:
     # Indirection kept tiny so tests can monkeypatch a fixed clock if needed.
     from flowly.flowlets.store import now_ms
     return now_ms()
+
+
+def _once_bucket(once: Any, tz: tzinfo | None) -> str:
+    """The latch bucket for an action's ``once`` window, in LOCAL time:
+    ``day`` → "YYYY-MM-DD", ``week`` → "YYYY-Www", ``true`` → "ever"."""
+    from datetime import datetime
+    if once == "day" or once == "week":
+        dt = datetime.fromtimestamp(queries_now_ms() / 1000, tz)
+        if once == "day":
+            return dt.strftime("%Y-%m-%d")
+        iso = dt.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    return "ever"
 
 
 async def _apply_op(

@@ -702,10 +702,12 @@ def resolve_values(
     """
     # Composites (catalog 3) inject their own state/computed/charts on
     # expansion — a tracker's aggregate metric, a form's draft keys. Resolve
-    # against the EXPANDED definition so those exist. Idempotent; a no-op (no
-    # copy) when the definition has no composite.
+    # against the EXPANDED definition so those exist. Then assign ids the
+    # author forgot (an id-less chart would otherwise resolve NOTHING — its
+    # series is keyed by id). Both idempotent; no-ops (no copy) when clean.
     from flowly.flowlets.composites import expand_composites
-    definition = expand_composites(definition)
+    from flowly.flowlets.normalize import assign_missing_ids
+    definition = assign_missing_ids(expand_composites(definition))
 
     values: dict[str, Any] = {}
 
