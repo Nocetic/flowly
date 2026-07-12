@@ -291,6 +291,15 @@ COMPONENTS: dict[str, dict] = {
     # Only valid as a `repeater`'s `item`; props reference the item's fields.
     "list_row":  {"category": "composite", "container": False, "action": False,
                   "required": ["title"], "composite": True},
+    # A multi-field entry card: one control per `fields` entry (typed from the
+    # list's item schema; `options` → picker) + a submit that adds a row into
+    # `into` and clears the form. The system owns the draft state + wiring.
+    "form":      {"category": "composite", "container": False, "action": False,
+                  "required": ["id", "into", "fields"], "composite": True},
+    # A stat + list-backed chart (+ optional quick-add) about one list: the
+    # aggregate is a computed over the rows, so it never drifts from the list.
+    "tracker_card": {"category": "composite", "container": False, "action": False,
+                     "required": ["id", "list"], "composite": True},
 }
 
 #: Chart-family components whose ``data`` prop resolves to a per-bucket series.

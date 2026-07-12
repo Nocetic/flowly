@@ -700,6 +700,13 @@ def resolve_values(
     * ``events`` — all event rows for this flowlet, each ``{"series","value","ts"}``,
       sorted by ``ts`` ascending.
     """
+    # Composites (catalog 3) inject their own state/computed/charts on
+    # expansion — a tracker's aggregate metric, a form's draft keys. Resolve
+    # against the EXPANDED definition so those exist. Idempotent; a no-op (no
+    # copy) when the definition has no composite.
+    from flowly.flowlets.composites import expand_composites
+    definition = expand_composites(definition)
+
     values: dict[str, Any] = {}
 
     # 1. state (declared defaults, overridden by persisted values)
@@ -943,6 +950,10 @@ def flowlet_preview(definition: dict, values: dict) -> dict | None:
     """A compact headline for a list card: the first progress/ring/gauge (with a
     percent for a mini bar) or the first stat — as ready-to-show ``text`` plus an
     optional ``pct`` (0..1). Lets a tile read as content, not just an icon."""
+    # Expand composites so a tracker_card's metric (hidden in the composite in
+    # the stored definition) can headline the tile. Idempotent no-op otherwise.
+    from flowly.flowlets.composites import expand_composites
+    definition = expand_composites(definition)
     for comp in _iter_ordered(definition.get("layout", []) or []):
         t = comp.get("type")
         if t in ("progress", "ring", "gauge"):
@@ -952,7 +963,7 @@ def flowlet_preview(definition: dict, values: dict) -> dict | None:
             text = label or f"{_clean_number(val)} / {_clean_number(mx)}"
             pct = min(1.0, max(0.0, val / mx)) if mx else 0.0
             return {"text": text, "pct": pct}
-        if t == "stat" and comp.get("value") is not None:
+        if t in ("stat", "metric") and comp.get("value") is not None:
             val = _num(comp.get("value"), values)
             label = comp.get("label")
             if isinstance(label, str) and "{" in label:

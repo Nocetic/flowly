@@ -1244,6 +1244,10 @@ def _validate_component_extras(ctype, cid, node, ctx: _Ctx, depth: int = 1) -> N
             raise _err(f"timer (id={cid}) `value` must name a declared timer state key")
     elif ctype == "list_row":
         _validate_list_row(cid, node, ctx)
+    elif ctype == "form":
+        _validate_form(cid, node, ctx)
+    elif ctype == "tracker_card":
+        _validate_tracker_card(cid, node, ctx)
 
 
 _LIST_ROW_PROPS = ("title", "subtitle", "value", "badge", "thumb")
@@ -1271,6 +1275,90 @@ def _validate_list_row(cid, node, ctx: _Ctx) -> None:
                     f"list_row (id={cid}) `{prop}` references unknown item field "
                     f"'{field}' (declared: {sorted(ctx.item_fields)})"
                 )
+
+
+def _mutable_list(cid, ctype, key, ctx: _Ctx) -> dict:
+    """The item schema of a USER-owned (non-source) list ``key``, or raise."""
+    if not isinstance(key, str) or key not in ctx.list_keys:
+        raise _err(
+            f"{ctype} (id={cid}) must name a declared list state key; got {key!r}"
+        )
+    if key in ctx.source_keys:
+        raise _err(
+            f"{ctype} (id={cid}) list '{key}' is data-source-owned (read-only); "
+            "a form/tracker writes rows, so point it at a user list"
+        )
+    return ctx.list_keys[key]
+
+
+def _validate_form(cid, node, ctx: _Ctx) -> None:
+    """A ``form`` adds rows into a mutable list; every field must be on that
+    list's item schema, and `options` only make sense on a string field. It
+    expands (composites.py) to typed inputs + a submit — the agent never wires
+    the draft state or the item_add."""
+    if not isinstance(cid, str) or not cid:
+        raise _err("form needs a stable `id` (it namespaces the form's draft state)")
+    if ctx.item_fields is not None:
+        raise _err(f"form (id={cid}) can't be nested inside a repeater row")
+    item = _mutable_list(cid, "form", node.get("into"), ctx)
+    fields = node.get("fields")
+    if not isinstance(fields, list) or not fields:
+        raise _err(f"form (id={cid}) needs a non-empty `fields` array")
+    if len(fields) > catalog.MAX_ITEM_FIELDS:
+        raise _err(f"form (id={cid}) has too many fields (max {catalog.MAX_ITEM_FIELDS})")
+    seen: set[str] = set()
+    for f in fields:
+        if not isinstance(f, dict) or not isinstance(f.get("field"), str):
+            raise _err(f"form (id={cid}) each field needs a string `field` name")
+        name = f["field"]
+        if name not in item:
+            raise _err(
+                f"form (id={cid}) field '{name}' is not on list '{node['into']}' "
+                f"(declared: {sorted(item)})"
+            )
+        if name in seen:
+            raise _err(f"form (id={cid}) field '{name}' is listed twice")
+        seen.add(name)
+        if name == "id" or item[name] == "image":
+            raise _err(f"form (id={cid}) can't edit the '{name}' field")
+        opts = f.get("options")
+        if opts is not None:
+            if not isinstance(opts, list) or not opts:
+                raise _err(f"form (id={cid}) field '{name}' `options` must be a non-empty array")
+            if item[name] != "string":
+                raise _err(
+                    f"form (id={cid}) field '{name}' has `options` but is a {item[name]} "
+                    "field; options are for string fields only"
+                )
+
+
+def _validate_tracker_card(cid, node, ctx: _Ctx) -> None:
+    """A ``tracker_card`` summarizes one list: an aggregate metric (+ chart).
+    Expands to a computed over the list + a list-backed chart."""
+    if not isinstance(cid, str) or not cid:
+        raise _err("tracker_card needs a stable `id` (it namespaces the aggregate)")
+    if ctx.item_fields is not None:
+        raise _err(f"tracker_card (id={cid}) can't be nested inside a repeater row")
+    item = _mutable_list(cid, "tracker_card", node.get("list"), ctx)
+    field = node.get("field")
+    if field is not None and item.get(field) != "number":
+        raise _err(
+            f"tracker_card (id={cid}) `field` must name a number field of the list; "
+            f"got {field!r}"
+        )
+    agg = node.get("agg")
+    if agg is not None and agg not in catalog.AGGS:
+        raise _err(f"tracker_card (id={cid}) `agg` must be one of {sorted(catalog.AGGS)}")
+    if agg in ("sum", "avg", "min", "max") and field is None:
+        raise _err(f"tracker_card (id={cid}) agg '{agg}' needs a number `field`")
+    chart = node.get("chart")
+    if chart is not None and chart not in ("bar", "line", "area", "pie", "donut"):
+        raise _err(
+            f"tracker_card (id={cid}) `chart` must be bar/line/area/pie/donut; got {chart!r}"
+        )
+    window = node.get("window")
+    if window is not None and window not in catalog.WINDOWS:
+        raise _err(f"tracker_card (id={cid}) `window` must be one of {sorted(catalog.WINDOWS)}")
 
 
 # ── watches (reactive rules) ─────────────────────────────────────────────────

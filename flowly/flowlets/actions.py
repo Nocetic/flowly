@@ -186,7 +186,12 @@ async def apply_action(
     flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FlowletActionError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
-    definition = flowlet["definition"]
+    # Expand composites first: a form's submit / a tracker's quick-add lives
+    # inside a composite in the STORED definition, so _find_component (and the
+    # injected draft-state specs it coerces against) only see it after
+    # expansion. Idempotent + a no-op when the definition has no composite.
+    from flowly.flowlets.composites import expand_composites
+    definition = expand_composites(flowlet["definition"])
 
     component = _find_component(definition, component_id)
     if component is None:

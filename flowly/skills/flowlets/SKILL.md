@@ -76,11 +76,15 @@ charts / data tables / drill screens, `3` only if you use a composite like
 **Layout:** `card`, `row`, `column`, `grid`, `list` (all take `children`),
 `divider`, `spacer`.
 
-**Composites (catalog 3) — prefer these; they own their own layout:**
+**Composites (catalog 3) — prefer these; they own their own layout + wiring:**
 - `list_row` — one display row of a list: `title` (line 1), `subtitle?` (muted
   line 2), `value?` (right-aligned), `badge?`, `thumb?` (image field). Only as a
-  `repeater`'s `item`. See "Row display" below — reach for this instead of
-  hand-building a `row` of texts.
+  `repeater`'s `item`. Reach for this instead of hand-building a `row` of texts.
+- `form` — a multi-field entry card that adds a row into a list (`into` + typed
+  `fields` + `submit`). The system owns the drafts/controls/reset.
+- `tracker_card` — a stat + chart about a list (`list` + `field?` + `chart?`);
+  the aggregate can't drift from the rows.
+- (details in the "Multi-field entry" and "Track a list" sections below.)
 
 **Display:** `header` (text), `text` (text, interpolates `{key}`), `badge`
 (text), `icon` (name), `stat` (value, label), `progress` (value, max),
@@ -271,38 +275,48 @@ is rejected (it used to leak into the UI, e.g. a box showing "manual_title").
   `number` state key. Use `op:"log"` ONLY for a time-series of ratings feeding a
   chart, never to hold "the current rating" (a series can't be read back as N).
 
-## Manual multi-field form — `item_add` with `fields`
+## Multi-field entry — the `form` composite (catalog 3)
 
-To add ONE row from SEVERAL inputs (e.g. an expense = amount + title + category
-+ date), give `item_add` a **`fields`** map of templates. `{value}` is what the
-tapped/typed input supplied; `{state_key}` pulls a live value (a title/category
-set by other inputs); `today` on a `date` field becomes the current date. A lone
-`{token}` keeps its type (a number stays numeric).
+To add ONE row from SEVERAL inputs (e.g. an expense = title + amount + category
++ date), use the `form` composite. You list the fields; the system owns the draft
+state, the typed controls, the submit button, and the reset-after-add. Don't
+hand-wire `set` inputs + an `item_add` — that is exactly where the manual form
+went wrong (leaked `{token}`s, blur-adds, `manual_title` literals).
 
 ```json
-{ "state": {
-    "draftTitle": { "type": "string", "default": "" },
-    "draftCat":   { "type": "string", "default": "Other" },
-    "expenses": { "type": "list", "item": {
-      "title": "string", "amount": "number", "category": "string", "date": "date" } } },
-  "layout": [
-    { "id": "titleIn", "type": "input", "placeholder": "e.g. coffee",
-      "action": { "op": "set", "key": "draftTitle" } },
-    { "id": "catSeg", "type": "segmented",
-      "options": ["Food", "Transport", "Bills", "Other"],
-      "action": { "op": "set", "key": "draftCat" } },
-    { "id": "amountIn", "type": "number_input", "placeholder": "amount",
-      "action": { "op": "item_add", "key": "expenses", "fields": {
-        "title": "{draftTitle}", "amount": "{value}",
-        "category": "{draftCat}", "date": "today" } } },
-    { "type": "repeater", "source": "expenses", "navigate": "expense",
-      "item": { "type": "row", "children": [
-        { "type": "text", "text": "{$.title}" },
-        { "type": "badge", "text": "{$.amount}" } ] } } ] }
+{ "type": "form", "id": "addExpense", "into": "expenses",
+  "title": "Manuel harcama ekle",
+  "fields": [
+    { "field": "title",    "label": "Açıklama", "placeholder": "örn. kahve" },
+    { "field": "amount",   "label": "Tutar" },
+    { "field": "category", "options": ["Market", "Fatura", "Diğer"] },
+    { "field": "date",     "default": "today" }
+  ],
+  "submit": { "label": "Ekle" } }
 ```
-The typed amount + the title/category the user set + today's date all land in one
-row. (For a SINGLE-field add, the fixed-`item` + first-free-field quick-add is
-simpler — see the todo example.)
+Each `field` names a field of the `into` list's item schema; the control type is
+derived (string→input, number→number_input, date→date, bool→toggle, `options`→a
+picker). `default: "today"` on a date pre-fills today (a user pick overrides).
+Submit adds the row and clears the form. `id` is required (it namespaces the
+draft state). A `form` is NOT nested inside a repeater — it's a screen-level card.
+
+For a SINGLE-field add (a todo title), the fixed-`item` + first-free-field
+quick-add input is still simpler — see the todo example above.
+
+## Track a list — the `tracker_card` composite (catalog 3)
+
+A stat + a chart ABOUT a list, in one card, that never drifts from the rows:
+
+```json
+{ "type": "tracker_card", "id": "spend", "list": "expenses",
+  "field": "amount", "title": "Bu ay", "window": "30d", "chart": "bar" }
+```
+`field` (a number field) + `agg` (default `sum`; `count` needs no field) drive
+the headline metric; `chart` (`bar`/`line`/`area`/`pie`/`donut`) draws the same
+data — bar/line over time, pie/donut grouped by a category field (or set `by`).
+`window` (`today`/`7d`/`30d`/`90d`/`all`) scopes both. Because it aggregates the
+LIST's rows, deleting/adding a row (incl. a photo capture) updates it correctly
+— never bind a chart to a parallel logged `series` for list data.
 
 ## Worked example — water tracker
 
