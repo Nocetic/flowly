@@ -52,6 +52,13 @@ lookup, cross-flowlet reasoning).
   optional `sources` (live data) and `screens` (drill-down fragments).
 - `update` — `{flowlet_id, definition}` (full replace, versioned) or
   `{flowlet_id, pinned}`.
+
+**Read your review.** `create`/`update` return a `lint` array (advisory quality
+findings — e.g. "use `list_row`", "this list has no way to add rows", "this
+chart drifts from its list") and a `preview` (the flowlet resolved against
+sample rows, so you see the shape). If `lint` is non-empty, fix the findings
+with ONE follow-up `update` — they are the exact mistakes that make a flowlet
+read wrong. A clean flowlet returns no `lint`.
 - `get` — `{flowlet_id}` → definition **and current live values**. Use this to
   answer "how much water did I drink today?".
 - `list` — all flowlets with their live values.

@@ -24,6 +24,23 @@ from flowly.flowlets.schema import FlowletValidationError, validate_definition
 from flowly.flowlets.store import now_ms
 
 
+def _compact_preview(values: dict) -> dict:
+    """Trim a resolved values map for the tool response: long arrays (chart
+    buckets, sample rows) truncate to a few entries so the agent sees the SHAPE
+    without a wall of data. Reserved (`__…`) keys dropped."""
+    if not isinstance(values, dict):
+        return {}
+    out: dict = {}
+    for k, v in values.items():
+        if k.startswith("__"):
+            continue
+        if isinstance(v, list) and len(v) > 3:
+            out[k] = v[:3] + [f"…(+{len(v) - 3} more)"]
+        else:
+            out[k] = v
+    return out
+
+
 def _extract_meta(definition: dict) -> dict:
     return {
         "name": str(definition.get("name", "")),
@@ -200,6 +217,28 @@ class FlowletTool(Tool):
             None,  # local tz
         )
 
+    @staticmethod
+    def _review(definition: dict) -> dict:
+        """A create/update self-check the agent reads back: deterministic lint
+        findings + a preview of the flowlet resolved against sample rows. Both
+        best-effort — a review must never fail the authoring call."""
+        review: dict = {}
+        try:
+            from flowly.flowlets.lint import lint_definition
+            findings = lint_definition(definition)
+            if findings:
+                review["lint"] = findings
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("flowlet lint failed: {}", exc)
+        try:
+            from flowly.flowlets.synth import preview_values
+            pv = _compact_preview(preview_values(definition, now_ms(), None))
+            if pv:
+                review["preview"] = pv
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("flowlet preview failed: {}", exc)
+        return review
+
     # ── actions ───────────────────────────────────────────────────────────────
 
     async def _create(self, **kw: Any) -> str:
@@ -223,6 +262,7 @@ class FlowletTool(Tool):
             "action": "create",
             "flowlet": _summary(flowlet, values),
             "message": f"Flowlet '{meta['name']}' created (id: {flowlet['id']})",
+            **self._review(definition),
         })
 
     async def _update(self, **kw: Any) -> str:
@@ -255,6 +295,7 @@ class FlowletTool(Tool):
             "action": "update",
             "flowlet": _summary(flowlet, values),
             "message": f"Flowlet updated (v{flowlet['version']})",
+            **(self._review(definition) if definition is not None else {}),
         })
 
     async def _get(self, **kw: Any) -> str:
