@@ -296,3 +296,53 @@ def ensure_editable_drill(defn: dict) -> dict:
         out["screens"] = screens
         return out
     return defn
+
+
+# ── chart layout (never cram a chart into columns) ────────────────────────────
+
+def _contains_chart(node: Any) -> bool:
+    if isinstance(node, list):
+        return any(_contains_chart(n) for n in node)
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") == "chart":
+        return True
+    return _contains_chart(node.get("children"))
+
+
+def ensure_chart_layout(defn: dict) -> dict:
+    """Force any multi-column ``grid`` that holds a ``chart`` to a SINGLE column.
+
+    A chart needs the full width — a donut's legend/labels spill off a phone in
+    a 2-up grid, and two chart cards of different heights read as broken side by
+    side. Stacking them full-width is always right, so the system guarantees it
+    regardless of how the agent laid it out. Runs on the EXPANDED definition (a
+    ``tracker_card`` is a card+chart by then). Serve-only, idempotent; returns
+    the original when nothing needed changing.
+    """
+    out = copy.deepcopy(defn)
+    changed = False
+
+    def walk(nodes: Any) -> None:
+        nonlocal changed
+        if isinstance(nodes, list):
+            for n in nodes:
+                walk(n)
+            return
+        if not isinstance(nodes, dict):
+            return
+        if (nodes.get("type") == "grid" and int(nodes.get("columns") or 2) >= 2
+                and _contains_chart(nodes.get("children"))):
+            nodes["columns"] = 1
+            changed = True
+        walk(nodes.get("children"))
+        item = nodes.get("item")
+        if isinstance(item, dict):
+            walk(item)
+
+    walk(out.get("layout"))
+    for screen in (out.get("screens") or {}).values():
+        if isinstance(screen, dict):
+            walk(screen.get("layout"))
+
+    return out if changed else defn

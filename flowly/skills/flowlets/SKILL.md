@@ -325,6 +325,10 @@ data — bar/line over time, pie/donut grouped by a category field (or set `by`)
 LIST's rows, deleting/adding a row (incl. a photo capture) updates it correctly
 — never bind a chart to a parallel logged `series` for list data.
 
+**Charts want the full width.** Never put a `chart`/`tracker_card` in a 2-column
+`grid` — a chart gets cramped and a donut's labels spill off a phone screen.
+Stack them full-width (in a `column`, or straight in the layout).
+
 ## Worked example — water tracker
 
 ```json

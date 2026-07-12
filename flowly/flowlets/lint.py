@@ -149,6 +149,27 @@ def lint_definition(defn: dict) -> list[dict]:
                 "`form`, an `item_add` input, or a `photo`+vision capture.",
             ))
 
+    # ── L08 — a chart / tracker_card crammed into a multi-column grid ─────────
+    def _grids(nodes: Any):
+        if isinstance(nodes, list):
+            for n in nodes:
+                yield from _grids(n)
+        elif isinstance(nodes, dict):
+            if nodes.get("type") == "grid" and int(nodes.get("columns") or 2) >= 2:
+                for c in _walk(nodes):
+                    if c.get("type") in (catalog.SERIES_COMPONENTS | {"tracker_card"}):
+                        yield nodes
+                        break
+            for c in nodes.get("children") or []:
+                yield from _grids(c)
+    for _g in _grids(defn.get("layout")):
+        out.append(_finding(
+            "L08",
+            "a chart / tracker_card sits in a 2-column grid — charts need width "
+            "and get cramped (a donut's labels spill off-screen). Put charts "
+            "full-width (in a `column`, or the layout root), not side by side.",
+        ))
+
     # ── L02 — a chart bound to a series that shadows a list ───────────────────
     from flowly.flowlets.queries import _shadow_series
     shadows = _shadow_series(defn)

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import copy
 
-from flowly.flowlets.normalize import ensure_editable_drill, ensure_photo_display
+from flowly.flowlets.normalize import (
+    ensure_chart_layout,
+    ensure_editable_drill,
+    ensure_photo_display,
+)
 from flowly.flowlets.schema import validate_definition
 
 
@@ -205,3 +209,39 @@ def test_composed_editable_then_photo_validates_and_edits():
     # full photo at the top (from the photo pass) + edit inputs
     assert screen["layout"][0] == {"type": "image", "src": "$.shot"}
     assert any(n.get("action", {}).get("op") == "item_update" for n in screen["layout"])
+
+
+# ── chart layout (chart grids go full-width) ──────────────────────────────────
+
+def _grid(columns, *children):
+    return {"catalog": 2, "name": "X",
+            "layout": [{"type": "grid", "columns": columns, "children": list(children)}]}
+
+
+def test_grid_with_a_chart_is_forced_to_one_column():
+    d = _grid(2,
+              {"type": "card", "children": [{"type": "chart", "id": "a", "kind": "bar",
+                                             "data": {"series": "s"}}]},
+              {"type": "card", "children": [{"type": "chart", "id": "b", "kind": "donut",
+                                             "data": {"series": "s", "by": "category"}}]})
+    out = ensure_chart_layout(d)
+    assert out["layout"][0]["columns"] == 1
+
+
+def test_grid_without_a_chart_is_untouched():
+    d = _grid(2, {"type": "stat", "value": "x"}, {"type": "stat", "value": "y"})
+    assert ensure_chart_layout(d) is d           # no chart → cheap no-op
+
+
+def test_single_column_chart_grid_is_a_noop():
+    d = _grid(1, {"type": "chart", "id": "a", "kind": "bar", "data": {"series": "s"}})
+    assert ensure_chart_layout(d) is d
+
+
+def test_chart_layout_is_idempotent_and_non_mutating():
+    import copy as _c
+    d = _grid(2, {"type": "chart", "id": "a", "kind": "bar", "data": {"series": "s"}})
+    snap = _c.deepcopy(d)
+    once = ensure_chart_layout(d)
+    assert d == snap                             # original untouched
+    assert ensure_chart_layout(once) is once     # already 1-col → no second copy
