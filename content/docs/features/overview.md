@@ -32,6 +32,7 @@ Flowly is a full agent, not just a chat box. These features work together across
 
 - **[Image generation](image-generation.md)** — text-to-image (FLUX, Stable Diffusion, Recraft, Ideogram); the picture rides the assistant's reply on every channel.
 - **[Artifacts](artifacts.md)** — render HTML, SVG, Markdown, charts, and forms the agent creates.
+- **[Flowlets](flowlets.md)** — live, interactive mini-screens the agent builds for you: trackers, checklists, dashboards, forms. Native on every device, driven by your own data, entirely local.
 
 ## Extend
 

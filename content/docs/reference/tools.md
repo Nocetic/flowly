@@ -59,9 +59,10 @@ Tools are the functions the agent calls to act on the world — reading files, r
 | `image_generate` | Text-to-image via FAL; the result rides the assistant's reply. | `tools.imageGeneration.enabled` + key |
 | `video_analyze` | Analyze a video via a multimodal model. | — |
 | `artifact` | Create/manage renderable artifacts (HTML/SVG/Markdown/form/chart/code). | artifact store |
+| `flowlet` | Build/update live mini-screens (create/update/get/list/delete/log/set_state/query) — see the [Flowlet catalog](flowlet-catalog.md). | flowlet store |
 | `voice_call` | Place / manage a voice call. | `integrations.voice.enabled` |
 
-See [Image generation](../features/image-generation.md) for the full image_generate guide (models, sizes, delivery).
+See [Image generation](../features/image-generation.md) for the full image_generate guide (models, sizes, delivery), and [Flowlets](../features/flowlets.md) for the mini-screen system the `flowlet` tool authors.
 
 ## Channels & automation
 

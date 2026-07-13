@@ -45,6 +45,8 @@ These are opt-in conveniences. The agent never depends on them.
 | Terminal UI (TUI) | ✅ | — *(uses the native GUI)* |
 | Memory, board, cron, MCP, plugins | ✅ | ✅ |
 | Run on your own machine, no account | ✅ | ✅ |
+| [Flowlets](../features/flowlets.md) — authoring the definitions | ✅ | ✅ |
+| Flowlets — the live GUI screens | — *(no dashboard to render them)* | ✅ |
 | Native Mac / iOS / Android apps | — | ✅ closed |
 | Browser extension | — | ✅ closed |
 | Hosted LLM (no key required) | — | ✅ |
