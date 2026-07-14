@@ -72,7 +72,7 @@ what the agent assembles — but understanding them explains what a flowlet can 
 | Part | What it holds |
 |------|---------------|
 | **name / icon / accent** | The title, an icon, and a hex accent colour for the tile. |
-| **state** | The values the flowlet remembers — a number, a string, a flag, a date, a **list** of rows, or a timer. Each has a default. |
+| **state** | The values the flowlet remembers — a number, a string (a date is stored as one), a flag, a **list** of rows, or a timer. Each has a default. |
 | **series** | An append-only event log ("drank 250ml at 3pm") that charts and totals read from. |
 | **computed** | Derived values the agent never has to keep in sync — a sum over a list, a percentage, a status sentence. Recomputed every render. |
 | **layout** | The screen itself: the tree of components you see and tap. |
@@ -86,9 +86,9 @@ The full catalog of components, actions, and grammar is in the
 ## State, values, and computed numbers
 
 A flowlet remembers things in **state**. A state key has a type — `number`,
-`string`, `bool`, `date`, a `list` of structured rows, or a `timer` — and a
-default. Tapping a control mutates state deterministically (a stepper's `+`
-increments a number; a toggle flips a flag).
+`string` (a date is stored as one), `bool`, a `list` of structured rows, or a
+`timer` — and a default. Tapping a control mutates state deterministically (a
+stepper's `+` increments a number; a toggle flips a flag).
 
 Anything derived is a **computed** value, so the agent never stores a number it
 would have to keep correct by hand. A computed can be:

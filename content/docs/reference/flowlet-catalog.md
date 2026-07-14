@@ -52,11 +52,13 @@ catalog is always forward-compatible.
 | Type | Value | Notes |
 |------|-------|-------|
 | `number` | a number | Optional `min` / `max` clamp. |
-| `string` | text | |
+| `string` | text | Optional `maxLength`. A date is stored as a `"YYYY-MM-DD"` string. |
 | `bool` | true/false | |
-| `date` | `"YYYY-MM-DD"` | |
 | `timer` | `{running, elapsed}` | A live stopwatch; toggled with `timer_toggle`. |
 | `list` | array of rows | The living rows of a repeater. |
+
+(There is no top-level `date` state type — a stored date is a `string`. `date`
+*is* a list item-field type and a `date` input component.)
 
 A `list` declares an **item schema** — `{field: type}` with up to 8 fields of
 `string` / `number` / `bool` / `date` / `image` (the `id` field is reserved and
@@ -111,7 +113,8 @@ per key:
   "else": "{remaining} ₺ left this month" }
 ```
 
-- `agg` ∈ `sum` `count` `avg` `min` `max` `last`.
+- `agg` ∈ `sum` `count` `avg` `min` `max` `last` for a series; a **list**
+  aggregate excludes `last` (`sum`/`count`/`avg`/`min`/`max`).
 - `window` ∈ `today` `7d` `30d` `90d` `all`.
 
 ## Components
@@ -133,7 +136,7 @@ expression.
 | `spacer` | `size` | Vertical gap. |
 | `repeater` | `source`, `item`, `empty?`, `navigate?`, `where?`, `sortBy?` | One `item` per row of a `list`. See [Dynamic lists](#dynamic-lists). |
 
-### Display (16)
+### Display (23)
 
 | Type | Props |
 |------|-------|
@@ -149,44 +152,46 @@ expression.
 | `chart` | `data`, `kind` — see [Charts](#charts) |
 | `sparkline` | `data` |
 | `heatmap` | `data` |
-| `table` | static `rows`, or `source` + `columns` (≤ 6) |
-| `status` | `text`, `tone?` |
+| `table` | static `rows`, or a data-bound `source` + `columns` — see [Tables](#tables) |
+| `status` | `text`, `tone?` (`ok` / `warn` / `bad` / `neutral`) |
 | `keyvalue` | `rows: [{label, value}]` |
-| `timeline` | `events: [{title, time?, tone?}]` |
-| `callout` | `text`, `tone?` |
+| `timeline` | `events: [{title, time?, tone?}]` (tone `done` / `now` / `wait`) |
+| `callout` | `text`, `tone?` (`info` / `success` / `warn` / `bad`), `icon?` |
 | `code` | `text`, `language?` |
 | `link` | `text`, `url` |
-| `image` | `src` (a URL, a `data:` URI, or a `$.field` ref) |
+| `image` | `src` (a URL, a `data:` URI, a `$.field` ref, or a state key), `height?`, `alt?` |
 | `clock` | `seconds?` |
-| `countdown` | `target` (epoch ms or ISO) |
+| `countdown` | `target` (epoch ms or `"YYYY-MM-DD[THH:MM]"`, read in local time) |
 | `timer` | `value` (a `timer` state key) |
 
 A `value`/`max`/`min` bind is a number literal or the name of a state/computed
-key.
+key. An `icon` (on `icon` / `icon_button` / `checklist` items) is a name from a
+vetted set; an unknown name degrades to a sensible fallback.
 
 ### Input (15)
 
 | Type | Props | Fires |
 |------|-------|-------|
-| `button` | `text`, `style?`, `action` | its action |
+| `button` | `text`, `style?` (`primary`/`secondary`/`ghost`/`destructive`), `action` | its action |
 | `icon_button` | `icon`, `action` | its action |
-| `input` | `action` (`set`/`item_update`/`item_add`), `value?`, `placeholder?` | on Enter / add button |
-| `number_input` | as `input`, numeric | as `input` |
-| `textarea` | as `input`, multiline | on submit / add |
-| `select` | `options`, `action` | on pick |
+| `input` | `action` (`set`/`item_update`/`item_add`), `value?`, `placeholder?`, `label?`, `maxLength?` | on Enter / add button |
+| `number_input` | as `input`, plus `min?` / `max?` | as `input` |
+| `textarea` | as `input`, multiline, `rows?` | on submit / add |
+| `select` | `options`, `action`, `placeholder?` | on pick |
 | `date` | `action` | on pick |
 | `segmented` | `options`, `action` | on pick |
-| `toggle` | `value`, `action` | on flip |
-| `checklist` | `items: [{key, label?}]` | toggles the tapped item's key |
-| `stepper` | `value`, `action` (`increment`) | on +/− |
-| `slider` | `min`, `max`, `step?`, `value`, `action` | on release |
+| `toggle` | `value`, `action`, `label?` | on flip |
+| `checklist` | `items: [{key, label?, icon?}]` | toggles the tapped item's key |
+| `stepper` | `value`, `action` (`increment`), `label?`, `min?` / `max?` | on +/− |
+| `slider` | `min`, `max`, `step?`, `value`, `action`, `label?` | on release |
 | `rating` | `max?`, `value`, `action` | on tap |
-| `search` | `target` (a repeater/table id), `fields?` | filters client-side |
+| `search` | `target` (a repeater/table id), `fields?`, `placeholder?` | filters client-side |
 | `photo` | `action` (`vision`) | captures an image → a new row |
 
-Interactive controls reflect a tap **optimistically** (the UI updates the instant
-you tap and reconciles when the authoritative value lands), so nothing feels
-laggy on a slow link.
+`options` (on `select` / `segmented`) is an array of strings, or of
+`{value, label}` objects. Interactive controls reflect a tap **optimistically**
+(the UI updates the instant you tap and reconciles when the authoritative value
+lands), so nothing feels laggy on a slow link.
 
 ### Composites (3)
 
@@ -238,20 +243,20 @@ the action fire at most once in that window; a repeat tap is a silent no-op.
 | Op | Shape | Effect |
 |----|-------|--------|
 | `set` | `{op, key}` | Set a state key to the supplied value. |
-| `increment` / `decrement` | `{op, key}` | Step a number (button `value` = step size). |
+| `increment` / `decrement` | `{op, key, by?}` | Step a number by `by` (default 1). A stepper supplies only the sign. |
 | `toggle` | `{op, key}` | Flip a bool. |
 | `log` | `{op, series, value?, category?}` | Append an event. |
 | `remove_last` | `{op, series}` | Undo the last logged event. |
 | `reset` | `{op, key}` or `{op, series}` | Reset a key to default / clear a series. |
 | `timer_toggle` | `{op, key}` | Start/pause a `timer` state key. |
-| `item_add` | `{op, key, fields?}` | Add a row to a list. `fields` is a `{field: template}` map. |
-| `item_update` | `{op, key, field}` | Edit one field of the tapped row. |
+| `item_add` | `{op, key, fields?}` or `{op, key, item?}` | Add a row. `fields` = a `{field: template}` map; `item` = a fixed `{field: value}` map. |
+| `item_update` | `{op, key, field}` or `{op, key, fields}` | Edit one field (or several) of the tapped row. |
 | `item_toggle` | `{op, key, field}` | Flip a bool field of the tapped row. |
 | `item_remove` | `{op, key}` | Delete the tapped row. |
 | `item_move` | `{op, key}` | Reorder the tapped row. |
-| `batch` | `{op, ops: [...]}` | Several ops at once (not nested). |
+| `batch` | `{op, ops: [...]}` | Up to 20 ops at once; not nested. |
 | `vision` | `{op, prompt, into}` | Read a captured photo into a new list row. |
-| `agent` | `{op}` | Hand a message to the model — the only op that reaches it. |
+| `agent` | `{op, message}` | Hand a `message` (≤ 2000 chars, templated with `{value}`/`{key}`) to the model — the only op that reaches it. |
 
 ### `item_add` field templates
 
@@ -259,6 +264,49 @@ the action fire at most once in that window; a repeat tap is a silent no-op.
 the tapped input's value; `{state_key}` pulls a live value; a lone `{token}`
 keeps its type (a number stays numeric); `today` on a date field becomes the
 current date. (A `form` composite generates all of this for you.)
+
+## Dynamic lists
+
+A `list` state key holds living rows; a `repeater` renders one `item` template
+per row.
+
+```json
+{ "type": "repeater", "source": "tasks", "empty": "No tasks yet",
+  "navigate": "taskDetail",
+  "item": { "type": "list_row", "title": "$.title" } }
+```
+
+| Prop | Purpose |
+|------|---------|
+| `source` | the `list` state key (required) |
+| `item` | the row template — a `list_row`, or any component tree (required) |
+| `empty` | text shown when the list is empty |
+| `navigate` | a `screens` id — tapping a row opens that detail screen, scoped to the row (screens are one level deep — a screen can't itself navigate) |
+| `where` | a per-row filter expression (over the row's fields) |
+| `sortBy` | `{field, dir}` — `dir` is `asc` / `desc` |
+
+Inside the `item`, `$.field` binds a prop to the current row and `{$.field}`
+interpolates it. Row actions — `item_update` / `item_toggle` / `item_remove` /
+`item_move` — live inside the template; `item_add` can sit anywhere. Every
+user-owned list row is guaranteed editable: if you author no detail screen, one
+with the right edit control per field is synthesized. Rows are swipe-to-delete.
+
+## Tables
+
+A `table` is either **static rows** or a **data-bound** list.
+
+```json
+{ "type": "table", "source": "prs",
+  "columns": [ { "field": "title", "label": "Title" },
+               { "field": "n", "label": "#", "align": "right", "width": 48 } ],
+  "sortBy": { "field": "n", "dir": "desc" }, "navigate": "prDetail" }
+```
+
+- **Static**: `rows` — an array of cell arrays.
+- **Data-bound**: `source` (a `list` key) + `columns` (≤ 6), each
+  `{field, label?, align?, width?}` (`align` = `left`/`center`/`right`). Optional
+  `sortBy: {field, dir}`, `where`, `navigate`, `empty`. Tapping a header re-sorts
+  client-side.
 
 ## Charts
 
@@ -274,6 +322,7 @@ A `chart`'s `data` object has one of these shapes; `kind` picks the drawing.
 | Scatter | `{list, x, y}` | `scatter` |
 
 - `bucket` ∈ `hour` `day` `week`; `window` ∈ `today` `7d` `30d` `90d` `all`.
+- A **category** breakdown's `agg` is `sum` or `count` only.
 - A **list-backed** chart aggregates the list's rows directly, so it stays
   correct through every add, edit, delete and photo capture — no parallel series
   to drift. Prefer it (or a `tracker_card`) whenever the data lives in a list.
@@ -303,36 +352,55 @@ names outside the resolved values.
 
 ## Watches
 
-Reactive reminders the flowlet evaluates itself — no scheduled model turn. Four
-trigger kinds:
+`watches` is an **array** of reactive reminders the flowlet evaluates itself —
+no scheduled model turn. Each rule has a stable `id`, a `trigger` (one of four
+kinds), a `notify`, and an optional cooldown.
 
-| Trigger | Fires when |
-|---------|-----------|
-| `schedule` | `at: "21:00"` / `everyMinutes` / on given `days`. |
-| `condition` | a `when` expression goes true (edge-triggered), optionally after a delay. |
-| `goal` | a `when` first becomes true (once). |
-| `stale` | nothing has changed for `idleMinutes`. |
+```json
+"watches": [ {
+  "id": "drink_reminder", "trigger": "condition",
+  "when": "today_ml < goal_ml", "after": "18:00",
+  "cooldownMinutes": 120,
+  "notify": { "title": "Water", "body": "{today_ml}/{goal_ml} ml today" }
+} ]
+```
 
-Each watch has a stable `id`, a `notify: {title, body?}`, and a cooldown. Set
-`notify.compose: true` to have the agent write the reminder text from the live
-numbers at fire time. An optional `also: {op: "agent"}` runs an agent turn when
-it fires (heavily throttled).
+| `trigger` | Fires when | Fields |
+|-----------|-----------|--------|
+| `schedule` | a time of day / an interval / given days | `at: "21:00"`, `everyMinutes`, `days: ["mon",…]` |
+| `condition` | a `when` expression goes true (edge-triggered) | `when`, optional `after: "HH:MM"` (only fire past that time of day) |
+| `goal` | a `when` first becomes true (once) | `when` |
+| `stale` | nothing changed for a while | `idleMinutes` |
+
+- `notify` = `{ title, body?, compose? }`. Set `compose: true` to have the agent
+  write the reminder text from the live numbers at fire time.
+- `cooldownMinutes` (optional) throttles re-fires; `once: true` (optional) fires
+  the whole watch at most once ever; `days: [...]` may narrow any trigger.
+- `also` = `{ op: "agent", message }` — the only side-effect a watch may trigger
+  beyond a notification; runs an agent turn on fire (heavily throttled).
 
 ## Sources
 
-Bind a `list` to live external data. The agent fetches on a schedule (or
-pull-to-refresh) and writes the result into the list.
+`sources` is an **object** `{name: {…}}` binding a `list` to live external data.
+The agent fetches on a schedule (or on pull-to-refresh) and writes the result
+into the list.
 
 ```json
-"sources": [ { "id": "commits", "kind": "agent",
+"sources": {
+  "commits": { "kind": "agent",
                "prompt": "the last 10 commits to {repo} in the past hour",
-               "into": "commits", "refresh": "1h", "limit": 10 } ]
+               "into": "commits", "refresh": "1h", "limit": 10 }
+}
 ```
 
-`kind: "agent"` runs a normal turn of yours (with your tools) as a self-prompt,
-on a schedule, isolated from chat; `prompt` is templated with `{key}` live
-values; `into` names the source-owned `list`. A source-owned list is read-only in
-the UI (the snapshot is replaced each refresh, not edited).
+- `kind` — currently `"agent"`: a normal turn of yours (with your tools) runs as
+  a self-prompt on a schedule, isolated from chat.
+- `prompt` — what to fetch, templated with `{key}` live values.
+- `into` — the source-owned `list`. A source-owned list is **read-only** in the
+  UI (the snapshot is replaced each refresh, not edited).
+- `refresh?` — a cadence like `"15m"` / `"1h"` (omit for manual / pull-to-refresh);
+  minimum 10 minutes.
+- `limit?` — cap the rows fetched. `prompt` is capped at 1000 characters.
 
 ## Serve-time guarantees
 
