@@ -6,6 +6,8 @@ import json
 import mimetypes
 import uuid
 from collections import OrderedDict
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -100,6 +102,35 @@ _MAX_ATTACHMENT_B64_CHARS = 34 * 1024 * 1024
 _THUMB_MAX_DIMENSION = 512
 _THUMB_TARGET_BYTES = 48 * 1024
 _THUMB_INITIAL_QUALITY = 70
+
+# Browser providers share the same local WebSocket transport as desktop/chat
+# clients. Provider IDs are intentionally stricter than arbitrary display
+# names: they are persisted by clients and may later be used for per-session
+# routing, so keeping them log- and URL-safe avoids a class of subtle bugs.
+_BROWSER_PROVIDER_ID_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:"
+)
+_BROWSER_PROVIDER_TYPES = frozenset({"embedded", "chrome_extension"})
+
+
+@dataclass(frozen=True, slots=True)
+class _BrowserRunBinding:
+    """Browser access granted to one direct-gateway chat run.
+
+    A binding with ``provider_id=None`` is an explicit deny. This distinction
+    matters: ``ContextVar``'s default ``None`` means a legacy/non-gateway run
+    may still use the globally selected Chrome extension, while every direct
+    ``chat.send`` must opt in with a provider owned by the same WebSocket.
+    """
+
+    client_id: str
+    provider_id: str | None = None
+    registration_id: str | None = None
+
+
+_BROWSER_RUN_BINDING: ContextVar[_BrowserRunBinding | None] = ContextVar(
+    "flowly_browser_run_binding", default=None
+)
 
 
 def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
@@ -348,10 +379,22 @@ class GatewayServer:
         self._session_ws: dict[str, web.WebSocketResponse] = {}
         # Tick task for periodic health pings to connected clients.
         self._tick_task: asyncio.Task | None = None
-        # Browser extension client tracking (supports multiple, uses most recent)
+        # Browser provider tracking. Chrome extensions and the desktop's
+        # embedded browser use the same tool protocol, but are distinct,
+        # selectable providers. The extension-named fields remain as a
+        # compatibility surface for BrowserTabTool and older clients.
         self._extension_clients: set[str] = set()  # all registered extension client IDs
         self._extension_active: str | None = None  # most recently registered
         self._extension_pending: dict[str, asyncio.Future] = {}  # request_id → Future
+        self._browser_providers: dict[str, dict[str, Any]] = {}
+        self._browser_client_provider: dict[str, str] = {}
+        self._browser_provider_active: str | None = None
+        self._browser_provider_selection_explicit = False
+        self._browser_provider_sequence = 0
+        # Bind each pending request to the WebSocket client that received it.
+        # A result from another provider must never resolve that request.
+        self._browser_pending_clients: dict[str, str] = {}
+        self._browser_pending_registrations: dict[str, str] = {}
 
     def _create_app(self) -> web.Application:
         """Create the aiohttp application."""
@@ -473,6 +516,9 @@ class GatewayServer:
             "capabilities": [
                 "tool_events",      # tool.start / tool.complete WS events
                 "queue_while_busy", # client-side, but flag for future server queueing
+                "browser_provider_v2",
+                "browser_session_binding_v1",
+                "browser_provider_unregister_v1",
             ],
         })
 
@@ -618,13 +664,14 @@ class GatewayServer:
         and check the side panel manually.
         """
         try:
-            connected = bool(self._extension_active and
-                             self._extension_active in self._ws_clients)
+            connected = self.has_browser_provider()
             return web.json_response({
                 "ok": True,
                 "connected": connected,
                 "client_count": len(self._extension_clients),
                 "active_client": self._extension_active,
+                "active_provider": self._browser_provider_active,
+                "providers": self._list_browser_providers(),
             })
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
@@ -906,7 +953,7 @@ class GatewayServer:
                     elif msg_type == "tool_result":
                         # Fix #10: Only accept tool_result from registered extension clients
                         if client_id in self._extension_clients:
-                            self._handle_extension_tool_result(data)
+                            self._handle_extension_tool_result(data, client_id)
                         else:
                             logger.warning(f"[WS] tool_result from non-extension client {client_id}, ignoring")
                 elif raw_msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
@@ -914,29 +961,24 @@ class GatewayServer:
         except Exception as e:
             logger.error(f"[WS] Client {client_id} error: {e}")
         finally:
-            self._ws_clients.pop(client_id, None)
+            # A stable clientId may already have reconnected on a newer socket.
+            # Cleanup from the stale socket must not evict the replacement or
+            # unregister its browser provider.
+            is_current_connection = self._ws_clients.get(client_id) is ws
+            if is_current_connection:
+                self._ws_clients.pop(client_id, None)
             # Drop any session→ws bindings that pointed at this closed socket so
             # we don't hold a dead ref (a live re-entry re-binds via chat.inflight
             # anyway; _ws_send already no-ops on a closed socket).
             for _sk in [k for k, v in self._session_ws.items() if v is ws]:
                 self._session_ws.pop(_sk, None)
-            if client_id in self._extension_clients:
-                self._extension_clients.discard(client_id)
-                # Fix #7: Cancel all pending futures for this extension
-                cancelled = 0
-                for req_id, future in list(self._extension_pending.items()):
-                    if not future.done():
-                        future.set_result({"error": "Extension disconnected"})
-                        cancelled += 1
-                    self._extension_pending.pop(req_id, None)
-                # Fix #6: Fall back to another extension if available
-                if self._extension_active == client_id:
-                    self._extension_active = next(iter(self._extension_clients), None)
+            if is_current_connection and client_id in self._extension_clients:
+                cancelled = self._unregister_browser_provider(client_id)
                 logger.info(
-                    f"[WS] Browser extension disconnected: {client_id} "
+                    f"[WS] Browser provider disconnected: {client_id} "
                     f"(cancelled {cancelled} pending, remaining: {len(self._extension_clients)})"
                 )
-            else:
+            elif is_current_connection:
                 logger.info(f"[WS] Desktop client disconnected: {client_id}")
 
             # Auto-stop any coaching session owned by this WS so background
@@ -1077,12 +1119,89 @@ class GatewayServer:
             elif method == "commands.list":
                 await self._ws_rpc_commands_list(ws, rpc_id, params)
 
-            # Browser extension registration
+            # Legacy registration remains supported for released Chrome
+            # extensions. It now feeds the same provider registry.
             elif method == "extension.register":
-                self._extension_clients.add(client_id)
-                self._extension_active = client_id
-                logger.info(f"[WS] Browser extension registered: {client_id} (total: {len(self._extension_clients)})")
-                await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
+                result = self._register_browser_provider(client_id, params, legacy=True)
+                logger.info(
+                    f"[WS] Legacy browser extension registered: {client_id} "
+                    f"as {result['provider']['id']} (total: {len(self._extension_clients)})"
+                )
+                await self._ws_rpc_reply(ws, rpc_id, result)
+
+            elif method == "browser.provider.register":
+                try:
+                    result = self._register_browser_provider(client_id, params)
+                except ValueError as exc:
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", str(exc))
+                    return
+                logger.info(
+                    f"[WS] Browser provider registered: {result['provider']['id']} "
+                    f"({result['provider']['type']})"
+                )
+                await self._ws_rpc_reply(ws, rpc_id, result)
+
+            elif method == "browser.provider.unregister":
+                provider_id = params.get("providerId")
+                registration_id = params.get("registrationId")
+                if not isinstance(provider_id, str) or not provider_id:
+                    await self._ws_rpc_error(
+                        ws, rpc_id, "INVALID_REQUEST", "Missing providerId"
+                    )
+                    return
+                if not isinstance(registration_id, str) or not registration_id:
+                    await self._ws_rpc_error(
+                        ws, rpc_id, "INVALID_REQUEST", "Missing registrationId"
+                    )
+                    return
+                provider = self._browser_providers.get(provider_id)
+                if provider is None:
+                    await self._ws_rpc_error(
+                        ws, rpc_id, "BROWSER_PROVIDER_UNAVAILABLE",
+                        "Browser provider is not registered",
+                    )
+                    return
+                if provider["client_id"] != client_id:
+                    await self._ws_rpc_error(
+                        ws, rpc_id, "BROWSER_PROVIDER_NOT_OWNED",
+                        "Browser provider belongs to another connection",
+                    )
+                    return
+                if provider["registrationId"] != registration_id:
+                    await self._ws_rpc_error(
+                        ws, rpc_id, "BROWSER_REGISTRATION_EXPIRED",
+                        "Browser provider registration has expired",
+                    )
+                    return
+                cancelled = self._unregister_browser_provider(client_id)
+                await self._ws_rpc_reply(ws, rpc_id, {
+                    "ok": True,
+                    "providerId": provider_id,
+                    "cancelledRequests": cancelled,
+                })
+
+            elif method == "browser.providers.list":
+                await self._ws_rpc_reply(ws, rpc_id, {
+                    "providers": self._list_browser_providers(),
+                    "activeProviderId": self._browser_provider_active,
+                })
+
+            elif method == "browser.provider.select":
+                provider_id = params.get("providerId")
+                if not isinstance(provider_id, str) or not provider_id:
+                    await self._ws_rpc_error(
+                        ws, rpc_id, "INVALID_REQUEST", "Missing providerId"
+                    )
+                    return
+                if not self._select_browser_provider(provider_id, explicit=True):
+                    await self._ws_rpc_error(
+                        ws, rpc_id, "NOT_FOUND", f"Browser provider not connected: {provider_id}"
+                    )
+                    return
+                await self._ws_rpc_reply(ws, rpc_id, {
+                    "ok": True,
+                    "activeProviderId": provider_id,
+                })
 
             else:
                 await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", f"Unknown method: {method}")
@@ -1789,6 +1908,21 @@ class GatewayServer:
         idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
         run_id = idempotency_key
 
+        # Direct gateway runs never inherit the process-global browser
+        # selection. The desktop must attach an opaque registration owned by
+        # this exact WebSocket; omission is an explicit no-browser run.
+        browser_binding, browser_error = self._browser_binding_for_chat(
+            client_id, ws, params.get("browserAccess")
+        )
+        if browser_error is not None:
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                browser_error["code"],
+                browser_error["message"],
+            )
+            return
+
         # Optional per-session runtime cwd (Desktop/TUI may send the
         # project folder the user opened). Pin it before the run so the
         # agent's exec / codex tools resolve to it via session_key. Omit
@@ -1851,7 +1985,7 @@ class GatewayServer:
         task = asyncio.create_task(
             self._run_chat(
                 ws, client_id, session_key, message, run_id,
-                stream_callback, media, voice_mode,
+                stream_callback, media, voice_mode, browser_binding,
             )
         )
         self._active_tasks[run_id] = task
@@ -1867,6 +2001,7 @@ class GatewayServer:
         stream_callback: Callable[[str], Awaitable[None]],
         media: list[str] | None = None,
         voice_mode: bool = False,
+        browser_binding: _BrowserRunBinding | None = None,
     ) -> None:
         """Execute the chat and send final/error events."""
         accumulated_text = ""
@@ -1901,6 +2036,7 @@ class GatewayServer:
                 session_key, ws, {"type": "event", "event": "chat", "data": wrapped}
             )
 
+        binding_token = _BROWSER_RUN_BINDING.set(browser_binding)
         try:
             assert self.on_chat_message is not None
             result = await self.on_chat_message(
@@ -1916,6 +2052,27 @@ class GatewayServer:
                 response, metadata = result, {}
             usage = (metadata or {}).get("usage") or {}
             model = (metadata or {}).get("model") or ""
+            provider_error = (metadata or {}).get("error") or None
+
+            # Agent/provider failures are expected product states, not gateway
+            # crashes. Emit the native error event with stable machine fields
+            # and safe copy; never place a wrapped SDK payload on the wire.
+            if isinstance(provider_error, dict):
+                await self._session_send(session_key, ws, {
+                    "type": "event",
+                    "event": "chat",
+                    "data": {
+                        "state": "error",
+                        "runId": run_id,
+                        "sessionKey": session_key,
+                        "model": model,
+                        "errorCode": str(provider_error.get("code") or "MODEL_PROVIDER_UNAVAILABLE"),
+                        "errorTitle": str(provider_error.get("title") or "The model couldn't respond"),
+                        "errorMessage": str(provider_error.get("message") or response),
+                        "retryable": bool(provider_error.get("retryable", False)),
+                    },
+                })
+                return
 
             # Send final chat event. ``usage`` rides inside ``message`` so
             # the existing TUI client parser (which already looks at
@@ -1960,7 +2117,10 @@ class GatewayServer:
                 "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key},
             })
         except Exception as e:
-            logger.error(f"[WS] chat.send run {run_id} failed: {e}")
+            # Unexpected exceptions are logged with their native detail for
+            # operators, but the gateway wire contract never exposes reprs,
+            # SDK payloads, filesystem paths, or provider internals.
+            logger.exception(f"[WS] chat.send run {run_id} failed: {e}")
             await self._session_send(session_key, ws, {
                 "type": "event",
                 "event": "chat",
@@ -1968,10 +2128,14 @@ class GatewayServer:
                     "state": "error",
                     "runId": run_id,
                     "sessionKey": session_key,
-                    "errorMessage": str(e),
+                    "errorCode": "AGENT_INTERNAL_ERROR",
+                    "errorTitle": "The agent hit an unexpected error",
+                    "errorMessage": "Try again. If this continues, restart the bot.",
+                    "retryable": True,
                 },
             })
         finally:
+            _BROWSER_RUN_BINDING.reset(binding_token)
             # Run settled (final / aborted / error) — the partial is no
             # longer needed; the final message carries the full text.
             inflight.finish(session_key, run_id)
@@ -2150,29 +2314,390 @@ class GatewayServer:
         await self._ws_send(ws, {"type": "rpc", "id": rpc_id, "result": result})
 
     # ------------------------------------------------------------------
-    # Browser extension tool request/response
+    # Browser provider registration + tool request/response
     # ------------------------------------------------------------------
 
-    def has_extension_client(self) -> bool:
-        """Check if a browser extension is connected."""
-        if not self._extension_active:
+    def _browser_binding_for_chat(
+        self,
+        client_id: str,
+        ws: web.WebSocketResponse,
+        raw_access: Any,
+    ) -> tuple[_BrowserRunBinding | None, dict[str, str] | None]:
+        """Validate and bind browser access to one direct chat run."""
+        denied = _BrowserRunBinding(client_id=client_id)
+        if raw_access is None:
+            # The locally spawned gateway is loopback-only and historically
+            # receives chat + extension/browser provider over separate trusted
+            # sockets. Preserve that contract. A remotely exposed/authenticated
+            # gateway must always opt in with a same-socket registration.
+            if not self._require_auth:
+                return None, None
+            return denied, None
+        if not isinstance(raw_access, dict):
+            return denied, {
+                "code": "INVALID_REQUEST",
+                "message": "browserAccess must be an object",
+            }
+
+        provider_id = raw_access.get("providerId")
+        registration_id = raw_access.get("registrationId")
+        if not isinstance(provider_id, str) or not provider_id:
+            return denied, {
+                "code": "INVALID_REQUEST",
+                "message": "browserAccess.providerId is required",
+            }
+        if not isinstance(registration_id, str) or not registration_id:
+            return denied, {
+                "code": "INVALID_REQUEST",
+                "message": "browserAccess.registrationId is required",
+            }
+
+        provider = self._browser_providers.get(provider_id)
+        if provider is None:
+            return denied, {
+                "code": "BROWSER_PROVIDER_UNAVAILABLE",
+                "message": "The embedded browser is no longer connected",
+            }
+        if provider["client_id"] != client_id:
+            return denied, {
+                "code": "BROWSER_PROVIDER_NOT_OWNED",
+                "message": "The browser provider belongs to another connection",
+            }
+        if provider["registrationId"] != registration_id:
+            return denied, {
+                "code": "BROWSER_REGISTRATION_EXPIRED",
+                "message": "The browser registration expired; reconnect it and try again",
+            }
+        if self._ws_clients.get(client_id) is not ws or ws.closed:
+            return denied, {
+                "code": "BROWSER_PROVIDER_UNAVAILABLE",
+                "message": "The browser provider connection is no longer active",
+            }
+        return _BrowserRunBinding(
+            client_id=client_id,
+            provider_id=provider_id,
+            registration_id=registration_id,
+        ), None
+
+    def _register_browser_provider(
+        self, client_id: str, params: dict, *, legacy: bool = False
+    ) -> dict:
+        """Register a browser-capable WebSocket client.
+
+        Released Chrome extensions only send ``extension.register`` and may
+        omit every provider field. New clients use
+        ``browser.provider.register`` with an explicit stable providerId.
+        """
+        raw_provider_id = params.get("providerId")
+        if legacy and not raw_provider_id:
+            raw_provider_id = f"chrome-extension:{client_id}"
+        if not isinstance(raw_provider_id, str) or not raw_provider_id:
+            raise ValueError("Missing providerId")
+        provider_id = raw_provider_id.strip()
+        if (
+            not provider_id
+            or len(provider_id) > 64
+            or any(char not in _BROWSER_PROVIDER_ID_CHARS for char in provider_id)
+        ):
+            raise ValueError(
+                "providerId must be 1-64 ASCII letters, digits, '-', '_', '.', or ':'"
+            )
+
+        raw_type = params.get("type")
+        if raw_type is not None and not isinstance(raw_type, str):
+            raise ValueError("type must be a string")
+        aliases = {
+            "embedded_browser": "embedded",
+            "extension": "chrome_extension",
+            "chrome": "chrome_extension",
+            "browser": "chrome_extension",
+            "browser_extension": "chrome_extension",
+            "chrome-extension": "chrome_extension",
+        }
+        provider_type = aliases.get(raw_type, raw_type)
+        if not provider_type:
+            provider_type = "chrome_extension" if legacy else "embedded"
+        # Old extension releases used several informal type labels. The
+        # legacy method itself proves this is an extension registration, so
+        # normalize unknown historical labels instead of breaking rollout.
+        if legacy and provider_type not in _BROWSER_PROVIDER_TYPES:
+            provider_type = "chrome_extension"
+        if provider_type not in _BROWSER_PROVIDER_TYPES:
+            raise ValueError(
+                f"type must be one of: {', '.join(sorted(_BROWSER_PROVIDER_TYPES))}"
+            )
+
+        display_name = params.get("displayName")
+        if not isinstance(display_name, str) or not display_name.strip():
+            display_name = (
+                "Flowly Embedded Browser"
+                if provider_type == "embedded"
+                else "Flowly Chrome Extension"
+            )
+        display_name = display_name.strip()[:100]
+
+        raw_capabilities = params.get("capabilities", [])
+        if not isinstance(raw_capabilities, list):
+            raise ValueError("capabilities must be an array of action names")
+        capabilities: list[str] = []
+        seen_capabilities: set[str] = set()
+        for capability in raw_capabilities[:128]:
+            if not isinstance(capability, str):
+                raise ValueError("capabilities must contain only strings")
+            capability = capability.strip()
+            if capability and capability not in seen_capabilities:
+                capabilities.append(capability)
+                seen_capabilities.add(capability)
+
+        protocol_version = params.get("protocolVersion", 1)
+        if not isinstance(protocol_version, int) or isinstance(protocol_version, bool):
+            raise ValueError("protocolVersion must be an integer")
+        if protocol_version < 1 or protocol_version > 2:
+            raise ValueError("protocolVersion must be 1 or 2")
+        session_scoped = params.get("sessionScoped", False)
+        if not isinstance(session_scoped, bool):
+            raise ValueError("sessionScoped must be a boolean")
+
+        # A client can own one provider. Re-registering replaces its previous
+        # identity without leaving stale routing entries behind. Every
+        # registration gets a new opaque generation so a delayed chat.send or
+        # tool_result cannot cross a reconnect boundary.
+        previous_provider_id = self._browser_client_provider.get(client_id)
+        if previous_provider_id:
+            self._cancel_browser_requests_for_client(
+                client_id,
+                error="Browser provider registration was replaced",
+                error_code="BROWSER_REGISTRATION_EXPIRED",
+            )
+        if previous_provider_id and previous_provider_id != provider_id:
+            self._browser_providers.pop(previous_provider_id, None)
+
+        # A stable provider can reconnect under a replacement WebSocket client.
+        # Detach the former owner; its stale socket cleanup will see that it no
+        # longer owns the provider and cannot remove this registration.
+        previous = self._browser_providers.get(provider_id)
+        if previous and previous["client_id"] != client_id:
+            self._browser_client_provider.pop(previous["client_id"], None)
+            self._extension_clients.discard(previous["client_id"])
+            self._cancel_browser_requests_for_client(previous["client_id"])
+
+        self._browser_provider_sequence += 1
+        provider = {
+            "id": provider_id,
+            "client_id": client_id,
+            "type": provider_type,
+            "displayName": display_name,
+            "protocolVersion": protocol_version,
+            "registrationId": uuid.uuid4().hex,
+            "sessionScoped": session_scoped,
+            "capabilities": capabilities,
+            "registrationOrder": self._browser_provider_sequence,
+        }
+        self._browser_providers[provider_id] = provider
+        self._browser_client_provider[client_id] = provider_id
+        self._extension_clients.add(client_id)
+
+        if session_scoped and self._browser_provider_active == provider_id:
+            self._browser_provider_active = None
+            self._extension_active = None
+            self._browser_provider_selection_explicit = False
+            for candidate in sorted(
+                self._browser_providers.values(),
+                key=lambda item: item["registrationOrder"],
+                reverse=True,
+            ):
+                if candidate["id"] != provider_id and self._select_browser_provider(candidate["id"]):
+                    break
+
+        # Preserve released extension behaviour (newest registration wins)
+        # until a UI/user explicitly selects a provider. Re-registering the
+        # selected provider refreshes its connection without losing selection.
+        if (
+            not session_scoped
+            and (
+                not self._browser_provider_active
+                or not self._browser_provider_selection_explicit
+                or self._browser_provider_active == provider_id
+            )
+        ):
+            self._select_browser_provider(provider_id)
+        return {
+            "ok": True,
+            "provider": self._public_browser_provider(
+                provider, include_registration=True
+            ),
+        }
+
+    def _public_browser_provider(
+        self, provider: dict[str, Any], *, include_registration: bool = False
+    ) -> dict:
+        client_id = provider["client_id"]
+        ws = self._ws_clients.get(client_id)
+        public = {
+            "id": provider["id"],
+            "type": provider["type"],
+            "displayName": provider["displayName"],
+            "protocolVersion": provider["protocolVersion"],
+            "capabilities": list(provider["capabilities"]),
+            "sessionScoped": bool(provider["sessionScoped"]),
+            "connected": bool(ws is not None and not ws.closed),
+            "active": provider["id"] == self._browser_provider_active,
+        }
+        if include_registration:
+            public["registrationId"] = provider["registrationId"]
+        return public
+
+    def _list_browser_providers(self) -> list[dict]:
+        providers = sorted(
+            self._browser_providers.values(),
+            key=lambda item: item["registrationOrder"],
+            reverse=True,
+        )
+        return [self._public_browser_provider(provider) for provider in providers]
+
+    def _select_browser_provider(self, provider_id: str, *, explicit: bool = False) -> bool:
+        provider = self._browser_providers.get(provider_id)
+        if not provider or provider["sessionScoped"]:
             return False
-        ws = self._ws_clients.get(self._extension_active)
+        ws = self._ws_clients.get(provider["client_id"])
+        if ws is None or ws.closed:
+            return False
+        self._browser_provider_active = provider_id
+        self._extension_active = provider["client_id"]
+        if explicit:
+            self._browser_provider_selection_explicit = True
+        return True
+
+    def _cancel_browser_requests_for_client(
+        self,
+        client_id: str,
+        *,
+        error: str = "Browser provider disconnected",
+        error_code: str = "BROWSER_PROVIDER_UNAVAILABLE",
+    ) -> int:
+        cancelled = 0
+        for request_id, expected_client_id in list(self._browser_pending_clients.items()):
+            if expected_client_id != client_id:
+                continue
+            future = self._extension_pending.pop(request_id, None)
+            self._browser_pending_clients.pop(request_id, None)
+            self._browser_pending_registrations.pop(request_id, None)
+            if future is not None and not future.done():
+                future.set_result({"error": error, "error_code": error_code})
+                cancelled += 1
+        return cancelled
+
+    def _unregister_browser_provider(self, client_id: str) -> int:
+        self._extension_clients.discard(client_id)
+        provider_id = self._browser_client_provider.pop(client_id, None)
+        provider = self._browser_providers.get(provider_id) if provider_id else None
+        if provider is not None and provider["client_id"] == client_id:
+            self._browser_providers.pop(provider_id, None)
+
+        cancelled = self._cancel_browser_requests_for_client(client_id)
+        if self._browser_provider_active == provider_id:
+            self._browser_provider_active = None
+            self._extension_active = None
+            self._browser_provider_selection_explicit = False
+            for candidate in sorted(
+                self._browser_providers.values(),
+                key=lambda item: item["registrationOrder"],
+                reverse=True,
+            ):
+                if self._select_browser_provider(candidate["id"]):
+                    break
+        elif self._extension_active == client_id:
+            active = self._browser_providers.get(self._browser_provider_active or "")
+            self._extension_active = active["client_id"] if active else None
+        return cancelled
+
+    def has_browser_provider(self, provider_id: str | None = None) -> bool:
+        """Return whether the selected (or requested) browser provider is live."""
+        binding = _BROWSER_RUN_BINDING.get()
+        if binding is not None:
+            if not binding.provider_id:
+                return False
+            if provider_id is not None and provider_id != binding.provider_id:
+                return False
+            target_id = binding.provider_id
+        else:
+            target_id = provider_id or self._browser_provider_active
+        if not target_id:
+            return False
+        provider = self._browser_providers.get(target_id)
+        if not provider:
+            return False
+        if binding is None and provider["sessionScoped"]:
+            return False
+        if binding is not None and (
+            provider["client_id"] != binding.client_id
+            or provider["registrationId"] != binding.registration_id
+        ):
+            return False
+        ws = self._ws_clients.get(provider["client_id"])
         return ws is not None and not ws.closed
 
-    async def send_extension_tool_request(
-        self, request_id: str, action: str, params: dict
-    ) -> dict:
-        """Send a tool request to the extension and wait for the result."""
-        if not self.has_extension_client():
-            return {"error": "Extension not connected"}
+    def has_extension_client(self) -> bool:
+        """Compatibility alias for existing BrowserTabTool callers."""
+        return self.has_browser_provider()
 
-        ws = self._ws_clients.get(self._extension_active)
+    async def send_browser_tool_request(
+        self,
+        request_id: str,
+        action: str,
+        params: dict,
+        provider_id: str | None = None,
+    ) -> dict:
+        """Send a tool request to one provider and await only its result."""
+        binding = _BROWSER_RUN_BINDING.get()
+        if binding is not None:
+            if not binding.provider_id:
+                return {
+                    "error": "Browser access was not granted for this chat run",
+                    "error_code": "BROWSER_ACCESS_NOT_GRANTED",
+                }
+            if provider_id is not None and provider_id != binding.provider_id:
+                return {
+                    "error": "The requested browser is outside this chat run",
+                    "error_code": "BROWSER_PROVIDER_NOT_OWNED",
+                }
+            target_provider_id = binding.provider_id
+        else:
+            target_provider_id = provider_id or self._browser_provider_active
+        if not target_provider_id or not self.has_browser_provider(target_provider_id):
+            return {
+                "error": "Browser provider not connected or registration expired",
+                "error_code": "BROWSER_PROVIDER_UNAVAILABLE",
+            }
+
+        provider = self._browser_providers[target_provider_id]
+        capabilities = provider["capabilities"]
+        if capabilities and action not in capabilities:
+            return {
+                "error": f"Browser provider does not support action: {action}",
+                "error_code": "UNSUPPORTED_ACTION",
+                "providerId": target_provider_id,
+            }
+
+        client_id = provider["client_id"]
+        ws = self._ws_clients.get(client_id)
         if not ws or ws.closed:
-            return {"error": "Extension WebSocket closed"}
+            return {"error": "Browser provider WebSocket closed"}
+        if request_id in self._extension_pending:
+            return {"error": f"Duplicate browser request id: {request_id}"}
+        if provider.get("activeRequestId"):
+            return {
+                "error": "Browser provider is busy with another action",
+                "error_code": "BROWSER_BUSY",
+                "providerId": target_provider_id,
+            }
+
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._extension_pending[request_id] = future
+        self._browser_pending_clients[request_id] = client_id
+        self._browser_pending_registrations[request_id] = provider["registrationId"]
+        provider["activeRequestId"] = request_id
 
         try:
             await self._ws_send(ws, {
@@ -2180,15 +2705,52 @@ class GatewayServer:
                 "id": request_id,
                 "action": action,
                 "params": params,
+                "providerId": target_provider_id,
+                "registrationId": provider["registrationId"],
             })
             return await future
         finally:
             self._extension_pending.pop(request_id, None)
+            self._browser_pending_clients.pop(request_id, None)
+            self._browser_pending_registrations.pop(request_id, None)
+            if provider.get("activeRequestId") == request_id:
+                provider.pop("activeRequestId", None)
 
-    def _handle_extension_tool_result(self, data: dict) -> None:
-        """Handle a tool_result message from the extension."""
+    async def send_extension_tool_request(
+        self, request_id: str, action: str, params: dict
+    ) -> dict:
+        """Compatibility alias for released agent/browser tool code."""
+        return await self.send_browser_tool_request(request_id, action, params)
+
+    def _handle_extension_tool_result(self, data: dict, client_id: str) -> None:
+        """Resolve a browser request only from the provider it was sent to."""
         request_id = data.get("id")
         result = data.get("result", {})
+        expected_client_id = self._browser_pending_clients.get(request_id)
+        if expected_client_id != client_id:
+            logger.warning(
+                f"[WS] Ignoring browser result {request_id!r} from {client_id}; "
+                f"expected {expected_client_id}"
+            )
+            return
+        expected_registration_id = self._browser_pending_registrations.get(request_id)
+        provider_id = self._browser_client_provider.get(client_id)
+        provider = self._browser_providers.get(provider_id or "")
+        received_registration_id = data.get("registrationId")
+        if received_registration_id is not None and received_registration_id != expected_registration_id:
+            logger.warning(
+                f"[WS] Ignoring browser result {request_id!r} from stale registration"
+            )
+            return
+        if (
+            provider is not None
+            and provider["protocolVersion"] >= 2
+            and received_registration_id != expected_registration_id
+        ):
+            logger.warning(
+                f"[WS] Ignoring browser v2 result {request_id!r} without matching registration"
+            )
+            return
         future = self._extension_pending.get(request_id)
         if future and not future.done():
             future.set_result(result)

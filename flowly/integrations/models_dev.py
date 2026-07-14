@@ -161,6 +161,7 @@ async def fetch_provider_models(provider_key: str) -> list[Model]:
             pricing_in=float(cost["input"]) if isinstance(cost.get("input"), (int, float)) else None,
             pricing_out=float(cost["output"]) if isinstance(cost.get("output"), (int, float)) else None,
             tags=tags,
+            supports_vision=bool(raw.get("attachment")),
         ))
     out.sort(key=lambda m: m.id)
     return out

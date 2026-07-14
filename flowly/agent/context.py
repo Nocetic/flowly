@@ -767,8 +767,9 @@ not running → `activate_app(app_name=)` to bring to front →
 _BROWSER_TAB_GUIDANCE = """\
 ## Browser Tab Control (Web Pages)
 
-`browser_tab` drives the user's REAL Chrome via the Flowly extension. They see
-every action live (cyan glow on the page edge). Pair this with the
+`browser_tab` drives the selected Flowly browser provider: either the browser
+embedded in Flowly Desktop or Chrome through the Flowly extension. The user
+sees every action live. Pair this with the
 **`flowly-browser` skill that is already loaded under "Active Skills"** —
 that skill is the playbook, this section is the non-negotiable floor.
 
