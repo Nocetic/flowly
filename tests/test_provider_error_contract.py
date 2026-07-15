@@ -13,7 +13,10 @@ from flowly.agent.error_classifier import (
     is_image_input_unsupported,
     present_provider_error,
 )
-from flowly.agent.loop import _messages_contain_image_input
+from flowly.agent.loop import (
+    _browser_tool_result_failed,
+    _messages_contain_image_input,
+)
 from flowly.gateway.server import GatewayServer
 from flowly.integrations import model_catalog
 from flowly.integrations.model_catalog import Model
@@ -38,6 +41,44 @@ def test_image_input_errors_are_terminal_and_provider_independent(message: str) 
     assert is_image_input_unsupported(message)
     assert classify_response(response) is ErrorCategory.IMAGE_INPUT_UNSUPPORTED
     assert backoff_for(ErrorCategory.IMAGE_INPUT_UNSUPPORTED, 1) is None
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        '{"error": "Browser provider does not support action: evaluate", "error_code": "UNSUPPORTED_ACTION"}',
+        '{"error_code": "TYPE_NOT_PERSISTED", "observed": ""}',
+        '{"error": "Element not found or no longer visible"}',
+        '{"error_code": "UPLOAD_PATH_NOT_ALLOWED"}',
+    ],
+)
+def test_browser_tab_error_envelope_counts_as_failure(result: str) -> None:
+    # The generic loop check would call these successes (they don't start with
+    # "Error"); the browser-scoped detector must flag them as failures.
+    assert not result.startswith("Error")
+    assert _browser_tool_result_failed("browser_tab", result) is True
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        '{"success": true, "ref": "ref_8", "textLength": 7, "verified": true}',
+        '{"success": true, "tabId": 4, "url": "https://x.com/"}',
+        # A success envelope that happens to carry an inner "error" field must
+        # still be a success.
+        '{"success": true, "error": "harmless subfield"}',
+    ],
+)
+def test_browser_tab_success_stays_success(result: str) -> None:
+    assert _browser_tool_result_failed("browser_tab", result) is False
+
+
+def test_browser_failure_detector_is_scoped_to_browser_tab() -> None:
+    # Another tool returning JSON with an "error" field must be untouched.
+    payload = '{"error": "some other tool payload"}'
+    assert _browser_tool_result_failed("exec", payload) is False
+    # Non-JSON browser results are left to the generic check.
+    assert _browser_tool_result_failed("browser_tab", "plain text result") is False
 
 
 @pytest.mark.parametrize(
