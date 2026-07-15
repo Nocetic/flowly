@@ -389,7 +389,13 @@ async def _apply_op(
             cat = queries.render_template(cat_tpl, ns).strip()[: catalog.MAX_CATEGORY_LEN]
             if cat:
                 meta = {"category": cat}
-        store.add_event(flowlet_id, series, float(v), meta=meta)
+        # Stamp the event with the same injectable clock the query/window engine
+        # uses (``queries_now_ms``) rather than letting add_event default to a
+        # second real-time ``now_ms``. In production both are the real now, so
+        # behavior is unchanged; under a frozen test clock this keeps the event
+        # inside the aggregation window (otherwise a logged event can land in a
+        # different day/week than the totals are computed for).
+        store.add_event(flowlet_id, series, float(v), meta=meta, ts=queries_now_ms())
 
     elif op == "remove_last":
         series = action.get("series")

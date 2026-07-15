@@ -487,6 +487,9 @@ _PERMISSION_BADGE: dict[str, tuple[str, str]] = {
     "ask":  ("#6ee7a0", "● ASK"),
     "auto": ("#f2c94c", "● AUTO"),
     "yolo": ("#ff5d6c", "● YOLO"),
+    # Standing plan mode (cycled with Shift+Tab like the levels above):
+    # every task is planned + approved before any side effect runs.
+    "plan": ("#00a6c8", "▣ PLAN"),
 }
 
 

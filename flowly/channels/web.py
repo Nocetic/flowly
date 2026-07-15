@@ -650,6 +650,39 @@ class WebChannel(BaseChannel):
         await self._send_or_queue(json.dumps(event_msg))
         logger.info(f"[WebChannel] Sent clarify event {clarify_id} to relay session {relay_id}")
 
+    async def send_plan_event(
+        self,
+        session_key: str,
+        event_name: str,
+        data: dict,
+    ) -> None:
+        """Push a plan.* event to the browser/iOS via relay, scoped to the
+        conversation (routed by ``sessionKey`` → relay session id). Mirrors
+        ``send_clarify_event`` so only the devices in that chat receive it.
+
+        NOTE (relay fan-out): the current relay session map is 1:1
+        (``session_key`` → one relay id), so with the same conversation open on
+        two devices only the last-mapped one is reached. Full multi-device
+        fan-out is a relay-server change tracked separately; ``plan.get`` on
+        re-entry keeps every device eventually consistent regardless.
+        """
+        if not self._ws or not session_key:
+            return
+        relay_id = self._session_key_to_relay_id.get(session_key)
+        if not relay_id:
+            relay_id = self._session_key_to_relay_id.get(f"web:{session_key}")
+        if not relay_id:
+            logger.debug(f"[WebChannel] No relay session for plan event {session_key}")
+            return
+        event_msg = {
+            "type": "event",
+            "sessionId": relay_id,
+            "event": event_name,
+            "data": data,
+        }
+        # Plan approvals are user-blocking — survive a flapping WS via the queue.
+        await self._send_or_queue(json.dumps(event_msg))
+
     async def send_compaction_event(
         self,
         session_key: str,

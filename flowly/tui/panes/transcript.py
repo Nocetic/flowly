@@ -9,7 +9,6 @@ from rich import box
 from rich.console import RenderableType
 from rich.markdown import Markdown as RichMarkdown
 from rich.markdown import TableElement as RichMarkdownTableElement
-from rich.markup import escape
 from rich.style import Style
 from rich.table import Table
 from rich.text import Text
@@ -115,7 +114,13 @@ class Bubble(Container):
         background: #101010;
     }
     Bubble.assistant { border: round #00a6c8; background: transparent; }
-    Bubble.system    { border: round #466b73; background: transparent; }
+    Bubble.system    {
+        border: none;
+        background: transparent;
+        padding: 0 2;
+        margin: 0 0 1 0;
+        color: #83b8c2;
+    }
     Bubble.slash     { border: round #466b73; background: transparent; }
     Bubble.error     { border: round #ff5d6c; background: transparent; }
 
@@ -170,7 +175,10 @@ class Bubble(Container):
         self._stream_timer = None
         self._dirty = False
         self._created_at = _format_message_time(timestamp)
-        if role != "user":
+        # System notices render as plain dim lines in the flow (Claude-Code
+        # style) — no box, no " · system " title. Everything else keeps its
+        # labelled border.
+        if role not in ("user", "system"):
             glyph, label = self.LABEL_GLYPHS.get(role, ("·", role))
             self.border_title = f" {glyph} {label} "
             self.border_title_align = "left"
@@ -242,10 +250,10 @@ class Bubble(Container):
         # plain Text(body) would render them literally as seen in the
         # "[b]brunowasright@gmail.com[/b]" screenshot bug.
         if self._role == "error":
-            return Text.from_markup(body, style="bold red")
+            return _markup_or_plain(body, "bold red")
         if self._role == "slash":
-            return Text.from_markup(body, style="dim italic")
-        return Text.from_markup(body, style="dim")
+            return _markup_or_plain(body, "dim italic")
+        return _markup_or_plain(body, "dim")
 
     def _render_user(self, body: str) -> Table:
         if len(body) > self.LONG_USER_MSG_CHARS:
@@ -365,11 +373,25 @@ class ToolLine(Static):
         spin = self.SPINNER_FRAMES[self._frame]
         elapsed = time.monotonic() - self._start
         elapsed_str = f"{elapsed:.1f}s" if elapsed < 60 else f"{int(elapsed) // 60}m{int(elapsed) % 60}s"
-        preview = f"  [dim]{self._arg_preview}[/dim]" if self._arg_preview else ""
-        hint = "  [dim]↵ details[/dim]" if self._can_expand() else ""
-        self.update(
-            f"  {spin} {self._icon}  [b]{self._name}[/b]{preview}  [dim]· {elapsed_str}[/dim]{hint}"
-        )
+        # Built as a Text object (not markup) so tool names/args can contain
+        # ANY characters — square brackets in user args must never be parsed
+        # as style tags (that used to crash the compositor mid-render).
+        self.update(self._label_text(f"  {spin} ", elapsed_str, running=True))
+
+    def _label_text(self, lead: str, timing: str, *, running: bool) -> Text:
+        parts: list[tuple[str, str] | tuple[str,]] = [(f"{lead}{self._icon}  ",)]
+        parts.append((self._name, "bold"))
+        if self._arg_preview:
+            parts.append((f"  {self._arg_preview}", "dim"))
+        parts.append((f"  · {timing}", "dim"))
+        if running:
+            if self._can_expand():
+                parts.append(("  ↵ details", "dim"))
+        elif self._preview:
+            parts.append(("  ↵ expand", "dim"))
+        elif self._can_expand():
+            parts.append(("  ↵ details", "dim"))
+        return Text.assemble(*parts)
 
     def complete(self, success: bool, duration_ms: int, preview: str = "") -> None:
         self._done = True
@@ -382,16 +404,7 @@ class ToolLine(Static):
         icon = "✓" if success else "✗"
         self.add_class("ok" if success else "fail")
         dur = f"{duration_ms}ms" if duration_ms < 1000 else f"{duration_ms / 1000:.1f}s"
-        if preview:
-            hint = "  [dim]↵ expand[/dim]"
-        elif self._can_expand():
-            hint = "  [dim]↵ details[/dim]"
-        else:
-            hint = ""
-        arg_preview = f"  [dim]{self._arg_preview}[/dim]" if self._arg_preview else ""
-        self.update(
-            f"  {icon} {self._icon}  [b]{self._name}[/b]{arg_preview}  [dim]· {dur}[/dim]{hint}"
-        )
+        self.update(self._label_text(f"  {icon} ", dur, running=False))
         self._refresh_detail()
         _request_tail_scroll_from(self)
 
@@ -409,12 +422,15 @@ class ToolLine(Static):
             _request_tail_scroll_from(self)
             return
         rendered = self._detail_renderable()
-        # markup=True so the ` … +N more lines[/dim]` hint colors render
+        # markup=False + Text content: tool args/results are arbitrary data
+        # and must NEVER be parsed as style markup (a stray `[/dim]`-looking
+        # sequence used to raise MarkupError and take the whole app down).
+        # The dim continuation hint is styled via Text spans instead.
         detail = Static(
             rendered,
             id=marker_id,
             classes="tool-detail",
-            markup=True,
+            markup=False,
         )
         parent.mount(detail, after=self)
         self._expanded = True
@@ -449,7 +465,7 @@ class ToolLine(Static):
             return
         detail.update(self._detail_renderable())
 
-    def _detail_renderable(self) -> str:
+    def _detail_renderable(self) -> Text:
         if self._done:
             if self._preview:
                 return _render_tool_preview(self._preview)
@@ -460,19 +476,18 @@ class ToolLine(Static):
 
             safe_args = _redact_tool_args(self._args)
             pretty_args = json.dumps(safe_args, indent=2, ensure_ascii=False)
-            return _railed_text(f"status: running\nargs:\n{escape(pretty_args)}")
-        return _railed_text(f"status: running\nargs: {escape(self._arg_preview)}")
+            return _railed_text(f"status: running\nargs:\n{pretty_args}")
+        return _railed_text(f"status: running\nargs: {self._arg_preview}")
 
 
-def _render_tool_preview(preview: str):
+def _render_tool_preview(preview: str) -> Text:
     """Prepend ` │ ` rail to each line; JSON parsed if detected."""
     import json
     text = preview.strip()
-    # Try JSON first — render with rich + then prefix rails.
+    # Try JSON first — pretty-print to lines, then add rails.
     if text.startswith(("{", "[")):
         try:
             obj = json.loads(text)
-            # Pretty-print to lines, then add rails.
             pretty = json.dumps(obj, indent=2, ensure_ascii=False)
             return _railed_text(pretty)
         except (ValueError, TypeError):
@@ -480,16 +495,17 @@ def _render_tool_preview(preview: str):
     return _railed_text(preview)
 
 
-def _railed_text(s: str, max_lines: int = 12) -> str:
-    """Add ` │ ` prefix to each line; truncate to max_lines with continuation hint."""
+def _railed_text(s: str, max_lines: int = 12) -> Text:
+    """Add ` │ ` prefix to each line; truncate to max_lines with a dim
+    continuation hint. Returns a Text object built from PLAIN strings — the
+    content is tool-derived data and must never pass through markup parsing.
+    """
     lines = s.splitlines() or [""]
+    shown = lines[:max_lines]
+    out = Text("\n".join(f" │ {ln}" for ln in shown))
     if len(lines) > max_lines:
-        shown = lines[:max_lines]
-        suffix = f"\n │ [dim]…and {len(lines) - max_lines} more lines[/dim]"
-    else:
-        shown = lines
-        suffix = ""
-    return "\n".join(f" │ {ln}" for ln in shown) + suffix
+        out.append(f"\n │ …and {len(lines) - max_lines} more lines", style="dim")
+    return out
 
 
 _SENSITIVE_KEY_PARTS = (
@@ -610,7 +626,9 @@ def _clean_preview_value(key: str, value: object, max_len: int = 72) -> str:
     text = " ".join(text.split())
     if len(text) > max_len:
         text = text[: max_len - 1] + "…"
-    return escape(text)
+    # Plain text on purpose — previews are rendered through Text objects
+    # (never markup-parsed), so escaping would just show literal backslashes.
+    return text
 
 
 def _format_arg_pair(key: str, value: object) -> str:
@@ -624,7 +642,21 @@ def _format_arg_pair(key: str, value: object) -> str:
 
 def _with_extras(preview: str, args: dict, used_keys: set[str]) -> str:
     extras = len([k for k, v in args.items() if k not in used_keys and v not in (None, "")])
-    return preview + (f"  [dim]+{extras}[/dim]" if extras else "")
+    # Plain `+N` — the whole arg preview renders dim via Text spans already.
+    return preview + (f"  +{extras}" if extras else "")
+
+
+def _markup_or_plain(body: str, style: str) -> Text:
+    """Parse app-authored markup, falling back to plain text on bad tags.
+
+    System/error bubbles interpolate exception messages and gateway close
+    reasons — arbitrary strings that can contain `[`-sequences which are not
+    valid markup. A styling downgrade beats crashing the compositor.
+    """
+    try:
+        return Text.from_markup(body, style=style)
+    except Exception:
+        return Text(body, style=style)
 
 
 def _first_arg(args: dict, keys: tuple[str, ...]) -> tuple[str, object] | None:
@@ -697,7 +729,7 @@ def _summarize_args(name: str, args: dict) -> str:
         if k in args and args[k] not in (None, ""):
             extras = len(args) - 1
             preview = _format_arg_pair(k, args[k])
-            return preview + (f"  [dim]+{extras}[/dim]" if extras else "")
+            return preview + (f"  +{extras}" if extras else "")
 
     bits: list[str] = []
     for key, value in list(args.items())[:3]:

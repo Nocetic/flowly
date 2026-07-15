@@ -1710,6 +1710,18 @@ class AgentLoop:
             logger.debug("Flowlet tool unavailable: {}", exc)
             self._flowlet_store = None
 
+        # Plan tool — general, session-level plan mode (always available).
+        # The proposing turn blocks on the user's approval; steps then sync to
+        # every client's composer with live ticks. Emergency off:
+        # FLOWLY_PLAN_ENABLED=0. The broadcast + restart-recovery wiring lives
+        # in gateway_cmd.py (set_on_change / recover_on_start).
+        try:
+            from flowly.agent.tools.plan import PlanTool, plan_tool_enabled
+            if plan_tool_enabled():
+                self.tools.register(PlanTool(registry=self.tools))
+        except Exception:  # noqa: BLE001 — never block agent startup
+            logger.exception("[loop] PlanTool registration failed (non-fatal)")
+
         # Browser tab tool (if enabled — requires Chrome extension)
         browser_tab_enabled = False
         if self._main_config and hasattr(self._main_config, "tools"):
@@ -3456,6 +3468,7 @@ class AgentLoop:
         # turn so a fresh turn can be nudged once. See the guard
         # block near the loop tail for the full rationale.
         self._plan_nudged_this_turn = False
+        self._general_plan_nudged_this_turn = False
 
         # NOTE: the repetition detector that lived here was removed in
         # 2026-05-02 because it produced false positives on legitimate
@@ -3931,6 +3944,53 @@ class AgentLoop:
                         )
                         _iteration_event_idx += 1
                         continue
+
+                    # Plan-mode gate: while a session is in forced plan mode
+                    # (or a plan sits awaiting the user's approval), side-
+                    # effecting tools are blocked at the backend — the agent
+                    # must propose a plan and get it approved before acting.
+                    # This does NOT depend on the prompt: even if the model
+                    # ignores the planning instruction, it physically cannot
+                    # run exec / write_file / send a message / etc. until the
+                    # plan is approved. Read-only tools and `plan` itself pass.
+                    if tool_call.name != "plan":
+                        try:
+                            from flowly.plans.manager import get_plan_manager
+                            _pmgr = get_plan_manager()
+                            if _current_session_key and _pmgr.gate_blocks(
+                                _current_session_key, tool_call.name
+                            ):
+                                blocked_tools.append(tool_call.name)
+                                result = (
+                                    f"BLOCKED: '{tool_call.name}' is a side-"
+                                    "effecting action. "
+                                    + _pmgr.gate_reason(_current_session_key)
+                                )
+                                logger.info(
+                                    f"[plan] gate blocked {tool_call.name} "
+                                    f"for session={_current_session_key}"
+                                )
+                                accumulated_tool_results.append({
+                                    "tool": tool_call.name,
+                                    "success": False,
+                                    "result": result,
+                                })
+                                messages = self.context.add_tool_result(
+                                    messages, tool_call.id, tool_call.name, result
+                                )
+                                await self._emit_iteration_event(
+                                    outbound_channel=outbound_channel,
+                                    outbound_chat_id=outbound_chat_id,
+                                    outbound_run_id=outbound_run_id,
+                                    iteration_idx=_iteration_event_idx,
+                                    message=messages[-1],
+                                    on_iteration=on_iteration,
+                                )
+                                _iteration_event_idx += 1
+                                continue
+                        except Exception:
+                            # Gate must never break tool execution on error.
+                            logger.debug("[plan] gate check skipped (non-fatal)")
 
                     # Media-intent guard: reject screenshot / capture_window
                     # when the user didn't explicitly ask for an image. The
@@ -4410,6 +4470,52 @@ class AgentLoop:
                 logger.exception("[loop] plan end-turn guard failed (non-fatal)")
             # ────────────────────────────────────────────────────────
 
+            # ── General plan end-turn guard ─────────────────────────
+            # Same idea for the general (non-browser) plan system: if the
+            # session has an executing plan with unfinished steps and the
+            # agent is trying to end, nudge once to finish / block / hand
+            # back. Never fires for sessions without a general plan.
+            try:
+                if not getattr(self, "_general_plan_nudged_this_turn", False):
+                    from flowly.plans.manager import get_plan_manager
+                    gplan = get_plan_manager().get_current(_current_session_key)
+                    if gplan and gplan.status == "executing":
+                        g_unfinished = [
+                            s for s in gplan.steps
+                            if s.status in ("pending", "in_progress")
+                        ]
+                        g_progress = any(
+                            s.status in ("completed", "blocked", "skipped")
+                            for s in gplan.steps
+                        )
+                        if g_progress and g_unfinished:
+                            self._general_plan_nudged_this_turn = True
+                            g_summary = ", ".join(
+                                f"#{s.id} ({s.status})" for s in g_unfinished[:5]
+                            )
+                            logger.warning(
+                                f"[loop] general plan {gplan.id} active with "
+                                f"{len(g_unfinished)} unfinished step(s); nudging"
+                            )
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"You're ending the turn but the plan is still "
+                                    f"active. Unfinished steps: {g_summary}. Either "
+                                    f"finish them (mark each in_progress then "
+                                    f"completed with plan(action='update_step')), or "
+                                    f"if genuinely blocked call "
+                                    f"plan(action='block', summary='why'), or if the "
+                                    f"work is done call plan(action='complete'). "
+                                    f"Don't claim done if the steps aren't."
+                                ),
+                                _EPHEMERAL_NUDGE: True,
+                            })
+                            continue  # one more iteration
+            except Exception:
+                logger.exception("[loop] general plan guard failed (non-fatal)")
+            # ────────────────────────────────────────────────────────
+
             # Leaked tool-call guard: the model emitted a tool call as inline
             # text (DSML / <invoke> / <tool_calls>) instead of the structured
             # tool API, so there are no real tool_calls to execute and this
@@ -4707,6 +4813,14 @@ class AgentLoop:
                 is_command = True
                 command = parsed_cmd
                 command_args = ""
+            elif parsed_cmd == "plan":
+                # ``/plan [task | off | status]`` — force plan mode. With a task
+                # it rewrites into a planning turn (like /learn); bare it arms
+                # forced mode for the next message. Works on every raw-text
+                # client, so it reaches Desktop/Web/iOS, not just the TUI.
+                is_command = True
+                command = parsed_cmd
+                command_args = parts[1] if len(parts) > 1 else ""
 
         if is_command and command in ("new", "clear"):
             session = self.sessions.get_or_create(msg.session_key)
@@ -4839,6 +4953,97 @@ class AgentLoop:
             command = ""
             command_args = ""
             # Do NOT return — execution continues to the normal agent run below.
+
+        if is_command and command == "plan":
+            from flowly.plans.manager import get_plan_manager
+            _pmgr = get_plan_manager()
+            _arg = (command_args or "").strip()
+            _low = _arg.lower()
+            if _low in ("off", "stop", "cancel"):
+                _pmgr.set_sticky(msg.session_key, False)
+                await _pmgr.abort_active_for_session(msg.session_key, "user turned off plan mode")
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="✅ Plan mode off.",
+                )
+            if _low in ("status", "?"):
+                cur = _pmgr.get_current(msg.session_key)
+                sticky = _pmgr.is_sticky(msg.session_key)
+                armed = _pmgr.is_forced_pending(msg.session_key)
+                mode_line = "▣ Plan mode is ON" if sticky else (
+                    "📋 Plan mode is armed for your next message." if armed
+                    else "Plan mode is off."
+                )
+                if cur:
+                    prog = cur.progress_summary()
+                    content = (
+                        f"{mode_line}\n📋 Plan **{cur.title}** — {cur.status} "
+                        f"({prog['completed']}/{prog['total']} steps)."
+                    )
+                else:
+                    content = f"{mode_line} Send `/plan <task>` to plan a single task."
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content=content,
+                )
+            if _low == "on" or not _arg:
+                # Bare /plan (or /plan on) = the STANDING mode toggle, like the
+                # exec permission levels: while on, every message plans first.
+                turning_on = True if _low == "on" else not _pmgr.is_sticky(msg.session_key)
+                _pmgr.set_sticky(msg.session_key, turning_on)
+                if turning_on:
+                    content = (
+                        "▣ Plan mode ON — I'll propose a plan and wait for your "
+                        "approval before acting, for every task. `/plan off` to leave."
+                    )
+                else:
+                    content = "✅ Plan mode off."
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content=content,
+                )
+            # /plan <task> — one-shot: plan-first for THIS task only.
+            _pmgr.arm_forced(msg.session_key)
+            # A task was given inline — rewrite into a planning turn (like /learn)
+            # and fall through to a normal agent run. The displayed user turn
+            # stays as the user typed it.
+            original_content = msg.content
+            msg.content = (
+                "Plan mode is ON for this task. Before doing ANY work, use the "
+                "plan tool: plan(action='propose', goal=..., steps=[...]) and wait "
+                "for the user's approval. Do not take side-effecting actions until "
+                "the plan is approved. You MAY read files and search while "
+                f"planning.\n\nTask: {_arg}"
+            )
+            msg.metadata["_display_content"] = original_content
+            is_command = False
+            command = ""
+            command_args = ""
+            # Do NOT return — continues to the normal agent run below.
+
+        # Standing plan mode: while sticky is on for this session, EVERY normal
+        # message becomes a plan-first turn (arm the gate + rewrite), exactly
+        # like the /plan <task> one-shot above. Skips commands and turns some
+        # other handler already rewrote (they set _display_content).
+        if (
+            not is_command
+            and "_display_content" not in msg.metadata
+            and not msg.content.strip().startswith("/")
+        ):
+            try:
+                from flowly.plans.manager import get_plan_manager as _get_pm_sticky
+                _pm_sticky = _get_pm_sticky()
+                if _pm_sticky.is_sticky(msg.session_key):
+                    _pm_sticky.arm_forced(msg.session_key)
+                    _orig = msg.content
+                    msg.content = (
+                        "Plan mode is ON. Before doing ANY work, use the plan "
+                        "tool: plan(action='propose', goal=..., steps=[...]) and "
+                        "wait for the user's approval. Do not take side-effecting "
+                        "actions until the plan is approved. You MAY read files "
+                        f"and search while planning.\n\nTask: {_orig}"
+                    )
+                    msg.metadata["_display_content"] = _orig
+            except Exception:
+                logger.debug("[plan] sticky rewrite skipped (non-fatal)")
 
         if is_command and command == "whoami":
             return OutboundMessage(
