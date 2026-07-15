@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+from flowly.gateway.auth import loopback_ws_allowed
 
 from flowly.agent.error_classifier import (
     ErrorCategory,
@@ -79,6 +82,45 @@ def test_browser_failure_detector_is_scoped_to_browser_tab() -> None:
     assert _browser_tool_result_failed("exec", payload) is False
     # Non-JSON browser results are left to the generic check.
     assert _browser_tool_result_failed("browser_tab", "plain text result") is False
+
+
+def _req(origin: str | None, host: str, url_host: str | None) -> Any:
+    headers: dict[str, str] = {}
+    if origin is not None:
+        headers["Origin"] = origin
+    return SimpleNamespace(headers=headers, host=host, url=SimpleNamespace(host=url_host))
+
+
+@pytest.mark.parametrize(
+    "req",
+    [
+        # Native local clients: desktop main-process ws / TUI (no Origin), the
+        # extension (chrome-extension://), a file:// renderer, and a same-host
+        # localhost web origin (dev renderer).
+        _req(None, "localhost:18790", "localhost"),
+        _req(None, "127.0.0.1:18790", "127.0.0.1"),
+        _req("chrome-extension://abcdefg", "localhost:18790", "localhost"),
+        _req("file://", "localhost:18790", "localhost"),
+        _req("http://localhost:5173", "localhost:18790", "localhost"),
+    ],
+)
+def test_loopback_ws_allows_legit_local_clients(req: Any) -> None:
+    assert loopback_ws_allowed(req) is True
+
+
+@pytest.mark.parametrize(
+    "req",
+    [
+        # A web page the embedded browser visits scripting a cross-origin WS.
+        _req("https://evil.com", "localhost:18790", "localhost"),
+        # DNS rebinding: Origin and Host match (passes the origin check) but the
+        # Host is not loopback → rejected.
+        _req("http://attacker.com", "attacker.com", "attacker.com"),
+        _req("https://attacker.com", "attacker.com:18790", "attacker.com"),
+    ],
+)
+def test_loopback_ws_blocks_web_origins_and_rebinding(req: Any) -> None:
+    assert loopback_ws_allowed(req) is False
 
 
 @pytest.mark.parametrize(

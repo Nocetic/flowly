@@ -24,6 +24,7 @@ from flowly.gateway.auth import (
     extract_request_token,
     host_origin_allowed,
     is_loopback_host,
+    loopback_ws_allowed,
     token_matches,
 )
 from flowly.profile import get_flowly_home
@@ -852,15 +853,21 @@ class GatewayServer:
 
     async def _handle_ws(self, request: web.Request) -> web.StreamResponse:
         """Handle a desktop WebSocket connection."""
-        # Auth gate — only when a token is configured (remote/self-hosted). The
-        # locally-spawned gateway (loopback, no token) is unchanged: the TUI and
-        # local desktop connect exactly as before. When engaged: an anti-DNS-
-        # rebinding Host/Origin check + a single-use ws-ticket (or raw token).
+        # Auth gate. Remote/self-hosted (token configured): anti-DNS-rebinding
+        # Host/Origin check + a single-use ws-ticket (or raw token). Loopback
+        # (no token): there's no credential boundary, so still refuse a web page
+        # the embedded browser visits from scripting a WS to the local gateway
+        # (registering a browser provider, driving chat, …) — reject cross-origin
+        # web pages and non-loopback Hosts. Native local clients (desktop main
+        # process, TUI, the extension) send no Origin / chrome-extension:// and
+        # connect to localhost, so they're unaffected.
         if self._require_auth:
             if not host_origin_allowed(request):
                 return web.Response(status=403, text="forbidden host/origin")
             if not self._ws_credential_ok(request):
                 return web.Response(status=401, text="unauthorized")
+        elif not loopback_ws_allowed(request):
+            return web.Response(status=403, text="forbidden host/origin")
         # 40 MB frame cap: chat.send carries attachments inline as base64 (a
         # 25 MB file inflates to ~33 MB encoded + JSON overhead). This is the
         # direct-gateway equivalent of the relay's CDN upload — base64-over-WS,
