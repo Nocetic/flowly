@@ -110,9 +110,11 @@ def test_tool_line_running_animation_uses_status_prefix(monkeypatch) -> None:
     line._render_running()
     line._tick()
 
-    assert rendered[0].lstrip().startswith(f"{ToolLine.SPINNER_FRAMES[0]} ")
-    assert rendered[1].lstrip().startswith(f"{ToolLine.SPINNER_FRAMES[1]} ")
-    assert "[b]read_file[/b]" in rendered[0]
+    # Labels are Text objects now (never markup-parsed) — assert on .plain
+    # and on the bold span carrying the tool name.
+    assert rendered[0].plain.lstrip().startswith(f"{ToolLine.SPINNER_FRAMES[0]} ")
+    assert rendered[1].plain.lstrip().startswith(f"{ToolLine.SPINNER_FRAMES[1]} ")
+    assert "read_file" in rendered[0].plain
 
 
 def test_tool_line_complete_replaces_animation_prefix(monkeypatch) -> None:
@@ -123,10 +125,10 @@ def test_tool_line_complete_replaces_animation_prefix(monkeypatch) -> None:
 
     line.complete(True, 125, "")
 
-    assert rendered[-1].lstrip().startswith("✓ ")
-    assert "[b]read_file[/b]" in rendered[-1]
-    assert "125ms" in rendered[-1]
-    assert "details" in rendered[-1]
+    assert rendered[-1].plain.lstrip().startswith("✓ ")
+    assert "read_file" in rendered[-1].plain
+    assert "125ms" in rendered[-1].plain
+    assert "details" in rendered[-1].plain
 
 
 def test_tool_line_running_detail_shows_sanitized_args() -> None:

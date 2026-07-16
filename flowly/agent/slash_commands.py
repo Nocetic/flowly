@@ -58,6 +58,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("retry", "Re-submit the last user message (drops the stale reply)", "Session"),
     CommandDef("undo", "Pop the last turn (pre-fills the removed prompt)", "Session"),
     CommandDef("status", "Session health summary", "Info"),
+    # Plan mode — universal (works on every surface). Bare "/plan" (or on/off)
+    # toggles the STANDING mode: every task is planned + approved before any
+    # side effect runs. "/plan <task>" plans just that one task.
+    CommandDef("plan", "Plan mode: propose a plan and wait for approval before acting",
+               "Session", args_hint="[task | on | off | status]"),
     CommandDef("usage", "Token & cost this session (+ Flowly account credits)", "Info",
                cli_only=True),
     CommandDef("whoami", "Show user / server / conversation", "Info"),

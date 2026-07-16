@@ -1489,6 +1489,62 @@ Respond to the user now:"""
     except Exception as exc:  # noqa: BLE001
         logger.debug("Flowlet wiring skipped: {}", exc)
 
+    # Wire the general plan system — same desktop(gateway)+relay fan-out as
+    # flowlets. plan.updated / plan.approval.requested carry the full plan
+    # snapshot; the relay send is conversation-scoped (routes by sessionKey).
+    try:
+        from flowly.plans.manager import get_plan_manager
+
+        _plan_mgr = get_plan_manager()
+
+        async def _broadcast_plan(event_name: str, data: dict) -> None:
+            # Desktop clients (direct WS).
+            await gateway_server.broadcast_event(event_name, data)
+            # Relay (web channel) — conversation-scoped so only the devices in
+            # that chat get it.
+            _web = channels.get_channel("web")
+            if _web and hasattr(_web, "send_plan_event"):
+                try:
+                    await _web.send_plan_event(
+                        str(data.get("sessionKey") or ""), event_name, data
+                    )
+                except Exception:
+                    pass  # relay sync is best-effort
+
+        _plan_mgr.set_on_change(_broadcast_plan)
+
+        # Restart recovery: any plan left mid-execution when the bot stopped is
+        # moved to `paused` (its coroutine is gone). Clients see it on plan.get
+        # and can Resume.
+        _plan_mgr.recover_on_start()
+
+        # plan.resume: start a fresh agent turn seeded to continue the plan.
+        async def _plan_resume_turn(session_key: str, plan_id: str) -> None:
+            plan = _plan_mgr.get_plan(plan_id)
+            if not plan:
+                return
+            done = [s.content for s in plan.steps if s.status in ("completed", "skipped")]
+            remaining = [s.content for s in plan.steps if s.status in ("pending", "in_progress")]
+            prompt = (
+                "Resume the approved plan (it was interrupted). Already done: "
+                + ("; ".join(done) or "nothing yet")
+                + ". Remaining: "
+                + ("; ".join(remaining) or "none")
+                + ". Continue from where it left off, ticking each step with "
+                "plan(action='update_step') and calling plan(action='complete') "
+                "at the end. The plan is already approved — do not re-propose."
+            )
+            try:
+                await agent.process_direct(content=prompt, session_key=session_key)
+            except Exception as e:
+                logger.warning(f"[plan] resume turn failed: {e}")
+
+        from flowly.channels import feature_rpc as _frpc_plan
+
+        _frpc_plan.set_plan_resume_callback(_plan_resume_turn)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Plan wiring skipped: {}", exc)
+
     # Wire auto-compaction notification — push to relay (web channel) + desktop (gateway)
     async def _on_auto_compaction(
         session_key: str, tokens_before: int, tokens_after: int, messages_removed: int,

@@ -428,7 +428,125 @@ def chat_inflight(params: dict) -> dict:
     from flowly.agent.inflight import get as _inflight_get
     session_key = (params.get("sessionKey") or "").strip()
     cur = _inflight_get(session_key) if session_key else None
-    return {"inflight": cur}
+    result: dict = {"inflight": cur}
+    # Attach the current plan snapshot so a client that re-enters mid-turn
+    # restores the plan bar too (not just the streaming bubble). The canonical
+    # resume source is plan.get; this is a one-round-trip optimization.
+    try:
+        from flowly.plans.manager import get_plan_manager
+
+        plan = get_plan_manager().get_current(session_key) if session_key else None
+        result["plan"] = plan.public_view() if plan else None
+    except Exception:
+        result["plan"] = None
+    return result
+
+
+# ── Plan mode ───────────────────────────────────────────────────────────────
+
+# Coroutine the host (gateway) registers so plan.resume can start a fresh agent
+# turn for a paused/approved plan. Signature: ``async (session_key, plan_id) ->
+# None``. Unset → plan.resume only flips state; the client sends a normal
+# message to continue.
+_plan_resume_cb = None
+
+
+def set_plan_resume_callback(cb) -> None:
+    """Register the host's plan-resume turn starter (gateway points this at a
+    function that injects a synthetic resume turn)."""
+    global _plan_resume_cb
+    _plan_resume_cb = cb
+
+
+def _plan_mgr():
+    from flowly.plans.manager import get_plan_manager
+
+    return get_plan_manager()
+
+
+def plan_get(params: dict) -> dict:
+    """Current plan snapshot for a session — the canonical resume source, called
+    on chat open / reconnect."""
+    session_key = (params.get("sessionKey") or "").strip()
+    if not session_key:
+        return {"plan": None}
+    plan = _plan_mgr().get_current(session_key)
+    return {"plan": plan.public_view() if plan else None}
+
+
+def plan_list(params: dict) -> dict:
+    session_key = (params.get("sessionKey") or "").strip()
+    if not session_key:
+        return {"plans": []}
+    plans = _plan_mgr().list_for_session(session_key)
+    return {"plans": [p.public_view() for p in plans]}
+
+
+async def plan_resolve(params: dict) -> dict:
+    """Approve / reject / revise a pending plan approval.
+
+    Carries ``expectedRevision`` + ``decisionId`` so a two-device race resolves
+    deterministically (first valid decision wins; the loser gets
+    ``revision_conflict`` / ``already_resolved``) and a retried RPC is idempotent.
+    """
+    plan_id = (params.get("planId") or "").strip()
+    decision = (params.get("decision") or "").strip()
+    if not plan_id:
+        raise FeatureRpcError("INVALID", "planId is required")
+    if decision not in ("approve", "reject", "revise"):
+        raise FeatureRpcError("INVALID", "decision must be approve|reject|revise")
+    expected = params.get("expectedRevision")
+    result = await _plan_mgr().resolve_approval(
+        plan_id,
+        decision,
+        feedback=(params.get("feedback") or None),
+        expected_revision=int(expected) if isinstance(expected, int) else None,
+        decision_id=(params.get("decisionId") or None),
+    )
+    return {"resolved": result.ok, "reason": result.reason}
+
+
+async def plan_resume(params: dict) -> dict:
+    """Resume a paused/approved plan — flips it to executing and, if the host
+    wired a resume callback, starts a fresh agent turn seeded with the plan."""
+    plan_id = (params.get("planId") or "").strip()
+    if not plan_id:
+        raise FeatureRpcError("INVALID", "planId is required")
+    plan = await _plan_mgr().resume(plan_id)
+    if plan is None:
+        raise FeatureRpcError("NOT_FOUND", "no resumable plan for that id")
+    if _plan_resume_cb is not None:
+        try:
+            await _plan_resume_cb(plan.sessionKey, plan.id)
+        except Exception as e:
+            from loguru import logger
+
+            logger.warning(f"[plan] resume callback failed: {e}")
+    return {"plan": plan.public_view()}
+
+
+async def plan_cancel(params: dict) -> dict:
+    plan_id = (params.get("planId") or "").strip()
+    if not plan_id:
+        raise FeatureRpcError("INVALID", "planId is required")
+    plan = await _plan_mgr().cancel(plan_id)
+    return {"plan": plan.public_view() if plan else None}
+
+
+def plan_mode_get(params: dict) -> dict:
+    """Standing plan mode for a session — drives the client's mode badge."""
+    session_key = (params.get("sessionKey") or "").strip()
+    return {"sticky": bool(session_key) and _plan_mgr().is_sticky(session_key)}
+
+
+def plan_mode_set(params: dict) -> dict:
+    """Turn the standing plan mode on/off (the Shift+Tab-style mode cycle)."""
+    session_key = (params.get("sessionKey") or "").strip()
+    if not session_key:
+        raise FeatureRpcError("INVALID", "sessionKey is required")
+    sticky = bool(params.get("sticky"))
+    _plan_mgr().set_sticky(session_key, sticky)
+    return {"sticky": sticky}
 
 
 def memory_entries() -> dict:
@@ -3004,6 +3122,13 @@ _DISPATCH: dict[str, tuple] = {
     "push.register":      (push_register, True, False),
     "push.unregister":    (push_unregister, True, False),
     "chat.inflight":      (chat_inflight, True, False),
+    "plan.get":           (plan_get, True, False),
+    "plan.list":          (plan_list, True, False),
+    "plan.resolve":       (plan_resolve, True, False),
+    "plan.resume":        (plan_resume, True, False),
+    "plan.cancel":        (plan_cancel, True, False),
+    "plan.mode.get":      (plan_mode_get, True, False),
+    "plan.mode.set":      (plan_mode_set, True, False),
     "config.get":         (config_get, False, False),
     "config.set":         (config_set, True, True),
     "exec.policy.get":              (exec_policy_get, False, False),

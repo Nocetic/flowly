@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import time
+import uuid
 from typing import Any
 
 from textual import events, on, work
@@ -30,6 +31,8 @@ from flowly.tui.client import (
     ConnectionLost,
     GatewayClient,
     GatewayUnavailable,
+    PlanApprovalRequested,
+    PlanUpdated,
     Reconnected,
     Reconnecting,
     StreamDelta,
@@ -68,6 +71,7 @@ from flowly.tui.panes.composer import (
     InlineSetupField,
     InlineSetupPrompt,
     InlineSetupPromptRequest,
+    PlanApprovalPrompt,
 )
 from flowly.tui.panes.confirm_modal import ConfirmPanel
 from flowly.tui.panes.help_hint import HelpHint
@@ -212,18 +216,27 @@ def _inline_setup_field(field: Field, value: object) -> InlineSetupField:
 # auto-review / granular) — codex.policy.set maps them to codex's own
 # ask_for_approval vocabulary. auto-review → codex "untrusted" (prompt for
 # everything but safe reads); never → run unattended.
-_PERMISSION_LEVELS: tuple[tuple[str, str, tuple[str, str], tuple[str, str]], ...] = (
+_PERMISSION_LEVELS: tuple[tuple[str, str, tuple[str, str] | None, tuple[str, str] | None], ...] = (
     ("ask",  "🔒 Ask",  ("full", "always"),       ("auto-review", "workspace-write")),
     ("auto", "⚖️ Auto", ("allowlist", "on-miss"), ("on-request",  "workspace-write")),
     ("yolo", "🚀 YOLO", ("full", "off"),          ("never",       "full-access")),
+    # Plan mode — a standing mode like the levels above but orthogonal to the
+    # exec policy: every task is planned and approved BEFORE any side effect
+    # runs (the backend gate enforces it). Policies stay untouched (None);
+    # cycling away turns the mode off and applies the next level's policies.
+    ("plan", "▣ Plan", None, None),
 )
 
 
 def _match_permission_level(policy: dict) -> int:
     """Index of the level whose exec (security, ask) matches ``policy``, else -1
-    (so the first cycle lands on the first level)."""
+    (so the first cycle lands on the first level). Policy-less levels (plan
+    mode) never match — they're driven by plan.mode.get instead."""
     sec, ask = policy.get("security"), policy.get("ask")
-    for i, (_key, _label, (s, a), _codex) in enumerate(_PERMISSION_LEVELS):
+    for i, (_key, _label, exec_pair, _codex) in enumerate(_PERMISSION_LEVELS):
+        if exec_pair is None:
+            continue
+        s, a = exec_pair
         if s == sec and a == ask:
             return i
     return -1
@@ -292,6 +305,11 @@ class FlowlyTUI(App[None]):
         self._approval_queue: list[ApprovalRequest] = []
         self._approval_active = False
         self._approval_choice_future: asyncio.Future[str] | None = None
+        # Plan mode: the snapshot awaiting the user's decision for THIS
+        # session (kept so an exec-approval interruption or a dismissed tray
+        # can re-surface it), plus a guard against double-submitting.
+        self._pending_plan_approval: dict | None = None
+        self._plan_resolve_busy = False
         self._inline_secret_future: asyncio.Future[str | None] | None = None
         self._inline_setup_future: asyncio.Future[dict[str, object] | None] | None = None
         self._composer_picker_future: asyncio.Future[Any] | None = None
@@ -744,6 +762,16 @@ class FlowlyTUI(App[None]):
                 pass
 
     async def _preload_history(self) -> None:
+        """Render saved history, then re-attach live state (in-flight turn +
+        plan) — the restores run even when history is empty, because a turn
+        that hasn't settled yet has nothing in history at all."""
+        try:
+            await self._preload_history_inner()
+        finally:
+            await self._restore_inflight()
+            await self._restore_plan_state()
+
+    async def _preload_history_inner(self) -> None:
         # A preload can render an empty session or a history without usage
         # metadata. Clear stale context-window numbers first, then hydrate
         # them again below if the loaded history carries usage.
@@ -965,6 +993,14 @@ class FlowlyTUI(App[None]):
             self._enqueue_approval(ev)
             return
 
+        if isinstance(ev, PlanApprovalRequested):
+            self._on_plan_approval_requested(ev.plan)
+            return
+
+        if isinstance(ev, PlanUpdated):
+            self._on_plan_updated(ev.plan)
+            return
+
         if isinstance(ev, ArtifactEvent):
             artifact_id = str(ev.artifact.get("id") or "")
             composer = self.query_one(Composer)
@@ -1057,6 +1093,11 @@ class FlowlyTUI(App[None]):
             # so a Desktop "save model" round-trip used to require killing
             # and restarting the TUI to see the new label.
             asyncio.create_task(self._resync_config_after_reconnect())
+            # Re-attach live state: a run that kept going while we were
+            # away streams to the socket that last called chat.inflight, so
+            # rebind + repaint the partial, and refresh the plan strip/tray.
+            asyncio.create_task(self._restore_inflight())
+            asyncio.create_task(self._restore_plan_state())
             return
 
         if isinstance(ev, ConnectionLost):
@@ -1090,6 +1131,15 @@ class FlowlyTUI(App[None]):
                 )
         finally:
             self._approval_active = False
+            # A plan approval that arrived while exec approvals were on
+            # screen was deferred — surface it now.
+            if self._pending_plan_approval is not None:
+                try:
+                    self.query_one(Composer).show_plan_approval(
+                        self._pending_plan_approval
+                    )
+                except Exception:
+                    pass
 
     async def _show_inline_approval(self, req: ApprovalRequest) -> str:
         loop = asyncio.get_running_loop()
@@ -1122,6 +1172,178 @@ class FlowlyTUI(App[None]):
         fut = self._approval_choice_future
         if fut is not None and not fut.done():
             fut.set_result(event.decision)
+
+    # --- plan mode ---------------------------------------------------
+
+    def _add_notice(self, text: str) -> None:
+        """Drop a dim notice INTO the conversation flow at the current point.
+
+        If an assistant bubble is still streaming, close it first so the
+        notice lands between what already happened and what comes next —
+        subsequent deltas open a fresh bubble BELOW the notice instead of
+        appending above it (which made notices look pinned to the bottom).
+        Mirrors how tool breaks already split bubbles.
+        """
+        if self._current_bubble is not None:
+            try:
+                self._current_bubble.mark_streaming(False)
+            except Exception:
+                pass
+            self._current_bubble = None
+        self.query_one(TranscriptPane).add_system(text)
+
+    def _on_plan_approval_requested(self, plan: dict) -> None:
+        """A plan revision wants the user's decision — open the plan tray.
+
+        Exec approvals outrank plan approvals (they expire faster); when one
+        is on screen the plan tray is deferred and re-surfaced by the drain
+        loop's tail.
+        """
+        if str(plan.get("sessionKey") or "") != self._session_key:
+            return
+        self._pending_plan_approval = plan
+        composer = self.query_one(Composer)
+        composer.set_plan(plan)
+        if self._approval_active:
+            return  # deferred — re-shown when the exec approval queue drains
+        composer.show_plan_approval(plan)
+
+    def _on_plan_updated(self, plan: dict) -> None:
+        if str(plan.get("sessionKey") or "") != self._session_key:
+            return
+        composer = self.query_one(Composer)
+        status = str(plan.get("status") or "")
+        if status in ("completed", "rejected", "aborted", "blocked"):
+            # Terminal — drop the strip + any pending approval for this plan.
+            composer.set_plan(None)
+            if (self._pending_plan_approval or {}).get("id") == plan.get("id"):
+                self._pending_plan_approval = None
+                composer.clear_plan_approval()
+            note = {
+                "completed": "✓ plan completed",
+                "rejected": "✗ plan rejected",
+                "aborted": "plan cancelled",
+                "blocked": "⚠ plan blocked — the agent needs you",
+            }[status]
+            self._add_notice(note)
+            return
+        composer.set_plan(plan)
+        if status != "awaiting_approval" and (
+            (self._pending_plan_approval or {}).get("id") == plan.get("id")
+        ):
+            # Decided elsewhere (another device / timeout) — close the tray.
+            self._pending_plan_approval = None
+            composer.clear_plan_approval()
+
+    @on(PlanApprovalPrompt.Decision)
+    async def _on_plan_decision(self, event: PlanApprovalPrompt.Decision) -> None:
+        event.stop()
+        plan = self._pending_plan_approval or self.query_one(Composer).plan_approval_plan()
+        if not plan or self._plan_resolve_busy:
+            return
+        self._plan_resolve_busy = True
+        composer = self.query_one(Composer)
+        transcript = self.query_one(TranscriptPane)
+        try:
+            approval = plan.get("approval") or {}
+            result = await self._client.plan_resolve(
+                str(plan.get("id") or ""),
+                event.decision,
+                feedback=event.feedback or None,
+                expected_revision=(
+                    int(approval["revision"])
+                    if isinstance(approval.get("revision"), int)
+                    else None
+                ),
+                decision_id=uuid.uuid4().hex,
+            )
+        except Exception as exc:
+            transcript.add_error(f"plan decision failed: {exc}")
+            return
+        finally:
+            self._plan_resolve_busy = False
+        reason = str(result.get("reason") or "")
+        if not result.get("resolved"):
+            if reason in ("already_resolved", "revision_conflict"):
+                transcript.add_system(
+                    "plan was already decided elsewhere — refreshing"
+                )
+                self._pending_plan_approval = None
+                composer.clear_plan_approval()
+                await self._restore_plan_state()
+            else:
+                transcript.add_error(f"plan decision not applied: {reason}")
+            return
+        self._pending_plan_approval = None
+        composer.clear_plan_approval()
+        note = {
+            "approve": "✓ plan approved — working through the steps",
+            "reject": "✗ plan rejected",
+            "revise": "↻ changes requested — a new revision is coming",
+        }.get(event.decision, event.decision)
+        self._add_notice(note)
+
+    @on(PlanApprovalPrompt.Dismissed)
+    def _on_plan_dismissed(self, event: PlanApprovalPrompt.Dismissed) -> None:
+        event.stop()
+        self.query_one(Composer).clear_plan_approval()
+        if self._pending_plan_approval is not None:
+            self.query_one(TranscriptPane).add_system(
+                "plan approval hidden — type /plan to reopen it"
+            )
+
+    async def _restore_plan_state(self) -> None:
+        """Fetch this session's plan (canonical resume source) and rebuild the
+        strip + a pending approval tray. Silent on any error — never blocks
+        opening a chat."""
+        try:
+            plan = await self._client.plan_get(self._session_key)
+        except Exception:
+            return
+        composer = self.query_one(Composer)
+        if not plan:
+            self._pending_plan_approval = None
+            composer.set_plan(None)
+            composer.clear_plan_approval()
+            return
+        self._on_plan_updated(plan)
+        if str(plan.get("status") or "") == "awaiting_approval" and plan.get("approval"):
+            self._on_plan_approval_requested(plan)
+
+    async def _restore_inflight(self) -> None:
+        """Rebuild a still-streaming turn after re-entering a chat.
+
+        Without this a re-entered session looks EMPTY until the run finishes:
+        the triggering user message isn't persisted to history until the turn
+        settles, and deltas only flow to sockets bound to the session. Calling
+        ``chat.inflight`` both returns the partial (user + assistant text) and
+        rebinds the live stream to THIS socket. Silent on any error.
+        """
+        try:
+            reply = await self._client.chat_inflight(self._session_key)
+        except Exception:
+            return
+        inflight = reply.get("inflight") if isinstance(reply, dict) else None
+        if not isinstance(inflight, dict) or not inflight.get("runId"):
+            return
+        run_id = str(inflight.get("runId") or "")
+        if self._current_bubble is not None and self._current_run == run_id:
+            # Same run already live on screen (reconnect mid-stream) — the
+            # chat.inflight call above rebound the socket; nothing to repaint.
+            return
+        transcript = self.query_one(TranscriptPane)
+        user_text = str(inflight.get("user") or "")
+        if user_text:
+            transcript.add_user(user_text)
+        bubble = transcript.start_assistant()
+        partial = str(inflight.get("text") or "")
+        if partial:
+            bubble.update_text(partial)
+        bubble.mark_streaming(True)
+        self._current_bubble = bubble
+        self._current_run = str(inflight.get("runId") or "")
+        self._set_state("busy")
+        transcript.add_system("⟳ reattached to the run in progress")
 
     # --- inline memory review queue --------------------------------
 
@@ -1648,6 +1870,21 @@ class FlowlyTUI(App[None]):
             new_key = fresh_session_key()
             await self._switch_session(new_key)
             self.query_one(TranscriptPane).add_system(f"new session · {new_key}")
+            return
+        if head == "/plan":
+            # Bare /plan with a decision already pending → reopen the tray
+            # locally (it may have been dismissed with Esc). Anything else is
+            # handled server-side by the agent loop — forward as a message,
+            # then refresh the mode badge (bare /plan and on/off toggle the
+            # standing plan mode).
+            if not rest and self._pending_plan_approval is not None:
+                self.query_one(Composer).show_plan_approval(
+                    self._pending_plan_approval
+                )
+                return
+            await self._send_as_message(cmd)
+            if rest.lower() in ("", "on", "off", "stop", "cancel"):
+                self.set_timer(0.8, lambda: asyncio.create_task(self._sync_permission_badge()))
             return
         if head == "/retry":
             await self._do_retry()
@@ -3411,17 +3648,32 @@ class FlowlyTUI(App[None]):
                 idx = _match_permission_level(await self._client.exec_policy_get())
             except Exception:
                 idx = -1
+        was_plan = (
+            0 <= (self._perm_level_idx if isinstance(getattr(self, "_perm_level_idx", None), int) else -1) < len(_PERMISSION_LEVELS)
+            and _PERMISSION_LEVELS[self._perm_level_idx][0] == "plan"
+        )
         idx = (idx + 1) % len(_PERMISSION_LEVELS)
 
-        key, _label, (security, ask), (approval, sandbox) = _PERMISSION_LEVELS[idx]
+        key, _label, exec_pair, codex_pair = _PERMISSION_LEVELS[idx]
         # Mute the sync poll while we apply, so it can't read a half-written
         # store and clobber the badge mid-cycle.
         self._perm_cycling = True
         try:
-            await self._client.exec_policy_set(security=security, ask=ask)
-            await self._client.codex_policy_set(
-                approval_policy=approval, sandbox=sandbox
-            )
+            if key == "plan":
+                # Plan mode: no policy write — turn the standing plan mode on
+                # for this session. Exec/codex policies stay as they are and
+                # govern execution AFTER a plan is approved.
+                await self._client.plan_mode_set(self._session_key, True)
+            else:
+                if was_plan:
+                    await self._client.plan_mode_set(self._session_key, False)
+                assert exec_pair is not None and codex_pair is not None
+                security, ask = exec_pair
+                approval, sandbox = codex_pair
+                await self._client.exec_policy_set(security=security, ask=ask)
+                await self._client.codex_policy_set(
+                    approval_policy=approval, sandbox=sandbox
+                )
         except Exception as exc:
             self.query_one(TranscriptPane).add_error(f"permission cycle failed: {exc}")
             return
@@ -3445,6 +3697,18 @@ class FlowlyTUI(App[None]):
         so it can't clobber it. A policy matching no preset hides the badge."""
         if getattr(self, "_perm_cycling", False):
             return
+        # Standing plan mode wins the badge — it's the stance the next message
+        # actually gets, regardless of the exec policy underneath.
+        try:
+            if await self._client.plan_mode_get(self._session_key):
+                self._perm_level_idx = next(
+                    (i for i, lv in enumerate(_PERMISSION_LEVELS) if lv[0] == "plan"),
+                    -1,
+                )
+                self._set_permission_badge("plan")
+                return
+        except Exception:
+            pass  # old gateway without plan.mode.* — fall through to policy
         try:
             idx = _match_permission_level(await self._client.exec_policy_get())
         except Exception:

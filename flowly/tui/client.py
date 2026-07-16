@@ -131,6 +131,18 @@ class ArtifactEvent:
     artifact: dict[str, Any]
 
 
+@dataclass
+class PlanUpdated:
+    """Full plan snapshot (revision-guarded) — drives the composer plan panel."""
+    plan: dict[str, Any]
+
+
+@dataclass
+class PlanApprovalRequested:
+    """A plan revision is awaiting the user's decision — opens the plan tray."""
+    plan: dict[str, Any]
+
+
 Event = (
     StreamDelta
     | ChatFinal
@@ -146,6 +158,8 @@ Event = (
     | SubagentCompleted
     | CompactionEvent
     | ArtifactEvent
+    | PlanUpdated
+    | PlanApprovalRequested
     | dict[str, Any]
 )
 
@@ -546,6 +560,57 @@ class GatewayClient:
             {"id": request_id, "requestId": request_id, "decision": decision, "remember": remember},
         )
 
+    # --- plan mode --------------------------------------------------
+
+    async def plan_get(self, session_key: str) -> dict[str, Any] | None:
+        """Current plan snapshot for a session (canonical resume source)."""
+        rid = await self._rpc("plan.get", {"sessionKey": session_key})
+        reply = await self._await_reply(rid, timeout=5.0)
+        plan = reply.get("plan")
+        return plan if isinstance(plan, dict) else None
+
+    async def plan_resolve(
+        self,
+        plan_id: str,
+        decision: str,
+        *,
+        feedback: str | None = None,
+        expected_revision: int | None = None,
+        decision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Approve / reject / revise a pending plan approval."""
+        params: dict[str, Any] = {"planId": plan_id, "decision": decision}
+        if feedback:
+            params["feedback"] = feedback
+        if expected_revision is not None:
+            params["expectedRevision"] = expected_revision
+        if decision_id:
+            params["decisionId"] = decision_id
+        rid = await self._rpc("plan.resolve", params)
+        return await self._await_reply(rid, timeout=10.0)
+
+    async def plan_mode_get(self, session_key: str) -> bool:
+        """Whether the standing plan mode is on for this session."""
+        rid = await self._rpc("plan.mode.get", {"sessionKey": session_key})
+        reply = await self._await_reply(rid, timeout=5.0)
+        return bool(reply.get("sticky"))
+
+    async def plan_mode_set(self, session_key: str, sticky: bool) -> bool:
+        rid = await self._rpc(
+            "plan.mode.set", {"sessionKey": session_key, "sticky": sticky}
+        )
+        reply = await self._await_reply(rid, timeout=5.0)
+        return bool(reply.get("sticky"))
+
+    async def chat_inflight(self, session_key: str) -> dict[str, Any]:
+        """Snapshot of a still-streaming run (+ current plan) for re-entry.
+
+        Calling this also rebinds the session's live stream to THIS socket on
+        the gateway, so subsequent deltas of an in-flight turn arrive here.
+        """
+        rid = await self._rpc("chat.inflight", {"sessionKey": session_key})
+        return await self._await_reply(rid, timeout=5.0)
+
     # --- standing approval policy ----------------------------------
 
     async def exec_policy_get(self) -> dict[str, Any]:
@@ -796,6 +861,14 @@ class GatewayClient:
             await self._inbox.put(
                 ArtifactEvent(action=ev_name.removeprefix("artifact."), artifact=artifact)
             )
+            return
+
+        if ev_name == "plan.updated":
+            await self._inbox.put(PlanUpdated(plan=dict(payload)))
+            return
+
+        if ev_name == "plan.approval.requested":
+            await self._inbox.put(PlanApprovalRequested(plan=dict(payload)))
             return
 
         if ev_name == "compaction":

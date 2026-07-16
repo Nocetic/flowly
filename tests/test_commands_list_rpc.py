@@ -99,7 +99,7 @@ def test_returns_builtin_commands(isolated_home: Path, monkeypatch):
     names = {b["name"] for b in result["builtin"]}
     assert names == {
         "help", "compact", "clear", "new", "retry", "undo",
-        "skills", "learn", "whoami", "status", "codex",
+        "skills", "learn", "whoami", "status", "codex", "plan",
     }
     # Every entry has a non-empty description.
     for entry in result["builtin"]:
@@ -247,7 +247,7 @@ def test_full_payload_with_all_categories(isolated_home: Path, monkeypatch):
     result = replies[0]["result"]
     assert {b["name"] for b in result["builtin"]} == {
         "help", "compact", "clear", "new", "retry", "undo",
-        "skills", "learn", "whoami", "status", "codex",
+        "skills", "learn", "whoami", "status", "codex", "plan",
     }
     assert [p["name"] for p in result["plugin"]] == ["lint"]
     assert [b["name"] for b in result["bundle"]] == ["coding"]

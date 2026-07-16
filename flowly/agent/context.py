@@ -1802,11 +1802,13 @@ and free of filler."""
         # removed — the same tool names + descriptions already ship to
         # the provider via the structured `tools=[...]` API parameter,
         # so the inline list was pure duplication.
-        from flowly.agent.prompt_blocks import build_agency_block
+        from flowly.agent.prompt_blocks import build_agency_block, build_plan_mode_block
 
         return f"""{identity_header}
 
 {build_agency_block()}
+
+{build_plan_mode_block()}
 
 ## exec Tool - Application and System Control
 

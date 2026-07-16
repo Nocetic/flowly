@@ -12,6 +12,7 @@ from dataclasses import field as dc_field
 from pathlib import Path
 
 from rich.markup import escape
+from rich.text import Text
 from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -405,6 +406,17 @@ class _Editor(TextArea):
             event.prevent_default()
             return
 
+        plan_approval_open = composer is not None and composer.has_class(
+            "plan-approval-open"
+        )
+        if plan_approval_open and composer is not None:
+            if composer.route_plan_approval_key(key):
+                composer.focus_plan_approval()
+                event.stop()
+                event.prevent_default()
+                return
+            # Key not handled (e.g. feedback input owns it) — fall through.
+
         if composer is not None and composer.artifact_navigation_active():
             if composer.route_artifact_key(key):
                 event.stop()
@@ -679,6 +691,308 @@ class ApprovalPrompt(Vertical):
         if not parts:
             return "[dim]Review the command before continuing.[/dim]"
         return " · ".join(parts)
+
+
+@dataclass(frozen=True)
+class PlanApprovalOption:
+    decision: str
+    label: str
+    keys: tuple[str, ...]
+
+
+PLAN_APPROVAL_OPTIONS: tuple[PlanApprovalOption, ...] = (
+    PlanApprovalOption("approve", "Approve — start working", ("1", "a")),
+    PlanApprovalOption("revise", "Request changes…", ("2", "r")),
+    PlanApprovalOption("reject", "Reject — don't do this", ("3", "d")),
+)
+
+
+class _PlanOptionRow(Static):
+    """One selectable decision row in the plan approval tray."""
+
+    def __init__(self, index: int, option: PlanApprovalOption) -> None:
+        super().__init__("", classes="plan-approval-option", markup=False)
+        self.index = index
+        self.option = option
+
+    def set_selected(self, selected: bool) -> None:
+        marker = "›" if selected else " "
+        self.update(f"{marker} {self.index + 1}  {self.option.label}")
+        self.set_class(selected, "selected")
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        tray = next(
+            (n for n in self.ancestors if isinstance(n, PlanApprovalPrompt)), None
+        )
+        if tray is not None:
+            tray.choose(self.option.decision)
+
+
+class _PlanFeedbackInput(Input):
+    """Feedback field that lets the tray own Esc (back to the options)."""
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "escape":
+            event.stop()
+            event.prevent_default()
+            tray = next(
+                (n for n in self.ancestors if isinstance(n, PlanApprovalPrompt)), None
+            )
+            if tray is not None:
+                tray.exit_feedback_mode()
+
+
+class PlanApprovalPrompt(Vertical):
+    """Inline plan approval — the agent proposed a plan and is blocked on the
+    user's decision. Approve / request changes (free text) / reject; Esc hides
+    the tray without deciding (the plan stays pending).
+
+    All plan-derived strings render with ``markup=False`` — titles/steps are
+    arbitrary user+agent text and must never be parsed as style markup.
+    """
+
+    can_focus = True
+
+    class Decision(Message):
+        def __init__(self, decision: str, feedback: str = "") -> None:
+            super().__init__()
+            self.decision = decision
+            self.feedback = feedback
+
+    class Dismissed(Message):
+        pass
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._plan: dict | None = None
+        self._selected_idx = 0
+        self._feedback_mode = False
+
+    def compose(self) -> ComposeResult:
+        from textual.containers import Horizontal
+
+        yield Static("Plan approval", id="plan-approval-title", markup=False)
+        yield Static("", id="plan-approval-name", markup=False)
+        yield Static("", id="plan-approval-steps", markup=False)
+        for idx, option in enumerate(PLAN_APPROVAL_OPTIONS):
+            yield _PlanOptionRow(idx, option)
+        with Horizontal(id="plan-approval-feedback-row"):
+            yield Static("›", id="plan-approval-feedback-prefix", markup=False)
+            yield _PlanFeedbackInput(
+                id="plan-approval-feedback",
+                placeholder="What should change?",
+            )
+        yield Static(
+            "↑/↓ choose · Enter select · Esc hide (stays pending)",
+            id="plan-approval-hint",
+            markup=False,
+        )
+
+    def on_mount(self) -> None:
+        self._render_options()
+        self._set_feedback_visible(False)
+
+    # ── state ───────────────────────────────────────────────────────────
+
+    @property
+    def plan(self) -> dict | None:
+        return self._plan
+
+    def set_plan(self, plan: dict) -> None:
+        self._plan = plan
+        self._selected_idx = 0
+        self._feedback_mode = False
+        title = str(plan.get("title") or plan.get("goal") or "(untitled plan)")
+        goal = str(plan.get("goal") or "")
+        name = title if title == goal or not goal else f"{title} — {goal}"
+        self.query_one("#plan-approval-name", Static).update(name[:200])
+        self.query_one("#plan-approval-steps", Static).update(_plan_steps_text(plan, max_rows=8))
+        self._set_feedback_visible(False)
+        self._render_options()
+        self.focus_options()
+
+    def clear_plan(self) -> None:
+        self._plan = None
+        try:
+            self.query_one("#plan-approval-name", Static).update("")
+            self.query_one("#plan-approval-steps", Static).update("")
+            self.query_one("#plan-approval-feedback", Input).value = ""
+            self._selected_idx = 0
+            self._feedback_mode = False
+            self._set_feedback_visible(False)
+            self._render_options()
+        except Exception:
+            pass
+
+    def focus_options(self) -> None:
+        try:
+            self.focus()
+        except Exception:
+            pass
+
+    # ── interaction ─────────────────────────────────────────────────────
+
+    def route_editor_key(self, key: str) -> bool:
+        if self._feedback_mode:
+            # The Input owns the keys while feedback is being typed.
+            return False
+        normalized = key.lower().replace("_", "+")
+        if normalized == "up":
+            self._move_selection(-1)
+            return True
+        if normalized == "down":
+            self._move_selection(1)
+            return True
+        if normalized in ("enter", "return"):
+            self.choose(PLAN_APPROVAL_OPTIONS[self._selected_idx].decision)
+            return True
+        if normalized in ("escape", "ctrl+c"):
+            self.post_message(self.Dismissed())
+            return True
+        for option in PLAN_APPROVAL_OPTIONS:
+            if normalized in option.keys:
+                self.choose(option.decision)
+                return True
+        return False
+
+    def on_key(self, event: events.Key) -> None:
+        if not self.route_editor_key(event.key):
+            return
+        event.stop()
+        event.prevent_default()
+
+    def choose(self, decision: str) -> None:
+        if decision == "revise":
+            self._enter_feedback_mode()
+            return
+        self.post_message(self.Decision(decision))
+
+    def _enter_feedback_mode(self) -> None:
+        self._feedback_mode = True
+        self._set_feedback_visible(True)
+        try:
+            self.query_one("#plan-approval-feedback", Input).focus()
+        except Exception:
+            pass
+
+    def exit_feedback_mode(self) -> None:
+        self._feedback_mode = False
+        self._set_feedback_visible(False)
+        self.focus_options()
+
+    @on(Input.Submitted, "#plan-approval-feedback")
+    def _submit_feedback(self, event: Input.Submitted) -> None:
+        event.stop()
+        value = event.value.strip()
+        if not value:
+            return
+        self.post_message(self.Decision("revise", feedback=value))
+
+    def _move_selection(self, delta: int) -> None:
+        count = len(PLAN_APPROVAL_OPTIONS)
+        self._selected_idx = (self._selected_idx + delta) % count
+        self._render_options()
+
+    def _render_options(self) -> None:
+        for row in self.query(_PlanOptionRow):
+            row.set_selected(row.index == self._selected_idx)
+
+    def _set_feedback_visible(self, visible: bool) -> None:
+        try:
+            self.query_one("#plan-approval-feedback-row").display = visible
+        except Exception:
+            pass
+
+
+def _plan_steps_text(plan: dict, max_rows: int = 6) -> Text:
+    """Compact step list for the tray/panel — a Text object, never markup.
+
+    Markers: ✓ completed · › in_progress · ✗ blocked · ⊘ skipped · space pending.
+    Windows around the first non-finished step so long plans stay scannable.
+    """
+    steps = [s for s in (plan.get("steps") or []) if isinstance(s, dict)]
+    if not steps:
+        return Text("")
+    markers = {
+        "completed": ("✓", "dim"),
+        "in_progress": ("›", "bold"),
+        "blocked": ("✗", "bold red"),
+        "skipped": ("⊘", "dim"),
+        "pending": ("·", ""),
+    }
+    # Window: keep the first unfinished step visible.
+    start = 0
+    for i, s in enumerate(steps):
+        if s.get("status") in ("pending", "in_progress"):
+            start = max(0, min(i - 1, len(steps) - max_rows))
+            break
+    shown = steps[start : start + max_rows]
+    out = Text()
+    if start > 0:
+        out.append(f"  … {start} earlier step(s)\n", style="dim")
+    for s in shown:
+        mark, style = markers.get(str(s.get("status")), ("·", ""))
+        content = str(s.get("content") or "")[:110]
+        line = f"  {mark} {content}"
+        out.append(line + "\n", style=style or None)
+    remaining = len(steps) - (start + len(shown))
+    if remaining > 0:
+        out.append(f"  … +{remaining} more\n", style="dim")
+    out.rstrip()
+    return out
+
+
+class PlanPanel(Static):
+    """Persistent plan progress strip above the input (Claude-Code style).
+
+    One Static updated with a Text snapshot — content is agent/user text so it
+    is rendered with ``markup=False`` and can never crash the compositor.
+    Visibility is driven by the ``has-plan`` class on the panel itself.
+    """
+
+    _STATUS_NOTES = {
+        "awaiting_approval": "waiting for your approval",
+        "paused": "paused — resume from any device",
+        "blocked": "blocked — needs you",
+    }
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("markup", False)
+        super().__init__("", *args, **kwargs)
+        self._revision = -1
+        self._plan_id = ""
+
+    def set_plan(self, plan: dict | None) -> None:
+        if plan is None:
+            self._plan_id = ""
+            self._revision = -1
+            self.update("")
+            self.set_class(False, "has-plan")
+            return
+        # Revision guard — a stale snapshot must never regress the panel.
+        rev = int(plan.get("revision") or 0)
+        if plan.get("id") == self._plan_id and rev <= self._revision:
+            return
+        self._plan_id = str(plan.get("id") or "")
+        self._revision = rev
+        progress = plan.get("progress") or {}
+        total = int(progress.get("total") or 0)
+        done = int(progress.get("completed") or 0) + int(progress.get("skipped") or 0)
+        title = str(plan.get("title") or plan.get("goal") or "plan")[:80]
+        header = Text()
+        header.append("▣ ", style="bold #00a6c8")
+        header.append(title, style="bold")
+        header.append(f"  {done}/{total}", style="dim")
+        note = self._STATUS_NOTES.get(str(plan.get("status") or ""))
+        if note:
+            header.append(f"  · {note}", style="#f2c94c")
+        body = _plan_steps_text(plan, max_rows=6)
+        content = header
+        if body.plain.strip():
+            content = Text.assemble(header, Text("\n"), body)
+        self.update(content)
+        self.set_class(True, "has-plan")
 
 
 class InlineSecretPrompt(Vertical):
@@ -1288,6 +1602,7 @@ class Composer(Vertical):
         color: #001318;
     }
     Composer.approval-open > #composer-input-row,
+    Composer.plan-approval-open > #composer-input-row,
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,
     Composer.review-open > #composer-input-row,
@@ -1295,6 +1610,7 @@ class Composer(Vertical):
     Composer.status-open > #composer-input-row,
     Composer.picker-inline-open > #composer-input-row,
     Composer.approval-open > #composer-hint,
+    Composer.plan-approval-open > #composer-hint,
     Composer.secret-open > #composer-hint,
     Composer.setup-open > #composer-hint,
     Composer.review-open > #composer-hint,
@@ -1398,6 +1714,70 @@ class Composer(Vertical):
     }
     Composer.approval-open > #composer-approval {
         display: block;
+    }
+    Composer > #composer-plan-panel {
+        display: none;
+        height: auto;
+        max-height: 9;
+        padding: 0 2;
+        margin: 0;
+        background: #000000;
+        color: #83b8c2;
+    }
+    Composer > #composer-plan-panel.has-plan {
+        display: block;
+    }
+    Composer > #composer-plan-approval {
+        display: none;
+        height: auto;
+        padding: 1 2;
+        margin: 0;
+    }
+    Composer.plan-approval-open > #composer-plan-approval {
+        display: block;
+    }
+    Composer > #composer-plan-approval > #plan-approval-title {
+        height: 1;
+        text-style: bold;
+        color: #00a6c8;
+    }
+    Composer > #composer-plan-approval > #plan-approval-name {
+        height: auto;
+        max-height: 2;
+        text-style: bold;
+    }
+    Composer > #composer-plan-approval > #plan-approval-steps {
+        height: auto;
+        max-height: 10;
+        color: #83b8c2;
+    }
+    Composer > #composer-plan-approval > .plan-approval-option {
+        height: 1;
+        margin: 0;
+    }
+    Composer > #composer-plan-approval > .plan-approval-option.selected {
+        color: #e6fbff;
+        background: #050505;
+        text-style: bold;
+    }
+    Composer > #composer-plan-approval > #plan-approval-feedback-row {
+        height: 3;
+        margin: 0;
+    }
+    Composer > #composer-plan-approval > #plan-approval-feedback-row > #plan-approval-feedback-prefix {
+        width: 2;
+        height: 1;
+        margin: 1 0 0 0;
+        color: #00a6c8;
+    }
+    Composer > #composer-plan-approval > #plan-approval-feedback-row > #plan-approval-feedback {
+        width: 1fr;
+        background: #050505;
+        border: none;
+    }
+    Composer > #composer-plan-approval > #plan-approval-hint {
+        height: 1;
+        color: #83b8c2;
     }
     Composer > #composer-approval > #approval-title {
         height: 1;
@@ -1650,7 +2030,9 @@ class Composer(Vertical):
         yield StatusBar(id="status")
         yield _Rule(classes="composer-rule", id="composer-rule-top")
         yield Static("", id="composer-attachments", markup=False)
+        yield PlanPanel(id="composer-plan-panel")
         yield ApprovalPrompt(id="composer-approval")
+        yield PlanApprovalPrompt(id="composer-plan-approval")
         yield InlineSecretPrompt(id="composer-secret")
         yield InlineSetupPrompt(id="composer-setup")
         yield MemoryReviewPanel(id="composer-review")
@@ -1936,6 +2318,7 @@ class Composer(Vertical):
     def show_approval(self, request: ApprovalPromptRequest) -> None:
         self.cancel_artifact_navigation()
         self.remove_class("palette-open")
+        self.remove_class("plan-approval-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("usage-open")
@@ -1966,10 +2349,62 @@ class Composer(Vertical):
             return False
         return prompt.route_editor_key(key)
 
+    # --- plan mode ------------------------------------------------------
+
+    def show_plan_approval(self, plan: dict) -> None:
+        self.cancel_artifact_navigation()
+        self.remove_class("palette-open")
+        self.remove_class("approval-open")
+        self.remove_class("plan-approval-open")
+        self.remove_class("secret-open")
+        self.remove_class("setup-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
+        self.add_class("plan-approval-open")
+        tray = self.query_one("#composer-plan-approval", PlanApprovalPrompt)
+        tray.set_plan(plan)
+
+    def clear_plan_approval(self) -> None:
+        try:
+            self.query_one("#composer-plan-approval", PlanApprovalPrompt).clear_plan()
+        except Exception:
+            pass
+        self.remove_class("plan-approval-open")
+        self.focus_input_safely()
+
+    def focus_plan_approval(self) -> None:
+        try:
+            self.query_one("#composer-plan-approval", PlanApprovalPrompt).focus_options()
+        except Exception:
+            pass
+
+    def route_plan_approval_key(self, key: str) -> bool:
+        try:
+            tray = self.query_one("#composer-plan-approval", PlanApprovalPrompt)
+        except Exception:
+            return False
+        return tray.route_editor_key(key)
+
+    def plan_approval_plan(self) -> dict | None:
+        """The plan currently shown in the approval tray, if any."""
+        try:
+            return self.query_one("#composer-plan-approval", PlanApprovalPrompt).plan
+        except Exception:
+            return None
+
+    def set_plan(self, plan: dict | None) -> None:
+        """Update (or hide, with ``None``) the persistent plan strip."""
+        try:
+            self.query_one("#composer-plan-panel", PlanPanel).set_plan(plan)
+        except Exception:
+            pass
+
     def show_memory_review(self, item: dict, idx: int, total: int) -> None:
         self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
+        self.remove_class("plan-approval-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("usage-open")
@@ -1991,6 +2426,7 @@ class Composer(Vertical):
         self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
+        self.remove_class("plan-approval-open")
         self.remove_class("setup-open")
         self.remove_class("usage-open")
         self.remove_class("status-open")
@@ -2017,6 +2453,7 @@ class Composer(Vertical):
         self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
+        self.remove_class("plan-approval-open")
         self.remove_class("secret-open")
         self.remove_class("usage-open")
         self.remove_class("status-open")
@@ -2037,6 +2474,7 @@ class Composer(Vertical):
         self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("approval-open")
+        self.remove_class("plan-approval-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("review-open")
@@ -2056,6 +2494,7 @@ class Composer(Vertical):
     def show_status(self, **data: object) -> None:
         self.remove_class("palette-open")
         self.remove_class("approval-open")
+        self.remove_class("plan-approval-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("review-open")
@@ -2075,6 +2514,7 @@ class Composer(Vertical):
     async def show_picker(self, picker: Widget, *, inline: bool = False) -> None:
         self.remove_class("palette-open")
         self.remove_class("approval-open")
+        self.remove_class("plan-approval-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("review-open")

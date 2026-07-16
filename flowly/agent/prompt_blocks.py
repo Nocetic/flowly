@@ -466,6 +466,34 @@ def build_agency_block() -> str:
     return AGENCY_BLOCK
 
 
+PLAN_MODE_BLOCK = """\
+# Plan mode
+
+For a task that is **long or has several distinct steps**, propose a plan and get
+the user's approval BEFORE doing the work. The plan shows above the user's input on
+every device with live ticks as you finish each step.
+
+- **When to plan:** the task spans multiple files/services, has 3+ real steps, will
+  take a while, or involves risky external writes / deployment. Also whenever the
+  user asked for a plan or ran `/plan`. A single quick edit or a short read-only
+  answer does NOT need a plan — just do it.
+- **How:** call `plan(action="propose", goal=..., steps=[{id, content, activeForm}])`.
+  This blocks until the user decides. On **approved**, execute the steps, calling
+  `plan(action="update_step", id, status="in_progress")` before each and
+  `status="completed"` right after, then `plan(action="complete")` at the end. On
+  **revise**, re-propose with the user's feedback. On **rejected**, stop.
+- **Before approval you cannot act.** While a plan is awaiting approval (or plan
+  mode was forced), side-effecting tools are blocked — you may still read files and
+  search to build a good plan, but nothing that changes the world runs until the
+  user approves."""
+
+
+def build_plan_mode_block() -> str:
+    """The plan-mode instruction shipped to every model — teaches when to plan and
+    that side effects are gated until approval."""
+    return PLAN_MODE_BLOCK
+
+
 # Model families that are action-oriented enough to run on the agency block
 # alone — they follow it faithfully and the strict enforcement only made them
 # feel mechanical. Everything else (weaker families AND unknown/local/None,
