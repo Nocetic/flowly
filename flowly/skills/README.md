@@ -65,6 +65,7 @@ Each skill is a directory containing a `SKILL.md` file with:
 | `github-repo-management` | Clone/create/fork repos; manage remotes, releases, and settings |
 | `macos-computer-use` | Drive macOS desktop apps through Flowly's `computer` tool |
 | `dogfood` | Systematic browser-based exploratory QA for web apps |
+| `vibe-code-detector` | Passively fingerprint whether a public site was built with an AI builder (Lovable/v0/Bolt/Replit) + the AI-builder stack — tiered verdict, evidence, confidence |
 | `adversarial-ux-test` | Test products as hostile or tech-resistant user personas |
 | `blogwatcher` | Monitor blogs and RSS/Atom feeds with `blogwatcher-cli` |
 | `watchers` | Poll RSS, GitHub, and JSON endpoints with watermark deduplication |

@@ -1,0 +1,248 @@
+{
+  "_comment": "Signature library for the vibe-code-detector skill. Update this file to add/adjust fingerprints without touching detect.py. 'where' is one of: host, header, script_src, html, js, any. Patterns are Python regex, matched case-insensitively. Seeded from public prior art (VibeCheck weighting, Wappalyzer, coderbuds/ai-detector, vibeappscanner) plus adversarially-ranked design tells. Signals are heuristic, not proof.",
+  "_version": "1",
+
+  "tierA_platforms": [
+    {
+      "id": "lovable",
+      "label": "Lovable",
+      "aliases": ["GPT Engineer"],
+      "signals": [
+        {"where": "any", "pattern": "cdn\\.gpteng\\.co|gptengineer\\.js", "note": "Lovable/GPT Engineer runtime script (core, breaks app if stripped)"},
+        {"where": "host", "pattern": "\\.lovable\\.(app|dev)$", "note": "Lovable default deploy subdomain"},
+        {"where": "any", "pattern": "gptengineer\\.app", "note": "Lovable legacy brand domain (GPT Engineer)"},
+        {"where": "html", "pattern": "data-lov(?:able|-id)", "note": "Lovable build-time DOM attribute (data-lov-id / data-lovable)"},
+        {"where": "any", "pattern": "lovable-uploads", "note": "Lovable asset CDN path (lovable-uploads.s3.amazonaws.com)"}
+      ]
+    },
+    {
+      "id": "bolt",
+      "label": "Bolt.new (StackBlitz)",
+      "signals": [
+        {"where": "any", "pattern": "bolt\\.new", "note": "Bolt.new reference"},
+        {"where": "any", "pattern": "webcontainer(?:-api)?\\.io|w-corp\\.staticblitz\\.com|stackblitz", "note": "StackBlitz WebContainer runtime (Bolt's in-browser stack)"}
+      ]
+    },
+    {
+      "id": "v0",
+      "label": "v0 (Vercel)",
+      "signals": [
+        {"where": "any", "pattern": "v0\\.dev|v0-[a-z0-9]+\\.vercel\\.app", "note": "v0.dev reference / default v0 preview host"},
+        {"where": "html", "pattern": "data-v0-t=", "note": "v0 component data attribute"}
+      ]
+    },
+    {
+      "id": "replit",
+      "label": "Replit",
+      "signals": [
+        {"where": "host", "pattern": "\\.repl(?:it)?\\.(dev|co|app)$|\\.replit\\.dev$", "note": "Replit deploy host"},
+        {"where": "any", "pattern": "replit\\.com|id\\.replit\\.com|replit-bridge|__replco", "note": "Replit runtime / bridge reference"}
+      ]
+    },
+    {
+      "id": "windsurf",
+      "label": "Windsurf",
+      "signals": [
+        {"where": "any", "pattern": "windsurf\\.(?:com|dev)|codeium.*cascade", "note": "Windsurf / Cascade reference"}
+      ]
+    },
+    {
+      "id": "base44",
+      "label": "Base44",
+      "signals": [
+        {"where": "any", "pattern": "base44\\.(?:com|app)", "note": "Base44 builder reference"}
+      ]
+    },
+    {
+      "id": "framer",
+      "label": "Framer (AI)",
+      "signals": [
+        {"where": "any", "pattern": "framerusercontent\\.com|events\\.framer\\.com", "note": "Framer asset/runtime host (Framer AI ships on the same infra)"},
+        {"where": "html", "pattern": "<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']Framer", "note": "Framer generator meta tag"}
+      ]
+    }
+  ],
+
+  "tierB_stack": [
+    {
+      "id": "shadcn",
+      "label": "shadcn/ui + Radix (AI builders' default component kit)",
+      "signals": [
+        {"where": "html", "pattern": "data-radix-", "note": "Radix UI primitives (shadcn/ui foundation)"},
+        {"where": "any", "pattern": "--radius:\\s|--primary:\\s|--muted-foreground:\\s", "note": "shadcn/ui default CSS variables"},
+        {"where": "any", "pattern": "class=[\"'][^\"']*\\b(?:bg-background|text-foreground|text-muted-foreground)\\b", "note": "shadcn/ui default utility classes"}
+      ]
+    },
+    {
+      "id": "tailwind",
+      "label": "Tailwind CSS (high utility-class density)",
+      "signals": [
+        {"where": "html", "pattern": "class=[\"'][^\"']*\\b(?:flex|grid)\\b[^\"']*\\b(?:items-center|justify-center)\\b[^\"']*\\b(?:gap-|px-|py-)", "note": "Dense Tailwind utility-class stacks"},
+        {"where": "any", "pattern": "cdn\\.tailwindcss\\.com|tailwindcss", "note": "Tailwind reference"}
+      ]
+    },
+    {
+      "id": "lucide",
+      "label": "Lucide icons (default icon set of AI builders)",
+      "signals": [
+        {"where": "any", "pattern": "lucide-react|lucide[_-]|data-lucide", "note": "Lucide icon library"}
+      ]
+    },
+    {
+      "id": "font-tell",
+      "label": "Uncustomized default font stack (Inter / Geist)",
+      "signals": [
+        {"where": "any", "pattern": "fonts\\.googleapis\\.com/css2?\\?family=Inter|font-family:[^;}]*Inter\\b|--font-geist|Geist[\\s_-]?(?:Sans|Mono)|Space\\+?Grotesk", "note": "Inter/Geist/Space Grotesk — the ubiquitous AI-generated default typefaces"}
+      ]
+    },
+    {
+      "id": "supabase",
+      "label": "Supabase backend (default DB of Lovable/Bolt vibe apps)",
+      "signals": [
+        {"where": "any", "pattern": "[a-z0-9]{16,}\\.supabase\\.co", "note": "Supabase project endpoint"},
+        {"where": "any", "pattern": "/rest/v1/|supabase\\.co/auth/v1", "note": "Supabase REST/Auth API calls from the client"},
+        {"where": "any", "pattern": "@supabase/supabase-js|createClient\\(\\s*[\"'`]?https?://[a-z0-9]+\\.supabase", "note": "supabase-js client instantiation"}
+      ]
+    },
+    {
+      "id": "firebase",
+      "label": "Firebase backend",
+      "signals": [
+        {"where": "any", "pattern": "firebaseio\\.com|firebaseapp\\.com|firebasestorage\\.googleapis\\.com", "note": "Firebase host"},
+        {"where": "any", "pattern": "authDomain:\\s*[\"'][^\"']+\\.firebaseapp\\.com", "note": "Firebase client config object"}
+      ]
+    },
+    {
+      "id": "vercel-host",
+      "label": "Vercel deployment",
+      "signals": [
+        {"where": "header", "header": "x-vercel-id", "note": "Vercel edge response header"},
+        {"where": "header", "header": "server", "pattern": "Vercel", "note": "Vercel server header"},
+        {"where": "html", "pattern": "vc-domain-verify", "note": "Vercel domain-verification token in markup"}
+      ]
+    },
+    {
+      "id": "netlify-host",
+      "label": "Netlify deployment",
+      "signals": [
+        {"where": "header", "header": "server", "pattern": "Netlify", "note": "Netlify server header"},
+        {"where": "header", "header": "x-nf-request-id", "note": "Netlify request-id header"}
+      ]
+    },
+    {
+      "id": "generator-meta",
+      "label": "AI/builder generator meta tag",
+      "signals": [
+        {"where": "html", "pattern": "<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"'][^\"']*(?:lovable|bolt|v0|replit|builder|gpt)", "note": "Generator meta tag naming an AI builder"}
+      ]
+    }
+  ],
+
+  "tierC_aesthetic": [
+    {
+      "id": "ai-purple",
+      "label": "'AI purple' indigo→purple gradient (strongest visual tell)",
+      "weight": 2,
+      "signals": [
+        {"where": "any", "pattern": "from-(?:indigo|violet|purple)-[456]00\\s+to-(?:purple|violet|fuchsia|pink)-[567]00|bg-gradient-to-[a-z]+\\s+from-(?:indigo|purple|violet)", "note": "Tailwind indigo/violet→purple gradient"},
+        {"where": "any", "pattern": "linear-gradient\\([^)]*#(?:6366f1|7c3aed|8b5cf6|a855f7)", "note": "Indigo/purple hex gradient (Tailwind indigo-500/violet defaults)"}
+      ]
+    },
+    {
+      "id": "default-palette",
+      "label": "Uncustomized default Tailwind accent (indigo-500 / purple-600)",
+      "weight": 1,
+      "signals": [
+        {"where": "any", "pattern": "\\b(?:bg|text|border)-(?:indigo-500|purple-600|violet-500)\\b", "note": "Default Tailwind demo colors, unchanged"}
+      ]
+    },
+    {
+      "id": "soft-card",
+      "label": "Tailwind-tutorial card styling (rounded + subtle low-opacity shadow)",
+      "weight": 1,
+      "signals": [
+        {"where": "any", "pattern": "shadow-sm[^\"']*rounded|rounded-(?:lg|xl|2xl)[^\"']*shadow|box-shadow:[^;}]*rgba\\([^)]*0?\\.1\\)", "note": "Rounded cards with ~0.1-opacity shadow"}
+      ]
+    },
+    {
+      "id": "uniform-spacing",
+      "label": "Uniform, unvaried Tailwind spacing (p-4 / gap-6 everywhere)",
+      "weight": 1,
+      "signals": [
+        {"where": "html", "pattern": "(?:\\bp-4\\b[^<]{0,400}){4,}|(?:\\bgap-6\\b[^<]{0,400}){4,}", "note": "Same spacing utility repeated across many elements"}
+      ]
+    },
+    {
+      "id": "emoji-features",
+      "label": "Emoji-led feature list / sparkle-rocket headings",
+      "weight": 1,
+      "signals": [
+        {"where": "html", "pattern": "(?:✨|🚀|⚡|🎉|🔥)\\s*<|>\\s*(?:✨|🚀|⚡)", "note": "Sparkle/rocket/lightning emoji as feature bullets or heading accents"}
+      ]
+    },
+    {
+      "id": "generic-copy",
+      "label": "Weightless generic hero copy",
+      "weight": 1,
+      "signals": [
+        {"where": "html", "pattern": "\\b(?:Build faster[.,]?\\s*Ship (?:smarter|faster)|Elevate your (?:workflow|business)|Supercharge your|Unlock the power of|Transform the way you)\\b", "note": "Boilerplate AI landing-page copy"}
+      ]
+    }
+  ],
+
+  "security_passive": [
+    {
+      "id": "supabase-service-role",
+      "label": "Supabase service_role key reference in client bundle",
+      "severity": "critical",
+      "signals": [
+        {"where": "js", "pattern": "service_role", "note": "service_role bypasses all Row-Level Security; must NEVER reach the client (anon key is normal, service_role is not)"}
+      ]
+    },
+    {
+      "id": "supabase-jwt",
+      "label": "Supabase JWT (anon or otherwise) embedded in client",
+      "severity": "info",
+      "secret": true,
+      "signals": [
+        {"where": "any", "pattern": "eyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}", "note": "JWT in client (anon key is expected for Supabase; note it, then check whether tables lack RLS)"}
+      ]
+    },
+    {
+      "id": "openai-key",
+      "label": "OpenAI-style secret key in client",
+      "severity": "critical",
+      "secret": true,
+      "signals": [
+        {"where": "any", "pattern": "sk-(?:proj-)?[A-Za-z0-9_-]{20,}", "note": "OpenAI/Anthropic-style secret key hardcoded in shipped JS"}
+      ]
+    },
+    {
+      "id": "aws-key",
+      "label": "AWS access key id in client",
+      "severity": "critical",
+      "secret": true,
+      "signals": [
+        {"where": "any", "pattern": "AKIA[0-9A-Z]{16}", "note": "AWS access key id in shipped JS"}
+      ]
+    },
+    {
+      "id": "google-key",
+      "label": "Google/Firebase API key in client",
+      "severity": "info",
+      "secret": true,
+      "signals": [
+        {"where": "any", "pattern": "AIza[0-9A-Za-z_-]{35}", "note": "Google API key (often expected for Firebase/Maps, but scope it)"}
+      ]
+    },
+    {
+      "id": "stripe-secret",
+      "label": "Stripe SECRET key in client",
+      "severity": "critical",
+      "secret": true,
+      "signals": [
+        {"where": "any", "pattern": "sk_live_[0-9A-Za-z]{20,}|rk_live_[0-9A-Za-z]{20,}", "note": "Stripe secret/restricted key in shipped JS (publishable pk_ keys are fine)"}
+      ]
+    }
+  ]
+}
