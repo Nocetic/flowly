@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from flowly import __version__ as _flowly_version
 from flowly.account import audit_log
 from flowly.account.auth import FLOWLY_API_BASE
 from flowly.account.fingerprint import machine_id, machine_name
@@ -82,6 +83,10 @@ async def register_machine(id_token: str) -> RegisteredServer:
         "platform": plat,
         # This registration always comes from the Flowly bot itself.
         "botType": "flowly",
+        # Client version, so the admin console can show a version distribution
+        # across installs and spot machines running stale releases. Falls back
+        # to the importlib default ("0.0.0-dev") when metadata is unavailable.
+        "appVersion": _flowly_version,
     }
     # Capture the reachable IP for headless/server installs only. Desktop apps
     # (macOS / Windows) are personal machines — we deliberately do NOT record
