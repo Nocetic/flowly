@@ -16,7 +16,7 @@ PICKER_EDGE_MARGIN = 6
 
 
 def picker_width_for_columns(columns: int) -> int:
-    """Clamp floating picker width like Hermes, without overflowing tiny panes."""
+    """Clamp floating picker width, without overflowing tiny panes."""
     available = max(1, int(columns) - PICKER_EDGE_MARGIN)
     if available < MIN_PICKER_WIDTH:
         return available
