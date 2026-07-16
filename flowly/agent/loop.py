@@ -14,7 +14,12 @@ from loguru import logger
 
 from flowly.bus.events import InboundMessage, OutboundMessage
 from flowly.bus.queue import MessageBus
-from flowly.providers.base import LLMProvider
+from flowly.providers.base import LLMProvider, LLMResponse
+from flowly.agent.error_classifier import (
+    backoff_for,
+    classify_response,
+    present_provider_error,
+)
 from flowly.agent.context import ContextBuilder
 from flowly.agent.tools.registry import ToolRegistry
 from flowly.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, MemoryAppendTool
@@ -145,6 +150,46 @@ def _maybe_extract_image_for_vision(raw_result: str, tool_name: str) -> str | No
     if not isinstance(url, str) or not url.startswith("data:image/"):
         return None
     return url
+
+
+def _browser_tool_result_failed(effective_tool_name: str, tool_result: str) -> bool:
+    """True when a browser_tab result is actually an error envelope.
+
+    The browser tool returns errors as ``{"error": ..., "error_code": ...}``
+    JSON that does NOT start with "Error", so the loop's generic
+    ``not result.startswith("Error")`` success check would mark a failed page
+    action (UNSUPPORTED_ACTION, TYPE_NOT_PERSISTED, blocked URL, element not
+    found, …) as a SUCCESS — inflating turn_success_count and letting a weak
+    model believe it completed a step it never did. Scoped to browser_tab so no
+    other tool's result shape is touched. A dict carrying ``success: true`` is
+    always treated as success even if it also has an ``error`` sub-field.
+    """
+    if effective_tool_name != "browser_tab":
+        return False
+    if not isinstance(tool_result, str) or not tool_result.startswith("{"):
+        return False
+    try:
+        parsed = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(parsed, dict) or parsed.get("success") is True:
+        return False
+    return bool(parsed.get("error") or parsed.get("error_code"))
+
+
+def _messages_contain_image_input(messages: list[dict[str, Any]]) -> bool:
+    """Detect OpenAI-compatible image blocks without inspecting image data."""
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type") or "").lower()
+            if block_type in {"image", "image_url", "input_image"}:
+                return True
+    return False
 
 
 # ── Leaked tool-call markup ───────────────────────────────────────────────
@@ -3370,6 +3415,7 @@ class AgentLoop:
         outbound_run_id: str = "",
         on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         reply_media: list[str] | None = None,
+        error_out: dict[str, Any] | None = None,
     ) -> tuple[str, list[dict[str, Any]], list[str], dict[str, Any], list[dict[str, Any]]]:
         """
         Run iterative LLM + tool execution loop until final response.
@@ -3617,9 +3663,6 @@ class AgentLoop:
                 f"blocked_tools={sorted(set(blocked_tools))}, "
                 f"iteration={iteration}/{max_turn_iterations}"
             )
-            self._api_call_count += 1
-            self._touch_activity(f"starting LLM call #{self._api_call_count} (iter {iteration})")
-
             # Stopwatch for audit log — measures the full retry chain
             # (primary + any streaming/required fallbacks) as one
             # iteration. Per-attempt timing is not worth the extra
@@ -3651,6 +3694,27 @@ class AgentLoop:
                     f"Interrupted: {self._interrupt_reason or 'inactivity timeout'}"
                 )
 
+            # Capability preflight is cache-only and tri-state. We block only
+            # on an explicit `False`; unknown catalog metadata always falls
+            # through to the provider. This prevents a guaranteed 400/404 and
+            # avoids uploading image bytes to a model route that declares it
+            # cannot consume them.
+            preflight_response: LLMResponse | None = None
+            if _messages_contain_image_input(messages):
+                from flowly.integrations.model_catalog import get_vision_support
+                if get_vision_support(selected_model) is False:
+                    logger.info(
+                        "Image-input preflight rejected request: "
+                        f"model={selected_model}, iteration={iteration}"
+                    )
+                    preflight_response = LLMResponse(
+                        content=(
+                            "Error calling LLM: selected model explicitly does not "
+                            "support image input"
+                        ),
+                        finish_reason="error",
+                    )
+
             # Use streaming whenever a stream_callback is provided. We previously
             # suppressed streaming on action turns (tool_choice="required") on
             # the assumption that tool-call chunks produce no user-visible
@@ -3665,8 +3729,12 @@ class AgentLoop:
             # streaming here doesn't break tool execution. The non-streaming
             # fallback below (line ~1257) still kicks in if the streamed
             # required-tool turn errors.
-            use_stream = stream_callback is not None
-            if use_stream:
+            use_stream = stream_callback is not None and preflight_response is None
+            if preflight_response is not None:
+                response = preflight_response
+            elif use_stream:
+                self._api_call_count += 1
+                self._touch_activity(f"starting LLM call #{self._api_call_count} (iter {iteration})")
                 response = await self._chat_with_stream(
                     messages=messages,
                     tools=tool_defs,
@@ -3677,6 +3745,8 @@ class AgentLoop:
                     run_id=outbound_run_id,
                 )
             else:
+                self._api_call_count += 1
+                self._touch_activity(f"starting LLM call #{self._api_call_count} (iter {iteration})")
                 response = await self.provider.chat(
                     messages=messages,
                     tools=tool_defs,
@@ -3708,7 +3778,12 @@ class AgentLoop:
                 break
 
             # If streaming failed, fall back to blocking chat()
-            if use_stream and response.content and response.content.startswith("Error calling LLM:"):
+            if (
+                use_stream
+                and response.content
+                and response.content.startswith("Error calling LLM:")
+                and backoff_for(classify_response(response), 1) is not None
+            ):
                 logger.warning("Streaming failed, falling back to blocking chat()")
                 response = await self.provider.chat(
                     messages=messages,
@@ -3718,7 +3793,15 @@ class AgentLoop:
                     tool_choice=tool_choice,
                 )
 
-            if response.content and response.content.startswith("Error") and tool_choice == "required":
+            if (
+                response.content
+                and response.content.startswith("Error")
+                and tool_choice == "required"
+                and (
+                    not response.content.startswith("Error calling LLM:")
+                    or backoff_for(classify_response(response), 1) is not None
+                )
+            ):
                 logger.warning(f"tool_choice=required failed, retrying with auto: {response.content[:120]}")
                 response = await self.provider.chat(
                     messages=messages,
@@ -3798,21 +3881,23 @@ class AgentLoop:
                         "Tool schema was rejected by the model provider. "
                         "No action was taken."
                     )
+                    if error_out is not None:
+                        error_out.update({
+                            "code": "MODEL_TOOL_SCHEMA_REJECTED",
+                            "title": "This model rejected an agent tool",
+                            "message": (
+                                "Choose another model or provider, then try again. "
+                                "No action was taken."
+                            ),
+                            "retryable": False,
+                            "category": "tool_schema_rejected",
+                        })
                 else:
                     logger.error(f"LLM call failed after fallback: {response.content}")
-                    # Surface the provider's ACTUAL error (the part after the
-                    # "Error calling LLM:" prefix) instead of an opaque
-                    # "no valid response" — so a wrong-model / unsupported-input
-                    # failure (e.g. "this model does not support image input")
-                    # is diagnosable. Trimmed to stay readable in a chat bubble.
-                    _detail = response.content.split("Error calling LLM:", 1)[-1].strip()
-                    if len(_detail) > 400:
-                        _detail = _detail[:400].rstrip() + "…"
-                    final_content = (
-                        f"The model provider returned an error:\n\n{_detail}"
-                        if _detail
-                        else "Could not get a valid response from the model provider. No action was taken."
-                    )
+                    presentation = present_provider_error(response)
+                    final_content = f"{presentation.title}\n\n{presentation.message}"
+                    if error_out is not None:
+                        error_out.update(presentation.as_dict())
                 break
 
             logger.info(
@@ -4119,6 +4204,13 @@ class AgentLoop:
                                     reply_media.append(_p)
                             _tool_result = _attach_summary
                         _tool_success = not _tool_result.startswith("Error")
+                        # Browser errors ride inside an {"error": ...} JSON
+                        # envelope that doesn't start with "Error"; catch it so a
+                        # failed page action isn't counted as a completed step.
+                        if _tool_success and _browser_tool_result_failed(
+                            _effective_tool_name, _tool_result
+                        ):
+                            _tool_success = False
                         accumulated_tool_results.append({
                             "tool": tool_call.name,
                             "success": _tool_success,
@@ -5380,6 +5472,7 @@ class AgentLoop:
         # Files a tool produces for this reply (image_generate, screenshot) land
         # here and ride the OutboundMessage below — no separate ``message`` send.
         reply_media: list[str] = []
+        provider_error: dict[str, Any] = {}
         final_content, tool_results, _executed_tools, usage, loop_messages = await self._run_llm_tool_loop(
             messages=messages,
             action_turn=action_turn,
@@ -5394,6 +5487,7 @@ class AgentLoop:
             outbound_run_id=msg.metadata.get("run_id") or "",
             on_iteration=on_iteration,
             reply_media=reply_media,
+            error_out=provider_error,
         )
 
         if action_turn:
@@ -5512,6 +5606,10 @@ class AgentLoop:
                 # the UI so the context-window indicator can look up
                 # the right model's context_length.
                 "model": model_override or self.model,
+                # Stable first-party error contract. The gateway maps this to
+                # a native state:"error" event; remote channel adapters still
+                # receive the same user-safe text in ``content``.
+                "error": provider_error or None,
                 # Structured tool-turn payload for the relay's
                 # tool_turns/ subcollection. Always set (may be empty);
                 # the channel layer drops the field from the WS payload

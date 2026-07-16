@@ -6,10 +6,11 @@ metadata: {"flowly":{"always":true,"requires_tools":["browser_tab"],"category":"
 
 # Flowly Browser Playbook
 
-You are operating the user's real Chrome browser through the Flowly Chrome
-extension's `browser_tab` tool. Every action runs in a tab the user has
-already added to the Flowly tab group — they can see what you do in real
-time, the cyan glow on the page edge tells them you're acting.
+You are operating the user's visible browser through `browser_tab`. The active
+provider may be Flowly Desktop's embedded browser or the Flowly Chrome
+extension. The user can see what you do in real time. Chrome-provider tabs are
+the ones the user added to the Flowly tab group; its cyan page-edge glow shows
+when the agent is acting.
 
 ## ⚠️ ALWAYS PLAN FIRST — `browser_plan(action="create", ...)`
 

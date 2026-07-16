@@ -37,6 +37,9 @@ class Model:
     pricing_in: float | None = None      # USD per 1M input tokens, if reported
     pricing_out: float | None = None     # USD per 1M output tokens
     tags: list[str] = dc_field(default_factory=list)
+    # Tri-state capability: True/False only when the upstream catalog states
+    # it explicitly; None means unknown and must never be used to block a call.
+    supports_vision: bool | None = None
 
 
 _TIMEOUT = httpx.Timeout(8.0, connect=3.0)
@@ -127,6 +130,30 @@ def get_pricing(model_id: str) -> tuple[float | None, float | None] | None:
     return None
 
 
+def get_vision_support(model_id: str) -> bool | None:
+    """Return cached image-input support without touching the network.
+
+    A model can appear in more than one cached provider catalog. An explicit
+    ``True`` wins; otherwise ``False`` is returned only when at least one exact
+    match explicitly reports no image support. Unknown/missing metadata stays
+    ``None`` so stale or incomplete catalogs never reject a valid request.
+    """
+    if not model_id:
+        return None
+    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
+    candidates.discard("")
+    found_false = False
+    for models in _CACHE.values():
+        for model in models:
+            if model.id not in candidates:
+                continue
+            if model.supports_vision is True:
+                return True
+            if model.supports_vision is False:
+                found_false = True
+    return False if found_false else None
+
+
 # ── id normalization ──────────────────────────────────────────────
 
 
@@ -202,6 +229,7 @@ async def _fetch_openrouter() -> list[Model]:
             item.get("context_length")
             or (item.get("top_provider") or {}).get("context_length")
         )
+        vision = _vision_capability(item)
         out.append(Model(
             id=mid,
             name=item.get("name") or mid,
@@ -210,6 +238,7 @@ async def _fetch_openrouter() -> list[Model]:
             pricing_in=_per_million(pricing.get("prompt")),
             pricing_out=_per_million(pricing.get("completion")),
             tags=_openrouter_tags(item, pricing),
+            supports_vision=vision,
         ))
     # Sort: free first, then alphabetical
     out.sort(key=lambda m: (0 if "free" in m.tags else 1, m.id.lower()))
@@ -271,7 +300,7 @@ async def _fetch_flowly_hosted() -> list[Model]:
             item.get("context_length")
             or (item.get("top_provider") or {}).get("context_length")
         )
-        tags: list[str] = []
+        tags = _openrouter_tags(item, pricing)
         # Plan-aware: the proxy marks each entry ``allowed`` for the
         # caller's tier. Greyed-out entries get a ``locked`` tag so the
         # picker can render them differently — and we sort allowed
@@ -279,7 +308,9 @@ async def _fetch_flowly_hosted() -> list[Model]:
         if item.get("allowed") is False:
             tags.append("locked")
         if pricing.get("prompt") in (None, "", "0") and pricing.get("completion") in (None, "", "0"):
-            tags.append("free")
+            if "free" not in tags:
+                tags.append("free")
+        vision = _vision_capability(item)
         out.append(Model(
             id=mid,
             name=item.get("name") or mid,
@@ -288,6 +319,7 @@ async def _fetch_flowly_hosted() -> list[Model]:
             pricing_in=_per_million(pricing.get("prompt")),
             pricing_out=_per_million(pricing.get("completion")),
             tags=tags,
+            supports_vision=vision,
         ))
     # Allowed first, then alphabetical within each bucket.
     out.sort(key=lambda m: (1 if "locked" in m.tags else 0, m.id.lower()))
@@ -473,10 +505,24 @@ def _openrouter_tags(item: dict[str, Any], pricing: dict[str, Any]) -> list[str]
             tags.append("free")
     except Exception:
         pass
-    arch = (item.get("architecture") or {})
-    modality = arch.get("input_modalities") or arch.get("modality") or []
-    if isinstance(modality, list) and any("image" in str(m).lower() for m in modality):
-        tags.append("vision")
-    elif isinstance(modality, str) and "image" in modality.lower():
+    if _vision_capability(item) is True:
         tags.append("vision")
     return tags
+
+
+def _vision_capability(item: dict[str, Any]) -> bool | None:
+    """Read explicit OpenRouter/Flowly architecture image modalities."""
+    arch = item.get("architecture")
+    if not isinstance(arch, dict):
+        return None
+    if "input_modalities" in arch:
+        modalities = arch.get("input_modalities")
+    elif "modality" in arch:
+        modalities = arch.get("modality")
+    else:
+        return None
+    if isinstance(modalities, list):
+        return any("image" in str(modality).lower() for modality in modalities)
+    if isinstance(modalities, str):
+        return "image" in modalities.lower()
+    return None

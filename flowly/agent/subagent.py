@@ -888,8 +888,16 @@ class SubagentManager:
                                     "credits are exhausted — top up or upgrade "
                                     "your plan to continue."
                                 )
+                            elif _category == ErrorCategory.IMAGE_INPUT_UNSUPPORTED:
+                                final_result = (
+                                    "Error: This model can't read images. Choose "
+                                    "a vision-capable model or remove the image."
+                                )
                             else:
-                                final_result = f"Error: {_err_snippet}"
+                                # Never leak wrapped provider/SDK payloads into
+                                # a parent-agent result. Unknown terminal kinds
+                                # get stable product copy; raw detail stays logged.
+                                final_result = "Error: The model provider couldn't respond."
                             break
 
                         if _consecutive_errors <= _MAX_CONSECUTIVE_ERRORS and iteration < max_iterations:

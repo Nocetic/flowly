@@ -107,6 +107,29 @@ def host_origin_allowed(request: web.Request) -> bool:
     return bool(origin_host) and origin_host.lower() == request_host.lower()
 
 
+def loopback_ws_allowed(request: web.Request) -> bool:
+    """WS-upgrade gate for the token-less LOOPBACK gateway (defence in depth).
+
+    With no credential to enforce, the socket must still not be reachable from
+    a web page the embedded browser (or any browser) visits. Two cheap checks,
+    both of which every legitimate local client passes:
+
+    * ``host_origin_allowed`` — a cross-origin web page (Origin host ≠ request
+      Host) is rejected; native clients (no Origin) and non-web schemes
+      (``chrome-extension://`` / ``file://``) pass.
+    * loopback Host — the request's Host must be a loopback name. This defeats
+      DNS rebinding, where a rebound ``attacker.com`` sends matching
+      Origin+Host (passing the check above) but a non-loopback Host.
+
+    Falls back to the origin check alone when the host can't be read, so a
+    legitimate native client is never blocked by a parsing gap.
+    """
+    if not host_origin_allowed(request):
+        return False
+    host = request.url.host
+    return host is None or is_loopback_host(host)
+
+
 class WsTicketStore:
     """In-memory single-use ticket store for WS-upgrade authentication.
 

@@ -1,7 +1,7 @@
-"""Browser tab tool — interact with web pages via the Flowly Chrome extension.
+"""Browser tab tool — interact with web pages via a Flowly browser provider.
 
-The extension connects to the gateway via WebSocket. This tool sends
-action requests to the extension and waits for results. All actions
+The selected provider connects to the gateway via WebSocket. This tool sends
+action requests to that provider and waits for results. All actions
 execute in the user's REAL browser — they see everything in real-time.
 """
 
@@ -90,7 +90,7 @@ _ERROR_HINT_PATTERNS: list[tuple[str, str]] = [
 
 
 class BrowserTabTool(Tool):
-    """Interact with web pages in the user's real browser via Chrome extension."""
+    """Interact with web pages through the selected Flowly browser provider."""
 
     # Inner-LLM model for semantic find. Cheap + fast; quality of
     # element matching far exceeds the extension's substring/regex
@@ -175,7 +175,7 @@ class BrowserTabTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Interact with web pages in the user's REAL browser (via Flowly Chrome extension). "
+            "Interact with web pages in the user's visible browser (embedded Flowly browser or Chrome). "
             "The user can see every action in real-time.\n\n"
             "Actions:\n"
             "- read_page: Get element map with ref IDs (text, NOT a screenshot). "
@@ -574,11 +574,12 @@ class BrowserTabTool(Tool):
         if not self._gateway:
             return json.dumps({"error": "Gateway not available"})
 
-        # Check if extension is connected
-        if not self._gateway.has_extension_client():
+        # Chrome extensions and the desktop's embedded browser register through
+        # the same provider surface. The selected provider receives the action.
+        if not self._gateway.has_browser_provider():
             return json.dumps({
-                "error": "Flowly Chrome extension not connected. "
-                "Install the extension and open the side panel to connect."
+                "error": "No Flowly browser provider is connected. "
+                "Open the embedded browser or connect the Chrome extension."
             })
 
         # Defensive action allowlist — never forward arbitrary action
@@ -650,7 +651,7 @@ class BrowserTabTool(Tool):
 
         try:
             result = await asyncio.wait_for(
-                self._gateway.send_extension_tool_request(request_id, action, params),
+                self._gateway.send_browser_tool_request(request_id, action, params),
                 timeout=timeout,
             )
 
@@ -793,7 +794,7 @@ class BrowserTabTool(Tool):
         click_request_id = str(uuid.uuid4())
         try:
             click_result = await asyncio.wait_for(
-                self._gateway.send_extension_tool_request(
+                self._gateway.send_browser_tool_request(
                     click_request_id, "click", click_params
                 ),
                 timeout=10.0,
@@ -851,7 +852,7 @@ class BrowserTabTool(Tool):
         if params.get("tabId") is not None:
             tree_params["tabId"] = params["tabId"]
         tree_result = await asyncio.wait_for(
-            self._gateway.send_extension_tool_request(
+            self._gateway.send_browser_tool_request(
                 tree_request_id, "read_page", tree_params
             ),
             timeout=20.0,
