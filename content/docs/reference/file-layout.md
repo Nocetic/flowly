@@ -18,6 +18,7 @@ written outside it without your involvement.
 | `credentials/` | OAuth tokens (e.g. `gmail.json`, mode `0600`). |
 | `plugins/` | User-installed [plugins](/docs/features/plugins). |
 | `cron/` | Scheduled-job data. |
+| `plan-mode/` | [Plan mode](/docs/features/plan-mode) plans, per session: `<session>/plan_<id>.json` plus an append-only `plan_<id>.revisions.log`. |
 | `audit/` | Command + decision [audit log](/docs/features/audit-log). |
 | `sessions/` | Session routing index and transcripts. |
 | `assistants/` | Saved assistant / multi-agent definitions. |

@@ -70,6 +70,7 @@ See [Image generation](../features/image-generation.md) for the full image_gener
 |---|---|---|
 | `message` | Send a message to a channel (Telegram / WhatsApp / …). | gateway bus |
 | `cron` | Schedule a prompt to run later. | — |
+| `plan` | Propose a plan and wait for approval, then tick its steps off (propose/view/update_step/complete/block/abort). | [Plan mode](/docs/features/plan-mode) |
 | `board_add` / `board_list` / `board_get` / `board_update` | Capture and manage cards on the [task board](/docs/features/board). | — |
 | `board_run` | Run a card, or split a goal into parallel sub-cards. | — |
 | `delegate_to` | Hand a task to a CLI-subprocess agent or team. | `flowly setup agents` |

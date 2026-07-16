@@ -17,7 +17,7 @@ If the gateway isn't running yet, the TUI starts one for you and connects to it.
 
 ## The layout
 
-- **Composer** (bottom) — where you type. `Enter` sends; `Shift+Enter` adds a new line. A header line shows the active model and session.
+- **Composer** (bottom) — where you type. `Enter` sends; `Shift+Enter` adds a new line. A header line shows the active model and session, plus the current permission level (`Shift+Tab` cycles it). Queued messages and the active [plan](../features/plan-mode.md) float just above it.
 - **Transcript** (middle) — your messages and the agent's streaming reply. Tool calls (file edits, shell, search, computer-use) render inline as collapsible blocks so you can watch what the agent is doing in real time.
 - **Panels** — activity log, approvals queue, artifacts gallery, and the subagent sidebar slide in over the transcript on demand (see [Panels](#panels) below).
 
@@ -78,6 +78,16 @@ For anything longer than a quick line, press **`Ctrl+E`** to open the current dr
 
 Attachments ride your next message; the agent sees them alongside your text. See [Image generation](../features/image-generation.md) for the reverse direction (the agent *producing* images).
 
+## Plan mode
+
+Press `Shift+Tab` until the composer reads **▣ Plan** (or type `/plan`). The
+agent then proposes a plan before it does anything, and waits: the proposal
+appears above the composer with approve / reject / revise, and once you approve,
+the step list stays there and ticks off as the work progresses.
+
+Nothing with a side effect — shell, file writes, email, integrations — runs
+until you approve. Full details in [Plan mode](../features/plan-mode.md).
+
 ## Panels
 
 Function keys open full-height panels over the transcript; `Esc` closes any of them:
@@ -108,6 +118,7 @@ This is for *your* quick checks; the agent has its own sandboxed shell tool gove
 | Key | Action |
 |---|---|
 | `Enter` / `Shift+Enter` | Send / new line |
+| `Shift+Tab` | Cycle permission level: 🔒 Ask → ⚖️ Auto → 🚀 YOLO → ▣ [Plan](../features/plan-mode.md) |
 | `↑` / `↓` | Input history prev / next; `↓` on an empty draft opens this chat's [artifacts](../features/artifacts.md) (`↑/↓` select · `Enter` open · `←/→` switch in the viewer) |
 | `Ctrl+E` | Edit draft in `$EDITOR` |
 | `Ctrl+S` / `Ctrl+M` | Sessions / personas picker |

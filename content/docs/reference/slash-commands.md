@@ -88,12 +88,35 @@ Short alias: `-n` is accepted as a dry-run flag.
 | Command | What it does |
 |---|---|
 | `/permissions` (`/policy`) | Edit command permissions (security / ask / allowlist). |
+| `/plan [task\|on\|off\|status]` | [Plan mode](/docs/features/plan-mode) — the agent proposes a plan and waits for approval before acting. Bare `/plan` toggles the standing mode; see below. |
 | `/memory` (`/review`) | Review the bot's pending memory candidates inline — keep / discard them one at a time. Pops automatically on open when the review queue is non-empty; `Esc` dismisses it until you re-enter the TUI. |
 | `/approvals` | Open the pending approvals queue (or `F3`). |
 | `/activity` | Open the activity / audit log (or `F2`). |
 | `/artifacts` | Open the artifacts gallery (or `F4`). |
 | `/subagents` (`/subs`) | Toggle the subagent sidebar. |
 | `/board` (`/kanban`) | Show the [task board](/docs/features/board) inline; `/board run\|done\|cancel\|del <id>`, `/board add <title>`, `/board clear`. |
+
+### `/plan`
+
+Turn on [plan mode](/docs/features/plan-mode): the agent decomposes the task into
+steps, shows you the plan, and runs no side-effecting tool until you approve it.
+
+```text
+/plan                 # toggle the standing mode on/off
+/plan on              # turn it on
+/plan off             # turn it off AND abort the active plan
+/plan status          # is it on? what's the active plan's progress?
+/plan <task>          # plan THIS task only, without entering the standing mode
+```
+
+Bare `/plan` is a **mode**, not a one-shot: while it's on, every message plans
+first. It's the same mode `Shift+Tab` cycles to (**▣ Plan**), and it works on
+every surface that sends text — the TUI, Desktop, iOS, and chat channels.
+
+`/plan <task>` is the exception: it forces plan-first for that message only.
+
+Aliases: `/plan stop` and `/plan cancel` behave like `/plan off`; `/plan ?`
+behaves like `/plan status`.
 
 ## Account
 
@@ -109,6 +132,7 @@ Short alias: `-n` is accepted as a dry-run flag.
 |---|---|
 | `Enter` | Send message |
 | `Shift+Enter` | New line in the draft |
+| `Shift+Tab` | Cycle the permission level: 🔒 Ask → ⚖️ Auto → 🚀 YOLO → ▣ [Plan](/docs/features/plan-mode) |
 | `↑` / `↓` | History prev / next (single-line draft) |
 | `Ctrl+E` | Open the draft in `$EDITOR` |
 | `Ctrl+S` | Open the sessions picker |

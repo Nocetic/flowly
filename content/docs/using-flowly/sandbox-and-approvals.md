@@ -74,6 +74,30 @@ When a command needs approval, you get a prompt on your active surface showing t
 > [!NOTE]
 > If no decision arrives before the approval timeout, the command is denied.
 
+## Plan mode: approving the work, not the command
+
+Everything above gates **one command at a time**, as the agent reaches it.
+[Plan mode](/docs/features/plan-mode) gates the **whole task, up front**: the
+agent proposes a plan, and until you approve it, every side-effecting tool —
+`exec` included, but also file writes, email, integrations, and subagents — is
+refused before it runs.
+
+The two layers are independent and compose:
+
+| | Exec approvals | Plan mode |
+| --- | --- | --- |
+| Gates | A single shell command | Every side-effecting tool |
+| Asks | When the command is reached | Before any work starts |
+| You approve | The command | The plan |
+| Timeout means | Denied (that command) | Not approved (nothing runs) |
+| Configured by | `security` / `ask` policy | `Shift+Tab` to **▣ Plan**, or `/plan` |
+
+Plan mode sets **no** exec policy of its own — your `security`/`ask` settings
+keep applying inside an approved plan. It's an extra gate in front of them, not
+a replacement. So an approved plan running under `security=full` + `ask=off`
+still executes its commands without per-command prompts; you approved the shape
+of the work, not each step of it.
+
 ## Managing policy from the CLI
 
 The `flowly approvals` command reads and writes the policy:
@@ -204,6 +228,7 @@ Within a session (non-Windows), a `cd` in one exec call persists to the next. Th
 
 ## Related
 
+- [Plan mode](../features/plan-mode.md)
 - [Codex runtime](../features/codex-runtime.md)
 - [Providers & models](./providers-and-models.md)
 - [Channels overview](../channels/overview.md)

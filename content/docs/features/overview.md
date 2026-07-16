@@ -21,6 +21,10 @@ Flowly is a full agent, not just a chat box. These features work together across
 - **[Delegation](delegation.md)** — spawn subagents and multi-agent teams for parallel work.
 - **[Codex runtime](codex-runtime.md)** — hand a coding turn to OpenAI's Codex app-server.
 
+## Control
+
+- **[Plan mode](plan-mode.md)** — a standing mode where the agent proposes a plan and waits for your approval before it changes anything. `Shift+Tab` to it, or `/plan`.
+
 ## Interfaces
 
 - **[Voice](voice.md)** — phone calls over Twilio with speech-to-text and text-to-speech.
