@@ -234,6 +234,19 @@ Pie/donut groups by a category-like field (or an explicit `by`).
   "title": "This month", "window": "30d", "chart": "bar" }
 ```
 
+### Icons
+
+An `icon` (on `icon` / `icon_button`, and `checklist` items) is a name from this
+vetted set — an unknown name degrades to a sensible fallback, so these always
+render:
+
+`activity` · `arrow-down` · `arrow-up` · `bed` · `bell` · `book` · `brain` ·
+`calendar` · `camera` · `cart` · `check` · `clock` · `cloud` · `coffee` · `cup` ·
+`droplet` · `dumbbell` · `flame` · `heart` · `leaf` · `mail` · `minus` · `moon` ·
+`music` · `pen` · `phone` · `pill` · `plus` · `run` · `smile` · `sparkles` ·
+`star` · `sun` · `target` · `trash` · `trophy` · `undo` · `walk` · `wallet` ·
+`zap`
+
 ## Actions
 
 Every interactive component declares one `action` object with an `op`. Any action
@@ -418,6 +431,65 @@ idempotent, and never change what's stored:
   full photo on its detail screen.
 - **A chart-bearing multi-column grid is forced full-width**, because charts
   don't fit side by side on a phone.
+
+## The `flowlet` tool
+
+The agent authors and maintains flowlets through one tool. You never call it —
+you ask in plain language — but these are the operations behind the scenes:
+
+| Action | Does |
+|--------|------|
+| `create` | Build a flowlet from a `definition`. |
+| `update` | Replace a flowlet's `definition` (versioned), or set `pinned`. |
+| `get` | The definition **and current live values** (answers "how much today?"). |
+| `list` | Every flowlet with its live values. |
+| `delete` | Remove a flowlet. |
+| `log` | Append an event to a series (from chat: "I drank 500 ml"). |
+| `set_state` | Change a state value ("make my goal 3 liters"). |
+| `query` | One aggregated number from a series, without dumping the flowlet. |
+| `notify` | Fire a one-off reminder now (recurring/conditional → use a `watch`). |
+
+On `create`/`update` the tool returns a **review** — deterministic lint findings
+plus a preview resolved against sample rows — which the agent reads and acts on,
+so a generated flowlet tends to come out right the first time.
+
+## A complete example
+
+A daily-habit tracker — checklist, a once-per-day "complete" button, a weekly
+total, a chart, and a 9pm reminder — showing how the pieces fit:
+
+```json
+{
+  "catalog": 3, "name": "Habits", "icon": "check", "accent": "#7C6FF0",
+  "state": {
+    "read_done": { "type": "bool", "default": false },
+    "code_done": { "type": "bool", "default": false }
+  },
+  "series": { "days": {} },
+  "computed": {
+    "both_done":    { "expr": "read_done > 0 and code_done > 0" },
+    "weekly_total": { "series": "days", "agg": "sum", "window": "7d" }
+  },
+  "layout": [
+    { "id": "habits", "type": "checklist", "items": [
+      { "key": "read_done", "label": "Read 1 hour", "icon": "book" },
+      { "key": "code_done", "label": "Code 5 hours", "icon": "zap" } ] },
+    { "id": "complete_day", "type": "button", "text": "Complete the day",
+      "style": "primary", "visibleWhen": "both_done > 0",
+      "action": { "op": "batch", "once": "day", "ops": [
+        { "op": "log", "series": "days", "value": 1 },
+        { "op": "reset", "key": "read_done" },
+        { "op": "reset", "key": "code_done" } ] } },
+    { "type": "metric", "value": "weekly_total", "label": "This week" },
+    { "id": "trend", "type": "chart", "kind": "bar",
+      "data": { "series": "days", "agg": "sum", "bucket": "day", "window": "7d" } }
+  ],
+  "watches": [ {
+    "id": "evening_nudge", "trigger": "schedule", "at": "21:00",
+    "notify": { "title": "Habits", "body": "Did you read and code today?" }
+  } ]
+}
+```
 
 ## Limits
 
