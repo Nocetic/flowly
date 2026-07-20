@@ -46,7 +46,10 @@ Desktop, iOS, and any chat channel:
 
 `/plan <task>` is the one-shot: it forces plan-first behavior for that message
 only, then the conversation goes back to normal. `/plan` with no argument is the
-standing mode — every message plans first until you leave.
+standing mode — every message plans first **until a plan is approved**: approval
+ends the mode and the work runs under whatever permission level was underneath.
+A trivial message ("hi", a quick question) doesn't force a plan — the agent
+just answers; the gate still blocks any real work until a plan is approved.
 
 ## Approving a plan
 
@@ -61,6 +64,13 @@ You have three answers:
 
 "Reject" and "revise" are deliberately separate — "no" and "not like that" are
 different answers, and blurring them costs you a turn.
+
+**Approving also ends plan mode** for that conversation. Since the mode never
+touched your exec policy, there's nothing to restore — the badge simply drops
+back to the level that was underneath all along (Ask stays Ask, YOLO stays
+YOLO), and the plan bar keeps tracking the approved work to completion.
+Rejecting or revising keeps you in plan mode: you're still planning. Want the
+next task planned too? Enter the mode again — one `Shift+Tab` away.
 
 > [!IMPORTANT]
 > A proposal that goes unanswered for **10 minutes** times out, and a timeout

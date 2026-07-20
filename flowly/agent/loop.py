@@ -5126,12 +5126,20 @@ class AgentLoop:
                 if _pm_sticky.is_sticky(msg.session_key):
                     _pm_sticky.arm_forced(msg.session_key)
                     _orig = msg.content
+                    # Softened on purpose: a greeting or a quick question needs
+                    # no plan, and forcing one plans "hi". Safety does not rest
+                    # on this text — the backend gate refuses side-effecting
+                    # tools until a plan is approved regardless of what the
+                    # model decides to do.
                     msg.content = (
-                        "Plan mode is ON. Before doing ANY work, use the plan "
-                        "tool: plan(action='propose', goal=..., steps=[...]) and "
-                        "wait for the user's approval. Do not take side-effecting "
-                        "actions until the plan is approved. You MAY read files "
-                        f"and search while planning.\n\nTask: {_orig}"
+                        "Plan mode is ON. If this message asks for real work, "
+                        "use the plan tool BEFORE doing it: "
+                        "plan(action='propose', goal=..., steps=[...]) and wait "
+                        "for the user's approval; do not take side-effecting "
+                        "actions until the plan is approved (you MAY read files "
+                        "and search while planning). If it is trivial or "
+                        "conversational, just answer it — no plan.\n\n"
+                        f"Message: {_orig}"
                     )
                     msg.metadata["_display_content"] = _orig
             except Exception:
