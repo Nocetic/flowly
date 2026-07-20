@@ -144,3 +144,68 @@ def test_sticky_mode_survives_restart(tmp_path: Path):
     # Turning it off persists too — it must not resurrect on the NEXT restart.
     mgr2.set_sticky("web:conv1", False)
     assert not _mgr(tmp_path).is_sticky("web:conv1")
+
+
+# ── compaction re-injection + content bounds ────────────────────────────
+# The plan survives compaction on disk, but the model's context does not:
+# without the note, a mid-plan compaction leaves the model executing an
+# approved contract it can no longer see. And every mutation is persisted +
+# broadcast to every client, so model-authored content must be bounded.
+
+
+@pytest.mark.asyncio
+async def test_compaction_note_lists_only_unfinished_steps(tmp_path: Path):
+    mgr = _mgr(tmp_path)
+    asyncio.create_task(_approve_soon(mgr, "web:1"))
+    plan, _ = await mgr.propose("web:1", "g", _steps(mgr, "A", "B", "C"), timeout_s=5)
+    await mgr.update_step(plan.id, 1, "completed")
+    await mgr.update_step(plan.id, 2, "in_progress")
+
+    note = mgr.compaction_note("web:1")
+    assert note is not None
+    assert "do NOT re-propose" in note
+    assert "1/3 steps are already finished" in note
+    assert "1. A" not in note        # completed → omitted
+    assert "[>] 2. B" in note        # in_progress → marked
+    assert "[ ] 3. C" in note        # pending → listed
+    assert "update_step" in note
+
+
+def test_compaction_note_absent_without_an_active_plan(tmp_path: Path):
+    assert _mgr(tmp_path).compaction_note("web:none") is None
+
+
+@pytest.mark.asyncio
+async def test_compaction_note_absent_while_awaiting_approval(tmp_path: Path):
+    """draft/awaiting plans are still covered by the side-effect gate — the
+    note is only for approved work the model could silently drift from."""
+    mgr = _mgr(tmp_path)
+    task = asyncio.create_task(
+        mgr.propose("web:1", "g", _steps(mgr, "A"), timeout_s=0.15)
+    )
+    await asyncio.sleep(0.02)
+    assert mgr.compaction_note("web:1") is None
+    await task  # times out → not approved
+
+
+def test_build_steps_caps_count_and_content(tmp_path: Path):
+    mgr = _mgr(tmp_path)
+    raw = [{"id": i, "content": f"s{i}"} for i in range(1, 200)]
+    steps = mgr.build_steps(raw)
+    assert len(steps) == 64
+
+    long = mgr.build_steps([{"id": 1, "content": "x" * 5000}])
+    assert len(long[0].content) == 2000
+    assert long[0].content.endswith("… [truncated]")
+
+
+@pytest.mark.asyncio
+async def test_propose_caps_goal_and_details(tmp_path: Path):
+    mgr = _mgr(tmp_path)
+    asyncio.create_task(_approve_soon(mgr, "web:1"))
+    plan, _ = await mgr.propose(
+        "web:1", "g" * 9000, _steps(mgr, "A"),
+        details_md="d" * 50_000, timeout_s=5,
+    )
+    assert len(plan.goal) == 2000
+    assert len(plan.detailsMd) == 20_000

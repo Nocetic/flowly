@@ -5360,6 +5360,17 @@ class AgentLoop:
                 self.sessions.flush_full(session)
                 session.clear()
                 summary_msg = f"[Previous conversation summary]\n\n{result.summary}"
+                # An approved plan mid-execution must survive compaction in the
+                # model's CONTEXT, not just on disk — otherwise the model keeps
+                # working with no memory of the contract it's bound to.
+                try:
+                    from flowly.plans.manager import get_plan_manager as _get_pm
+
+                    _plan_note = _get_pm().compaction_note(msg.session_key)
+                    if _plan_note:
+                        summary_msg += f"\n\n{_plan_note}"
+                except Exception:
+                    logger.debug("[plan] compaction note skipped (non-fatal)")
                 session.add_message("system", summary_msg)
                 for kept_msg in result.kept_messages:
                     extras = {
@@ -6265,10 +6276,18 @@ class AgentLoop:
         # early message (compaction only shrinks the LLM working context).
         self.sessions.flush_full(session)
         session.clear()
-        session.add_message(
-            "system",
-            f"[Compacted conversation summary]\n\n{result.summary}"
-        )
+        compacted_msg = f"[Compacted conversation summary]\n\n{result.summary}"
+        # Same plan re-injection as the auto-compaction path: an approved plan
+        # mid-execution must survive /compact in the model's context too.
+        try:
+            from flowly.plans.manager import get_plan_manager as _get_pm
+
+            _plan_note = _get_pm().compaction_note(session_key)
+            if _plan_note:
+                compacted_msg += f"\n\n{_plan_note}"
+        except Exception:
+            logger.debug("[plan] compaction note skipped (non-fatal)")
+        session.add_message("system", compacted_msg)
         for kept_msg in result.kept_messages:
             extras = {
                 k: kept_msg[k]

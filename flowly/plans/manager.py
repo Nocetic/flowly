@@ -39,6 +39,25 @@ from flowly.plans.store import PlanStore, get_plan_store
 # approved). Generous: the user may be away from the surface.
 DEFAULT_APPROVAL_TIMEOUT_S = 600
 
+# Bounds on model-authored plan content. Every mutation is persisted, copied
+# into the append-only revisions log, and broadcast as a full snapshot to
+# every client (down to the iOS pill), so one runaway generation must not
+# inflate all three. Generous relative to real plans; truncation is graceful
+# (a marker, never a hard failure that would strand an approval mid-flight).
+MAX_PLAN_STEPS = 64
+MAX_STEP_CHARS = 2_000
+MAX_GOAL_CHARS = 2_000
+MAX_NOTE_CHARS = 2_000
+MAX_DETAILS_CHARS = 20_000
+_TRUNCATION_MARKER = "… [truncated]"
+
+
+def _cap(text: str, limit: int) -> str:
+    """Clip oversized model output, keeping the head (the actionable part)."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
 BroadcastCallback = Callable[[str, dict], Awaitable[None]]
 
 # Tools with real side effects — blocked while a session is gated (forced
@@ -125,6 +144,43 @@ class PlanManager:
     def list_for_session(self, session_key: str) -> list[GeneralPlan]:
         return self._store.all_for_session(session_key)
 
+    def compaction_note(self, session_key: str) -> Optional[str]:
+        """Render the live plan for re-injection after context compaction.
+
+        The plan survives compaction on DISK, but the model's working context
+        does not — without this note, a mid-plan compaction leaves the model
+        executing an approved contract it can no longer see, and it silently
+        drifts or re-proposes. Injected only for approved/executing/paused
+        plans (draft/awaiting are still protected by the side-effect gate),
+        and lists only the UNFINISHED steps: re-injecting completed ones makes
+        the model redo finished work.
+        """
+        plan = self._store.current_for_session(session_key)
+        if not plan or plan.status not in ("approved", "executing", "paused"):
+            return None
+        unfinished = [s for s in plan.steps if s.status in ("pending", "in_progress")]
+        if not unfinished:
+            return None
+        prog = plan.progress_summary()
+        done = prog["completed"] + prog["skipped"]
+        lines = [
+            "[Active plan preserved across context compaction — already "
+            "approved, do NOT re-propose it]",
+            f"Plan: {plan.title} (status: {plan.status})",
+        ]
+        if done:
+            lines.append(
+                f"{done}/{prog['total']} steps are already finished — do not redo them."
+            )
+        for s in unfinished:
+            marker = "[>]" if s.status == "in_progress" else "[ ]"
+            lines.append(f"- {marker} {s.id}. {s.content}")
+        lines.append(
+            "Continue the remaining steps, ticking each with "
+            "plan(action='update_step') and finishing with plan(action='complete')."
+        )
+        return "\n".join(lines)
+
     # ── propose (the proposing turn awaits) ─────────────────────────────
 
     async def propose(
@@ -147,6 +203,9 @@ class PlanManager:
         other active plan (executing/paused) is aborted first: re-planning
         supersedes it.
         """
+        goal = _cap(goal.strip(), MAX_GOAL_CHARS)
+        if details_md is not None:
+            details_md = _cap(details_md, MAX_DETAILS_CHARS)
         existing = self._store.current_for_session(session_key)
         if existing and existing.status in ("awaiting_approval", "draft"):
             plan = existing
@@ -287,7 +346,7 @@ class PlanManager:
             step.completedAt = now
         step.status = status  # type: ignore[assignment]
         if note is not None:
-            step.note = note
+            step.note = _cap(note, MAX_NOTE_CHARS)
         if plan.status in ("approved", "paused"):
             plan.status = "executing"
         plan.touch(f"step {step_id} → {status}")
@@ -301,7 +360,7 @@ class PlanManager:
         plan = self._store.get(plan_id)
         if not plan:
             return None
-        plan.completionSummary = summary.strip() or None
+        plan.completionSummary = _cap(summary.strip(), MAX_NOTE_CHARS) or None
         plan.status = "completed"
         plan.touch("completed")
         self._store.save(plan)
@@ -314,7 +373,7 @@ class PlanManager:
         plan = self._store.get(plan_id)
         if not plan:
             return None
-        plan.completionSummary = reason.strip() or None
+        plan.completionSummary = _cap(reason.strip(), MAX_NOTE_CHARS) or None
         plan.status = "blocked"
         plan.touch("blocked")
         self._store.save(plan)
@@ -448,10 +507,15 @@ class PlanManager:
 
     @staticmethod
     def build_steps(raw_steps: list[dict[str, Any]]) -> list[PlanStep]:
-        """Coerce tool-supplied step dicts into PlanStep, filling activeForm."""
+        """Coerce tool-supplied step dicts into PlanStep, filling activeForm.
+        Bounded (MAX_PLAN_STEPS / MAX_STEP_CHARS): the list head is the plan's
+        priority order, so overflow drops the tail, and long content clips
+        with a marker rather than failing the propose."""
         steps: list[PlanStep] = []
         seen: set[int] = set()
         for i, raw in enumerate(raw_steps, start=1):
+            if len(steps) >= MAX_PLAN_STEPS:
+                break
             if not isinstance(raw, dict):
                 continue
             sid = raw.get("id")
@@ -460,7 +524,7 @@ class PlanManager:
             if sid in seen:
                 sid = max(seen) + 1
             seen.add(sid)
-            content = str(raw.get("content", "")).strip()
+            content = _cap(str(raw.get("content", "")).strip(), MAX_STEP_CHARS)
             if not content:
                 continue
             active = str(raw.get("activeForm", "")).strip() or imperative_to_gerund(
@@ -470,8 +534,12 @@ class PlanManager:
                 PlanStep(
                     id=sid,
                     content=content,
-                    activeForm=active,
-                    note=(str(raw["note"]).strip() if raw.get("note") else None),
+                    activeForm=_cap(active, MAX_STEP_CHARS),
+                    note=(
+                        _cap(str(raw["note"]).strip(), MAX_NOTE_CHARS)
+                        if raw.get("note")
+                        else None
+                    ),
                 )
             )
         return steps
