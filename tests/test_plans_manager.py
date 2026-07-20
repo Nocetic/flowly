@@ -130,3 +130,17 @@ async def test_sticky_mode_toggles_and_clears_oneshot(tmp_path: Path):
     mgr.set_sticky("web:1", False)
     assert not mgr.is_sticky("web:1")
     assert not mgr.gate_blocks("web:1", "exec")
+
+
+def test_sticky_mode_survives_restart(tmp_path: Path):
+    """/plan on, gateway restarts, mode is still on — like the exec policy."""
+    mgr = _mgr(tmp_path)
+    mgr.set_sticky("web:conv1", True)
+
+    mgr2 = _mgr(tmp_path)  # fresh manager over the same dir = restart
+    assert mgr2.is_sticky("web:conv1")
+    assert not mgr2.is_sticky("web:other")
+
+    # Turning it off persists too — it must not resurrect on the NEXT restart.
+    mgr2.set_sticky("web:conv1", False)
+    assert not _mgr(tmp_path).is_sticky("web:conv1")

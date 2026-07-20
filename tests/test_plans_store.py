@@ -86,3 +86,33 @@ def test_persist_disabled_via_flag(tmp_path: Path, monkeypatch):
 def test_safe_filename_strips_separators():
     assert "/" not in safe_filename("web:../../etc/passwd")
     assert safe_filename("") == "_unknown"
+
+
+# ── standing-mode (sticky) persistence ──────────────────────────────────
+# The mode is the 4th permission level; the exec policy survives restarts,
+# so this must too — a gateway restart silently dropping it means the next
+# message runs ungated while the user still believes plan mode is on.
+
+
+def test_sticky_roundtrips_through_disk(tmp_path: Path):
+    store = PlanStore(root=tmp_path, hydrate=False)
+    store.save_sticky({"web:conv1", "tui:default"})
+    assert PlanStore(root=tmp_path, hydrate=False).load_sticky() == {
+        "web:conv1",
+        "tui:default",
+    }
+
+
+def test_sticky_empty_when_never_written(tmp_path: Path):
+    assert PlanStore(root=tmp_path, hydrate=False).load_sticky() == set()
+
+
+def test_sticky_corrupt_file_is_tolerated(tmp_path: Path):
+    (tmp_path / "sticky.json").write_text("{not json", encoding="utf-8")
+    assert PlanStore(root=tmp_path, hydrate=False).load_sticky() == set()
+
+
+def test_sticky_save_is_noop_when_persistence_off(tmp_path: Path):
+    store = PlanStore(root=tmp_path, persist=False, hydrate=False)
+    store.save_sticky({"web:conv1"})
+    assert not (tmp_path / "sticky.json").exists()

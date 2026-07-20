@@ -205,6 +205,44 @@ class PlanStore:
             logger.warning(f"[plans.store] write-through failed for {plan.id}: {e}")
 
 
+    # ── standing-mode (sticky) persistence ──────────────────────────────
+    #
+    # The sticky set is the plan-mode analogue of the exec policy: a standing
+    # per-session stance the user set with Shift+Tab or /plan. The exec policy
+    # survives restarts (exec-approvals.json); this must too, or every gateway
+    # restart silently drops the mode and the next message runs ungated while
+    # the user still believes plan mode is on.
+
+    def load_sticky(self) -> set[str]:
+        """Session keys with the standing plan mode on. Empty set on any
+        error — a broken file must never block startup."""
+        root = self._resolve_root()
+        if root is None:
+            return set()
+        try:
+            data = json.loads((root / "sticky.json").read_text(encoding="utf-8"))
+            return {str(s) for s in (data.get("sticky") or []) if s}
+        except Exception:
+            return set()
+
+    def save_sticky(self, keys: set[str]) -> None:
+        """Persist the sticky set (atomic, best-effort like every other
+        write here)."""
+        if not self._persist:
+            return
+        root = self._resolve_root()
+        if root is None:
+            return
+        try:
+            tmp = root / f".sticky.json.tmp.{os.getpid()}"
+            tmp.write_text(
+                json.dumps({"sticky": sorted(keys)}), encoding="utf-8"
+            )
+            os.replace(tmp, root / "sticky.json")
+        except Exception as e:
+            logger.warning(f"[plans.store] sticky write-through failed: {e}")
+
+
 # ── process singleton ───────────────────────────────────────────────────
 
 _singleton: Optional[PlanStore] = None

@@ -114,6 +114,10 @@ next start. The coroutine that was running it is gone and can't be revived, but
 the plan and its completed steps survive on disk, and your surface offers to
 resume from where it stopped.
 
+The standing mode itself survives restarts too: a conversation you put in plan
+mode is still in plan mode when Flowly comes back — the same way your exec
+permission level persists.
+
 ## Where plans live
 
 ```text

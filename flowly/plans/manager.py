@@ -100,8 +100,11 @@ class PlanManager:
         self._forced_pending: set[str] = set()
         # Sessions with STICKY plan mode on (the standing mode, like the
         # exec permission levels): every normal message plans first until
-        # the user turns it off. In-memory — resets on bot restart.
-        self._sticky: set[str] = set()
+        # the user turns it off. Hydrated from disk so a gateway restart
+        # doesn't silently drop the mode (the exec policy survives restarts;
+        # this must match, or the next message runs ungated while the user
+        # still believes plan mode is on).
+        self._sticky: set[str] = self._store.load_sticky()
 
     @property
     def store(self) -> PlanStore:
@@ -377,12 +380,14 @@ class PlanManager:
 
     def set_sticky(self, session_key: str, on: bool) -> None:
         """Turn the standing plan mode on/off for a session. Off also drops any
-        armed one-shot gate so the next message runs normally."""
+        armed one-shot gate so the next message runs normally. Persisted, so
+        the mode survives a gateway restart like the exec policy does."""
         if on:
             self._sticky.add(session_key)
         else:
             self._sticky.discard(session_key)
             self._forced_pending.discard(session_key)
+        self._store.save_sticky(self._sticky)
 
     def is_sticky(self, session_key: str) -> bool:
         return session_key in self._sticky
