@@ -29,7 +29,7 @@ Flowly is configured mainly through `~/.flowly/config.json`. The environment var
 | `FLOWLY_LLM_TIMEOUT_SECONDS` | `120` | Timeout for a non-streaming LLM call. |
 | `FLOWLY_LLM_STREAM_TIMEOUT_SECONDS` | `120` | Timeout for a streaming LLM call. |
 | `FLOWLY_CLAUDE_CACHE_TTL` | `1h` | TTL for the Anthropic prompt cache (Claude models). |
-| `FLOWLY_PLAN_PERSIST` | on | Set to `0` / `false` / `off` / `no` to keep [plan mode](/docs/features/plan-mode) plans in memory only, instead of writing them to `<FLOWLY_HOME>/plan-mode`. |
+| `FLOWLY_PLAN_PERSIST` | on | Set to `0` / `false` / `off` / `no` to keep [plan mode](/docs/features/plan-mode) state (plans + the standing-mode flag) in memory only, instead of writing it to `<FLOWLY_HOME>/plan-mode`. |
 
 ## Cron
 

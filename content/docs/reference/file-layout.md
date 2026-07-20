@@ -18,7 +18,7 @@ written outside it without your involvement.
 | `credentials/` | OAuth tokens (e.g. `gmail.json`, mode `0600`). |
 | `plugins/` | User-installed [plugins](/docs/features/plugins). |
 | `cron/` | Scheduled-job data. |
-| `plan-mode/` | [Plan mode](/docs/features/plan-mode) plans, per session: `<session>/plan_<id>.json` plus an append-only `plan_<id>.revisions.log`. |
+| `plan-mode/` | [Plan mode](/docs/features/plan-mode) state: per-session plans (`<session>/plan_<id>.json` plus an append-only `plan_<id>.revisions.log`) and `sticky.json`, which conversations have the standing mode on (what makes the mode survive restarts). |
 | `audit/` | Command + decision [audit log](/docs/features/audit-log). |
 | `sessions/` | Session routing index and transcripts. |
 | `assistants/` | Saved assistant / multi-agent definitions. |

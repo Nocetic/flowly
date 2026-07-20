@@ -29,6 +29,10 @@ sets no security/ask policy of its own — whatever was active stays active, and
 plan mode adds the approval gate on top. Cycling past it turns the mode off and
 applies the next level's policy as usual.
 
+This works on a brand-new chat too: turn plan mode on before you've sent
+anything, and it binds to the conversation your first message creates — the
+very first task already goes through the plan.
+
 Or use the command, which works on every surface that sends text — the TUI,
 Desktop, iOS, and any chat channel:
 
@@ -107,6 +111,14 @@ Every surface shows the plan just above the composer:
 The plan follows the conversation, not the window. Leave a chat mid-run and come
 back — even from a different device — and the current plan is restored.
 
+It also outlives the context window. A long plan can run past the point where
+the conversation gets summarized to reclaim tokens (automatically, or via
+`/compact`) — and a summary is exactly where an approved plan could silently
+fall out of the agent's working memory. So the active plan is carried across:
+the summary keeps the plan's title, the steps still to do, and a count of the
+ones already finished — deliberately not their content, so completed work is
+never redone.
+
 ## If Flowly restarts
 
 A plan left `executing` when the process stops is moved to **`paused`** on the
@@ -123,11 +135,13 @@ permission level persists.
 ```text
 ~/.flowly/plan-mode/<session>/plan_<id>.json           # full snapshot
 ~/.flowly/plan-mode/<session>/plan_<id>.revisions.log  # append-only audit trail
+~/.flowly/plan-mode/sticky.json                        # which conversations have the standing mode on
 ```
 
 Snapshots are written atomically (temp file, then rename), so a crash mid-write
 can't leave a half-written plan. The revisions log appends one JSON line per
-mutation — a readable history of what changed, when, and why.
+mutation — a readable history of what changed, when, and why. `sticky.json` is
+what makes the standing mode survive restarts.
 
 Set `FLOWLY_PLAN_PERSIST=0` to keep plans in memory only, for a throwaway or
 test instance.
@@ -136,6 +150,9 @@ test instance.
 
 - **One active plan per conversation.** Proposing a new plan aborts the previous
   one.
+- **A plan is bounded**: at most 64 steps, ~2,000 characters per step or note,
+  and a ~20,000-character plan body. Anything longer is clipped with a marker —
+  never an error that would strand an approval.
 - **The 10-minute approval timeout is not configurable.**
 - **Cron and background runs can't approve** — a plan proposed there is rejected.
 - **Live updates over the relay reach the device you're chatting on.** Other
