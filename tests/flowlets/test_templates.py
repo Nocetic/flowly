@@ -48,7 +48,39 @@ def test_template_carries_its_card_metadata(template_id):
 def test_ids_are_stable_and_unique():
     # Clients key their picker off these; renaming one is a breaking change, so
     # it should take a deliberate edit here.
-    assert [t.id for t in TEMPLATES] == ["water", "habits", "expenses", "tasks"]
+    assert [t.id for t in TEMPLATES] == [
+        "water", "habits", "expenses", "tasks", "sleep", "mood",
+    ]
+
+
+@pytest.mark.parametrize("template_id", [t.id for t in TEMPLATES])
+def test_template_is_a_furnished_screen(template_id):
+    """A template is someone's first impression of what a flowlet can be, so a
+    bare control and a line of text isn't good enough — it needs a headline to
+    land on, something that reacts, and history underneath."""
+    defn = build_template(template_id)
+
+    def walk(node):
+        if isinstance(node, dict):
+            if isinstance(node.get("type"), str):
+                yield node
+            for v in node.values():
+                yield from walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                yield from walk(v)
+
+    kinds = [n["type"] for n in walk(defn["layout"])]
+    assert len(kinds) >= 10, f"{template_id} is thin: {kinds}"
+    # A number the eye lands on first…
+    assert {"ring", "progress", "stat", "metric", "tracker_card"} & set(kinds)
+    # …something that acts on it…
+    assert {"button", "form", "photo", "rating", "checklist",
+            "number_input", "toggle"} & set(kinds)
+    # …and history under it.
+    assert {"chart", "heatmap", "sparkline", "repeater", "tracker_card"} & set(kinds)
+    # Derived values, not numbers the agent would have to keep in sync by hand.
+    assert len(defn.get("computed") or {}) >= 3
 
 
 def test_cards_are_localized_and_complete():
