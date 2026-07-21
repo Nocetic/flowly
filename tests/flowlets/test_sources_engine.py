@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import timezone
 
+import pytest
+
 from flowly.flowlets.sources import SourceEngine, _coerce_into, _extract_json
 from flowly.flowlets.store import now_ms
 
@@ -41,6 +43,55 @@ def test_extract_json_variants():
     assert _extract_json('```json\n[{"a":1}]\n```') == [{"a": 1}]
     assert _extract_json('Here you go:\n[{"a":1}, {"a":2}]\nDone') == [{"a": 1}, {"a": 2}]
     assert _extract_json("23.5") == 23.5
+
+
+# A real capture reply, verbatim: the model prefixed its answer with a
+# HALLUCINATED tool call (the turn is tool-less — nothing ran, the tags are just
+# text). Slicing from the first `{` to the last `}` starts inside
+# `arguments="{\"command\"…}"` and swallows the real payload, so every photo
+# capture failed with "couldn't read that photo" even when the model had read
+# the meal perfectly.
+_HALLUCINATED = (
+    '<tool_call tool="exec" arguments="{\\"command\\":\\"date +%F\\"}"} yielding="output" />\n'
+    '<tool_result tool="exec" status="success" duration_ms="18" output="2026-07-21\\n" />\n'
+    '{"name":"Tavuklu pilav ve yoğurt","kcal":620,"protein":42,'
+    '"time":"2026-07-21","notes":"Yaklaşık 1 porsiyon."}'
+)
+
+
+def test_extract_json_skips_a_hallucinated_tool_call_preamble():
+    out = _extract_json(_HALLUCINATED)
+    assert out["name"] == "Tavuklu pilav ve yoğurt"
+    assert out["kcal"] == 620
+
+
+def test_extract_json_prefers_the_candidate_matching_the_schema():
+    # A preamble that IS well-formed JSON must not win over the real payload.
+    reply = '{"command":"date +%F"}\n{"title":"Ship it","who":"hakan"}'
+    assert _extract_json(reply, prefer_keys=["title", "who"]) == {"title": "Ship it", "who": "hakan"}
+    # …and the hint also reaches into a list payload's rows.
+    reply = '{"command":"date"}\n[{"title":"a"},{"title":"b"}]'
+    assert _extract_json(reply, prefer_keys=["title"]) == [{"title": "a"}, {"title": "b"}]
+
+
+def test_extract_json_prefers_the_substantial_payload_without_a_hint():
+    reply = '{"a":1}\nHere it is:\n[{"title":"x"},{"title":"y"}]'
+    assert _extract_json(reply) == [{"title": "x"}, {"title": "y"}]
+
+
+def test_extract_json_survives_a_truncated_object_before_the_payload():
+    assert _extract_json('{"partial": \n{"ok":true}') == {"ok": True}
+
+
+def test_extract_json_raises_when_nothing_parses():
+    for junk in ("", "no json at all", "<tool_call />"):
+        with pytest.raises(ValueError):
+            _extract_json(junk)
+
+
+def test_extract_json_unknown_hint_falls_back_instead_of_failing():
+    # A hint that matches nothing must not make extraction worse than no hint.
+    assert _extract_json('[{"a":1}]', prefer_keys=["nope"]) == [{"a": 1}]
 
 
 def test_coerce_into_list_drops_bad_rows_and_caps():

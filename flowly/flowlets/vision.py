@@ -100,7 +100,11 @@ async def apply_capture(
     try:
         prompt = _build_vision_prompt(action.get("prompt", ""), fields)
         reply = await runner(flowlet, prompt, str(image_path))
-        parsed = _extract_json(reply or "")
+        # The item's own field names disambiguate the reply: a model that pads
+        # its answer with a tool-call preamble can't have the preamble win.
+        parsed = _extract_json(
+            reply or "", prefer_keys=[f for f, ft in fields.items() if ft != "image"]
+        )
     except Exception as exc:  # noqa: BLE001 — model/parse failure: don't keep the orphan
         if att_id:
             store.delete_attachment(flowlet_id, att_id)

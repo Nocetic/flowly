@@ -125,6 +125,40 @@ def test_vision_runner_uses_tool_names_as_property():
     assert "tool_names()" not in src, "tool_names is a property — don't call it"
 
 
+async def test_capture_survives_a_hallucinated_tool_call_preamble(store):
+    """The vision turn is tool-less, but the model still emits pseudo-XML tool
+    tags as PLAIN TEXT ahead of its answer. Extraction used to slice from the
+    first `{` — inside `arguments="{\\"command\\"…}"` — through the last `}`,
+    which parsed as nothing and failed every capture the model had read fine."""
+    async def _runner_noisy(flowlet, prompt, image_path):
+        return (
+            '<tool_call tool="exec" arguments="{\\"command\\":\\"date +%F\\"}"} yielding="output" />\n'
+            '<tool_result tool="exec" status="success" duration_ms="18" output="2026-07-21\\n" />\n'
+            '{"name": "Tavuklu pilav", "kcal": 620}'
+        )
+    f = store.create("Kalori", _meal_def())
+    fl = store.get(f["id"])
+    values = await apply_capture(
+        store, fl, _photo_component(fl["definition"]), _JPEG, runner=_runner_noisy
+    )
+    assert values["meals"][0]["name"] == "Tavuklu pilav"
+    assert values["meals"][0]["kcal"] == 620
+
+
+async def test_capture_ignores_a_well_formed_preamble_via_the_item_schema(store):
+    # Same shape, but the hallucinated preamble is itself valid JSON. The item's
+    # own field names are the tiebreak, so the real reading still wins.
+    async def _runner(flowlet, prompt, image_path):
+        return '{"command":"date +%F"}\n{"name": "Mercimek çorbası", "kcal": 180}'
+    f = store.create("Kalori", _meal_def())
+    fl = store.get(f["id"])
+    values = await apply_capture(
+        store, fl, _photo_component(fl["definition"]), _JPEG, runner=_runner
+    )
+    assert values["meals"][0]["name"] == "Mercimek çorbası"
+    assert values["meals"][0]["kcal"] == 180
+
+
 async def test_capture_fails_closed_on_unreadable_photo(store):
     # The model returns nothing matching the item schema → no ghost row is
     # appended, and the stored photo is cleaned up (not orphaned).
