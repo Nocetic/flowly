@@ -38,7 +38,8 @@ def test_capabilities_advertises_flowlets(rpc_home):
     caps = feature_rpc.system_capabilities()
     methods = set(caps["featureMethods"])
     assert {"flowlets.list", "flowlets.get", "flowlets.state",
-            "flowlets.action", "flowlets.pin", "flowlets.delete"} <= methods
+            "flowlets.action", "flowlets.pin", "flowlets.delete",
+            "flowlets.templates", "flowlets.createFromTemplate"} <= methods
 
 
 async def test_dispatch_list_and_get(rpc_home):
@@ -102,6 +103,48 @@ async def test_dispatch_delete_broadcasts(rpc_home):
         assert any(n == "flowlet.deleted" for n, _ in events)
     finally:
         feature_rpc.set_flowlet_broadcast(None)
+
+
+async def test_dispatch_templates_are_localized(rpc_home):
+    from flowly.channels import feature_rpc
+    en, _ = await feature_rpc.dispatch("flowlets.templates", {})
+    tr, _ = await feature_rpc.dispatch("flowlets.templates", {"lang": "tr-TR"})
+    assert [t["id"] for t in en["templates"]] == [t["id"] for t in tr["templates"]]
+    assert en["templates"][0]["title"] != tr["templates"][0]["title"]
+
+
+async def test_dispatch_create_from_template_creates_and_broadcasts(rpc_home):
+    from flowly.channels import feature_rpc
+    events = []
+
+    async def capture(name, data):
+        events.append((name, data))
+
+    feature_rpc.set_flowlet_broadcast(capture)
+    try:
+        res, _ = await feature_rpc.dispatch(
+            "flowlets.createFromTemplate", {"templateId": "water", "lang": "tr"}
+        )
+        created = res["flowlet"]
+        assert created["name"] == "Su Takibi"
+        assert "values" in created            # a card can render it immediately
+        assert any(n == "flowlet.created" for n, _ in events)
+
+        # It is an ORDINARY flowlet from here on — listed, gettable, editable.
+        listed, _ = await feature_rpc.dispatch("flowlets.list", {})
+        assert [f["id"] for f in listed["flowlets"]] == [created["id"]]
+        got, _ = await feature_rpc.dispatch("flowlets.get", {"id": created["id"]})
+        assert got["values"]["goal_ml"] == 2000
+    finally:
+        feature_rpc.set_flowlet_broadcast(None)
+
+
+async def test_dispatch_create_from_template_rejects_unknown(rpc_home):
+    from flowly.channels import feature_rpc
+    with pytest.raises(feature_rpc.FeatureRpcError):
+        await feature_rpc.dispatch("flowlets.createFromTemplate", {"templateId": "nope"})
+    with pytest.raises(feature_rpc.FeatureRpcError):
+        await feature_rpc.dispatch("flowlets.createFromTemplate", {})
 
 
 async def test_agent_action_uses_runner(rpc_home):

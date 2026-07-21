@@ -2090,6 +2090,60 @@ async def flowlets_delete(params: dict) -> dict:
     return {"ok": ok}
 
 
+def flowlets_templates(params: dict) -> dict:
+    """The ready-made flowlets a client can offer, localized to the caller's own
+    language. Cards only — a picker never needs the definitions.
+    ``{lang?}`` → ``{templates: [{id, title, description, icon, accent}]}``."""
+    from flowly.flowlets.templates import list_templates
+
+    return {"templates": list_templates(params.get("lang"))}
+
+
+async def flowlets_create_from_template(params: dict) -> dict:
+    """Instantiate a template as an ORDINARY flowlet the user owns — no lasting
+    link back, so the agent can reshape it afterwards like any other screen.
+    ``{templateId, lang?, pinned?}`` → ``{flowlet}`` (list's summary shape).
+
+    Mirrors the authoring tool's create path exactly — assign ids, validate,
+    store, broadcast — so a templated flowlet is indistinguishable from one the
+    agent wrote."""
+    from flowly.flowlets.normalize import assign_missing_ids
+    from flowly.flowlets.schema import FlowletValidationError, validate_definition
+    from flowly.flowlets.templates import build_template
+
+    template_id = str(params.get("templateId", "") or "")
+    if not template_id:
+        raise FeatureRpcError("INVALID", "templateId required")
+    try:
+        definition = build_template(template_id, params.get("lang"))
+    except KeyError:
+        raise FeatureRpcError("NOT_FOUND", f"template '{template_id}' not found")
+    definition = assign_missing_ids(definition)
+    try:
+        validate_definition(definition)
+    except FlowletValidationError as exc:
+        raise FeatureRpcError("INVALID", str(exc))
+
+    flowlet = _flowlet_store().create(
+        name=str(definition.get("name") or template_id),
+        definition=definition,
+        icon=definition.get("icon"),
+        accent=definition.get("accent"),
+        catalog=int(definition.get("catalog") or 3),
+        pinned=bool(params.get("pinned", False)),
+    )
+    try:
+        summary = _flowlet_summary(flowlet, _flowlet_values(flowlet))
+    except Exception:
+        summary = _flowlet_summary(flowlet)
+    if _flowlet_broadcast_cb is not None:
+        try:
+            await _flowlet_broadcast_cb("flowlet.created", summary)
+        except Exception:
+            pass
+    return {"flowlet": summary}
+
+
 # ── Logs ─────────────────────────────────────────────────────────────────────
 
 def _gateway_log_file():
@@ -3187,6 +3241,8 @@ _DISPATCH: dict[str, tuple] = {
     "flowlets.itemRemove": (flowlets_item_remove, True, False),
     "flowlets.pin":       (flowlets_pin, True, False),
     "flowlets.delete":    (flowlets_delete, True, False),
+    "flowlets.templates": (flowlets_templates, True, False),
+    "flowlets.createFromTemplate": (flowlets_create_from_template, True, False),
     "model.list":         (model_list, True, False),
     "model.set":          (model_set, True, True),
     "assistants.list":    (assistants_list, False, False),
