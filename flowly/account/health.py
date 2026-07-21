@@ -3,14 +3,13 @@
 Used by:
   * ``flowly login`` — gap detection on the "already signed in" path,
     pre-flight check before ``--repair`` short-circuits.
-  * ``flowly doctor`` — read-only health dashboard.
-  * (future) ``flowly doctor --fix`` — orchestrator that maps detected
-    issues onto the right repair command.
+  * ``flowly onboard`` — token-state check when deciding whether an
+    existing sign-in can be reused.
 
 Every function in this module is **side-effect-free**. They read
 ``~/.flowly/config.json`` and the keychain / fallback credentials file,
-never write. That guarantee is load-bearing: doctor must be safe to
-run against any install without surprising the user. Mutation lives
+never write. That guarantee is load-bearing: these checks must be safe
+to run against any install without surprising the user. Mutation lives
 in ``relay_config.py``, ``token_store.py``, ``active_provider.py``.
 """
 
