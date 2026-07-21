@@ -256,11 +256,37 @@ def update(
 
 @app.command()
 def doctor(
-    fix: bool = typer.Option(False, "--fix", "-f", help="Auto-repair fixable issues"),
+    fix: bool = typer.Option(False, "--fix", "-f", help="Run registered safe repairs"),
+    online: bool = typer.Option(False, "--online", help="Opt in to network/credential probes"),
+    strict: bool = typer.Option(False, "--strict", help="Treat warnings as an unhealthy exit"),
+    json_output: bool = typer.Option(False, "--json", help="Emit one machine-readable JSON line"),
+    category: list[str] | None = typer.Option(
+        None,
+        "--category",
+        "-c",
+        help="Run one diagnostic category (repeatable)",
+    ),
+    timeout: float = typer.Option(5.0, "--timeout", min=0.1, max=120.0),
+    repair: str = typer.Option(
+        "",
+        "--repair",
+        help="Run one named canonical-data recovery action",
+    ),
 ):
-    """Check configuration and runtime health. Use --fix to auto-repair."""
+    """Inspect configuration and runtime health (offline and read-only by default)."""
     from flowly.cli.doctor import run_doctor
-    raise typer.Exit(run_doctor(fix=fix))
+
+    raise typer.Exit(
+        run_doctor(
+            fix=fix,
+            online=online,
+            strict=strict,
+            json_output=json_output,
+            categories=set(category) if category else None,
+            timeout=timeout,
+            repair=repair,
+        )
+    )
 
 
 @app.command()
