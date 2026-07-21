@@ -603,6 +603,62 @@ def test_online_probe_uses_flowly_account_key_from_runtime_config(
     assert results["provider_online"]["status"] == "ok"
 
 
+def test_online_probe_prefers_file_account_credential_over_relay_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Source order must match the runtime resolver: account.json beats channels.web."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    credentials = home / "credentials"
+    credentials.mkdir(mode=0o700)
+    account = credentials / "account.json"
+    account.write_text(
+        json.dumps(
+            {"server_id": "srv_file", "gateway_auth_token": "tok_file", "email": "a@b.c"}
+        ),
+        encoding="utf-8",
+    )
+    account.chmod(0o600)
+    config = Config()
+    config.agents.defaults.workspace = str(home / "workspace")
+    config.providers.active = "flowly"
+    config.channels.web.enabled = True
+    config.channels.web.server_id = "srv_relay"
+    config.channels.web.auth_token = "tok_relay"
+    config.channels.web.relay_url = "wss://relay.example"
+    config_path = home / "config.json"
+    config_path.write_text(
+        json.dumps(convert_to_camel(config.model_dump())),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    calls: list[tuple[str, dict]] = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"status": "ok", "auth_required": False, "capabilities": []}
+
+    def fake_get(url: str, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr("httpx.get", fake_get)
+
+    code = run_doctor(online=True, categories={"online"}, json_output=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    provider_call = next(call for call in calls if "useflowlyapp.com" in call[0])
+    assert provider_call[1]["headers"]["Authorization"] == "Bearer srv_file:tok_file"
+    results = {item["name"]: item for item in payload["results"]}
+    assert results["provider_online"]["status"] == "ok"
+
+
 def test_online_category_requires_explicit_online_flag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

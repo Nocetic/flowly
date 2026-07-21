@@ -883,14 +883,18 @@ def _static_provider(ctx: DoctorContext) -> tuple[str, str, str] | None:
             flowly = config.providers.flowly
             if not flowly.enabled:
                 return None
+            # Same source order as the runtime resolver in
+            # flowly.integrations.active_provider: config pair, then the
+            # file-backed account credential, then the Desktop relay pair.
             key = (flowly.account_key or "").strip()
             if not key and flowly.server_id and flowly.auth_token:
                 key = f"{flowly.server_id.strip()}:{flowly.auth_token.strip()}"
-            web = config.channels.web
-            if not key and web.enabled and web.server_id and web.auth_token:
-                key = f"{web.server_id.strip()}:{web.auth_token.strip()}"
             if not key:
                 key = _flowly_file_credential(ctx)
+            if not key:
+                web = config.channels.web
+                if web.enabled and web.server_id and web.auth_token:
+                    key = f"{web.server_id.strip()}:{web.auth_token.strip()}"
             return (name, key, _PROVIDER_BASES[name]) if key else None
         if name in _CREDENTIAL_STORE_PROVIDERS:
             return None
