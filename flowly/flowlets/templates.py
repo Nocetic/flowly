@@ -529,7 +529,7 @@ TEMPLATES: tuple[Template, ...] = (
         build=_water,
     ),
     Template(
-        id="habits", icon="check", accent="#7C6FF0",
+        id="habits", icon="flame", accent="#7C6FF0",
         title=("Habits", "Alışkanlıklar", "Hábitos"),
         description=(
             "Two habits to tick off, an evening nudge, and a streak you can see.",
@@ -539,7 +539,7 @@ TEMPLATES: tuple[Template, ...] = (
         build=_habits,
     ),
     Template(
-        id="expenses", icon="receipt", accent="#E2703A",
+        id="expenses", icon="wallet", accent="#E2703A",
         title=("Expenses", "Harcamalar", "Gastos"),
         description=(
             "A budget, a category breakdown, and entry straight from a receipt photo.",
@@ -549,7 +549,7 @@ TEMPLATES: tuple[Template, ...] = (
         build=_expenses,
     ),
     Template(
-        id="tasks", icon="list", accent="#2E9E6B",
+        id="tasks", icon="check", accent="#2E9E6B",
         title=("Tasks", "Görevler", "Tareas"),
         description=(
             "A running list you add to, tick off, and swipe away.",

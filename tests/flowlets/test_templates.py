@@ -45,6 +45,16 @@ def test_template_carries_its_card_metadata(template_id):
         assert defn["catalog"] == 3
 
 
+def test_icons_are_real_catalog_names():
+    """`validate_definition` doesn't police icon names, and both clients fall
+    back to a neutral dot for one they don't know — so a typo here ships as a
+    blank card that nothing else would have caught."""
+    from flowly.flowlets.catalog import ICON_NAMES
+
+    for t in TEMPLATES:
+        assert t.icon in ICON_NAMES, f"{t.id}: '{t.icon}' is not a catalog icon"
+
+
 def test_ids_are_stable_and_unique():
     # Clients key their picker off these; renaming one is a breaking change, so
     # it should take a deliberate edit here.
