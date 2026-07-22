@@ -41,6 +41,7 @@ def _restore_httpx():
 def test_model_normalization_strips_prefix_and_effort_suffix():
     assert _normalize_codex_model("openai/gpt-5.5") == "gpt-5.5"
     assert _normalize_codex_model("gpt-5.5:high") == "gpt-5.5"
+    assert _normalize_codex_model("gpt-5.6-sol:max") == "gpt-5.6-sol"
     assert _normalize_codex_model("chatgpt/gpt-5.4-mini") == "gpt-5.4-mini"
     assert _normalize_codex_model(None) == codex.DEFAULT_CODEX_MODEL
 
@@ -50,6 +51,8 @@ def test_effort_rules():
     assert _resolve_effort("gpt-5.5", "minimal") == "low"   # backend has no "minimal"
     assert _resolve_effort("gpt-5.5", "none") == "none"     # general model keeps none
     assert _resolve_effort("gpt-5.5-codex", "none") == "low"  # codex rejects none
+    assert _resolve_effort("gpt-5.6-sol", "none") == "low"
+    assert _resolve_effort("gpt-5.6-sol:max") == "max"
     assert _resolve_effort("gpt-5.5", "bogus") == "medium"
 
 
@@ -230,3 +233,11 @@ def test_default_model_matches_curated_default():
     # provider switch doesn't land on an id the backend rejects.
     from flowly.integrations.active_provider import DEFAULT_MODELS
     assert DEFAULT_MODELS["openai_codex"] == codex.DEFAULT_CODEX_MODEL
+
+
+def test_openai_codex_compatibility_accepts_new_gpt_5_variants():
+    from flowly.integrations.active_provider import model_fits_provider
+
+    assert model_fits_provider("gpt-5.6-sol", "openai_codex") is True
+    assert model_fits_provider("gpt-5.6-terra", "openai_codex") is True
+    assert model_fits_provider("gpt-4o", "openai_codex") is False

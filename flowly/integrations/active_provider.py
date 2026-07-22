@@ -307,7 +307,7 @@ DEFAULT_MODELS: dict[str, str] = {
     "sakana": "fugu",                         # Fugu orchestrator (also: fugu-ultra)
     "xai": "grok-4.3",                        # matches model_catalog._XAI_TOP_MODEL
     "xai_oauth": "grok-4.20-reasoning",       # matches DEFAULT_XAI_RESPONSES_MODEL
-    "openai_codex": "gpt-5.5",                # matches DEFAULT_CODEX_MODEL
+    "openai_codex": "gpt-5.6-sol",            # matches DEFAULT_CODEX_MODEL
 }
 
 # Cheap offline "does this model plausibly belong to this provider?" check —
@@ -328,9 +328,9 @@ _MODEL_PREFIX_HINTS: dict[str, tuple[str, ...]] = {
     "sakana": ("fugu",),
     "xai": ("grok",),
     "xai_oauth": ("grok",),
-    # ChatGPT subscription serves the current-generation general GPT-5.x
-    # models (gpt-5.4 / gpt-5.5 families) — not codex-suffixed or older ids.
-    "openai_codex": ("gpt-5.4", "gpt-5.5"),
+    # Match the current family so newly-added GPT-5.x variants from the live
+    # catalogue are not reset while the asynchronous catalogue is warming.
+    "openai_codex": ("gpt-5.",),
 }
 
 

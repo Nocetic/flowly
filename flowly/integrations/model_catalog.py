@@ -415,32 +415,149 @@ async def _fetch_xai_apikey() -> list[Model]:
     return await _fetch_xai_models(api_key, base)
 
 
-# ChatGPT subscription (Codex OAuth) has no public /models endpoint — the
-# plan gates access, not a catalogue. The backend serves the current
-# general-purpose GPT-5.x models and 400s everything else (older versions,
-# codex-suffixed ids). Verified live against a Plus plan on 2026-07-02;
-# higher tiers may unlock more, and a user can still type a custom id.
-_CODEX_MODELS: list[tuple[str, str, list[str]]] = [
-    ("gpt-5.5", "GPT-5.5 — newest, strongest reasoning", ["reasoning"]),
-    ("gpt-5.4", "GPT-5.4 — general purpose", ["reasoning"]),
-    ("gpt-5.4-mini", "GPT-5.4 Mini — fast and efficient", ["fast"]),
+# The ChatGPT Codex backend exposes the same account-authenticated catalogue
+# used by the Codex CLI. Keep a small fallback so a transient failure does not
+# make the picker empty; the live response remains the source of truth.
+_CODEX_FALLBACK_CONTEXT_WINDOW = 272_000
+_CODEX_FALLBACK_MODELS: list[tuple[str, str, str, list[str]]] = [
+    ("gpt-5.6-sol", "GPT-5.6-Sol", "Latest frontier agentic coding model.",
+     ["reasoning", "vision"]),
+    ("gpt-5.6-terra", "GPT-5.6-Terra", "Balanced agentic coding model for everyday work.",
+     ["reasoning", "vision"]),
+    ("gpt-5.6-luna", "GPT-5.6-Luna", "Fast and affordable agentic coding model.",
+     ["reasoning", "fast", "vision"]),
+    ("gpt-5.5", "GPT-5.5", "Frontier model for complex coding, research, and real-world work.",
+     ["reasoning", "vision"]),
+    ("gpt-5.4", "GPT-5.4", "Strong model for everyday coding.", ["reasoning", "vision"]),
+    ("gpt-5.4-mini", "GPT-5.4-Mini", "Small, fast, and cost-efficient model.",
+     ["reasoning", "fast", "vision"]),
 ]
 
 
-async def _fetch_openai_codex() -> list[Model]:
-    """ChatGPT subscription models — static, gated by the signed-in plan.
-
-    Only returns rows when a Codex OAuth credential is present, so the picker
-    stays empty (with the "sign in" hint) until the user logs in.
-    """
-    from flowly.auth.openai_codex import load_token_payload
-    payload = await asyncio.to_thread(load_token_payload)
-    if payload is None or not payload.access_token:
-        return []
+def _static_codex_models() -> list[Model]:
+    """Return fresh picker rows for the offline Codex catalogue fallback."""
     return [
-        Model(id=mid, name=mid, description=desc, tags=list(tags))
-        for mid, desc, tags in _CODEX_MODELS
+        Model(
+            id=mid,
+            name=name,
+            description=description,
+            context_window=_CODEX_FALLBACK_CONTEXT_WINDOW,
+            tags=list(tags),
+            supports_vision="vision" in tags,
+        )
+        for mid, name, description, tags in _CODEX_FALLBACK_MODELS
     ]
+
+
+def _codex_models_from_payload(payload: Any) -> list[Model]:
+    """Map the ChatGPT Codex ``/models`` response into picker rows."""
+    if not isinstance(payload, dict):
+        return []
+    raw_models = payload.get("models")
+    if not isinstance(raw_models, list):
+        # Defensive compatibility if the backend adopts the conventional
+        # OpenAI ``data`` wrapper in a future response revision.
+        raw_models = payload.get("data")
+    if not isinstance(raw_models, list):
+        return []
+
+    ranked: list[tuple[int, str, Model]] = []
+    for index, item in enumerate(raw_models):
+        if not isinstance(item, dict):
+            continue
+        # The authenticated response is authoritative for ChatGPT OAuth.
+        # ``supported_in_api`` concerns API-key access, not this provider.
+        if str(item.get("visibility") or "list").lower() != "list":
+            continue
+        mid = str(item.get("slug") or item.get("id") or "").strip()
+        if not mid:
+            continue
+
+        levels = item.get("supported_reasoning_levels")
+        tags: list[str] = ["reasoning"] if isinstance(levels, list) and levels else []
+        description = str(item.get("description") or "")[:140]
+        low_id = mid.lower()
+        if "fast" in description.lower() or "mini" in low_id or low_id.endswith("-luna"):
+            tags.append("fast")
+
+        modalities = item.get("input_modalities")
+        if isinstance(modalities, list):
+            supports_vision: bool | None = any(
+                "image" in str(modality).lower() for modality in modalities
+            )
+        elif isinstance(modalities, str):
+            supports_vision = "image" in modalities.lower()
+        else:
+            supports_vision = None
+        if supports_vision is True:
+            tags.append("vision")
+
+        raw_context = item.get("context_window") or item.get("max_context_window")
+        context_window = (
+            int(raw_context)
+            if isinstance(raw_context, int) and not isinstance(raw_context, bool) and raw_context > 0
+            else None
+        )
+        raw_priority = item.get("priority")
+        priority = (
+            int(raw_priority)
+            if isinstance(raw_priority, (int, float)) and not isinstance(raw_priority, bool)
+            else 1_000_000 + index
+        )
+        model = Model(
+            id=mid,
+            name=str(item.get("display_name") or item.get("name") or mid),
+            description=description,
+            context_window=context_window,
+            tags=tags,
+            supports_vision=supports_vision,
+        )
+        ranked.append((priority, low_id, model))
+
+    ranked.sort(key=lambda entry: (entry[0], entry[1]))
+    return [model for _, _, model in ranked]
+
+
+async def _fetch_openai_codex() -> list[Model]:
+    """Fetch the signed-in account's live ChatGPT Codex model catalogue.
+
+    ``client_version`` is required by this endpoint. A 401 refreshes OAuth
+    once; all other network/schema failures use the curated fallback.
+    """
+    from flowly import __version__
+    from flowly.auth.openai_codex import resolve_runtime_credentials
+
+    try:
+        creds = await asyncio.to_thread(resolve_runtime_credentials)
+    except Exception:
+        return []
+    if creds is None or not creds.api_key or not creds.account_id:
+        return []
+
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                response = await client.get(
+                    f"{creds.base_url.rstrip('/')}/models",
+                    params={"client_version": __version__},
+                    headers={
+                        "Authorization": f"Bearer {creds.api_key}",
+                        "ChatGPT-Account-Id": creds.account_id,
+                        "Accept": "application/json",
+                        "User-Agent": _UA,
+                        "originator": "flowly",
+                    },
+                )
+            if response.status_code == 401 and attempt == 0:
+                creds = await asyncio.to_thread(resolve_runtime_credentials, force_refresh=True)
+                if creds is None or not creds.api_key or not creds.account_id:
+                    return _static_codex_models()
+                continue
+            response.raise_for_status()
+            return _codex_models_from_payload(response.json()) or _static_codex_models()
+        except Exception:
+            return _static_codex_models()
+    return _static_codex_models()
 
 
 _ZAI_CODING_MODELS: list[tuple[str, str, int, list[str]]] = [
