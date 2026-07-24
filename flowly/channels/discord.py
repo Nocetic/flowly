@@ -200,15 +200,44 @@ class DiscordChannel(BaseChannel):
             return
 
         is_guild = bool(payload.get("guild_id"))
-        if is_guild and not self._should_respond_in_guild(payload, channel_id, content):
+        should_respond = not is_guild or self._should_respond_in_guild(
+            payload, channel_id, content
+        )
+        # When we won't reply, still passively record the message so the next
+        # mention has the channel's context. Scoped to "mention" policy: open
+        # answers everything (nothing to observe) and allowlist deliberately
+        # ignores channels it isn't in, so neither should buffer.
+        observe = (
+            is_guild
+            and not should_respond
+            and self.config.group_policy == "mention"
+            and getattr(self.config, "group_context", "listen") == "listen"
+        )
+        if not should_respond and not observe:
             return
 
         content = self._strip_bot_mention(content)
         content = self._humanize_mentions(payload, content)
+        sender_name = self._author_name(payload)
+
+        # Observed (not answered): forward bare text tagged group_observe so the
+        # loop files it into the channel's context buffer — no LLM turn, no
+        # typing indicator, no attachment download.
+        if observe:
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=channel_id,
+                content=content or "[non-text message]",
+                metadata={
+                    "guild_id": payload.get("guild_id"),
+                    "sender_name": sender_name,
+                    "group_observe": True,
+                },
+            )
+            return
 
         # Label server messages with the human sender so the agent can tell
         # channel members apart — raw content gives it no speaker at all.
-        sender_name = self._author_name(payload)
         if is_guild and sender_name:
             content = f"[{sender_name}]: {content}" if content else f"[{sender_name}]:"
 

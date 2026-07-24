@@ -25,12 +25,14 @@ def _run(coro):
 def _make_channel(
     group_policy: str = "mention",
     group_allow_from: list[str] | None = None,
+    group_context: str = "listen",
 ) -> tuple[DiscordChannel, list[dict]]:
     config = DiscordConfig(
         enabled=True,
         token="t",
         group_policy=group_policy,
         group_allow_from=group_allow_from or [],
+        group_context=group_context,
     )
     channel = DiscordChannel(config, MagicMock())
     channel._bot_user_id = "BOT1"
@@ -83,8 +85,10 @@ def _bot_mention(uid: str = "BOT1") -> dict:
 # ── group policy gating ─────────────────────────────────────────────
 
 
-def test_mention_policy_ignores_plain_guild_message():
-    channel, handled = _make_channel("mention")
+def test_mention_policy_does_not_reply_to_plain_guild_message():
+    # Not answered; with listen default it's observed instead — covered by
+    # test_unanswered_guild_message_is_observed below.
+    channel, handled = _make_channel("mention", group_context="off")
     _feed(channel, _payload("günaydın ekip"))
     assert handled == []
 
@@ -156,3 +160,50 @@ def test_bot_mention_is_stripped_and_others_humanized():
         ),
     )
     assert handled[0]["content"] == "[Hakan]: @Ayşe ile konuş"
+
+
+# ── passive channel context (Faz B / observe path) ──────────────────
+
+
+def test_unanswered_guild_message_is_observed():
+    channel, handled = _make_channel("mention")
+    _feed(channel, _payload("günaydın ekip"))
+    assert len(handled) == 1
+    kw = handled[0]
+    assert kw["metadata"]["group_observe"] is True
+    # Bare text (no [name] prefix) + sender name in metadata for the loop.
+    assert kw["content"] == "günaydın ekip"
+    assert kw["metadata"]["sender_name"] == "Hakan"
+
+
+def test_group_context_off_drops_unanswered_guild_messages():
+    channel, handled = _make_channel("mention", group_context="off")
+    _feed(channel, _payload("selam ekip"))
+    assert handled == []
+
+
+def test_observed_guild_message_gets_no_typing():
+    called: list[str] = []
+
+    channel, handled = _make_channel("mention")
+
+    async def record_typing(channel_id: str) -> None:
+        called.append(channel_id)
+
+    channel._start_typing = record_typing  # type: ignore[method-assign]
+    _feed(channel, _payload("selam ekip"))
+    assert called == []
+
+
+def test_open_policy_never_observes_it_answers():
+    channel, handled = _make_channel("open")
+    _feed(channel, _payload("selam"))
+    assert len(handled) == 1
+    assert "group_observe" not in handled[0]["metadata"]
+
+
+def test_dm_is_never_observed():
+    channel, handled = _make_channel("mention")
+    _feed(channel, _payload("selam", guild_id=None))
+    assert len(handled) == 1
+    assert "group_observe" not in handled[0]["metadata"]

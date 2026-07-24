@@ -28,10 +28,12 @@ def _run(coro):
 def _make_channel(
     group_policy: str = "mention",
     users: dict[str, str] | None = None,
+    group_context: str = "listen",
 ) -> tuple[SlackChannel, list[dict]]:
     """SlackChannel wired to a stub web client; returns (channel, handled)."""
     config = SlackConfig(
-        enabled=True, bot_token="xoxb-t", app_token="xapp-t", group_policy=group_policy
+        enabled=True, bot_token="xoxb-t", app_token="xapp-t",
+        group_policy=group_policy, group_context=group_context,
     )
     channel = SlackChannel(config, MagicMock())
     channel._bot_user_id = "UBOT"
@@ -45,6 +47,8 @@ def _make_channel(
         return {"user": {"profile": {"display_name": name}}}
 
     web.users_info = AsyncMock(side_effect=users_info)
+    web.conversations_info = AsyncMock(return_value={"channel": {"name": "genel"}})
+    web.conversations_members = AsyncMock(return_value={"members": ["U1", "U2"]})
     channel._web_client = web
 
     handled: list[dict] = []
@@ -90,8 +94,10 @@ def _app_mention(text: str, ts: str = "100.1", **extra) -> dict:
 # ── mention gating ──────────────────────────────────────────────────
 
 
-def test_mention_policy_ignores_plain_channel_message():
-    channel, handled = _make_channel("mention")
+def test_mention_policy_does_not_reply_to_plain_channel_message():
+    # Not answered (no reply turn); with listen default it's observed instead —
+    # covered by test_unanswered_mention_channel_message_is_observed below.
+    channel, handled = _make_channel("mention", group_context="off")
     _feed(channel, _msg("günaydın ekip"))
     assert handled == []
 
@@ -154,8 +160,12 @@ def test_unresolvable_sender_degrades_to_raw_content():
 
 def test_user_name_lookup_is_cached():
     channel, handled = _make_channel("open", users={"U1": "Hakan"})
-    _feed(channel, _msg("bir", ts="1.1"), _msg("iki", ts="1.2"))
-    assert channel._web_client.users_info.await_count == 1
+    _feed(channel, _msg("bir", ts="1.1"))
+    after_first = channel._web_client.users_info.await_count
+    _feed(channel, _msg("iki", ts="1.2"))
+    # Second message from the same user resolves no new names — sender and
+    # channel-member lookups are both cached.
+    assert channel._web_client.users_info.await_count == after_first
 
 
 def test_other_user_mentions_are_humanized():
@@ -168,3 +178,54 @@ def test_channel_refs_are_humanized():
     channel, handled = _make_channel("open", users={"U1": "Hakan"})
     _feed(channel, _msg("detaylar <#C42|genel> kanalında"))
     assert handled[0]["content"] == "[Hakan]: detaylar #genel kanalında"
+
+
+# ── passive channel context (Faz B / observe path) ──────────────────
+
+
+def test_unanswered_mention_channel_message_is_observed():
+    # mention policy, plain message → not answered but recorded for context.
+    channel, handled = _make_channel("mention", users={"U1": "Hakan"})
+    _feed(channel, _msg("günaydın ekip"))
+    assert len(handled) == 1
+    kw = handled[0]
+    assert kw["metadata"]["group_observe"] is True
+    # Bare text (no [name] prefix) — the loop labels it in the context block.
+    assert kw["content"] == "günaydın ekip"
+    assert kw["metadata"]["slack"]["sender_name"] == "Hakan"
+
+
+def test_observed_message_gets_no_reaction():
+    channel, handled = _make_channel("mention")
+    _feed(channel, _msg("selam ekip"))
+    channel._web_client.reactions_add.assert_not_awaited()
+
+
+def test_group_context_off_drops_unanswered_messages():
+    channel, handled = _make_channel("mention", group_context="off")
+    _feed(channel, _msg("selam ekip"))
+    assert handled == []
+
+
+def test_open_policy_never_observes_it_answers():
+    # In open mode every message is answered, so nothing is merely observed.
+    channel, handled = _make_channel("open")
+    _feed(channel, _msg("selam"))
+    assert len(handled) == 1
+    assert "group_observe" not in handled[0]["metadata"]
+
+
+def test_answered_mention_attaches_channel_awareness():
+    channel, handled = _make_channel("mention", users={"U1": "Hakan", "U2": "Ayşe"})
+    _feed(channel, _msg("<@UBOT> özetle"))
+    slack = handled[0]["metadata"]["slack"]
+    assert slack["channel_name"] == "genel"
+    assert slack["members"] == ["Hakan", "Ayşe"]
+
+
+def test_dm_is_never_observed():
+    channel, handled = _make_channel("mention", group_context="listen")
+    _feed(channel, _msg("selam", channel_type="im"))
+    # DMs always answer; observe flag never set.
+    assert len(handled) == 1
+    assert "group_observe" not in handled[0]["metadata"]

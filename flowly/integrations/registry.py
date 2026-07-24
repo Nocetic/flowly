@@ -116,6 +116,13 @@ _CHANNELS: list[IntegrationCard] = [
             Field("group_allow_from", "Allowed channels", FieldType.MULTI,
                   placeholder="123456789012345678, …",
                   help="Channel IDs (used when group policy = allowlist)."),
+            Field("group_context", "Channel awareness", FieldType.SELECT,
+                  default="listen",
+                  choices=[("listen", "listen · read the channel so replies have context"),
+                           ("off", "off · only see messages that reach it")],
+                  help="When listening, unanswered channel messages are kept "
+                       "locally so a reply knows the conversation. It still only "
+                       "replies by your group policy; nothing leaves your machine."),
         ],
         probe=probe_discord,
     ),
@@ -140,6 +147,13 @@ _CHANNELS: list[IntegrationCard] = [
             Field("group_allow_from", "Allowed channels", FieldType.MULTI,
                   placeholder="C01ABCDEF, C02XXXX",
                   help="Channel IDs (used when group policy = allowlist)."),
+            Field("group_context", "Channel awareness", FieldType.SELECT,
+                  default="listen",
+                  choices=[("listen", "listen · read the channel so replies have context"),
+                           ("off", "off · only see messages that reach it")],
+                  help="When listening, unanswered channel messages are kept "
+                       "locally so a reply knows the conversation. It still only "
+                       "replies by your group policy; nothing leaves your machine."),
         ],
         probe=probe_slack,
     ),

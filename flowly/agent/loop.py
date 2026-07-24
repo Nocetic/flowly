@@ -80,6 +80,12 @@ _DEFAULT_MAX_CHARS = 8000
 # heartbeat/cron tick never looks like a conversation worth remembering.
 _NON_USER_CHANNELS = ("system", "heartbeat", "cron")
 
+# Passive group-context buffer bounds (Slack/Discord "listen" mode). Un-answered
+# channel messages accumulate per session until the next mention flushes them
+# into that turn's LLM view; oldest entries drop past either cap.
+_GROUP_BUFFER_MAX_MSGS = 50
+_GROUP_BUFFER_MAX_CHARS = 6000
+
 
 def _is_user_activity_channel(channel: str) -> bool:
     """True when ``channel`` is real user conversation (not a background run)."""
@@ -2475,10 +2481,79 @@ class AgentLoop:
         (subagent announces re-enter as channel="system") stay strictly
         sequential, preserving their existing ordering guarantees.
         """
+        if msg.metadata.get("group_observe"):
+            # A passively-observed channel message: file it into the session's
+            # context buffer and stop. No LLM turn, no reply — the bot stays
+            # silent but remembers what was said for the next mention.
+            await self._record_group_observation(msg)
+            return
+
         if msg.channel == "web":
             self._spawn_concurrent_turn(msg)
         else:
             await self._process_turn(msg)
+
+    async def _record_group_observation(self, msg: "InboundMessage") -> None:
+        """Append an un-answered channel message to its session's group buffer.
+
+        Cheap and side-effect-free: no provider call, no outbound. The buffer
+        lives on session metadata (so it survives restarts) and is bounded by
+        ``_GROUP_BUFFER_MAX_MSGS`` / ``_GROUP_BUFFER_MAX_CHARS`` — oldest first.
+        """
+        try:
+            session = self.sessions.get_or_create(msg.session_key)
+            buf = session.metadata.get("group_buffer")
+            if not isinstance(buf, list):
+                buf = []
+            slack_meta = msg.metadata.get("slack") or {}
+            name = (
+                slack_meta.get("sender_name")
+                or msg.metadata.get("sender_name")
+                or msg.sender_id
+            )
+            buf.append({"s": str(name), "c": msg.content or ""})
+            # Drop oldest until both caps hold.
+            while buf and (
+                len(buf) > _GROUP_BUFFER_MAX_MSGS
+                or sum(len(e.get("c") or "") for e in buf) > _GROUP_BUFFER_MAX_CHARS
+            ):
+                buf.pop(0)
+            session.metadata["group_buffer"] = buf
+            self.sessions.save(session)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"group observation record skipped: {exc}")
+
+    def _flush_group_context(self, session: Any, msg: "InboundMessage") -> str:
+        """Pop the session's group buffer and render it as an LLM context block.
+
+        Returns '' when nothing was observed. The block is EPHEMERAL — prepended
+        only to this turn's current-message (never the persisted user turn), so
+        the reply is informed but history stays clean. Cleared one-shot: the next
+        mention re-injects only messages observed since this one.
+        """
+        buf = session.metadata.get("group_buffer")
+        if not isinstance(buf, list) or not buf:
+            return ""
+
+        slack_meta = msg.metadata.get("slack") or {}
+        ctx: list[str] = []
+        ch_name = slack_meta.get("channel_name") or ""
+        if ch_name:
+            ctx.append(f"Channel: #{ch_name}")
+        members = slack_meta.get("members") or []
+        if members:
+            ctx.append("Members: " + ", ".join(members))
+
+        lines = [f"[{e.get('s') or 'someone'}]: {e.get('c') or ''}" for e in buf]
+        header = "[Channel conversation you did not reply to — context only]"
+        block = header + ("\n" + " · ".join(ctx) if ctx else "") + "\n" + "\n".join(lines)
+
+        session.metadata["group_buffer"] = []
+        try:
+            self.sessions.save(session)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"group buffer clear save skipped: {exc}")
+        return block
 
     def _spawn_concurrent_turn(self, msg: "InboundMessage") -> None:
         """Process a per-session chat (web/relay) in its own task so unrelated
@@ -5193,6 +5268,13 @@ class AgentLoop:
         session = self.sessions.get_or_create(msg.session_key)
         display_content = str(msg.metadata.get("_display_content") or msg.content)
 
+        # Passive channel context (Slack/Discord "listen" mode): render any
+        # messages observed since the last reply into a block we prepend ONLY to
+        # the LLM's current-message below. ``msg.content``/``display_content``
+        # stay the raw user text, so action-turn detection, UI, and persisted
+        # history are untouched.
+        group_context_block = self._flush_group_context(session, msg)
+
         # Sync per-session cwd between the in-memory pin (set by chat.send
         # cwd handlers on web/gateway channels) and persisted metadata, so
         # the pin survives bot restarts and channels that don't transport
@@ -5430,9 +5512,16 @@ class AgentLoop:
         # lands on, not the gateway default.
         effective_model = msg.metadata.get("model_override") or self.model
 
+        # Prepend observed channel context to the LLM's view of this turn only.
+        llm_current_message = (
+            f"{group_context_block}\n---\n{msg.content}"
+            if group_context_block
+            else msg.content
+        )
+
         messages = self.context.build_messages(
             history=history,
-            current_message=msg.content,
+            current_message=llm_current_message,
             media=msg.media if msg.media else None,
             memory_search_enabled=self._memory_manager is not None,
             skip_memory=skip_memory_flag,

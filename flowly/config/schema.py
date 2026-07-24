@@ -84,6 +84,7 @@ class DiscordConfig(BaseModel):
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
     group_policy: str = "mention"  # Server channels: "mention", "open", "allowlist"
     group_allow_from: list[str] = Field(default_factory=list)  # Channel IDs if allowlist
+    group_context: str = "listen"  # Passive read of un-answered channel msgs: "listen" | "off"
 
 
 class SlackDMConfig(BaseModel):
@@ -101,6 +102,7 @@ class SlackConfig(BaseModel):
     app_token: str = ""  # xapp-...
     group_policy: str = "mention"  # "mention", "open", "allowlist"
     group_allow_from: list[str] = Field(default_factory=list)  # Allowed channel IDs if allowlist
+    group_context: str = "listen"  # Passive read of un-answered channel msgs: "listen" | "off"
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
