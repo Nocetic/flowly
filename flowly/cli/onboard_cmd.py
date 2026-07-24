@@ -1,6 +1,7 @@
 """CLI commands — onboard_cmd."""
 
 import asyncio
+import contextlib
 import os
 import platform
 import shutil
@@ -182,6 +183,45 @@ def _already_configured() -> bool:
     except Exception:
         pass
     return False
+
+
+@contextlib.contextmanager
+def _tty_friendly_event_loop():
+    """Back asyncio's loops with ``select(2)`` on macOS for the prompt session.
+
+    The installer runs ``flowly setup </dev/tty`` so a ``curl | bash`` install can
+    still show the interactive picker. That leaves stdin (fd 0) pointing at the
+    ``/dev/tty`` clone device — and on macOS **kqueue cannot register /dev/tty**
+    for read events (a long-standing BSD limitation). InquirerPy drives each
+    prompt on a fresh ``asyncio.run`` loop whose default selector on macOS is
+    kqueue, so the first ``add_reader(0)`` blows up with a raw traceback the
+    moment a menu tries to draw. Running ``flowly setup`` straight in a terminal
+    dodges it (fd 0 is the pty slave, which kqueue handles) — but the installer
+    path doesn't.
+
+    ``select(2)`` has no such limitation, so here we install an event-loop policy
+    that builds SelectorEventLoops backed by ``SelectSelector``. Onboarding only
+    juggles a handful of fds and starts the gateway in a separate process, so
+    select's scale ceiling is irrelevant. The previous policy is restored on exit
+    so nothing else in the process inherits it. No-op off macOS, where epoll
+    watches /dev/tty fine.
+    """
+    if sys.platform != "darwin":
+        yield
+        return
+
+    import selectors
+
+    class _SelectLoopPolicy(asyncio.DefaultEventLoopPolicy):
+        def new_event_loop(self):
+            return asyncio.SelectorEventLoop(selectors.SelectSelector())
+
+    prev = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(_SelectLoopPolicy())
+    try:
+        yield
+    finally:
+        asyncio.set_event_loop_policy(prev)
 
 
 def _select_with_back(message: str, choices: list, default=None):
@@ -633,7 +673,21 @@ def run_onboarding() -> None:
         return
 
     _print_banner()
-    _run_setup_home()
+    try:
+        with _tty_friendly_event_loop():
+            _run_setup_home()
+    except OSError as exc:
+        # Last-resort guard: if the terminal still can't be attached to an event
+        # loop (an exotic stdin even select can't watch), don't dump a traceback
+        # on a first-run user. Point them at a plain re-run — run straight in the
+        # terminal, fd 0 is the pty slave and the picker works.
+        console.print(
+            f"[yellow]![/yellow] Couldn't open the interactive setup here "
+            f"([dim]{exc}[/dim])."
+        )
+        console.print(
+            "  Run [cyan]flowly setup[/cyan] directly in your terminal to finish."
+        )
 
 
 def _install_persona_files(workspace: Path):
