@@ -445,11 +445,16 @@ def _offer_start_gateway() -> None:
 
         try:
             argv = _resolve_flowly_exec_argv() + ["service", "install", "--start"]
-            subprocess.run(argv, check=False)
-            console.print("\n  [green]✓[/green] Done — run [cyan]flowly[/cyan] to start chatting.")
-            return
-        except Exception:
-            console.print("  [yellow]Couldn't auto-start — start it manually:[/yellow]")
+            result = subprocess.run(argv, check=False)
+            if result.returncode == 0:
+                console.print("\n  [green]✓[/green] Done — run [cyan]flowly[/cyan] to start chatting.")
+                return
+            console.print(
+                f"  [yellow]Couldn't auto-start (exit {result.returncode}) — "
+                "start it manually:[/yellow]"
+            )
+        except Exception as exc:
+            console.print(f"  [yellow]Couldn't auto-start ({exc}) — start it manually:[/yellow]")
     console.print(
         "\n  Next:\n"
         "    [cyan]flowly service install --start[/cyan]   [dim]— run the gateway in the background[/dim]\n"
@@ -717,4 +722,3 @@ def _install_persona_files(workspace: Path):
                 encoding="utf-8",
             )
             console.print("  [dim]Created personas/default.md[/dim]")
-

@@ -4,12 +4,14 @@ import asyncio
 import os
 import platform
 import plistlib
+import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import textwrap
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -27,6 +29,19 @@ console = Console()
 # ============================================================================
 
 service_app = typer.Typer(help="Manage background gateway service")
+
+SERVICE_HEALTH_TIMEOUT = 20.0
+SERVICE_HEALTH_REQUEST_TIMEOUT = 2.0
+SERVICE_HEALTH_POLL_INTERVAL = 0.25
+WINDOWS_TASK_CREATE_TIMEOUT = 5.0
+LAUNCHD_COMMAND_TIMEOUT = 2.0
+SERVICE_START_TOTAL_BUDGET = 25.0
+
+_LAUNCHD_UNLOADED_EXIT_CODES = frozenset({3, 113, 125})
+_LAUNCHD_UNSUPPORTED_EXIT_CODES = frozenset({5, 125})
+_LAUNCHD_BOOTSTRAP_EIO = 5
+_LAUNCHD_MODE_MANAGED = "launchd"
+_LAUNCHD_MODE_DETACHED = "detached"
 
 
 def _is_windows_admin() -> bool:
@@ -143,7 +158,13 @@ def _get_log_dir() -> Path:
 
 def _run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     """Run command and return completed process with text output."""
-    proc = subprocess.run(args, capture_output=True, text=True)
+    timeout = LAUNCHD_COMMAND_TIMEOUT if args and args[0] == "launchctl" else None
+    proc = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
     if check and proc.returncode != 0:
         stderr = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"{' '.join(args)} failed: {stderr}")
@@ -154,7 +175,7 @@ def _service_health(port: int) -> tuple[bool, str]:
     """Check local gateway health endpoint."""
     url = f"http://127.0.0.1:{port}/health"
     try:
-        with urllib.request.urlopen(url, timeout=2.0) as resp:
+        with urllib.request.urlopen(url, timeout=SERVICE_HEALTH_REQUEST_TIMEOUT) as resp:
             if 200 <= int(resp.status) < 300:
                 return True, f"{url} OK"
             return False, f"{url} HTTP {resp.status}"
@@ -162,6 +183,40 @@ def _service_health(port: int) -> tuple[bool, str]:
         return False, f"{url} unavailable ({e.reason})"
     except Exception as e:
         return False, f"{url} unavailable ({e})"
+
+
+def _wait_for_service_health(
+    port: int,
+    *,
+    timeout: float = SERVICE_HEALTH_TIMEOUT,
+    interval: float = SERVICE_HEALTH_POLL_INTERVAL,
+) -> tuple[bool, str]:
+    """Wait until the gateway's HTTP health endpoint reports success."""
+    deadline = time.monotonic() + timeout
+    last_detail = f"http://127.0.0.1:{port}/health not checked"
+    while time.monotonic() < deadline:
+        ok, last_detail = _service_health(port)
+        if ok:
+            return True, last_detail
+        time.sleep(interval)
+    return False, last_detail
+
+
+def _require_service_health(
+    port: int,
+    *,
+    manager: str,
+    timeout: float = SERVICE_HEALTH_TIMEOUT,
+) -> None:
+    """Raise when a service manager accepted start but the gateway stayed down."""
+    ok, detail = _wait_for_service_health(port, timeout=timeout)
+    if ok:
+        return
+    raise RuntimeError(
+        f"{manager} accepted the start request, but the gateway did not become "
+        f"healthy on 127.0.0.1:{port} within {timeout:.0f}s ({detail}). "
+        "Run 'flowly service status' and 'flowly service logs --no-follow'."
+    )
 
 
 def _port_listener_pids(port: int) -> list[int]:
@@ -291,21 +346,289 @@ def _extract_port_from_unit(unit_path: Path) -> int:
 
 
 def _extract_port_from_win_xml(xml_path: Path) -> int:
-    """Extract --port value from Windows Task Scheduler XML."""
-    if not xml_path.exists():
-        return 18790
+    """Extract --port from the Windows task's companion supervisor script.
+
+    The Task Scheduler XML launches only ``wscript.exe <supervisor.vbs>``;
+    the actual gateway argv (and therefore ``--port``) lives in that VBS file.
+    Fall back to the XML for compatibility with older generated artifacts.
+    """
+    candidates = (xml_path.with_suffix(".vbs"), xml_path)
+    content = ""
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            encoding = "utf-8" if candidate.suffix.lower() == ".vbs" else "utf-16"
+            content = candidate.read_text(encoding=encoding)
+        except Exception:
+            continue
+        if "--port" in content:
+            break
+    match = re.search(r"--port\s+[\"']?(\d+)", content)
+    return int(match.group(1)) if match else 18790
+
+
+class _LaunchctlCommandError(RuntimeError):
+    """A launchctl failure whose numeric exit code callers must classify."""
+
+    def __init__(self, args: list[str], proc: subprocess.CompletedProcess[str]):
+        self.returncode = proc.returncode
+        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        super().__init__(f"{' '.join(args)} failed: {detail}")
+
+
+def _raise_launchctl_error(
+    args: list[str], proc: subprocess.CompletedProcess[str],
+) -> None:
+    if proc.returncode != 0:
+        raise _LaunchctlCommandError(args, proc)
+
+
+def _launchd_domain(label: str = DEFAULT_SERVICE_LABEL) -> str:
+    """Resolve the launchd domain that owns (or should own) this user agent.
+
+    Aqua sessions normally use ``gui/<uid>`` while SSH/background sessions
+    may only expose ``user/<uid>``. Probe both for an existing registration,
+    then use ``launchctl managername`` to choose the fresh-install domain.
+    """
+    uid = os.getuid()
+    gui_domain = f"gui/{uid}"
+    user_domain = f"user/{uid}"
+    for domain in (gui_domain, user_domain):
+        try:
+            if _run_cmd(
+                ["launchctl", "print", f"{domain}/{label}"],
+                check=False,
+            ).returncode == 0:
+                return domain
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     try:
-        content = xml_path.read_text(encoding="utf-16")
-    except Exception:
-        return 18790
-    marker = "--port"
-    if marker not in content:
-        return 18790
+        manager = _run_cmd(["launchctl", "managername"], check=False)
+        if manager.returncode == 0 and "Aqua" in (manager.stdout or ""):
+            return gui_domain
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return user_domain
+
+
+def _launchd_target(label: str, domain: str | None = None) -> str:
+    return f"{domain or _launchd_domain(label)}/{label}"
+
+
+def _launchd_loaded(label: str, domain: str | None = None) -> bool:
+    """Return whether the job is registered in the selected user domain."""
+    return _run_cmd(
+        ["launchctl", "print", _launchd_target(label, domain)],
+        check=False,
+    ).returncode == 0
+
+
+def _launchctl_bootstrap(domain: str, label: str, plist_path: Path) -> None:
+    """Bootstrap once, recovering an EIO caused by a stale registration."""
+    args = ["launchctl", "bootstrap", domain, str(plist_path)]
+    proc = _run_cmd(args, check=False)
+    if proc.returncode == 0:
+        return
+    if proc.returncode != _LAUNCHD_BOOTSTRAP_EIO:
+        _raise_launchctl_error(args, proc)
+        return
+
+    # launchctl uses exit 5 both for a stale label and for a genuinely
+    # unavailable domain. A best-effort bootout disambiguates the two.
+    _run_cmd(
+        ["launchctl", "bootout", _launchd_target(label, domain)],
+        check=False,
+    )
+    retry = _run_cmd(args, check=False)
+    _raise_launchctl_error(args, retry)
+
+
+def _launchd_fallback_marker_path(label: str) -> Path:
+    from flowly.profile import get_flowly_home
+
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+    return get_flowly_home() / f".{safe_label}.launchd-fallback"
+
+
+def _read_launchd_fallback_pid(label: str) -> int | None:
     try:
-        after = content.split(marker, 1)[1].strip()
-        return int(after.split()[0].strip('"').strip("'"))
-    except Exception:
-        return 18790
+        value = _launchd_fallback_marker_path(label).read_text(encoding="utf-8").strip()
+        pid = int(value)
+        return pid if pid > 0 else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _launchd_fallback_process_running(label: str) -> tuple[bool, int | None]:
+    pid = _read_launchd_fallback_pid(label)
+    if pid is None:
+        return False, None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, pid
+    except PermissionError:
+        return True, pid
+    except OSError:
+        return False, pid
+    return True, pid
+
+
+def _clear_launchd_fallback_marker(label: str) -> None:
+    try:
+        _launchd_fallback_marker_path(label).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _spawn_detached_launchd_fallback(label: str, plist_path: Path) -> int:
+    """Run the plist command detached when launchd cannot supervise it."""
+    try:
+        plist_obj = plistlib.loads(plist_path.read_bytes())
+        argv = [str(part) for part in (plist_obj.get("ProgramArguments") or [])]
+        if not argv:
+            raise RuntimeError(f"launchd plist has no ProgramArguments: {plist_path}")
+
+        environment = os.environ.copy()
+        environment.update({
+            str(key): str(value)
+            for key, value in (plist_obj.get("EnvironmentVariables") or {}).items()
+        })
+        working_dir = Path(plist_obj.get("WorkingDirectory") or Path.home())
+        if not working_dir.is_dir():
+            working_dir = Path.home()
+
+        stdout_path = Path(
+            plist_obj.get("StandardOutPath")
+            or (_get_log_dir() / "flowly-gateway.out.log")
+        )
+        stderr_path = Path(
+            plist_obj.get("StandardErrorPath")
+            or (_get_log_dir() / "flowly-gateway.err.log")
+        )
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with stdout_path.open("ab") as stdout_file, stderr_path.open("ab") as stderr_file:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(working_dir),
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise RuntimeError(
+            f"launchd failed and the detached gateway fallback could not start: {exc}"
+        ) from exc
+
+    marker = _launchd_fallback_marker_path(label)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{proc.pid}\n", encoding="utf-8")
+    except OSError:
+        pass
+    return proc.pid
+
+
+def _launchd_fallback_to_detached(
+    label: str, plist_path: Path, reason: str,
+) -> str:
+    pid = _spawn_detached_launchd_fallback(label, plist_path)
+    console.print(
+        f"[yellow]⚠ launchd could not supervise {label} ({reason}).[/yellow]"
+    )
+    console.print(
+        f"[green]✓[/green] Started gateway as a detached background fallback "
+        f"(PID {pid})."
+    )
+    console.print(
+        "[yellow]It will NOT auto-start at login or auto-restart after a crash.[/yellow]"
+    )
+    return _LAUNCHD_MODE_DETACHED
+
+
+def _start_launchd_service(
+    label: str,
+    plist_path: Path,
+    *,
+    domain: str | None = None,
+) -> str:
+    """Start a launch agent, with Hermes-style EIO recovery and fallback."""
+    resolved_domain = domain or _launchd_domain(label)
+    target = _launchd_target(label, resolved_domain)
+
+    enable_args = ["launchctl", "enable", target]
+    enable = _run_cmd(enable_args, check=False)
+    if (
+        enable.returncode != 0
+        and enable.returncode not in _LAUNCHD_UNSUPPORTED_EXIT_CODES
+    ):
+        _raise_launchctl_error(enable_args, enable)
+
+    if _launchd_loaded(label, resolved_domain):
+        kickstart_args = ["launchctl", "kickstart", "-k", target]
+        kickstart = _run_cmd(kickstart_args, check=False)
+        if kickstart.returncode == 0:
+            _clear_launchd_fallback_marker(label)
+            return _LAUNCHD_MODE_MANAGED
+        if kickstart.returncode not in _LAUNCHD_UNLOADED_EXIT_CODES:
+            if kickstart.returncode in _LAUNCHD_UNSUPPORTED_EXIT_CODES:
+                return _launchd_fallback_to_detached(
+                    label, plist_path, f"launchctl exit {kickstart.returncode}",
+                )
+            _raise_launchctl_error(kickstart_args, kickstart)
+
+    try:
+        _launchctl_bootstrap(resolved_domain, label, plist_path)
+    except _LaunchctlCommandError as exc:
+        if exc.returncode not in _LAUNCHD_UNSUPPORTED_EXIT_CODES:
+            raise
+        return _launchd_fallback_to_detached(
+            label, plist_path, f"launchctl bootstrap exit {exc.returncode}",
+        )
+
+    # A zero bootstrap exit is not enough: verify the label is registered.
+    if not _launchd_loaded(label, resolved_domain):
+        return _launchd_fallback_to_detached(
+            label, plist_path, "bootstrap returned success but the job was not registered",
+        )
+
+    _clear_launchd_fallback_marker(label)
+    return _LAUNCHD_MODE_MANAGED
+
+
+def _remaining_service_health_timeout(started_at: float) -> float:
+    """Keep CLI startup verification inside Desktop's 30-second kill window."""
+    remaining = SERVICE_START_TOTAL_BUDGET - (time.monotonic() - started_at)
+    return max(1.0, min(SERVICE_HEALTH_TIMEOUT, remaining))
+
+
+def _windows_startup_launcher(label: str) -> Path:
+    startup_dir = (
+        Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+        / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    )
+    return startup_dir / f"{label}.cmd"
+
+
+def _start_windows_fallback(label: str, win_xml: Path) -> None:
+    """Start the no-admin Startup-folder supervisor immediately."""
+    vbs_path = win_xml.parent / f"{label}.vbs"
+    startup_cmd = _windows_startup_launcher(label)
+    if not startup_cmd.exists() or not vbs_path.exists():
+        raise RuntimeError(
+            "Task Scheduler task was not found and the Startup-folder fallback "
+            "is incomplete. Run 'flowly service install --start' first."
+        )
+    subprocess.Popen(
+        ["wscript.exe", str(vbs_path)],
+        creationflags=0x00000008 | 0x00000200,  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    )
 
 
 def _service_env_base(flowly_home: str, runtime_cwd: str) -> dict[str, str]:
@@ -512,12 +835,16 @@ def service_install(
             raise typer.Exit(1)
         runtime_cwd = str(validated)
 
+    start_requested = bool(start)
+    skipped_start_no_provider = False
+
     # Preflight: don't hand launchd/systemd a gateway that will crash-loop
     # on a missing provider. Install the unit either way (so it's ready),
     # but skip the auto-start when there's nothing for it to run.
     if start and not _provider_configured():
         _warn_no_provider("starting the service")
         start = False
+        skipped_start_no_provider = True
 
     mac_plist, linux_unit, win_xml = _service_paths(label)
     exec_argv = _resolve_flowly_exec_argv()
@@ -604,6 +931,7 @@ def service_install(
         )
 
     if system == "darwin" and mac_plist:
+        launchd_started_at = time.monotonic()
         mac_plist.parent.mkdir(parents=True, exist_ok=True)
         if mac_plist.exists():
             console.print(f"[dim]Reinstalling — service already present ({mac_plist}).[/dim]")
@@ -615,16 +943,44 @@ def service_install(
         mac_plist.write_bytes(plistlib.dumps(plist_obj, fmt=plistlib.FMT_XML, sort_keys=False))
 
         try:
-            _run_cmd(["launchctl", "unload", str(mac_plist)], check=False)
-            _run_cmd(["launchctl", "load", str(mac_plist)])
+            domain = _launchd_domain(label)
+            # Remove any previous loaded definition before installing the
+            # freshly written one. A clean machine has no job to boot out;
+            # a real bootout failure on a reinstall must not be hidden.
+            if _launchd_loaded(label, domain):
+                _run_cmd(["launchctl", "bootout", _launchd_target(label, domain)])
+            launch_mode = _LAUNCHD_MODE_MANAGED
             if start:
-                _run_cmd(["launchctl", "start", label], check=False)
+                launch_mode = _start_launchd_service(
+                    label, mac_plist, domain=domain,
+                )
+                manager = (
+                    "launchd"
+                    if launch_mode == _LAUNCHD_MODE_MANAGED
+                    else "detached launchd fallback"
+                )
+                _require_service_health(
+                    port,
+                    manager=manager,
+                    timeout=_remaining_service_health_timeout(launchd_started_at),
+                )
         except Exception as e:
             console.print(f"[red]Service install failed: {e}[/red]")
             raise typer.Exit(1)
 
-        console.print(f"[green]✓[/green] Installed launchd service: {label}")
+        if start and launch_mode == _LAUNCHD_MODE_DETACHED:
+            console.print(
+                f"[yellow]Installed launchd definition, but macOS did not load "
+                f"the service: {label}[/yellow]"
+            )
+            console.print(
+                "[dim]The verified gateway process is running in degraded mode.[/dim]"
+            )
+        else:
+            console.print(f"[green]✓[/green] Installed launchd service: {label}")
         console.print(f"[dim]File: {mac_plist}[/dim]")
+        if start_requested and skipped_start_no_provider:
+            raise typer.Exit(1)
         return
 
     if system == "linux" and linux_unit:
@@ -647,6 +1003,7 @@ def service_install(
             _run_cmd(["systemctl", "--user", "enable", label])
             if start:
                 _run_cmd(["systemctl", "--user", "restart", label])
+                _require_service_health(port, manager="systemd")
         except Exception as e:
             console.print(f"[red]Service install failed: {e}[/red]")
             console.print("[dim]Tip: Ensure user systemd is available (login session).[/dim]")
@@ -654,6 +1011,8 @@ def service_install(
 
         console.print(f"[green]✓[/green] Installed systemd user service: {label}")
         console.print(f"[dim]File: {linux_unit}[/dim]")
+        if start_requested and skipped_start_no_provider:
+            raise typer.Exit(1)
         return
 
     if system == "windows" and win_xml:
@@ -802,7 +1161,7 @@ def service_install(
         try:
             r = subprocess.run(
                 ["schtasks", "/create", "/tn", label, "/xml", str(win_xml), "/f"],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, timeout=WINDOWS_TASK_CREATE_TIMEOUT,
             )
             schtasks_ok = r.returncode == 0
             if not schtasks_ok:
@@ -817,22 +1176,28 @@ def service_install(
             )
 
         if schtasks_ok:
+            # A prior no-admin install may have left this fallback behind.
+            # Keeping both would start two supervisor loops at next logon.
+            _windows_startup_launcher(label).unlink(missing_ok=True)
             if start:
-                _run_cmd(["schtasks", "/run", "/tn", label], check=False)
+                try:
+                    _run_cmd(["schtasks", "/run", "/tn", label])
+                    _require_service_health(port, manager="Task Scheduler")
+                except Exception as e:
+                    console.print(f"[red]Service install failed: {e}[/red]")
+                    raise typer.Exit(1)
             console.print(f"[green]✓[/green] Installed Windows Task Scheduler service: {label}")
             console.print(f"[dim]File: {win_xml}[/dim]")
             console.print(f"[dim]Logs: {log_dir / 'gateway.log'}[/dim]")
+            if start_requested and skipped_start_no_provider:
+                raise typer.Exit(1)
             return
 
         # Fallback: a Startup-folder launcher that starts the SAME supervisor
         # .vbs via wscript — no admin, no Task Scheduler, still console-less and
         # auto-restarting. `flowly service stop` reaches it via the stop-flag.
-        startup_dir = (
-            Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
-            / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-        )
-        startup_dir.mkdir(parents=True, exist_ok=True)
-        startup_cmd = startup_dir / f"{label}.cmd"
+        startup_cmd = _windows_startup_launcher(label)
+        startup_cmd.parent.mkdir(parents=True, exist_ok=True)
         startup_cmd.write_text(
             "@echo off\r\n" f'start "" wscript.exe "{vbs_path}"\r\n',
             encoding="utf-8",
@@ -841,15 +1206,16 @@ def service_install(
 
         if start:
             try:
-                subprocess.Popen(
-                    ["wscript.exe", str(vbs_path)],
-                    creationflags=0x00000008 | 0x00000200,  # DETACHED_PROCESS | NEW_PROCESS_GROUP
-                )
+                _start_windows_fallback(label, win_xml)
+                _require_service_health(port, manager="Startup-folder launcher")
                 console.print("[green]✓[/green] Gateway started.")
             except Exception as ee:
-                console.print(f"[yellow]Couldn't auto-start ({ee}) — run 'flowly gateway'.[/yellow]")
+                console.print(f"[red]Couldn't auto-start: {ee}[/red]")
+                raise typer.Exit(1)
         console.print(f"[dim]File: {startup_cmd}[/dim]")
         console.print(f"[dim]Logs: {log_dir / 'gateway.log'}[/dim]")
+        if start_requested and skipped_start_no_provider:
+            raise typer.Exit(1)
         return
 
     console.print(f"[red]Unsupported platform for service install: {platform.system()}[/red]")
@@ -867,15 +1233,27 @@ def service_start(
     mac_plist, linux_unit, win_xml = _service_paths(label)
     system = platform.system().lower()
 
+    if system == "darwin" and mac_plist:
+        _port = _extract_port_from_plist(mac_plist)
+    elif system == "linux" and linux_unit:
+        _port = _extract_port_from_unit(linux_unit)
+    elif system == "windows" and win_xml:
+        _port = _extract_port_from_win_xml(win_xml)
+    else:
+        _port = 18790
+
     # Don't launch a second gateway: if the port is already held, say so and
     # stop. This is exactly the "multiple gateways / port in use" trap.
-    try:
-        from flowly.config.loader import load_config
-        _port = int(load_config().gateway.port or 18790)
-    except Exception:
-        _port = 18790
     _existing = _port_listener_pids(_port)
     if _existing:
+        _healthy, _health_detail = _service_health(_port)
+        if not _healthy:
+            console.print(
+                f"[red]Port {_port} is occupied by PID "
+                f"{', '.join(map(str, _existing))}, but the Flowly gateway is "
+                f"not healthy ({_health_detail}).[/red]"
+            )
+            raise typer.Exit(1)
         console.print(
             f"[green]✓[/green] A gateway is already running on port {_port} "
             f"(PID {', '.join(map(str, _existing))})."
@@ -898,19 +1276,39 @@ def service_start(
 
     try:
         if system == "darwin" and mac_plist:
+            launchd_started_at = time.monotonic()
             if not mac_plist.exists():
                 console.print(f"[red]Service not installed: {mac_plist}[/red]")
                 raise typer.Exit(1)
-            _run_cmd(["launchctl", "load", str(mac_plist)], check=False)
-            _run_cmd(["launchctl", "start", label], check=False)
-            console.print(f"[green]✓[/green] Started service {label}")
+            launch_mode = _start_launchd_service(label, mac_plist)
+            manager = (
+                "launchd"
+                if launch_mode == _LAUNCHD_MODE_MANAGED
+                else "detached launchd fallback"
+            )
+            _require_service_health(
+                _port,
+                manager=manager,
+                timeout=_remaining_service_health_timeout(launchd_started_at),
+            )
+            if launch_mode == _LAUNCHD_MODE_MANAGED:
+                console.print(f"[green]✓[/green] Started service {label}")
+            else:
+                console.print(
+                    f"[green]✓[/green] Gateway is healthy via the detached "
+                    f"fallback for {label}"
+                )
             return
-        if system == "linux":
+        if system == "linux" and linux_unit:
+            if not linux_unit.exists():
+                console.print(f"[red]Service not installed: {linux_unit}[/red]")
+                raise typer.Exit(1)
             # Ensure linger so the service stays up after this session ends —
             # covers users who only ever run `service start` on an already
             # installed unit (no re-install).
             _ensure_linger_linux()
             _run_cmd(["systemctl", "--user", "start", label])
+            _require_service_health(_port, manager="systemd")
             console.print(f"[green]✓[/green] Started service {label}")
             return
         if system == "windows":
@@ -921,7 +1319,22 @@ def service_start(
                 # Clear the stop-flag so the supervisor loop runs instead of
                 # exiting on its first check.
                 (win_xml.parent / f"{label}.stop").unlink(missing_ok=True)
-            _run_cmd(["schtasks", "/run", "/tn", label])
+            try:
+                task = _run_cmd(
+                    ["schtasks", "/query", "/tn", label],
+                    check=False,
+                )
+            except Exception:
+                task = None
+            if task is not None and task.returncode == 0:
+                _run_cmd(["schtasks", "/run", "/tn", label])
+                manager = "Task Scheduler"
+            elif win_xml:
+                _start_windows_fallback(label, win_xml)
+                manager = "Startup-folder launcher"
+            else:
+                raise RuntimeError("Windows service artifacts are missing")
+            _require_service_health(_port, manager=manager)
             console.print(f"[green]✓[/green] Started service {label}")
             return
     except Exception as e:
@@ -969,6 +1382,8 @@ def service_stop(
 
         # Force-kill any remaining process on the port
         _kill_gateway_on_port(port)
+        if system == "darwin":
+            _clear_launchd_fallback_marker(label)
         console.print(f"[green]✓[/green] Stopped service {label}")
     except typer.Exit:
         raise
@@ -1008,6 +1423,21 @@ def service_restart(
     # install/start) on this host — no-op on macOS/Windows and when it's already
     # enabled, so it's cheap to assert on every restart.
     _ensure_linger_linux()
+
+    # A launchd fallback is deliberately not registered with launchd. Restart
+    # it through the CLI lifecycle so we can retry launchd first, then degrade
+    # again only if the domain is still unavailable.
+    if platform.system().lower() == "darwin":
+        fallback_running, fallback_pid = _launchd_fallback_process_running(label)
+        if fallback_pid is not None:
+            state = "running" if fallback_running else "stale"
+            console.print(
+                f"[yellow]Detached launchd fallback is {state}; retrying the "
+                f"managed service path.[/yellow]"
+            )
+            service_stop(label=label)
+            service_start(label=label)
+            return
 
     # Avoid asyncio.run inside Typer when an event loop is already
     # active (e.g. called from a TUI worker). The helper is async so
@@ -1059,6 +1489,7 @@ def service_status(
                     break
         except Exception:
             loaded = False
+        fallback_running, fallback_pid = _launchd_fallback_process_running(label)
         port = _extract_port_from_plist(mac_plist)
         ok, health = _service_health(port)
         console.print(f"Service: [cyan]{label}[/cyan]")
@@ -1066,10 +1497,24 @@ def service_status(
         console.print(f"Loaded: {'[green]yes[/green]' if loaded else '[red]no[/red]'}")
         if pid:
             console.print(f"PID info: [dim]{pid}[/dim]")
+        if fallback_pid is not None:
+            fallback_state = "running" if fallback_running else "stale"
+            console.print(
+                f"Mode: [yellow]detached fallback ({fallback_state}, PID "
+                f"{fallback_pid})[/yellow]"
+            )
+            console.print(
+                "[yellow]Auto-start at login and auto-restart after a crash "
+                "are unavailable.[/yellow]"
+            )
         console.print(f"Health: {'[green]ok[/green]' if ok else '[yellow]down[/yellow]'} - {health}")
         if installed:
             console.print(f"[dim]File: {mac_plist}[/dim]")
-        _print_port_diagnostics(port, installed=installed, service_running=loaded)
+        _print_port_diagnostics(
+            port,
+            installed=installed,
+            service_running=loaded or (fallback_running and ok),
+        )
         return
 
     if system == "linux" and linux_unit:
@@ -1267,8 +1712,13 @@ def service_uninstall(
 
     try:
         if system == "darwin" and mac_plist:
+            port = _extract_port_from_plist(mac_plist)
+            fallback_running, fallback_pid = _launchd_fallback_process_running(label)
             _run_cmd(["launchctl", "stop", label], check=False)
             _run_cmd(["launchctl", "unload", str(mac_plist)], check=False)
+            if fallback_running or fallback_pid is not None:
+                _kill_gateway_on_port(port)
+            _clear_launchd_fallback_marker(label)
             if mac_plist.exists():
                 mac_plist.unlink()
             console.print(f"[green]✓[/green] Uninstalled service {label}")
@@ -1309,5 +1759,3 @@ def service_uninstall(
 
     console.print(f"[red]Unsupported platform: {platform.system()}[/red]")
     raise typer.Exit(1)
-
-

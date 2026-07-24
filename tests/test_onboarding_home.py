@@ -7,8 +7,11 @@ short-circuits before any prompt) without touching InquirerPy/Textual.
 
 from __future__ import annotations
 
+import io
 import types
 from pathlib import Path
+
+from rich.console import Console
 
 import flowly.cli.onboard_cmd as ob
 
@@ -54,6 +57,53 @@ def test_quick_mode_is_provider_then_chat(monkeypatch):
     monkeypatch.setattr(ob, "_offer_start_gateway", lambda: calls.append("gateway"))
     ob._run_setup_home()
     assert calls == ["provider", "summary", "gateway"]
+
+
+def test_gateway_offer_reports_success_only_for_zero_exit(monkeypatch):
+    from flowly.cli import service_cmd
+
+    stream = io.StringIO()
+    monkeypatch.setattr(
+        ob,
+        "console",
+        Console(file=stream, force_terminal=False, color_system=None),
+    )
+    monkeypatch.setattr("rich.prompt.Confirm.ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(service_cmd, "_resolve_flowly_exec_argv", lambda: ["/opt/flowly"])
+    monkeypatch.setattr(
+        ob.subprocess,
+        "run",
+        lambda argv, check=False: types.SimpleNamespace(returncode=0),
+    )
+
+    ob._offer_start_gateway()
+
+    assert "✓ Done" in stream.getvalue()
+
+
+def test_gateway_offer_does_not_claim_done_for_nonzero_exit(monkeypatch):
+    from flowly.cli import service_cmd
+
+    stream = io.StringIO()
+    monkeypatch.setattr(
+        ob,
+        "console",
+        Console(file=stream, force_terminal=False, color_system=None),
+    )
+    monkeypatch.setattr("rich.prompt.Confirm.ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(service_cmd, "_resolve_flowly_exec_argv", lambda: ["/opt/flowly"])
+    monkeypatch.setattr(
+        ob.subprocess,
+        "run",
+        lambda argv, check=False: types.SimpleNamespace(returncode=1),
+    )
+
+    ob._offer_start_gateway()
+
+    text = stream.getvalue()
+    assert "Couldn't auto-start (exit 1)" in text
+    assert "✓ Done" not in text
+    assert "flowly service install --start" in text
 
 
 def test_onboarding_never_launches_textual_setup():
