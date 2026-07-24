@@ -82,6 +82,8 @@ class DiscordConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
+    group_policy: str = "mention"  # Server channels: "mention", "open", "allowlist"
+    group_allow_from: list[str] = Field(default_factory=list)  # Channel IDs if allowlist
 
 
 class SlackDMConfig(BaseModel):

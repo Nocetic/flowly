@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from pathlib import Path
+import re
 from typing import Any
 
 import httpx
@@ -14,7 +14,6 @@ from flowly.bus.queue import MessageBus
 from flowly.channels.base import BaseChannel
 from flowly.config.schema import DiscordConfig
 from flowly.profile import get_flowly_home
-
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
@@ -33,6 +32,7 @@ class DiscordChannel(BaseChannel):
         self._heartbeat_task: asyncio.Task | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._http: httpx.AsyncClient | None = None
+        self._bot_user_id: str = ""
 
     async def start(self) -> None:
         """Start the Discord gateway connection."""
@@ -134,7 +134,8 @@ class DiscordChannel(BaseChannel):
                 await self._start_heartbeat(interval_ms / 1000)
                 await self._identify()
             elif op == 0 and event_type == "READY":
-                logger.info("Discord gateway READY")
+                self._bot_user_id = str(((payload or {}).get("user") or {}).get("id") or "")
+                logger.info(f"Discord gateway READY (bot user {self._bot_user_id or 'unknown'})")
             elif op == 0 and event_type == "MESSAGE_CREATE":
                 await self._handle_message_create(payload)
             elif op == 7:
@@ -198,6 +199,19 @@ class DiscordChannel(BaseChannel):
         if not self.is_allowed(sender_id):
             return
 
+        is_guild = bool(payload.get("guild_id"))
+        if is_guild and not self._should_respond_in_guild(payload, channel_id, content):
+            return
+
+        content = self._strip_bot_mention(content)
+        content = self._humanize_mentions(payload, content)
+
+        # Label server messages with the human sender so the agent can tell
+        # channel members apart — raw content gives it no speaker at all.
+        sender_name = self._author_name(payload)
+        if is_guild and sender_name:
+            content = f"[{sender_name}]: {content}" if content else f"[{sender_name}]:"
+
         content_parts = [content] if content else []
         media_paths: list[str] = []
         media_dir = get_flowly_home() / "media"
@@ -237,7 +251,58 @@ class DiscordChannel(BaseChannel):
                 "message_id": str(payload.get("id", "")),
                 "guild_id": payload.get("guild_id"),
                 "reply_to": reply_to,
+                "sender_name": sender_name,
             },
+        )
+
+    def _should_respond_in_guild(self, payload: dict[str, Any], channel_id: str, content: str) -> bool:
+        """Gate server-channel messages by ``group_policy`` (DMs never pass here)."""
+        policy = self.config.group_policy
+        if policy == "open":
+            return True
+        if policy == "allowlist":
+            return channel_id in self.config.group_allow_from
+        # "mention" (default): the bot is @-mentioned, or the message replies
+        # to one of the bot's own messages.
+        if self._bot_user_id:
+            if any(
+                str(m.get("id")) == self._bot_user_id
+                for m in payload.get("mentions") or []
+            ):
+                return True
+            ref_author = (payload.get("referenced_message") or {}).get("author") or {}
+            if str(ref_author.get("id") or "") == self._bot_user_id:
+                return True
+            return f"<@{self._bot_user_id}>" in content or f"<@!{self._bot_user_id}>" in content
+        return False
+
+    def _strip_bot_mention(self, content: str) -> str:
+        if not content or not self._bot_user_id:
+            return content
+        return re.sub(rf"<@!?{re.escape(self._bot_user_id)}>\s*", "", content).strip()
+
+    def _humanize_mentions(self, payload: dict[str, Any], content: str) -> str:
+        """Rewrite raw ``<@id>`` mentions as ``@name`` using the payload's mention list."""
+        if not content:
+            return content
+        for m in payload.get("mentions") or []:
+            user_id = str(m.get("id") or "")
+            name = m.get("global_name") or m.get("username") or ""
+            if user_id and name:
+                content = content.replace(f"<@!{user_id}>", f"@{name}")
+                content = content.replace(f"<@{user_id}>", f"@{name}")
+        return content
+
+    @staticmethod
+    def _author_name(payload: dict[str, Any]) -> str:
+        """Best human name for the message author (guild nick > global > username)."""
+        author = payload.get("author") or {}
+        member = payload.get("member") or {}
+        return (
+            member.get("nick")
+            or author.get("global_name")
+            or author.get("username")
+            or ""
         )
 
     async def _start_typing(self, channel_id: str) -> None:

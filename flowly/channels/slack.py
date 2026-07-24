@@ -2,12 +2,12 @@
 
 import asyncio
 import re
-from typing import Any
+from collections import OrderedDict
 
 from loguru import logger
-from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
+from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.web.async_client import AsyncWebClient
 
 from flowly.bus.events import OutboundMessage
@@ -28,6 +28,14 @@ class SlackChannel(BaseChannel):
         self._web_client: AsyncWebClient | None = None
         self._socket_client: SocketModeClient | None = None
         self._bot_user_id: str | None = None
+        # (channel, ts) of already-dispatched events. Slack delivers a mention
+        # as BOTH `message` and `app_mention` when both subscriptions exist —
+        # whichever copy arrives first wins, the twin is dropped here.
+        self._seen_events: OrderedDict[tuple[str, str], None] = OrderedDict()
+        # user_id -> display name. Misses are cached too, so a workspace
+        # without the users:read scope costs one failed lookup per user,
+        # not one per message.
+        self._user_names: dict[str, str] = {}
 
     async def start(self) -> None:
         """Start the Slack Socket Mode client."""
@@ -128,12 +136,7 @@ class SlackChannel(BaseChannel):
         if self._bot_user_id and sender_id == self._bot_user_id:
             return
 
-        # Avoid double-processing: Slack sends both `message` and `app_mention`
-        # for mentions in channels. Prefer `app_mention`.
         text = event.get("text") or ""
-        if event_type == "message" and self._bot_user_id and f"<@{self._bot_user_id}>" in text:
-            return
-
         logger.debug(
             "Slack event: type={} subtype={} user={} channel={} channel_type={} text={}",
             event_type,
@@ -146,7 +149,20 @@ class SlackChannel(BaseChannel):
         if not sender_id or not chat_id:
             return
 
-        channel_type = event.get("channel_type") or ""
+        # A mention arrives as both `message` and `app_mention` ONLY when the
+        # Slack app subscribed to both events. Dedupe by (channel, ts) instead
+        # of dropping the `message` copy outright: for an app without the
+        # `app_mention` subscription that copy is the only delivery, and
+        # dropping it made the bot ignore every @-mention.
+        ts = str(event.get("ts") or "")
+        if ts and (str(chat_id), ts) in self._seen_events:
+            return
+
+        # `app_mention` events carry no channel_type; they can only fire in
+        # channels/groups, never in DMs.
+        channel_type = event.get("channel_type") or (
+            "channel" if event_type == "app_mention" else ""
+        )
 
         if not self._is_allowed(sender_id, chat_id, channel_type):
             return
@@ -154,7 +170,20 @@ class SlackChannel(BaseChannel):
         if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
             return
 
+        if ts:
+            self._seen_events[(str(chat_id), ts)] = None
+            while len(self._seen_events) > 500:
+                self._seen_events.popitem(last=False)
+
         text = self._strip_bot_mention(text)
+        text = await self._humanize_refs(text)
+
+        # Label group messages with the human sender so the agent can tell
+        # channel members apart — raw content gives it no speaker at all.
+        sender_name = await self._resolve_user_name(sender_id)
+        content = text
+        if channel_type != "im" and sender_name:
+            content = f"[{sender_name}]: {text}"
 
         thread_ts = event.get("thread_ts") or event.get("ts")
         # Add :eyes: reaction to the triggering message (best-effort)
@@ -171,15 +200,55 @@ class SlackChannel(BaseChannel):
         await self._handle_message(
             sender_id=sender_id,
             chat_id=chat_id,
-            content=text,
+            content=content,
             metadata={
                 "slack": {
                     "event": event,
                     "thread_ts": thread_ts,
                     "channel_type": channel_type,
+                    "sender_name": sender_name,
                 }
             },
         )
+
+    async def _resolve_user_name(self, user_id: str) -> str:
+        """Human display name for a Slack user id ('' when unresolvable)."""
+        if not user_id:
+            return ""
+        cached = self._user_names.get(user_id)
+        if cached is not None:
+            return cached
+        name = ""
+        try:
+            if self._web_client:
+                info = await self._web_client.users_info(user=user_id)
+                user = info.get("user") or {}
+                profile = user.get("profile") or {}
+                name = (
+                    profile.get("display_name")
+                    or profile.get("real_name")
+                    or user.get("real_name")
+                    or user.get("name")
+                    or ""
+                )
+        except Exception as e:
+            # Typically a missing users:read scope — degrade to raw ids.
+            logger.debug(f"Slack users_info failed for {user_id}: {e}")
+        if len(self._user_names) > 1000:
+            self._user_names.clear()
+        self._user_names[user_id] = name
+        return name
+
+    async def _humanize_refs(self, text: str) -> str:
+        """Rewrite raw Slack refs (`<@U…>`, `<#C…|name>`) as readable names."""
+        if not text:
+            return text
+
+        for user_id in set(re.findall(r"<@([A-Z0-9]+)>", text)):
+            name = await self._resolve_user_name(user_id)
+            if name:
+                text = text.replace(f"<@{user_id}>", f"@{name}")
+        return re.sub(r"<#[A-Z0-9]+\|([^>]+)>", r"#\1", text)
 
     def _is_allowed(self, sender_id: str, chat_id: str, channel_type: str) -> bool:
         if channel_type == "im":
