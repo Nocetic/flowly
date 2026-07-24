@@ -34,6 +34,14 @@ SERVICE_HEALTH_TIMEOUT = 20.0
 SERVICE_HEALTH_REQUEST_TIMEOUT = 2.0
 SERVICE_HEALTH_POLL_INTERVAL = 0.25
 WINDOWS_TASK_CREATE_TIMEOUT = 5.0
+LAUNCHD_COMMAND_TIMEOUT = 2.0
+SERVICE_START_TOTAL_BUDGET = 25.0
+
+_LAUNCHD_UNLOADED_EXIT_CODES = frozenset({3, 113, 125})
+_LAUNCHD_UNSUPPORTED_EXIT_CODES = frozenset({5, 125})
+_LAUNCHD_BOOTSTRAP_EIO = 5
+_LAUNCHD_MODE_MANAGED = "launchd"
+_LAUNCHD_MODE_DETACHED = "detached"
 
 
 def _is_windows_admin() -> bool:
@@ -150,7 +158,13 @@ def _get_log_dir() -> Path:
 
 def _run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     """Run command and return completed process with text output."""
-    proc = subprocess.run(args, capture_output=True, text=True)
+    timeout = LAUNCHD_COMMAND_TIMEOUT if args and args[0] == "launchctl" else None
+    proc = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
     if check and proc.returncode != 0:
         stderr = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"{' '.join(args)} failed: {stderr}")
@@ -354,31 +368,244 @@ def _extract_port_from_win_xml(xml_path: Path) -> int:
     return int(match.group(1)) if match else 18790
 
 
-def _launchd_domain() -> str:
-    """Current user's modern launchd GUI domain."""
-    return f"gui/{os.getuid()}"
+class _LaunchctlCommandError(RuntimeError):
+    """A launchctl failure whose numeric exit code callers must classify."""
+
+    def __init__(self, args: list[str], proc: subprocess.CompletedProcess[str]):
+        self.returncode = proc.returncode
+        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        super().__init__(f"{' '.join(args)} failed: {detail}")
 
 
-def _launchd_target(label: str) -> str:
-    return f"{_launchd_domain()}/{label}"
+def _raise_launchctl_error(
+    args: list[str], proc: subprocess.CompletedProcess[str],
+) -> None:
+    if proc.returncode != 0:
+        raise _LaunchctlCommandError(args, proc)
 
 
-def _launchd_loaded(label: str) -> bool:
-    """Return whether the job is loaded in the current user's GUI domain."""
+def _launchd_domain(label: str = DEFAULT_SERVICE_LABEL) -> str:
+    """Resolve the launchd domain that owns (or should own) this user agent.
+
+    Aqua sessions normally use ``gui/<uid>`` while SSH/background sessions
+    may only expose ``user/<uid>``. Probe both for an existing registration,
+    then use ``launchctl managername`` to choose the fresh-install domain.
+    """
+    uid = os.getuid()
+    gui_domain = f"gui/{uid}"
+    user_domain = f"user/{uid}"
+    for domain in (gui_domain, user_domain):
+        try:
+            if _run_cmd(
+                ["launchctl", "print", f"{domain}/{label}"],
+                check=False,
+            ).returncode == 0:
+                return domain
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    try:
+        manager = _run_cmd(["launchctl", "managername"], check=False)
+        if manager.returncode == 0 and "Aqua" in (manager.stdout or ""):
+            return gui_domain
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return user_domain
+
+
+def _launchd_target(label: str, domain: str | None = None) -> str:
+    return f"{domain or _launchd_domain(label)}/{label}"
+
+
+def _launchd_loaded(label: str, domain: str | None = None) -> bool:
+    """Return whether the job is registered in the selected user domain."""
     return _run_cmd(
-        ["launchctl", "print", _launchd_target(label)],
+        ["launchctl", "print", _launchd_target(label, domain)],
         check=False,
     ).returncode == 0
 
 
-def _start_launchd_service(label: str, plist_path: Path) -> None:
-    """Load/start a launch agent using modern, domain-qualified launchctl."""
-    target = _launchd_target(label)
-    _run_cmd(["launchctl", "enable", target])
-    if _launchd_loaded(label):
-        _run_cmd(["launchctl", "kickstart", "-k", target])
-    else:
-        _run_cmd(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)])
+def _launchctl_bootstrap(domain: str, label: str, plist_path: Path) -> None:
+    """Bootstrap once, recovering an EIO caused by a stale registration."""
+    args = ["launchctl", "bootstrap", domain, str(plist_path)]
+    proc = _run_cmd(args, check=False)
+    if proc.returncode == 0:
+        return
+    if proc.returncode != _LAUNCHD_BOOTSTRAP_EIO:
+        _raise_launchctl_error(args, proc)
+        return
+
+    # launchctl uses exit 5 both for a stale label and for a genuinely
+    # unavailable domain. A best-effort bootout disambiguates the two.
+    _run_cmd(
+        ["launchctl", "bootout", _launchd_target(label, domain)],
+        check=False,
+    )
+    retry = _run_cmd(args, check=False)
+    _raise_launchctl_error(args, retry)
+
+
+def _launchd_fallback_marker_path(label: str) -> Path:
+    from flowly.profile import get_flowly_home
+
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+    return get_flowly_home() / f".{safe_label}.launchd-fallback"
+
+
+def _read_launchd_fallback_pid(label: str) -> int | None:
+    try:
+        value = _launchd_fallback_marker_path(label).read_text(encoding="utf-8").strip()
+        pid = int(value)
+        return pid if pid > 0 else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _launchd_fallback_process_running(label: str) -> tuple[bool, int | None]:
+    pid = _read_launchd_fallback_pid(label)
+    if pid is None:
+        return False, None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, pid
+    except PermissionError:
+        return True, pid
+    except OSError:
+        return False, pid
+    return True, pid
+
+
+def _clear_launchd_fallback_marker(label: str) -> None:
+    try:
+        _launchd_fallback_marker_path(label).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _spawn_detached_launchd_fallback(label: str, plist_path: Path) -> int:
+    """Run the plist command detached when launchd cannot supervise it."""
+    try:
+        plist_obj = plistlib.loads(plist_path.read_bytes())
+        argv = [str(part) for part in (plist_obj.get("ProgramArguments") or [])]
+        if not argv:
+            raise RuntimeError(f"launchd plist has no ProgramArguments: {plist_path}")
+
+        environment = os.environ.copy()
+        environment.update({
+            str(key): str(value)
+            for key, value in (plist_obj.get("EnvironmentVariables") or {}).items()
+        })
+        working_dir = Path(plist_obj.get("WorkingDirectory") or Path.home())
+        if not working_dir.is_dir():
+            working_dir = Path.home()
+
+        stdout_path = Path(
+            plist_obj.get("StandardOutPath")
+            or (_get_log_dir() / "flowly-gateway.out.log")
+        )
+        stderr_path = Path(
+            plist_obj.get("StandardErrorPath")
+            or (_get_log_dir() / "flowly-gateway.err.log")
+        )
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with stdout_path.open("ab") as stdout_file, stderr_path.open("ab") as stderr_file:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(working_dir),
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise RuntimeError(
+            f"launchd failed and the detached gateway fallback could not start: {exc}"
+        ) from exc
+
+    marker = _launchd_fallback_marker_path(label)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{proc.pid}\n", encoding="utf-8")
+    except OSError:
+        pass
+    return proc.pid
+
+
+def _launchd_fallback_to_detached(
+    label: str, plist_path: Path, reason: str,
+) -> str:
+    pid = _spawn_detached_launchd_fallback(label, plist_path)
+    console.print(
+        f"[yellow]⚠ launchd could not supervise {label} ({reason}).[/yellow]"
+    )
+    console.print(
+        f"[green]✓[/green] Started gateway as a detached background fallback "
+        f"(PID {pid})."
+    )
+    console.print(
+        "[yellow]It will NOT auto-start at login or auto-restart after a crash.[/yellow]"
+    )
+    return _LAUNCHD_MODE_DETACHED
+
+
+def _start_launchd_service(
+    label: str,
+    plist_path: Path,
+    *,
+    domain: str | None = None,
+) -> str:
+    """Start a launch agent, with Hermes-style EIO recovery and fallback."""
+    resolved_domain = domain or _launchd_domain(label)
+    target = _launchd_target(label, resolved_domain)
+
+    enable_args = ["launchctl", "enable", target]
+    enable = _run_cmd(enable_args, check=False)
+    if (
+        enable.returncode != 0
+        and enable.returncode not in _LAUNCHD_UNSUPPORTED_EXIT_CODES
+    ):
+        _raise_launchctl_error(enable_args, enable)
+
+    if _launchd_loaded(label, resolved_domain):
+        kickstart_args = ["launchctl", "kickstart", "-k", target]
+        kickstart = _run_cmd(kickstart_args, check=False)
+        if kickstart.returncode == 0:
+            _clear_launchd_fallback_marker(label)
+            return _LAUNCHD_MODE_MANAGED
+        if kickstart.returncode not in _LAUNCHD_UNLOADED_EXIT_CODES:
+            if kickstart.returncode in _LAUNCHD_UNSUPPORTED_EXIT_CODES:
+                return _launchd_fallback_to_detached(
+                    label, plist_path, f"launchctl exit {kickstart.returncode}",
+                )
+            _raise_launchctl_error(kickstart_args, kickstart)
+
+    try:
+        _launchctl_bootstrap(resolved_domain, label, plist_path)
+    except _LaunchctlCommandError as exc:
+        if exc.returncode not in _LAUNCHD_UNSUPPORTED_EXIT_CODES:
+            raise
+        return _launchd_fallback_to_detached(
+            label, plist_path, f"launchctl bootstrap exit {exc.returncode}",
+        )
+
+    # A zero bootstrap exit is not enough: verify the label is registered.
+    if not _launchd_loaded(label, resolved_domain):
+        return _launchd_fallback_to_detached(
+            label, plist_path, "bootstrap returned success but the job was not registered",
+        )
+
+    _clear_launchd_fallback_marker(label)
+    return _LAUNCHD_MODE_MANAGED
+
+
+def _remaining_service_health_timeout(started_at: float) -> float:
+    """Keep CLI startup verification inside Desktop's 30-second kill window."""
+    remaining = SERVICE_START_TOTAL_BUDGET - (time.monotonic() - started_at)
+    return max(1.0, min(SERVICE_HEALTH_TIMEOUT, remaining))
 
 
 def _windows_startup_launcher(label: str) -> Path:
@@ -704,6 +931,7 @@ def service_install(
         )
 
     if system == "darwin" and mac_plist:
+        launchd_started_at = time.monotonic()
         mac_plist.parent.mkdir(parents=True, exist_ok=True)
         if mac_plist.exists():
             console.print(f"[dim]Reinstalling — service already present ({mac_plist}).[/dim]")
@@ -715,19 +943,41 @@ def service_install(
         mac_plist.write_bytes(plistlib.dumps(plist_obj, fmt=plistlib.FMT_XML, sort_keys=False))
 
         try:
+            domain = _launchd_domain(label)
             # Remove any previous loaded definition before installing the
             # freshly written one. A clean machine has no job to boot out;
             # a real bootout failure on a reinstall must not be hidden.
-            if _launchd_loaded(label):
-                _run_cmd(["launchctl", "bootout", _launchd_target(label)])
+            if _launchd_loaded(label, domain):
+                _run_cmd(["launchctl", "bootout", _launchd_target(label, domain)])
+            launch_mode = _LAUNCHD_MODE_MANAGED
             if start:
-                _start_launchd_service(label, mac_plist)
-                _require_service_health(port, manager="launchd")
+                launch_mode = _start_launchd_service(
+                    label, mac_plist, domain=domain,
+                )
+                manager = (
+                    "launchd"
+                    if launch_mode == _LAUNCHD_MODE_MANAGED
+                    else "detached launchd fallback"
+                )
+                _require_service_health(
+                    port,
+                    manager=manager,
+                    timeout=_remaining_service_health_timeout(launchd_started_at),
+                )
         except Exception as e:
             console.print(f"[red]Service install failed: {e}[/red]")
             raise typer.Exit(1)
 
-        console.print(f"[green]✓[/green] Installed launchd service: {label}")
+        if start and launch_mode == _LAUNCHD_MODE_DETACHED:
+            console.print(
+                f"[yellow]Installed launchd definition, but macOS did not load "
+                f"the service: {label}[/yellow]"
+            )
+            console.print(
+                "[dim]The verified gateway process is running in degraded mode.[/dim]"
+            )
+        else:
+            console.print(f"[green]✓[/green] Installed launchd service: {label}")
         console.print(f"[dim]File: {mac_plist}[/dim]")
         if start_requested and skipped_start_no_provider:
             raise typer.Exit(1)
@@ -1026,12 +1276,28 @@ def service_start(
 
     try:
         if system == "darwin" and mac_plist:
+            launchd_started_at = time.monotonic()
             if not mac_plist.exists():
                 console.print(f"[red]Service not installed: {mac_plist}[/red]")
                 raise typer.Exit(1)
-            _start_launchd_service(label, mac_plist)
-            _require_service_health(_port, manager="launchd")
-            console.print(f"[green]✓[/green] Started service {label}")
+            launch_mode = _start_launchd_service(label, mac_plist)
+            manager = (
+                "launchd"
+                if launch_mode == _LAUNCHD_MODE_MANAGED
+                else "detached launchd fallback"
+            )
+            _require_service_health(
+                _port,
+                manager=manager,
+                timeout=_remaining_service_health_timeout(launchd_started_at),
+            )
+            if launch_mode == _LAUNCHD_MODE_MANAGED:
+                console.print(f"[green]✓[/green] Started service {label}")
+            else:
+                console.print(
+                    f"[green]✓[/green] Gateway is healthy via the detached "
+                    f"fallback for {label}"
+                )
             return
         if system == "linux" and linux_unit:
             if not linux_unit.exists():
@@ -1116,6 +1382,8 @@ def service_stop(
 
         # Force-kill any remaining process on the port
         _kill_gateway_on_port(port)
+        if system == "darwin":
+            _clear_launchd_fallback_marker(label)
         console.print(f"[green]✓[/green] Stopped service {label}")
     except typer.Exit:
         raise
@@ -1155,6 +1423,21 @@ def service_restart(
     # install/start) on this host — no-op on macOS/Windows and when it's already
     # enabled, so it's cheap to assert on every restart.
     _ensure_linger_linux()
+
+    # A launchd fallback is deliberately not registered with launchd. Restart
+    # it through the CLI lifecycle so we can retry launchd first, then degrade
+    # again only if the domain is still unavailable.
+    if platform.system().lower() == "darwin":
+        fallback_running, fallback_pid = _launchd_fallback_process_running(label)
+        if fallback_pid is not None:
+            state = "running" if fallback_running else "stale"
+            console.print(
+                f"[yellow]Detached launchd fallback is {state}; retrying the "
+                f"managed service path.[/yellow]"
+            )
+            service_stop(label=label)
+            service_start(label=label)
+            return
 
     # Avoid asyncio.run inside Typer when an event loop is already
     # active (e.g. called from a TUI worker). The helper is async so
@@ -1206,6 +1489,7 @@ def service_status(
                     break
         except Exception:
             loaded = False
+        fallback_running, fallback_pid = _launchd_fallback_process_running(label)
         port = _extract_port_from_plist(mac_plist)
         ok, health = _service_health(port)
         console.print(f"Service: [cyan]{label}[/cyan]")
@@ -1213,10 +1497,24 @@ def service_status(
         console.print(f"Loaded: {'[green]yes[/green]' if loaded else '[red]no[/red]'}")
         if pid:
             console.print(f"PID info: [dim]{pid}[/dim]")
+        if fallback_pid is not None:
+            fallback_state = "running" if fallback_running else "stale"
+            console.print(
+                f"Mode: [yellow]detached fallback ({fallback_state}, PID "
+                f"{fallback_pid})[/yellow]"
+            )
+            console.print(
+                "[yellow]Auto-start at login and auto-restart after a crash "
+                "are unavailable.[/yellow]"
+            )
         console.print(f"Health: {'[green]ok[/green]' if ok else '[yellow]down[/yellow]'} - {health}")
         if installed:
             console.print(f"[dim]File: {mac_plist}[/dim]")
-        _print_port_diagnostics(port, installed=installed, service_running=loaded)
+        _print_port_diagnostics(
+            port,
+            installed=installed,
+            service_running=loaded or (fallback_running and ok),
+        )
         return
 
     if system == "linux" and linux_unit:
@@ -1414,8 +1712,13 @@ def service_uninstall(
 
     try:
         if system == "darwin" and mac_plist:
+            port = _extract_port_from_plist(mac_plist)
+            fallback_running, fallback_pid = _launchd_fallback_process_running(label)
             _run_cmd(["launchctl", "stop", label], check=False)
             _run_cmd(["launchctl", "unload", str(mac_plist)], check=False)
+            if fallback_running or fallback_pid is not None:
+                _kill_gateway_on_port(port)
+            _clear_launchd_fallback_marker(label)
             if mac_plist.exists():
                 mac_plist.unlink()
             console.print(f"[green]✓[/green] Uninstalled service {label}")
