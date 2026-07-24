@@ -156,6 +156,9 @@ app.add_typer(memory_app, name="memory")
 from flowly.cli.skill_gov_cmd import skill_gov_app
 app.add_typer(skill_gov_app, name="skill")
 
+from flowly.cli.keychain_cmd import keychain_app
+app.add_typer(keychain_app, name="keychain")
+
 
 # ── Standalone commands (registered directly on app) ──────────────
 

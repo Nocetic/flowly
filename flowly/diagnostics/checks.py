@@ -516,6 +516,49 @@ def check_account_snapshot(ctx: DoctorContext) -> None:
         ctx.warn("account", "File-backed account credential has no account identity")
 
 
+def check_credential_storage(ctx: DoctorContext) -> None:
+    """Report when credentials have been demoted from the OS keychain to a file.
+
+    Flowly writes ``.keychain-broken`` the first time the OS keychain refuses
+    a read or a write, and from then on every credential goes to a 0600 file
+    instead. That is a deliberate, working fallback — but it is a quieter
+    security tier than the user signed up for, and nothing surfaced it until
+    now. Read-only by construction: this only stats and reads the marker.
+    """
+    marker = ctx.data_dir / "credentials" / ".keychain-broken"
+    if not marker.exists():
+        ctx.ok("credential_storage", "Credentials may use the OS keychain")
+        return
+    reason = _keychain_marker_reason(marker)
+    detail = "Run `flowly keychain retry` to use the OS keychain again."
+    if reason:
+        detail = f"Recorded reason: {reason}\n{detail}"
+    ctx.warn(
+        "credential_storage",
+        "OS keychain is disabled; credentials fall back to owner-only files",
+        detail,
+    )
+
+
+def _keychain_marker_reason(marker: Path) -> str:
+    """First non-boilerplate line of the marker, or "" if unreadable.
+
+    The marker is a comment block, so tolerate both the current format and
+    the raw-exception one written by older builds.
+    """
+    boilerplate = ("Recorded at", "Delete this file", "Run `flowly")
+    try:
+        lines = marker.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return ""
+    for line in lines:
+        text = line.lstrip("#").strip()
+        if not text or text.endswith(":") or text.startswith(boilerplate):
+            continue
+        return text
+    return ""
+
+
 def check_relay(ctx: DoctorContext) -> None:
     if ctx.config is None:
         ctx.skipped("relay", "Config is not valid")
@@ -1023,6 +1066,7 @@ CHECKS = [
     DoctorCheck("profile_isolation", "workspace", check_profile_isolation),
     DoctorCheck("memory", "workspace", check_memory),
     DoctorCheck("account", "credentials", check_account_snapshot),
+    DoctorCheck("credential_storage", "credentials", check_credential_storage),
     DoctorCheck("relay", "channels", check_relay),
     DoctorCheck("service", "service", check_service_definition),
     DoctorCheck("linux_linger", "service", check_linux_linger),

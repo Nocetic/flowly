@@ -227,18 +227,14 @@ def _storage_status() -> str:
 
 
 def _try_keyring():
-    marker = get_flowly_home() / "credentials" / ".keychain-broken"
-    if marker.exists():
-        return None
-    try:
-        import keyring  # type: ignore[import-not-found]
-        backend = keyring.get_keyring()
-        module = type(backend).__module__ or ""
-        if "fail" in module or "null" in module:
-            return None
-        return keyring
-    except Exception:
-        return None
+    """Working keyring backend, or None — see ``token_store.available_keyring``.
+
+    This used to be a private copy of that probe, which only *read* the
+    broken-keychain marker and never wrote it: a Mac that refused the
+    keychain here re-opened the blocking OS panel on every single save.
+    """
+    from flowly.account.token_store import available_keyring
+    return available_keyring()
 
 
 def _write_file(raw: dict[str, Any]) -> None:
@@ -269,7 +265,8 @@ def load_token_payload() -> XAITokenPayload | None:
         try:
             raw_blob = keyring.get_password(_keyring_service(), _KEYRING_ACCOUNT)
         except Exception as exc:
-            logger.warning("xAI OAuth keyring read failed, falling back to file: {}", exc)
+            from flowly.account.token_store import disable_keyring_for
+            disable_keyring_for("xai get_password", exc, fallback=credentials_path())
             raw_blob = None
         if raw_blob:
             try:
@@ -291,7 +288,8 @@ def save_token_payload(payload: XAITokenPayload) -> str:
                 pass
             return _storage_status()
         except Exception as exc:
-            logger.warning("xAI OAuth keyring write failed, falling back to file: {}", exc)
+            from flowly.account.token_store import disable_keyring_for
+            disable_keyring_for("xai set_password", exc, fallback=credentials_path())
     _write_file(raw)
     return _storage_status()
 
