@@ -2,15 +2,12 @@
 
 from pathlib import Path
 
-import pytest
-
 from flowly.config.schema import (
     AgentDefaults,
     ChannelsConfig,
     Config,
     DiscordConfig,
     ExecToolConfig,
-    GatewayConfig,
     ProviderConfig,
     ProvidersConfig,
     SlackConfig,
@@ -23,7 +20,7 @@ class TestConfig:
     def test_defaults(self):
         config = Config()
         assert config.gateway.port == 18790
-        assert config.agents.defaults.model == "moonshotai/kimi-k2.5"
+        assert config.agents.defaults.model == "anthropic/claude-haiku-4.5"
         assert config.agents.defaults.temperature == 0.7
         assert config.agents.defaults.max_tokens == 8192
 

@@ -65,7 +65,7 @@ The loader is resilient by design:
 |---|---|
 | `workspace` | `"~/.flowly/workspace"` |
 | `cwd` | `""` (empty → workspace; overridden by `FLOWLY_CWD`) |
-| `model` | `"moonshotai/kimi-k2.5"` |
+| `model` | `"anthropic/claude-haiku-4.5"` |
 | `maxTokens` | `8192` |
 | `temperature` | `0.7` |
 | `actionTemperature` | `0.1` |

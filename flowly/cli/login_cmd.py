@@ -221,6 +221,10 @@ def _login_with_account_key(key: str) -> None:
     try:
         from flowly.integrations import model_catalog
         model_catalog.flush_cache()
+        reconciled = asyncio.run(
+            model_catalog.reconcile_flowly_model(force_refresh=True)
+        )
+        model_changed = reconciled or model_changed
     except Exception:  # noqa: BLE001
         pass
 

@@ -15,13 +15,17 @@ Public surface
     edits a provider key in case the new key unlocks more models).
 
 The returned ``Model`` objects are intentionally minimal — just enough
-fields for the picker UI. Add metadata fields here as the picker grows.
+fields for the picker UI. Flowly's account-specific ``plan`` and
+``default_model`` response metadata is retained separately so login/startup
+can reconcile a stale configured model without changing this public list API.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field as dc_field
+import re as _re
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import Any
 
 import httpx
@@ -42,11 +46,20 @@ class Model:
     supports_vision: bool | None = None
 
 
+@dataclass(frozen=True)
+class FlowlyModelPolicy:
+    """Account-specific metadata returned by Flowly's authenticated catalog."""
+
+    plan: str
+    default_model: str
+
+
 _TIMEOUT = httpx.Timeout(8.0, connect=3.0)
 _UA = "flowly-tui/model-catalog"
 
 # Session cache: provider_key → list[Model]. Cleared on flush_cache().
 _CACHE: dict[str, list[Model]] = {}
+_FLOWLY_POLICY: FlowlyModelPolicy | None = None
 
 
 async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> list[Model]:
@@ -81,7 +94,14 @@ async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> lis
 
 def flush_cache() -> None:
     """Drop every cached provider catalog. Call after credentials change."""
+    global _FLOWLY_POLICY
     _CACHE.clear()
+    _FLOWLY_POLICY = None
+
+
+def get_flowly_model_policy() -> FlowlyModelPolicy | None:
+    """Return metadata from the latest authenticated Flowly catalog fetch."""
+    return _FLOWLY_POLICY
 
 
 def get_context_window(model_id: str) -> int | None:
@@ -155,9 +175,6 @@ def get_vision_support(model_id: str) -> bool | None:
 
 
 # ── id normalization ──────────────────────────────────────────────
-
-
-import re as _re
 
 # Match version suffixes like ``-4-5`` or ``-4`` at end of a model id
 # component. ``claude-sonnet-4-5`` → group "4-5" → normalised to "4.5".
@@ -262,6 +279,9 @@ async def _fetch_flowly_hosted() -> list[Model]:
     credential we fall back to the full OpenRouter catalog so the picker still
     has something browsable.
     """
+    global _FLOWLY_POLICY
+    _FLOWLY_POLICY = None
+
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
     cfg = load_config()
@@ -287,8 +307,21 @@ async def _fetch_flowly_hosted() -> list[Model]:
         # Network / 401 / plan lookup failure — degrade to OpenRouter
         # so the picker doesn't open empty.
         return await _fetch_openrouter()
+    payload = r.json()
+    if not isinstance(payload, dict):
+        return []
+    raw_plan = payload.get("plan")
+    raw_default = payload.get("default_model")
+    if isinstance(raw_plan, str) and raw_plan.strip() and isinstance(raw_default, str) and raw_default.strip():
+        _FLOWLY_POLICY = FlowlyModelPolicy(
+            plan=raw_plan.strip(),
+            default_model=raw_default.strip(),
+        )
+
     out: list[Model] = []
-    for item in r.json().get("data", []):
+    for item in payload.get("data", []):
+        if not isinstance(item, dict):
+            continue
         mid = str(item.get("id") or "").strip()
         if not mid:
             continue
@@ -324,6 +357,46 @@ async def _fetch_flowly_hosted() -> list[Model]:
     # Allowed first, then alphabetical within each bucket.
     out.sort(key=lambda m: (1 if "locked" in m.tags else 0, m.id.lower()))
     return out
+
+
+def _catalog_contains(models: list[Model], model_id: str) -> bool:
+    """True when an allowed catalog row matches ``model_id`` (dash/dot aliases)."""
+    candidates = {
+        model_id,
+        _dash_to_dot_version(model_id),
+        _dot_to_dash_version(model_id),
+    }
+    return any("locked" not in model.tags and model.id in candidates for model in models)
+
+
+async def reconcile_flowly_model(*, force_refresh: bool = True) -> str | None:
+    """Replace a model unavailable to this Flowly account with its backend default.
+
+    The authenticated ``/models`` response is authoritative. A valid current
+    choice — including a paid user's deliberate Kimi selection — is preserved.
+    Network/auth/catalog failures are fail-safe no-ops; they never rewrite the
+    user's config from an unverified OpenRouter fallback.
+    """
+    models = await fetch_models("flowly", force_refresh=force_refresh)
+    policy = _FLOWLY_POLICY
+    if policy is None or not models:
+        return None
+
+    from flowly.config.loader import load_config
+
+    current = (load_config().agents.defaults.model or "").strip()
+    if current and _catalog_contains(models, current):
+        return None
+    if not _catalog_contains(models, policy.default_model):
+        return None
+
+    from flowly.config.loader import get_config_path
+    from flowly.integrations.config_io import _atomic_write_json, _load_raw, _set_path
+
+    raw = _load_raw()
+    _set_path(raw, "agents.defaults.model", policy.default_model, merge=False)
+    _atomic_write_json(get_config_path(), raw)
+    return policy.default_model
 
 
 # Pin xAI's headline chat model to the top of the picker. Everything
