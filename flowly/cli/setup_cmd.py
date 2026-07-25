@@ -105,17 +105,21 @@ def _print_runtime_next_steps() -> None:
 
     console.print(f"[green]✓[/] Provider ready: [b]{active.source}[/]")
     console.print()
-    console.print("Now start the gateway, then chat:")
+    console.print("You're set:")
+    console.print(
+        "  [cyan]flowly[/]                          "
+        "[dim]— start chatting (starts the gateway if it isn't running)[/]"
+    )
+    console.print()
+    console.print("[dim]Optional:[/]")
     console.print(
         "  [cyan]flowly service install --start[/]  "
-        "[dim](Recommended — runs the gateway in the background)[/]"
+        "[dim](keep the gateway running in the background, across logins)[/]"
     )
     console.print(
         "  [cyan]flowly gateway[/]                  "
         "[dim](foreground — keeps this terminal busy; use a 2nd one to chat)[/]"
     )
-    console.print()
-    console.print("  Then: [cyan]flowly[/]  [dim]— open the chat UI[/]")
 
 
 @setup_app.command("byok")

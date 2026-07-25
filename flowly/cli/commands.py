@@ -71,18 +71,13 @@ def main(
         return
 
     # Smart entry: provider configured → open TUI, else first-run setup.
-    # Failure to read config (corrupt JSON, fresh install) shouldn't
-    # crash here — fall through to the unconfigured prompt instead of
-    # exploding before the user even sees a message.
-    try:
-        from flowly.config.loader import load_config
-        from flowly.integrations.active_provider import resolve_active_provider
-        cfg = load_config()
-        active = resolve_active_provider(cfg)
-    except Exception:
-        active = None
+    # ``provider_readiness`` is the one shared answer (see
+    # ``flowly/integrations/active_provider.py``) and never raises, so a
+    # corrupt config or a fresh install lands on the setup prompt rather
+    # than a traceback before the user has seen anything.
+    from flowly.integrations.active_provider import provider_readiness
 
-    if active is None:
+    if not provider_readiness().ready:
         from flowly.cli.onboard_cmd import run_onboarding
 
         run_onboarding()
