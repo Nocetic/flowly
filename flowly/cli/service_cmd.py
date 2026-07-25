@@ -558,7 +558,7 @@ def _start_launchd_service(
     *,
     domain: str | None = None,
 ) -> str:
-    """Start a launch agent, with Hermes-style EIO recovery and fallback."""
+    """Start a launch agent, recovering from launchctl EIO with a detached fallback."""
     resolved_domain = domain or _launchd_domain(label)
     target = _launchd_target(label, resolved_domain)
 
@@ -720,16 +720,34 @@ def _provider_configured() -> bool:
     crash-restart loop. We preflight the same check so service commands
     can refuse to *start* an unconfigured gateway — the unit still gets
     installed so it's ready the moment ``flowly setup`` is done.
+
+    Shares :func:`provider_readiness` with onboarding so the screen that
+    says "you're set up" and this preflight can never disagree.
     """
-    try:
-        from flowly.config.loader import load_config
-        from flowly.integrations.active_provider import resolve_active_provider
-        return resolve_active_provider(load_config()) is not None
-    except Exception:
-        return False
+    from flowly.integrations.active_provider import provider_readiness
+
+    return provider_readiness().ready
 
 
 def _warn_no_provider(action: str) -> None:
+    from flowly.integrations.active_provider import provider_readiness
+
+    if provider_readiness().has_account:
+        # Signed in, but no credential landed — sending this user to
+        # `flowly setup` to "pick a provider" reads as though the sign-in
+        # they just completed didn't count. Point at the actual repair.
+        console.print(
+            f"[yellow]Signed in, but no usable credential yet — not {action}.[/yellow]\n"
+            "The account key hasn't reached this machine, so the gateway has "
+            "nothing to call. Retry it, then start the service:"
+        )
+        console.print(
+            "  [cyan]flowly login[/]            [dim]— reissue the account key[/]"
+        )
+        console.print(
+            "  [cyan]flowly service start[/]    [dim]— start once it lands[/]"
+        )
+        return
     console.print(
         f"[yellow]No LLM provider configured — not {action}.[/yellow]\n"
         "The gateway would crash-loop without one. Configure a provider, "
