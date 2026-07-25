@@ -160,13 +160,15 @@ The gateway runs as a local daemon, and the **whole process runs inside the OS s
 | `uv tool` | `uv tool install flowly-ai` | Packaged PyPI install; tracks releases |
 | Source | `git clone … && pip install -e ".[dev]"` | Contributors |
 
-After install, run `flowly setup`. To run without a terminal session open:
+After install, run `flowly setup` to pick a provider, then `flowly` to chat — it
+starts the gateway for you if none is running.
+
+To keep it up without anyone running `flowly` (channels reachable, cron jobs
+firing, across reboots):
 
 ```bash
 flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Scheduler (Windows)
 ```
-
-It survives reboots and terminal close.
 
 ---
 
