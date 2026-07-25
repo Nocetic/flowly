@@ -289,6 +289,48 @@ def test_manual_instructions_survive_when_autostart_fails(
     assert _FakeTUI.launched == []
 
 
+def test_we_never_kill_a_service_start_that_is_still_within_its_own_budget() -> None:
+    """Our timeout must outlast the child's, or we abort legitimate starts.
+
+    ``flowly service install --start`` waits for the gateway's health endpoint
+    before returning (up to SERVICE_START_TOTAL_BUDGET). Interpreter startup
+    and the launchctl/systemctl round trip sit on top of that. A timeout equal
+    to the child's budget would kill it mid-install and report a failure that
+    did not happen — and would do it most often on the slowest machines.
+    """
+    from flowly.cli.service_cmd import SERVICE_START_TOTAL_BUDGET
+
+    assert autostart._command_timeout() > SERVICE_START_TOTAL_BUDGET + 10
+
+
+def test_the_port_wait_is_not_the_command_timeout(
+    monkeypatch: pytest.MonkeyPatch, interactive
+) -> None:
+    """A short ``timeout`` bounds how long we wait for the socket, not how long
+    the service manager is allowed to take."""
+    seen: dict[str, float] = {}
+    monkeypatch.setattr(autostart, "_unit_installed", lambda: True)
+    monkeypatch.setattr(autostart, "_configured_port", lambda: 18790)
+    monkeypatch.setattr(autostart, "_port_open", _reachable())
+    monkeypatch.setattr(autostart, "_flowly_argv", lambda: ["flowly"])
+
+    def fake_run(argv, **kwargs):
+        seen["timeout"] = kwargs.get("timeout", 0.0)
+
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Result()
+
+    monkeypatch.setattr(autostart.subprocess, "run", fake_run)
+
+    autostart.ensure_gateway_running("127.0.0.1", 18790, timeout=0.1)
+
+    assert seen["timeout"] > 30
+
+
 def test_remote_host_gets_remote_advice_not_a_local_service_command(
     tui_without_gateway, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:

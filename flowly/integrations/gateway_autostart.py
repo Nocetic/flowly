@@ -44,6 +44,25 @@ DEFAULT_TIMEOUT = 25.0
 _POLL_INTERVAL = 0.4
 _OPT_OUT_ENV = "FLOWLY_NO_GATEWAY_AUTOSTART"
 
+# Headroom over the child's OWN start budget. `service install --start` already
+# waits for the gateway's health endpoint before returning, so killing it on
+# our timer would abort a legitimate start mid-`launchctl bootstrap` and report
+# a failure that never happened. Interpreter startup and the service-manager
+# round trip are on top of that budget, and both are slower on a cold Windows
+# box than anywhere else — hence a generous margin rather than a tight one.
+_COMMAND_HEADROOM = 30.0
+
+
+def _command_timeout() -> float:
+    """How long to let ``flowly service …`` run before giving up on it."""
+    try:
+        from flowly.cli.service_cmd import SERVICE_START_TOTAL_BUDGET
+
+        budget = float(SERVICE_START_TOTAL_BUDGET)
+    except Exception:
+        budget = 25.0
+    return budget + _COMMAND_HEADROOM
+
 
 @dataclass(frozen=True)
 class AutostartResult:
@@ -87,11 +106,24 @@ def _configured_port() -> int:
 
 
 def _unit_installed() -> bool:
-    """True when a launchd/systemd/Windows unit for the gateway exists."""
-    try:
-        from flowly.cli.service_cmd import DEFAULT_SERVICE_LABEL, _service_paths
+    """True when a launchd/systemd/Windows definition for the gateway exists.
 
-        return any(p is not None and p.exists() for p in _service_paths(DEFAULT_SERVICE_LABEL))
+    Includes the Windows Startup-folder launcher: without admin rights the
+    installer falls back to that instead of a scheduled task, and treating it
+    as "nothing installed" would make every launch take the heavier reinstall
+    path and announce a background service the user already had.
+    """
+    try:
+        from flowly.cli.service_cmd import (
+            DEFAULT_SERVICE_LABEL,
+            _service_paths,
+            _windows_startup_launcher,
+        )
+
+        candidates = list(_service_paths(DEFAULT_SERVICE_LABEL))
+        if sys.platform == "win32":
+            candidates.append(_windows_startup_launcher(DEFAULT_SERVICE_LABEL))
+        return any(p is not None and p.exists() for p in candidates)
     except Exception:
         return False
 
@@ -144,7 +176,9 @@ def ensure_gateway_running(
     argv += ["service", "install", "--start"] if install_unit else ["service", "start"]
 
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=_command_timeout()
+        )
     except Exception as exc:  # noqa: BLE001 — a failed start must not kill the CLI
         return AutostartResult(running=False, attempted=True, detail=str(exc))
 
