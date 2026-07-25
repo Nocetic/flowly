@@ -11,7 +11,12 @@ from flowly.cli import doctor as doctor_module
 from flowly.cli.doctor import run_doctor
 from flowly.config.loader import convert_to_camel
 from flowly.config.schema import Config
-from flowly.diagnostics.checks import _service_command_and_home, check_profile_isolation
+from flowly.diagnostics import checks as checks_module
+from flowly.diagnostics.checks import (
+    _service_command_and_home,
+    check_profile_isolation,
+    check_service_definition,
+)
 from flowly.diagnostics.config import find_unknown_keys, read_config_snapshot
 from flowly.diagnostics.models import DoctorCheck, DoctorContext, Status
 from flowly.diagnostics.repairs import (
@@ -775,6 +780,100 @@ def test_windows_service_parser_reads_production_xml_and_vbs(tmp_path: Path) -> 
     assert parsed_home == str(profile)
     assert "gateway" in argv
     assert "19999" in argv
+
+
+def _write_launchd_plist(path: Path, *, executable: Path, home: Path) -> None:
+    import plistlib
+
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "ai.flowly.gateway",
+                "ProgramArguments": [str(executable), "gateway", "--port", "18790"],
+                "EnvironmentVariables": {"FLOWLY_HOME": str(home)},
+            }
+        )
+    )
+
+
+def test_foreign_home_service_is_not_reported_against_this_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A unit owned by another Flowly home must not fail this profile's doctor.
+
+    The launchd/systemd label is global, so a profile (or a second product
+    built on this codebase) sees the *default* home's unit at the well-known
+    path. Validating that foreign unit's executable produced a hard ERROR —
+    "Service executable does not exist" — about an install this profile has
+    nothing to do with, which is also why the read-only doctor test failed on
+    any developer machine with Flowly installed.
+    """
+    other_home = tmp_path / "other-home"
+    other_home.mkdir()
+    plist = tmp_path / "ai.flowly.gateway.plist"
+    _write_launchd_plist(
+        plist, executable=tmp_path / "deleted-worktree" / "flowly", home=other_home
+    )
+
+    this_home = tmp_path / "this-profile"
+    this_home.mkdir()
+    monkeypatch.setattr(checks_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(checks_module, "_service_path", lambda: plist)
+    monkeypatch.setattr(checks_module, "default_home", lambda: tmp_path / "default")
+
+    ctx = DoctorContext(data_dir=this_home)
+    check_service_definition(ctx)
+
+    (result,) = ctx.results
+    assert result.status is Status.WARN
+    assert "executable" not in result.message.lower()
+    assert str(other_home) in result.detail
+
+
+def test_default_home_still_errors_when_its_service_was_taken_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the default home a foreign unit means someone clobbered your service."""
+    default_home = tmp_path / "default"
+    default_home.mkdir()
+    other_home = tmp_path / "other-home"
+    other_home.mkdir()
+    executable = tmp_path / "flowly"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    plist = tmp_path / "ai.flowly.gateway.plist"
+    _write_launchd_plist(plist, executable=executable, home=other_home)
+
+    monkeypatch.setattr(checks_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(checks_module, "_service_path", lambda: plist)
+    monkeypatch.setattr(checks_module, "default_home", lambda: default_home)
+
+    ctx = DoctorContext(data_dir=default_home)
+    check_service_definition(ctx)
+
+    (result,) = ctx.results
+    assert result.status is Status.ERROR
+    assert str(other_home) in result.detail
+
+
+def test_matching_home_service_is_still_fully_validated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reordering the home comparison must not stop us validating our own unit."""
+    home = tmp_path / "home"
+    home.mkdir()
+    plist = tmp_path / "ai.flowly.gateway.plist"
+    _write_launchd_plist(plist, executable=tmp_path / "gone" / "flowly", home=home)
+
+    monkeypatch.setattr(checks_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(checks_module, "_service_path", lambda: plist)
+    monkeypatch.setattr(checks_module, "default_home", lambda: home)
+
+    ctx = DoctorContext(data_dir=home)
+    check_service_definition(ctx)
+
+    (result,) = ctx.results
+    assert result.status is Status.ERROR
+    assert "executable does not exist" in result.message
 
 
 def test_windows_service_parser_supports_startup_fallback(tmp_path: Path) -> None:
