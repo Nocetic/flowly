@@ -8,18 +8,22 @@ import mimetypes
 import os
 import ssl
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import websockets
-from websockets.exceptions import ConnectionClosed
 from loguru import logger
+from websockets.exceptions import ConnectionClosed
 
-from flowly.bus.events import InboundMessage, OutboundMessage
+from flowly.browser_annotations import append_browser_annotation_context
+from flowly.bus.events import InboundMessage as _Base
+from flowly.bus.events import OutboundMessage
 from flowly.bus.queue import MessageBus
-from flowly.channels.base import BaseChannel
 from flowly.channels import feature_rpc
+from flowly.channels.base import BaseChannel
 from flowly.config.schema import WebChannelConfig
+from flowly.profile import get_flowly_home
 
 # ─── Transport limits ──────────────────────────────────────────────────────
 #
@@ -752,8 +756,9 @@ class WebChannel(BaseChannel):
 
     async def _connect_and_run(self) -> None:
         """Open one WebSocket connection to the relay proxy and process messages."""
-        from jose import jwt as jose_jwt
         import time
+
+        from jose import jwt as jose_jwt
 
         jwt_secret = os.environ.get("MOLTBOT_PROXY_JWT_SECRET", "")
         if not jwt_secret or jwt_secret == "flowly-moltbot-proxy-secret-change-in-production":
@@ -932,6 +937,7 @@ class WebChannel(BaseChannel):
             # Save attachments to disk
             media: list[str] = []
             attachments = params.get("attachments") or []
+            message_text = append_browser_annotation_context(message_text, attachments)
             if attachments:
                 media_dir = get_flowly_home() / "media"
                 media = _save_attachments(attachments, media_dir)
@@ -1206,12 +1212,6 @@ class WebChannel(BaseChannel):
 # ---------------------------------------------------------------------------
 # InboundMessage subclass that allows overriding session_key
 # ---------------------------------------------------------------------------
-
-from dataclasses import dataclass, field
-from datetime import datetime
-from flowly.bus.events import InboundMessage as _Base
-from flowly.profile import get_flowly_home
-
 
 @dataclass
 class _WebInboundMessage(_Base):

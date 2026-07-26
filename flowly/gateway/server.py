@@ -18,6 +18,7 @@ from loguru import logger
 from flowly.agent.subagent_registry import SubagentRegistry
 from flowly.artifacts.context import is_internal_context_artifact
 from flowly.artifacts.summary import artifact_summary
+from flowly.browser_annotations import append_browser_annotation_context
 from flowly.channels import feature_rpc
 from flowly.gateway.auth import (
     WsTicketStore,
@@ -1918,6 +1919,7 @@ class GatewayServer:
         if not message and not attachments:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Empty message")
             return
+        message = append_browser_annotation_context(message, attachments)
 
         session_key = params.get("sessionKey") or f"desktop:{client_id}"
         idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
