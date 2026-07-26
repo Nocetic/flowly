@@ -73,6 +73,18 @@ def get_flowly_home() -> Path:
     return _DEFAULT_HOME
 
 
+def default_home() -> Path:
+    """The canonical home (``~/.flowly``), regardless of what is active.
+
+    ``get_flowly_home()`` answers "where am I writing?"; this answers "which
+    home owns the shared, non-profile-scoped resources?" — chiefly the
+    background-service label, which is a single global name every home would
+    otherwise fight over. Callers that need to tell "this unit is mine" from
+    "this unit belongs to the default install" compare against this.
+    """
+    return _DEFAULT_HOME
+
+
 def is_default_home() -> bool:
     """True iff the active ``FLOWLY_HOME`` is the default (``~/.flowly``)."""
     return get_flowly_home() == _DEFAULT_HOME

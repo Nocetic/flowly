@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 from flowly.diagnostics.config import find_unknown_keys, read_config_snapshot
 from flowly.diagnostics.models import DoctorCheck, DoctorContext, RepairRisk
+from flowly.profile import default_home
 
 _WORKSPACE_FILES = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "HEARTBEAT.md")
 _FLOWLY_BEARER_RE = re.compile(r"^[A-Za-z0-9_-]{12,32}:[0-9a-f]{32,128}$")
@@ -704,6 +705,32 @@ def check_service_definition(ctx: DoctorContext) -> None:
     except (OSError, ValueError, ET.ParseError, plistlib.InvalidFileException) as exc:
         ctx.error("service", f"Service definition cannot be parsed ({type(exc).__name__})")
         return
+
+    # Whose unit is this? The service label is a single global name, so every
+    # home sees whichever home installed it last at the well-known path. Settle
+    # ownership BEFORE validating the command: judging a foreign unit's
+    # executable reports someone else's broken install as this profile's error.
+    if service_home:
+        owner = Path(service_home).expanduser().resolve()
+        if owner != ctx.data_dir.resolve():
+            detail = f"Service: {service_home}\nThis profile: {ctx.data_dir}"
+            if ctx.data_dir.resolve() == default_home().resolve():
+                # The default home owns the label. A unit pointing elsewhere
+                # means this install's service was taken over — its gateway
+                # is not the one running.
+                ctx.error(
+                    "service",
+                    "Service FLOWLY_HOME does not match the active profile",
+                    detail,
+                )
+            else:
+                ctx.warn(
+                    "service",
+                    "Background service belongs to another Flowly home",
+                    detail,
+                )
+            return
+
     if not argv:
         ctx.error("service", "Service definition has no executable command")
         return
@@ -713,13 +740,6 @@ def check_service_definition(ctx: DoctorContext) -> None:
         return
     if "gateway" not in argv:
         ctx.warn("service", "Service command does not visibly invoke the Flowly gateway")
-        return
-    if service_home and Path(service_home).expanduser().resolve() != ctx.data_dir.resolve():
-        ctx.error(
-            "service",
-            "Service FLOWLY_HOME does not match the active profile",
-            f"Service: {service_home}\nDoctor: {ctx.data_dir}",
-        )
         return
     ctx.ok("service", f"Service definition is structurally valid: {path}")
 

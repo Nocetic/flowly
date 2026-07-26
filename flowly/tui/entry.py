@@ -22,6 +22,8 @@ import time
 import typer
 from rich.console import Console
 
+from flowly.integrations.active_provider import provider_readiness
+from flowly.integrations.gateway_autostart import ensure_gateway_running
 from flowly.tui.state import (
     canonical_session_key,
     fresh_session_key,
@@ -37,6 +39,16 @@ def _gateway_reachable(host: str, port: int, timeout: float = 0.5) -> bool:
         with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
+        return False
+
+
+def _is_remote_host(host: str) -> bool:
+    """True when ``host`` names another machine, so there is nothing here to start."""
+    try:
+        from flowly.gateway.auth import is_loopback_host
+
+        return not is_loopback_host(host)
+    except Exception:
         return False
 
 
@@ -188,17 +200,7 @@ def run_tui(
         # but gateway not running" (→ start it). A fresh user hits the
         # former; pointing them at `flowly gateway` there would just bounce
         # them off the gateway's own no-provider error.
-        configured = False
-        try:
-            from flowly.config.loader import load_config
-            from flowly.integrations.active_provider import (
-                resolve_active_provider,
-            )
-            configured = resolve_active_provider(load_config()) is not None
-        except Exception:
-            configured = False
-
-        if not configured:
+        if not provider_readiness().ready:
             # Fresh install — run the unified onboarding (account or API key)
             # instead of a bare "not configured" message. TTY-guarded inside;
             # non-interactive contexts just get guidance and return.
@@ -206,17 +208,40 @@ def run_tui(
             run_onboarding()
             raise typer.Exit(code=0)
 
-        console.print(f"[red]Gateway not reachable on {host}:{port}.[/red]")
-        console.print("Start the gateway, then run [bold]flowly[/bold] again:")
-        console.print(
-            "  [bold]flowly service install --start[/bold]  "
-            "[dim](background)[/dim]"
-        )
-        console.print(
-            "  [bold]flowly gateway[/bold]                  "
-            "[dim](foreground, in another terminal)[/dim]"
-        )
-        raise typer.Exit(code=1)
+        # Provider ready, gateway down: this is ours to fix. Starting it is
+        # exactly what the old message asked the user to go and type.
+        result = ensure_gateway_running(host, port)
+        if result.running:
+            if result.installed_unit:
+                # A persistent service is a change to their machine, so it
+                # gets one line — and the way back out.
+                console.print(
+                    "[dim]Started Flowly in the background "
+                    "(stop it any time with [/dim][bold]flowly service uninstall[/bold][dim]).[/dim]"
+                )
+        else:
+            console.print(f"[red]Gateway not reachable on {host}:{port}.[/red]")
+            if result.detail:
+                console.print(f"  [dim]{result.detail}[/dim]")
+            if _is_remote_host(host):
+                # Nothing local to start — telling them to install a service
+                # here would point them at the wrong machine entirely.
+                console.print(
+                    f"That gateway runs on [bold]{host}[/bold]. Check it's up "
+                    f"there and that port {port} is reachable "
+                    "[dim](firewall, VPN, same Wi-Fi)[/dim]."
+                )
+            else:
+                console.print("Start the gateway, then run [bold]flowly[/bold] again:")
+                console.print(
+                    "  [bold]flowly service install --start[/bold]  "
+                    "[dim](background)[/dim]"
+                )
+                console.print(
+                    "  [bold]flowly gateway[/bold]                  "
+                    "[dim](foreground, in another terminal)[/dim]"
+                )
+            raise typer.Exit(code=1)
 
     # Every launch starts a fresh session by default. ``--resume`` opens a
     # terminal session picker (like ``flowly setup``'s menus) and launches

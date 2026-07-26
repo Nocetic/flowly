@@ -71,7 +71,7 @@ flowly --version
 
 ## Running as a background service
 
-By default Flowly runs in your terminal session. To keep the gateway running without a terminal — surviving reboots and terminal close — install it as a background service:
+Bare `flowly` starts the gateway on demand, so nothing below is required to chat. Install it as a background service when you want the gateway up **without anyone running `flowly`** — keeping channels reachable and scheduled jobs firing, across logout and reboots:
 
 ```bash
 flowly service install --start

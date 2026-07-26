@@ -789,6 +789,36 @@ main() {
 # reports ok but the gateway never binds its port again. Rewrite the unit
 # against this install and restart it. This also means a re-run-to-update
 # actually bounces the running gateway onto the new code.
+#
+# It must only adopt a unit that is actually THIS install's to adopt. The
+# service label is a single global name, and FLOWLY_SRC / FLOWLY_VENV can point
+# anywhere — that is how CI and anyone testing a branch run this script. Blindly
+# rewriting the unit repoints the machine's real background service at a
+# throwaway venv, and breaks the gateway for good the moment that directory is
+# cleaned up. So: adopt the unit when it is ours or when it dangles (the case
+# this function exists for), and otherwise leave it exactly as we found it.
+unit_exec_path() {
+  local unit="$1"
+  "${FLOWLY_VENV}/bin/python" - "$unit" <<'EOF' 2>/dev/null || true
+import plistlib, shlex, sys
+from pathlib import Path
+
+unit = Path(sys.argv[1])
+try:
+    if unit.suffix == ".plist":
+        argv = plistlib.loads(unit.read_bytes()).get("ProgramArguments") or []
+        print(argv[0] if argv else "")
+    else:
+        for line in unit.read_text(encoding="utf-8").splitlines():
+            if line.startswith("ExecStart="):
+                tokens = shlex.split(line.split("=", 1)[1].strip())
+                print(tokens[0] if tokens else "")
+                break
+except Exception:
+    pass
+EOF
+}
+
 refresh_service() {
   local flowly_bin="$1"
   local unit=""
@@ -797,6 +827,14 @@ refresh_service() {
     Linux)  unit="${HOME}/.config/systemd/user/ai.flowly.gateway.service" ;;
   esac
   [[ -n "$unit" && -f "$unit" ]] || return 0
+
+  local current
+  current="$(unit_exec_path "$unit")"
+  if [[ -n "$current" && -x "$current" && "$current" != "${FLOWLY_VENV}/bin/flowly" ]]; then
+    log "Leaving the existing background service alone — it belongs to another install:"
+    log "  ${current}"
+    return 0
+  fi
 
   log "Refreshing the background service to point at this install..."
   if "$flowly_bin" service install --start >/dev/null 2>&1; then
@@ -826,8 +864,11 @@ print_next_steps() {
     printf '\n'
   fi
 
+  # One command, not two. `flowly service install --start` used to be listed
+  # here as a step the user had to perform before the product would work —
+  # the CLI now starts the gateway on demand, so the only thing left to type
+  # is the thing they actually came for.
   printf 'Get started:\n'
-  printf '  flowly service install --start   # run the gateway in the background\n'
   printf '  flowly                           # start chatting\n'
 }
 

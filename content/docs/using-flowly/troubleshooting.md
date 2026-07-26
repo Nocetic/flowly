@@ -71,9 +71,21 @@ the port. One command rewrites the unit onto the current install and starts it:
 flowly service install --start
 ```
 
-Current releases close this loophole from both ends: the install script
-refreshes an existing service unit automatically, and `service restart`/`start`
-detect the stale executable and print exactly this fix instead of a false ✓.
+Current releases close this loophole from both ends: the install script adopts
+a unit that dangles or belongs to the install it is replacing (one pointing at
+a *different, working* install is deliberately left alone), and `service
+restart`/`start` detect the stale executable and print exactly this fix instead
+of a false ✓.
+
+**"Gateway not reachable" when I run `flowly`.**
+`flowly` starts the gateway itself when none is running, so seeing this means
+the start was refused or failed — and the line underneath says which. Common
+reasons: you passed a `--host` that names another machine (nothing here to
+start — check that machine and the firewall), you passed a one-off `--port`
+that isn't the configured one, you're not on an interactive terminal, or
+`FLOWLY_NO_GATEWAY_AUTOSTART=1` is set. If the service manager itself refused,
+the last line of its error is shown; `flowly service logs --no-follow` has the
+rest.
 
 **Port already in use / "gateway already running".**
 Something is already listening on the gateway port (default `18790`) — usually a

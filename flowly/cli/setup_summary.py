@@ -304,9 +304,14 @@ def _next_commands(summary: SetupSummary) -> list[tuple[str, str]]:
     if not summary.provider_ready:
         cmds.append(("flowly setup", "choose an account or API key"))
         return cmds
-    if not summary.gateway_installed:
-        cmds.append(("flowly service install --start", "run the gateway in the background"))
+    # `flowly` leads. It starts the gateway itself when one isn't running, so
+    # the service command below is a convenience (keep it running at login),
+    # not a prerequisite the user has to clear before chatting.
     cmds.append(("flowly", "start chatting"))
+    if not summary.gateway_installed:
+        cmds.append(
+            ("flowly service install --start", "optional — keep it running at login")
+        )
     cmds.append(("flowly memory import-prompt", "bring memories from ChatGPT/Gemini"))
     if not summary.configured_tools:
         cmds.append(("flowly setup tools", "add integrations"))

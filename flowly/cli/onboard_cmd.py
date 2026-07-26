@@ -166,23 +166,36 @@ def seed_workspace() -> Path:
 
 
 def _already_configured() -> bool:
-    """True when a provider is set up OR a Flowly account is signed in."""
-    try:
-        from flowly.config.loader import load_config
-        from flowly.integrations.active_provider import resolve_active_provider
+    """True when Flowly can actually serve a request right now.
 
-        if resolve_active_provider(load_config()) is not None:
-            return True
-    except Exception:
-        pass
-    try:
-        from flowly.account.health import check_token_state
+    This used to also return True for "a Flowly account is signed in", which
+    is not the same thing: ``ensure_account_key`` is best-effort, so a
+    sign-in whose mint failed leaves an account with nothing to bill
+    against. Onboarding then declared victory while ``service install
+    --start`` refused to run the gateway — and bare ``flowly``, finding no
+    provider, reopened onboarding. One definition now, shared with the
+    service manager (see :func:`provider_readiness`).
+    """
+    from flowly.integrations.active_provider import provider_readiness
 
-        if check_token_state().has_account:
-            return True
-    except Exception:
-        pass
-    return False
+    return provider_readiness().ready
+
+
+def _warn_signed_in_but_unusable() -> None:
+    """Explain the one state that looks configured but cannot serve a request."""
+    from flowly.integrations.active_provider import provider_readiness
+
+    state = provider_readiness()
+    if state.ready or not state.has_account:
+        return
+    console.print(
+        "\n  [yellow]![/yellow] You're signed in, but no usable credential "
+        "reached this machine yet\n"
+        "    [dim](the account key couldn't be issued — usually a network or "
+        "backend hiccup).[/dim]\n"
+        "    Retry with [cyan]flowly login[/cyan], or pick your own API key "
+        "below."
+    )
 
 
 @contextlib.contextmanager
@@ -429,13 +442,28 @@ def _model_label(m) -> str:
 
 
 def _offer_start_gateway() -> None:
-    """Ask whether to start the gateway in the background, then guide next steps."""
+    """Offer to keep Flowly running in the background, then guide next steps.
+
+    Declining is now cheap: ``flowly`` starts the gateway on demand, so the
+    question is really "keep it running across logins?" rather than "may I
+    make the product work?". Only the failure path still spells out the
+    manual command, because that is the one case where the user has to do
+    something themselves.
+    """
     from rich.prompt import Confirm
 
     try:
-        start_now = Confirm.ask("\n  Start Flowly in the background now?", default=True)
+        start_now = Confirm.ask("\n  Keep Flowly running in the background?", default=True)
     except (EOFError, KeyboardInterrupt):
         start_now = False
+
+    if not start_now:
+        console.print(
+            "\n  Next:\n"
+            "    [cyan]flowly[/cyan]   [dim]— start chatting "
+            "(it starts the gateway for you)[/dim]"
+        )
+        return
 
     if start_now:
         # Resolve the launcher properly instead of trusting sys.argv[0]: under
@@ -515,6 +543,9 @@ def _run_provider_step() -> bool:
     if _already_configured():
         _prompt_model(choice)
         return True
+    # Sign-in can succeed while the credential behind it doesn't arrive. Say
+    # so here rather than dropping the user back on the picker in silence.
+    _warn_signed_in_but_unusable()
     return False
 
 

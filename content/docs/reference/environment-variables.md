@@ -87,6 +87,7 @@ These let tools pick up credentials from the environment instead of `config.json
 | Variable | Default | What it does |
 |---|---|---|
 | `FLOWLY_TUI_THEME` | `flowly` | Default TUI theme. |
+| `FLOWLY_NO_GATEWAY_AUTOSTART` | — | Set to `1` to stop bare `flowly` from starting the gateway when none is running. Without it, `flowly` starts an installed service, or installs and starts one, before opening the chat. Never fires for a non-loopback `--host`, for a `--port` other than the configured one, or outside an interactive terminal. |
 | `FLOWLY_BROWSER_PLAN_ENABLED` | `1` | Toggles the `browser_plan` tool. |
 | `FLOWLY_BROWSER_PLAN_PERSIST` | — | Controls browser-plan persistence. |
 
