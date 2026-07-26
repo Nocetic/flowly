@@ -1,7 +1,9 @@
 """Command executor with security checks."""
 
 import asyncio
+import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -127,7 +129,33 @@ async def _spawn_shell_subprocess(
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
         env=env,
+        start_new_session=True,
     )
+
+
+async def _terminate_subprocess_tree(process: asyncio.subprocess.Process) -> None:
+    """Best-effort termination for an exec shell and all of its children."""
+    if process.returncode is not None:
+        return
+
+    try:
+        if sys.platform == "win32":
+            process.kill()
+        else:
+            # POSIX exec shells start in their own session above, so the pid is
+            # also the process-group id. Killing the group prevents a command
+            # such as ``sh -c 'long_child'`` from surviving after Stop.
+            os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+
+    try:
+        await process.wait()
+    except ProcessLookupError:
+        pass
 
 
 def _wrap_for_cwd_capture(command: str) -> tuple[str, str]:
@@ -312,7 +340,6 @@ async def execute_command(
         # See flowly/exec/env_scrub.py for the rationale and the list
         # of names stripped (user-owned creds like AWS_* and GH_TOKEN
         # pass through; only Flowly-managed names are blocked).
-        import os
         env = sanitize_subprocess_env(os.environ, request.env)
 
         # Run command via the platform's best shell.
@@ -330,14 +357,16 @@ async def execute_command(
                 timeout=timeout
             )
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            await _terminate_subprocess_tree(process)
             return ExecResult(
                 success=False,
                 exit_code=-1,
                 error=f"Command timed out after {timeout} seconds",
                 timed_out=True
             )
+        except asyncio.CancelledError:
+            await _terminate_subprocess_tree(process)
+            raise
 
         # Decode output
         stdout_str = stdout.decode('utf-8', errors='replace')
@@ -377,7 +406,6 @@ async def execute_command(
         )
     finally:
         if cwd_file is not None:
-            import os
             try:
                 os.unlink(cwd_file)
             except OSError:

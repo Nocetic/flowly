@@ -86,6 +86,7 @@ ChatCallback = Callable[
     ],
     Awaitable[tuple[str, dict]],
 ]
+AbortCallback = Callable[[str], bool]
 
 
 # Per-file attachment cap for the direct gateway's base64-over-WS upload path.
@@ -294,6 +295,7 @@ class GatewayServer:
         on_cron_reload: Callable[[], Awaitable[int]] | None = None,
         on_cron_health: Callable[[], dict] | None = None,
         on_chat_message: ChatCallback | None = None,
+        on_chat_abort: AbortCallback | None = None,
         sessions: SessionManager | None = None,
         subagent_registry: SubagentRegistry | None = None,
         artifact_store: Any | None = None,
@@ -351,6 +353,7 @@ class GatewayServer:
         self.on_cron_reload = on_cron_reload
         self.on_provider_reload = on_provider_reload
         self.on_chat_message = on_chat_message
+        self.on_chat_abort = on_chat_abort
         self.sessions = sessions
         self.subagent_registry = subagent_registry
         self._delegate_tool: Any | None = None
@@ -1891,6 +1894,11 @@ class GatewayServer:
                 msg["timestamp"] = m["timestamp"]
             if "usage" in m:
                 msg["usage"] = m["usage"]
+            if m.get("aborted") is True:
+                msg["aborted"] = True
+            duration_ms = m.get("duration_ms")
+            if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
+                msg["durationMs"] = max(0, int(duration_ms))
             messages.append(msg)
 
         await self._ws_rpc_reply(ws, rpc_id, {
@@ -2011,6 +2019,7 @@ class GatewayServer:
         browser_binding: _BrowserRunBinding | None = None,
     ) -> None:
         """Execute the chat and send final/error events."""
+        run_started_at = asyncio.get_running_loop().time()
         accumulated_text = ""
 
         # Track the in-flight stream so a client that leaves and re-enters
@@ -2105,16 +2114,28 @@ class GatewayServer:
                 if atts:
                     final_message["attachments"] = atts
 
+            final_data: dict[str, Any] = {
+                "state": "final",
+                "runId": run_id,
+                "sessionKey": session_key,
+                "model": model,
+                "message": final_message,
+            }
+            if (metadata or {}).get("aborted") is True:
+                final_data["aborted"] = True
+            metadata_duration = (metadata or {}).get("duration_ms")
+            if isinstance(metadata_duration, (int, float)) and not isinstance(metadata_duration, bool):
+                final_data["durationMs"] = max(0, int(metadata_duration))
+            else:
+                final_data["durationMs"] = max(
+                    0,
+                    int((asyncio.get_running_loop().time() - run_started_at) * 1000),
+                )
+
             await self._session_send(session_key, ws, {
                 "type": "event",
                 "event": "chat",
-                "data": {
-                    "state": "final",
-                    "runId": run_id,
-                    "sessionKey": session_key,
-                    "model": model,
-                    "message": final_message,
-                },
+                "data": final_data,
             })
             self._schedule_offline_chat_push(session_key, response)
         except asyncio.CancelledError:
@@ -2151,10 +2172,21 @@ class GatewayServer:
 
     async def _ws_rpc_chat_abort(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
         run_id = params.get("runId", "")
-        task = self._active_tasks.get(run_id)
-        if task and not task.done():
-            task.cancel()
-        await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
+        cancelled = False
+        abort_callback = getattr(self, "on_chat_abort", None)
+        if abort_callback is not None:
+            try:
+                cancelled = bool(abort_callback(run_id))
+            except Exception:
+                logger.exception(f"[GatewayWS] chat.abort callback failed run_id={run_id}")
+        else:
+            # Backward compatibility for embedders that provide a chat
+            # callback but have not wired the cooperative abort callback yet.
+            task = self._active_tasks.get(run_id)
+            if task and not task.done():
+                task.cancel()
+                cancelled = True
+        await self._ws_rpc_reply(ws, rpc_id, {"ok": True, "cancelled": cancelled})
 
     # ------------------------------------------------------------------
     # RPC: chat.compact / chat.clear

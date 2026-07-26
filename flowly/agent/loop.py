@@ -47,6 +47,7 @@ from flowly.audit.logger import get_audit_logger
 from flowly.providers.key_rotator import is_context_overflow
 from flowly.agent.prompt_blocks import detect_model_families
 from flowly.agent.reply_media import extract_reply_media
+from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
 
 
@@ -682,25 +683,11 @@ class AgentLoop:
         # finish — exactly the "no title on the server" failure mode.
         self._title_tasks: set[asyncio.Task] = set()
 
-        # ─── Per-run cooperative abort ─────────────────────────────────
-        # The desktop / iOS Stop button drives this. The web channel's
-        # ``chat.abort`` RPC used to call ``task.cancel()`` on the task
-        # that pushed the inbound to the bus — but that task is done
-        # in microseconds (it only awaits ``bus.publish_inbound``), so
-        # the cancel was a no-op. The actual LLM call runs inside
-        # ``agent.run()``'s long-lived task, which can't be cancelled
-        # per-message without a refactor.
-        #
-        # Instead we track aborted run_ids in this set; the streaming
-        # loop checks it between every chunk and breaks out, preserving
-        # the partial accumulated text so the user still sees what the
-        # bot had said up to the abort point. ``MAX_ABORTED_RUNS`` is
-        # a defensive cap with LRU eviction — the set never holds more
-        # than a session's worth of recent abort markers, but a leak
-        # would otherwise grow unbounded on a long-lived gateway.
-        self._aborted_runs: set[str] = set()
-        self._aborted_runs_order: list[str] = []
-        self._MAX_ABORTED_RUNS = 64
+        # One controller owns per-run cancellation for every transport.
+        # Streams poll its marker; active tool awaitables are registered with
+        # it so Stop can cancel the current tool without cancelling the parent
+        # turn before partial transcript persistence/final delivery.
+        self._run_aborts = RunAbortController(max_recent=64)
 
         # Self-improvement nudge intervals (0 = disabled). Skill review is
         # intentionally not triggered by self-review; skill creation remains
@@ -2602,32 +2589,22 @@ class AgentLoop:
                     except Exception:
                         logger.debug("[loop] inflight.finish failed", exc_info=True)
 
-    def mark_aborted(self, run_id: str) -> None:
-        """Mark a run_id as aborted so the streaming loop bails out.
+    def mark_aborted(self, run_id: str) -> bool:
+        """Stop one run without cancelling its transcript-finalization task.
 
-        Called by ``WebChannel.chat.abort`` (and any future channel
-        with a Stop affordance). The streaming loop checks
-        ``is_run_aborted(run_id)`` between chunks; on a positive hit
-        it breaks out cooperatively, keeping the partial accumulated
-        text so the user sees what the bot had managed to say.
-
-        Idempotent. The set is bounded — see ``_MAX_ABORTED_RUNS``
-        for the LRU policy.
+        Streams observe the marker between chunks. If a tool is currently
+        awaiting, the shared controller cancels that child task immediately;
+        the surrounding turn then records a stopped tool result and emits the
+        authoritative partial ``final`` event.
         """
-        if not run_id:
-            return
-        if run_id in self._aborted_runs:
-            return
-        self._aborted_runs.add(run_id)
-        self._aborted_runs_order.append(run_id)
-        while len(self._aborted_runs_order) > self._MAX_ABORTED_RUNS:
-            evict = self._aborted_runs_order.pop(0)
-            self._aborted_runs.discard(evict)
-        logger.info(f"[agent] mark_aborted run_id={run_id}")
+        requested = self._run_aborts.request(run_id)
+        if requested:
+            logger.info(f"[agent] mark_aborted run_id={run_id}")
+        return requested
 
     def is_run_aborted(self, run_id: str) -> bool:
         """Test whether a run_id has been marked aborted."""
-        return bool(run_id) and run_id in self._aborted_runs
+        return self._run_aborts.is_requested(run_id)
 
     def stop(self) -> None:
         """Stop the agent loop.
@@ -4065,6 +4042,11 @@ class AgentLoop:
                 terminal_action_executed = False
                 turn_success_count = 0
                 for tool_call in response.tool_calls:
+                    # Stop is checked per call, not just per LLM iteration.
+                    # This guarantees a batch of N tool calls never starts call
+                    # N+1 after the user has stopped the run.
+                    if outbound_run_id and self.is_run_aborted(outbound_run_id):
+                        break
                     turn_tools.append(tool_call.name)
                     executed_tool_names.append(tool_call.name)
                     args_str = json.dumps(_redact_log_args(tool_call.arguments))
@@ -4261,7 +4243,10 @@ class AgentLoop:
                                 call_args = {"agent": _detected_agent, "task": _task_text}
                                 _effective_tool_name = "builtin_agent"
 
-                        _tool_result = await self.tools.execute(_effective_tool_name, call_args)
+                        _tool_result = await self._run_aborts.run_cancellable(
+                            outbound_run_id,
+                            lambda: self.tools.execute(_effective_tool_name, call_args),
+                        )
                         # Reply-media envelope: a tool (image_generate, screenshot)
                         # produced file(s) for THIS turn's reply. Peel the paths onto
                         # the turn collector and replace the raw JSON with the human
@@ -4292,6 +4277,19 @@ class AgentLoop:
                             "result": _tool_result[:500] if len(_tool_result) > 500 else _tool_result,
                         })
                         result = _tool_result
+                    except RunAbortedError:
+                        result = "Stopped by user."
+                        _tool_result = result
+                        _tool_success = False
+                        logger.info(
+                            f"Tool stopped: {tool_call.name} run_id={outbound_run_id}"
+                        )
+                        accumulated_tool_results.append({
+                            "tool": tool_call.name,
+                            "success": False,
+                            "aborted": True,
+                            "result": result,
+                        })
                     except Exception as e:
                         result = f"Error executing {tool_call.name}: {str(e)}"
                         _tool_result = result
@@ -4429,7 +4427,7 @@ class AgentLoop:
                                 _iteration_event_idx += 1
 
                     # In strict action turns, stop as soon as a terminal action succeeds.
-                    if not result.startswith("Error"):
+                    if _tool_success:
                         if tool_call.name == "cron":
                             cron_action = str(tool_call.arguments.get("action", "")).lower()
                             target_tool = str(tool_call.arguments.get("tool_name", "")).lower()
@@ -4447,6 +4445,18 @@ class AgentLoop:
                         break
 
                 logger.info(f"Tool execution telemetry: executed_tools={turn_tools}")
+                if outbound_run_id and self.is_run_aborted(outbound_run_id):
+                    # Keep the model's already-streamed preamble as the partial
+                    # final. Tool protocol messages/results remain in
+                    # ``messages`` and are persisted below, but no fallback
+                    # summary or next model iteration is allowed to make an
+                    # aborted turn look successfully completed.
+                    final_content = response.content or ""
+                    logger.info(
+                        f"[loop] aborted during tool batch; "
+                        f"executed_tools={turn_tools}, run_id={outbound_run_id}"
+                    )
+                    break
                 tools_were_used = True
                 if turn_success_count > 0:
                     successful_tools_were_used = True
@@ -4712,11 +4722,15 @@ class AgentLoop:
             final_content = response.content
             break
 
-        if enforce_action_tools and not successful_tools_were_used:
+        run_was_aborted = bool(
+            outbound_run_id and self.is_run_aborted(outbound_run_id)
+        )
+
+        if enforce_action_tools and not successful_tools_were_used and not run_was_aborted:
             if not final_content or not final_content.startswith("Tool"):
                 final_content = "Tool calls failed, no action was taken."
 
-        if final_content is None:
+        if final_content is None and not run_was_aborted:
             if accumulated_tool_results:
                 summary = f"Actions completed ({len(accumulated_tool_results)} tools executed):\n"
                 for tr in accumulated_tool_results[-5:]:
@@ -4726,7 +4740,7 @@ class AgentLoop:
             else:
                 final_content = "Action completed but no response could be generated."
 
-        if not final_content or not final_content.strip():
+        if (not final_content or not final_content.strip()) and not run_was_aborted:
             if enforce_action_tools and not successful_tools_were_used:
                 final_content = "Tool call could not be verified, no action was taken."
             elif accumulated_tool_results:
@@ -4734,8 +4748,15 @@ class AgentLoop:
             else:
                 final_content = "Action completed but no response could be generated."
 
+        # Empty is a valid terminal payload for a run stopped before the first
+        # token. The aborted flag — not synthetic assistant prose — explains
+        # why the turn ended.
+        if run_was_aborted and final_content is None:
+            final_content = ""
+
         if (
             final_content
+            and not run_was_aborted
             and not executed_tool_names
             and (action_turn or self._is_retry_action_followup(turn_content))
             and self._contains_unverified_completion_claim(final_content)
@@ -4757,7 +4778,11 @@ class AgentLoop:
         # summarize what happened in natural language — always, regardless
         # of whether tool results exist. Users should never see generic
         # "no action was taken" messages.
-        if final_content and self._is_hardcoded_fallback(final_content):
+        if (
+            final_content
+            and not run_was_aborted
+            and self._is_hardcoded_fallback(final_content)
+        ):
             logger.info("Requesting model summary turn to replace hardcoded fallback")
             summary = await self._request_summary_turn(messages, accumulated_tool_results)
             if summary:
@@ -4927,6 +4952,7 @@ class AgentLoop:
 
     async def _process_message_inner(self, msg: InboundMessage) -> OutboundMessage | None:
         """Inner message processing (called with session marked busy)."""
+        turn_started_at = time.monotonic()
 
         # Handle slash commands from ALL channels
         # Telegram sets is_command metadata; Desktop/Web/iOS send raw text.
@@ -5589,6 +5615,14 @@ class AgentLoop:
             reply_media=reply_media,
             error_out=provider_error,
         )
+        outbound_run_id = msg.metadata.get("run_id") or ""
+        turn_aborted = bool(
+            outbound_run_id and self.is_run_aborted(outbound_run_id)
+        )
+        turn_duration_ms = max(
+            0,
+            int((time.monotonic() - turn_started_at) * 1000),
+        )
 
         if action_turn:
             successful_tools = [r for r in tool_results if r.get("success")]
@@ -5625,6 +5659,8 @@ class AgentLoop:
             usage=usage,
             media=msg.media or None,
             reply_media=reply_media or None,
+            aborted=turn_aborted,
+            duration_ms=turn_duration_ms,
         )
         self.sessions.save(session)
 
@@ -5726,10 +5762,11 @@ class AgentLoop:
                 # Read the flag at the moment of emit so a Stop
                 # pressed after ``_run_llm_tool_loop`` returned but
                 # before we reached this builder is still respected.
-                "aborted": bool(
-                    msg.metadata.get("run_id")
-                    and self.is_run_aborted(msg.metadata["run_id"])
-                ),
+                "aborted": turn_aborted,
+                # One transport-neutral duration lets every client render the
+                # same "Stopped after …" marker and keeps reloads identical to
+                # the live turn. Older channels ignore this additive field.
+                "duration_ms": turn_duration_ms,
             },
         )
 
@@ -6022,6 +6059,7 @@ class AgentLoop:
         origin_chat_id: str | None = None,
         voice_mode: bool = False,
         on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        run_id: str | None = None,
     ) -> str | tuple[str, dict[str, Any]]:
         """
         Process a message directly (for CLI, voice calls, or desktop WebSocket).
@@ -6036,6 +6074,8 @@ class AgentLoop:
                             default. Intended for cron jobs with a per-job model
                             pinned at creation time. Scoped to this call; does
                             not leak to other in-flight requests.
+            run_id: Transport-owned run identifier. When present, Stop requests
+                    use the same per-run controller as relay chats.
 
         Returns:
             The agent's response string, or (response, metadata) if return_metadata=True.
@@ -6047,6 +6087,8 @@ class AgentLoop:
             channel, chat_id = "cli", session_key
 
         metadata: dict[str, Any] = {}
+        if run_id:
+            metadata["run_id"] = run_id
         if stream_callback is not None:
             metadata["stream_callback"] = stream_callback
         if on_iteration is not None:
