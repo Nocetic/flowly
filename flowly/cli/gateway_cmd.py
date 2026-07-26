@@ -1154,6 +1154,7 @@ Respond to the user now:"""
             voice_mode=voice_mode,
             return_metadata=True,
             on_iteration=iteration_callback,
+            run_id=run_id,
         )
         return text, (metadata or {})
 
@@ -1293,6 +1294,7 @@ Respond to the user now:"""
         on_cron_reload=cron.reload,
         on_cron_health=cron.health_report,
         on_chat_message=on_chat_message,
+        on_chat_abort=agent.mark_aborted,
         sessions=agent.sessions,
         subagent_registry=agent._subagent_registry,
         artifact_store=artifact_store,

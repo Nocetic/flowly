@@ -498,6 +498,9 @@ class WebChannel(BaseChannel):
         # know the field see exactly the same wire shape as before.
         if msg.metadata.get("aborted"):
             data_block["aborted"] = True
+        duration_ms = msg.metadata.get("duration_ms")
+        if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
+            data_block["durationMs"] = max(0, int(duration_ms))
 
         event_msg = {
             "type": "event",
@@ -1004,31 +1007,27 @@ class WebChannel(BaseChannel):
 
         elif method == "chat.abort":
             run_id = params.get("runId", "")
-            raw_session_key = params.get("sessionKey")
-            session_key = (
-                raw_session_key
-                if isinstance(raw_session_key, str) and raw_session_key
-                else self._session_key_for_relay_id(session_id)
-            )
+            cooperative_abort = False
             # ``task.cancel()`` used to be the heart of this handler,
             # but ``self._active_tasks[run_id]`` only ever held the
             # short-lived task that pushes the inbound to the bus —
             # done in microseconds, so the cancel was a no-op by the
-            # time Stop reached us. The actual LLM call runs inside
-            # ``agent.run()``'s long-lived task and can't be cancelled
-            # per-message without a refactor.
+            # time Stop reached us. The actual turn runs inside
+            # ``agent.run()`` and must stay alive long enough to persist its
+            # partial transcript and emit one authoritative final event.
             #
             # Instead, mark the run as aborted on the agent. The
-            # streaming loop polls this flag between every chunk
-            # (see ``_chat_with_stream`` and the tool-loop's
-            # post-LLM check) and bails out cooperatively, preserving
-            # whatever partial text was accumulated. The OutboundMessage
+            # streaming loop polls this flag between every chunk and the
+            # shared run-abort controller cancels the active tool child task.
+            # The parent turn then exits cooperatively, preserving whatever
+            # partial text was accumulated. The OutboundMessage
             # the agent eventually publishes carries ``aborted: true``
             # in its metadata so the relay + client UI can render the
             # partial with an [Aborted] marker.
             if self._abort_callback is not None:
                 try:
                     self._abort_callback(run_id)
+                    cooperative_abort = True
                     logger.info(
                         f"[WebChannel] chat.abort marked run_id={run_id} for cooperative interrupt"
                     )
@@ -1044,29 +1043,27 @@ class WebChannel(BaseChannel):
                 task = self._active_tasks.get(run_id)
                 if task is not None and not task.done():
                     task.cancel()
-            # ACK + aborted event. The aborted WS event lets the
-            # client clear its streaming bubble immediately rather
-            # than waiting for the partial final to land via Firestore
-            # (which can take 100–500ms). The Firestore-delivered
-            # message arrives shortly after with the partial text.
+            # ACK only. The run remains in-flight until AgentLoop persists its
+            # partial transcript and emits the single authoritative
+            # state:"final", aborted:true event. Sending a second terminal
+            # "aborted" event here used to make clients clear the run id/tool
+            # panel before that final arrived.
             ack = {
                 "type": "rpc", "id": rpc_id, "sessionId": session_id,
                 "result": {"ok": True, "cancelled": True},
             }
             await ws.send(json.dumps(ack))
-            aborted_event = {
-                "type": "event",
-                "sessionId": session_id,
-                "event": "chat",
-                "data": {"state": "aborted", "runId": run_id},
-            }
-            await ws.send(json.dumps(aborted_event))
-            asyncio.create_task(self._emit_local_event("chat", {
-                "state": "aborted",
-                "runId": run_id,
-                "sessionKey": session_key,
-                "source": "relay",
-            }))
+            if not cooperative_abort:
+                # A legacy embedder without AgentLoop.mark_aborted cannot
+                # produce the authoritative partial final. Preserve its old
+                # terminal event so existing clients do not remain busy
+                # forever; current bots always use the cooperative path.
+                await ws.send(json.dumps({
+                    "type": "event",
+                    "sessionId": session_id,
+                    "event": "chat",
+                    "data": {"state": "aborted", "runId": run_id},
+                }))
 
         elif method == "chat.history":
             # History is managed by Firestore on the client side — return empty
