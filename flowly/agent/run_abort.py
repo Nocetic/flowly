@@ -5,7 +5,7 @@ stable identifier into one cancellation contract shared by relay and direct
 gateway chats:
 
 * a durable, bounded "stop requested" marker for stream/tool-loop checks;
-* immediate cancellation of the tool awaitable currently owned by the run;
+* immediate cancellation of the provider/tool awaitable currently owned by the run;
 * no cancellation leakage to unrelated concurrent runs.
 
 The controller intentionally does not cancel the whole chat task.  The caller
@@ -67,7 +67,7 @@ class RunAbortController:
         return bool(run_id) and run_id in self._requested
 
     def _prune_requested(self) -> None:
-        """Bound old markers without evicting a run whose tool is active."""
+        """Bound old markers without evicting a run whose operation is active."""
         scanned = 0
         while (
             len(self._request_order) > self._max_recent

@@ -2592,10 +2592,10 @@ class AgentLoop:
     def mark_aborted(self, run_id: str) -> bool:
         """Stop one run without cancelling its transcript-finalization task.
 
-        Streams observe the marker between chunks. If a tool is currently
-        awaiting, the shared controller cancels that child task immediately;
-        the surrounding turn then records a stopped tool result and emits the
-        authoritative partial ``final`` event.
+        The shared controller immediately cancels whichever provider or tool
+        awaitable is active for the run. The surrounding turn task stays alive
+        so it can preserve partial text/tool history and emit the authoritative
+        aborted ``final`` event.
         """
         requested = self._run_aborts.request(run_id)
         if requested:
@@ -3282,40 +3282,48 @@ class AgentLoop:
         chunk_count = 0
         aborted = False
 
-        async for chunk in self.provider.chat_stream(
-            messages=messages,
-            tools=tools,
-            model=model,
-            temperature=temperature,
-            tool_choice=tool_choice,
-        ):
-            # Cooperative abort: check before processing the chunk so
-            # accumulated_text reflects exactly what was rendered to
-            # the user at the moment of Stop. Checking after the
-            # ``stream_callback`` send would leak one extra delta
-            # past the abort line — small but distracting in the UI.
-            if run_id and self.is_run_aborted(run_id):
-                aborted = True
-                logger.info(
-                    f"[stream] aborted at chunk #{chunk_count}, "
-                    f"{len(accumulated_text)} chars preserved, run_id={run_id}"
-                )
-                break
-            if chunk.content:
-                chunk_count += 1
-                accumulated_text += chunk.content
-                # Heartbeat for the inactivity watchdog — every stream
-                # chunk counts as progress. Without this a long streaming
-                # reply could look "idle" to the poller even though the
-                # model is actively emitting tokens.
-                self._touch_activity("receiving stream response")
-                logger.debug(f"[stream] chunk #{chunk_count}: {len(chunk.content)} chars")
-                try:
-                    await stream_callback(chunk.content)
-                except Exception as e:
-                    logger.warning(f"[stream] stream_callback error: {e}")
-            if chunk.finish_reason:
-                final_response = chunk
+        async def consume_stream() -> None:
+            nonlocal accumulated_text, final_response, chunk_count, aborted
+            async for chunk in self.provider.chat_stream(
+                messages=messages,
+                tools=tools,
+                model=model,
+                temperature=temperature,
+                tool_choice=tool_choice,
+            ):
+                # Keep this cooperative check as a second line of defence for
+                # providers that yield immediately after the stop request.
+                # The RunAbortController below also cancels a provider that is
+                # silent / reasoning and has not yielded another chunk yet.
+                if run_id and self.is_run_aborted(run_id):
+                    aborted = True
+                    break
+                if chunk.content:
+                    chunk_count += 1
+                    accumulated_text += chunk.content
+                    # Heartbeat for the inactivity watchdog — every stream
+                    # chunk counts as progress. Without this a long streaming
+                    # reply could look "idle" to the poller even though the
+                    # model is actively emitting tokens.
+                    self._touch_activity("receiving stream response")
+                    logger.debug(f"[stream] chunk #{chunk_count}: {len(chunk.content)} chars")
+                    try:
+                        await stream_callback(chunk.content)
+                    except Exception as e:
+                        logger.warning(f"[stream] stream_callback error: {e}")
+                if chunk.finish_reason:
+                    final_response = chunk
+
+        try:
+            await self._run_aborts.run_cancellable(run_id, consume_stream)
+        except RunAbortedError:
+            aborted = True
+
+        if aborted:
+            logger.info(
+                f"[stream] aborted at chunk #{chunk_count}, "
+                f"{len(accumulated_text)} chars preserved, run_id={run_id}"
+            )
 
         logger.info(f"[stream] done: {chunk_count} chunks, {len(accumulated_text)} total chars{' (ABORTED)' if aborted else ''}")
 
@@ -3364,6 +3372,43 @@ class AgentLoop:
             )
 
         return final_response
+
+    async def _chat_without_stream(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str,
+        temperature: float,
+        tool_choice: str,
+        run_id: str = "",
+    ) -> LLMResponse:
+        """Run one blocking provider call under the shared per-run abort.
+
+        Streaming and non-streaming providers now use the exact same
+        cancellation primitive as tools. A stopped blocking call has no safe
+        partial payload to preserve, so it returns an empty aborted response
+        and lets the normal turn finalizer emit the authoritative terminal
+        event.
+        """
+        try:
+            return await self._run_aborts.run_cancellable(
+                run_id,
+                lambda: self.provider.chat(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    temperature=temperature,
+                    tool_choice=tool_choice,
+                ),
+            )
+        except RunAbortedError:
+            logger.info(f"[chat] blocking provider call aborted, run_id={run_id}")
+            return LLMResponse(
+                content=None,
+                finish_reason="aborted",
+                usage={},
+            )
 
     async def _emit_iteration_event(
         self,
@@ -3799,12 +3844,13 @@ class AgentLoop:
             else:
                 self._api_call_count += 1
                 self._touch_activity(f"starting LLM call #{self._api_call_count} (iter {iteration})")
-                response = await self.provider.chat(
+                response = await self._chat_without_stream(
                     messages=messages,
                     tools=tool_defs,
                     model=selected_model,
                     temperature=selected_temperature,
                     tool_choice=tool_choice,
+                    run_id=outbound_run_id,
                 )
 
             # Cooperative abort — short-circuit the tool loop. Two
@@ -3837,12 +3883,13 @@ class AgentLoop:
                 and backoff_for(classify_response(response), 1) is not None
             ):
                 logger.warning("Streaming failed, falling back to blocking chat()")
-                response = await self.provider.chat(
+                response = await self._chat_without_stream(
                     messages=messages,
                     tools=tool_defs,
                     model=selected_model,
                     temperature=selected_temperature,
                     tool_choice=tool_choice,
+                    run_id=outbound_run_id,
                 )
 
             if (
@@ -3855,12 +3902,13 @@ class AgentLoop:
                 )
             ):
                 logger.warning(f"tool_choice=required failed, retrying with auto: {response.content[:120]}")
-                response = await self.provider.chat(
+                response = await self._chat_without_stream(
                     messages=messages,
                     tools=tool_defs,
                     model=selected_model,
                     temperature=selected_temperature,
                     tool_choice="auto",
+                    run_id=outbound_run_id,
                 )
 
             # Audit the LLM call after the retry chain settles. We log
