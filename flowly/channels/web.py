@@ -389,6 +389,7 @@ class WebChannel(BaseChannel):
             return
 
         run_id = msg.metadata.get("run_id", str(uuid.uuid4()))
+        stream_run_id = msg.metadata.get("stream_run_id")
 
         # Build content blocks — always start with text
         content_blocks: list[dict[str, Any]] = []
@@ -456,6 +457,13 @@ class WebChannel(BaseChannel):
                 "content": content_blocks,
             },
         }
+        if stream_run_id:
+            # ``runId`` is the durable assistant-message identity used by the
+            # relay's Firestore document. ``streamRunId`` is the chat.send
+            # lifecycle identity used by deltas, Stop, tool turns, and client
+            # streaming state. They must remain distinct: chat.send's
+            # idempotency key also identifies the durable USER document.
+            data_block["streamRunId"] = str(stream_run_id)
         usage_meta = msg.metadata.get("usage")
         if isinstance(usage_meta, dict) and usage_meta:
             data_block["usage"] = {

@@ -5823,6 +5823,16 @@ class AgentLoop:
                 # same "Stopped after …" marker and keeps reloads identical to
                 # the live turn. Older channels ignore this additive field.
                 "duration_ms": turn_duration_ms,
+                # Keep transport lifecycle identity separate from the final
+                # assistant message identity.  Relay chats stream under
+                # chat.send's idempotency key, while WebChannel historically
+                # assigns the durable final message a fresh UUID.  Reusing the
+                # stream id as the final message id makes the relay overwrite
+                # the user document, because that user document is keyed by
+                # the same idempotency key.  Channels can forward this
+                # additive field so clients settle the right live stream
+                # without changing the durable assistant message id.
+                "stream_run_id": outbound_run_id or None,
             },
         )
 
