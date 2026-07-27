@@ -21,7 +21,7 @@ import json
 import os
 import re
 from datetime import tzinfo
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from loguru import logger
 
@@ -48,9 +48,55 @@ def _parse_refresh_minutes(v: Any) -> int | None:
 
 # ── JSON extraction + coercion (external data is messy — be lenient) ──────────
 
-def _extract_json(text: str) -> Any:
-    """Pull a JSON payload out of an agent reply — tolerating code fences and a
-    little surrounding prose. Raises ValueError if nothing parses."""
+def _json_candidates(text: str, *, max_scans: int = 4096) -> list[tuple[Any, int]]:
+    """Every well-formed JSON value in ``text``, left to right, each paired with
+    the length of its source span.
+
+    Scanning — rather than slicing from the first brace to the last — is what
+    makes extraction robust: a preamble that merely *contains* a brace is
+    stepped over instead of swallowing the real payload behind it. Models do
+    emit such preambles; a tool-less vision turn still writes pseudo-XML tool
+    tags as plain text (``<tool_call arguments="{…}">``), and the old slice
+    started inside those arguments and parsed as nothing at all.
+    """
+    decoder = json.JSONDecoder()
+    found: list[tuple[Any, int]] = []
+    i, n, scans = 0, len(text), 0
+    while i < n and scans < max_scans:
+        if text[i] not in "{[":
+            i += 1
+            continue
+        scans += 1
+        try:
+            value, end = decoder.raw_decode(text, i)
+        except ValueError:
+            i += 1          # not a payload (or truncated) — keep looking
+            continue
+        found.append((value, end - i))
+        i = end             # nested values aren't separate candidates
+    return found
+
+
+def _schema_score(value: Any, keys: list[str]) -> int:
+    """How many of the caller's expected field names a candidate carries. A list
+    is judged by its first row — that's what gets coerced downstream."""
+    obj = value
+    if isinstance(obj, list):
+        obj = next((r for r in obj if isinstance(r, dict)), None)
+    if not isinstance(obj, dict):
+        return 0
+    return sum(1 for k in keys if k in obj)
+
+
+def _extract_json(text: str, *, prefer_keys: Iterable[str] | None = None) -> Any:
+    """Pull a JSON payload out of an agent reply — tolerating code fences, prose
+    on either side, and hallucinated tool-call preambles. Raises ValueError if
+    nothing parses.
+
+    ``prefer_keys`` — the field names the caller is actually after. When more
+    than one JSON value survives, the one that matches the target schema wins,
+    so a stray ``{"command": "date +%F"}`` can never be taken for the payload.
+    """
     t = (text or "").strip()
     if t.startswith("```"):
         parts = t.split("```")
@@ -59,14 +105,20 @@ def _extract_json(text: str) -> Any:
             if t.lstrip().lower().startswith("json"):
                 t = t.lstrip()[4:]
             t = t.strip()
-    for opener, closer in (("[", "]"), ("{", "}")):
-        i = t.find(opener)
-        j = t.rfind(closer)
-        if 0 <= i < j:
-            try:
-                return json.loads(t[i : j + 1])
-            except ValueError:
-                pass
+    found = _json_candidates(t)
+    if found:
+        keys = [k for k in (prefer_keys or ()) if isinstance(k, str)]
+        # `max` keeps the FIRST best on a tie, so scan reversed: a tie goes to
+        # the LAST value — the answer a model gives *after* its preamble.
+        if keys:
+            best, score = max(
+                ((c, _schema_score(c[0], keys)) for c in reversed(found)),
+                key=lambda p: (p[1], p[0][1]),
+            )
+            if score > 0:
+                return best[0]
+        # No hint, or nothing matched it: the substantial value beats a stray brace.
+        return max(reversed(found), key=lambda c: c[1])[0]
     return json.loads(t)  # a bare scalar ("23.5" / a quoted string)
 
 
@@ -243,7 +295,8 @@ class SourceEngine:
             )
             prompt = _build_prompt(flowlet, sid, spec, into_spec, values)
             reply = await self._agent(flowlet, prompt)
-            written = _coerce_into(into_spec, _extract_json(reply or ""), spec.get("limit"))
+            parsed = _extract_json(reply or "", prefer_keys=list(into_spec.get("item") or {}))
+            written = _coerce_into(into_spec, parsed, spec.get("limit"))
         except Exception as exc:  # noqa: BLE001 — keep stale data, back off, log
             fail = (self._store.get_source_state(fid).get(sid, {}).get("fail_count") or 0) + 1
             self._store.set_source_state(

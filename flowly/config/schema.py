@@ -82,6 +82,9 @@ class DiscordConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
+    group_policy: str = "mention"  # Server channels: "mention", "open", "allowlist"
+    group_allow_from: list[str] = Field(default_factory=list)  # Channel IDs if allowlist
+    group_context: str = "listen"  # Passive read of un-answered channel msgs: "listen" | "off"
 
 
 class SlackDMConfig(BaseModel):
@@ -99,6 +102,7 @@ class SlackConfig(BaseModel):
     app_token: str = ""  # xapp-...
     group_policy: str = "mention"  # "mention", "open", "allowlist"
     group_allow_from: list[str] = Field(default_factory=list)  # Allowed channel IDs if allowlist
+    group_context: str = "listen"  # Passive read of un-answered channel msgs: "listen" | "off"
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
@@ -256,7 +260,7 @@ class AgentDefaults(BaseModel):
     workspace. ``~`` is expanded. Overridden per-call by an explicit
     ``working_dir``, per-session by the gateway, and by the ``FLOWLY_CWD``
     env var. See flowly/runtime_cwd.py for the full resolution order."""
-    model: str = "moonshotai/kimi-k2.5"
+    model: str = "anthropic/claude-haiku-4.5"
     max_tokens: int = 8192
     # Per-request LLM call timeout (seconds). A hung or slow provider call is
     # aborted after this instead of hanging and accumulating token charges.

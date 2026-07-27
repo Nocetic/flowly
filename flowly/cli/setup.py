@@ -1651,6 +1651,8 @@ def setup_all() -> None:
     # Done
     console.print(f"\n{'─' * 40}")
     console.print("[bold green]✓ Setup complete![/bold green]\n")
-    console.print("Start Flowly with: [cyan]flowly gateway[/cyan]")
-    console.print("Background mode: [cyan]flowly service install --start[/cyan]")
+    console.print("Start chatting with: [cyan]flowly[/cyan]")
+    console.print(
+        "[dim]Keep it running across logins: [/dim][cyan]flowly service install --start[/cyan]"
+    )
     console.print()

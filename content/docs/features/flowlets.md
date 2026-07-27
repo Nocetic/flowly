@@ -12,6 +12,9 @@ you describe what you want ("track my daily water"), and the agent assembles it
 from a catalog of building blocks. It then lives on your dashboard, updates
 instantly when you tap it, and syncs across your devices.
 
+If you'd rather not start from a blank page, there are also
+[ready-made templates](#start-from-a-template) — pick one and it's yours.
+
 Flowlets turn the agent from something you *talk to* into something that *builds
 you tools*. Each one is a real, persistent mini-app that knows your world.
 
@@ -180,11 +183,15 @@ fires and resets your checkboxes, tapping it again the same day does nothing.
 
 ## Read a photo into a flowlet
 
-A **`photo`** capture is a first-class action: snap a receipt, a meal, a
-whiteboard, and the agent reads the image in one isolated, tool-less turn and
-turns it into a new list row — the expense's amount and merchant, the meal's
-calories and macros. The image is attacker-controlled input, so the reading turn
-runs with every tool disabled; it can only look and answer.
+A **`photo`** capture is a first-class action: a receipt, a meal, a whiteboard —
+the agent reads the image in one isolated, tool-less turn and turns it into a
+new list row: the expense's amount and merchant, the meal's calories and macros.
+You can take the photo there and then, choose one from your library, or pick an
+image file — a meal you already photographed is worth just as much as one you
+shoot now.
+
+The image is attacker-controlled input, so the reading turn runs with **every
+tool disabled**; it can only look and answer.
 
 ## Reminders that fire themselves
 
@@ -230,6 +237,33 @@ And it's all local:
 - Nothing about a flowlet is sent to any external service unless a `source` you
   set up explicitly fetches it, or an `agent` button you designed sends a
   message.
+
+## Start from a template
+
+Asking for a screen works, but it assumes you already know what to ask for. So
+Flowly ships a handful of **ready-made flowlets** — pick a card and you have a
+working screen a second later:
+
+| Template | What you get |
+|----------|--------------|
+| **Water** | A daily goal as a ring, one tap per glass, a weekly chart, and an evening nudge if you're behind. |
+| **Habits** | Two habits to tick off, a "complete the day" button that can only fire once a day, a weekly streak, and 90 days on a grid. |
+| **Expenses** | A monthly budget with an over-budget warning, a category breakdown, and entry by hand *or* straight from a receipt photo. |
+| **Tasks** | A list you add to and tick off, split into what's open and what's done. |
+| **Sleep** | Log the night, see the 30-day trend against your target, get a bedtime nudge. |
+| **Mood** | A one-tap daily rating, 90 days on a grid, and room for a note about the day. |
+
+Two things worth knowing:
+
+- **It's yours immediately.** Creating from a template writes an ordinary
+  flowlet you own — there's no lasting link back to the template. Ask the agent
+  to change anything about it ("drop the second habit, add a 7am reminder") and
+  it edits it like any other screen.
+- **It arrives in your language.** The screen is built in whichever language the
+  app is set to, so you get a finished screen rather than one to translate.
+
+On an empty Flowlets page the templates *are* the page. Once you have flowlets
+of your own they move out of the way into a single button.
 
 ## Talking to your agent about flowlets
 

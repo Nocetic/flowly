@@ -487,14 +487,31 @@ class FlowlyTUI(App[None]):
             self.action_open_integrations()
 
     async def _warm_model_catalogs(self) -> None:
-        """Prefetch model lists for any provider with a working fetcher.
-
-        Today that's just OpenRouter (its catalog is also what the Flowly
-        proxy exposes), so a single call covers ~262 models. The status
-        bar's ``_model_budget`` picks up the cache on the next render."""
+        """Prefetch the active provider's catalog and reconcile Flowly defaults."""
         try:
-            from flowly.integrations.model_catalog import warm_cache
-            await warm_cache("openrouter")
+            from flowly.config.loader import load_config
+            from flowly.integrations.active_provider import resolve_active_provider
+            from flowly.integrations.model_catalog import (
+                reconcile_flowly_model,
+                warm_cache,
+            )
+
+            active = resolve_active_provider(load_config())
+            provider_key = active.key if active is not None else "openrouter"
+            await warm_cache(provider_key)
+
+            # Existing installs can still have Kimi K2.5 serialized from the old
+            # schema default. The authenticated catalog tells us whether it is
+            # genuinely available to this account; only replace it when it is
+            # absent, preserving valid paid-plan/user selections.
+            if provider_key == "flowly":
+                changed = await reconcile_flowly_model(force_refresh=False)
+                if changed:
+                    try:
+                        from flowly.tui.gateway_reload import post_provider_reload
+                        await post_provider_reload(timeout=5.0)
+                    except Exception:
+                        pass
             # Cache just landed — directly refresh the _TokenBar so it
             # re-renders with the live ``context_length`` instead of the
             # 200k default it baked in while the cache was empty. We

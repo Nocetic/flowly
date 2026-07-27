@@ -51,7 +51,7 @@ def test_injected_provider_and_model():
     assert s.provider_ready is True
     assert s.provider_key == "anthropic"
     # Model comes from config.agents.defaults.model (schema default here).
-    assert s.model == "moonshotai/kimi-k2.5"
+    assert s.model == "anthropic/claude-haiku-4.5"
 
 
 def test_enabled_channel_is_configured():

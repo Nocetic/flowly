@@ -15,7 +15,7 @@ the list in its metadata; this file pins:
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -141,6 +141,68 @@ async def test_tool_messages_absent_when_metadata_key_missing(channel) -> None:
     event = channel._capture[0]
     data = event["data"]
     assert "toolMessages" not in data
+
+
+@pytest.mark.asyncio
+async def test_aborted_final_includes_partial_marker_and_duration(channel) -> None:
+    msg = OutboundMessage(
+        channel="web",
+        chat_id="sess-1",
+        content="Partial answer",
+        metadata={
+            "run_id": "run-stopped",
+            "aborted": True,
+            "duration_ms": 4200,
+        },
+    )
+
+    await channel.send(msg)
+
+    data = channel._capture[0]["data"]
+    assert data["state"] == "final"
+    assert data["runId"] == "run-stopped"
+    assert data["aborted"] is True
+    assert data["durationMs"] == 4200
+    assert data["message"]["content"] == [
+        {"type": "text", "text": "Partial answer"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cooperative_abort_acks_without_early_terminal_event(channel) -> None:
+    stopped: list[str] = []
+    channel.set_abort_callback(stopped.append)
+    ws = AsyncMock()
+
+    await channel._handle_rpc(ws, {
+        "type": "rpc",
+        "id": "rpc-1",
+        "sessionId": "sess-1",
+        "method": "chat.abort",
+        "params": {"runId": "run-stopped"},
+    })
+
+    assert stopped == ["run-stopped"]
+    assert ws.send.await_count == 1
+    ack = json.loads(ws.send.await_args.args[0])
+    assert ack["result"] == {"ok": True, "cancelled": True}
+
+
+@pytest.mark.asyncio
+async def test_legacy_abort_keeps_terminal_event_for_old_embedders(channel) -> None:
+    ws = AsyncMock()
+
+    await channel._handle_rpc(ws, {
+        "type": "rpc",
+        "id": "rpc-1",
+        "sessionId": "sess-1",
+        "method": "chat.abort",
+        "params": {"runId": "run-stopped"},
+    })
+
+    assert ws.send.await_count == 2
+    terminal = json.loads(ws.send.await_args_list[1].args[0])
+    assert terminal["data"] == {"state": "aborted", "runId": "run-stopped"}
 
 
 @pytest.mark.asyncio

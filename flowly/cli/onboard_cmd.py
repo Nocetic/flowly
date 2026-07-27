@@ -1,6 +1,7 @@
 """CLI commands — onboard_cmd."""
 
 import asyncio
+import contextlib
 import os
 import platform
 import shutil
@@ -165,23 +166,75 @@ def seed_workspace() -> Path:
 
 
 def _already_configured() -> bool:
-    """True when a provider is set up OR a Flowly account is signed in."""
-    try:
-        from flowly.config.loader import load_config
-        from flowly.integrations.active_provider import resolve_active_provider
+    """True when Flowly can actually serve a request right now.
 
-        if resolve_active_provider(load_config()) is not None:
-            return True
-    except Exception:
-        pass
-    try:
-        from flowly.account.health import check_token_state
+    This used to also return True for "a Flowly account is signed in", which
+    is not the same thing: ``ensure_account_key`` is best-effort, so a
+    sign-in whose mint failed leaves an account with nothing to bill
+    against. Onboarding then declared victory while ``service install
+    --start`` refused to run the gateway — and bare ``flowly``, finding no
+    provider, reopened onboarding. One definition now, shared with the
+    service manager (see :func:`provider_readiness`).
+    """
+    from flowly.integrations.active_provider import provider_readiness
 
-        if check_token_state().has_account:
-            return True
-    except Exception:
-        pass
-    return False
+    return provider_readiness().ready
+
+
+def _warn_signed_in_but_unusable() -> None:
+    """Explain the one state that looks configured but cannot serve a request."""
+    from flowly.integrations.active_provider import provider_readiness
+
+    state = provider_readiness()
+    if state.ready or not state.has_account:
+        return
+    console.print(
+        "\n  [yellow]![/yellow] You're signed in, but no usable credential "
+        "reached this machine yet\n"
+        "    [dim](the account key couldn't be issued — usually a network or "
+        "backend hiccup).[/dim]\n"
+        "    Retry with [cyan]flowly login[/cyan], or pick your own API key "
+        "below."
+    )
+
+
+@contextlib.contextmanager
+def _tty_friendly_event_loop():
+    """Back asyncio's loops with ``select(2)`` on macOS for the prompt session.
+
+    The installer runs ``flowly setup </dev/tty`` so a ``curl | bash`` install can
+    still show the interactive picker. That leaves stdin (fd 0) pointing at the
+    ``/dev/tty`` clone device — and on macOS **kqueue cannot register /dev/tty**
+    for read events (a long-standing BSD limitation). InquirerPy drives each
+    prompt on a fresh ``asyncio.run`` loop whose default selector on macOS is
+    kqueue, so the first ``add_reader(0)`` blows up with a raw traceback the
+    moment a menu tries to draw. Running ``flowly setup`` straight in a terminal
+    dodges it (fd 0 is the pty slave, which kqueue handles) — but the installer
+    path doesn't.
+
+    ``select(2)`` has no such limitation, so here we install an event-loop policy
+    that builds SelectorEventLoops backed by ``SelectSelector``. Onboarding only
+    juggles a handful of fds and starts the gateway in a separate process, so
+    select's scale ceiling is irrelevant. The previous policy is restored on exit
+    so nothing else in the process inherits it. No-op off macOS, where epoll
+    watches /dev/tty fine.
+    """
+    if sys.platform != "darwin":
+        yield
+        return
+
+    import selectors
+
+    class _SelectLoopPolicy(asyncio.DefaultEventLoopPolicy):
+        def new_event_loop(self):
+            return asyncio.SelectorEventLoop(selectors.SelectSelector())
+
+    prev = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(_SelectLoopPolicy())
+    try:
+        yield
+    finally:
+        asyncio.set_event_loop_policy(prev)
 
 
 def _select_with_back(message: str, choices: list, default=None):
@@ -389,13 +442,28 @@ def _model_label(m) -> str:
 
 
 def _offer_start_gateway() -> None:
-    """Ask whether to start the gateway in the background, then guide next steps."""
+    """Offer to keep Flowly running in the background, then guide next steps.
+
+    Declining is now cheap: ``flowly`` starts the gateway on demand, so the
+    question is really "keep it running across logins?" rather than "may I
+    make the product work?". Only the failure path still spells out the
+    manual command, because that is the one case where the user has to do
+    something themselves.
+    """
     from rich.prompt import Confirm
 
     try:
-        start_now = Confirm.ask("\n  Start Flowly in the background now?", default=True)
+        start_now = Confirm.ask("\n  Keep Flowly running in the background?", default=True)
     except (EOFError, KeyboardInterrupt):
         start_now = False
+
+    if not start_now:
+        console.print(
+            "\n  Next:\n"
+            "    [cyan]flowly[/cyan]   [dim]— start chatting "
+            "(it starts the gateway for you)[/dim]"
+        )
+        return
 
     if start_now:
         # Resolve the launcher properly instead of trusting sys.argv[0]: under
@@ -405,11 +473,16 @@ def _offer_start_gateway() -> None:
 
         try:
             argv = _resolve_flowly_exec_argv() + ["service", "install", "--start"]
-            subprocess.run(argv, check=False)
-            console.print("\n  [green]✓[/green] Done — run [cyan]flowly[/cyan] to start chatting.")
-            return
-        except Exception:
-            console.print("  [yellow]Couldn't auto-start — start it manually:[/yellow]")
+            result = subprocess.run(argv, check=False)
+            if result.returncode == 0:
+                console.print("\n  [green]✓[/green] Done — run [cyan]flowly[/cyan] to start chatting.")
+                return
+            console.print(
+                f"  [yellow]Couldn't auto-start (exit {result.returncode}) — "
+                "start it manually:[/yellow]"
+            )
+        except Exception as exc:
+            console.print(f"  [yellow]Couldn't auto-start ({exc}) — start it manually:[/yellow]")
     console.print(
         "\n  Next:\n"
         "    [cyan]flowly service install --start[/cyan]   [dim]— run the gateway in the background[/dim]\n"
@@ -470,6 +543,9 @@ def _run_provider_step() -> bool:
     if _already_configured():
         _prompt_model(choice)
         return True
+    # Sign-in can succeed while the credential behind it doesn't arrive. Say
+    # so here rather than dropping the user back on the picker in silence.
+    _warn_signed_in_but_unusable()
     return False
 
 
@@ -633,7 +709,21 @@ def run_onboarding() -> None:
         return
 
     _print_banner()
-    _run_setup_home()
+    try:
+        with _tty_friendly_event_loop():
+            _run_setup_home()
+    except OSError as exc:
+        # Last-resort guard: if the terminal still can't be attached to an event
+        # loop (an exotic stdin even select can't watch), don't dump a traceback
+        # on a first-run user. Point them at a plain re-run — run straight in the
+        # terminal, fd 0 is the pty slave and the picker works.
+        console.print(
+            f"[yellow]![/yellow] Couldn't open the interactive setup here "
+            f"([dim]{exc}[/dim])."
+        )
+        console.print(
+            "  Run [cyan]flowly setup[/cyan] directly in your terminal to finish."
+        )
 
 
 def _install_persona_files(workspace: Path):
@@ -663,4 +753,3 @@ def _install_persona_files(workspace: Path):
                 encoding="utf-8",
             )
             console.print("  [dim]Created personas/default.md[/dim]")
-

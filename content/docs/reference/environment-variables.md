@@ -63,7 +63,7 @@ Generated media (image generation, etc.) is written to `<FLOWLY_HOME>/media`. Th
 | `FLOWLY_USER_AGENT` | `FlowlyBot/1.0` | HTTP User-Agent for outbound requests. |
 | `FLOWLY_XAI_OAUTH_MODEL` | `grok-4.20-reasoning` | Model used with an xAI OAuth subscription. |
 | `FLOWLY_X_SEARCH_MODEL` | `grok-4.20-reasoning` | Model used by the `x_search` tool. |
-| `FLOWLY_CODEX_MODEL` | `gpt-5.5` | Default model used with a ChatGPT subscription (`openai_codex` provider). |
+| `FLOWLY_CODEX_MODEL` | `gpt-5.6-sol` | Default model used with a ChatGPT subscription (`openai_codex` provider). |
 | `FLOWLY_CODEX_INSTRUCTIONS` | — | Overrides the `instructions` field sent to the ChatGPT Codex backend, replacing your system prompt wholesale. |
 | `FLOWLY_AUTH_DEBUG` | off | Set to `1` for verbose auth logging. |
 | `CODEX_HOME` | `~/.codex` | State directory for the Codex CLI subprocess (Codex runtime) — also where the `openai_codex` provider looks for a `codex login` session as a fallback credential source. |
@@ -87,6 +87,7 @@ These let tools pick up credentials from the environment instead of `config.json
 | Variable | Default | What it does |
 |---|---|---|
 | `FLOWLY_TUI_THEME` | `flowly` | Default TUI theme. |
+| `FLOWLY_NO_GATEWAY_AUTOSTART` | — | Set to `1` to stop bare `flowly` from starting the gateway when none is running. Without it, `flowly` starts an installed service, or installs and starts one, before opening the chat. Never fires for a non-loopback `--host`, for a `--port` other than the configured one, or outside an interactive terminal. |
 | `FLOWLY_BROWSER_PLAN_ENABLED` | `1` | Toggles the `browser_plan` tool. |
 | `FLOWLY_BROWSER_PLAN_PERSIST` | — | Controls browser-plan persistence. |
 

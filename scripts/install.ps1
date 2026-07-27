@@ -668,6 +668,11 @@ Write-Host ''
 if (-not $SkipBootstrap -and -not [System.Console]::IsInputRedirected) {
     try { & $flowly setup }
     catch { try { & $flowly bootstrap } catch {} }
+
+    # No "now start the gateway" step: the CLI starts it on demand.
+    Write-Host ''
+    Write-Host 'Get started (open a new terminal first so PATH is picked up):'
+    Write-Host '  flowly                             # start chatting'
 }
 else {
     if (-not $SkipBootstrap) {
@@ -676,6 +681,5 @@ else {
     }
     Write-Host 'Get started (open a new terminal first so PATH is picked up):'
     Write-Host '  1. flowly setup                    # choose an account or API key'
-    Write-Host '  2. flowly service install --start  # run the gateway in the background'
-    Write-Host '  3. flowly                          # start chatting'
+    Write-Host '  2. flowly                          # start chatting'
 }

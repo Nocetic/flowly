@@ -47,6 +47,7 @@ from flowly.audit.logger import get_audit_logger
 from flowly.providers.key_rotator import is_context_overflow
 from flowly.agent.prompt_blocks import detect_model_families
 from flowly.agent.reply_media import extract_reply_media
+from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
 
 
@@ -79,6 +80,12 @@ _DEFAULT_MAX_CHARS = 8000
 # Memory learning (idle + turn dreamer triggers) must ignore these so a periodic
 # heartbeat/cron tick never looks like a conversation worth remembering.
 _NON_USER_CHANNELS = ("system", "heartbeat", "cron")
+
+# Passive group-context buffer bounds (Slack/Discord "listen" mode). Un-answered
+# channel messages accumulate per session until the next mention flushes them
+# into that turn's LLM view; oldest entries drop past either cap.
+_GROUP_BUFFER_MAX_MSGS = 50
+_GROUP_BUFFER_MAX_CHARS = 6000
 
 
 def _is_user_activity_channel(channel: str) -> bool:
@@ -676,25 +683,11 @@ class AgentLoop:
         # finish — exactly the "no title on the server" failure mode.
         self._title_tasks: set[asyncio.Task] = set()
 
-        # ─── Per-run cooperative abort ─────────────────────────────────
-        # The desktop / iOS Stop button drives this. The web channel's
-        # ``chat.abort`` RPC used to call ``task.cancel()`` on the task
-        # that pushed the inbound to the bus — but that task is done
-        # in microseconds (it only awaits ``bus.publish_inbound``), so
-        # the cancel was a no-op. The actual LLM call runs inside
-        # ``agent.run()``'s long-lived task, which can't be cancelled
-        # per-message without a refactor.
-        #
-        # Instead we track aborted run_ids in this set; the streaming
-        # loop checks it between every chunk and breaks out, preserving
-        # the partial accumulated text so the user still sees what the
-        # bot had said up to the abort point. ``MAX_ABORTED_RUNS`` is
-        # a defensive cap with LRU eviction — the set never holds more
-        # than a session's worth of recent abort markers, but a leak
-        # would otherwise grow unbounded on a long-lived gateway.
-        self._aborted_runs: set[str] = set()
-        self._aborted_runs_order: list[str] = []
-        self._MAX_ABORTED_RUNS = 64
+        # One controller owns per-run cancellation for every transport.
+        # Streams poll its marker; active tool awaitables are registered with
+        # it so Stop can cancel the current tool without cancelling the parent
+        # turn before partial transcript persistence/final delivery.
+        self._run_aborts = RunAbortController(max_recent=64)
 
         # Self-improvement nudge intervals (0 = disabled). Skill review is
         # intentionally not triggered by self-review; skill creation remains
@@ -2475,10 +2468,79 @@ class AgentLoop:
         (subagent announces re-enter as channel="system") stay strictly
         sequential, preserving their existing ordering guarantees.
         """
+        if msg.metadata.get("group_observe"):
+            # A passively-observed channel message: file it into the session's
+            # context buffer and stop. No LLM turn, no reply — the bot stays
+            # silent but remembers what was said for the next mention.
+            await self._record_group_observation(msg)
+            return
+
         if msg.channel == "web":
             self._spawn_concurrent_turn(msg)
         else:
             await self._process_turn(msg)
+
+    async def _record_group_observation(self, msg: "InboundMessage") -> None:
+        """Append an un-answered channel message to its session's group buffer.
+
+        Cheap and side-effect-free: no provider call, no outbound. The buffer
+        lives on session metadata (so it survives restarts) and is bounded by
+        ``_GROUP_BUFFER_MAX_MSGS`` / ``_GROUP_BUFFER_MAX_CHARS`` — oldest first.
+        """
+        try:
+            session = self.sessions.get_or_create(msg.session_key)
+            buf = session.metadata.get("group_buffer")
+            if not isinstance(buf, list):
+                buf = []
+            slack_meta = msg.metadata.get("slack") or {}
+            name = (
+                slack_meta.get("sender_name")
+                or msg.metadata.get("sender_name")
+                or msg.sender_id
+            )
+            buf.append({"s": str(name), "c": msg.content or ""})
+            # Drop oldest until both caps hold.
+            while buf and (
+                len(buf) > _GROUP_BUFFER_MAX_MSGS
+                or sum(len(e.get("c") or "") for e in buf) > _GROUP_BUFFER_MAX_CHARS
+            ):
+                buf.pop(0)
+            session.metadata["group_buffer"] = buf
+            self.sessions.save(session)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"group observation record skipped: {exc}")
+
+    def _flush_group_context(self, session: Any, msg: "InboundMessage") -> str:
+        """Pop the session's group buffer and render it as an LLM context block.
+
+        Returns '' when nothing was observed. The block is EPHEMERAL — prepended
+        only to this turn's current-message (never the persisted user turn), so
+        the reply is informed but history stays clean. Cleared one-shot: the next
+        mention re-injects only messages observed since this one.
+        """
+        buf = session.metadata.get("group_buffer")
+        if not isinstance(buf, list) or not buf:
+            return ""
+
+        slack_meta = msg.metadata.get("slack") or {}
+        ctx: list[str] = []
+        ch_name = slack_meta.get("channel_name") or ""
+        if ch_name:
+            ctx.append(f"Channel: #{ch_name}")
+        members = slack_meta.get("members") or []
+        if members:
+            ctx.append("Members: " + ", ".join(members))
+
+        lines = [f"[{e.get('s') or 'someone'}]: {e.get('c') or ''}" for e in buf]
+        header = "[Channel conversation you did not reply to — context only]"
+        block = header + ("\n" + " · ".join(ctx) if ctx else "") + "\n" + "\n".join(lines)
+
+        session.metadata["group_buffer"] = []
+        try:
+            self.sessions.save(session)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"group buffer clear save skipped: {exc}")
+        return block
 
     def _spawn_concurrent_turn(self, msg: "InboundMessage") -> None:
         """Process a per-session chat (web/relay) in its own task so unrelated
@@ -2527,32 +2589,22 @@ class AgentLoop:
                     except Exception:
                         logger.debug("[loop] inflight.finish failed", exc_info=True)
 
-    def mark_aborted(self, run_id: str) -> None:
-        """Mark a run_id as aborted so the streaming loop bails out.
+    def mark_aborted(self, run_id: str) -> bool:
+        """Stop one run without cancelling its transcript-finalization task.
 
-        Called by ``WebChannel.chat.abort`` (and any future channel
-        with a Stop affordance). The streaming loop checks
-        ``is_run_aborted(run_id)`` between chunks; on a positive hit
-        it breaks out cooperatively, keeping the partial accumulated
-        text so the user sees what the bot had managed to say.
-
-        Idempotent. The set is bounded — see ``_MAX_ABORTED_RUNS``
-        for the LRU policy.
+        The shared controller immediately cancels whichever provider or tool
+        awaitable is active for the run. The surrounding turn task stays alive
+        so it can preserve partial text/tool history and emit the authoritative
+        aborted ``final`` event.
         """
-        if not run_id:
-            return
-        if run_id in self._aborted_runs:
-            return
-        self._aborted_runs.add(run_id)
-        self._aborted_runs_order.append(run_id)
-        while len(self._aborted_runs_order) > self._MAX_ABORTED_RUNS:
-            evict = self._aborted_runs_order.pop(0)
-            self._aborted_runs.discard(evict)
-        logger.info(f"[agent] mark_aborted run_id={run_id}")
+        requested = self._run_aborts.request(run_id)
+        if requested:
+            logger.info(f"[agent] mark_aborted run_id={run_id}")
+        return requested
 
     def is_run_aborted(self, run_id: str) -> bool:
         """Test whether a run_id has been marked aborted."""
-        return bool(run_id) and run_id in self._aborted_runs
+        return self._run_aborts.is_requested(run_id)
 
     def stop(self) -> None:
         """Stop the agent loop.
@@ -3230,40 +3282,48 @@ class AgentLoop:
         chunk_count = 0
         aborted = False
 
-        async for chunk in self.provider.chat_stream(
-            messages=messages,
-            tools=tools,
-            model=model,
-            temperature=temperature,
-            tool_choice=tool_choice,
-        ):
-            # Cooperative abort: check before processing the chunk so
-            # accumulated_text reflects exactly what was rendered to
-            # the user at the moment of Stop. Checking after the
-            # ``stream_callback`` send would leak one extra delta
-            # past the abort line — small but distracting in the UI.
-            if run_id and self.is_run_aborted(run_id):
-                aborted = True
-                logger.info(
-                    f"[stream] aborted at chunk #{chunk_count}, "
-                    f"{len(accumulated_text)} chars preserved, run_id={run_id}"
-                )
-                break
-            if chunk.content:
-                chunk_count += 1
-                accumulated_text += chunk.content
-                # Heartbeat for the inactivity watchdog — every stream
-                # chunk counts as progress. Without this a long streaming
-                # reply could look "idle" to the poller even though the
-                # model is actively emitting tokens.
-                self._touch_activity("receiving stream response")
-                logger.debug(f"[stream] chunk #{chunk_count}: {len(chunk.content)} chars")
-                try:
-                    await stream_callback(chunk.content)
-                except Exception as e:
-                    logger.warning(f"[stream] stream_callback error: {e}")
-            if chunk.finish_reason:
-                final_response = chunk
+        async def consume_stream() -> None:
+            nonlocal accumulated_text, final_response, chunk_count, aborted
+            async for chunk in self.provider.chat_stream(
+                messages=messages,
+                tools=tools,
+                model=model,
+                temperature=temperature,
+                tool_choice=tool_choice,
+            ):
+                # Keep this cooperative check as a second line of defence for
+                # providers that yield immediately after the stop request.
+                # The RunAbortController below also cancels a provider that is
+                # silent / reasoning and has not yielded another chunk yet.
+                if run_id and self.is_run_aborted(run_id):
+                    aborted = True
+                    break
+                if chunk.content:
+                    chunk_count += 1
+                    accumulated_text += chunk.content
+                    # Heartbeat for the inactivity watchdog — every stream
+                    # chunk counts as progress. Without this a long streaming
+                    # reply could look "idle" to the poller even though the
+                    # model is actively emitting tokens.
+                    self._touch_activity("receiving stream response")
+                    logger.debug(f"[stream] chunk #{chunk_count}: {len(chunk.content)} chars")
+                    try:
+                        await stream_callback(chunk.content)
+                    except Exception as e:
+                        logger.warning(f"[stream] stream_callback error: {e}")
+                if chunk.finish_reason:
+                    final_response = chunk
+
+        try:
+            await self._run_aborts.run_cancellable(run_id, consume_stream)
+        except RunAbortedError:
+            aborted = True
+
+        if aborted:
+            logger.info(
+                f"[stream] aborted at chunk #{chunk_count}, "
+                f"{len(accumulated_text)} chars preserved, run_id={run_id}"
+            )
 
         logger.info(f"[stream] done: {chunk_count} chunks, {len(accumulated_text)} total chars{' (ABORTED)' if aborted else ''}")
 
@@ -3312,6 +3372,43 @@ class AgentLoop:
             )
 
         return final_response
+
+    async def _chat_without_stream(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str,
+        temperature: float,
+        tool_choice: str,
+        run_id: str = "",
+    ) -> LLMResponse:
+        """Run one blocking provider call under the shared per-run abort.
+
+        Streaming and non-streaming providers now use the exact same
+        cancellation primitive as tools. A stopped blocking call has no safe
+        partial payload to preserve, so it returns an empty aborted response
+        and lets the normal turn finalizer emit the authoritative terminal
+        event.
+        """
+        try:
+            return await self._run_aborts.run_cancellable(
+                run_id,
+                lambda: self.provider.chat(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    temperature=temperature,
+                    tool_choice=tool_choice,
+                ),
+            )
+        except RunAbortedError:
+            logger.info(f"[chat] blocking provider call aborted, run_id={run_id}")
+            return LLMResponse(
+                content=None,
+                finish_reason="aborted",
+                usage={},
+            )
 
     async def _emit_iteration_event(
         self,
@@ -3747,12 +3844,13 @@ class AgentLoop:
             else:
                 self._api_call_count += 1
                 self._touch_activity(f"starting LLM call #{self._api_call_count} (iter {iteration})")
-                response = await self.provider.chat(
+                response = await self._chat_without_stream(
                     messages=messages,
                     tools=tool_defs,
                     model=selected_model,
                     temperature=selected_temperature,
                     tool_choice=tool_choice,
+                    run_id=outbound_run_id,
                 )
 
             # Cooperative abort — short-circuit the tool loop. Two
@@ -3785,12 +3883,13 @@ class AgentLoop:
                 and backoff_for(classify_response(response), 1) is not None
             ):
                 logger.warning("Streaming failed, falling back to blocking chat()")
-                response = await self.provider.chat(
+                response = await self._chat_without_stream(
                     messages=messages,
                     tools=tool_defs,
                     model=selected_model,
                     temperature=selected_temperature,
                     tool_choice=tool_choice,
+                    run_id=outbound_run_id,
                 )
 
             if (
@@ -3803,12 +3902,13 @@ class AgentLoop:
                 )
             ):
                 logger.warning(f"tool_choice=required failed, retrying with auto: {response.content[:120]}")
-                response = await self.provider.chat(
+                response = await self._chat_without_stream(
                     messages=messages,
                     tools=tool_defs,
                     model=selected_model,
                     temperature=selected_temperature,
                     tool_choice="auto",
+                    run_id=outbound_run_id,
                 )
 
             # Audit the LLM call after the retry chain settles. We log
@@ -3990,6 +4090,11 @@ class AgentLoop:
                 terminal_action_executed = False
                 turn_success_count = 0
                 for tool_call in response.tool_calls:
+                    # Stop is checked per call, not just per LLM iteration.
+                    # This guarantees a batch of N tool calls never starts call
+                    # N+1 after the user has stopped the run.
+                    if outbound_run_id and self.is_run_aborted(outbound_run_id):
+                        break
                     turn_tools.append(tool_call.name)
                     executed_tool_names.append(tool_call.name)
                     args_str = json.dumps(_redact_log_args(tool_call.arguments))
@@ -4186,7 +4291,10 @@ class AgentLoop:
                                 call_args = {"agent": _detected_agent, "task": _task_text}
                                 _effective_tool_name = "builtin_agent"
 
-                        _tool_result = await self.tools.execute(_effective_tool_name, call_args)
+                        _tool_result = await self._run_aborts.run_cancellable(
+                            outbound_run_id,
+                            lambda: self.tools.execute(_effective_tool_name, call_args),
+                        )
                         # Reply-media envelope: a tool (image_generate, screenshot)
                         # produced file(s) for THIS turn's reply. Peel the paths onto
                         # the turn collector and replace the raw JSON with the human
@@ -4217,6 +4325,19 @@ class AgentLoop:
                             "result": _tool_result[:500] if len(_tool_result) > 500 else _tool_result,
                         })
                         result = _tool_result
+                    except RunAbortedError:
+                        result = "Stopped by user."
+                        _tool_result = result
+                        _tool_success = False
+                        logger.info(
+                            f"Tool stopped: {tool_call.name} run_id={outbound_run_id}"
+                        )
+                        accumulated_tool_results.append({
+                            "tool": tool_call.name,
+                            "success": False,
+                            "aborted": True,
+                            "result": result,
+                        })
                     except Exception as e:
                         result = f"Error executing {tool_call.name}: {str(e)}"
                         _tool_result = result
@@ -4354,7 +4475,7 @@ class AgentLoop:
                                 _iteration_event_idx += 1
 
                     # In strict action turns, stop as soon as a terminal action succeeds.
-                    if not result.startswith("Error"):
+                    if _tool_success:
                         if tool_call.name == "cron":
                             cron_action = str(tool_call.arguments.get("action", "")).lower()
                             target_tool = str(tool_call.arguments.get("tool_name", "")).lower()
@@ -4372,6 +4493,18 @@ class AgentLoop:
                         break
 
                 logger.info(f"Tool execution telemetry: executed_tools={turn_tools}")
+                if outbound_run_id and self.is_run_aborted(outbound_run_id):
+                    # Keep the model's already-streamed preamble as the partial
+                    # final. Tool protocol messages/results remain in
+                    # ``messages`` and are persisted below, but no fallback
+                    # summary or next model iteration is allowed to make an
+                    # aborted turn look successfully completed.
+                    final_content = response.content or ""
+                    logger.info(
+                        f"[loop] aborted during tool batch; "
+                        f"executed_tools={turn_tools}, run_id={outbound_run_id}"
+                    )
+                    break
                 tools_were_used = True
                 if turn_success_count > 0:
                     successful_tools_were_used = True
@@ -4637,11 +4770,15 @@ class AgentLoop:
             final_content = response.content
             break
 
-        if enforce_action_tools and not successful_tools_were_used:
+        run_was_aborted = bool(
+            outbound_run_id and self.is_run_aborted(outbound_run_id)
+        )
+
+        if enforce_action_tools and not successful_tools_were_used and not run_was_aborted:
             if not final_content or not final_content.startswith("Tool"):
                 final_content = "Tool calls failed, no action was taken."
 
-        if final_content is None:
+        if final_content is None and not run_was_aborted:
             if accumulated_tool_results:
                 summary = f"Actions completed ({len(accumulated_tool_results)} tools executed):\n"
                 for tr in accumulated_tool_results[-5:]:
@@ -4651,7 +4788,7 @@ class AgentLoop:
             else:
                 final_content = "Action completed but no response could be generated."
 
-        if not final_content or not final_content.strip():
+        if (not final_content or not final_content.strip()) and not run_was_aborted:
             if enforce_action_tools and not successful_tools_were_used:
                 final_content = "Tool call could not be verified, no action was taken."
             elif accumulated_tool_results:
@@ -4659,8 +4796,15 @@ class AgentLoop:
             else:
                 final_content = "Action completed but no response could be generated."
 
+        # Empty is a valid terminal payload for a run stopped before the first
+        # token. The aborted flag — not synthetic assistant prose — explains
+        # why the turn ended.
+        if run_was_aborted and final_content is None:
+            final_content = ""
+
         if (
             final_content
+            and not run_was_aborted
             and not executed_tool_names
             and (action_turn or self._is_retry_action_followup(turn_content))
             and self._contains_unverified_completion_claim(final_content)
@@ -4682,7 +4826,11 @@ class AgentLoop:
         # summarize what happened in natural language — always, regardless
         # of whether tool results exist. Users should never see generic
         # "no action was taken" messages.
-        if final_content and self._is_hardcoded_fallback(final_content):
+        if (
+            final_content
+            and not run_was_aborted
+            and self._is_hardcoded_fallback(final_content)
+        ):
             logger.info("Requesting model summary turn to replace hardcoded fallback")
             summary = await self._request_summary_turn(messages, accumulated_tool_results)
             if summary:
@@ -4852,6 +5000,7 @@ class AgentLoop:
 
     async def _process_message_inner(self, msg: InboundMessage) -> OutboundMessage | None:
         """Inner message processing (called with session marked busy)."""
+        turn_started_at = time.monotonic()
 
         # Handle slash commands from ALL channels
         # Telegram sets is_command metadata; Desktop/Web/iOS send raw text.
@@ -5201,6 +5350,13 @@ class AgentLoop:
         session = self.sessions.get_or_create(msg.session_key)
         display_content = str(msg.metadata.get("_display_content") or msg.content)
 
+        # Passive channel context (Slack/Discord "listen" mode): render any
+        # messages observed since the last reply into a block we prepend ONLY to
+        # the LLM's current-message below. ``msg.content``/``display_content``
+        # stay the raw user text, so action-turn detection, UI, and persisted
+        # history are untouched.
+        group_context_block = self._flush_group_context(session, msg)
+
         # Sync per-session cwd between the in-memory pin (set by chat.send
         # cwd handlers on web/gateway channels) and persisted metadata, so
         # the pin survives bot restarts and channels that don't transport
@@ -5438,9 +5594,16 @@ class AgentLoop:
         # lands on, not the gateway default.
         effective_model = msg.metadata.get("model_override") or self.model
 
+        # Prepend observed channel context to the LLM's view of this turn only.
+        llm_current_message = (
+            f"{group_context_block}\n---\n{msg.content}"
+            if group_context_block
+            else msg.content
+        )
+
         messages = self.context.build_messages(
             history=history,
-            current_message=msg.content,
+            current_message=llm_current_message,
             media=msg.media if msg.media else None,
             memory_search_enabled=self._memory_manager is not None,
             skip_memory=skip_memory_flag,
@@ -5508,6 +5671,14 @@ class AgentLoop:
             reply_media=reply_media,
             error_out=provider_error,
         )
+        outbound_run_id = msg.metadata.get("run_id") or ""
+        turn_aborted = bool(
+            outbound_run_id and self.is_run_aborted(outbound_run_id)
+        )
+        turn_duration_ms = max(
+            0,
+            int((time.monotonic() - turn_started_at) * 1000),
+        )
 
         if action_turn:
             successful_tools = [r for r in tool_results if r.get("success")]
@@ -5544,6 +5715,8 @@ class AgentLoop:
             usage=usage,
             media=msg.media or None,
             reply_media=reply_media or None,
+            aborted=turn_aborted,
+            duration_ms=turn_duration_ms,
         )
         self.sessions.save(session)
 
@@ -5645,10 +5818,11 @@ class AgentLoop:
                 # Read the flag at the moment of emit so a Stop
                 # pressed after ``_run_llm_tool_loop`` returned but
                 # before we reached this builder is still respected.
-                "aborted": bool(
-                    msg.metadata.get("run_id")
-                    and self.is_run_aborted(msg.metadata["run_id"])
-                ),
+                "aborted": turn_aborted,
+                # One transport-neutral duration lets every client render the
+                # same "Stopped after …" marker and keeps reloads identical to
+                # the live turn. Older channels ignore this additive field.
+                "duration_ms": turn_duration_ms,
             },
         )
 
@@ -5941,6 +6115,7 @@ class AgentLoop:
         origin_chat_id: str | None = None,
         voice_mode: bool = False,
         on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        run_id: str | None = None,
     ) -> str | tuple[str, dict[str, Any]]:
         """
         Process a message directly (for CLI, voice calls, or desktop WebSocket).
@@ -5955,6 +6130,8 @@ class AgentLoop:
                             default. Intended for cron jobs with a per-job model
                             pinned at creation time. Scoped to this call; does
                             not leak to other in-flight requests.
+            run_id: Transport-owned run identifier. When present, Stop requests
+                    use the same per-run controller as relay chats.
 
         Returns:
             The agent's response string, or (response, metadata) if return_metadata=True.
@@ -5966,6 +6143,8 @@ class AgentLoop:
             channel, chat_id = "cli", session_key
 
         metadata: dict[str, Any] = {}
+        if run_id:
+            metadata["run_id"] = run_id
         if stream_callback is not None:
             metadata["stream_callback"] = stream_callback
         if on_iteration is not None:

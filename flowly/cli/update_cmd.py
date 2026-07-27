@@ -176,7 +176,7 @@ def _windows_self_update(cmd: list[str]) -> int:
         pip_line,
         "if errorlevel 1 ( echo. & echo Update FAILED. & echo. & pause & exit /b 1 )",
         "echo.",
-        "echo Flowly updated. To continue:  flowly service install --start  then  flowly",
+        "echo Flowly updated. To continue:  flowly",
         "echo You can close this window.",
         "pause >nul",
     ]

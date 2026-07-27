@@ -276,6 +276,8 @@ class Session:
         media: list[str] | None = None,
         reply_media: list[str] | None = None,
         user_display_hidden: bool = False,
+        aborted: bool = False,
+        duration_ms: int | None = None,
     ) -> None:
         """Append a completed turn — user message + all assistant/tool
         messages the loop produced — to the session.
@@ -320,6 +322,14 @@ class Session:
             context-window indicator without re-running the LLM. Also
             accumulated into ``session.metadata['token_totals']`` for
             cheap session-wide queries. ``None`` skips persistence.
+        aborted:
+            Marks the closing assistant record as user-stopped. An aborted
+            turn gets a closing record even when no text was produced so
+            display history can render an explicit stop marker.
+        duration_ms:
+            End-to-end turn duration persisted on the closing assistant
+            record. Internal bookkeeping only; projected away before the
+            transcript is sent back to an LLM.
         """
         # Persist the media file paths alongside the user message so chat
         # history can reconstruct attachment previews (the direct gateway has
@@ -369,6 +379,10 @@ class Session:
             # the image preview on the assistant bubble, same as the live reply.
             if i == closing_idx and reply_media:
                 extras["media"] = list(reply_media)
+            if i == closing_idx and aborted:
+                extras["aborted"] = True
+            if i == closing_idx and duration_ms is not None:
+                extras["duration_ms"] = max(0, int(duration_ms))
             content = new_msg.get("content") or ""
             if i == closing_idx and final_content:
                 content = final_content
@@ -383,10 +397,14 @@ class Session:
         # like "Action executed.", error string, etc.). Append it as
         # a capstone so the saved transcript ends on a clean assistant
         # text boundary the next turn can extend cleanly.
-        if closing_idx is None and (final_content or reply_media):
+        if closing_idx is None and (final_content or reply_media or aborted):
             extras = {"usage": clean_usage} if clean_usage else {}
             if reply_media:
                 extras["media"] = list(reply_media)
+            if aborted:
+                extras["aborted"] = True
+            if duration_ms is not None:
+                extras["duration_ms"] = max(0, int(duration_ms))
             self.add_message("assistant", final_content or "", **extras)
 
         # Roll the turn's usage into session-wide totals so list_sessions

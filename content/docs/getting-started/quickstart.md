@@ -37,7 +37,9 @@ See [Setup wizard](./setup-wizard.md) for all subcommands.
 flowly
 ```
 
-Bare `flowly` opens the terminal chat. Type a message and the agent responds. Inside the chat you can switch provider and model on the fly:
+Bare `flowly` opens the terminal chat. Type a message and the agent responds. If the gateway (the background process that actually runs your agent) isn't up, `flowly` starts it for you — there is no separate "start the server" step.
+
+Inside the chat you can switch provider and model on the fly:
 
 ```bash
 /provider openrouter
@@ -56,7 +58,7 @@ flowly agent -m "Summarize the README in this directory"
 
 ## Where to next
 
-- Run Flowly in the background so it stays reachable: [Service](../using-flowly/service.md) — `flowly service install --start`
+- Keep Flowly running across logins and reboots: [Service](../using-flowly/service.md) — `flowly service install --start` (optional; `flowly` already starts the gateway on demand)
 - Add a Telegram, Discord, or Slack bot: [Channels overview](../channels/overview.md)
 - Tune models, tools, and behavior: [Configuration](../using-flowly/configuration.md)
 - Control shell execution and approvals: [Sandbox and approvals](../using-flowly/sandbox-and-approvals.md)

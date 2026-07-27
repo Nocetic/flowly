@@ -42,16 +42,13 @@ from flowly.auth.openai_codex import (
 )
 from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
-# The ChatGPT subscription backend serves the current-generation general
-# GPT-5.x models (NOT the codex-suffixed ids, nor older versions — the
-# backend 400s those with "not supported when using Codex with a ChatGPT
-# account"). gpt-5.5 matches the Codex CLI's own default.
-DEFAULT_CODEX_MODEL = os.getenv("FLOWLY_CODEX_MODEL", "gpt-5.5")
+# Keep the startup/provider-switch default aligned with the first visible
+# model in the live ChatGPT Codex catalogue.
+DEFAULT_CODEX_MODEL = os.getenv("FLOWLY_CODEX_MODEL", "gpt-5.6-sol")
 
 # Reasoning efforts the ChatGPT Codex backend accepts. "minimal" is NOT
 # accepted here (unlike the metered API) — it is folded down to "low".
-_VALID_EFFORTS = ("none", "low", "medium", "high", "xhigh")
-# Codex-family models reject "none"; only general-purpose gpt-5.x take it.
+_VALID_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 _DEFAULT_EFFORT = "medium"
 
 
@@ -96,12 +93,13 @@ def _resolve_effort(model: str | None, override: str | None = None) -> str:
     if effort not in _VALID_EFFORTS:
         effort = _DEFAULT_EFFORT
     normalized = _normalize_codex_model(model)
-    is_codex = "codex" in normalized.lower()
-    # Codex-family models reject "none"; bump it to "low".
-    if effort == "none" and is_codex:
+    low_model = normalized.lower()
+    requires_reasoning = "codex" in low_model or low_model.startswith("gpt-5.6")
+    # Codex-family and GPT-5.6 agentic models reject "none"; bump it to low.
+    if effort == "none" and requires_reasoning:
         effort = "low"
-    # xhigh only exists on the newest models; keep it but the backend will
-    # downgrade if unsupported. We don't over-police it offline.
+    # xhigh/max only exist on newer models; keep them and let the backend
+    # reject an explicitly requested unsupported combination.
     return effort
 
 

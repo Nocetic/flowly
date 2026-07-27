@@ -4,6 +4,12 @@ eyebrow: Using Flowly
 description: The Flowly gateway can run as a background service so it stays up without a terminal session — surviving reboots and terminal close — keeping your channels reachable.
 ---
 
+> [!NOTE]
+> You don't need this to use Flowly. Bare `flowly` starts the gateway itself
+> when none is running. Install the service when you want it up **without
+> anyone typing `flowly`** — across logins and reboots, so channels stay
+> reachable and scheduled jobs keep firing.
+
 ## Install and lifecycle
 
 ```bash
@@ -80,7 +86,7 @@ sudo loginctl enable-linger "$USER"              # or: flowly doctor --fix
 
 Genuine crashes are covered by `Restart=always` + `StartLimitIntervalSec=0` (retried indefinitely, never permanently `failed`).
 
-**Restart reports ok, but the port never comes back.** The unit was probably installed by a *previous* Flowly install and points at a binary that no longer exists — `restart`/`start` detect this and print the fix: `flowly service install --start` rewrites the unit onto the current install. (The install script also does this automatically when it finds an existing unit.)
+**Restart reports ok, but the port never comes back.** The unit was probably installed by a *previous* Flowly install and points at a binary that no longer exists — `restart`/`start` detect this and print the fix: `flowly service install --start` rewrites the unit onto the current install. The install script does this for you when the unit dangles or belongs to the install it is replacing; a unit pointing at a *different, working* install is left alone, so re-running the installer against a throwaway checkout can't repoint your real service at a directory that is about to be deleted.
 
 **Windows — it runs, then is down a few hours later.** This is exactly what the console-less supervisor fixes: the launcher relaunches the gateway whenever it exits, so a mid-life crash recovers on its own within seconds. If it still won't stay up:
 

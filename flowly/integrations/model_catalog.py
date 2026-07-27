@@ -15,13 +15,17 @@ Public surface
     edits a provider key in case the new key unlocks more models).
 
 The returned ``Model`` objects are intentionally minimal — just enough
-fields for the picker UI. Add metadata fields here as the picker grows.
+fields for the picker UI. Flowly's account-specific ``plan`` and
+``default_model`` response metadata is retained separately so login/startup
+can reconcile a stale configured model without changing this public list API.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field as dc_field
+import re as _re
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import Any
 
 import httpx
@@ -42,11 +46,20 @@ class Model:
     supports_vision: bool | None = None
 
 
+@dataclass(frozen=True)
+class FlowlyModelPolicy:
+    """Account-specific metadata returned by Flowly's authenticated catalog."""
+
+    plan: str
+    default_model: str
+
+
 _TIMEOUT = httpx.Timeout(8.0, connect=3.0)
 _UA = "flowly-tui/model-catalog"
 
 # Session cache: provider_key → list[Model]. Cleared on flush_cache().
 _CACHE: dict[str, list[Model]] = {}
+_FLOWLY_POLICY: FlowlyModelPolicy | None = None
 
 
 async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> list[Model]:
@@ -81,7 +94,14 @@ async def fetch_models(provider_key: str, *, force_refresh: bool = False) -> lis
 
 def flush_cache() -> None:
     """Drop every cached provider catalog. Call after credentials change."""
+    global _FLOWLY_POLICY
     _CACHE.clear()
+    _FLOWLY_POLICY = None
+
+
+def get_flowly_model_policy() -> FlowlyModelPolicy | None:
+    """Return metadata from the latest authenticated Flowly catalog fetch."""
+    return _FLOWLY_POLICY
 
 
 def get_context_window(model_id: str) -> int | None:
@@ -155,9 +175,6 @@ def get_vision_support(model_id: str) -> bool | None:
 
 
 # ── id normalization ──────────────────────────────────────────────
-
-
-import re as _re
 
 # Match version suffixes like ``-4-5`` or ``-4`` at end of a model id
 # component. ``claude-sonnet-4-5`` → group "4-5" → normalised to "4.5".
@@ -262,6 +279,9 @@ async def _fetch_flowly_hosted() -> list[Model]:
     credential we fall back to the full OpenRouter catalog so the picker still
     has something browsable.
     """
+    global _FLOWLY_POLICY
+    _FLOWLY_POLICY = None
+
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
     cfg = load_config()
@@ -287,8 +307,21 @@ async def _fetch_flowly_hosted() -> list[Model]:
         # Network / 401 / plan lookup failure — degrade to OpenRouter
         # so the picker doesn't open empty.
         return await _fetch_openrouter()
+    payload = r.json()
+    if not isinstance(payload, dict):
+        return []
+    raw_plan = payload.get("plan")
+    raw_default = payload.get("default_model")
+    if isinstance(raw_plan, str) and raw_plan.strip() and isinstance(raw_default, str) and raw_default.strip():
+        _FLOWLY_POLICY = FlowlyModelPolicy(
+            plan=raw_plan.strip(),
+            default_model=raw_default.strip(),
+        )
+
     out: list[Model] = []
-    for item in r.json().get("data", []):
+    for item in payload.get("data", []):
+        if not isinstance(item, dict):
+            continue
         mid = str(item.get("id") or "").strip()
         if not mid:
             continue
@@ -324,6 +357,46 @@ async def _fetch_flowly_hosted() -> list[Model]:
     # Allowed first, then alphabetical within each bucket.
     out.sort(key=lambda m: (1 if "locked" in m.tags else 0, m.id.lower()))
     return out
+
+
+def _catalog_contains(models: list[Model], model_id: str) -> bool:
+    """True when an allowed catalog row matches ``model_id`` (dash/dot aliases)."""
+    candidates = {
+        model_id,
+        _dash_to_dot_version(model_id),
+        _dot_to_dash_version(model_id),
+    }
+    return any("locked" not in model.tags and model.id in candidates for model in models)
+
+
+async def reconcile_flowly_model(*, force_refresh: bool = True) -> str | None:
+    """Replace a model unavailable to this Flowly account with its backend default.
+
+    The authenticated ``/models`` response is authoritative. A valid current
+    choice — including a paid user's deliberate Kimi selection — is preserved.
+    Network/auth/catalog failures are fail-safe no-ops; they never rewrite the
+    user's config from an unverified OpenRouter fallback.
+    """
+    models = await fetch_models("flowly", force_refresh=force_refresh)
+    policy = _FLOWLY_POLICY
+    if policy is None or not models:
+        return None
+
+    from flowly.config.loader import load_config
+
+    current = (load_config().agents.defaults.model or "").strip()
+    if current and _catalog_contains(models, current):
+        return None
+    if not _catalog_contains(models, policy.default_model):
+        return None
+
+    from flowly.config.loader import get_config_path
+    from flowly.integrations.config_io import _atomic_write_json, _load_raw, _set_path
+
+    raw = _load_raw()
+    _set_path(raw, "agents.defaults.model", policy.default_model, merge=False)
+    _atomic_write_json(get_config_path(), raw)
+    return policy.default_model
 
 
 # Pin xAI's headline chat model to the top of the picker. Everything
@@ -415,32 +488,149 @@ async def _fetch_xai_apikey() -> list[Model]:
     return await _fetch_xai_models(api_key, base)
 
 
-# ChatGPT subscription (Codex OAuth) has no public /models endpoint — the
-# plan gates access, not a catalogue. The backend serves the current
-# general-purpose GPT-5.x models and 400s everything else (older versions,
-# codex-suffixed ids). Verified live against a Plus plan on 2026-07-02;
-# higher tiers may unlock more, and a user can still type a custom id.
-_CODEX_MODELS: list[tuple[str, str, list[str]]] = [
-    ("gpt-5.5", "GPT-5.5 — newest, strongest reasoning", ["reasoning"]),
-    ("gpt-5.4", "GPT-5.4 — general purpose", ["reasoning"]),
-    ("gpt-5.4-mini", "GPT-5.4 Mini — fast and efficient", ["fast"]),
+# The ChatGPT Codex backend exposes the same account-authenticated catalogue
+# used by the Codex CLI. Keep a small fallback so a transient failure does not
+# make the picker empty; the live response remains the source of truth.
+_CODEX_FALLBACK_CONTEXT_WINDOW = 272_000
+_CODEX_FALLBACK_MODELS: list[tuple[str, str, str, list[str]]] = [
+    ("gpt-5.6-sol", "GPT-5.6-Sol", "Latest frontier agentic coding model.",
+     ["reasoning", "vision"]),
+    ("gpt-5.6-terra", "GPT-5.6-Terra", "Balanced agentic coding model for everyday work.",
+     ["reasoning", "vision"]),
+    ("gpt-5.6-luna", "GPT-5.6-Luna", "Fast and affordable agentic coding model.",
+     ["reasoning", "fast", "vision"]),
+    ("gpt-5.5", "GPT-5.5", "Frontier model for complex coding, research, and real-world work.",
+     ["reasoning", "vision"]),
+    ("gpt-5.4", "GPT-5.4", "Strong model for everyday coding.", ["reasoning", "vision"]),
+    ("gpt-5.4-mini", "GPT-5.4-Mini", "Small, fast, and cost-efficient model.",
+     ["reasoning", "fast", "vision"]),
 ]
 
 
-async def _fetch_openai_codex() -> list[Model]:
-    """ChatGPT subscription models — static, gated by the signed-in plan.
-
-    Only returns rows when a Codex OAuth credential is present, so the picker
-    stays empty (with the "sign in" hint) until the user logs in.
-    """
-    from flowly.auth.openai_codex import load_token_payload
-    payload = await asyncio.to_thread(load_token_payload)
-    if payload is None or not payload.access_token:
-        return []
+def _static_codex_models() -> list[Model]:
+    """Return fresh picker rows for the offline Codex catalogue fallback."""
     return [
-        Model(id=mid, name=mid, description=desc, tags=list(tags))
-        for mid, desc, tags in _CODEX_MODELS
+        Model(
+            id=mid,
+            name=name,
+            description=description,
+            context_window=_CODEX_FALLBACK_CONTEXT_WINDOW,
+            tags=list(tags),
+            supports_vision="vision" in tags,
+        )
+        for mid, name, description, tags in _CODEX_FALLBACK_MODELS
     ]
+
+
+def _codex_models_from_payload(payload: Any) -> list[Model]:
+    """Map the ChatGPT Codex ``/models`` response into picker rows."""
+    if not isinstance(payload, dict):
+        return []
+    raw_models = payload.get("models")
+    if not isinstance(raw_models, list):
+        # Defensive compatibility if the backend adopts the conventional
+        # OpenAI ``data`` wrapper in a future response revision.
+        raw_models = payload.get("data")
+    if not isinstance(raw_models, list):
+        return []
+
+    ranked: list[tuple[int, str, Model]] = []
+    for index, item in enumerate(raw_models):
+        if not isinstance(item, dict):
+            continue
+        # The authenticated response is authoritative for ChatGPT OAuth.
+        # ``supported_in_api`` concerns API-key access, not this provider.
+        if str(item.get("visibility") or "list").lower() != "list":
+            continue
+        mid = str(item.get("slug") or item.get("id") or "").strip()
+        if not mid:
+            continue
+
+        levels = item.get("supported_reasoning_levels")
+        tags: list[str] = ["reasoning"] if isinstance(levels, list) and levels else []
+        description = str(item.get("description") or "")[:140]
+        low_id = mid.lower()
+        if "fast" in description.lower() or "mini" in low_id or low_id.endswith("-luna"):
+            tags.append("fast")
+
+        modalities = item.get("input_modalities")
+        if isinstance(modalities, list):
+            supports_vision: bool | None = any(
+                "image" in str(modality).lower() for modality in modalities
+            )
+        elif isinstance(modalities, str):
+            supports_vision = "image" in modalities.lower()
+        else:
+            supports_vision = None
+        if supports_vision is True:
+            tags.append("vision")
+
+        raw_context = item.get("context_window") or item.get("max_context_window")
+        context_window = (
+            int(raw_context)
+            if isinstance(raw_context, int) and not isinstance(raw_context, bool) and raw_context > 0
+            else None
+        )
+        raw_priority = item.get("priority")
+        priority = (
+            int(raw_priority)
+            if isinstance(raw_priority, (int, float)) and not isinstance(raw_priority, bool)
+            else 1_000_000 + index
+        )
+        model = Model(
+            id=mid,
+            name=str(item.get("display_name") or item.get("name") or mid),
+            description=description,
+            context_window=context_window,
+            tags=tags,
+            supports_vision=supports_vision,
+        )
+        ranked.append((priority, low_id, model))
+
+    ranked.sort(key=lambda entry: (entry[0], entry[1]))
+    return [model for _, _, model in ranked]
+
+
+async def _fetch_openai_codex() -> list[Model]:
+    """Fetch the signed-in account's live ChatGPT Codex model catalogue.
+
+    ``client_version`` is required by this endpoint. A 401 refreshes OAuth
+    once; all other network/schema failures use the curated fallback.
+    """
+    from flowly import __version__
+    from flowly.auth.openai_codex import resolve_runtime_credentials
+
+    try:
+        creds = await asyncio.to_thread(resolve_runtime_credentials)
+    except Exception:
+        return []
+    if creds is None or not creds.api_key or not creds.account_id:
+        return []
+
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                response = await client.get(
+                    f"{creds.base_url.rstrip('/')}/models",
+                    params={"client_version": __version__},
+                    headers={
+                        "Authorization": f"Bearer {creds.api_key}",
+                        "ChatGPT-Account-Id": creds.account_id,
+                        "Accept": "application/json",
+                        "User-Agent": _UA,
+                        "originator": "flowly",
+                    },
+                )
+            if response.status_code == 401 and attempt == 0:
+                creds = await asyncio.to_thread(resolve_runtime_credentials, force_refresh=True)
+                if creds is None or not creds.api_key or not creds.account_id:
+                    return _static_codex_models()
+                continue
+            response.raise_for_status()
+            return _codex_models_from_payload(response.json()) or _static_codex_models()
+        except Exception:
+            return _static_codex_models()
+    return _static_codex_models()
 
 
 _ZAI_CODING_MODELS: list[tuple[str, str, int, list[str]]] = [

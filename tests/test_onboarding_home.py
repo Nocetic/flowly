@@ -7,8 +7,11 @@ short-circuits before any prompt) without touching InquirerPy/Textual.
 
 from __future__ import annotations
 
+import io
 import types
 from pathlib import Path
+
+from rich.console import Console
 
 import flowly.cli.onboard_cmd as ob
 
@@ -54,6 +57,53 @@ def test_quick_mode_is_provider_then_chat(monkeypatch):
     monkeypatch.setattr(ob, "_offer_start_gateway", lambda: calls.append("gateway"))
     ob._run_setup_home()
     assert calls == ["provider", "summary", "gateway"]
+
+
+def test_gateway_offer_reports_success_only_for_zero_exit(monkeypatch):
+    from flowly.cli import service_cmd
+
+    stream = io.StringIO()
+    monkeypatch.setattr(
+        ob,
+        "console",
+        Console(file=stream, force_terminal=False, color_system=None),
+    )
+    monkeypatch.setattr("rich.prompt.Confirm.ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(service_cmd, "_resolve_flowly_exec_argv", lambda: ["/opt/flowly"])
+    monkeypatch.setattr(
+        ob.subprocess,
+        "run",
+        lambda argv, check=False: types.SimpleNamespace(returncode=0),
+    )
+
+    ob._offer_start_gateway()
+
+    assert "✓ Done" in stream.getvalue()
+
+
+def test_gateway_offer_does_not_claim_done_for_nonzero_exit(monkeypatch):
+    from flowly.cli import service_cmd
+
+    stream = io.StringIO()
+    monkeypatch.setattr(
+        ob,
+        "console",
+        Console(file=stream, force_terminal=False, color_system=None),
+    )
+    monkeypatch.setattr("rich.prompt.Confirm.ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(service_cmd, "_resolve_flowly_exec_argv", lambda: ["/opt/flowly"])
+    monkeypatch.setattr(
+        ob.subprocess,
+        "run",
+        lambda argv, check=False: types.SimpleNamespace(returncode=1),
+    )
+
+    ob._offer_start_gateway()
+
+    text = stream.getvalue()
+    assert "Couldn't auto-start (exit 1)" in text
+    assert "✓ Done" not in text
+    assert "flowly service install --start" in text
 
 
 def test_onboarding_never_launches_textual_setup():
@@ -244,3 +294,49 @@ def test_tty_unconfigured_opens_home(monkeypatch):
     monkeypatch.setattr(ob, "_run_setup_home", lambda: calls.append("home"))
     ob.run_onboarding()
     assert calls == ["home"]
+
+
+# ── /dev/tty event-loop guard (installer runs `flowly setup </dev/tty`) ───
+
+def test_tty_friendly_loop_uses_select_on_macos(monkeypatch):
+    """On macOS the picker must run on a select()-backed loop: kqueue can't
+    register /dev/tty, which is exactly what the installer hands us as stdin."""
+    import asyncio
+    import selectors
+
+    monkeypatch.setattr(ob.sys, "platform", "darwin")
+    prev = asyncio.get_event_loop_policy()
+    with ob._tty_friendly_event_loop():
+        loop = asyncio.new_event_loop()
+        try:
+            assert isinstance(loop._selector, selectors.SelectSelector)
+        finally:
+            loop.close()
+    # policy restored on exit — nothing else in the process inherits select
+    assert asyncio.get_event_loop_policy() is prev
+
+
+def test_tty_friendly_loop_is_noop_off_macos(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(ob.sys, "platform", "linux")
+    prev = asyncio.get_event_loop_policy()
+    with ob._tty_friendly_event_loop():
+        assert asyncio.get_event_loop_policy() is prev  # untouched inside
+    assert asyncio.get_event_loop_policy() is prev
+
+
+def test_interactive_setup_swallows_event_loop_oserror(monkeypatch, capsys):
+    """A terminal that still can't attach to an event loop must degrade to an
+    actionable hint, never a raw traceback on a first-run user."""
+    monkeypatch.setattr(ob, "seed_workspace", lambda: Path("/tmp/x"))
+    monkeypatch.setattr(ob, "_already_configured", lambda: False)
+    monkeypatch.setattr(ob.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(ob, "_print_banner", lambda: None)
+
+    def _boom():
+        raise OSError("kqueue: /dev/tty is not registered")
+
+    monkeypatch.setattr(ob, "_run_setup_home", _boom)
+    ob.run_onboarding()  # must not raise
+    assert "flowly setup" in capsys.readouterr().out

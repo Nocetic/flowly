@@ -293,6 +293,57 @@ class TestExtendWithTurnMessages:
         assert roles == ["user", "assistant"]
         assert s.messages[-1]["content"] == "Hello!"
 
+    def test_aborted_turn_without_text_persists_terminal_marker(self) -> None:
+        """Stopping before the first token must not leave a user-only tail."""
+        s = Session(key="t")
+        s.extend_with_turn_messages(
+            user_content="do something",
+            new_messages=[],
+            final_content="",
+            aborted=True,
+            duration_ms=4200,
+        )
+
+        assert [m["role"] for m in s.messages] == ["user", "assistant"]
+        assert s.messages[-1]["content"] == ""
+        assert s.messages[-1]["aborted"] is True
+        assert s.messages[-1]["duration_ms"] == 4200
+        # Display-only abort metadata must never leak to provider payloads.
+        assert s.get_history()[-1] == {"role": "assistant", "content": ""}
+
+    def test_aborted_tool_turn_keeps_protocol_and_marks_capstone(self) -> None:
+        s = Session(key="t")
+        new_msgs = [
+            {
+                "role": "assistant",
+                "content": "Let me check.",
+                "tool_calls": [_tc("c1", "exec", '{"command":"sleep 60"}')],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "exec",
+                "content": "Stopped by user.",
+            },
+        ]
+        s.extend_with_turn_messages(
+            user_content="run it",
+            new_messages=new_msgs,
+            final_content="Let me check.",
+            aborted=True,
+            duration_ms=800,
+        )
+
+        assert [m["role"] for m in s.messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        assert s.messages[2]["content"] == "Stopped by user."
+        assert s.messages[-1]["content"] == "Let me check."
+        assert s.messages[-1]["aborted"] is True
+
     def test_tool_turn_preserves_full_structure(self) -> None:
         """A single-tool turn must save the full
         assistant_with_tool_calls + tool_result + final_assistant

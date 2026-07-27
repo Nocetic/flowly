@@ -71,18 +71,13 @@ def main(
         return
 
     # Smart entry: provider configured → open TUI, else first-run setup.
-    # Failure to read config (corrupt JSON, fresh install) shouldn't
-    # crash here — fall through to the unconfigured prompt instead of
-    # exploding before the user even sees a message.
-    try:
-        from flowly.config.loader import load_config
-        from flowly.integrations.active_provider import resolve_active_provider
-        cfg = load_config()
-        active = resolve_active_provider(cfg)
-    except Exception:
-        active = None
+    # ``provider_readiness`` is the one shared answer (see
+    # ``flowly/integrations/active_provider.py``) and never raises, so a
+    # corrupt config or a fresh install lands on the setup prompt rather
+    # than a traceback before the user has seen anything.
+    from flowly.integrations.active_provider import provider_readiness
 
-    if active is None:
+    if not provider_readiness().ready:
         from flowly.cli.onboard_cmd import run_onboarding
 
         run_onboarding()
@@ -155,6 +150,9 @@ app.add_typer(memory_app, name="memory")
 
 from flowly.cli.skill_gov_cmd import skill_gov_app
 app.add_typer(skill_gov_app, name="skill")
+
+from flowly.cli.keychain_cmd import keychain_app
+app.add_typer(keychain_app, name="keychain")
 
 
 # ── Standalone commands (registered directly on app) ──────────────
@@ -256,11 +254,37 @@ def update(
 
 @app.command()
 def doctor(
-    fix: bool = typer.Option(False, "--fix", "-f", help="Auto-repair fixable issues"),
+    fix: bool = typer.Option(False, "--fix", "-f", help="Run registered safe repairs"),
+    online: bool = typer.Option(False, "--online", help="Opt in to network/credential probes"),
+    strict: bool = typer.Option(False, "--strict", help="Treat warnings as an unhealthy exit"),
+    json_output: bool = typer.Option(False, "--json", help="Emit one machine-readable JSON line"),
+    category: list[str] | None = typer.Option(
+        None,
+        "--category",
+        "-c",
+        help="Run one diagnostic category (repeatable)",
+    ),
+    timeout: float = typer.Option(5.0, "--timeout", min=0.1, max=120.0),
+    repair: str = typer.Option(
+        "",
+        "--repair",
+        help="Run one named canonical-data recovery action",
+    ),
 ):
-    """Check configuration and runtime health. Use --fix to auto-repair."""
+    """Inspect configuration and runtime health (offline and read-only by default)."""
     from flowly.cli.doctor import run_doctor
-    raise typer.Exit(run_doctor(fix=fix))
+
+    raise typer.Exit(
+        run_doctor(
+            fix=fix,
+            online=online,
+            strict=strict,
+            json_output=json_output,
+            categories=set(category) if category else None,
+            timeout=timeout,
+            repair=repair,
+        )
+    )
 
 
 @app.command()

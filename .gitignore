@@ -35,9 +35,12 @@ path/
 # public OSS repo (guards against an accidental `git add .`).
 .claude/
 .worktrees/
+.codex-worktrees/
 amp
 # Internal feature/roadmap planning notes — keep local, never publish.
 *_PLAN.md
+# Internal audit reports (MEMORY_AUDIT.md, TUI_UX_AUDIT.md, …) — same deal.
+*_AUDIT.md
 
 # Compiled iMessage send helper (built per-platform by helpers/build.sh)
 flowly/channels/helpers/Flowly iMessage Helper.app/

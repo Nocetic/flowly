@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from loguru import logger
-
 from flowly.profile import credential_scope_suffix, get_flowly_home
 
 DEFAULT_ZAI_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
@@ -202,18 +200,14 @@ def _storage_status() -> str:
 
 
 def _try_keyring():
-    marker = get_flowly_home() / "credentials" / ".keychain-broken"
-    if marker.exists():
-        return None
-    try:
-        import keyring  # type: ignore[import-not-found]
-        backend = keyring.get_keyring()
-        module = type(backend).__module__ or ""
-        if "fail" in module or "null" in module:
-            return None
-        return keyring
-    except Exception:
-        return None
+    """Working keyring backend, or None — see ``token_store.available_keyring``.
+
+    This used to be a private copy of that probe, which only *read* the
+    broken-keychain marker and never wrote it: a Mac that refused the
+    keychain here re-opened the blocking OS panel on every single save.
+    """
+    from flowly.account.token_store import available_keyring
+    return available_keyring()
 
 
 def _write_file(raw: dict[str, Any]) -> None:
@@ -243,7 +237,8 @@ def _load_flowly_token_payload() -> ZaiCodingTokenPayload | None:
         try:
             raw_blob = keyring.get_password(_keyring_service(), _KEYRING_ACCOUNT)
         except Exception as exc:
-            logger.warning("Z.AI Coding keyring read failed, falling back to file: {}", exc)
+            from flowly.account.token_store import disable_keyring_for
+            disable_keyring_for("zai get_password", exc, fallback=credentials_path())
             raw_blob = None
         if raw_blob:
             try:
@@ -359,7 +354,8 @@ def save_token_payload(payload: ZaiCodingTokenPayload) -> str:
                 pass
             return _storage_status()
         except Exception as exc:
-            logger.warning("Z.AI Coding keyring write failed, falling back to file: {}", exc)
+            from flowly.account.token_store import disable_keyring_for
+            disable_keyring_for("zai set_password", exc, fallback=credentials_path())
     _write_file(raw)
     return _storage_status()
 

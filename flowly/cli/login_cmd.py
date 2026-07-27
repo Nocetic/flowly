@@ -50,6 +50,7 @@ from flowly.account.health import (
     check_provider_corruption,
     check_relay_state,
 )
+from flowly.integrations.active_provider import provider_readiness
 
 console = Console()
 
@@ -221,6 +222,10 @@ def _login_with_account_key(key: str) -> None:
     try:
         from flowly.integrations import model_catalog
         model_catalog.flush_cache()
+        reconciled = asyncio.run(
+            model_catalog.reconcile_flowly_model(force_refresh=True)
+        )
+        model_changed = reconciled or model_changed
     except Exception:  # noqa: BLE001
         pass
 
@@ -239,6 +244,43 @@ def _mint_and_save_account_key(account) -> bool:
     login modal). Idempotent + best-effort — see ``flowly.account.account_key``."""
     from flowly.account.account_key import ensure_account_key
     return ensure_account_key(account)
+
+
+def _repair_account_credentials(account) -> bool:
+    """Re-issue the account key during ``--repair``.
+
+    ``--repair`` re-registers the machine and rewrites relay config, which
+    are the two things that were *not* broken for a user whose mint failed.
+    The key is the credential the LLM proxy actually authenticates, so a
+    repair that skips it leaves the install exactly as unusable as it found
+    it. Idempotent: an existing key is kept, not replaced.
+    """
+    return _mint_and_save_account_key(account)
+
+
+def _print_provider_verdict() -> bool:
+    """Close the sign-in with what is true, not with what we hoped for.
+
+    Sign-in and provisioning are separate steps against separate endpoints;
+    the first can succeed while the second doesn't. Returns whether Flowly
+    can serve a request now, so callers can pick an exit code.
+    """
+    if provider_readiness().ready:
+        console.print()
+        console.print("  Ready. Run [cyan]flowly[/] to start chatting.\n")
+        return True
+
+    console.print(
+        "\n  [yellow]⚠ Signed in, but the account key hasn't reached this "
+        "machine.[/]\n"
+        "  [dim]Sign-in and key issuing are separate steps — the second one "
+        "didn't land, so there is nothing to bill LLM calls to yet.[/]\n"
+        "  Retry:  [cyan]flowly login[/]            "
+        "[dim]— reissues the key, no browser needed[/]\n"
+        "  Or:     [cyan]flowly setup[/]            "
+        "[dim]— use your own API key instead[/]\n"
+    )
+    return False
 
 
 def login(
@@ -372,12 +414,15 @@ def login(
             console.print()
             console.print("  [dim](dry run — nothing changed)[/]\n")
         else:
+            # The account key is the credential the LLM proxy authenticates.
+            # Repairing server registration and relay config without it fixes
+            # everything except the thing most likely to be broken.
+            _repair_account_credentials(account)
             _print_repair_summary(
                 result,
                 header=f"Account: {account.email or account.user_id}",
             )
-            console.print()
-            console.print("  Ready. Run [cyan]flowly[/] to start chatting.\n")
+            _print_provider_verdict()
         return
 
     # ── Path: already signed in — detect gaps, never mutate ──────
@@ -535,8 +580,9 @@ def login(
         raise typer.Exit(code=1)
 
     # Provider: ALWAYS auto-provision an account key so the user is billed
-    # immediately without ever dealing with keys (Source 0). Best-effort.
-    _mint_and_save_account_key(account)
+    # immediately without ever dealing with keys (Source 0). Best-effort —
+    # the verdict printed at the end reports whether it actually landed.
+    minted = _mint_and_save_account_key(account)
 
     # Reach: remote / phone access via the relay is OPT-IN — it registers a
     # server. Ask interactively unless the caller forced it with
@@ -574,15 +620,24 @@ def login(
             result,
             header=f"Signed in as {account.email or account.user_id}",
         )
-    else:
+    elif minted:
         console.print(
             f"  [green]✓[/] Signed in as [b]{account.email or account.user_id}[/] — "
             "Flowly provider ready, billed to your account (no relay)."
+        )
+    else:
+        console.print(
+            f"  [green]✓[/] Signed in as [b]{account.email or account.user_id}[/]."
         )
 
     console.print(
         f"  [green]✓[/] Tokens saved to {credential_storage_status()}"
     )
-    console.print()
-    console.print("  Ready. Run [cyan]flowly[/] to start chatting.\n")
-    audit_log.info("cli.login.full_flow_success", relay=bool(want_relay))
+    # Exit code stays 0 even when the key didn't land: the sign-in itself
+    # succeeded and the tokens are stored, so failing here would tell every
+    # caller (installers, Desktop, scripts) that login broke when it didn't.
+    # The verdict above is what tells the user what's left to do.
+    ready = _print_provider_verdict()
+    audit_log.info(
+        "cli.login.full_flow_success", relay=bool(want_relay), provider_ready=ready
+    )

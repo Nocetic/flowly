@@ -88,7 +88,7 @@ Tokens are stored in the keychain or `~/.flowly/credentials/xai_oauth.json` (mod
 For a ChatGPT Plus / Pro / Team plan, authenticate with OpenAI's Codex "Sign in with ChatGPT" OAuth (PKCE) flow — no API key, usage is billed against your plan:
 
 ```bash
-flowly codex login          # sets active provider + default model (gpt-5.5)
+flowly codex login          # sets active provider + default model (gpt-5.6-sol)
 flowly codex login --device # headless / no-browser: prints a code to enter at auth.openai.com/codex/device
 flowly codex status         # shows both codex_session tool AND ChatGPT subscription state
 flowly codex logout
@@ -103,7 +103,7 @@ Tokens are stored in the keychain or `~/.flowly/credentials/openai_codex.json` (
 > The `openai_codex` **provider** (this section) and the `codex_session` **tool** ([Codex runtime](../features/codex-runtime.md)) are unrelated features that happen to share the "Codex" name and the `flowly codex` CLI namespace. The provider makes Flowly's *own* agent loop run on GPT-5.x via your ChatGPT plan. The tool *delegates* a coding turn to a separate `codex app-server` subprocess. You can use either, both, or neither.
 
 > [!NOTE]
-> The ChatGPT Codex backend only serves current general-purpose GPT-5.x models (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`) — Codex-suffixed model ids and older versions are rejected. See [Environment variables](../reference/environment-variables.md) to override the default model or the system instructions sent as `instructions`.
+> The `openai_codex` picker reads the signed-in account's live ChatGPT Codex model catalogue. The current default is `gpt-5.6-sol`; the catalogue also exposes other available GPT-5.x variants for the account. See [Environment variables](../reference/environment-variables.md) to override the default model or the system instructions sent as `instructions`.
 
 ## Switching providers and models at runtime
 
@@ -177,7 +177,7 @@ Flowly builds the model picker from a live catalog — each provider's own `/mod
 | `flowly` | Live `GET {base}/models` (plan-filtered with `allowed`/`locked` tags; degrades to OpenRouter on no-account/network/401). |
 | `xai` | Live `GET /v1/models` with your BYOK key. |
 | `xai_oauth` | Live `GET /v1/models` with the OAuth token. |
-| `openai_codex` | Static curated list (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`) — the backend has no `/models` endpoint; access is plan-gated, not catalogued. Only shown once signed in. |
+| `openai_codex` | Live authenticated `GET /models` from the ChatGPT Codex backend, filtered to picker-visible entries and kept in server priority order. Falls back to a curated list on network/schema failure; only shown once signed in. |
 | `anthropic`, `openai`, `gemini`, `groq`, `zhipu` | The [models.dev](https://models.dev) community catalogue — cached locally, filtered to tool-capable models (no per-provider fetcher needed). |
 | `sakana`, `vllm` | No catalog — set the model id directly. |
 

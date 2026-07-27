@@ -66,6 +66,58 @@ class ActiveProvider:
     account_id: str = ""
 
 
+@dataclass(frozen=True)
+class ProviderReadiness:
+    """Can Flowly serve a request right now — and if not, why not?
+
+    ``ready`` is the ONLY question the product should ask when deciding
+    whether setup is finished, whether the gateway may start, and whether
+    bare ``flowly`` opens the chat UI. It used to be asked in two
+    incompatible ways: onboarding accepted "a Flowly account is signed in"
+    while the service manager demanded a resolvable provider. A sign-in
+    whose account-key mint quietly failed satisfies the first and not the
+    second, which told the user they were done and then refused to start.
+
+    ``has_account`` exists so that in-between state stays *nameable*: the
+    user really is signed in, there is just nothing to bill against yet, and
+    saying so beats sending them back through the picker with no explanation.
+    """
+
+    ready: bool
+    provider: ActiveProvider | None
+    has_account: bool
+
+
+def provider_readiness(config: Config | None = None) -> ProviderReadiness:
+    """Resolve the provider once and report it as a readiness verdict.
+
+    Never raises: a fresh machine has no config file, and every caller here
+    sits on a first-run path where an exception would be worse than a
+    "nothing configured yet" answer.
+    """
+    provider: ActiveProvider | None = None
+    try:
+        if config is None:
+            from flowly.config.loader import load_config
+
+            config = load_config()
+        provider = resolve_active_provider(config)
+    except Exception as exc:  # noqa: BLE001 — first-run paths must not crash
+        logger.debug("provider readiness could not resolve a provider: %s", exc)
+
+    has_account = False
+    try:
+        from flowly.account.health import check_token_state
+
+        has_account = check_token_state().has_account
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("provider readiness could not read the account: %s", exc)
+
+    return ProviderReadiness(
+        ready=provider is not None, provider=provider, has_account=has_account
+    )
+
+
 def resolve_active_provider(config: Config) -> ActiveProvider | None:
     """Return the provider that will serve the next LLM request.
 
@@ -307,7 +359,7 @@ DEFAULT_MODELS: dict[str, str] = {
     "sakana": "fugu",                         # Fugu orchestrator (also: fugu-ultra)
     "xai": "grok-4.3",                        # matches model_catalog._XAI_TOP_MODEL
     "xai_oauth": "grok-4.20-reasoning",       # matches DEFAULT_XAI_RESPONSES_MODEL
-    "openai_codex": "gpt-5.5",                # matches DEFAULT_CODEX_MODEL
+    "openai_codex": "gpt-5.6-sol",            # matches DEFAULT_CODEX_MODEL
 }
 
 # Cheap offline "does this model plausibly belong to this provider?" check —
@@ -328,9 +380,9 @@ _MODEL_PREFIX_HINTS: dict[str, tuple[str, ...]] = {
     "sakana": ("fugu",),
     "xai": ("grok",),
     "xai_oauth": ("grok",),
-    # ChatGPT subscription serves the current-generation general GPT-5.x
-    # models (gpt-5.4 / gpt-5.5 families) — not codex-suffixed or older ids.
-    "openai_codex": ("gpt-5.4", "gpt-5.5"),
+    # Match the current family so newly-added GPT-5.x variants from the live
+    # catalogue are not reset while the asynchronous catalogue is warming.
+    "openai_codex": ("gpt-5.",),
 }
 
 
