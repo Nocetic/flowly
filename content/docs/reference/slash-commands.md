@@ -112,6 +112,9 @@ steps, shows you the plan, and runs no side-effecting tool until you approve it.
 Bare `/plan` is a **mode**, not a one-shot: while it's on, every message plans
 first. It's the same mode `Shift+Tab` cycles to (**▣ Plan**), and it works on
 every surface that sends text — the TUI, Desktop, iOS, and chat channels.
+**Approving a plan ends the mode** — the work runs under whatever permission
+level was underneath, and the next message is a normal one. Rejecting or
+revising keeps you planning.
 
 `/plan <task>` is the exception: it forces plan-first for that message only.
 

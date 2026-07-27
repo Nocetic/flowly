@@ -310,6 +310,14 @@ class PlanManager:
             # window) the plan is approved-but-idle until plan.resume runs it.
             plan.status = "executing" if live_turn else "approved"
             plan.touch("approved")
+            # Approval ENDS the standing mode — the same contract Claude
+            # Code's plan mode keeps: plan → approve → execute in whatever
+            # permission level was underneath (which this mode never touched,
+            # so "restoring" it is just revealing it). Staying sticky here
+            # would also wrap the user's next message mid-execution into a
+            # NEW proposal, which supersedes — i.e. aborts — the running
+            # plan. Reject/revise/timeout keep the mode: still planning.
+            self.set_sticky(plan.sessionKey, False)
         elif decision.decision == "reject":
             plan.status = "rejected"
             plan.touch("rejected")

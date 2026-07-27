@@ -169,6 +169,30 @@ async def test_aborted_final_includes_partial_marker_and_duration(channel) -> No
 
 
 @pytest.mark.asyncio
+async def test_final_keeps_message_id_distinct_from_stream_lifecycle_id(channel) -> None:
+    """Relay persistence and live stream correlation use different ids.
+
+    chat.send's idempotency key is also the durable USER document id. Reusing
+    it as the assistant final's ``runId`` would overwrite that user message.
+    The additive ``streamRunId`` closes the correct live bubble while the
+    final keeps its independently generated durable message id.
+    """
+    msg = OutboundMessage(
+        channel="web",
+        chat_id="sess-1",
+        content="Done.",
+        metadata={"stream_run_id": "chat-send-id"},
+    )
+
+    await channel.send(msg)
+
+    data = channel._capture[0]["data"]
+    assert data["state"] == "final"
+    assert data["streamRunId"] == "chat-send-id"
+    assert data["runId"] != data["streamRunId"]
+
+
+@pytest.mark.asyncio
 async def test_cooperative_abort_acks_without_early_terminal_event(channel) -> None:
     stopped: list[str] = []
     channel.set_abort_callback(stopped.append)

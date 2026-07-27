@@ -1230,6 +1230,12 @@ class FlowlyTUI(App[None]):
             return
         composer = self.query_one(Composer)
         status = str(plan.get("status") or "")
+        if status in ("approved", "executing"):
+            # Approval ends the standing mode on the bot (Claude-style: plan →
+            # approve → execute in the level underneath). Re-sync now — even
+            # when the approval came from another device — instead of leaving
+            # the ▣ Plan badge stale until the slow poll.
+            asyncio.create_task(self._sync_permission_badge())
         if status in ("completed", "rejected", "aborted", "blocked"):
             # Terminal — drop the strip + any pending approval for this plan.
             composer.set_plan(None)

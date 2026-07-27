@@ -209,3 +209,48 @@ async def test_propose_caps_goal_and_details(tmp_path: Path):
     )
     assert len(plan.goal) == 2000
     assert len(plan.detailsMd) == 20_000
+
+
+# ── approval ends the standing mode (Claude-style exit) ─────────────────
+# plan → approve → execute under the level underneath. The mode never wrote
+# any exec policy, so "returning to the previous mode" is just revealing it;
+# reject/revise/timeout keep the mode — the user is still planning.
+
+
+@pytest.mark.asyncio
+async def test_approval_ends_the_standing_mode(tmp_path: Path):
+    mgr = _mgr(tmp_path)
+    mgr.set_sticky("web:1", True)
+    asyncio.create_task(_approve_soon(mgr, "web:1"))
+    _plan, decision = await mgr.propose("web:1", "g", _steps(mgr, "A"), timeout_s=5)
+    assert decision.approved
+    assert not mgr.is_sticky("web:1")
+    # Persisted too: a restart must not resurrect the mode.
+    assert not _mgr(tmp_path).is_sticky("web:1")
+
+
+@pytest.mark.asyncio
+async def test_reject_keeps_the_standing_mode(tmp_path: Path):
+    mgr = _mgr(tmp_path)
+    mgr.set_sticky("web:1", True)
+
+    async def _reject_soon():
+        await asyncio.sleep(0.02)
+        cur = mgr.get_current("web:1")
+        await mgr.resolve_approval(
+            cur.id, "reject", expected_revision=cur.approval.revision, decision_id="d"
+        )
+
+    asyncio.create_task(_reject_soon())
+    _plan, decision = await mgr.propose("web:1", "g", _steps(mgr, "A"), timeout_s=5)
+    assert decision.decision == "reject"
+    assert mgr.is_sticky("web:1")
+
+
+@pytest.mark.asyncio
+async def test_timeout_keeps_the_standing_mode(tmp_path: Path):
+    mgr = _mgr(tmp_path)
+    mgr.set_sticky("web:1", True)
+    _plan, decision = await mgr.propose("web:1", "g", _steps(mgr, "A"), timeout_s=0.05)
+    assert decision.decision == "timeout"
+    assert mgr.is_sticky("web:1")
