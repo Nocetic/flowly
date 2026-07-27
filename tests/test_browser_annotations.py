@@ -18,13 +18,15 @@ from flowly.gateway.server import GatewayServer
 
 def _attachment(**overrides):
     manifest = {
-        "version": 1,
+        "version": 2,
+        "sessionId": "session_annotation_123",
         "url": "https://example.com/settings",
         "pageTitle": "Settings",
         "annotations": [
             {
                 "number": 1,
                 "comment": "This button does nothing.",
+                "intent": "fix",
                 "target": {
                     "kind": "element",
                     "tag": "button",
@@ -51,27 +53,91 @@ def _attachment(**overrides):
 def test_extracts_bounded_browser_annotation_context():
     result = extract_browser_annotation_context([_attachment()])
 
-    assert "<browser_annotations>" in result
+    assert '<browser_annotations session="session_annotation_123">' in result
     assert "Page: Settings" in result
     assert "URL: https://example.com/settings" in result
     assert 'Annotation 1: button &quot;Save changes&quot; &lt;button&gt;' in result
     assert "Selected text: Save" in result
     assert "Comment: This button does nothing." in result
+    assert "Intent: fix" in result
     assert 'Selector hint: button[data-testid=&quot;save&quot;]' in result
+    assert (
+        "[Annotation N](https://flowly.local/annotation/session_annotation_123/N)"
+        in result
+    )
 
 
 def test_appends_context_without_losing_user_prompt():
     result = append_browser_annotation_context("Please fix it.", [_attachment()])
 
-    assert result.startswith("Please fix it.\n\n<browser_annotations>")
+    assert result.startswith(
+        'Please fix it.\n\n<browser_annotations session="session_annotation_123">'
+    )
 
 
 def test_ignores_unknown_or_invalid_manifests():
     assert extract_browser_annotation_context([{"kind": "file"}]) == ""
-    assert extract_browser_annotation_context([_attachment(manifest={"version": 2})]) == ""
+    assert extract_browser_annotation_context([_attachment(manifest={"version": 99})]) == ""
     assert extract_browser_annotation_context(
         [_attachment(manifest={"url": "file:///etc/passwd"})]
     ) == ""
+
+
+def test_removes_credentials_query_and_fragment_from_model_visible_url():
+    result = extract_browser_annotation_context(
+        [
+            _attachment(
+                manifest={
+                    "url": (
+                        "https://user:secret@example.com/settings"
+                        "?access_token=private#billing"
+                    )
+                }
+            )
+        ]
+    )
+
+    assert "URL: https://example.com/settings" in result
+    assert "user:secret" not in result
+    assert "access_token" not in result
+    assert "billing" not in result
+
+
+def test_accepts_legacy_v1_manifest_without_reference_link():
+    result = extract_browser_annotation_context(
+        [_attachment(manifest={"version": 1, "sessionId": None})]
+    )
+
+    assert "Annotation 1:" in result
+    assert "flowly.local/annotation/" not in result
+
+
+def test_rejects_an_unaddressable_session_and_bounds_marker_numbers():
+    attachment = _attachment(manifest={"sessionId": "short"})
+    attachment["browserAnnotation"]["annotations"][0]["number"] = 999
+
+    result = extract_browser_annotation_context([attachment])
+
+    assert "Annotation 1:" in result
+    assert "Annotation 999:" not in result
+    assert "flowly.local/annotation/" not in result
+
+
+def test_formats_region_and_defaults_unknown_intent():
+    attachment = _attachment()
+    annotation = attachment["browserAnnotation"]["annotations"][0]
+    annotation["intent"] = "override-system"
+    annotation["target"] = {
+        "kind": "region",
+        "tag": "region",
+        "rects": [{"x": 10, "y": 20, "width": 80, "height": 30}],
+    }
+
+    result = extract_browser_annotation_context([attachment])
+
+    assert "selected page region" in result
+    assert "Intent: note" in result
+    assert "override-system" not in result
 
 
 def test_redacts_sensitive_target_text():
@@ -155,7 +221,7 @@ async def test_direct_gateway_chat_send_delivers_image_and_structured_context(
     await asyncio.wait_for(task, timeout=1)
 
     assert captured["message"].startswith(
-        "Please fix the marked element.\n\n<browser_annotations>"
+        'Please fix the marked element.\n\n<browser_annotations session="session_annotation_123">'
     )
     assert "This button does nothing." in captured["message"]
     assert len(captured["media"]) == 1
@@ -229,7 +295,7 @@ async def test_relay_chat_send_delivers_image_and_structured_context(
         await asyncio.wait_for(processed.wait(), timeout=1)
 
         assert captured["content"].startswith(
-            "Review my notes.\n\n<browser_annotations>"
+            'Review my notes.\n\n<browser_annotations session="session_annotation_123">'
         )
         assert "This button does nothing." in captured["content"]
         assert len(captured["media"]) == 1
