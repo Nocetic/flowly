@@ -45,7 +45,11 @@ from flowly.exec.types import ExecConfig
 from flowly.config.schema import TrelloConfig, VoiceBridgeConfig, XConfig, MemorySearchConfig
 from flowly.audit.logger import get_audit_logger
 from flowly.providers.key_rotator import is_context_overflow
-from flowly.agent.prompt_blocks import detect_model_families
+from flowly.agent.prompt_blocks import (
+    build_render_capability_hint,
+    detect_model_families,
+)
+from flowly.render_capabilities import normalize_render_capabilities
 from flowly.agent.reply_media import extract_reply_media
 from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
@@ -5616,6 +5620,11 @@ class AgentLoop:
         self._inject_recent_artifacts_hint(
             messages, session_key=msg.session_key,
         )
+        self._inject_render_capability_hint(
+            messages,
+            capabilities=msg.metadata.get("render_capabilities"),
+            voice_mode=voice_mode_flag,
+        )
 
         action_turn = self._is_action_turn(msg.channel, msg.content)
         if not action_turn and self._should_promote_retry_to_action(msg.content, history):
@@ -6079,6 +6088,29 @@ class AgentLoop:
         else:
             messages.insert(0, {"role": "system", "content": hint})
 
+    @staticmethod
+    def _inject_render_capability_hint(
+        messages: list[dict[str, Any]],
+        capabilities: Any,
+        *,
+        voice_mode: bool = False,
+    ) -> None:
+        """Add ephemeral renderer guidance after the cacheable main prompt.
+
+        Voice responses intentionally suppress every rich-rendering hint:
+        their output is spoken aloud and must follow the dedicated TTS rules.
+        """
+
+        if voice_mode:
+            return
+        hint = build_render_capability_hint(capabilities)
+        if not hint:
+            return
+        if messages and messages[0].get("role") == "system":
+            messages.insert(1, {"role": "system", "content": hint})
+        else:
+            messages.insert(0, {"role": "system", "content": hint})
+
     def interrupt(self, reason: str = "interrupted", session_key: str | None = None) -> None:
         """Request a cooperative interrupt.
 
@@ -6124,6 +6156,7 @@ class AgentLoop:
         origin_channel: str | None = None,
         origin_chat_id: str | None = None,
         voice_mode: bool = False,
+        render_capabilities: list[str] | tuple[str, ...] | None = None,
         on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         run_id: str | None = None,
     ) -> str | tuple[str, dict[str, Any]]:
@@ -6140,6 +6173,8 @@ class AgentLoop:
                             default. Intended for cron jobs with a per-job model
                             pinned at creation time. Scoped to this call; does
                             not leak to other in-flight requests.
+            render_capabilities: Rich-rendering features advertised by the
+                                 current client for this response.
             run_id: Transport-owned run identifier. When present, Stop requests
                     use the same per-run controller as relay chats.
 
@@ -6175,6 +6210,11 @@ class AgentLoop:
             # sanitize_for_tts on the final response. Default False
             # preserves every text/chat caller's behaviour.
             metadata["voice_mode"] = True
+        normalized_render_capabilities = normalize_render_capabilities(
+            render_capabilities
+        )
+        if normalized_render_capabilities:
+            metadata["render_capabilities"] = normalized_render_capabilities
         # Real (user-facing) delivery coordinates. When session_key is
         # "cron:{job_id}" the derived channel/chat_id aren't deliverable —
         # tools that capture context (spawn, cron, builtin_agent, message,

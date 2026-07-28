@@ -22,8 +22,12 @@ from __future__ import annotations
 import os
 import platform
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
+from flowly.render_capabilities import (
+    MERMAID_RENDER_CAPABILITY,
+    normalize_render_capabilities,
+)
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -1127,6 +1131,48 @@ def build_platform_hint(channel: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-turn client rendering capabilities
+# ---------------------------------------------------------------------------
+
+
+_MERMAID_RENDER_HINT = """\
+# Client rendering capability — Mermaid
+
+This chat surface can render Mermaid diagrams in this response. Use a
+Mermaid diagram when the user explicitly asks for one, or when a diagram
+would make a multi-step flow, architecture, state transition, sequence, or
+relationship materially easier to understand. Do not force a diagram into a
+simple answer.
+
+Put valid Mermaid source in a fenced ``mermaid`` code block. Keep prose,
+context, and caveats outside the fence. Prefer a focused diagram with concise,
+quoted labels over a dense wall of nodes; split a large system into multiple
+diagrams when that improves readability. Prefer stable diagram families such
+as ``flowchart``, ``sequenceDiagram``, ``stateDiagram-v2``, ``classDiagram``,
+and ``erDiagram``. Keep source below 20,000 characters and 500 edges. Add
+``accTitle`` and ``accDescr`` when they can meaningfully describe the diagram.
+
+The renderer uses a strict security policy. Do not emit Mermaid init
+directives, ``click`` / hyperlink actions, raw HTML, or HTML labels. If the
+requested idea cannot be represented reliably in Mermaid, explain it with
+normal Markdown instead of returning knowingly invalid diagram source."""
+
+
+def build_render_capability_hint(capabilities: Any) -> str:
+    """Return per-turn guidance for the capabilities a client advertised.
+
+    This block is injected after the stable system prompt instead of being
+    baked into it, preserving prompt-cache reuse for clients that do not
+    advertise rich rendering.
+    """
+
+    normalized = normalize_render_capabilities(capabilities)
+    if MERMAID_RENDER_CAPABILITY in normalized:
+        return _MERMAID_RENDER_HINT
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Voice mode block (P4 — opt-in via voice_mode=True)
 # ---------------------------------------------------------------------------
 #
@@ -1199,6 +1245,7 @@ __all__ = [
     "build_agency_block",
     "model_needs_strict_discipline",
     "build_voice_mode_block",
+    "build_render_capability_hint",
     "build_model_family_block",
     "detect_model_families",
     "ModelFamily",

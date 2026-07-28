@@ -20,6 +20,7 @@ from flowly.bus.queue import MessageBus
 from flowly.channels.base import BaseChannel
 from flowly.channels import feature_rpc
 from flowly.config.schema import WebChannelConfig
+from flowly.render_capabilities import normalize_render_capabilities
 
 # ─── Transport limits ──────────────────────────────────────────────────────
 #
@@ -929,6 +930,9 @@ class WebChannel(BaseChannel):
                     )
 
             voice_mode = bool(params.get("voiceMode", False))
+            render_capabilities = normalize_render_capabilities(
+                params.get("renderCapabilities")
+            )
 
             # Track mapping so approval events can find the relay session
             self._session_key_to_relay_id[session_key] = session_id
@@ -994,7 +998,16 @@ class WebChannel(BaseChannel):
             # the map the abort handler had nothing to call .cancel()
             # on and the stop button was effectively a no-op.
             task = asyncio.create_task(
-                self._process_message(session_id, session_key, message_text, run_id, stream_callback, media, voice_mode)
+                self._process_message(
+                    session_id,
+                    session_key,
+                    message_text,
+                    run_id,
+                    stream_callback,
+                    media,
+                    voice_mode,
+                    render_capabilities,
+                )
             )
             self._active_tasks[run_id] = task
 
@@ -1187,6 +1200,7 @@ class WebChannel(BaseChannel):
         stream_callback=None,
         media: list[str] | None = None,
         voice_mode: bool = False,
+        render_capabilities: tuple[str, ...] = (),
     ) -> None:
         """Push message to bus and wait for agent response."""
         metadata: dict[str, Any] = {
@@ -1196,6 +1210,8 @@ class WebChannel(BaseChannel):
         }
         if voice_mode:
             metadata["voice_mode"] = True
+        if render_capabilities:
+            metadata["render_capabilities"] = render_capabilities
 
         inbound_with_session = _WebInboundMessage(
             channel="web",

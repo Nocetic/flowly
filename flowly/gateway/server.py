@@ -28,6 +28,7 @@ from flowly.gateway.auth import (
     token_matches,
 )
 from flowly.profile import get_flowly_home
+from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
 
 # Maximum allowed request body size (1MB)
@@ -65,7 +66,8 @@ async def _cors_middleware(request: web.Request, handler: Callable) -> web.Strea
     return response
 
 # Type alias for the chat callback used by the /ws endpoint.
-# Signature: (session_key, message, run_id, stream_callback, media, voice_mode)
+# Signature: (session_key, message, run_id, stream_callback, media, voice_mode,
+#             iteration_callback, render_capabilities)
 #         -> (response_text, metadata)
 # ``metadata`` carries ``usage`` (prompt_tokens / completion_tokens /
 # cache_read_tokens / cache_write_tokens) + the effective ``model`` so
@@ -83,6 +85,7 @@ ChatCallback = Callable[
         list[str],
         bool,
         Callable[[dict], Awaitable[None]] | None,
+        tuple[str, ...],
     ],
     Awaitable[tuple[str, dict]],
 ]
@@ -1969,6 +1972,9 @@ class GatewayServer:
         # `.get(..., False)` is strict-validation-free so an old bot
         # ignores this silently (forward compat already verified).
         voice_mode = bool(params.get("voiceMode", False))
+        render_capabilities = normalize_render_capabilities(
+            params.get("renderCapabilities")
+        )
 
         # Save attachments to disk
         media: list[str] = []
@@ -2001,6 +2007,7 @@ class GatewayServer:
             self._run_chat(
                 ws, client_id, session_key, message, run_id,
                 stream_callback, media, voice_mode, browser_binding,
+                render_capabilities,
             )
         )
         self._active_tasks[run_id] = task
@@ -2017,6 +2024,7 @@ class GatewayServer:
         media: list[str] | None = None,
         voice_mode: bool = False,
         browser_binding: _BrowserRunBinding | None = None,
+        render_capabilities: tuple[str, ...] = (),
     ) -> None:
         """Execute the chat and send final/error events."""
         run_started_at = asyncio.get_running_loop().time()
@@ -2057,7 +2065,7 @@ class GatewayServer:
             assert self.on_chat_message is not None
             result = await self.on_chat_message(
                 session_key, message, run_id, tracking_callback, media or [], voice_mode,
-                iteration_callback,
+                iteration_callback, render_capabilities,
             )
             # Back-compat: older callbacks returned bare text. Detect the
             # tuple form and fall back to ``{}`` metadata otherwise so

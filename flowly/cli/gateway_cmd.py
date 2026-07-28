@@ -1140,6 +1140,7 @@ Respond to the user now:"""
         media: list[str] | None = None,
         voice_mode: bool = False,
         iteration_callback=None,
+        render_capabilities: tuple[str, ...] = (),
     ) -> tuple[str, dict]:
         # Return ``(text, metadata)`` so the gateway can forward usage
         # tokens (prompt/completion/cache) to the TUI's context-window
@@ -1152,6 +1153,7 @@ Respond to the user now:"""
             stream_callback=stream_callback,
             media=media,
             voice_mode=voice_mode,
+            render_capabilities=render_capabilities,
             return_metadata=True,
             on_iteration=iteration_callback,
             run_id=run_id,
