@@ -1205,13 +1205,13 @@ class AgentLoop:
                         current_pin = set_session_cwd(session_key, stored)
                         logger.info(
                             "[Loop] restored session cwd pin from metadata: "
-                            "key=%s cwd=%s",
+                            "key={} cwd={}",
                             session_key, stored,
                         )
                     except ValueError:
                         logger.warning(
                             "[Loop] stored session cwd no longer exists, dropping: "
-                            "key=%s cwd=%s",
+                            "key={} cwd={}",
                             session_key, stored,
                         )
                         metadata.pop("cwd", None)

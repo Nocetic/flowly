@@ -1,6 +1,7 @@
 """Heartbeat service - periodic agent wake-up to check for tasks."""
 
 import asyncio
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -14,12 +15,21 @@ DEFAULT_HEARTBEAT_INTERVAL_S = 30 * 60
 # Token that indicates "nothing to do"
 HEARTBEAT_OK_TOKEN = "HEARTBEAT_OK"
 
+_HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
+_MARKDOWN_HEADING_RE = re.compile(r"^\s*(#{1,6})\s+(.+?)\s*#*\s*$")
+_CHECKED_TASK_RE = re.compile(r"^\s*[-*+]\s+\[[xX]\](?:\s+.*)?$")
+_EMPTY_TASK_MARKER_RE = re.compile(
+    r"^\s*(?:[-*+](?:\s+\[\s*\])?|(?:\d+[.)]))\s*$"
+)
 
-def _build_heartbeat_prompt(deliver: bool) -> str:
+
+def _build_heartbeat_prompt(deliver: bool, tasks: str) -> str:
     """Build the heartbeat prompt sent to the agent."""
     base = (
-        "Read HEARTBEAT.md in your workspace (if it exists).\n"
-        "Follow any instructions or tasks listed there."
+        "The following periodic tasks were loaded from HEARTBEAT.md in your "
+        "workspace.\n\n"
+        f"{tasks.strip()}\n\n"
+        "Follow these task instructions."
     )
     if deliver:
         return (
@@ -30,18 +40,84 @@ def _build_heartbeat_prompt(deliver: bool) -> str:
     return base + f"\nIf nothing needs attention, reply with just: {HEARTBEAT_OK_TOKEN}"
 
 
+def _parse_markdown_heading(line: str) -> tuple[int, str] | None:
+    """Return ``(level, normalized title)`` for an ATX Markdown heading."""
+    match = _MARKDOWN_HEADING_RE.match(line)
+    if not match:
+        return None
+    return len(match.group(1)), match.group(2).strip().casefold()
+
+
+def _extract_heartbeat_tasks(content: str | None) -> str:
+    """Extract actionable task content while preserving legacy free-form files.
+
+    The bundled template has an ``Active Tasks`` section followed by
+    ``Completed``.  When that section exists, only its body is considered;
+    explanatory prose elsewhere in the template cannot wake the agent.
+    Files created before the sectioned template remain supported by treating
+    their whole pre-``Completed`` body as the task area.
+
+    HTML comments, checked tasks, headings, and empty task markers do not make
+    a file actionable.  Unchecked checkboxes, bullets, numbered items, and
+    free-form instructions all remain valid task formats.
+    """
+    if not content:
+        return ""
+
+    # Remove complete and unterminated HTML comments.  The latter matters for
+    # partially edited files: comment text must never become an accidental task.
+    lines = _HTML_COMMENT_RE.sub("", content).splitlines()
+
+    active_start: int | None = None
+    active_level: int | None = None
+    for index, line in enumerate(lines):
+        heading = _parse_markdown_heading(line)
+        if heading and heading[1] == "active tasks":
+            active_start = index + 1
+            active_level = heading[0]
+            break
+
+    scoped: list[str] = []
+    if active_start is not None and active_level is not None:
+        for line in lines[active_start:]:
+            heading = _parse_markdown_heading(line)
+            if heading and heading[0] <= active_level:
+                break
+            scoped.append(line)
+    else:
+        # Legacy files had no formal Active Tasks section.  Preserve their
+        # free-form behavior, but do not resurrect entries under Completed.
+        for line in lines:
+            heading = _parse_markdown_heading(line)
+            if heading and heading[1] in {"completed", "completed tasks"}:
+                break
+            scoped.append(line)
+
+    visible: list[str] = []
+    has_actionable_content = False
+    for line in scoped:
+        stripped = line.strip()
+        if not stripped:
+            visible.append("")
+            continue
+        if _parse_markdown_heading(line):
+            # Keep subheadings as useful grouping context when a real task
+            # follows, but a heading by itself must not wake the agent.
+            visible.append(line.rstrip())
+            continue
+        if _CHECKED_TASK_RE.match(line) or _EMPTY_TASK_MARKER_RE.match(line):
+            continue
+        visible.append(line.rstrip())
+        has_actionable_content = True
+
+    if not has_actionable_content:
+        return ""
+    return "\n".join(visible).strip()
+
+
 def _is_heartbeat_empty(content: str | None) -> bool:
     """Check if HEARTBEAT.md has no actionable content."""
-    if not content:
-        return True
-
-    skip_patterns = {"- [ ]", "* [ ]", "- [x]", "* [x]"}
-    for line in content.split("\n"):
-        line = line.strip()
-        if not line or line.startswith("#") or line.startswith("<!--") or line in skip_patterns:
-            continue
-        return False
-    return True
+    return not _extract_heartbeat_tasks(content)
 
 
 def _is_within_active_hours(start: str, end: str, timezone: str) -> bool:
@@ -163,8 +239,8 @@ class HeartbeatService:
             logger.debug("Heartbeat: skipped (outside active hours)")
             return
 
-        content = self._read_heartbeat_file()
-        if _is_heartbeat_empty(content):
+        tasks = _extract_heartbeat_tasks(self._read_heartbeat_file())
+        if not tasks:
             logger.debug("Heartbeat: no tasks (HEARTBEAT.md empty)")
             return
 
@@ -174,7 +250,7 @@ class HeartbeatService:
 
         try:
             deliver = self.deliver == "message_tool"
-            prompt = _build_heartbeat_prompt(deliver=deliver)
+            prompt = _build_heartbeat_prompt(deliver=deliver, tasks=tasks)
             response = await self.on_heartbeat(prompt)
 
             if HEARTBEAT_OK_TOKEN in response.upper():
@@ -188,6 +264,9 @@ class HeartbeatService:
         """Manually trigger a heartbeat tick."""
         if not self.on_heartbeat:
             return None
+        tasks = _extract_heartbeat_tasks(self._read_heartbeat_file())
+        if not tasks:
+            return HEARTBEAT_OK_TOKEN
         deliver = self.deliver == "message_tool"
-        prompt = _build_heartbeat_prompt(deliver=deliver)
+        prompt = _build_heartbeat_prompt(deliver=deliver, tasks=tasks)
         return await self.on_heartbeat(prompt)
