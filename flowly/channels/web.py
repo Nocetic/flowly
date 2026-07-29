@@ -34,10 +34,10 @@ from flowly.render_capabilities import normalize_render_capabilities
 # Anthropic vision (5 MB per image) ceilings.
 _WS_MAX_SIZE = 15 * 1024 * 1024
 _IMAGE_TARGET_BYTES = 800 * 1024  # 800 KB raw JPEG before base64
-_IMAGE_MAX_DIMENSION = 1280       # px on the longest edge
+_IMAGE_MAX_DIMENSION = 1280  # px on the longest edge
 _IMAGE_INITIAL_QUALITY = 75
 _IMAGE_MIN_QUALITY = 40
-_OUTBOUND_QUEUE_LIMIT = 50        # cap pending replays to avoid unbounded growth
+_OUTBOUND_QUEUE_LIMIT = 50  # cap pending replays to avoid unbounded growth
 
 LocalEventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 
@@ -54,6 +54,7 @@ def _build_ssl_context() -> ssl.SSLContext | None:
     """
     try:
         import certifi
+
         return ssl.create_default_context(cafile=certifi.where())
     except Exception as exc:
         logger.warning(f"[WebChannel] Failed to build certifi SSL context: {exc}")
@@ -373,16 +374,15 @@ class WebChannel(BaseChannel):
                     "content": iter_event.get("content", ""),
                     **(
                         {"tool_calls": iter_event["tool_calls"]}
-                        if iter_event.get("tool_calls") else {}
+                        if iter_event.get("tool_calls")
+                        else {}
                     ),
                     **(
                         {"tool_call_id": iter_event["tool_call_id"]}
-                        if iter_event.get("tool_call_id") else {}
+                        if iter_event.get("tool_call_id")
+                        else {}
                     ),
-                    **(
-                        {"name": iter_event["name"]}
-                        if iter_event.get("name") else {}
-                    ),
+                    **({"name": iter_event["name"]} if iter_event.get("name") else {}),
                 },
             }
             await self._send_or_queue(json.dumps(event_msg))
@@ -413,14 +413,16 @@ class WebChannel(BaseChannel):
                     continue
                 jpeg_bytes, jpeg_mime = compressed
                 data = base64.b64encode(jpeg_bytes).decode("ascii")
-                content_blocks.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": jpeg_mime,
-                        "data": data,
-                    },
-                })
+                content_blocks.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": jpeg_mime,
+                            "data": data,
+                        },
+                    }
+                )
                 raw_kb = p.stat().st_size / 1024
                 sent_kb = len(jpeg_bytes) / 1024
                 if sent_kb < raw_kb * 0.9:
@@ -768,7 +770,9 @@ class WebChannel(BaseChannel):
             # Use jwt_secret from config, fallback to auth_token
             jwt_secret = self.config.jwt_secret or self.config.auth_token or ""
         if not jwt_secret:
-            logger.warning("[WebChannel] No JWT secret configured — set MOLTBOT_PROXY_JWT_SECRET env var")
+            logger.warning(
+                "[WebChannel] No JWT secret configured — set MOLTBOT_PROXY_JWT_SECRET env var"
+            )
 
         # Build agent JWT
         now = int(time.time())
@@ -806,16 +810,49 @@ class WebChannel(BaseChannel):
             # against a stale outbound one.
             await self._flush_outbound_queue()
 
-            async for raw in ws:
-                if not self._running:
-                    break
-                try:
-                    msg = json.loads(raw)
-                    await self._handle_relay_message(ws, msg)
-                except json.JSONDecodeError:
-                    logger.warning("[WebChannel] Invalid JSON from relay")
-                except Exception as e:
-                    logger.error(f"[WebChannel] Error handling relay message: {e}")
+            long_rpc_tasks: set[asyncio.Task[None]] = set()
+
+            def _long_rpc_done(task: asyncio.Task[None]) -> None:
+                long_rpc_tasks.discard(task)
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    logger.warning(
+                        "[WebChannel] background feature RPC failed: %s",
+                        type(exc).__name__,
+                    )
+
+            try:
+                async for raw in ws:
+                    if not self._running:
+                        break
+                    try:
+                        msg = json.loads(raw)
+                        if (
+                            msg.get("type") == "rpc"
+                            and msg.get("method") in feature_rpc.LONG_RUNNING_METHODS
+                        ):
+                            # Keep receiving relay pings and other sessions'
+                            # traffic while a browser OAuth flow is pending.
+                            task = asyncio.create_task(
+                                self._handle_relay_message(ws, msg),
+                                name=f"relay-feature-rpc-{msg.get('method')}",
+                            )
+                            long_rpc_tasks.add(task)
+                            task.add_done_callback(_long_rpc_done)
+                        else:
+                            await self._handle_relay_message(ws, msg)
+                    except json.JSONDecodeError:
+                        logger.warning("[WebChannel] Invalid JSON from relay")
+                    except Exception as e:
+                        logger.error(f"[WebChannel] Error handling relay message: {e}")
+            finally:
+                pending_long_rpcs = tuple(long_rpc_tasks)
+                for task in pending_long_rpcs:
+                    task.cancel()
+                if pending_long_rpcs:
+                    await asyncio.gather(*pending_long_rpcs, return_exceptions=True)
 
         self._ws = None
 
@@ -827,7 +864,9 @@ class WebChannel(BaseChannel):
             cron_session_id = msg.get("cronSessionId")
             if cron_session_id:
                 self._cron_session_id = cron_session_id
-                logger.info(f"[WebChannel] Relay confirmed agent ready — cronSessionId={cron_session_id[:8]}")
+                logger.info(
+                    f"[WebChannel] Relay confirmed agent ready — cronSessionId={cron_session_id[:8]}"
+                )
             else:
                 logger.info("[WebChannel] Relay confirmed agent ready (no cronSessionId)")
             if self._on_ready:
@@ -864,9 +903,7 @@ class WebChannel(BaseChannel):
             # cron.register.failed etc.) are still surfaced by the
             # unhandled branch below.
             job_name = msg.get("job", {}).get("name") or msg.get("name") or "?"
-            logger.debug(
-                f"[WebChannel] Relay {msg_type}: '{job_name}' synced to Firestore"
-            )
+            logger.debug(f"[WebChannel] Relay {msg_type}: '{job_name}' synced to Firestore")
 
         else:
             logger.debug(f"[WebChannel] Unhandled relay message type: {msg_type}")
@@ -909,6 +946,7 @@ class WebChannel(BaseChannel):
             cwd = params.get("cwd")
             if cwd:
                 from flowly.runtime_cwd import set_session_cwd
+
                 try:
                     set_session_cwd(session_key, cwd)
                     logger.info(
@@ -930,9 +968,7 @@ class WebChannel(BaseChannel):
                     )
 
             voice_mode = bool(params.get("voiceMode", False))
-            render_capabilities = normalize_render_capabilities(
-                params.get("renderCapabilities")
-            )
+            render_capabilities = normalize_render_capabilities(params.get("renderCapabilities"))
 
             # Track mapping so approval events can find the relay session
             self._session_key_to_relay_id[session_key] = session_id
@@ -964,6 +1000,7 @@ class WebChannel(BaseChannel):
             # (GatewayServer._run_chat); previously only the gateway fed this,
             # so relay/cloud chats had no resume.
             from flowly.agent import inflight
+
             inflight.begin(session_key, run_id, message_text)
 
             # Build streaming callback — sends delta events to this browser session.
@@ -977,20 +1014,29 @@ class WebChannel(BaseChannel):
                     "source": "relay",
                     "delta": delta,
                 }
-                await ws.send(json.dumps({
-                    "type": "event",
-                    "sessionId": session_id,
-                    "event": "chat",
-                    "data": {"state": "streaming", "runId": run_id, "delta": delta},
-                }))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "event",
+                            "sessionId": session_id,
+                            "event": "chat",
+                            "data": {"state": "streaming", "runId": run_id, "delta": delta},
+                        }
+                    )
+                )
                 asyncio.create_task(self._emit_local_event("chat", local_stream_data))
-                asyncio.create_task(self._emit_local_event("agent", {
-                    "stream": "assistant",
-                    "runId": run_id,
-                    "sessionKey": session_key,
-                    "source": "relay",
-                    "data": {"text": delta},
-                }))
+                asyncio.create_task(
+                    self._emit_local_event(
+                        "agent",
+                        {
+                            "stream": "assistant",
+                            "runId": run_id,
+                            "sessionKey": session_key,
+                            "source": "relay",
+                            "data": {"text": delta},
+                        },
+                    )
+                )
 
             # Process message asynchronously (don't block the recv loop).
             # Tracking the Task by run_id is what makes chat.abort
@@ -1052,9 +1098,7 @@ class WebChannel(BaseChannel):
                         f"[WebChannel] chat.abort marked run_id={run_id} for cooperative interrupt"
                     )
                 except Exception:
-                    logger.exception(
-                        f"[WebChannel] abort_callback failed for run_id={run_id}"
-                    )
+                    logger.exception(f"[WebChannel] abort_callback failed for run_id={run_id}")
             else:
                 logger.warning(
                     f"[WebChannel] chat.abort: no abort_callback registered "
@@ -1069,7 +1113,9 @@ class WebChannel(BaseChannel):
             # "aborted" event here used to make clients clear the run id/tool
             # panel before that final arrived.
             ack = {
-                "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                "type": "rpc",
+                "id": rpc_id,
+                "sessionId": session_id,
                 "result": {"ok": True, "cancelled": True},
             }
             await ws.send(json.dumps(ack))
@@ -1078,12 +1124,16 @@ class WebChannel(BaseChannel):
                 # produce the authoritative partial final. Preserve its old
                 # terminal event so existing clients do not remain busy
                 # forever; current bots always use the cooperative path.
-                await ws.send(json.dumps({
-                    "type": "event",
-                    "sessionId": session_id,
-                    "event": "chat",
-                    "data": {"state": "aborted", "runId": run_id},
-                }))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "event",
+                            "sessionId": session_id,
+                            "event": "chat",
+                            "data": {"state": "aborted", "runId": run_id},
+                        }
+                    )
+                )
 
         elif method == "chat.history":
             # History is managed by Firestore on the client side — return empty
@@ -1100,11 +1150,17 @@ class WebChannel(BaseChannel):
             decision = params.get("decision", "")
             if decision in ("allow-once", "allow-always", "deny"):
                 from flowly.exec.approval_manager import get_approval_manager
+
                 manager = get_approval_manager()
                 ok = manager.resolve(approval_id, decision)
                 ack = {"type": "rpc", "id": rpc_id, "sessionId": session_id, "result": {"ok": ok}}
             else:
-                ack = {"type": "rpc", "id": rpc_id, "sessionId": session_id, "error": {"code": "INVALID", "message": "Invalid decision"}}
+                ack = {
+                    "type": "rpc",
+                    "id": rpc_id,
+                    "sessionId": session_id,
+                    "error": {"code": "INVALID", "message": "Invalid decision"},
+                }
             await ws.send(json.dumps(ack))
 
         elif method == "agent.clarify.resolve":
@@ -1112,11 +1168,17 @@ class WebChannel(BaseChannel):
             answer = params.get("answer", "")
             if clarify_id and isinstance(answer, str):
                 from flowly.clarify.manager import get_clarify_manager
+
                 manager = get_clarify_manager()
                 ok = manager.resolve(clarify_id, answer)
                 ack = {"type": "rpc", "id": rpc_id, "sessionId": session_id, "result": {"ok": ok}}
             else:
-                ack = {"type": "rpc", "id": rpc_id, "sessionId": session_id, "error": {"code": "INVALID", "message": "Invalid clarify resolve"}}
+                ack = {
+                    "type": "rpc",
+                    "id": rpc_id,
+                    "sessionId": session_id,
+                    "error": {"code": "INVALID", "message": "Invalid clarify resolve"},
+                }
             await ws.send(json.dumps(ack))
 
         elif method == "commands.list":
@@ -1126,6 +1188,7 @@ class WebChannel(BaseChannel):
             # handles the relay path where the web/iOS client talks
             # to the bot through ``wss://relay.useflowlyapp.com``.
             from flowly.agent.skill_bundles import build_commands_catalogue
+
             ack = {
                 "type": "rpc",
                 "id": rpc_id,
@@ -1160,35 +1223,56 @@ class WebChannel(BaseChannel):
         try:
             result, needs_restart = await feature_rpc.dispatch(method, params)
         except feature_rpc.FeatureRpcError as e:
-            await ws.send(json.dumps({
-                "type": "rpc", "id": rpc_id, "sessionId": session_id,
-                "error": {"code": e.code, "message": e.message},
-            }))
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "rpc",
+                        "id": rpc_id,
+                        "sessionId": session_id,
+                        "error": {"code": e.code, "message": e.message},
+                    }
+                )
+            )
             return
         except Exception as e:
             logger.exception(f"[WebChannel] feature rpc {method} failed")
-            await ws.send(json.dumps({
-                "type": "rpc", "id": rpc_id, "sessionId": session_id,
-                "error": {"code": "INTERNAL", "message": str(e)},
-            }))
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "rpc",
+                        "id": rpc_id,
+                        "sessionId": session_id,
+                        "error": {"code": "INTERNAL", "message": str(e)},
+                    }
+                )
+            )
             return
-        await ws.send(json.dumps({
-            "type": "rpc", "id": rpc_id, "sessionId": session_id,
-            "result": result,
-        }))
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "rpc",
+                    "id": rpc_id,
+                    "sessionId": session_id,
+                    "result": result,
+                }
+            )
+        )
         if needs_restart:
             self._schedule_feature_restart()
 
     def _schedule_feature_restart(self) -> None:
         """Bounce the gateway after the ACK frame has flushed, so a config/
         channel change takes effect without cutting the reply mid-flight."""
+
         async def _run() -> None:
             await asyncio.sleep(0.5)
             try:
                 from flowly.integrations.service_control import restart_gateway
+
                 await restart_gateway()
             except Exception:
                 logger.exception("[WebChannel] feature restart failed")
+
         asyncio.create_task(_run())
 
     async def _process_message(

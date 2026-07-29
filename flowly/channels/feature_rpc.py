@@ -57,6 +57,7 @@ class FeatureRpcError(Exception):
 
 # ── Shared on-disk locations ────────────────────────────────────────────────
 
+
 def workspace_dir() -> Path:
     """Workspace root on the bot host (``~/.flowly/workspace``)."""
     return get_flowly_home() / "workspace"
@@ -82,6 +83,7 @@ def state_db(filename: str) -> Path:
 
 
 # ── Connections (integration cards: channels / tools / voice / media) ───────
+
 
 async def connections_list() -> dict:
     """List integration cards with masked PASSWORD fields + live probe status."""
@@ -109,26 +111,31 @@ async def connections_list() -> dict:
                 probe_detail = probe.detail
             except Exception:
                 probe_status = None
-        out.append({
-            "key": card.key,
-            "label": card.label,
-            "category": card.category,
-            "enabled": bool(values.get("enabled", False)),
-            "connected": probe_status == "ok",
-            "probeStatus": probe_status or "unknown",
-            "probeDetail": probe_detail,
-            "values": masked,
-            "fields": [{
-                "key": f.key,
-                "label": f.label,
-                "type": f.type.value,
-                "required": f.required,
-                "placeholder": f.placeholder,
-                "help": f.help,
-                "choices": f.choices,
-            } for f in card.fields],
-            "needsRestart": card.needs_gateway_restart,
-        })
+        out.append(
+            {
+                "key": card.key,
+                "label": card.label,
+                "category": card.category,
+                "enabled": bool(values.get("enabled", False)),
+                "connected": probe_status == "ok",
+                "probeStatus": probe_status or "unknown",
+                "probeDetail": probe_detail,
+                "values": masked,
+                "fields": [
+                    {
+                        "key": f.key,
+                        "label": f.label,
+                        "type": f.type.value,
+                        "required": f.required,
+                        "placeholder": f.placeholder,
+                        "help": f.help,
+                        "choices": f.choices,
+                    }
+                    for f in card.fields
+                ],
+                "needsRestart": card.needs_gateway_restart,
+            }
+        )
     return {"connections": out}
 
 
@@ -137,7 +144,10 @@ def connections_set(params: dict) -> dict:
     ``{"ok": True, "willRestart": bool}`` — the caller schedules the restart."""
     from flowly.integrations.registry import get_card
     from flowly.integrations.config_io import (
-        CardValidationError, read_card_values, apply_card_values, clear_card,
+        CardValidationError,
+        read_card_values,
+        apply_card_values,
+        clear_card,
     )
 
     key = params.get("key", "")
@@ -170,6 +180,7 @@ def connections_set(params: dict) -> dict:
 # primitives the TUI /mcp modal uses). Changes to mcpServers take effect at the
 # next agent boot, so mutations are restart-aware like connections.set.
 
+
 def _mcp_entry_dict(e) -> dict:
     """Serialise an ``MCPServerEntry`` for the wire (camelCase)."""
     return {
@@ -195,6 +206,7 @@ def _mcp_entry_dict(e) -> dict:
 def mcp_list() -> dict:
     """Configured MCP servers + installable catalog entries (same as TUI /mcp)."""
     from flowly.integrations.mcp_io import list_mcp_servers
+
     return {"servers": [_mcp_entry_dict(e) for e in list_mcp_servers()]}
 
 
@@ -255,7 +267,7 @@ def mcp_install(params: dict) -> dict:
     }
 
 
-def mcp_test(params: dict) -> dict:
+async def mcp_test(params: dict) -> dict:
     """Connect once and report tools — for a saved server (by ``name``) or an
     unsaved config (``config``, pre-save validation). Never restarts."""
     name = (params.get("name") or "").strip()
@@ -265,21 +277,36 @@ def mcp_test(params: dict) -> dict:
     if config:
         from flowly.config.loader import convert_keys
         from flowly.config.schema import MCPServerConfig
-        from flowly.mcp.probe import probe_tool_names
+        from flowly.mcp.probe import probe_tool_names_async
+
         try:
             dump = MCPServerConfig(**convert_keys(config)).model_dump()
         except Exception as exc:
             raise FeatureRpcError("INVALID", f"invalid server config: {exc}")
-        ok, tools, error = probe_tool_names(name or "test", dump, interactive=interactive)
+        ok, tools, error = await probe_tool_names_async(
+            name or "test",
+            dump,
+            interactive=interactive,
+        )
     elif name:
-        from flowly.integrations.mcp_io import probe_mcp_server
-        ok, tools, error = probe_mcp_server(name, interactive=interactive)
+        from flowly.integrations.mcp_io import _server_config_dump
+        from flowly.mcp.probe import probe_tool_names_async
+
+        dump = _server_config_dump(name)
+        if dump is None:
+            ok, tools, error = False, [], f"unknown MCP server {name!r}"
+        else:
+            ok, tools, error = await probe_tool_names_async(
+                name,
+                dump,
+                interactive=interactive,
+            )
     else:
         raise FeatureRpcError("INVALID", "name or config is required")
     return {"ok": ok, "tools": tools, "error": error}
 
 
-def mcp_oauth_start(params: dict) -> dict:
+async def mcp_oauth_start(params: dict) -> dict:
     """Run the OAuth browser flow for an OAuth-configured server on the bot host.
 
     Clears cached tokens first, then connects interactively (opens the browser
@@ -289,6 +316,7 @@ def mcp_oauth_start(params: dict) -> dict:
     with the fresh grant.
     """
     from flowly.integrations.mcp_io import _server_config_dump
+
     name = (params.get("name") or "").strip()
     if not name:
         raise FeatureRpcError("INVALID", "name is required")
@@ -301,26 +329,52 @@ def mcp_oauth_start(params: dict) -> dict:
         raise FeatureRpcError("INVALID", f"{name} is not configured for OAuth (auth: oauth)")
 
     try:
-        from flowly.mcp.oauth import clear_tokens, oauth_available
+        from flowly.mcp.oauth import (
+            backup_tokens,
+            clear_tokens,
+            oauth_available,
+            restore_tokens,
+        )
     except Exception as exc:
         raise FeatureRpcError("UNAVAILABLE", f"OAuth runtime not importable: {exc}")
     if not oauth_available():
         raise FeatureRpcError("UNAVAILABLE", "this 'mcp' SDK build lacks OAuth support")
 
-    clear_tokens(name)
-    from flowly.mcp.probe import probe_message
-    ok, message = probe_message(name, dump, interactive=True)
+    backup = backup_tokens(name)
+    if backup is None:
+        raise FeatureRpcError(
+            "UNAVAILABLE",
+            f"could not back up existing OAuth credentials for {name}",
+        )
+    cleared = clear_tokens(name)
+    if backup[0] and not cleared:
+        raise FeatureRpcError(
+            "UNAVAILABLE",
+            f"could not clear existing OAuth credentials for {name}",
+        )
+    from flowly.mcp.probe import probe_message_async
+
+    try:
+        ok, message = await probe_message_async(name, dump, interactive=True)
+    except BaseException:
+        restore_tokens(name, backup)
+        raise
     if not ok:
+        restored = restore_tokens(name, backup)
+        if not restored:
+            message += "; previous OAuth credentials could not be restored"
         raise FeatureRpcError("AUTH_FAILED", message)
     return {"ok": True, "message": message, "willRestart": bool(params.get("restart", True))}
 
 
 # ── Config (raw config.json, deep-merge patch) ──────────────────────────────
 
+
 def config_get() -> dict:
     """Return the raw config.json — same shape the desktop reads locally."""
     from flowly.config.loader import get_config_path
     from flowly.integrations.config_io import _load_raw_or_empty
+
     # Tolerate a transiently malformed config.json (the loader self-heals from
     # the same state via .bak) — never crash the remote Settings load.
     return {"config": _load_raw_or_empty(get_config_path())}
@@ -358,12 +412,14 @@ def config_set(params: dict) -> dict:
 
 # ── Pet (Petdex floating companion) ─────────────────────────────────────────
 
+
 def _pet_err(exc: Exception) -> FeatureRpcError:
     return FeatureRpcError(getattr(exc, "code", "PET_ERROR"), getattr(exc, "message", str(exc)))
 
 
 def pet_info(params: dict) -> dict:
     from flowly.pet import service
+
     try:
         return service.get_info()
     except service.PetServiceError as exc:
@@ -372,6 +428,7 @@ def pet_info(params: dict) -> dict:
 
 async def pet_gallery(params: dict) -> dict:
     from flowly.pet import service
+
     try:
         return await service.get_gallery()
     except service.PetServiceError as exc:
@@ -380,6 +437,7 @@ async def pet_gallery(params: dict) -> dict:
 
 async def pet_select(params: dict) -> dict:
     from flowly.pet import service
+
     slug = (params.get("slug") or "").strip()
     if not slug:
         raise FeatureRpcError("INVALID", "slug is required")
@@ -391,11 +449,13 @@ async def pet_select(params: dict) -> dict:
 
 def pet_disable(params: dict) -> dict:
     from flowly.pet import service
+
     return service.disable()
 
 
 def pet_scale(params: dict) -> dict:
     from flowly.pet import service
+
     if "scale" not in params:
         raise FeatureRpcError("INVALID", "scale is required")
     try:
@@ -406,6 +466,7 @@ def pet_scale(params: dict) -> dict:
 
 async def pet_thumb(params: dict) -> dict:
     from flowly.pet import service
+
     slug = (params.get("slug") or "").strip()
     if not slug:
         raise FeatureRpcError("INVALID", "slug is required")
@@ -417,6 +478,7 @@ async def pet_thumb(params: dict) -> dict:
 
 # ── Memory (entries + USER.md) ──────────────────────────────────────────────
 
+
 def chat_inflight(params: dict) -> dict:
     """Partial text of a still-streaming run for this session, or null.
 
@@ -426,6 +488,7 @@ def chat_inflight(params: dict) -> dict:
     the same key the client tags its chat.send with.
     """
     from flowly.agent.inflight import get as _inflight_get
+
     session_key = (params.get("sessionKey") or "").strip()
     cur = _inflight_get(session_key) if session_key else None
     result: dict = {"inflight": cur}
@@ -592,10 +655,12 @@ def memory_update_user(params: dict) -> dict:
 
 # ── Memory governance (review queue / stats / accept / reject / …) ──────────
 
+
 def _open_memory_gov():
     from flowly.memory.governance import GovernanceStore
     from flowly.memory.coordinator import MemoryGovernance
     from flowly.agent.memory import MemoryStore
+
     gov = GovernanceStore(state_db("memory_governance.sqlite3"))
     return MemoryGovernance(gov, memory_store=MemoryStore(workspace_dir()))
 
@@ -603,6 +668,7 @@ def _open_memory_gov():
 def _obsidian_cfg():
     """Return the resolved ObsidianConfig from config.json, or None."""
     from flowly.config.loader import load_config
+
     cfg = load_config()
     return getattr(getattr(cfg, "integrations", None), "obsidian", None)
 
@@ -630,7 +696,12 @@ def obsidian_rpc(action: str, params: dict) -> dict:
         try:
             root = rt.root()
         except VaultPermissionDenied as exc:
-            return {"configured": False, "enabled": True, "permissionDenied": True, "detail": str(exc)}
+            return {
+                "configured": False,
+                "enabled": True,
+                "permissionDenied": True,
+                "detail": str(exc),
+            }
         except VaultNotConfigured as exc:
             return {"configured": False, "enabled": True, "detail": str(exc)}
         return {"configured": True, "enabled": True, "vaultPath": str(root)}
@@ -665,7 +736,9 @@ def memory_gov(action: str, params: dict) -> dict:
         # list_items returns every status (incl. rejected/superseded), which made
         # a deleted (rejected) item linger in the panel — "delete didn't work".
         # The review queue (needs_review) is fetched separately via memory.review.
-        return {"items": [i.to_dict() for i in mg.list_items(status=params.get("status") or "active")]}
+        return {
+            "items": [i.to_dict() for i in mg.list_items(status=params.get("status") or "active")]
+        }
     if action == "review":
         return {"items": [i.to_dict() for i in mg.review_queue()]}
     if action == "stats":
@@ -691,7 +764,9 @@ def memory_gov(action: str, params: dict) -> dict:
         if not item_id:
             raise FeatureRpcError("INVALID", "id required")
         item = mg.ingest_feedback(
-            item_id, bool(params.get("helpful", False)), params.get("note", ""),
+            item_id,
+            bool(params.get("helpful", False)),
+            params.get("note", ""),
         )
         return {"item": item.to_dict() if item else None}
     raise FeatureRpcError("INVALID", f"unknown memory action: {action}")
@@ -726,12 +801,14 @@ def _consolidate_run(dry_run: bool) -> dict:
             return ""
         try:
             from flowly.memory.knowledge_graph import KnowledgeGraph
+
             return KnowledgeGraph(str(kg_path)).summary(max_entities=20)
         except Exception:
             return ""
 
     def _propose(ctx: dict):
         from flowly.providers.factory import build_provider
+
         provider = build_provider(ap, default_model=model, config=config)
         prompt = PROMPT.replace("{context}", json.dumps(ctx, ensure_ascii=False, indent=2))
 
@@ -739,7 +816,9 @@ def _consolidate_run(dry_run: bool) -> dict:
             parts: list[str] = []
             async for delta in provider.chat_stream(
                 [{"role": "user", "content": prompt}],
-                model=model, max_tokens=2048, temperature=0.1,
+                model=model,
+                max_tokens=2048,
+                temperature=0.1,
             ):
                 if delta.content:
                     parts.append(delta.content)
@@ -750,8 +829,11 @@ def _consolidate_run(dry_run: bool) -> dict:
     gov = GovernanceStore(state_db("memory_governance.sqlite3"))
     mirror = SqliteKGMirror(str(kg_path)) if kg_path.exists() else None
     consolidator = Consolidator(
-        gov, _propose, kg_mirror=mirror,
-        memory_store=MemoryStore(workspace_dir()), kg_summary_fn=_kg_summary,
+        gov,
+        _propose,
+        kg_mirror=mirror,
+        memory_store=MemoryStore(workspace_dir()),
+        kg_summary_fn=_kg_summary,
     )
     ops, res = consolidator.run(dry_run=dry_run)
     if dry_run:
@@ -765,8 +847,7 @@ def _consolidate_run(dry_run: bool) -> dict:
         "output": output,
         "dryRun": dry_run,
         "operations": [
-            {"op": o.op, "itemId": o.item_id, "intoId": o.into_id, "reason": o.reason}
-            for o in ops
+            {"op": o.op, "itemId": o.item_id, "intoId": o.into_id, "reason": o.reason} for o in ops
         ],
     }
 
@@ -776,6 +857,7 @@ async def memory_consolidate(params: dict) -> dict:
     transport (the desktop's "Clean now"). Offloaded to a thread so the event
     loop isn't blocked by the LLM round-trip."""
     import asyncio
+
     dry_run = bool(params.get("dryRun") or params.get("dry_run"))
     return await asyncio.to_thread(_consolidate_run, dry_run)
 
@@ -871,6 +953,7 @@ async def memory_dream(params: dict) -> dict:
     desktop/iOS "Learn from chats" button). Offloaded to a thread so the LLM
     round-trip doesn't block the event loop."""
     import asyncio
+
     try:
         max_messages = int(params.get("maxMessages") or params.get("max_messages") or 500)
     except (TypeError, ValueError):
@@ -958,6 +1041,7 @@ async def memory_import(params: dict) -> dict:
 
 
 # ── Persona / Provider ──────────────────────────────────────────────────────
+
 
 def persona_list() -> dict:
     """Workspace personas + the active one (``config.agents.defaults.persona``)."""
@@ -1165,10 +1249,13 @@ def provider_active() -> dict:
     for the Settings display and the model picker's current selection."""
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
+
     cfg = load_config()
     active = resolve_active_provider(cfg)
     return {
-        "provider": None if active is None else {
+        "provider": None
+        if active is None
+        else {
             "key": active.key,
             "source": active.source,
             "apiBase": getattr(active, "api_base", None),
@@ -1185,6 +1272,7 @@ async def model_list(params: dict) -> dict:
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
     from flowly.integrations.model_catalog import fetch_models
+
     active = resolve_active_provider(load_config())
     if active is None:
         return {"provider": None, "models": []}
@@ -1216,6 +1304,7 @@ async def model_set(params: dict) -> dict:
         raise FeatureRpcError("INVALID", "model must be a non-empty string")
     model = model.strip()
     from flowly.config.loader import load_config, save_config
+
     cfg = load_config()
     cfg.agents.defaults.model = model
     save_config(cfg)
@@ -1261,6 +1350,7 @@ def _exec_policy_payload(store) -> dict:
 def exec_policy_get() -> dict:
     """Standing exec approval policy (security/ask + allowlist patterns)."""
     from flowly.exec.approvals import ExecApprovalStore
+
     store = ExecApprovalStore()
     store.load()
     return _exec_policy_payload(store)
@@ -1290,6 +1380,7 @@ def exec_policy_set(params: dict) -> dict:
         raise FeatureRpcError("INVALID", "Nothing to set")
     from flowly.exec.approvals import ExecApprovalStore
     from flowly.exec.types import AllowlistEntry
+
     store = ExecApprovalStore()
     cfg = store.load()
     if security is not None:
@@ -1314,6 +1405,7 @@ def exec_policy_allowlist_remove(params: dict) -> dict:
     if not pattern:
         raise FeatureRpcError("INVALID", "Missing pattern")
     from flowly.exec.approvals import ExecApprovalStore
+
     store = ExecApprovalStore()
     store.load()
     removed = store.remove_from_allowlist(pattern)
@@ -1337,6 +1429,7 @@ _CODEX_SANDBOX = ("read-only", "workspace-write", "full-access")
 def codex_policy_get() -> dict:
     """Current codex_session approval policy + sandbox (for the settings UI)."""
     from flowly.config.loader import load_config
+
     cs = load_config().tools.codex_session
     return {
         "enabled": cs.enabled,
@@ -1364,6 +1457,7 @@ async def codex_policy_set(params: dict) -> dict:
         raise FeatureRpcError("INVALID", "Nothing to set")
 
     from flowly.config.loader import load_config, save_config
+
     cfg = load_config()
     if approval is not None:
         cfg.tools.codex_session.approval_policy = approval
@@ -1414,6 +1508,7 @@ def provider_list() -> dict:
     ``active`` choice, and the resolved provider (key + human-readable source)."""
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
+
     cfg = load_config()
     resolved = resolve_active_provider(cfg)
     explicit = (cfg.providers.active or "").strip()
@@ -1426,36 +1521,44 @@ def provider_list() -> dict:
             fl = cfg.providers.flowly
             has_key = bool(
                 (getattr(fl, "account_key", "") or "").strip()
-                or ((getattr(fl, "server_id", "") or "").strip() and (getattr(fl, "auth_token", "") or "").strip())
+                or (
+                    (getattr(fl, "server_id", "") or "").strip()
+                    and (getattr(fl, "auth_token", "") or "").strip()
+                )
             )
         elif key == "zai_coding":
             try:
                 from flowly.auth.zai_coding import resolve_runtime_credentials
+
                 has_key = resolve_runtime_credentials(config=cfg) is not None
             except Exception:
                 has_key = False
         elif key == "xai_oauth":
             try:
                 from flowly.auth.xai_oauth import resolve_runtime_credentials
+
                 has_key = resolve_runtime_credentials(config=cfg) is not None
             except Exception:
                 has_key = False
         elif key == "openai_codex":
             try:
                 from flowly.auth.openai_codex import resolve_runtime_credentials
+
                 has_key = resolve_runtime_credentials(config=cfg) is not None
             except Exception:
                 has_key = False
         else:
             has_key = bool(getattr(slot, "api_key", "")) if keyable else True
-        providers.append({
-            "key": key,
-            "name": name,
-            "keyable": keyable,
-            "hasKey": has_key,
-            "apiBase": getattr(slot, "api_base", None),
-            "isActive": resolved is not None and resolved.key == key,
-        })
+        providers.append(
+            {
+                "key": key,
+                "name": name,
+                "keyable": keyable,
+                "hasKey": has_key,
+                "apiBase": getattr(slot, "api_base", None),
+                "isActive": resolved is not None and resolved.key == key,
+            }
+        )
     return {
         "providers": providers,
         "active": explicit or None,
@@ -1472,6 +1575,7 @@ async def provider_set(params: dict) -> dict:
         raise FeatureRpcError("INVALID", "key must be a string")
     key = key.strip()
     from flowly.integrations.active_provider import set_active_provider
+
     try:
         # Also auto-fixes agents.defaults.model when the new provider can't
         # serve the current one (returns the applied model, else None).
@@ -1479,6 +1583,7 @@ async def provider_set(params: dict) -> dict:
     except ValueError as exc:
         raise FeatureRpcError("INVALID", str(exc))
     from flowly.integrations import model_catalog
+
     model_catalog.flush_cache()
     if _provider_reload_cb is not None:
         try:
@@ -1504,6 +1609,7 @@ async def provider_set_key(params: dict) -> dict:
     if key == "zai_coding":
         from flowly.auth import zai_coding
         from flowly.config.loader import load_config, save_config
+
         cfg = load_config()
         cfg.providers.zai_coding.enabled = True
         cfg.providers.zai_coding.api_base = zai_coding.DEFAULT_ZAI_CODING_BASE_URL
@@ -1513,6 +1619,7 @@ async def provider_set_key(params: dict) -> dict:
         else:
             zai_coding.clear_token_payload()
         from flowly.integrations import model_catalog
+
         model_catalog.flush_cache()
         has_key = zai_coding.resolve_runtime_credentials(config=load_config()) is not None
         if _provider_reload_cb is not None:
@@ -1523,6 +1630,7 @@ async def provider_set_key(params: dict) -> dict:
                 pass
         return {"ok": True, "key": key, "hasKey": has_key, "willRestart": True}
     from flowly.config.loader import load_config, save_config
+
     cfg = load_config()
     slot = getattr(cfg.providers, key, None)
     if slot is None or not hasattr(slot, "api_key"):
@@ -1530,6 +1638,7 @@ async def provider_set_key(params: dict) -> dict:
     slot.api_key = value
     save_config(cfg)
     from flowly.integrations import model_catalog
+
     model_catalog.flush_cache()
     if _provider_reload_cb is not None:
         try:
@@ -1558,12 +1667,14 @@ async def provider_set_flowly_account(params: dict) -> dict:
     server_id = server_id.strip()
     auth_token = auth_token.strip()
     from flowly.config.loader import load_config, save_config
+
     cfg = load_config()
     cfg.providers.flowly.account_key = account_key
     cfg.providers.flowly.server_id = server_id
     cfg.providers.flowly.auth_token = auth_token
     save_config(cfg)
     from flowly.integrations import model_catalog
+
     model_catalog.flush_cache()
     has = bool(account_key or (server_id and auth_token))
     if _provider_reload_cb is not None:
@@ -1581,8 +1692,10 @@ async def provider_set_flowly_account(params: dict) -> dict:
 # gateway already serves artifacts.* on its own WS dispatch — these handlers
 # make the surface transport-agnostic).
 
+
 def _artifact_store():
     from flowly.artifacts.store import get_store
+
     return get_store()
 
 
@@ -1592,6 +1705,7 @@ def artifacts_list(params: dict) -> dict:
     doesn't shrink below the caller's limit."""
     from flowly.artifacts.context import is_internal_context_artifact
     from flowly.artifacts.summary import artifact_summary
+
     store = _artifact_store()
     limit = max(1, min(int(params.get("limit", 50) or 50), 200))
     include_internal = bool(params.get("includeInternal", False))
@@ -1624,7 +1738,7 @@ def artifacts_get(params: dict) -> dict:
     if offset or len(content) > offset + limit:
         artifact = {
             **artifact,
-            "content": content[offset:offset + limit],
+            "content": content[offset : offset + limit],
             "content_range": {
                 "offset": offset,
                 "limit": limit,
@@ -1686,14 +1800,17 @@ def artifacts_versions(params: dict) -> dict:
 # artifact surface uses (no client-side authoring). `flowlets.action` is the
 # deterministic tap handler: it never calls the LLM.
 
+
 def _flowlet_store():
     from flowly.flowlets.store import get_store
+
     return get_store()
 
 
 def _flowlet_values(flowlet: dict) -> dict:
     from flowly.flowlets import queries
     from flowly.flowlets.store import get_store, now_ms
+
     store = get_store()
     return queries.resolve_values(
         flowlet["definition"],
@@ -1718,6 +1835,7 @@ def _flowlet_summary(flowlet: dict, values: dict | None = None) -> dict:
     if values is not None:
         s["values"] = values
         from flowly.flowlets.queries import flowlet_preview
+
         preview = flowlet_preview(flowlet.get("definition") or {}, values)
         if preview is not None:
             s["preview"] = preview
@@ -1752,6 +1870,7 @@ def flowlets_get(params: dict) -> dict:
     if _flowlet_refresh_cb is not None and (flowlet.get("definition") or {}).get("sources"):
         try:
             import asyncio as _asyncio
+
             _asyncio.get_running_loop().create_task(_flowlet_refresh_cb(flowlet_id, False))
         except Exception:
             pass  # no loop / best-effort
@@ -1767,6 +1886,7 @@ def flowlets_get(params: dict) -> dict:
         ensure_editable_drill,
         ensure_photo_display,
     )
+
     # Composites (catalog 3) expand to primitives FIRST, so the photo/edit
     # augmentation and the client both see plain v2 nodes; an old client renders
     # the expansion with no changes. Forgotten ids are assigned (same
@@ -1775,9 +1895,7 @@ def flowlets_get(params: dict) -> dict:
     # (charts don't fit side by side on a phone).
     definition = ensure_chart_layout(
         ensure_photo_display(
-            ensure_editable_drill(
-                assign_missing_ids(expand_composites(flowlet["definition"]))
-            )
+            ensure_editable_drill(assign_missing_ids(expand_composites(flowlet["definition"])))
         )
     )
     return {
@@ -1833,6 +1951,7 @@ async def flowlets_action(params: dict) -> dict:
     Returns the new values; the transport also broadcasts ``flowlet.state`` so
     the OTHER connected clients update too (the caller gets it in this reply)."""
     from flowly.flowlets.actions import FlowletActionError, apply_action
+
     store = _flowlet_store()
     flowlet_id = str(params.get("id", "") or "")
     component_id = str(params.get("componentId", "") or "")
@@ -1842,13 +1961,18 @@ async def flowlets_action(params: dict) -> dict:
     # model path already is). Best-effort component lookup; a component in a
     # drill screen isn't found here and simply isn't throttled (rare).
     from flowly.flowlets.actions import _find_component
+
     _fl = store.get(flowlet_id)
     _comp = _find_component(_fl.get("definition") or {}, component_id) if _fl else None
-    if ((_comp or {}).get("action") or {}).get("op") == "agent" and not _agent_action_rate_ok(flowlet_id):
+    if ((_comp or {}).get("action") or {}).get("op") == "agent" and not _agent_action_rate_ok(
+        flowlet_id
+    ):
         raise FeatureRpcError("RATE_LIMITED", "too many requests; try again in a moment")
     try:
         result = await apply_action(
-            store, flowlet_id, component_id,
+            store,
+            flowlet_id,
+            component_id,
             value=params.get("value"),
             agent_runner=_flowlet_agent_runner_cb,
         )
@@ -1857,8 +1981,11 @@ async def flowlets_action(params: dict) -> dict:
     # Recompute the card headline so list tiles update live (not just the open
     # screen) — carry it in both the reply and the broadcast.
     from flowly.flowlets.queries import flowlet_preview
+
     flowlet = store.get(flowlet_id)
-    preview = flowlet_preview(flowlet.get("definition") or {}, result["values"]) if flowlet else None
+    preview = (
+        flowlet_preview(flowlet.get("definition") or {}, result["values"]) if flowlet else None
+    )
     if preview is not None:
         result["preview"] = preview
     if _flowlet_broadcast_cb is not None:
@@ -1894,12 +2021,13 @@ def _decode_capture_image(image: Any, max_bytes: int) -> bytes | None:
         comma = b64.find(",")
         if comma == -1:
             return None
-        b64 = b64[comma + 1:]
+        b64 = b64[comma + 1 :]
     # base64 is 4 chars per 3 bytes; reject before allocating the decode.
     if len(b64) > (max_bytes * 4) // 3 + 4:
         return None
     try:
         import base64 as _b64
+
         data = _b64.b64decode(b64, validate=False)
     except Exception:
         return None
@@ -1921,6 +2049,7 @@ _agent_action_hits_global: list[float] = []
 def _agent_action_rate_ok(flowlet_id: str) -> bool:
     import time as _time
     from flowly.flowlets import catalog as _fcat
+
     now = _time.monotonic()
     cutoff = now - _fcat.AGENT_ACTION_WINDOW_S
     g = [t for t in _agent_action_hits_global if t >= cutoff]
@@ -1941,6 +2070,7 @@ def _agent_action_rate_ok(flowlet_id: str) -> bool:
 def _capture_rate_ok(flowlet_id: str) -> bool:
     import time as _time
     from flowly.flowlets import catalog as _fcat
+
     now = _time.monotonic()
     cutoff = now - _fcat.CAPTURE_WINDOW_S
     g = [t for t in _capture_hits_global if t >= cutoff]
@@ -1990,6 +2120,7 @@ async def flowlets_capture(params: dict) -> dict:
         raise FeatureRpcError(exc.code, exc.message)
 
     from flowly.flowlets.queries import flowlet_preview
+
     preview = flowlet_preview(flowlet.get("definition") or {}, values)
     result = {"id": flowlet_id, "values": values}
     if preview is not None:
@@ -2032,6 +2163,7 @@ async def flowlets_item_remove(params: dict) -> dict:
         raise FeatureRpcError("INVALID", str(exc))
 
     from flowly.flowlets.queries import flowlet_preview
+
     values = _flowlet_values(flowlet)
     preview = flowlet_preview(defn, values)
     result = {"id": flowlet_id, "values": values}
@@ -2064,6 +2196,7 @@ def flowlets_attachment(params: dict) -> dict:
     if data is None:
         raise FeatureRpcError("NOT_FOUND", "attachment not found")
     import base64 as _b64
+
     return {"id": att_id, "mime": "image/jpeg", "data": _b64.b64encode(data).decode("ascii")}
 
 
@@ -2146,6 +2279,7 @@ async def flowlets_create_from_template(params: dict) -> dict:
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 
+
 def _gateway_log_file():
     """The gateway service's stderr log (loguru writes to stderr) — the same
     file launchd/systemd capture to. Falls back to the stdout log. Returns a
@@ -2153,10 +2287,12 @@ def _gateway_log_file():
     whose output went to the terminal)."""
     import platform
     from pathlib import Path
+
     if platform.system().lower() == "windows":
         log_dir = Path.home() / "AppData" / "Local" / "flowly" / "logs"
     else:
         from flowly.profile import get_flowly_home
+
         log_dir = get_flowly_home() / "logs"
     for name in ("flowly-gateway.err.log", "flowly-gateway.out.log"):
         p = log_dir / name
@@ -2208,6 +2344,7 @@ def logs_tail(params: dict) -> dict:
 
 # ── Skills ──────────────────────────────────────────────────────────────────
 
+
 def skills_list() -> dict:
     """Installed skills (workspace + managed + builtin) in the rich shape the
     desktop Skills UI expects."""
@@ -2247,33 +2384,37 @@ def skills_list() -> dict:
         except Exception:
             pass
         source = _src.get(s.get("source", ""), "local")
-        skills.append({
-            "slug": name,
-            "name": name,
-            "description": desc,
-            "category": fm.get("category") or "General",
-            "tags": fm.get("tags") or [],
-            "source": source,
-            "isLocal": source == "local",
-            "installed": True,
-        })
+        skills.append(
+            {
+                "slug": name,
+                "name": name,
+                "description": desc,
+                "category": fm.get("category") or "General",
+                "tags": fm.get("tags") or [],
+                "source": source,
+                "isLocal": source == "local",
+                "installed": True,
+            }
+        )
     return {"skills": skills}
 
 
 # ── Knowledge graph ─────────────────────────────────────────────────────────
 
+
 def kg_graph() -> dict:
     """Dump knowledge-graph entities + triples (read-only)."""
     import sqlite3
+
     db = state_db("knowledge_graph.sqlite3")
     if not db.exists():
         return {"entities": [], "triples": []}
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         conn.row_factory = sqlite3.Row
-        entities = [dict(r) for r in conn.execute(
-            "SELECT id, name, type, properties FROM entities"
-        )]
+        entities = [
+            dict(r) for r in conn.execute("SELECT id, name, type, properties FROM entities")
+        ]
         triples = []
         for r in conn.execute(
             "SELECT t.id, s.name AS subject, t.predicate, o.name AS object, "
@@ -2291,6 +2432,7 @@ def kg_graph() -> dict:
 def kg_delete_entity(params: dict) -> dict:
     """Delete an entity and its incident triples + aliases."""
     import sqlite3
+
     entity_id = params.get("id")
     if entity_id is None:
         raise FeatureRpcError("INVALID", "id required")
@@ -2313,6 +2455,7 @@ def kg_delete_entity(params: dict) -> dict:
 
 
 # ── Sessions (Activity → Sessions) ──────────────────────────────────────────
+
 
 def _session_title(path) -> str | None:
     """Auto-generated chat title from a session's metadata line (first jsonl
@@ -2340,9 +2483,11 @@ def sessions_list() -> dict:
     # client — gateway and relay — surface a live "working" indicator straight
     # from the bot's runtime state, no separate flag to drift.
     from flowly.agent.inflight import get as _inflight_get
+
     out = []
     if sessions_dir.exists():
         from flowly.session.manager import iter_session_files
+
         for p in iter_session_files(sessions_dir):
             try:
                 st = p.stat()
@@ -2351,7 +2496,7 @@ def sessions_list() -> dict:
                 if sep == -1:
                     channel, chat_id = "unknown", base
                 else:
-                    channel, chat_id = base[:sep], base[sep + 1:]
+                    channel, chat_id = base[:sep], base[sep + 1 :]
                 key = base.replace("_", ":")
                 modified_ms = int(st.st_mtime * 1000)
                 # Auto-generated descriptive title, so every
@@ -2360,23 +2505,25 @@ def sessions_list() -> dict:
                 # to its (encrypted) Firestore conversation doc; the relay
                 # itself is untouched — this only enriches the RPC payload.
                 title = _session_title(p)
-                out.append({
-                    "key": key,
-                    "fileName": p.name,
-                    "sizeBytes": st.st_size,
-                    "modifiedAt": modified_ms,
-                    "channel": channel,
-                    "chatId": chat_id,
-                    "title": title,
-                    # Superset fields for the TUI gateway client (which reads
-                    # ``displayName`` / ``updatedAt``). Same content, one shape
-                    # serves every client + transport.
-                    "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
-                    "updatedAt": modified_ms,
-                    # True while a turn for this session is in flight — drives the
-                    # client's "running" shimmer. Old clients ignore the field.
-                    "running": _inflight_get(key) is not None,
-                })
+                out.append(
+                    {
+                        "key": key,
+                        "fileName": p.name,
+                        "sizeBytes": st.st_size,
+                        "modifiedAt": modified_ms,
+                        "channel": channel,
+                        "chatId": chat_id,
+                        "title": title,
+                        # Superset fields for the TUI gateway client (which reads
+                        # ``displayName`` / ``updatedAt``). Same content, one shape
+                        # serves every client + transport.
+                        "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
+                        "updatedAt": modified_ms,
+                        # True while a turn for this session is in flight — drives the
+                        # client's "running" shimmer. Old clients ignore the field.
+                        "running": _inflight_get(key) is not None,
+                    }
+                )
             except Exception:
                 continue
     out.sort(key=lambda s: s["modifiedAt"], reverse=True)
@@ -2403,10 +2550,12 @@ def sessions_read(params: dict) -> dict:
 
 # ── Audit (Activity → Audit) ────────────────────────────────────────────────
 
+
 def audit_list(params: dict) -> dict:
     """Audit entries with filter + pagination — ``{success, entries, total,
     has_more, next_offset}`` (the desktop audit hook's shape)."""
     from flowly.audit.reader import read_entries
+
     try:
         limit = int(params.get("limit", 50))
     except (TypeError, ValueError):
@@ -2432,11 +2581,13 @@ def audit_list(params: dict) -> dict:
 def audit_stats() -> dict:
     """Folder-level audit stats (+ retention/size/enabled from config)."""
     from flowly.audit.reader import get_stats
+
     stats = get_stats(audit_dir())
     payload: dict[str, Any] = {"success": True}
     payload.update(stats if isinstance(stats, dict) else {})
     try:
         from flowly.config.loader import load_config
+
         cfg = load_config()
         payload["retention_days"] = cfg.audit.retention_days
         payload["max_size_mb"] = cfg.audit.max_size_mb
@@ -2461,6 +2612,7 @@ def audit_clear() -> dict:
 
 # ── Assistants (Agents tab) ─────────────────────────────────────────────────
 
+
 def _assistants_dir() -> Path:
     return get_flowly_home() / "assistants"
 
@@ -2468,6 +2620,7 @@ def _assistants_dir() -> Path:
 def assistants_list() -> dict:
     """User-defined + builtin assistants in the desktop Agents-tab shape."""
     from flowly.agent.assistants import AssistantRegistry
+
     reg = AssistantRegistry(_assistants_dir())
     try:
         reg.reload()
@@ -2475,17 +2628,19 @@ def assistants_list() -> dict:
         pass
     out = []
     for a in reg.all():
-        out.append({
-            "name": a.name,
-            "description": a.description,
-            "model": a.model,
-            "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
-            "autoSaveArtifact": getattr(a, "auto_save_artifact", False),
-            "artifactType": getattr(a, "artifact_type", None),
-            "systemPrompt": getattr(a, "system_prompt", ""),
-            "builtin": a.builtin,
-            "sourcePath": str(a.source_path) if a.source_path else None,
-        })
+        out.append(
+            {
+                "name": a.name,
+                "description": a.description,
+                "model": a.model,
+                "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
+                "autoSaveArtifact": getattr(a, "auto_save_artifact", False),
+                "artifactType": getattr(a, "artifact_type", None),
+                "systemPrompt": getattr(a, "system_prompt", ""),
+                "builtin": a.builtin,
+                "sourcePath": str(a.source_path) if a.source_path else None,
+            }
+        )
     return {"assistants": out}
 
 
@@ -2495,13 +2650,18 @@ def assistants_write(params: dict) -> dict:
     ``{"success": bool, "error"?: str}``."""
     name = str(params.get("name", ""))
     if not re.match(r"^[a-z0-9][a-z0-9_-]*$", name):
-        return {"success": False, "error": (
-            f"Invalid assistant name '{name}'. Use lowercase letters, digits, "
-            "- and _ only."
-        )}
-    lines = ["---", f"name: {name}",
-             f"description: {params.get('description', '')}",
-             f"model: {params.get('model', '')}"]
+        return {
+            "success": False,
+            "error": (
+                f"Invalid assistant name '{name}'. Use lowercase letters, digits, - and _ only."
+            ),
+        }
+    lines = [
+        "---",
+        f"name: {name}",
+        f"description: {params.get('description', '')}",
+        f"model: {params.get('model', '')}",
+    ]
     tools = params.get("allowedTools")
     if tools:
         lines.append("allowed_tools: [" + ", ".join(f'"{t}"' for t in tools) + "]")
@@ -2530,20 +2690,27 @@ def assistants_delete(params: dict) -> dict:
 
 # ── Pairing (Telegram / WhatsApp device approval) ───────────────────────────
 
+
 def pairing_list(params: dict) -> dict:
     """Pending pairing requests for a channel."""
     channel = params.get("channel", "telegram")
     if channel not in _PAIRING_CHANNELS:
         raise FeatureRpcError("INVALID", f"unknown pairing channel: {channel}")
     from flowly.pairing.store import list_pairing_requests
+
     reqs = list_pairing_requests(channel)
-    return {"requests": [{
-        "id": r.id,
-        "code": r.code,
-        "createdAt": r.created_at,
-        "lastSeenAt": getattr(r, "last_seen_at", None),
-        "meta": getattr(r, "meta", {}) or {},
-    } for r in reqs]}
+    return {
+        "requests": [
+            {
+                "id": r.id,
+                "code": r.code,
+                "createdAt": r.created_at,
+                "lastSeenAt": getattr(r, "last_seen_at", None),
+                "meta": getattr(r, "meta", {}) or {},
+            }
+            for r in reqs
+        ]
+    }
 
 
 def gmail_set_credentials(params: dict) -> dict:
@@ -2563,6 +2730,7 @@ def gmail_set_credentials(params: dict) -> dict:
     if not isinstance(creds.get("refresh_token"), str) or not creds["refresh_token"].strip():
         raise FeatureRpcError("INVALID", "credentials.refresh_token is required")
     from flowly.channels.gmail_auth import save_credentials
+
     save_credentials(creds)
     return {"ok": True, "willRestart": True}
 
@@ -2605,18 +2773,20 @@ def subagents_list(params: dict) -> dict:
             duration = round(r.ended_at - r.started_at, 1)
         elif r.started_at:
             duration = round(_time.time() - r.started_at, 1)
-        tasks.append({
-            "runId": r.run_id,
-            "label": getattr(r, "display_name", "") or r.label,
-            "task": r.task,
-            "model": r.model,
-            "status": "running" if r.ended_at is None else (r.outcome or "unknown"),
-            "duration": duration,
-            "createdAt": r.created_at,
-            "endedAt": r.ended_at,
-            "error": r.error,
-            "parentSessionKey": r.parent_session_key,
-        })
+        tasks.append(
+            {
+                "runId": r.run_id,
+                "label": getattr(r, "display_name", "") or r.label,
+                "task": r.task,
+                "model": r.model,
+                "status": "running" if r.ended_at is None else (r.outcome or "unknown"),
+                "duration": duration,
+                "createdAt": r.created_at,
+                "endedAt": r.ended_at,
+                "error": r.error,
+                "parentSessionKey": r.parent_session_key,
+            }
+        )
     return {"tasks": tasks}
 
 
@@ -2656,14 +2826,16 @@ def subagents_assistants(params: dict) -> dict:
             effective = override
         else:
             effective = a.model
-        out.append({
-            "name": a.name,
-            "description": a.description,
-            "defaultModel": a.model,
-            "override": override,
-            "effectiveModel": effective,
-            "builtin": a.builtin,
-        })
+        out.append(
+            {
+                "name": a.name,
+                "description": a.description,
+                "defaultModel": a.model,
+                "override": override,
+                "effectiveModel": effective,
+                "builtin": a.builtin,
+            }
+        )
     return {"assistants": out, "botModel": bot_model}
 
 
@@ -2690,7 +2862,9 @@ def subagents_set_model(params: dict) -> dict:
     from flowly.agent.assistants import AssistantRegistry
     from flowly.config.loader import get_config_path, load_config
     from flowly.integrations.config_io import (
-        _atomic_write_json, _load_raw, _set_path,
+        _atomic_write_json,
+        _load_raw,
+        _set_path,
     )
 
     reg = AssistantRegistry(_assistants_dir())
@@ -2700,9 +2874,7 @@ def subagents_set_model(params: dict) -> dict:
         pass
     asst = reg.get(name)
     if asst is None:
-        raise FeatureRpcError(
-            "INVALID", f"unknown specialist '{name}'. Available: {reg.names()}"
-        )
+        raise FeatureRpcError("INVALID", f"unknown specialist '{name}'. Available: {reg.names()}")
 
     cfg = load_config()
     overrides = dict(cfg.agents.assistant_models or {})
@@ -2779,6 +2951,7 @@ async def subagents_spawn(params: dict) -> dict:
     if isinstance(asst_name, str) and asst_name.strip():
         try:
             from flowly.agent.assistants import AssistantRegistry
+
             reg = AssistantRegistry(_assistants_dir())
             try:
                 reg.reload()
@@ -2841,6 +3014,7 @@ async def board_action(params: dict) -> dict:
     cancel) over either transport. Shared single-writer store; ``run``/``cancel``
     drive the agent's board orchestrator."""
     from flowly.board.actions import apply_board_action
+
     store, orchestrator = _board()
     result, status = await apply_board_action(store, orchestrator, params)
     if status >= 400 and not result.get("ok"):
@@ -2894,6 +3068,7 @@ def board_card(params: dict) -> dict:
 # RPCs are additive (list/add/update/remove/run/output for a desktop+iOS UI over
 # relay AND gateway). The relay's cron delivery is untouched.
 
+
 def _cron_job_to_dict(j) -> dict:
     """Serialize a CronJob to the UI shape (mirrors the jobs.json on-disk form)."""
     return {
@@ -2929,7 +3104,8 @@ def _cron_job_to_dict(j) -> dict:
                 "chatName": j.origin.chat_name,
                 "threadId": j.origin.thread_id,
             }
-            if j.origin else None
+            if j.origin
+            else None
         ),
         "createdAtMs": j.created_at_ms,
         "updatedAtMs": j.updated_at_ms,
@@ -3058,7 +3234,7 @@ def cron_output(params: dict) -> dict:
         limit = max(1, min(int(params.get("limit", 10) or 10), 50))
     except (TypeError, ValueError):
         limit = 10
-    job_dir = (svc.store_path.parent / "output" / jid)
+    job_dir = svc.store_path.parent / "output" / jid
     outputs: list[dict[str, Any]] = []
     if job_dir.exists():
         files = sorted(job_dir.glob("*.md"), reverse=True)[:limit]
@@ -3075,9 +3251,11 @@ def cron_output(params: dict) -> dict:
 # APNs/FCM through the relay for out-of-band deliveries (cron results while the
 # app is closed). No Flowly account needed.
 
+
 def push_register(params: dict) -> dict:
     """Register a device's relay push credentials (from /api/push/register)."""
     from flowly.push.relay_push import get_push_registry
+
     push_id = (params.get("pushId") or "").strip()
     push_secret = (params.get("pushSecret") or "").strip()
     if not push_id or not push_secret:
@@ -3095,6 +3273,7 @@ def push_register(params: dict) -> dict:
 def push_unregister(params: dict) -> dict:
     """Drop a device's push registration (logout / disable notifications)."""
     from flowly.push.relay_push import get_push_registry
+
     pid = (params.get("pushId") or "").strip()
     if pid:
         get_push_registry().unregister(pid)
@@ -3111,10 +3290,13 @@ def pairing_approve(params: dict) -> dict:
     if not code:
         raise FeatureRpcError("INVALID", "missing pairing code")
     from flowly.pairing.store import approve_pairing_code
+
     approved = approve_pairing_code(channel, code)
     return {
         "ok": approved is not None,
-        "approved": None if approved is None else {
+        "approved": None
+        if approved is None
+        else {
             "id": approved.id,
             "code": approved.code,
             "meta": getattr(approved, "meta", {}) or {},
@@ -3145,6 +3327,7 @@ def system_capabilities() -> dict:
     method itself, so its mere presence already signals a capable bot.
     """
     from flowly import __version__
+
     return {
         "version": __version__,
         "featureMethods": sorted(_DISPATCH),
@@ -3157,111 +3340,116 @@ def system_capabilities() -> dict:
 #                   ACK then bounce the gateway
 _DISPATCH: dict[str, tuple] = {
     "system.capabilities": (system_capabilities, False, False),
-    "connections.list":   (connections_list, False, False),
-    "connections.set":    (connections_set, True, True),
+    "connections.list": (connections_list, False, False),
+    "connections.set": (connections_set, True, True),
     "gmail.set_credentials": (gmail_set_credentials, True, True),
-    "board.snapshot":     (board_snapshot, False, False),
-    "board.action":       (board_action, True, False),
-    "subagents.list":     (subagents_list, True, False),
+    "board.snapshot": (board_snapshot, False, False),
+    "board.action": (board_action, True, False),
+    "subagents.list": (subagents_list, True, False),
     "subagents.assistants": (subagents_assistants, True, False),
     "subagents.set_model": (subagents_set_model, True, False),
-    "subagents.spawn":    (subagents_spawn, True, False),
-    "board.card":         (board_card, True, False),
-    "cron.list":          (cron_list, True, False),
-    "cron.add":           (cron_add, True, False),
-    "cron.update":        (cron_update, True, False),
-    "cron.remove":        (cron_remove, True, False),
-    "cron.run":           (cron_run, True, False),
-    "cron.output":        (cron_output, True, False),
-    "push.register":      (push_register, True, False),
-    "push.unregister":    (push_unregister, True, False),
-    "chat.inflight":      (chat_inflight, True, False),
-    "plan.get":           (plan_get, True, False),
-    "plan.list":          (plan_list, True, False),
-    "plan.resolve":       (plan_resolve, True, False),
-    "plan.resume":        (plan_resume, True, False),
-    "plan.cancel":        (plan_cancel, True, False),
-    "plan.mode.get":      (plan_mode_get, True, False),
-    "plan.mode.set":      (plan_mode_set, True, False),
-    "config.get":         (config_get, False, False),
-    "config.set":         (config_set, True, True),
-    "exec.policy.get":              (exec_policy_get, False, False),
-    "exec.policy.set":              (exec_policy_set, True, False),
+    "subagents.spawn": (subagents_spawn, True, False),
+    "board.card": (board_card, True, False),
+    "cron.list": (cron_list, True, False),
+    "cron.add": (cron_add, True, False),
+    "cron.update": (cron_update, True, False),
+    "cron.remove": (cron_remove, True, False),
+    "cron.run": (cron_run, True, False),
+    "cron.output": (cron_output, True, False),
+    "push.register": (push_register, True, False),
+    "push.unregister": (push_unregister, True, False),
+    "chat.inflight": (chat_inflight, True, False),
+    "plan.get": (plan_get, True, False),
+    "plan.list": (plan_list, True, False),
+    "plan.resolve": (plan_resolve, True, False),
+    "plan.resume": (plan_resume, True, False),
+    "plan.cancel": (plan_cancel, True, False),
+    "plan.mode.get": (plan_mode_get, True, False),
+    "plan.mode.set": (plan_mode_set, True, False),
+    "config.get": (config_get, False, False),
+    "config.set": (config_set, True, True),
+    "exec.policy.get": (exec_policy_get, False, False),
+    "exec.policy.set": (exec_policy_set, True, False),
     "exec.policy.allowlist.remove": (exec_policy_allowlist_remove, True, False),
-    "codex.policy.get":             (codex_policy_get, False, False),
-    "codex.policy.set":             (codex_policy_set, True, True),
-    "pet.info":           (pet_info, True, False),
-    "pet.gallery":        (pet_gallery, True, False),
-    "pet.select":         (pet_select, True, False),
-    "pet.disable":        (pet_disable, True, False),
-    "pet.scale":          (pet_scale, True, False),
-    "pet.thumb":          (pet_thumb, True, False),
-    "mcp.list":           (mcp_list, False, False),
-    "mcp.upsert":         (mcp_upsert, True, True),
-    "mcp.set_enabled":    (mcp_set_enabled, True, True),
-    "mcp.remove":         (mcp_remove, True, True),
-    "mcp.install":        (mcp_install, True, True),
-    "mcp.test":           (mcp_test, True, False),
-    "mcp.oauth_start":    (mcp_oauth_start, True, True),
-    "memory.entries":     (memory_entries, False, False),
+    "codex.policy.get": (codex_policy_get, False, False),
+    "codex.policy.set": (codex_policy_set, True, True),
+    "pet.info": (pet_info, True, False),
+    "pet.gallery": (pet_gallery, True, False),
+    "pet.select": (pet_select, True, False),
+    "pet.disable": (pet_disable, True, False),
+    "pet.scale": (pet_scale, True, False),
+    "pet.thumb": (pet_thumb, True, False),
+    "mcp.list": (mcp_list, False, False),
+    "mcp.upsert": (mcp_upsert, True, True),
+    "mcp.set_enabled": (mcp_set_enabled, True, True),
+    "mcp.remove": (mcp_remove, True, True),
+    "mcp.install": (mcp_install, True, True),
+    "mcp.test": (mcp_test, True, False),
+    "mcp.oauth_start": (mcp_oauth_start, True, True),
+    "memory.entries": (memory_entries, False, False),
     "memory.update_user": (memory_update_user, True, False),
-    "memory.gov_list":    (_partial(memory_gov, "list"), True, False),
-    "memory.review":      (_partial(memory_gov, "review"), True, False),
-    "memory.stats":       (_partial(memory_gov, "stats"), True, False),
-    "memory.accept":      (_partial(memory_gov, "accept"), True, False),
-    "memory.reject":      (_partial(memory_gov, "reject"), True, False),
-    "memory.correct":     (_partial(memory_gov, "correct"), True, False),
-    "memory.feedback":    (_partial(memory_gov, "feedback"), True, False),
+    "memory.gov_list": (_partial(memory_gov, "list"), True, False),
+    "memory.review": (_partial(memory_gov, "review"), True, False),
+    "memory.stats": (_partial(memory_gov, "stats"), True, False),
+    "memory.accept": (_partial(memory_gov, "accept"), True, False),
+    "memory.reject": (_partial(memory_gov, "reject"), True, False),
+    "memory.correct": (_partial(memory_gov, "correct"), True, False),
+    "memory.feedback": (_partial(memory_gov, "feedback"), True, False),
     "memory.consolidate": (memory_consolidate, True, False),
-    "memory.dream":       (memory_dream, True, False),
+    "memory.dream": (memory_dream, True, False),
     "memory.import_prompt": (memory_import_prompt, True, False),
-    "memory.import":      (memory_import, True, False),
-    "obsidian.status":    (_partial(obsidian_rpc, "status"), True, False),
-    "obsidian.search":    (_partial(obsidian_rpc, "search"), True, False),
-    "persona.list":       (persona_list, False, False),
-    "provider.active":    (provider_active, False, False),
-    "provider.list":      (provider_list, False, False),
-    "provider.set":       (provider_set, True, True),
-    "provider.set_key":   (provider_set_key, True, True),
+    "memory.import": (memory_import, True, False),
+    "obsidian.status": (_partial(obsidian_rpc, "status"), True, False),
+    "obsidian.search": (_partial(obsidian_rpc, "search"), True, False),
+    "persona.list": (persona_list, False, False),
+    "provider.active": (provider_active, False, False),
+    "provider.list": (provider_list, False, False),
+    "provider.set": (provider_set, True, True),
+    "provider.set_key": (provider_set_key, True, True),
     "provider.set_flowly_account": (provider_set_flowly_account, True, True),
-    "logs.tail":          (logs_tail, True, False),
-    "artifacts.list":     (artifacts_list, True, False),
-    "artifacts.get":      (artifacts_get, True, False),
-    "artifacts.update":   (artifacts_update, True, False),
-    "artifacts.delete":   (artifacts_delete, True, False),
-    "artifacts.pin":      (artifacts_pin, True, False),
+    "logs.tail": (logs_tail, True, False),
+    "artifacts.list": (artifacts_list, True, False),
+    "artifacts.get": (artifacts_get, True, False),
+    "artifacts.update": (artifacts_update, True, False),
+    "artifacts.delete": (artifacts_delete, True, False),
+    "artifacts.pin": (artifacts_pin, True, False),
     "artifacts.versions": (artifacts_versions, True, False),
-    "flowlets.list":      (flowlets_list, True, False),
-    "flowlets.get":       (flowlets_get, True, False),
-    "flowlets.state":     (flowlets_state, True, False),
-    "flowlets.action":    (flowlets_action, True, False),
-    "flowlets.refresh":   (flowlets_refresh, True, False),
-    "flowlets.capture":   (flowlets_capture, True, False),
+    "flowlets.list": (flowlets_list, True, False),
+    "flowlets.get": (flowlets_get, True, False),
+    "flowlets.state": (flowlets_state, True, False),
+    "flowlets.action": (flowlets_action, True, False),
+    "flowlets.refresh": (flowlets_refresh, True, False),
+    "flowlets.capture": (flowlets_capture, True, False),
     "flowlets.attachment": (flowlets_attachment, True, False),
     "flowlets.itemRemove": (flowlets_item_remove, True, False),
-    "flowlets.pin":       (flowlets_pin, True, False),
-    "flowlets.delete":    (flowlets_delete, True, False),
+    "flowlets.pin": (flowlets_pin, True, False),
+    "flowlets.delete": (flowlets_delete, True, False),
     "flowlets.templates": (flowlets_templates, True, False),
     "flowlets.createFromTemplate": (flowlets_create_from_template, True, False),
-    "model.list":         (model_list, True, False),
-    "model.set":          (model_set, True, True),
-    "assistants.list":    (assistants_list, False, False),
-    "assistants.write":   (assistants_write, True, False),
-    "assistants.delete":  (assistants_delete, True, False),
-    "skills.list":        (skills_list, False, False),
-    "kg.graph":           (kg_graph, False, False),
-    "kg.delete_entity":   (kg_delete_entity, True, False),
-    "sessions.list":      (sessions_list, False, False),
-    "sessions.read":      (sessions_read, True, False),
-    "audit.list":         (audit_list, True, False),
-    "audit.stats":        (audit_stats, False, False),
-    "audit.clear":        (audit_clear, False, False),
-    "pairing.list":       (pairing_list, True, False),
-    "pairing.approve":    (pairing_approve, True, False),
+    "model.list": (model_list, True, False),
+    "model.set": (model_set, True, True),
+    "assistants.list": (assistants_list, False, False),
+    "assistants.write": (assistants_write, True, False),
+    "assistants.delete": (assistants_delete, True, False),
+    "skills.list": (skills_list, False, False),
+    "kg.graph": (kg_graph, False, False),
+    "kg.delete_entity": (kg_delete_entity, True, False),
+    "sessions.list": (sessions_list, False, False),
+    "sessions.read": (sessions_read, True, False),
+    "audit.list": (audit_list, True, False),
+    "audit.stats": (audit_stats, False, False),
+    "audit.clear": (audit_clear, False, False),
+    "pairing.list": (pairing_list, True, False),
+    "pairing.approve": (pairing_approve, True, False),
 }
 
 #: Every method this module serves. Transports gate on membership.
 FEATURE_METHODS = frozenset(_DISPATCH)
+
+# These methods may legitimately wait for a human/browser or a slow server.
+# WebSocket transports dispatch them in tracked background tasks so their
+# receive loops keep processing control frames, pings, and unrelated RPCs.
+LONG_RUNNING_METHODS = frozenset({"mcp.test", "mcp.oauth_start"})
 
 
 async def dispatch(method: str, params: dict) -> tuple[dict, bool]:

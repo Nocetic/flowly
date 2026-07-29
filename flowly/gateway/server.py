@@ -65,6 +65,7 @@ async def _cors_middleware(request: web.Request, handler: Callable) -> web.Strea
     response.headers.setdefault("Vary", "Origin")
     return response
 
+
 # Type alias for the chat callback used by the /ws endpoint.
 # Signature: (session_key, message, run_id, stream_callback, media, voice_mode,
 #             iteration_callback, render_capabilities)
@@ -218,6 +219,7 @@ def _thumbnail_b64(p: Path) -> tuple[str, str] | None:
         return hit
     try:
         from flowly.channels.web import _compress_image_for_transport
+
         compressed = _compress_image_for_transport(
             p,
             max_dimension=_THUMB_MAX_DIMENSION,
@@ -258,11 +260,13 @@ def _reply_media_attachments(media_paths: list) -> list[dict]:
                 continue
             if mp.startswith(("http://", "https://")):
                 url_mime, _ = mimetypes.guess_type(mp)
-                out.append({
-                    "fileName": mp.rsplit("/", 1)[-1] or mp,
-                    "mimeType": url_mime or "",
-                    "cdnUrl": mp,
-                })
+                out.append(
+                    {
+                        "fileName": mp.rsplit("/", 1)[-1] or mp,
+                        "mimeType": url_mime or "",
+                        "cdnUrl": mp,
+                    }
+                )
                 continue
             p = Path(mp)
             if not p.is_file():
@@ -449,8 +453,11 @@ class GatewayServer:
         if self.on_send and self._control_token:
             try:
                 from flowly.mcp.server.control import register_control_routes
+
                 register_control_routes(
-                    app, token=self._control_token, on_send=self.on_send,
+                    app,
+                    token=self._control_token,
+                    on_send=self.on_send,
                 )
             except Exception as exc:  # pragma: no cover — never block boot
                 logger.warning("MCP control routes unavailable: {}", exc)
@@ -475,9 +482,8 @@ class GatewayServer:
         @web.middleware
         async def _auth_middleware(request: web.Request, handler):
             path = request.path
-            if (
-                path in self._AUTH_PUBLIC_PATHS
-                or any(path.startswith(p) for p in self._AUTH_SELF_GATED_PREFIXES)
+            if path in self._AUTH_PUBLIC_PATHS or any(
+                path.startswith(p) for p in self._AUTH_SELF_GATED_PREFIXES
             ):
                 return await handler(request)
             if not token_matches(extract_request_token(request), self._auth_token):
@@ -494,9 +500,7 @@ class GatewayServer:
         middleware has already verified the static token, so reaching here
         means the caller is authenticated."""
         ticket = self._ticket_store.mint()
-        return web.json_response(
-            {"ticket": ticket, "ttl_seconds": self._ticket_store.ttl_seconds}
-        )
+        return web.json_response({"ticket": ticket, "ttl_seconds": self._ticket_store.ttl_seconds})
 
     def _ws_credential_ok(self, request: web.Request) -> bool:
         """Authenticate a /ws upgrade. No-op (always True) when auth is off.
@@ -515,19 +519,21 @@ class GatewayServer:
         # Capabilities advertise what this gateway build supports so clients
         # (like the TUI) can detect a stale running process and prompt for
         # restart instead of silently degrading.
-        return web.json_response({
-            "status": "ok",
-            # The public handshake the desktop probes to decide whether to
-            # prompt for a token before connecting (the /api/status handshake).
-            "auth_required": self._require_auth,
-            "capabilities": [
-                "tool_events",      # tool.start / tool.complete WS events
-                "queue_while_busy", # client-side, but flag for future server queueing
-                "browser_provider_v2",
-                "browser_session_binding_v1",
-                "browser_provider_unregister_v1",
-            ],
-        })
+        return web.json_response(
+            {
+                "status": "ok",
+                # The public handshake the desktop probes to decide whether to
+                # prompt for a token before connecting (the /api/status handshake).
+                "auth_required": self._require_auth,
+                "capabilities": [
+                    "tool_events",  # tool.start / tool.complete WS events
+                    "queue_while_busy",  # client-side, but flag for future server queueing
+                    "browser_provider_v2",
+                    "browser_session_binding_v1",
+                    "browser_provider_unregister_v1",
+                ],
+            }
+        )
 
     async def _handle_cron_run(self, request: web.Request) -> web.Response:
         try:
@@ -542,7 +548,9 @@ class GatewayServer:
             if success:
                 return web.json_response({"ok": True})
             else:
-                return web.json_response({"error": f"Job '{job_id}' not found or disabled"}, status=404)
+                return web.json_response(
+                    {"error": f"Job '{job_id}' not found or disabled"}, status=404
+                )
         except json.JSONDecodeError:
             return web.json_response({"error": "Invalid JSON"}, status=400)
         except Exception as e:
@@ -560,9 +568,7 @@ class GatewayServer:
         """
         try:
             if not self.on_cron_health:
-                return web.json_response(
-                    {"error": "Cron health not configured"}, status=500
-                )
+                return web.json_response({"error": "Cron health not configured"}, status=500)
             snapshot = self.on_cron_health()
             return web.json_response(snapshot)
         except Exception as e:
@@ -599,7 +605,8 @@ class GatewayServer:
                 return web.json_response({"error": SKEW_MESSAGE}, status=409)
             if not self.on_provider_reload:
                 return web.json_response(
-                    {"error": "Provider reload not configured"}, status=500,
+                    {"error": "Provider reload not configured"},
+                    status=500,
                 )
             info = await self.on_provider_reload()
             if not info or not info.get("ok"):
@@ -626,13 +633,7 @@ class GatewayServer:
           * images only (allowlist), with a 25 MB ceiling.
         """
         name = (request.rel_url.query.get("id") or "").strip()
-        if (
-            not name
-            or "/" in name
-            or "\\" in name
-            or ".." in name
-            or name.startswith(".")
-        ):
+        if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
             return web.json_response({"error": "invalid id"}, status=400)
 
         media_dir = (get_flowly_home() / "media").resolve()
@@ -657,11 +658,13 @@ class GatewayServer:
         except OSError:
             return web.json_response({"error": "not found"}, status=404)
         encoded = base64.b64encode(data).decode("ascii")
-        return web.json_response({
-            "dataUrl": f"data:{mime};base64,{encoded}",
-            "fileName": name,
-            "mimeType": mime,
-        })
+        return web.json_response(
+            {
+                "dataUrl": f"data:{mime};base64,{encoded}",
+                "fileName": name,
+                "mimeType": mime,
+            }
+        )
 
     async def _handle_extension_status(self, request: web.Request) -> web.Response:
         """Report whether a Chrome extension is currently connected.
@@ -672,14 +675,16 @@ class GatewayServer:
         """
         try:
             connected = self.has_browser_provider()
-            return web.json_response({
-                "ok": True,
-                "connected": connected,
-                "client_count": len(self._extension_clients),
-                "active_client": self._extension_active,
-                "active_provider": self._browser_provider_active,
-                "providers": self._list_browser_providers(),
-            })
+            return web.json_response(
+                {
+                    "ok": True,
+                    "connected": connected,
+                    "client_count": len(self._extension_clients),
+                    "active_client": self._extension_active,
+                    "active_provider": self._browser_provider_active,
+                    "providers": self._list_browser_providers(),
+                }
+            )
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
@@ -734,6 +739,7 @@ class GatewayServer:
             if action in ("clear_done", "clear"):
                 # Bulk-remove finished cards (Done by default).
                 from flowly.board.store import STATUS_DONE
+
                 target = body.get("status") or STATUS_DONE
                 removed = self.board_store.delete_by_status(target)
                 return {"ok": True, "removed": removed}, 200
@@ -754,7 +760,8 @@ class GatewayServer:
 
             if action == "note":
                 self.board_store.add_note(
-                    card_id, author=body.get("author", "user") or "user",
+                    card_id,
+                    author=body.get("author", "user") or "user",
                     text=body.get("text", "") or "",
                 )
                 card = self.board_store.get_card(card_id)
@@ -795,6 +802,7 @@ class GatewayServer:
                         except Exception as exc:
                             logger.warning(f"[board] cancel subagent failed: {exc}")
                     from flowly.board.store import STATUS_CANCELLED
+
                     self.board_store.set_status(card_id, STATUS_CANCELLED)
                 card = self.board_store.get_card(card_id)
                 return {"ok": True, "card": card.to_dict() if card else None}, 200
@@ -814,15 +822,18 @@ class GatewayServer:
         try:
             from flowly.config.loader import load_config
             from flowly.integrations.active_provider import resolve_active_provider
+
             active = resolve_active_provider(load_config())
             if active is None:
                 return web.json_response({"ok": False, "error": "no provider"})
-            return web.json_response({
-                "ok": True,
-                "key": active.key,
-                "source": active.source,
-                "api_base": active.api_base,
-            })
+            return web.json_response(
+                {
+                    "ok": True,
+                    "key": active.key,
+                    "source": active.source,
+                    "api_base": active.api_base,
+                }
+            )
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
@@ -901,10 +912,7 @@ class GatewayServer:
             ConnectionAbortedError,
             asyncio.CancelledError,
         ) as e:
-            logger.debug(
-                f"[WS] Client disconnected before handshake completed: "
-                f"{type(e).__name__}"
-            )
+            logger.debug(f"[WS] Client disconnected before handshake completed: {type(e).__name__}")
             return web.Response(status=400)
         except Exception as e:
             # aiohttp surfaces ClientConnectionResetError which isn't in
@@ -915,8 +923,7 @@ class GatewayServer:
                 "ClientConnectionError",
             ):
                 logger.debug(
-                    f"[WS] Client disconnected before handshake completed: "
-                    f"{type(e).__name__}"
+                    f"[WS] Client disconnected before handshake completed: {type(e).__name__}"
                 )
                 return web.Response(status=400)
             raise
@@ -932,23 +939,30 @@ class GatewayServer:
         # ASCII-only [a-zA-Z0-9_-]{1,64} — Python's str.isalnum is unicode-aware
         # which would let through e.g. "üñıç". Keep it strictly ASCII.
         _id_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-        if (
-            requested_id
-            and len(requested_id) <= 64
-            and all(c in _id_chars for c in requested_id)
-        ):
+        if requested_id and len(requested_id) <= 64 and all(c in _id_chars for c in requested_id):
             client_id = requested_id
             # If two connections claim the same id, keep the newest — the old
             # WS is almost certainly already broken (this is exactly the
             # reconnect case we're trying to support). Drop the stale ref.
             if client_id in self._ws_clients:
-                logger.info(
-                    f"[WS] Reattaching client_id={client_id}: replacing stale ws"
-                )
+                logger.info(f"[WS] Reattaching client_id={client_id}: replacing stale ws")
         else:
             client_id = str(uuid.uuid4())
         self._ws_clients[client_id] = ws
         logger.info(f"[WS] Desktop client connected: {client_id}")
+
+        long_rpc_tasks: set[asyncio.Task[None]] = set()
+
+        def _long_rpc_done(task: asyncio.Task[None]) -> None:
+            long_rpc_tasks.discard(task)
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(
+                    "[WS] background feature RPC failed: %s",
+                    type(exc).__name__,
+                )
 
         try:
             async for raw_msg in ws:
@@ -960,20 +974,42 @@ class GatewayServer:
                         continue
                     msg_type = data.get("type")
                     if msg_type == "rpc":
-                        await self._handle_ws_rpc(ws, client_id, data)
+                        if data.get("method") in feature_rpc.LONG_RUNNING_METHODS:
+                            # Browser auth/probes can take minutes. Keep the
+                            # receive loop alive for WS heartbeat frames and
+                            # unrelated RPCs, while retaining ownership so a
+                            # disconnect cancels the underlying MCP future.
+                            task = asyncio.create_task(
+                                self._handle_ws_rpc(ws, client_id, data),
+                                name=f"feature-rpc-{data.get('method')}",
+                            )
+                            long_rpc_tasks.add(task)
+                            task.add_done_callback(_long_rpc_done)
+                        else:
+                            await self._handle_ws_rpc(ws, client_id, data)
                     elif msg_type == "ping":
-                        await self._ws_send(ws, {"type": "pong", "timestamp": data.get("timestamp")})
+                        await self._ws_send(
+                            ws, {"type": "pong", "timestamp": data.get("timestamp")}
+                        )
                     elif msg_type == "tool_result":
                         # Fix #10: Only accept tool_result from registered extension clients
                         if client_id in self._extension_clients:
                             self._handle_extension_tool_result(data, client_id)
                         else:
-                            logger.warning(f"[WS] tool_result from non-extension client {client_id}, ignoring")
+                            logger.warning(
+                                f"[WS] tool_result from non-extension client {client_id}, ignoring"
+                            )
                 elif raw_msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                     break
         except Exception as e:
             logger.error(f"[WS] Client {client_id} error: {e}")
         finally:
+            pending_long_rpcs = tuple(long_rpc_tasks)
+            for task in pending_long_rpcs:
+                task.cancel()
+            if pending_long_rpcs:
+                await asyncio.gather(*pending_long_rpcs, return_exceptions=True)
+
             # A stable clientId may already have reconnected on a newer socket.
             # Cleanup from the stale socket must not evict the replacement or
             # unregister its browser provider.
@@ -1000,12 +1036,9 @@ class GatewayServer:
                 coaching_sid = f"coaching:{client_id}"
                 if self._coaching_manager.is_active(coaching_sid):
                     try:
-                        await self._coaching_manager.stop(
-                            coaching_sid, background_finalize=True
-                        )
+                        await self._coaching_manager.stop(coaching_sid, background_finalize=True)
                         logger.info(
-                            f"[WS] auto-stopped coaching session {coaching_sid} "
-                            f"on disconnect"
+                            f"[WS] auto-stopped coaching session {coaching_sid} on disconnect"
                         )
                     except Exception as e:
                         logger.warning(f"[WS] coaching auto-stop failed: {e}")
@@ -1158,9 +1191,7 @@ class GatewayServer:
                 provider_id = params.get("providerId")
                 registration_id = params.get("registrationId")
                 if not isinstance(provider_id, str) or not provider_id:
-                    await self._ws_rpc_error(
-                        ws, rpc_id, "INVALID_REQUEST", "Missing providerId"
-                    )
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Missing providerId")
                     return
                 if not isinstance(registration_id, str) or not registration_id:
                     await self._ws_rpc_error(
@@ -1170,51 +1201,67 @@ class GatewayServer:
                 provider = self._browser_providers.get(provider_id)
                 if provider is None:
                     await self._ws_rpc_error(
-                        ws, rpc_id, "BROWSER_PROVIDER_UNAVAILABLE",
+                        ws,
+                        rpc_id,
+                        "BROWSER_PROVIDER_UNAVAILABLE",
                         "Browser provider is not registered",
                     )
                     return
                 if provider["client_id"] != client_id:
                     await self._ws_rpc_error(
-                        ws, rpc_id, "BROWSER_PROVIDER_NOT_OWNED",
+                        ws,
+                        rpc_id,
+                        "BROWSER_PROVIDER_NOT_OWNED",
                         "Browser provider belongs to another connection",
                     )
                     return
                 if provider["registrationId"] != registration_id:
                     await self._ws_rpc_error(
-                        ws, rpc_id, "BROWSER_REGISTRATION_EXPIRED",
+                        ws,
+                        rpc_id,
+                        "BROWSER_REGISTRATION_EXPIRED",
                         "Browser provider registration has expired",
                     )
                     return
                 cancelled = self._unregister_browser_provider(client_id)
-                await self._ws_rpc_reply(ws, rpc_id, {
-                    "ok": True,
-                    "providerId": provider_id,
-                    "cancelledRequests": cancelled,
-                })
+                await self._ws_rpc_reply(
+                    ws,
+                    rpc_id,
+                    {
+                        "ok": True,
+                        "providerId": provider_id,
+                        "cancelledRequests": cancelled,
+                    },
+                )
 
             elif method == "browser.providers.list":
-                await self._ws_rpc_reply(ws, rpc_id, {
-                    "providers": self._list_browser_providers(),
-                    "activeProviderId": self._browser_provider_active,
-                })
+                await self._ws_rpc_reply(
+                    ws,
+                    rpc_id,
+                    {
+                        "providers": self._list_browser_providers(),
+                        "activeProviderId": self._browser_provider_active,
+                    },
+                )
 
             elif method == "browser.provider.select":
                 provider_id = params.get("providerId")
                 if not isinstance(provider_id, str) or not provider_id:
-                    await self._ws_rpc_error(
-                        ws, rpc_id, "INVALID_REQUEST", "Missing providerId"
-                    )
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Missing providerId")
                     return
                 if not self._select_browser_provider(provider_id, explicit=True):
                     await self._ws_rpc_error(
                         ws, rpc_id, "NOT_FOUND", f"Browser provider not connected: {provider_id}"
                     )
                     return
-                await self._ws_rpc_reply(ws, rpc_id, {
-                    "ok": True,
-                    "activeProviderId": provider_id,
-                })
+                await self._ws_rpc_reply(
+                    ws,
+                    rpc_id,
+                    {
+                        "ok": True,
+                        "activeProviderId": provider_id,
+                    },
+                )
 
             else:
                 await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", f"Unknown method: {method}")
@@ -1224,7 +1271,9 @@ class GatewayServer:
 
     # --- RPC: exec.approval ---
 
-    async def _ws_rpc_exec_approval_resolve(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_exec_approval_resolve(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         approval_id = params.get("id", "")
         decision = params.get("decision", "")
         if decision not in ("allow-once", "allow-always", "deny"):
@@ -1232,28 +1281,37 @@ class GatewayServer:
             return
 
         from flowly.exec.approval_manager import get_approval_manager
+
         manager = get_approval_manager()
         if manager.resolve(approval_id, decision):
             await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
         else:
             await self._ws_rpc_error(ws, rpc_id, "NOT_FOUND", "Approval not found or expired")
 
-    async def _ws_rpc_exec_approval_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_exec_approval_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         from flowly.exec.approval_manager import get_approval_manager
+
         manager = get_approval_manager()
         pending = manager.list_pending()
-        items = [{
-            "id": p.id,
-            "command": p.request.command,
-            "sessionKey": p.session_key,
-            "expiresAt": p.expires_at,
-            "supportsAlways": getattr(p, "supports_always", True),
-        } for p in pending]
+        items = [
+            {
+                "id": p.id,
+                "command": p.request.command,
+                "sessionKey": p.session_key,
+                "expiresAt": p.expires_at,
+                "supportsAlways": getattr(p, "supports_always", True),
+            }
+            for p in pending
+        ]
         await self._ws_rpc_reply(ws, rpc_id, {"approvals": items})
 
     # --- RPC: agent.clarify ---
 
-    async def _ws_rpc_clarify_resolve(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_clarify_resolve(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         clarify_id = params.get("id", "")
         answer = params.get("answer", "")
         if not clarify_id:
@@ -1264,22 +1322,29 @@ class GatewayServer:
             return
 
         from flowly.clarify.manager import get_clarify_manager
+
         manager = get_clarify_manager()
         if manager.resolve(clarify_id, answer):
             await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
         else:
             await self._ws_rpc_error(ws, rpc_id, "NOT_FOUND", "Clarify not found or expired")
 
-    async def _ws_rpc_clarify_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_clarify_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         from flowly.clarify.manager import get_clarify_manager
+
         manager = get_clarify_manager()
-        items = [{
-            "id": p.id,
-            "question": p.question,
-            "choices": p.choices,
-            "sessionKey": p.session_key,
-            "expiresAt": p.expires_at,
-        } for p in manager.list_pending()]
+        items = [
+            {
+                "id": p.id,
+                "question": p.question,
+                "choices": p.choices,
+                "sessionKey": p.session_key,
+                "expiresAt": p.expires_at,
+            }
+            for p in manager.list_pending()
+        ]
         await self._ws_rpc_reply(ws, rpc_id, {"clarifies": items})
 
     async def broadcast_clarify_request(
@@ -1315,9 +1380,12 @@ class GatewayServer:
     def _audit_dir(self) -> Path:
         """Return the active profile's audit directory."""
         from flowly.profile import get_flowly_home
+
         return get_flowly_home() / "audit"
 
-    async def _ws_rpc_audit_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_audit_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """List audit entries with filter + pagination."""
         from flowly.audit.reader import read_entries
 
@@ -1345,7 +1413,9 @@ class GatewayServer:
         )
         await self._ws_rpc_reply(ws, rpc_id, result)
 
-    async def _ws_rpc_audit_stats(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_audit_stats(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """Folder-level stats for the Activity footer."""
         from flowly.audit.reader import get_stats
         from flowly.config.loader import load_config
@@ -1361,20 +1431,32 @@ class GatewayServer:
             pass
         await self._ws_rpc_reply(ws, rpc_id, stats)
 
-    async def _ws_rpc_audit_clear(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_audit_clear(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """Delete every audit file — confirmation lives in the desktop UI."""
         if not params.get("confirm"):
             await self._ws_rpc_error(
-                ws, rpc_id, "INVALID_REQUEST",
+                ws,
+                rpc_id,
+                "INVALID_REQUEST",
                 "Missing confirm=true",
             )
             return
 
         from flowly.audit.reader import clear_audit_logs
+
         result = clear_audit_logs(self._audit_dir())
         await self._ws_rpc_reply(ws, rpc_id, result)
 
-    async def broadcast_approval_request(self, approval_id: str, command: str, session_key: str | None, expires_at: float, supports_always: bool = True) -> None:
+    async def broadcast_approval_request(
+        self,
+        approval_id: str,
+        command: str,
+        session_key: str | None,
+        expires_at: float,
+        supports_always: bool = True,
+    ) -> None:
         """Push an exec approval request to all connected desktop/web clients."""
         event = {
             "type": "event",
@@ -1393,7 +1475,10 @@ class GatewayServer:
     # --- RPC: commands.list ---
 
     async def _ws_rpc_commands_list(
-        self, ws: web.WebSocketResponse, rpc_id: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        params: dict,
     ) -> None:
         """Catalogue every ``/`` command the user can type in chat.
 
@@ -1413,11 +1498,14 @@ class GatewayServer:
         at least the built-ins so the dropdown stays useful.
         """
         from flowly.agent.skill_bundles import build_commands_catalogue
+
         await self._ws_rpc_reply(ws, rpc_id, build_commands_catalogue())
 
     # --- RPC: subagents.list ---
 
-    async def _ws_rpc_board_snapshot(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_board_snapshot(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """Return the board snapshot for the TUI's inline /board view."""
         if self.board_store is None:
             await self._ws_rpc_reply(ws, rpc_id, {"snapshot": None})
@@ -1427,15 +1515,21 @@ class GatewayServer:
         except Exception as e:
             await self._ws_rpc_error(ws, rpc_id, "board_error", str(e))
 
-    async def _ws_rpc_board_action(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_board_action(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """Apply a board action from the TUI (/board run|del|done|cancel|add)."""
         result, _status = await self._apply_board_action(params or {})
         if result.get("ok"):
             await self._ws_rpc_reply(ws, rpc_id, result)
         else:
-            await self._ws_rpc_error(ws, rpc_id, "board_error", result.get("error", "board action failed"))
+            await self._ws_rpc_error(
+                ws, rpc_id, "board_error", result.get("error", "board action failed")
+            )
 
-    async def _ws_rpc_subagents_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_subagents_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         records = []
         if self.subagent_registry:
             self.subagent_registry._load_from_disk()
@@ -1444,18 +1538,24 @@ class GatewayServer:
         # Also include delegate tool running tasks
         if self._delegate_tool:
             for run_id, info in self._delegate_tool._running.items():
-                records.append(type('R', (), {
-                    'run_id': run_id,
-                    'label': info.get('label', f'@{info.get("agent_id", "?")}'),
-                    'task': info.get('task', ''),
-                    'model': info.get('model', ''),
-                    'outcome': None,
-                    'created_at': info.get('started_at', 0),
-                    'started_at': info.get('started_at', 0),
-                    'ended_at': None,
-                    'error': None,
-                    'parent_session_key': '',
-                })())
+                records.append(
+                    type(
+                        "R",
+                        (),
+                        {
+                            "run_id": run_id,
+                            "label": info.get("label", f"@{info.get('agent_id', '?')}"),
+                            "task": info.get("task", ""),
+                            "model": info.get("model", ""),
+                            "outcome": None,
+                            "created_at": info.get("started_at", 0),
+                            "started_at": info.get("started_at", 0),
+                            "ended_at": None,
+                            "error": None,
+                            "parent_session_key": "",
+                        },
+                    )()
+                )
 
         status_filter = params.get("status")
         if status_filter == "running":
@@ -1466,6 +1566,7 @@ class GatewayServer:
             records = [r for r in records if r.outcome in ("error", "timeout")]
 
         import time as _time
+
         tasks = []
         for r in sorted(records, key=lambda x: x.created_at, reverse=True):
             duration = None
@@ -1474,24 +1575,28 @@ class GatewayServer:
             elif r.started_at:
                 duration = round(_time.time() - r.started_at, 1)
 
-            tasks.append({
-                "runId": r.run_id,
-                "label": r.label,
-                "task": r.task,
-                "model": r.model,
-                "status": "running" if r.ended_at is None else (r.outcome or "unknown"),
-                "duration": duration,
-                "createdAt": r.created_at,
-                "endedAt": r.ended_at,
-                "error": r.error,
-                "parentSessionKey": r.parent_session_key,
-            })
+            tasks.append(
+                {
+                    "runId": r.run_id,
+                    "label": r.label,
+                    "task": r.task,
+                    "model": r.model,
+                    "status": "running" if r.ended_at is None else (r.outcome or "unknown"),
+                    "duration": duration,
+                    "createdAt": r.created_at,
+                    "endedAt": r.ended_at,
+                    "error": r.error,
+                    "parentSessionKey": r.parent_session_key,
+                }
+            )
 
         await self._ws_rpc_reply(ws, rpc_id, {"tasks": tasks})
 
     # --- RPC: subagents.cancel ---
 
-    async def _ws_rpc_subagents_cancel(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_subagents_cancel(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         run_id = params.get("runId", "")
         if not run_id:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "runId is required")
@@ -1503,6 +1608,7 @@ class GatewayServer:
 
         result_json = await self._subagent_manager.cancel(run_id)
         import json as _json
+
         result = _json.loads(result_json)
         await self._ws_rpc_reply(ws, rpc_id, result)
 
@@ -1513,36 +1619,50 @@ class GatewayServer:
     # file without a gateway restart.
 
     async def _ws_rpc_assistants_list(
-        self, ws: web.WebSocketResponse, rpc_id: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        params: dict,
     ) -> None:
         registry = getattr(self, "_assistant_registry", None)
         if registry is None:
             await self._ws_rpc_error(
-                ws, rpc_id, "NOT_AVAILABLE", "Assistant registry not wired",
+                ws,
+                rpc_id,
+                "NOT_AVAILABLE",
+                "Assistant registry not wired",
             )
             return
         assistants = []
         for a in registry.all():
-            assistants.append({
-                "name": a.name,
-                "description": a.description,
-                "model": a.model,
-                "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
-                "autoSaveArtifact": a.auto_save_artifact,
-                "artifactType": a.artifact_type,
-                "systemPrompt": a.system_prompt,
-                "builtin": a.builtin,
-                "sourcePath": str(a.source_path) if a.source_path else None,
-            })
+            assistants.append(
+                {
+                    "name": a.name,
+                    "description": a.description,
+                    "model": a.model,
+                    "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
+                    "autoSaveArtifact": a.auto_save_artifact,
+                    "artifactType": a.artifact_type,
+                    "systemPrompt": a.system_prompt,
+                    "builtin": a.builtin,
+                    "sourcePath": str(a.source_path) if a.source_path else None,
+                }
+            )
         await self._ws_rpc_reply(ws, rpc_id, {"assistants": assistants})
 
     async def _ws_rpc_assistants_reload(
-        self, ws: web.WebSocketResponse, rpc_id: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        params: dict,
     ) -> None:
         registry = getattr(self, "_assistant_registry", None)
         if registry is None:
             await self._ws_rpc_error(
-                ws, rpc_id, "NOT_AVAILABLE", "Assistant registry not wired",
+                ws,
+                rpc_id,
+                "NOT_AVAILABLE",
+                "Assistant registry not wired",
             )
             return
         report = registry.reload()
@@ -1580,7 +1700,9 @@ class GatewayServer:
         )
         if result.get("status") == "at_capacity":
             await self._ws_rpc_error(
-                ws, rpc_id, "CAPACITY",
+                ws,
+                rpc_id,
+                "CAPACITY",
                 f"Max {result.get('limit')} concurrent coaching sessions",
             )
             return
@@ -1592,49 +1714,68 @@ class GatewayServer:
         # `seq` and `timestamp` are kwargs from the manager (post-snapshot
         # refactor); they propagate into the event payload so clients can
         # deduplicate live events against rehydrated snapshots.
-        async def _tip_cb(sid: str, tip_text: str, confidence: float, *, seq: int = -1, timestamp: float | None = None) -> None:
+        async def _tip_cb(
+            sid: str,
+            tip_text: str,
+            confidence: float,
+            *,
+            seq: int = -1,
+            timestamp: float | None = None,
+        ) -> None:
             if ws.closed:
                 return
-            await self._ws_send(ws, {
-                "type": "event",
-                "event": "coaching.tip",
-                "data": {
-                    "sessionId": sid,
-                    "text": tip_text,
-                    "confidence": confidence,
-                    "timestamp": timestamp if timestamp is not None else _time.time(),
-                    "seq": seq,
+            await self._ws_send(
+                ws,
+                {
+                    "type": "event",
+                    "event": "coaching.tip",
+                    "data": {
+                        "sessionId": sid,
+                        "text": tip_text,
+                        "confidence": confidence,
+                        "timestamp": timestamp if timestamp is not None else _time.time(),
+                        "seq": seq,
+                    },
                 },
-            })
+            )
 
         async def _transcript_cb(sid: str, text: str, source: str, *, seq: int = -1) -> None:
             if ws.closed:
                 return
-            await self._ws_send(ws, {
-                "type": "event",
-                "event": "coaching.transcript",
-                "data": {"sessionId": sid, "text": text, "source": source, "seq": seq},
-            })
+            await self._ws_send(
+                ws,
+                {
+                    "type": "event",
+                    "event": "coaching.transcript",
+                    "data": {"sessionId": sid, "text": text, "source": source, "seq": seq},
+                },
+            )
 
         async def _finalized_cb(sid: str, summary: dict) -> None:
             if ws.closed:
                 return
-            await self._ws_send(ws, {
-                "type": "event",
-                "event": "coaching.finalized",
-                "data": {"sessionId": sid, **summary},
-            })
+            await self._ws_send(
+                ws,
+                {
+                    "type": "event",
+                    "event": "coaching.finalized",
+                    "data": {"sessionId": sid, **summary},
+                },
+            )
 
         async def _gate_decision_cb(sid: str, **payload) -> None:
             """Forward gate-decision events to the desktop renderer for the
             Diagnostics panel. Best-effort — never raises."""
             if ws.closed:
                 return
-            await self._ws_send(ws, {
-                "type": "event",
-                "event": "coaching.gate_decision",
-                "data": {"sessionId": sid, "timestamp": _time.time(), **payload},
-            })
+            await self._ws_send(
+                ws,
+                {
+                    "type": "event",
+                    "event": "coaching.gate_decision",
+                    "data": {"sessionId": sid, "timestamp": _time.time(), **payload},
+                },
+            )
 
         self._coaching_manager.on_tip(session_id, _tip_cb)
         self._coaching_manager.on_transcript(session_id, _transcript_cb)
@@ -1797,7 +1938,9 @@ class GatewayServer:
 
     # --- RPC: sessions.list ---
 
-    async def _ws_rpc_sessions_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_sessions_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.sessions:
             await self._ws_rpc_reply(ws, rpc_id, {"sessions": []})
             return
@@ -1810,13 +1953,15 @@ class GatewayServer:
             # desktop see); fall back to the key suffix only until the session
             # has been titled after its first exchange.
             title = s.get("title")
-            sessions.append({
-                "key": key,
-                "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
-                "title": title,
-                "createdAt": s.get("created_at"),
-                "updatedAt": s.get("updated_at"),
-            })
+            sessions.append(
+                {
+                    "key": key,
+                    "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
+                    "title": title,
+                    "createdAt": s.get("created_at"),
+                    "updatedAt": s.get("updated_at"),
+                }
+            )
 
         limit = params.get("limit")
         if limit and isinstance(limit, int):
@@ -1826,7 +1971,9 @@ class GatewayServer:
 
     # --- RPC: sessions.delete ---
 
-    async def _ws_rpc_sessions_delete(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_sessions_delete(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         session_key = params.get("sessionKey", "")
         if not session_key or not self.sessions:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "sessionKey is required")
@@ -1837,12 +1984,15 @@ class GatewayServer:
         # that happens to reuse this session_key would inherit the
         # deleted conversation's working directory.
         from flowly.runtime_cwd import clear_session_cwd
+
         clear_session_cwd(session_key)
         await self._ws_rpc_reply(ws, rpc_id, {"deleted": deleted, "sessionKey": session_key})
 
     # --- RPC: chat.history ---
 
-    async def _ws_rpc_chat_history(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_history(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         session_key = params.get("sessionKey", "")
         if not session_key or not self.sessions:
             await self._ws_rpc_reply(ws, rpc_id, {"sessionKey": session_key, "messages": []})
@@ -1904,17 +2054,25 @@ class GatewayServer:
                 msg["durationMs"] = max(0, int(duration_ms))
             messages.append(msg)
 
-        await self._ws_rpc_reply(ws, rpc_id, {
-            "sessionKey": session_key,
-            "sessionId": session_key,
-            "messages": messages,
-            "thinkingLevel": session.metadata.get("thinkingLevel"),
-        })
+        await self._ws_rpc_reply(
+            ws,
+            rpc_id,
+            {
+                "sessionKey": session_key,
+                "sessionId": session_key,
+                "messages": messages,
+                "thinkingLevel": session.metadata.get("thinkingLevel"),
+            },
+        )
 
     # --- RPC: chat.send ---
 
     async def _ws_rpc_chat_send(
-        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        client_id: str,
+        rpc_id: str,
+        params: dict,
     ) -> None:
         message = params.get("message", "")
         attachments = params.get("attachments") or []
@@ -1949,11 +2107,10 @@ class GatewayServer:
         cwd = params.get("cwd")
         if cwd:
             from flowly.runtime_cwd import set_session_cwd
+
             try:
                 set_session_cwd(session_key, cwd)
-                logger.info(
-                    f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}"
-                )
+                logger.info(f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}")
             except ValueError:
                 # Defensive: a client may ship a path that doesn't exist
                 # on this host (older client without per-kind cwd gating,
@@ -1972,9 +2129,7 @@ class GatewayServer:
         # `.get(..., False)` is strict-validation-free so an old bot
         # ignores this silently (forward compat already verified).
         voice_mode = bool(params.get("voiceMode", False))
-        render_capabilities = normalize_render_capabilities(
-            params.get("renderCapabilities")
-        )
+        render_capabilities = normalize_render_capabilities(params.get("renderCapabilities"))
 
         # Save attachments to disk
         media: list[str] = []
@@ -1992,21 +2147,32 @@ class GatewayServer:
         # Build streaming callback that pushes delta events to the session's
         # CURRENT socket (follows the latest viewer on re-entry).
         async def stream_callback(delta: str) -> None:
-            await self._session_send(session_key, ws, {
-                "type": "event",
-                "event": "agent",
-                "data": {
-                    "runId": run_id,
-                    "stream": "assistant",
-                    "data": {"text": delta},
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "agent",
+                    "data": {
+                        "runId": run_id,
+                        "stream": "assistant",
+                        "data": {"text": delta},
+                    },
                 },
-            })
+            )
 
         # Process in background so we don't block the recv loop.
         task = asyncio.create_task(
             self._run_chat(
-                ws, client_id, session_key, message, run_id,
-                stream_callback, media, voice_mode, browser_binding,
+                ws,
+                client_id,
+                session_key,
+                message,
+                run_id,
+                stream_callback,
+                media,
+                voice_mode,
+                browser_binding,
                 render_capabilities,
             )
         )
@@ -2033,6 +2199,7 @@ class GatewayServer:
         # Track the in-flight stream so a client that leaves and re-enters
         # mid-run can fetch the partial via the chat.inflight RPC.
         from flowly.agent import inflight
+
         inflight.begin(session_key, run_id, message)
 
         # Wrap the stream callback to accumulate full text for the final event.
@@ -2064,8 +2231,14 @@ class GatewayServer:
         try:
             assert self.on_chat_message is not None
             result = await self.on_chat_message(
-                session_key, message, run_id, tracking_callback, media or [], voice_mode,
-                iteration_callback, render_capabilities,
+                session_key,
+                message,
+                run_id,
+                tracking_callback,
+                media or [],
+                voice_mode,
+                iteration_callback,
+                render_capabilities,
             )
             # Back-compat: older callbacks returned bare text. Detect the
             # tuple form and fall back to ``{}`` metadata otherwise so
@@ -2082,20 +2255,28 @@ class GatewayServer:
             # crashes. Emit the native error event with stable machine fields
             # and safe copy; never place a wrapped SDK payload on the wire.
             if isinstance(provider_error, dict):
-                await self._session_send(session_key, ws, {
-                    "type": "event",
-                    "event": "chat",
-                    "data": {
-                        "state": "error",
-                        "runId": run_id,
-                        "sessionKey": session_key,
-                        "model": model,
-                        "errorCode": str(provider_error.get("code") or "MODEL_PROVIDER_UNAVAILABLE"),
-                        "errorTitle": str(provider_error.get("title") or "The model couldn't respond"),
-                        "errorMessage": str(provider_error.get("message") or response),
-                        "retryable": bool(provider_error.get("retryable", False)),
+                await self._session_send(
+                    session_key,
+                    ws,
+                    {
+                        "type": "event",
+                        "event": "chat",
+                        "data": {
+                            "state": "error",
+                            "runId": run_id,
+                            "sessionKey": session_key,
+                            "model": model,
+                            "errorCode": str(
+                                provider_error.get("code") or "MODEL_PROVIDER_UNAVAILABLE"
+                            ),
+                            "errorTitle": str(
+                                provider_error.get("title") or "The model couldn't respond"
+                            ),
+                            "errorMessage": str(provider_error.get("message") or response),
+                            "retryable": bool(provider_error.get("retryable", False)),
+                        },
                     },
-                })
+                )
                 return
 
             # Send final chat event. ``usage`` rides inside ``message`` so
@@ -2132,7 +2313,9 @@ class GatewayServer:
             if (metadata or {}).get("aborted") is True:
                 final_data["aborted"] = True
             metadata_duration = (metadata or {}).get("duration_ms")
-            if isinstance(metadata_duration, (int, float)) and not isinstance(metadata_duration, bool):
+            if isinstance(metadata_duration, (int, float)) and not isinstance(
+                metadata_duration, bool
+            ):
                 final_data["durationMs"] = max(0, int(metadata_duration))
             else:
                 final_data["durationMs"] = max(
@@ -2140,36 +2323,48 @@ class GatewayServer:
                     int((asyncio.get_running_loop().time() - run_started_at) * 1000),
                 )
 
-            await self._session_send(session_key, ws, {
-                "type": "event",
-                "event": "chat",
-                "data": final_data,
-            })
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "chat",
+                    "data": final_data,
+                },
+            )
             self._schedule_offline_chat_push(session_key, response)
         except asyncio.CancelledError:
-            await self._session_send(session_key, ws, {
-                "type": "event",
-                "event": "chat",
-                "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key},
-            })
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "chat",
+                    "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key},
+                },
+            )
         except Exception as e:
             # Unexpected exceptions are logged with their native detail for
             # operators, but the gateway wire contract never exposes reprs,
             # SDK payloads, filesystem paths, or provider internals.
             logger.exception(f"[WS] chat.send run {run_id} failed: {e}")
-            await self._session_send(session_key, ws, {
-                "type": "event",
-                "event": "chat",
-                "data": {
-                    "state": "error",
-                    "runId": run_id,
-                    "sessionKey": session_key,
-                    "errorCode": "AGENT_INTERNAL_ERROR",
-                    "errorTitle": "The agent hit an unexpected error",
-                    "errorMessage": "Try again. If this continues, restart the bot.",
-                    "retryable": True,
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "chat",
+                    "data": {
+                        "state": "error",
+                        "runId": run_id,
+                        "sessionKey": session_key,
+                        "errorCode": "AGENT_INTERNAL_ERROR",
+                        "errorTitle": "The agent hit an unexpected error",
+                        "errorMessage": "Try again. If this continues, restart the bot.",
+                        "retryable": True,
+                    },
                 },
-            })
+            )
         finally:
             _BROWSER_RUN_BINDING.reset(binding_token)
             # Run settled (final / aborted / error) — the partial is no
@@ -2178,7 +2373,9 @@ class GatewayServer:
 
     # --- RPC: chat.abort ---
 
-    async def _ws_rpc_chat_abort(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_abort(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         run_id = params.get("runId", "")
         cancelled = False
         abort_callback = getattr(self, "on_chat_abort", None)
@@ -2200,7 +2397,9 @@ class GatewayServer:
     # RPC: chat.compact / chat.clear
     # ------------------------------------------------------------------
 
-    async def _ws_rpc_chat_compact(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_compact(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.on_compact:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Compaction not available")
         session_key = params.get("sessionKey", "desktop:default")
@@ -2212,7 +2411,9 @@ class GatewayServer:
             logger.error(f"[WS] chat.compact error: {e}")
             await self._ws_rpc_error(ws, rpc_id, "INTERNAL", str(e))
 
-    async def _ws_rpc_chat_clear(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_clear(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.on_clear:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Clear not available")
         session_key = params.get("sessionKey", "desktop:default")
@@ -2223,7 +2424,9 @@ class GatewayServer:
             logger.error(f"[WS] chat.clear error: {e}")
             await self._ws_rpc_error(ws, rpc_id, "INTERNAL", str(e))
 
-    async def _ws_rpc_chat_retry(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_retry(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.on_retry:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Retry not available")
         session_key = params.get("sessionKey", "desktop:default")
@@ -2258,7 +2461,10 @@ class GatewayServer:
             pass
 
     async def _session_send(
-        self, session_key: str, fallback_ws: web.WebSocketResponse, data: dict,
+        self,
+        session_key: str,
+        fallback_ws: web.WebSocketResponse,
+        data: dict,
     ) -> None:
         """Send a live stream event to the session's CURRENT socket.
 
@@ -2276,7 +2482,9 @@ class GatewayServer:
             self._session_ws[session_key] = ws
 
     def _session_has_live_ws(
-        self, session_key: str, fallback_ws: web.WebSocketResponse | None = None,
+        self,
+        session_key: str,
+        fallback_ws: web.WebSocketResponse | None = None,
     ) -> bool:
         """Whether a session currently has an open direct-gateway socket."""
         target = self._session_ws.get(session_key) or fallback_ws
@@ -2313,7 +2521,11 @@ class GatewayServer:
         asyncio.create_task(_run())
 
     async def _handle_feature_rpc(
-        self, ws: web.WebSocketResponse, rpc_id: str, method: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        method: str,
+        params: dict,
     ) -> None:
         """Serve a feature RPC via the shared ``feature_rpc`` dispatch — the
         exact handlers the relay channel serves, so the desktop sees identical
@@ -2346,15 +2558,19 @@ class GatewayServer:
 
     def _schedule_feature_restart(self) -> None:
         """Bounce the gateway after the ACK frame has flushed."""
+
         async def _run() -> None:
             await asyncio.sleep(0.5)
             try:
                 from flowly.integrations.service_control import restart_gateway
+
                 await restart_gateway(
-                    health_check_host=self.host, health_check_port=self.port,
+                    health_check_host=self.host,
+                    health_check_port=self.port,
                 )
             except Exception:
                 logger.exception("[Gateway] feature restart failed")
+
         asyncio.create_task(_run())
 
     async def _ws_rpc_reply(self, ws: web.WebSocketResponse, rpc_id: str, result: Any) -> None:
@@ -2446,9 +2662,7 @@ class GatewayServer:
             or len(provider_id) > 64
             or any(char not in _BROWSER_PROVIDER_ID_CHARS for char in provider_id)
         ):
-            raise ValueError(
-                "providerId must be 1-64 ASCII letters, digits, '-', '_', '.', or ':'"
-            )
+            raise ValueError("providerId must be 1-64 ASCII letters, digits, '-', '_', '.', or ':'")
 
         raw_type = params.get("type")
         if raw_type is not None and not isinstance(raw_type, str):
@@ -2470,9 +2684,7 @@ class GatewayServer:
         if legacy and provider_type not in _BROWSER_PROVIDER_TYPES:
             provider_type = "chrome_extension"
         if provider_type not in _BROWSER_PROVIDER_TYPES:
-            raise ValueError(
-                f"type must be one of: {', '.join(sorted(_BROWSER_PROVIDER_TYPES))}"
-            )
+            raise ValueError(f"type must be one of: {', '.join(sorted(_BROWSER_PROVIDER_TYPES))}")
 
         display_name = params.get("displayName")
         if not isinstance(display_name, str) or not display_name.strip():
@@ -2553,26 +2765,23 @@ class GatewayServer:
                 key=lambda item: item["registrationOrder"],
                 reverse=True,
             ):
-                if candidate["id"] != provider_id and self._select_browser_provider(candidate["id"]):
+                if candidate["id"] != provider_id and self._select_browser_provider(
+                    candidate["id"]
+                ):
                     break
 
         # Preserve released extension behaviour (newest registration wins)
         # until a UI/user explicitly selects a provider. Re-registering the
         # selected provider refreshes its connection without losing selection.
-        if (
-            not session_scoped
-            and (
-                not self._browser_provider_active
-                or not self._browser_provider_selection_explicit
-                or self._browser_provider_active == provider_id
-            )
+        if not session_scoped and (
+            not self._browser_provider_active
+            or not self._browser_provider_selection_explicit
+            or self._browser_provider_active == provider_id
         ):
             self._select_browser_provider(provider_id)
         return {
             "ok": True,
-            "provider": self._public_browser_provider(
-                provider, include_registration=True
-            ),
+            "provider": self._public_browser_provider(provider, include_registration=True),
         }
 
     def _public_browser_provider(
@@ -2747,14 +2956,17 @@ class GatewayServer:
         provider["activeRequestId"] = request_id
 
         try:
-            await self._ws_send(ws, {
-                "type": "tool_request",
-                "id": request_id,
-                "action": action,
-                "params": params,
-                "providerId": target_provider_id,
-                "registrationId": provider["registrationId"],
-            })
+            await self._ws_send(
+                ws,
+                {
+                    "type": "tool_request",
+                    "id": request_id,
+                    "action": action,
+                    "params": params,
+                    "providerId": target_provider_id,
+                    "registrationId": provider["registrationId"],
+                },
+            )
             return await future
         finally:
             self._extension_pending.pop(request_id, None)
@@ -2763,9 +2975,7 @@ class GatewayServer:
             if provider.get("activeRequestId") == request_id:
                 provider.pop("activeRequestId", None)
 
-    async def send_extension_tool_request(
-        self, request_id: str, action: str, params: dict
-    ) -> dict:
+    async def send_extension_tool_request(self, request_id: str, action: str, params: dict) -> dict:
         """Compatibility alias for released agent/browser tool code."""
         return await self.send_browser_tool_request(request_id, action, params)
 
@@ -2784,10 +2994,11 @@ class GatewayServer:
         provider_id = self._browser_client_provider.get(client_id)
         provider = self._browser_providers.get(provider_id or "")
         received_registration_id = data.get("registrationId")
-        if received_registration_id is not None and received_registration_id != expected_registration_id:
-            logger.warning(
-                f"[WS] Ignoring browser result {request_id!r} from stale registration"
-            )
+        if (
+            received_registration_id is not None
+            and received_registration_id != expected_registration_id
+        ):
+            logger.warning(f"[WS] Ignoring browser result {request_id!r} from stale registration")
             return
         if (
             provider is not None
@@ -2862,18 +3073,25 @@ class GatewayServer:
             except Exception as e:
                 logger.debug(f"agent_state push to {client_id} failed: {e}")
 
-    async def _ws_rpc_error(self, ws: web.WebSocketResponse, rpc_id: str, code: str, message: str) -> None:
-        await self._ws_send(ws, {
-            "type": "rpc",
-            "id": rpc_id,
-            "error": {"code": code, "message": message},
-        })
+    async def _ws_rpc_error(
+        self, ws: web.WebSocketResponse, rpc_id: str, code: str, message: str
+    ) -> None:
+        await self._ws_send(
+            ws,
+            {
+                "type": "rpc",
+                "id": rpc_id,
+                "error": {"code": code, "message": message},
+            },
+        )
 
     # ------------------------------------------------------------------
     # RPC: artifacts
     # ------------------------------------------------------------------
 
-    async def _ws_rpc_artifacts_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         limit = int(params.get("limit", 50))
@@ -2898,7 +3116,9 @@ class GatewayServer:
             results = [artifact_summary(a) for a in results]
         await self._ws_rpc_reply(ws, rpc_id, {"artifacts": results})
 
-    async def _ws_rpc_artifacts_get(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_get(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact = self.artifact_store.get(params.get("id", ""))
@@ -2906,16 +3126,22 @@ class GatewayServer:
             return await self._ws_rpc_error(ws, rpc_id, "NOT_FOUND", "Artifact not found")
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
 
-    async def _ws_rpc_artifacts_create(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_create(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         art_type = params.get("type", "")
         title = params.get("title", "")
         content = params.get("content", "")
         if not art_type or not title or not content:
-            return await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "type, title, content required")
+            return await self._ws_rpc_error(
+                ws, rpc_id, "INVALID_REQUEST", "type, title, content required"
+            )
         artifact = self.artifact_store.create(
-            type=art_type, title=title, content=content,
+            type=art_type,
+            title=title,
+            content=content,
             pinned=params.get("pinned", False),
             dashboard_size=params.get("dashboardSize", "medium"),
             tags=params.get("tags"),
@@ -2924,7 +3150,9 @@ class GatewayServer:
         await self._broadcast_artifact_event("artifact.created", artifact)
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
 
-    async def _ws_rpc_artifacts_update(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_update(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact_id = params.get("id", "")
@@ -2943,7 +3171,9 @@ class GatewayServer:
         await self._broadcast_artifact_event("artifact.updated", artifact)
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
 
-    async def _ws_rpc_artifacts_delete(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_delete(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact_id = params.get("id", "")
@@ -2955,7 +3185,9 @@ class GatewayServer:
         await self._broadcast_artifact_event("artifact.deleted", {"id": artifact_id})
         await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
 
-    async def _ws_rpc_artifacts_pin(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_pin(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact_id = params.get("id", "")
@@ -2968,7 +3200,9 @@ class GatewayServer:
         await self._broadcast_artifact_event("artifact.updated", artifact)
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
 
-    async def _ws_rpc_artifacts_versions(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_versions(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact_id = params.get("id", "")
@@ -3125,6 +3359,7 @@ class GatewayServer:
         if self.on_send and self._control_token:
             try:
                 from flowly.mcp.server.control import write_api_file
+
                 write_api_file(self.host, self.port, self._control_token)
             except Exception as exc:  # pragma: no cover
                 logger.debug("MCP control advertise failed: {}", exc)
@@ -3138,6 +3373,7 @@ class GatewayServer:
         if self.on_send and self._control_token:
             try:
                 from flowly.mcp.server.control import remove_api_file
+
                 remove_api_file()
             except Exception:
                 pass

@@ -27,7 +27,6 @@ import threading
 from datetime import datetime
 from typing import Any
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -50,27 +49,110 @@ def get_stderr_log() -> Any:
         return _log_fh
 
 
-def write_stderr_log_header(server_name: str) -> None:
+def write_stderr_log_header(server_name: str) -> int | None:
     """Emit a session marker before launching *server_name*.
 
     Lets operators grep the shared log for a particular server's output
     range without needing per-line prefixes (which would force a pipe +
-    reader thread and complicate shutdown).
+    reader thread and complicate shutdown). Returns the byte offset immediately
+    after the marker so a failed startup can inspect only its bounded excerpt.
     """
     fh = get_stderr_log()
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         fh.write(f"\n===== [{ts}] starting MCP server '{server_name}' =====\n")
         fh.flush()
+        return os.lseek(fh.fileno(), 0, os.SEEK_CUR)
     except Exception:
         # Worst-case: log header just doesn't appear. The subprocess
         # output itself still flows.
-        pass
+        return None
+
+
+def read_stderr_excerpt(offset: int | None, max_bytes: int = 128 * 1024) -> str:
+    """Read a bounded stderr excerpt written after *offset*.
+
+    A separate read handle avoids disturbing the append descriptor shared with
+    subprocesses. Concurrent MCP servers may interleave output in the shared
+    log, so this is diagnostic-only and always size-bounded.
+    """
+    if offset is None:
+        return ""
+    fh = get_stderr_log()
+    try:
+        fh.flush()
+        path = getattr(fh, "name", "")
+        if not path or path == os.devnull:
+            return ""
+        size = os.path.getsize(path)
+        start = max(offset, size - max_bytes)
+        with open(path, "rb") as reader:
+            reader.seek(start)
+            text = reader.read(max_bytes).decode("utf-8", errors="replace")
+        # Never attribute another concurrently-started server's output to this
+        # one. Losing a diagnostic is safer than presenting the wrong cause.
+        next_header = text.find("\n===== [")
+        return text[:next_header] if next_header >= 0 else text
+    except (OSError, ValueError):
+        return ""
+
+
+def summarize_stderr_excerpt(text: str) -> str:
+    """Return one safe, actionable startup diagnostic from stderr."""
+    if not text:
+        return ""
+
+    # mcp-remote emits this shape when the supplied URL is a registry/server
+    # manifest rather than the actual JSON-RPC endpoint. This was previously
+    # hidden behind a generic TaskGroup error and then a fake 300 s timeout.
+    if (
+        "ZodError" in text
+        and '"$schema"' in text
+        and '"remotes"' in text
+        and "Invalid input" in text
+    ):
+        return (
+            "the URL returned an MCP manifest instead of JSON-RPC; "
+            "use the endpoint in remotes[].url"
+        )
+
+    candidates: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if (
+            not line
+            or line.startswith("at ")
+            or line.startswith("=====")
+            or line == "Shutting down..."
+        ):
+            continue
+        lowered = line.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "connection error",
+                "error:",
+                "failed",
+                "unauthorized",
+                "forbidden",
+                "econnrefused",
+                "enotfound",
+            )
+        ):
+            candidates.append(line)
+
+    if not candidates:
+        return ""
+
+    from flowly.mcp.security import sanitize_error
+
+    return sanitize_error(candidates[-1])[:500]
 
 
 def _open_log() -> Any:
     try:
         from flowly.profile import get_flowly_home
+
         log_dir = get_flowly_home() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         path = log_dir / "mcp-stderr.log"

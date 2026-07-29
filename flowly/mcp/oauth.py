@@ -35,7 +35,6 @@ from typing import Any
 
 from flowly.mcp.schema import sanitize_mcp_name_component
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +47,7 @@ try:
         OAuthClientMetadata,
         OAuthToken,
     )
+
     _OAUTH_AVAILABLE = True
 except ImportError:  # pragma: no cover — older SDK without auth module
     TokenStorage = object  # type: ignore
@@ -60,6 +60,7 @@ except ImportError:  # pragma: no cover — older SDK without auth module
 _CALLBACK_HOST = "127.0.0.1"
 _CALLBACK_PORT = 8765
 _CALLBACK_PATH = "/callback"
+OAUTH_CALLBACK_TIMEOUT_SECONDS = 300.0
 
 
 def oauth_available() -> bool:
@@ -73,10 +74,12 @@ def oauth_available() -> bool:
 
 def _tokens_dir() -> Path:
     from flowly.profile import get_flowly_home
+
     path = get_flowly_home() / "mcp-tokens"
     path.mkdir(parents=True, exist_ok=True)
     try:
         from flowly.utils.file_security import secure_dir
+
         secure_dir(path)  # POSIX chmod; real owner-only ACL on Windows
     except OSError:
         pass
@@ -110,11 +113,17 @@ class FlowlyTokenStorage(TokenStorage):  # type: ignore[misc]
 
     def _write(self, data: dict[str, Any]) -> None:
         import secrets
+
         tmp = self._path.with_suffix(f".tmp.{secrets.token_hex(4)}")
         try:
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            os.replace(str(tmp), str(self._path))
             from flowly.utils.file_security import secure_file
+
+            # Set owner-only permissions before the atomic rename so there is
+            # no window where the destination contains credentials with the
+            # process umask's broader default mode.
+            secure_file(tmp)
+            os.replace(str(tmp), str(self._path))
             secure_file(self._path)  # POSIX chmod; real owner-only ACL on Windows
         except OSError as exc:
             logger.warning("MCP token write failed for '%s': %s", self._server_name, exc)
@@ -166,6 +175,52 @@ def has_tokens(server_name: str) -> bool:
     return _token_file(server_name).exists()
 
 
+def backup_tokens(server_name: str) -> tuple[bool, bytes] | None:
+    """Capture opaque token-file bytes before a destructive re-auth.
+
+    Returns ``(existed, data)`` or ``None`` if an existing file could not be
+    read. Callers must abort re-auth on ``None`` rather than risk destroying
+    the last working credentials.
+    """
+    path = _token_file(server_name)
+    if not path.exists():
+        return False, b""
+    try:
+        return True, path.read_bytes()
+    except OSError as exc:
+        logger.warning("MCP token backup failed for '%s': %s", server_name, exc)
+        return None
+
+
+def restore_tokens(server_name: str, backup: tuple[bool, bytes]) -> bool:
+    """Atomically restore a token backup after failed/cancelled re-auth."""
+    existed, data = backup
+    path = _token_file(server_name)
+    if not existed:
+        try:
+            path.unlink(missing_ok=True)
+            return True
+        except OSError as exc:
+            logger.warning("MCP partial-token cleanup failed for '%s': %s", server_name, exc)
+            return False
+
+    import secrets
+
+    tmp = path.with_suffix(f".restore.{secrets.token_hex(4)}")
+    try:
+        tmp.write_bytes(data)
+        from flowly.utils.file_security import secure_file
+
+        secure_file(tmp)
+        os.replace(str(tmp), str(path))
+        secure_file(path)
+        return True
+    except OSError as exc:
+        logger.warning("MCP token restore failed for '%s': %s", server_name, exc)
+        tmp.unlink(missing_ok=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Callback server (one-shot localhost capture of the OAuth redirect)
 # ---------------------------------------------------------------------------
@@ -181,8 +236,9 @@ class _CallbackResult:
 
 def _run_callback_server(result: _CallbackResult, timeout: float) -> None:
     """Serve a single OAuth redirect on the pinned localhost port."""
+    import time
     from http.server import BaseHTTPRequestHandler, HTTPServer
-    from urllib.parse import urlparse, parse_qs
+    from urllib.parse import parse_qs, urlparse
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
@@ -210,18 +266,26 @@ def _run_callback_server(result: _CallbackResult, timeout: float) -> None:
         def log_message(self, *args):  # silence default stderr logging
             return
 
-    server = HTTPServer((_CALLBACK_HOST, _CALLBACK_PORT), _Handler)
-    server.timeout = timeout
-    # Handle one request (the redirect), then we're done.
-    deadline_handler = threading.Thread(
-        target=lambda: result.event.wait(timeout), daemon=True,
-    )
-    deadline_handler.start()
     try:
-        while not result.event.is_set():
+        server = HTTPServer((_CALLBACK_HOST, _CALLBACK_PORT), _Handler)
+    except OSError as exc:
+        result.error = f"could not bind localhost callback port {_CALLBACK_PORT}: {exc}"
+        result.event.set()
+        return
+
+    # Poll at a short interval so the deadline closes the listening socket
+    # promptly. The previous single 300 s handle_request timeout re-entered
+    # forever after expiry, leaking a daemon thread and keeping port 8765 busy.
+    deadline = time.monotonic() + max(0.0, timeout)
+    server.timeout = min(0.25, max(0.01, timeout))
+    try:
+        while not result.event.is_set() and time.monotonic() < deadline:
             server.handle_request()
             if result.code or result.error:
                 break
+        if not result.event.is_set():
+            result.error = "OAuth callback timed out without a code"
+            result.event.set()
     finally:
         try:
             server.server_close()
@@ -240,7 +304,7 @@ def build_oauth_provider(
     *,
     interactive: bool,
     scope: str | None = None,
-    callback_timeout: float = 300.0,
+    callback_timeout: float = OAUTH_CALLBACK_TIMEOUT_SECONDS,
 ) -> Any | None:
     """Construct an ``OAuthClientProvider`` for *url*, or ``None``.
 
@@ -269,6 +333,7 @@ def build_oauth_provider(
                 f"`flowly mcp login {server_name}`"
             )
         import webbrowser
+
         print(f"\n  Opening browser to authorize MCP server '{server_name}'...")
         print(f"  If it doesn't open, visit:\n    {authorization_url}\n")
         try:
@@ -278,10 +343,9 @@ def build_oauth_provider(
 
     async def _callback_handler() -> tuple[str, str | None]:
         if not interactive:
-            raise RuntimeError(
-                f"MCP server '{server_name}' needs interactive OAuth callback"
-            )
+            raise RuntimeError(f"MCP server '{server_name}' needs interactive OAuth callback")
         import asyncio
+
         result = _CallbackResult()
         thread = threading.Thread(
             target=_run_callback_server,
@@ -289,7 +353,24 @@ def build_oauth_provider(
             daemon=True,
         )
         thread.start()
-        await asyncio.to_thread(result.event.wait, callback_timeout)
+        try:
+            completed = await asyncio.to_thread(result.event.wait, callback_timeout)
+        except asyncio.CancelledError:
+            # Cancelling the MCP probe must also stop the one-shot HTTP server;
+            # otherwise it can retain port 8765 until the human-auth deadline
+            # and make the next sign-in fail with "address already in use".
+            if not result.event.is_set():
+                result.error = "OAuth callback cancelled"
+                result.event.set()
+            await asyncio.to_thread(thread.join, 1.0)
+            raise
+        if not completed and not result.event.is_set():
+            result.error = "OAuth callback timed out without a code"
+            result.event.set()
+        # The callback server polls at 250 ms and closes its listening socket
+        # in finally. Joining here makes successful, failed, and timed-out
+        # flows all release the port before the RPC completes.
+        await asyncio.to_thread(thread.join, 1.0)
         if result.error:
             raise RuntimeError(f"OAuth callback error: {result.error}")
         if not result.code:
