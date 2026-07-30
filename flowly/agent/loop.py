@@ -5726,6 +5726,10 @@ class AgentLoop:
             reply_media=reply_media or None,
             aborted=turn_aborted,
             duration_ms=turn_duration_ms,
+            # Provider failures are terminal, but they are not successful
+            # assistant completions. Keep their visible error text in history
+            # without advancing the cross-client unread identity.
+            run_id=(outbound_run_id or None) if not provider_error else None,
         )
         self.sessions.save(session)
 
@@ -5961,6 +5965,7 @@ class AgentLoop:
             # and stay in the LLM context, but must never render in the chat as a
             # user message — only the assistant's summary is user-facing.
             user_display_hidden=True,
+            run_id=(msg.metadata.get("run_id") or None),
         )
         self.sessions.save(session)
 

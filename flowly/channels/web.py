@@ -509,6 +509,11 @@ class WebChannel(BaseChannel):
         # know the field see exactly the same wire shape as before.
         if msg.metadata.get("aborted"):
             data_block["aborted"] = True
+        if isinstance(msg.metadata.get("error"), dict):
+            # The relay may persist the user-facing error response, but must
+            # not promote it to a successful assistant completion or send an
+            # unread push notification.
+            data_block["failed"] = True
         duration_ms = msg.metadata.get("duration_ms")
         if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
             data_block["durationMs"] = max(0, int(duration_ms))

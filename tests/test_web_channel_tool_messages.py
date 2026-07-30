@@ -169,6 +169,29 @@ async def test_aborted_final_includes_partial_marker_and_duration(channel) -> No
 
 
 @pytest.mark.asyncio
+async def test_provider_failure_is_not_a_successful_completion(channel) -> None:
+    msg = OutboundMessage(
+        channel="web",
+        chat_id="sess-1",
+        content="The model could not respond.",
+        metadata={
+            "stream_run_id": "chat-send-id",
+            "error": {
+                "code": "MODEL_PROVIDER_UNAVAILABLE",
+                "message": "Try again.",
+            },
+        },
+    )
+
+    await channel.send(msg)
+
+    data = channel._capture[0]["data"]
+    assert data["state"] == "final"
+    assert data["failed"] is True
+    assert data["streamRunId"] == "chat-send-id"
+
+
+@pytest.mark.asyncio
 async def test_final_keeps_message_id_distinct_from_stream_lifecycle_id(channel) -> None:
     """Relay persistence and live stream correlation use different ids.
 

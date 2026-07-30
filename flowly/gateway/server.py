@@ -8,6 +8,7 @@ import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -1960,6 +1961,8 @@ class GatewayServer:
                     "title": title,
                     "createdAt": s.get("created_at"),
                     "updatedAt": s.get("updated_at"),
+                    "lastAssistantRunId": s.get("last_assistant_run_id"),
+                    "lastAssistantAt": s.get("last_assistant_at"),
                 }
             )
 
@@ -2049,6 +2052,9 @@ class GatewayServer:
                 msg["usage"] = m["usage"]
             if m.get("aborted") is True:
                 msg["aborted"] = True
+            run_id = m.get("run_id")
+            if isinstance(run_id, str) and run_id:
+                msg["runId"] = run_id
             duration_ms = m.get("duration_ms")
             if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
                 msg["durationMs"] = max(0, int(duration_ms))
@@ -2308,6 +2314,7 @@ class GatewayServer:
                 "runId": run_id,
                 "sessionKey": session_key,
                 "model": model,
+                "completedAt": datetime.now(timezone.utc).isoformat(),
                 "message": final_message,
             }
             if (metadata or {}).get("aborted") is True:
@@ -2332,7 +2339,13 @@ class GatewayServer:
                     "data": final_data,
                 },
             )
-            self._schedule_offline_chat_push(session_key, response)
+            if not final_data.get("aborted"):
+                self._schedule_offline_chat_push(
+                    session_key,
+                    response,
+                    run_id=run_id,
+                    completed_at=final_data["completedAt"],
+                )
         except asyncio.CancelledError:
             await self._session_send(
                 session_key,
@@ -2490,7 +2503,14 @@ class GatewayServer:
         target = self._session_ws.get(session_key) or fallback_ws
         return bool(target is not None and not target.closed)
 
-    def _schedule_offline_chat_push(self, session_key: str, text: str) -> None:
+    def _schedule_offline_chat_push(
+        self,
+        session_key: str,
+        text: str,
+        *,
+        run_id: str = "",
+        completed_at: str | None = None,
+    ) -> None:
         """Wake registered iOS/Android clients when a direct chat finished offline.
 
         Relay-backed chats are handled by the hosted relay's Firestore/device
@@ -2498,22 +2518,27 @@ class GatewayServer:
         clients install with ``push.register``; it is a no-op when no device has
         registered push credentials.
         """
-        if not text or self._session_has_live_ws(session_key):
+        if self._session_has_live_ws(session_key):
             return
 
         preview = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
         if not preview:
-            return
+            preview = "New message"
 
         async def _run() -> None:
             try:
                 from flowly.push.relay_push import notify_devices
 
+                push_data = {"type": "chat"}
+                if run_id:
+                    push_data["runId"] = run_id
+                if completed_at:
+                    push_data["completedAt"] = completed_at
                 await notify_devices(
                     "Flowly",
                     preview[:140],
                     conversation_id=session_key,
-                    data={"type": "chat"},
+                    data=push_data,
                 )
             except Exception as exc:  # pragma: no cover - best-effort background notify
                 logger.debug(f"[push] offline chat notify skipped: {exc}")

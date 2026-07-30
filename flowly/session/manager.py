@@ -7,7 +7,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger
@@ -278,6 +278,7 @@ class Session:
         user_display_hidden: bool = False,
         aborted: bool = False,
         duration_ms: int | None = None,
+        run_id: str | None = None,
     ) -> None:
         """Append a completed turn — user message + all assistant/tool
         messages the loop produced — to the session.
@@ -330,6 +331,11 @@ class Session:
             End-to-end turn duration persisted on the closing assistant
             record. Internal bookkeeping only; projected away before the
             transcript is sent back to an LLM.
+        run_id:
+            Stable identity of this assistant turn. Persisted on the closing
+            assistant record and, for non-aborted turns, copied to session
+            metadata so lightweight ``sessions.list`` callers can reconcile
+            unread state without scanning chat history.
         """
         # Persist the media file paths alongside the user message so chat
         # history can reconstruct attachment previews (the direct gateway has
@@ -362,6 +368,9 @@ class Session:
 
         clean_usage = _filter_usage(usage)
 
+        clean_run_id = run_id.strip() if isinstance(run_id, str) else ""
+        persisted_closing: dict[str, Any] | None = None
+
         for i, new_msg in enumerate(new_messages):
             extras = {
                 k: new_msg[k]
@@ -383,6 +392,8 @@ class Session:
                 extras["aborted"] = True
             if i == closing_idx and duration_ms is not None:
                 extras["duration_ms"] = max(0, int(duration_ms))
+            if i == closing_idx and clean_run_id:
+                extras["run_id"] = clean_run_id
             content = new_msg.get("content") or ""
             if i == closing_idx and final_content:
                 content = final_content
@@ -391,6 +402,8 @@ class Session:
                 content,
                 **extras,
             )
+            if i == closing_idx:
+                persisted_closing = self.messages[-1]
 
         # Loop ended without a plain-text closing assistant but the
         # caller still produced a final_content (synthesised fallback
@@ -405,7 +418,19 @@ class Session:
                 extras["aborted"] = True
             if duration_ms is not None:
                 extras["duration_ms"] = max(0, int(duration_ms))
+            if clean_run_id:
+                extras["run_id"] = clean_run_id
             self.add_message("assistant", final_content or "", **extras)
+            persisted_closing = self.messages[-1]
+
+        # Only a completed, user-visible assistant terminal advances unread
+        # identity. A stopped turn remains in history but must not light up a
+        # conversation after the user intentionally aborted it.
+        if clean_run_id and persisted_closing is not None and not aborted:
+            self.metadata["last_assistant_run_id"] = clean_run_id
+            # Completion metadata uses an unambiguous UTC timestamp without
+            # rewriting the message's existing display/history timestamp.
+            self.metadata["last_assistant_at"] = datetime.now(timezone.utc).isoformat()
 
         # Roll the turn's usage into session-wide totals so list_sessions
         # / future cost dashboards can read aggregates without scanning
@@ -813,6 +838,12 @@ class SessionManager:
                                 # exchange is titled. Clients fall back to the
                                 # key suffix when absent.
                                 "title": (data.get("metadata") or {}).get("title"),
+                                "last_assistant_run_id": (
+                                    data.get("metadata") or {}
+                                ).get("last_assistant_run_id"),
+                                "last_assistant_at": (
+                                    data.get("metadata") or {}
+                                ).get("last_assistant_at"),
                                 "path": str(path)
                             })
             except Exception:

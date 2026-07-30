@@ -10,6 +10,8 @@ dead socket and the re-entered view freezes at the snapshot. ``bind_session_ws``
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -77,6 +79,33 @@ def test_bind_ignores_empty_session_key() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_history_surfaces_assistant_completion_identity() -> None:
+    srv = _bare_server()
+    srv.sessions = SimpleNamespace(
+        get_or_create=lambda _key: SimpleNamespace(metadata={}),
+        get_full_messages=lambda _key: [
+            {
+                "role": "assistant",
+                "content": "Done.",
+                "timestamp": "2026-07-30T10:00:00+00:00",
+                "run_id": "run-1",
+            }
+        ],
+    )
+    srv._ws_rpc_reply = AsyncMock()
+
+    await srv._ws_rpc_chat_history(
+        _FakeWS(),
+        "rpc-1",
+        {"sessionKey": "ios:chat-1"},
+    )
+
+    payload = srv._ws_rpc_reply.await_args.args[2]
+    assert payload["messages"][0]["runId"] == "run-1"
+    assert payload["messages"][0]["timestamp"] == "2026-07-30T10:00:00+00:00"
+
+
+@pytest.mark.asyncio
 async def test_offline_chat_final_schedules_push(monkeypatch) -> None:
     srv = _bare_server()
     calls: list[dict] = []
@@ -87,14 +116,23 @@ async def test_offline_chat_final_schedules_push(monkeypatch) -> None:
     from flowly.push import relay_push
 
     monkeypatch.setattr(relay_push, "notify_devices", fake_notify)
-    srv._schedule_offline_chat_push("ios:chat-1", "hello\nsecond line")
+    srv._schedule_offline_chat_push(
+        "ios:chat-1",
+        "hello\nsecond line",
+        run_id="run-1",
+        completed_at="2026-07-30T10:00:00Z",
+    )
     await asyncio.sleep(0)
 
     assert calls == [{
         "title": "Flowly",
         "body": "hello",
         "conversation_id": "ios:chat-1",
-        "data": {"type": "chat"},
+        "data": {
+            "type": "chat",
+            "runId": "run-1",
+            "completedAt": "2026-07-30T10:00:00Z",
+        },
     }]
 
 
@@ -115,3 +153,26 @@ async def test_offline_chat_final_skips_push_when_session_live(monkeypatch) -> N
     await asyncio.sleep(0)
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_offline_media_only_final_still_schedules_attention_push(monkeypatch) -> None:
+    srv = _bare_server()
+    calls: list[dict] = []
+
+    async def fake_notify(title: str, body: str, **kwargs) -> None:
+        calls.append({"title": title, "body": body, **kwargs})
+
+    from flowly.push import relay_push
+
+    monkeypatch.setattr(relay_push, "notify_devices", fake_notify)
+    srv._schedule_offline_chat_push(
+        "ios:chat-1",
+        "",
+        run_id="run-media",
+        completed_at="2026-07-30T10:00:00Z",
+    )
+    await asyncio.sleep(0)
+
+    assert calls[0]["body"] == "New message"
+    assert calls[0]["data"]["runId"] == "run-media"

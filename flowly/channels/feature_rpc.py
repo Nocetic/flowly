@@ -2457,21 +2457,26 @@ def kg_delete_entity(params: dict) -> dict:
 # ── Sessions (Activity → Sessions) ──────────────────────────────────────────
 
 
-def _session_title(path) -> str | None:
-    """Auto-generated chat title from a session's metadata line (first jsonl
-    line), or None. Cheap: reads only the opening line, not the whole file."""
+def _session_metadata(path) -> dict:
+    """Session metadata from the opening JSONL line, or an empty dictionary."""
     try:
         with path.open("r", encoding="utf-8") as fh:
             first = fh.readline().strip()
         if not first:
-            return None
+            return {}
         meta = json.loads(first)
         if meta.get("_type") != "metadata":
-            return None
-        title = (meta.get("metadata") or {}).get("title")
-        return title if isinstance(title, str) and title.strip() else None
+            return {}
+        value = meta.get("metadata")
+        return value if isinstance(value, dict) else {}
     except Exception:
-        return None
+        return {}
+
+
+def _session_title(path) -> str | None:
+    """Auto-generated chat title from a session's metadata line."""
+    title = _session_metadata(path).get("title")
+    return title if isinstance(title, str) and title.strip() else None
 
 
 def sessions_list() -> dict:
@@ -2504,7 +2509,22 @@ def sessions_list() -> dict:
                 # instead of a random session-key suffix. The client writes it
                 # to its (encrypted) Firestore conversation doc; the relay
                 # itself is untouched — this only enriches the RPC payload.
-                title = _session_title(p)
+                metadata = _session_metadata(p)
+                raw_title = metadata.get("title")
+                title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
+                raw_completion_id = metadata.get("last_assistant_run_id")
+                last_assistant_run_id = (
+                    raw_completion_id.strip()
+                    if isinstance(raw_completion_id, str) and raw_completion_id.strip()
+                    else None
+                )
+                raw_completed_at = metadata.get("last_assistant_at")
+                last_assistant_at = (
+                    raw_completed_at
+                    if isinstance(raw_completed_at, (str, int, float))
+                    and not isinstance(raw_completed_at, bool)
+                    else None
+                )
                 out.append(
                     {
                         "key": key,
@@ -2519,6 +2539,8 @@ def sessions_list() -> dict:
                         # serves every client + transport.
                         "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
                         "updatedAt": modified_ms,
+                        "lastAssistantRunId": last_assistant_run_id,
+                        "lastAssistantAt": last_assistant_at,
                         # True while a turn for this session is in flight — drives the
                         # client's "running" shimmer. Old clients ignore the field.
                         "running": _inflight_get(key) is not None,
