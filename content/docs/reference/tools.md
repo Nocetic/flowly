@@ -68,7 +68,7 @@ See [Image generation](../features/image-generation.md) for the full image_gener
 
 | Tool | What it does | Gated by |
 |---|---|---|
-| `message` | Send a message to a channel (Telegram / WhatsApp / …). | gateway bus |
+| `message` | Send a message to a channel (Telegram / WhatsApp / Buzz / …). | gateway bus |
 | `cron` | Schedule a prompt to run later. | — |
 | `plan` | Propose a plan and wait for approval, then tick its steps off (propose/view/update_step/complete/block/abort). | [Plan mode](/docs/features/plan-mode) |
 | `board_add` / `board_list` / `board_get` / `board_update` | Capture and manage cards on the [task board](/docs/features/board). | — |
@@ -76,6 +76,12 @@ See [Image generation](../features/image-generation.md) for the full image_gener
 | `delegate_to` | Hand a task to a CLI-subprocess agent or team. | `flowly setup agents` |
 | `spawn` / `builtin_agent` | Run an in-process subagent (writer / researcher / coder). | — |
 | `skill_view` / `skill_manage` | Read / author skills. | — |
+
+The `message` tool normally inherits the current channel and conversation ID.
+On Buzz, explicit targets are Buzz channel or DM IDs. A normal reply should
+still be returned as assistant text rather than wrapped in `message`; the
+gateway routes it back to the originating Buzz conversation. See
+[Buzz channel selection](../channels/buzz.md#channel-selection-and-the-home-channel).
 
 ## Integrations
 

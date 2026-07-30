@@ -56,6 +56,15 @@ Archives are retained for **30 days** by default (override with `FLOWLY_CRON_RET
 
 When a job fires, the gateway runs the job's prompt as an isolated agent turn (`session_key = cron:<job_id>`) and publishes the plain-text reply to a channel. The default delivery channel is **telegram**. A job captures its originating chat (platform, chat id, name, thread) at creation time, so output can route back to the chat that created it even after the session ends.
 
+For Buzz, a job created from a Buzz channel or DM captures that conversation ID
+and delivers back to it. The Buzz adapter's `homeChannel` is only a fallback for
+an outbound event that reaches the adapter without a conversation ID; it does
+not replace the origin of a normal chat-created job. See
+[Buzz channel selection](../channels/buzz.md#channel-selection-and-the-home-channel).
+Creating the job conversationally from Buzz therefore requires no copied UUID.
+The lower-level `flowly cron add --channel buzz --to …` form below accepts a raw
+target ID for headless scripts and automation.
+
 Two reply sentinels affect delivery:
 
 - A `[SILENT]` reply suppresses delivery but is still archived.
@@ -79,6 +88,7 @@ Beyond a plain prompt, a job may carry:
 ```bash
 flowly cron list [--all]
 flowly cron add --name "Morning digest" --message "Summarize my inbox" --every 86400 [--deliver --to <chat> --channel telegram]
+flowly cron add --name "Buzz digest" --message "Summarize activity" --every 86400 --deliver --to <buzz-channel-id> --channel buzz
 flowly cron add --name "Standup ping" --message "Post standup reminder" --cron "0 9 * * 1-5"
 flowly cron add --name "One-off" --message "Reminder" --at 2026-06-10T09:00:00
 flowly cron remove <job_id>

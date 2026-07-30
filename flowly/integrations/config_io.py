@@ -57,6 +57,12 @@ def read_card_values(card: IntegrationCard) -> dict[str, Any]:
     section = _descend(raw, card.config_path) or {}
     out: dict[str, Any] = {}
     for f in card.fields:
+        if f.env_var:
+            from flowly.mcp.env_loader import load_flowly_dotenv
+
+            load_flowly_dotenv()
+            out[f.key] = _coerce_in(f, os.environ.get(f.env_var, ""))
+            continue
         camel = snake_to_camel(f.key)
         if camel in section:
             v = section[camel]
@@ -87,7 +93,6 @@ def _assert_config_valid(raw: dict[str, Any]) -> None:
     boot accepts (a free ``str`` SELECT like ``fal_image.model`` passes; only a
     constrained ``Literal`` field rejects an off-list value) — no over-rejection.
     """
-    from flowly.config.loader import convert_keys
     from flowly.config.schema import Config
 
     try:
@@ -121,10 +126,18 @@ def apply_card_values(card: IntegrationCard, values: dict[str, Any]) -> None:
     path = get_config_path()
     raw = _load_raw_or_empty(path)
 
-    section_camel = convert_to_camel({f.key: _coerce_out(f, values.get(f.key)) for f in card.fields})
+    config_fields = [field for field in card.fields if not field.env_var]
+    section_camel = convert_to_camel(
+        {field.key: _coerce_out(field, values.get(field.key)) for field in config_fields}
+    )
     _set_path(raw, card.config_path, section_camel, merge=True)
 
     _assert_config_valid(raw)  # reject a value that would brick config.json at boot
+    for field in card.fields:
+        if field.env_var:
+            from flowly.mcp.env_loader import save_env_value
+
+            save_env_value(field.env_var, str(_coerce_out(field, values.get(field.key)) or ""))
     _atomic_write_json(path, raw)
 
 

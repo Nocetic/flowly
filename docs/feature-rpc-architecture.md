@@ -12,6 +12,7 @@ single dispatch table:
 ```python
 _DISPATCH = {
     "connections.list":      (connections_list, False, False),
+    "connections.discover":  (connections_discover, True, False),
     "connections.set":       (connections_set,  True,  True),
     "gmail.set_credentials": (gmail_set_credentials, True, True),
     "model.list":            (model_list, True, False),
@@ -37,6 +38,11 @@ Both transports wrap it:
 **So adding one entry to `_DISPATCH` lights an RPC up over relay AND
 gateway at once.** That's why the iOS model picker / connections panel
 "just work" on either transport.
+
+`connections.discover` is the read-only setup path for cards that expose a
+discovery hook. It merges unsaved form values with stored values without
+echoing password fields, then returns selectable resources such as joined
+channel names and IDs. It never persists settings or restarts the gateway.
 
 ### Hot reload vs restart
 

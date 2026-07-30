@@ -8,6 +8,7 @@ import platform
 import plistlib
 import re
 import shlex
+import shutil
 import sqlite3
 import stat
 import time
@@ -334,6 +335,66 @@ def check_gateway_security(ctx: DoctorContext) -> None:
         ctx.ok("gateway_security", f"Loopback-only binding: {gateway.host}:{gateway.port}")
 
 
+def _dotenv_value(path: Path, name: str) -> str:
+    """Read one dotenv value without mutating the doctor process environment."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() != name:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        return value
+    return ""
+
+
+def _buzz_private_key_present(ctx: DoctorContext, buzz) -> bool:
+    if os.getenv("BUZZ_PRIVATE_KEY", "").strip():
+        return True
+    if _dotenv_value(ctx.data_dir / ".env", "BUZZ_PRIVATE_KEY").strip():
+        return True
+    configured = (
+        os.getenv("BUZZ_CREDENTIALS_FILE", "").strip()
+        or str(buzz.credentials_file or "").strip()
+    )
+    if configured:
+        candidates = [Path(configured).expanduser()]
+    else:
+        candidates = [ctx.data_dir / "credentials" / "buzz.json"]
+        try:
+            candidates.extend(
+                sorted((Path.home() / ".config" / "buzz").glob("*credentials*.json"))
+            )
+        except OSError:
+            pass
+    for path in candidates:
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(document, dict) and any(
+            isinstance(document.get(key), str) and document[key].strip()
+            for key in ("nsec", "private_key_hex", "private_key")
+        ):
+            return True
+    return False
+
+
+def _buzz_binary_present(buzz) -> bool:
+    configured = os.getenv("BUZZ_CLI_PATH", "").strip() or str(buzz.cli_path or "").strip()
+    if configured:
+        expanded = Path(configured).expanduser()
+        return expanded.is_file() or shutil.which(configured) is not None
+    return shutil.which("buzz") is not None or (Path.home() / "bin" / "buzz").is_file()
+
+
 def check_channels(ctx: DoctorContext) -> None:
     if ctx.config is None:
         ctx.skipped("channels", "Config is not valid")
@@ -368,6 +429,28 @@ def check_channels(ctx: DoctorContext) -> None:
         problems.append("whatsapp: bridge URL is missing")
     if channels.teams.enabled and not channels.teams.webhook_url.strip():
         problems.append("teams: webhook URL is missing")
+    if channels.buzz.enabled:
+        relay_url = os.getenv("BUZZ_RELAY_URL", "").strip() or channels.buzz.relay_url.strip()
+        allow_all_override = os.getenv("BUZZ_ALLOW_ALL_USERS")
+        allow_all = (
+            allow_all_override.strip().lower() in {"1", "true", "yes", "on"}
+            if allow_all_override is not None
+            else channels.buzz.allow_all_users
+        )
+        allowed_override = os.getenv("BUZZ_ALLOWED_USERS")
+        allowed = (
+            [item for item in allowed_override.split(",") if item.strip()]
+            if allowed_override is not None
+            else channels.buzz.allow_from
+        )
+        if not relay_url:
+            problems.append("buzz: community relay URL is missing")
+        if not _buzz_private_key_present(ctx, channels.buzz):
+            problems.append("buzz: Nostr private key is missing")
+        if not _buzz_binary_present(channels.buzz):
+            problems.append("buzz: Buzz CLI binary is missing")
+        if not allow_all and not allowed:
+            problems.append("buzz: access is enabled but no senders are allowed")
     if channels.email.enabled:
         gmail = ctx.data_dir / "credentials" / "gmail.json"
         if gmail.is_symlink() or not gmail.is_file():

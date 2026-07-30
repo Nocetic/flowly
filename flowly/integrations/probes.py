@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 from typing import Any
 
 import httpx
@@ -428,6 +429,74 @@ async def probe_linear(values: dict[str, Any]) -> ProbeResult:
     except Exception:
         pass
     return ProbeResult("ok", "authenticated")
+
+
+async def probe_buzz(values: dict[str, Any]) -> ProbeResult:
+    """Validate the local CLI and community membership with a read-only lookup."""
+    from flowly.channels.buzz import (
+        _command_error,
+        _execute_buzz,
+        _json_objects,
+        _private_key_from_sources,
+        _resolve_buzz_binary,
+    )
+    from flowly.config.schema import BuzzConfig
+    from flowly.mcp.env_loader import load_flowly_dotenv
+
+    load_flowly_dotenv()
+    relay_url = (os.getenv("BUZZ_RELAY_URL") or values.get("relay_url") or "").strip()
+    private_key = (
+        str(values.get("private_key") or "").strip()
+        or _private_key_from_sources(BuzzConfig(**{
+            key: value
+            for key, value in values.items()
+            if key in BuzzConfig.model_fields
+        }))
+    )
+    binary = _resolve_buzz_binary(
+        os.getenv("BUZZ_CLI_PATH") or str(values.get("cli_path") or "")
+    )
+    configured = bool(relay_url or private_key or binary)
+    if not values.get("enabled"):
+        return ProbeResult(
+            "disabled" if configured else "not_configured",
+            "settings present · channel disabled" if configured else "not configured",
+        )
+    if not relay_url:
+        return ProbeResult("not_configured", "relay URL missing")
+    if not private_key:
+        return ProbeResult("not_configured", "Nostr private key missing")
+    if not binary:
+        return ProbeResult("not_configured", "Buzz CLI not found")
+
+    try:
+        result = await _execute_buzz(
+            binary,
+            ["users", "get"],
+            relay_url=relay_url,
+            private_key=private_key,
+            timeout=4.0,
+        )
+    except Exception as exc:
+        return _net_error(exc)
+    if result.returncode != 0:
+        detail = _command_error(result)
+        lowered = detail.lower()
+        if any(word in lowered for word in ("auth", "key", "member", "forbidden")):
+            return ProbeResult("auth_failed", detail)
+        return ProbeResult("down", detail)
+    profiles = _json_objects(result.stdout)
+    if not profiles or not profiles[0].get("pubkey"):
+        return ProbeResult("auth_failed", "identity is not a community member")
+    label = str(profiles[0].get("display_name") or "").strip()
+    return ProbeResult("ok", f"as {label}" if label else "community membership verified")
+
+
+async def discover_buzz(values: dict[str, Any]) -> dict[str, Any]:
+    """Return the current identity and joined channels for setup UIs."""
+    from flowly.channels.buzz import discover_buzz_channels
+
+    return await discover_buzz_channels(values)
 
 
 async def probe_github(values: dict[str, Any]) -> ProbeResult:

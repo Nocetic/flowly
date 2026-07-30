@@ -44,7 +44,7 @@ def create_server(*, allow_writes: bool = False) -> Any:
         "flowly",
         instructions=(
             "Flowly conversation bridge. Read conversation history across "
-            "connected channels (Telegram, Discord, Slack, WhatsApp, web, "
+            "connected channels (Telegram, Discord, Slack, Buzz, WhatsApp, web, "
             "email, Teams). Session keys are 'channel:chat_id'."
         ),
     )
@@ -59,7 +59,7 @@ def create_server(*, allow_writes: bool = False) -> Any:
         """List Flowly conversations (most recent first).
 
         Args:
-            platform: filter by channel (telegram, discord, slack, ...)
+            platform: filter by channel (telegram, discord, slack, buzz, ...)
             limit: max conversations (default 50)
             search: filter by text in the session key or preview
         """

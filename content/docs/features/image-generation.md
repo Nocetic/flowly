@@ -5,7 +5,7 @@ description: Generate images from a text prompt right in the chat — the pictur
 group: Media
 ---
 
-Ask Flowly for an image and it appears **inline in the reply** — no separate message, no link to click. Generation runs through [FAL](https://fal.ai) with a model you choose, the file is downloaded to your Flowly home, and Flowly's media-delivery layer surfaces it on whatever surface you're talking from: a Telegram photo, an inline image in the desktop/iOS chat, or an attachment fetched over the gateway.
+Ask Flowly for an image and it appears **inline in the reply** — no separate message, no link to click. Generation runs through [FAL](https://fal.ai) with a model you choose, the file is downloaded to your Flowly home, and Flowly's media-delivery layer surfaces it on whatever surface you're talking from: a Telegram photo, a Buzz file attachment, an inline image in the desktop/iOS chat, or an attachment fetched over the gateway.
 
 It's an opt-in tool: it registers **only** when `tools.image_generation` is enabled and has an API key. Bring your own FAL key — there's no hosted image quota in the open-source build.
 
@@ -80,7 +80,7 @@ You can also pass **any** FAL text-to-image model id as the `model` argument —
 
 The generated file is downloaded to **`~/.flowly/media/img-<id>.png`** and then rides the assistant's own reply — there is no separate "here's your image" message. The same picture reaches every surface through Flowly's existing media path:
 
-- **Messaging channels** (Telegram, WhatsApp, …) — sent as a native photo/attachment.
+- **Messaging channels** (Telegram, WhatsApp, Buzz, …) — sent as a native photo/attachment. Buzz passes the generated local file to the official CLI with `--file`; an HTTP(S) media value is sent as a link instead.
 - **Relay-connected apps** (iOS / desktop / web) — uploaded and surfaced from the conversation.
 - **Direct gateway clients** (self-hosted iOS / desktop) — delivered as an inline thumbnail with the reply, with the full-resolution original served on demand from `GET /api/media?id=…` (tap to zoom). No relay/S3 needed.
 

@@ -47,7 +47,7 @@ The loader is resilient by design:
 | Key | Purpose |
 |---|---|
 | `agents` | Agent defaults, compaction, heartbeat, memory search, multi-agent |
-| `channels` | Messaging channels (Telegram, Discord, Slack, …) |
+| `channels` | Messaging channels (Telegram, Discord, Slack, Buzz, …) |
 | `providers` | LLM providers and API keys |
 | `gateway` | Gateway host / port |
 | `tools` | Built-in tool toggles and limits |
@@ -145,9 +145,13 @@ Channels are off by default. See [Channels overview](../channels/overview.md).
 | `telegram` | `enabled=false`, `token=""`, `allowFrom=[]`, `dmPolicy="pairing"` (`"open"`\|`"pairing"`\|`"allowlist"`) |
 | `discord` | `enabled=false`, `token=""`, `allowFrom=[]`, `gatewayUrl="wss://gateway.discord.gg/?v=10&encoding=json"`, `intents=37377` |
 | `slack` | `enabled=false`, `mode="socket"`, `botToken=""`, `appToken=""`, `groupPolicy="mention"`, `groupAllowFrom=[]`, `dm.enabled=true`, `dm.policy="open"`, `dm.allowFrom=[]` |
+| `buzz` | `enabled=false`, `relayUrl=""`, `channels=[]` (all joined), `homeChannel=""` (automatic), `groupPolicy="mention"`, `allowAllUsers=false`, `allowFrom=[]` (**deny everyone**), `transport="auto"`, `pollIntervalSeconds=4`, `cliPath=""`, `credentialsFile=""`, `authTag=""` |
 | `web` | `enabled=false`, `relayUrl=""`, `serverId=""`, `authToken=""`, `jwtSecret=""` |
 | `email` | `enabled=false`, `pollIntervalSeconds=30`, `allowFrom=[]` |
 | `teams` | `enabled=false`, `webhookUrl=""`, `defaultChatLabel=""`, `allowFrom=[]` |
+
+> [!IMPORTANT]
+> Buzz is the exception to any channel convention where an empty allowlist means open access. With `allowAllUsers=false`, an empty `channels.buzz.allowFrom` denies every sender in channels and direct messages. Buzz private keys do not have a `config.json` field: Desktop and the setup UI save them as `BUZZ_PRIVATE_KEY` in the active profile's `.env`. See the complete [Buzz configuration and security reference](../channels/buzz.md).
 
 ### providers
 

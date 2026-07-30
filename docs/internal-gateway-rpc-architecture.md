@@ -319,7 +319,8 @@ extension answers with a top-level `{type:"tool_result", id, result}` frame
 
 | Method | Params → Result (abridged) | restart |
 |---|---|---|
-| `connections.list` | — → `{connections:[{key,label,enabled,connected,probeStatus,values,fields,needsRestart}]}` | |
+| `connections.list` | — → `{connections:[{key,label,enabled,connected,probeStatus,discoverable,values,fields,needsRestart}]}` | |
+| `connections.discover` | `{key, values?}` → integration-specific read-only resources | |
 | `connections.set` | `{key, values?, clear?}` → `{ok, willRestart}` | ✓ |
 | `gmail.set_credentials` | `{credentials}` → `{ok, willRestart}` | ✓ |
 | `config.get` / `config.set` | — / `{config?\|patch?, restart?}` → raw config / `{ok, willRestart}` | set: ✓ |

@@ -33,7 +33,7 @@ Inside the Flowly TUI, type `/` to run a command instead of sending a message to
 | Command | What it does |
 |---|---|
 | `/integrations` | Connect external services — Home Assistant, Linear, Trello, Google Workspace. |
-| `/channels` | Configure messaging channels — Telegram, Slack, Discord, Email, iOS/Web. |
+| `/channels` | Configure messaging channels — Telegram, Slack, Discord, Buzz, Email, iOS/Web. |
 | `/mcp` | Manage MCP servers — enable / disable / remove, install from the catalog. |
 | `/plugins` | List installed plugins (bundled + user) and toggle them. |
 | `/browser` | Toggle the `browser_tab` tool; shows the Chrome extension link + live status. |

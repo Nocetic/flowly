@@ -981,6 +981,22 @@ exceeds a few paragraphs, ask the user if they want the rest as a
 thread reply or a doc attachment."""
 
 
+_PLATFORM_HINT_BUZZ = """\
+# Channel — Buzz
+
+You are collaborating in a Buzz community channel or direct message.
+Buzz renders standard Markdown, including headings, emphasis, links,
+lists, blockquotes, inline code, and fenced code blocks.
+
+Media delivery: include `MEDIA:/absolute/path/to/file` to upload a
+native attachment. Remote image/file URLs can be included as normal
+Markdown links.
+
+Shared channels may contain several people. Address the current
+speaker naturally, keep replies conversational, and prefer a concise
+answer before deeper detail. In direct messages no @mention is needed."""
+
+
 _PLATFORM_HINT_EMAIL = """\
 # Channel — Email
 
@@ -1100,6 +1116,7 @@ PLATFORM_HINTS: dict[str, str] = {
     "imessage":  _PLATFORM_HINT_IMESSAGE,
     "discord":   _PLATFORM_HINT_DISCORD,
     "slack":     _PLATFORM_HINT_SLACK,
+    "buzz":      _PLATFORM_HINT_BUZZ,
     "email":     _PLATFORM_HINT_EMAIL,
     "web":       _PLATFORM_HINT_WEB,
     "desktop":   _PLATFORM_HINT_DESKTOP,

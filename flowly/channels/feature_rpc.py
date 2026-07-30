@@ -87,9 +87,9 @@ def state_db(filename: str) -> Path:
 
 async def connections_list() -> dict:
     """List integration cards with masked PASSWORD fields + live probe status."""
-    from flowly.integrations.registry import list_cards
-    from flowly.integrations.config_io import read_card_values
     from flowly.integrations.cards import FieldType
+    from flowly.integrations.config_io import read_card_values
+    from flowly.integrations.registry import list_cards
 
     out = []
     for card in (c for c in list_cards() if c.category in CONNECTION_CATEGORIES):
@@ -120,6 +120,7 @@ async def connections_list() -> dict:
                 "connected": probe_status == "ok",
                 "probeStatus": probe_status or "unknown",
                 "probeDetail": probe_detail,
+                "discoverable": card.discover is not None,
                 "values": masked,
                 "fields": [
                     {
@@ -139,16 +140,51 @@ async def connections_list() -> dict:
     return {"connections": out}
 
 
+async def connections_discover(params: dict) -> dict:
+    """Discover selectable resources using saved and/or unsaved card values.
+
+    Password placeholders and blank password inputs never replace an existing
+    saved secret. Discovery is read-only and does not restart the gateway.
+    """
+    from flowly.integrations.cards import FieldType
+    from flowly.integrations.config_io import read_card_values
+    from flowly.integrations.registry import get_card
+
+    key = str(params.get("key") or "").strip()
+    card = get_card(key)
+    if not card or card.category not in CONNECTION_CATEGORIES:
+        raise FeatureRpcError("NOT_FOUND", f"unknown connection: {key}")
+    if card.discover is None:
+        raise FeatureRpcError("NOT_SUPPORTED", f"{key} does not support discovery")
+
+    incoming = params.get("values") or {}
+    if not isinstance(incoming, dict):
+        raise FeatureRpcError("INVALID", "values must be an object")
+    values = read_card_values(card)
+    fields = {field.key: field for field in card.fields}
+    for field_key, value in incoming.items():
+        field = fields.get(field_key)
+        if field is None:
+            continue
+        if (
+            field.type == FieldType.PASSWORD
+            and (value is None or str(value).strip() in {"", "••••••••"})
+        ):
+            continue
+        values[field_key] = value
+    return await card.discover(values)
+
+
 def connections_set(params: dict) -> dict:
     """Apply a channel/integration's values (or clear it). Returns
     ``{"ok": True, "willRestart": bool}`` — the caller schedules the restart."""
-    from flowly.integrations.registry import get_card
     from flowly.integrations.config_io import (
         CardValidationError,
-        read_card_values,
         apply_card_values,
         clear_card,
+        read_card_values,
     )
+    from flowly.integrations.registry import get_card
 
     key = params.get("key", "")
     card = get_card(key)
@@ -3341,6 +3377,7 @@ def system_capabilities() -> dict:
 _DISPATCH: dict[str, tuple] = {
     "system.capabilities": (system_capabilities, False, False),
     "connections.list": (connections_list, False, False),
+    "connections.discover": (connections_discover, True, False),
     "connections.set": (connections_set, True, True),
     "gmail.set_credentials": (gmail_set_credentials, True, True),
     "board.snapshot": (board_snapshot, False, False),

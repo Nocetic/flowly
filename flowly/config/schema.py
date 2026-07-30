@@ -140,6 +140,29 @@ class TeamsConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Reserved for Faz 2 inbound
 
 
+class BuzzConfig(BaseModel):
+    """Buzz community channel configuration.
+
+    The Nostr private key is intentionally not part of ``config.json``. Set
+    ``BUZZ_PRIVATE_KEY`` in the active profile's ``.env`` file or point
+    ``credentials_file`` at a JSON file containing ``nsec`` /
+    ``private_key_hex``.
+    """
+
+    enabled: bool = False
+    relay_url: str = ""
+    channels: list[str] = Field(default_factory=list)
+    home_channel: str = ""
+    cli_path: str = ""
+    credentials_file: str = ""
+    poll_interval_seconds: float = 4.0
+    transport: Literal["auto", "websocket", "poll"] = "auto"
+    auth_tag: str = ""
+    allow_from: list[str] = Field(default_factory=list)
+    allow_all_users: bool = False
+    group_policy: Literal["mention", "open"] = "mention"
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
@@ -150,6 +173,7 @@ class ChannelsConfig(BaseModel):
     email: EmailConfig = Field(default_factory=EmailConfig)
     teams: TeamsConfig = Field(default_factory=TeamsConfig)
     imessage: IMessageConfig = Field(default_factory=IMessageConfig)
+    buzz: BuzzConfig = Field(default_factory=BuzzConfig)
 
 
 class HeartbeatActiveHours(BaseModel):

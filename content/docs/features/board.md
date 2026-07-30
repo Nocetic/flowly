@@ -1,7 +1,7 @@
 ---
 title: Board — cross-channel task board
 eyebrow: Features
-description: A single task board you capture to from any channel — terminal, Telegram, voice — and that the agent can actually run, sequentially or as a fan-out of parallel sub-tasks, reporting the result back on the channel the card came from.
+description: A single task board you capture to from any channel — terminal, Telegram, Buzz, voice — and that the agent can actually run, sequentially or as a fan-out of parallel sub-tasks, reporting the result back on the channel the card came from.
 group: Automation
 ---
 
@@ -27,7 +27,7 @@ The fastest way to feel it, from the terminal UI:
 Flowly: Here's today's AI roundup — OpenAI shipped …, Anthropic …, and …
 ```
 
-The same flow works from Telegram, Discord, WhatsApp, email, or a voice call.
+The same flow works from Telegram, Discord, WhatsApp, Buzz, email, or a voice call.
 You can also drive it explicitly with the [`/board` command](#the-board-command)
 in the terminal, or visually in the [desktop Board tab](#the-desktop-board).
 
@@ -165,7 +165,7 @@ A few ways the board tends to get used in practice:
 - **Fan-out.** Split one goal into independent pieces and run them at once —
   *"audit these 6 files in parallel"*. The agent creates a parent card and a
   child per piece; up to five run concurrently and you get one summary.
-- **Capture anywhere, act anywhere.** Drop a card from your phone over Telegram,
+- **Capture anywhere, act anywhere.** Drop a card from your phone over Telegram or Buzz,
   then open the desktop and hit **Run**; or capture it in the terminal and let a
   morning routine pick it up. The card doesn't care which surface touches it.
 - **Human-in-the-loop.** Start a run and stay in control: cancel or redirect it
@@ -327,7 +327,7 @@ result string, and the orchestrator records it.
 
 Completion delivery reuses the path a normal message already takes to reach you:
 
-- **Real channels** (Telegram / WhatsApp / web / …) → their channel adapter.
+- **Real channels** (Telegram / WhatsApp / Buzz / web / …) → their channel adapter.
 - **Local clients** (terminal UI / desktop) have no channel adapter, so the
   gateway **pushes** the result over its WebSocket — the same mechanism is also
   how sub-agent results surface in the terminal.

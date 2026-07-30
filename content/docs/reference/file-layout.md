@@ -4,24 +4,28 @@ eyebrow: Reference
 description: Everything Flowly stores lives under ~/.flowly. This is the map — config, workspace, memory, skills, credentials, and the SQLite databases — useful for backups, debugging, and self-hosting.
 ---
 
-Flowly keeps all of its state in one directory: **`~/.flowly/`** (override with
-`FLOWLY_HOME`; named profiles live under `~/.flowly/profiles/<name>/`). Nothing is
-written outside it without your involvement.
+Flowly keeps almost all of its state in one directory: **`~/.flowly/`**
+(override with `FLOWLY_HOME`; named profiles live under
+`~/.flowly/profiles/<name>/`). Buzz identity ownership is the deliberate
+exception: its cross-profile locks always live under the canonical
+`~/.flowly/locks/buzz/`, so isolated profiles cannot accidentally consume the
+same relay/identity pair twice.
 
 ## Top level
 
 | Path | What it is |
 | --- | --- |
 | `config.json` | Main configuration (camelCase keys). The one file you edit by hand. |
-| `.env` | Secrets / environment overrides loaded at startup. |
+| `.env` | Secrets / environment overrides loaded at startup, including a Desktop/setup-managed Buzz key as `BUZZ_PRIVATE_KEY`. |
 | `workspace/` | Context files, memory, skills, personas — see below. |
-| `credentials/` | OAuth tokens (e.g. `gmail.json`, mode `0600`). |
+| `credentials/` | OAuth tokens and optional channel credential files (for example `gmail.json` or `buzz.json`, mode `0600`). |
 | `plugins/` | User-installed [plugins](/docs/features/plugins). |
 | `cron/` | Scheduled-job data. |
 | `plan-mode/` | [Plan mode](/docs/features/plan-mode) state: per-session plans (`<session>/plan_<id>.json` plus an append-only `plan_<id>.revisions.log`) and `sticky.json`, which conversations have the standing mode on (what makes the mode survive restarts). |
 | `audit/` | Command + decision [audit log](/docs/features/audit-log). |
 | `sessions/` | Session routing index and transcripts. |
 | `assistants/` | Saved assistant / multi-agent definitions. |
+| `locks/` | Runtime ownership locks, including Buzz relay/identity locks. |
 
 ## Workspace (`~/.flowly/workspace/`)
 
@@ -55,6 +59,17 @@ sidecars):
 | `electron-api.json` | Shared-secret handshake with Flowly Desktop (screenshots, perms). |
 | `imessage-state.json` | iMessage channel watermark/state. |
 | `desktop-client-id` | Stable id for the paired desktop client. |
+| `locks/buzz/<sha256>.lock` | Prevents two Flowly processes from consuming the same Buzz relay/identity pair. The filename is derived from the relay and public key; the private key is not part of the file. |
+
+## Buzz credential files
+
+The recommended Buzz setup stores `BUZZ_PRIVATE_KEY` in the active profile's `.env`. For headless or existing Buzz CLI installations, the adapter can instead read a JSON credentials file. Resolution works as follows:
+
+1. `BUZZ_PRIVATE_KEY`, when present;
+2. otherwise, one explicitly selected file—`BUZZ_CREDENTIALS_FILE` before `channels.buzz.credentialsFile`; or
+3. when no explicit file is set, `<FLOWLY_HOME>/credentials/buzz.json`, then files matching `~/.config/buzz/*credentials*.json`.
+
+An explicit file shadows the automatic fallbacks. The JSON may contain `nsec`, `private_key_hex`, or `private_key`. Keep these files owner-readable only and include them in the same secret-handling policy as `.env`. See [Buzz](../channels/buzz.md#identity-and-credential-resolution).
 
 ## The install itself (not your data)
 

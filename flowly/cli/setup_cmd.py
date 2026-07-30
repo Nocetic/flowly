@@ -12,7 +12,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from flowly import __version__, __logo__
+from flowly import __logo__, __version__
 
 console = Console()
 
@@ -46,7 +46,7 @@ def setup_main(ctx: typer.Context):
     integrations are optional follow-ups:
 
         flowly setup           — first-run: account or API key (default)
-        flowly setup channels  — Telegram / Discord / Slack
+        flowly setup channels  — Telegram / Discord / Slack / Buzz
         flowly setup tools     — browser, voice, Trello, etc.
         flowly setup byok <p>  — quick BYOK one-shot (no UI)
 
@@ -62,7 +62,7 @@ def setup_main(ctx: typer.Context):
 
 @setup_app.command("channels")
 def setup_channels_cmd() -> None:
-    """Connect messaging channels (Telegram / Discord / Slack)."""
+    """Connect messaging channels (Telegram / Discord / Slack / Buzz)."""
     console.print("Opening the channels catalog...\n")
     from flowly.tui.setup_app import run_setup
     run_setup(target="channels")
@@ -260,5 +260,4 @@ def setup_google_workspace_cmd():
     """Install and authenticate the Google Workspace CLI (gws)."""
     from flowly.cli.setup import setup_google_workspace
     setup_google_workspace()
-
 

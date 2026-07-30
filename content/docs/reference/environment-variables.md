@@ -82,6 +82,27 @@ These let tools pick up credentials from the environment instead of `config.json
 | `GITHUB_TOKEN` | GitHub MCP server (from the catalog) |
 | `EDITOR` | Opening the TUI draft with `Ctrl+E` |
 
+## Buzz channel
+
+Buzz-specific variables override `channels.buzz` for the running process. The active profile's `.env` is loaded automatically, so these also work without exporting them globally.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `BUZZ_PRIVATE_KEY` | — | Nostr identity private key as `nsec` or 64-character hex. This secret is intentionally absent from `config.json`. |
+| `BUZZ_RELAY_URL` | `channels.buzz.relayUrl` | Buzz community relay URL. |
+| `BUZZ_CHANNELS` | `channels.buzz.channels` | Comma-separated watched channel IDs. An unset/empty config list watches all joined channels. |
+| `BUZZ_HOME_CHANNEL` | `channels.buzz.homeChannel` | Adapter fallback channel ID for an outbound Buzz event with no conversation ID. |
+| `BUZZ_TRANSPORT` | `channels.buzz.transport` | `auto`, `websocket`, or `poll`. |
+| `BUZZ_POLL_INTERVAL` | `channels.buzz.pollIntervalSeconds` | CLI polling interval in seconds; runtime clamps values below one second. |
+| `BUZZ_REQUIRE_MENTION` | `channels.buzz.groupPolicy` | Truthy selects mention-only channel behavior; false selects open behavior. |
+| `BUZZ_ALLOWED_USERS` | `channels.buzz.allowFrom` | Comma-separated allowed Nostr `npub` or 64-character hex public keys. |
+| `BUZZ_ALLOW_ALL_USERS` | `channels.buzz.allowAllUsers` | Truthy explicitly allows every community member; false keeps allowlist enforcement. |
+| `BUZZ_CLI_PATH` | `channels.buzz.cliPath` | Explicit `buzz` executable path or command name. |
+| `BUZZ_CREDENTIALS_FILE` | `channels.buzz.credentialsFile` | JSON fallback containing `nsec`, `private_key_hex`, or `private_key`. |
+| `BUZZ_AUTH_TAG` | `channels.buzz.authTag` | Optional owner-attestation tag. Overrides the Flowly WebSocket value and is inherited by official CLI/REST calls. |
+
+For private-key resolution order, default-deny behavior, transport fallback, and headless examples, see the [Buzz channel guide](../channels/buzz.md).
+
 ## TUI
 
 | Variable | Default | What it does |

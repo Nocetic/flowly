@@ -87,7 +87,7 @@ The first-run onboarding + configuration surface. Bare `flowly setup` seeds the 
 
 | Subcommand | What it does |
 |---|---|
-| `setup channels` | Connect messaging channels (Telegram / Discord / Slack). |
+| `setup channels` | Connect messaging channels (Telegram / Discord / Slack / Buzz / …). |
 | `setup tools` | Configure tool integrations (browser, voice, Trello, …). |
 | `setup byok <slug>` | Quick BYOK one-shot: save an API key (slugs: `openrouter`, `anthropic`, `openai`, `xai`, `gemini`, `groq`, `zhipu`, `sakana`). |
 | `setup agents` | Set up multi-agent orchestration. |
@@ -111,8 +111,10 @@ Manage the background gateway service (launchd / systemd / Task Scheduler).
 
 | Subcommand | What it does |
 |---|---|
-| `status` | Show channel status. |
-| `login` | Link a device via QR code. |
+| `status` | Show WhatsApp status. It does not currently enumerate Buzz or the other adapters. |
+| `login` | Build/start the WhatsApp bridge and link it via QR code. |
+
+For Buzz, use `flowly setup channels` to configure the connection, `flowly doctor` to check that the relay/key/CLI/access prerequisites are present, and the gateway or service logs for live transport failures. Desktop's connection test performs the live identity and channel lookup. See [Buzz](../channels/buzz.md).
 
 ## flowly cron
 

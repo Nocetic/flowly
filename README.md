@@ -49,7 +49,7 @@ flowly
 <table>
 <tr>
   <td width="30%"><b>One agent, every channel</b></td>
-  <td>Terminal TUI · Telegram · Discord · Slack · Microsoft Teams · WhatsApp · iMessage · Email · voice. A single gateway process speaks to all of them, with one conversation memory shared across every surface. Native Mac / iOS / Android apps and a browser extension come via <a href="https://useflowlyapp.com">Flowly Cloud</a> (optional).</td>
+  <td>Terminal TUI · Telegram · Discord · Slack · Buzz · Microsoft Teams · WhatsApp · iMessage · Email · voice. A single gateway process speaks to all of them, with one conversation memory shared across every surface. Native Mac / iOS / Android apps and a browser extension come via <a href="https://useflowlyapp.com">Flowly Cloud</a> (optional).</td>
 </tr>
 <tr>
   <td><b>40+ first-class tools</b></td>
@@ -99,7 +99,7 @@ Or edit `~/.flowly/config.json`. When nothing is pinned, Flowly cascades through
 
 ## CLI vs messaging — quick reference
 
-Two entry points: start the terminal UI with `flowly`, or run the gateway and talk to Flowly from Telegram, Discord, Slack, WhatsApp, iMessage, or email. Once you're in a conversation, most slash commands work the same in both.
+Two entry points: start the terminal UI with `flowly`, or run the gateway and talk to Flowly from Telegram, Discord, Slack, Buzz, WhatsApp, iMessage, or email. Once you're in a conversation, most slash commands work the same in both.
 
 | Action | Terminal (TUI) | Messaging channels |
 |---|---|---|

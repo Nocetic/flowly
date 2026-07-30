@@ -43,7 +43,7 @@ HELP_BODY = """
 | `/sessions`          | Switch saved session |
 | `/assistants` `/model` | Pick a persona / assistant |
 | `/integrations`      | Connect external services like Home Assistant, Linear, Trello, Google Workspace |
-| `/channels`          | Configure messaging channels like Telegram, Slack, Discord, iMessage, Email, iOS/Web |
+| `/channels`          | Configure messaging channels like Telegram, Slack, Discord, Buzz, iMessage, Email, iOS/Web |
 | `/provider`          | Pick LLM provider (arrow-key picker) · `/provider <key>` direct switch · `/provider off` clear |
 | `/model`             | Pick model from active provider's catalog (OpenRouter live) |
 | `/theme`             | Switch TUI theme · `/theme mono` direct switch |
@@ -84,12 +84,12 @@ Run these from a regular shell — they work without launching the TUI.
 | `flowly doctor`            | Read-only health check — tokens, relay, provider, gateway, sessions |
 | `flowly doctor --fix`      | Auto-repair the issues `flowly doctor` flagged as fixable |
 | `flowly setup`             | Open the TUI's provider picker (the one mandatory setup step) |
-| `flowly setup channels`    | Open the channels catalog (Telegram / Discord / Slack) |
+| `flowly setup channels`    | Open the channels catalog (Telegram / Discord / Slack / Buzz) |
 | `flowly setup tools`       | Open the integrations catalog (browser, voice, …) |
 | `flowly setup byok <slug> --key <k>` | Quick BYOK one-shot: save key + (optionally) set active — for CI / dotfile bootstrap |
 | `flowly`                   | Launch this TUI (when a provider is configured) |
 | `flowly --theme catppuccin` | Launch with a specific TUI theme (catppuccin, synthwave, gruvbox...) |
-| `flowly gateway`           | Run the gateway daemon (Telegram/iOS/Discord channels go through it) |
+| `flowly gateway`           | Run the gateway daemon (Telegram/iOS/Discord/Buzz channels go through it) |
 | `flowly status`            | One-line snapshot of model + provider + session |
 | `flowly memory list`       | Show active long-term memories |
 | `flowly memory review`     | Memories awaiting your review — accept / reject |

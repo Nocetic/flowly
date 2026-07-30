@@ -847,6 +847,7 @@ _EXPECTED_CHANNELS: tuple[str, ...] = (
     "whatsapp",
     "discord",
     "slack",
+    "buzz",
     "email",
     "web",
     "desktop",

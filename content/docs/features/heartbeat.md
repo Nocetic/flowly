@@ -76,7 +76,12 @@ When a tick has actionable work, the agent runs it. What happens with the result
 When there's genuinely nothing to report, the agent replies with the internal token `HEARTBEAT_OK`, which Flowly suppresses — so you never get an empty "all clear" message.
 
 > [!TIP]
-> Delivering to a channel with `"message_tool"` needs a channel configured (for example Telegram or web), so the agent has somewhere to send the message.
+> Delivering with `"message_tool"` needs a concrete channel and conversation
+> context. A heartbeat tick itself has no originating Buzz conversation, so
+> `homeChannel` is not automatically injected into the message tool. If a
+> standing heartbeat instruction must notify Buzz, give the instruction an
+> explicit Buzz channel/DM ID and ensure the message tool is invoked with
+> `channel="buzz"` and that `chat_id`.
 
 ## Configuration keys
 

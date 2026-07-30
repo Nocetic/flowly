@@ -188,7 +188,7 @@ Every callback runs inside its own `try/except` — an exception in your hook is
 
 ### `register_command(name, handler, *, description="", args_hint="")`
 
-Register an in-session slash command, available across all channels (Telegram, Web, Desktop, iOS, …).
+Register an in-session slash command, available across all channels (Telegram, Buzz, Web, Desktop, iOS, …).
 
 ```python
 def register(ctx):

@@ -53,6 +53,18 @@ Behavior per platform:
 > [!IMPORTANT]
 > On Linux, the service only survives logout when systemd linger is enabled (`flowly doctor --fix` can do this). On Windows, an elevated shell lets Flowly use Task Scheduler; without one it automatically uses the Startup folder instead — either way the gateway starts at logon.
 
+### External channel executables
+
+Service environments usually have a smaller `PATH` than an interactive shell.
+Channels that launch an external program therefore need that program to be
+visible to the service account.
+
+For Buzz, the official `buzz` CLI must be installed on the gateway host. If it
+works in your terminal but the service reports it missing, set an absolute
+`channels.buzz.cliPath` or `BUZZ_CLI_PATH`, or install it at `~/bin/buzz`.
+Validate the service-facing setup with `flowly doctor`, then restart the
+service. See [Buzz](../channels/buzz.md#requirements).
+
 ## Logs
 
 Gateway logs are written to:

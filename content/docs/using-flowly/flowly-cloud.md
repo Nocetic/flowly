@@ -16,7 +16,7 @@ Flowly's agent core is Apache 2.0. You can run it on a laptop, a VPS, or a Mac m
 | | Self-host (OSS, BYOK) | Flowly Cloud (optional) |
 | --- | --- | --- |
 | LLM provider | Your own key (OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI, Zhipu, vLLM, …) | Hosted `flowly` provider — no API key required |
-| Reach | Terminal, Telegram, Discord, Slack, Teams, email, voice | All of those **plus** browser extension and Mac / iOS / Android apps |
+| Reach | Terminal, Telegram, Discord, Slack, Buzz, Teams, email, voice | All of those **plus** browser extension and Mac / iOS / Android apps |
 | Cross-device sync | — | Conversations sync across your devices |
 | Relay | — | Managed relay so your bot stays reachable when your laptop sleeps |
 | Account | None needed | Flowly account (OAuth sign-in) |
@@ -149,7 +149,7 @@ Logout performs three clean-ups and prints what it cleared:
 
 ## Relationship to pairing
 
-Opting into remote reach at sign-in **pairs this machine** for app access: registration binds the machine to a `serverId`, and the wired relay credentials are what let your iOS / desktop / browser clients reach the gateway. (Sign in without remote reach and none of this is provisioned — the gateway stays local-only.) This is distinct from per-channel pairing for Telegram / WhatsApp / Discord / Slack (the `flowly pairing` commands), which authorizes individual chat users on a messaging channel rather than a device for relay access.
+Opting into remote reach at sign-in **pairs this machine** for app access: registration binds the machine to a `serverId`, and the wired relay credentials are what let your iOS / desktop / browser clients reach the gateway. (Sign in without remote reach and none of this is provisioned — the gateway stays local-only.) This is distinct from messaging-channel access control, which authorizes individual chat users rather than a device for relay access. Telegram and iMessage consume Flowly's pairing store; Buzz and several other adapters enforce their own allowlist/policy settings. See [Channels overview](/docs/channels/overview).
 
 ## Privacy & data
 

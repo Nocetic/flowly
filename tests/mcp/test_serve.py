@@ -109,7 +109,7 @@ def test_channels_list_reads_config(home_with_sessions):
     from flowly.mcp.server.readplane import channels_list
     out = channels_list()
     names = {c["platform"] for c in out["channels"]}
-    assert {"telegram", "discord", "slack", "whatsapp", "web", "email", "teams"} <= names
+    assert {"telegram", "discord", "slack", "buzz", "whatsapp", "web", "email", "teams"} <= names
 
 
 def test_server_builds_with_read_tools(home_with_sessions):

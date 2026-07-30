@@ -15,7 +15,7 @@ Everything the agent needs to run on your own machine, with your own keys, with 
 - **Agent core** — the loop, tool dispatch, sub-agents, planning, streaming
 - **40+ tools** — files, shell (sandboxed), web, computer-use, documents, media
 - **135 skills** + skill bundles + drop-in Markdown skills
-- **All channel adapters** — Telegram, Discord, Slack, Teams, WhatsApp, iMessage, email, voice
+- **All channel adapters** — Telegram, Discord, Slack, Buzz, Teams, WhatsApp, iMessage, email, voice
 - **BYOK providers** — Anthropic, OpenAI, OpenRouter, Gemini, Groq, xAI/Grok, Zhipu, and OpenAI-compatible local models
 - **Gateway** — the local WebSocket daemon every client connects to
 - **Self-maintaining memory** + knowledge graph, **board**, **cron**, **MCP** (both directions), **plugins**, **sandbox**

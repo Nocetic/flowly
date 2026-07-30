@@ -95,6 +95,78 @@ Stop the stray process (or `flowly service stop`) before starting again. Flowly
 never force-kills a gateway it didn't start — including the one Flowly Desktop
 manages — so two installs won't fight over the port silently.
 
+### Buzz-specific
+
+Start with:
+
+```bash
+flowly doctor
+flowly service logs
+```
+
+When Buzz is enabled, Doctor checks the relay URL, private-key sources, CLI
+resolution, and whether the sender policy permits anyone.
+
+**`buzz` CLI not found.**
+The executable must be installed on the machine and under the OS account that
+runs the gateway. A service may not inherit the same `PATH` as your shell. Run
+`command -v buzz` as that account, then set an absolute
+`channels.buzz.cliPath` / `BUZZ_CLI_PATH` or install it at `~/bin/buzz`.
+
+**Desktop cannot test the identity or load channels.**
+Desktop runs discovery on the agent host through a read-only RPC. Check the
+relay URL, confirm the private key is an `nsec` or 64-character hex value, and
+confirm that identity already belongs to the community. On a remote
+installation, having the CLI and key only on the Desktop computer is
+insufficient.
+
+**Buzz is connected but never responds.**
+The secure default `allowAllUsers=false` plus `allowFrom=[]` denies everyone.
+Add the sender's Nostr `npub` or hex public key, or explicitly allow every
+member. Pairing approval does not apply to Buzz. In a channel,
+`groupPolicy="mention"` also requires the agent identity to be addressed;
+direct messages do not require a mention.
+
+**A joined channel is not being watched.**
+An empty `channels` list loads all joined group channels when the adapter
+starts; restart after joining a new group channel. A non-empty list is a fixed
+subset of channel IDs. Verify that the identity is joined and remove a stale
+explicit list or add the missing channel ID. Desktop's reload action refreshes
+the named picker before you save.
+
+**The identity has DMs but the adapter reports no channels to watch.**
+The current startup path requires at least one joined group channel before it
+discovers DM conversations. Join the identity to a group channel, reload
+Desktop discovery, and restart the gateway.
+
+**Messages sent before restart do not appear.**
+This is intentional. Startup fetches recent messages only to seed the
+watermark and de-duplication cache; it does not replay history. Send a new
+message after the adapter is ready.
+
+**WebSocket authentication/reconnect errors.**
+Use `transport="auto"` so CLI polling keeps receiving messages while the
+authenticated Nostr WebSocket retries. Use `poll` if WebSockets are
+intentionally blocked. A forced `websocket` transport has no polling fallback.
+If the relay requires owner attestation, configure `authTag` or
+`BUZZ_AUTH_TAG`. Use `BUZZ_AUTH_TAG` in the active profile `.env` when the
+official CLI's identity, discovery, or send calls also require the attestation;
+the config-only `authTag` field covers Flowly's WebSocket path.
+
+**"Buzz identity is already active in another Flowly profile."**
+Another process is using the same relay and public key. Stop the duplicate
+gateway instead of deleting an active lock. Buzz identity locks live under
+the canonical `~/.flowly/locks/buzz/` directory, even for named profiles or a
+custom `FLOWLY_HOME`.
+
+**The key or connection settings changed but runtime behavior did not.**
+Restart the gateway. Also check for exported `BUZZ_*` variables: environment
+overrides take precedence over `channels.buzz`, so Desktop can correctly show
+the saved config while the running process uses a different value.
+
+The full decision tables and resolution order are in the
+[Buzz channel guide](/docs/channels/buzz).
+
 ### Windows-specific
 
 **Do I need an administrator shell for the service?**
@@ -127,7 +199,8 @@ gateway). If you hit it on an older build, `flowly update` to the latest.
 
 **Channel silent / not receiving.**
 Confirm the channel is `enabled` in config and that access control
-(`allowFrom` / pairing) permits the sender. See the channel's own page under
+(`allowFrom` / pairing) permits the sender. Buzz is default-deny and does not
+use pairing codes. See the channel's own page under
 [Channels](/docs/channels/overview).
 
 ## Still stuck?

@@ -1,7 +1,7 @@
 ---
 title: Channels Overview
 eyebrow: Channels
-description: Flowly's gateway is a local daemon that runs the agent loop and attaches chat-platform adapters ("channels") so you can talk to your agent from Telegram, Discord, Slack, Teams, WhatsApp, or the web.
+description: Flowly's gateway is a local daemon that runs the agent loop and attaches chat-platform adapters ("channels") so you can talk to your agent from Telegram, Discord, Slack, Buzz, Teams, WhatsApp, or the web.
 ---
 
 ## The gateway
@@ -47,6 +47,7 @@ Channels `cli`, `tui`, and `desktop` are intentionally adapter-less — their re
 | [Telegram](./telegram.md) | Bot long-polling (`python-telegram-bot`) | Bot `token` from @BotFather |
 | [Discord](./discord.md) | Discord Gateway WebSocket + REST v10 | Bot `token` from Discord Developer Portal |
 | [Slack](./slack.md) | Socket Mode WebSocket (`slack_sdk`) | `botToken` (`xoxb-`) + `appToken` (`xapp-`) |
+| [Buzz](./buzz.md) | Authenticated Nostr WebSocket + CLI polling fallback | Community relay URL + Nostr private key |
 | [Teams](./teams.md) | Incoming Webhook (outbound only) | `webhookUrl` (HTTPS connector URL) |
 | [WhatsApp](./whatsapp.md) | Node baileys bridge over WebSocket | QR-code scan (no token in config) |
 | [iMessage](./imessage.md) | BlueBubbles Server (webhook in + REST out) | BlueBubbles `serverUrl` + `password` |
@@ -57,7 +58,10 @@ Channels `cli`, `tui`, and `desktop` are intentionally adapter-less — their re
 
 ## Pairing & allowlist security model
 
-Each adapter checks whether a sender is allowed before publishing their message to the bus. The simplest control is the per-channel `allowFrom` list (an empty list means allow everyone). On top of that, Flowly has a **pairing store** for granting access without editing config by hand.
+Each adapter checks whether a sender is allowed before publishing their message to the bus. Most adapters use a per-channel `allowFrom` list; the exact meaning of an empty list depends on the adapter. On top of that, Flowly has a **pairing store** for granting access without editing config by hand.
+
+> [!IMPORTANT]
+> Buzz is deliberately **default-deny**: `allowAllUsers=false` and `allowFrom=[]` allows nobody, for both channels and direct messages. Buzz does not use pairing codes. Add allowed Nostr `npub`/hex public keys or explicitly enable `allowAllUsers`. See [Buzz access control](./buzz.md#access-control-matrix).
 
 ### How pairing works
 
@@ -82,7 +86,7 @@ flowly pairing allowed <channel>
 `<channel>` accepts `telegram`, `whatsapp`, `discord`, `slack`, or `imessage`. `--notify` (on `approve`) only sends a confirmation DM for Telegram.
 
 > [!WARNING]
-> **Pairing is enforced by Telegram and iMessage.** Those two adapters read the pairing/allow store. Discord, Slack, and WhatsApp enforce access through their own `allowFrom` / policy config keys instead, not the pairing store — so approving a Discord or Slack code writes a file those adapters never read. Use the channel's config `allowFrom`/policy keys for Discord/Slack/WhatsApp access control.
+> **Pairing is enforced by Telegram and iMessage.** Those two adapters read the pairing/allow store. Discord, Slack, WhatsApp, and Buzz enforce access through their own `allowFrom` / policy config keys instead, not the pairing store — so approving a code does not grant access on those adapters. Use the channel's own access settings.
 
 ## Channel status & login (WhatsApp)
 
@@ -92,13 +96,14 @@ flowly channels login
 ```
 
 > [!NOTE]
-> `flowly channels status` currently reports **only WhatsApp** (enabled + bridge URL). It does not enumerate Telegram, Discord, Slack, Teams, or Web. `flowly channels login` builds and runs the WhatsApp Node bridge and prints a QR code.
+> `flowly channels status` currently reports **only WhatsApp** (enabled + bridge URL). It does not enumerate Telegram, Discord, Slack, Buzz, Teams, or Web. `flowly channels login` builds and runs the WhatsApp Node bridge and prints a QR code. For Buzz, use Desktop's connection test, `flowly doctor`, and the gateway logs.
 
 ## Related
 
 - [Telegram](./telegram.md)
 - [Discord](./discord.md)
 - [Slack](./slack.md)
+- [Buzz](./buzz.md)
 - [Teams](./teams.md)
 - [WhatsApp](./whatsapp.md)
 - [Web](./web.md)

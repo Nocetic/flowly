@@ -182,7 +182,17 @@ def channels_list(platform: str | None = None) -> dict:
     config = load_config()
     channels = config.channels
     out: list[dict[str, Any]] = []
-    for name in ("telegram", "discord", "slack", "whatsapp", "imessage", "web", "email", "teams"):
+    for name in (
+        "telegram",
+        "discord",
+        "slack",
+        "buzz",
+        "whatsapp",
+        "imessage",
+        "web",
+        "email",
+        "teams",
+    ):
         cfg = getattr(channels, name, None)
         if cfg is None:
             continue

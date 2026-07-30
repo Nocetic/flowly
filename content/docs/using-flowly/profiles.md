@@ -6,12 +6,23 @@ description: Run multiple isolated Flowly setups — separate config, keys, sess
 
 ## What a profile is
 
-A **profile** is a fully self-contained Flowly environment. Each profile has its own config file, its own API keys and credentials, its own sessions and memory, and its own skills — none of it shared with any other profile. Switching profiles is like switching to a different, completely separate Flowly install, except everything still lives under one home directory and you select between them with a single flag.
+A **profile** is a self-contained Flowly environment. Each profile has its own
+config file, API keys and credentials, sessions and memory, and skills.
+Switching profiles is like switching to a different Flowly install, except
+everything still lives under one home directory and you select between them
+with a single flag.
 
-Under the hood there is exactly one mechanism: the `FLOWLY_HOME` directory. Every path in Flowly resolves from `FLOWLY_HOME`, so pointing it at a different directory gives you a different, isolated instance. A profile is just a named `FLOWLY_HOME`.
+Under the hood the isolation mechanism is the `FLOWLY_HOME` directory. Profile-owned data resolves from `FLOWLY_HOME`, so pointing it at a different directory gives you a different isolated instance. A profile is just a named `FLOWLY_HOME`; process-coordination files such as Buzz's canonical identity lock can intentionally sit outside it.
 
 > [!NOTE]
 > Profiles are about **isolation on one machine**, not multi-user accounts. Each profile is its own data directory; they never read each other's config, keys, sessions, or memory.
+
+> [!IMPORTANT]
+> Buzz has one deliberate cross-profile coordination point: ownership locks
+> live under the canonical `~/.flowly/locks/buzz/`, even for named profiles or
+> a custom `FLOWLY_HOME`. This prevents two gateways from consuming the same
+> relay/identity pair. The Buzz private key remains profile-local in that
+> profile's `.env` or credentials file; the lock contains no private key.
 
 ## Default vs named profiles
 
@@ -93,7 +104,7 @@ rm ~/.flowly/active_profile
 
 ## What's isolated per profile
 
-Selecting a profile changes `FLOWLY_HOME`, and **everything** Flowly stores resolves from there. Concretely, each profile keeps its own copy of:
+Selecting a profile changes `FLOWLY_HOME`, and profile-owned state resolves from there. Concretely, each profile keeps its own copy of:
 
 | What | Path (relative to the profile home) | Notes |
 | --- | --- | --- |
@@ -110,6 +121,11 @@ Selecting a profile changes `FLOWLY_HOME`, and **everything** Flowly stores reso
 | Audit | `audit/` | Audit records |
 | Cron | `cron/` | Scheduled jobs |
 | Screenshots / media | `screenshots/`, `media/` | Captured artifacts |
+
+For Buzz, `BUZZ_PRIVATE_KEY` belongs in the selected profile's `.env`, while
+the shared ownership guard remains at `~/.flowly/locks/buzz/`. To run two Buzz
+profiles concurrently, use different relay/identity pairs. See
+[Buzz identity locking](../channels/buzz.md#startup-history-and-membership-changes).
 
 For the **default** profile the home is `~/.flowly`, so these resolve to `~/.flowly/config.json`, `~/.flowly/sessions/`, and so on. For a **named** profile they live under `~/.flowly/profiles/<name>/` — for example `~/.flowly/profiles/work/config.json`.
 

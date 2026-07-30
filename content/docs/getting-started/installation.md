@@ -29,6 +29,24 @@ All methods install the same `flowly` CLI. The native script clones the repo int
 
 **Already have Flowly installed?** Running the native script over an existing PyPI/`uv tool` install migrates it in place: your `~/.flowly` data is untouched, the old package is retired only after the new install proves it works, and an installed background service is rewritten onto the new install and restarted — so nothing keeps pointing at the retired binary.
 
+## Optional Buzz dependency
+
+Flowly itself does not bundle the external Buzz CLI. You need it only when you
+enable the [Buzz channel](../channels/buzz.md), and it must be installed on the
+machine that runs the gateway:
+
+```bash
+git clone https://github.com/block/buzz.git
+cd buzz
+cargo install --path crates/buzz-cli
+command -v buzz
+```
+
+This requires a current Rust/Cargo toolchain. Cargo normally installs `buzz`
+under `~/.cargo/bin`; background services may need an absolute
+`channels.buzz.cliPath` or `BUZZ_CLI_PATH` because their `PATH` is smaller than
+your interactive shell's.
+
 ## First run
 
 On a fresh machine the **first-run picker opens automatically** right after the install script finishes. It asks how to power Flowly — **sign in with a Flowly account** (managed, nothing else to configure) or **enter your own API key** — which is the one mandatory step before the agent can run. The same picker also seeds your workspace and offers to start the gateway.

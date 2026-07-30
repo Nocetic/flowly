@@ -59,7 +59,7 @@ flowly agent -m "Summarize the README in this directory"
 ## Where to next
 
 - Keep Flowly running across logins and reboots: [Service](../using-flowly/service.md) — `flowly service install --start` (optional; `flowly` already starts the gateway on demand)
-- Add a Telegram, Discord, or Slack bot: [Channels overview](../channels/overview.md)
+- Add Telegram, Discord, Slack, Buzz, or another messaging channel: [Channels overview](../channels/overview.md)
 - Tune models, tools, and behavior: [Configuration](../using-flowly/configuration.md)
 - Control shell execution and approvals: [Sandbox and approvals](../using-flowly/sandbox-and-approvals.md)
 

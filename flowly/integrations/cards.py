@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from enum import Enum
 from typing import Any, Literal
 
@@ -36,6 +37,9 @@ class Field:
     # ``choices`` is a list of (value, display) tuples for SELECT fields.
     choices: list[tuple[str, str]] = dc_field(default_factory=list)
     default: Any = None
+    # When set, the value lives in the active profile's ``.env`` instead of
+    # config.json. The form contract stays identical; only persistence changes.
+    env_var: str = ""
 
 
 ProbeStatus = Literal[
@@ -92,6 +96,10 @@ class IntegrationCard:
     config_path: str
     fields: list[Field] = dc_field(default_factory=list)
     probe: Callable[[dict[str, Any]], Awaitable[ProbeResult]] | None = None
+    # Optional read-only discovery hook for integrations whose credentials can
+    # enumerate user-selectable resources (for example joined channels). The
+    # result is passed through the shared feature-RPC surface as JSON.
+    discover: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     needs_gateway_restart: bool = True
     # For system cards (e.g. iOS pairing) that aren't config-editable:
     # the modal renders the description + a custom action label instead

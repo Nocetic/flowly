@@ -4,6 +4,7 @@ from pathlib import Path
 
 from flowly.config.schema import (
     AgentDefaults,
+    BuzzConfig,
     ChannelsConfig,
     Config,
     DiscordConfig,
@@ -87,6 +88,7 @@ class TestChannelsConfig:
         assert channels.discord.enabled is False
         assert channels.slack.enabled is False
         assert channels.whatsapp.enabled is False
+        assert channels.buzz.enabled is False
 
     def test_telegram_dm_policy(self):
         tg = TelegramConfig()
@@ -102,6 +104,13 @@ class TestChannelsConfig:
         assert slack.group_policy == "mention"
         assert slack.dm.enabled is True
         assert slack.dm.policy == "open"
+
+    def test_buzz_defaults_are_safe(self):
+        buzz = BuzzConfig()
+        assert buzz.transport == "auto"
+        assert buzz.group_policy == "mention"
+        assert buzz.allow_all_users is False
+        assert buzz.allow_from == []
 
 
 class TestExecToolConfig:

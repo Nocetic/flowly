@@ -65,7 +65,7 @@ The gateway listens on `127.0.0.1:18790` by default — loopback only, reachable
 
 ## 4. Headless / VPS
 
-Run Flowly on a VPS or Mac mini and talk to it from Telegram, Discord, etc. — or from the desktop/mobile apps over the network.
+Run Flowly on a VPS or Mac mini and talk to it from Telegram, Discord, Buzz, etc. — or from the desktop/mobile apps over the network.
 
 ```bash
 # 1. Install + configure a provider (steps 1–2 above)
@@ -73,7 +73,7 @@ Run Flowly on a VPS or Mac mini and talk to it from Telegram, Discord, etc. — 
 flowly bootstrap
 
 # 3a. Local-only + a messaging channel (recommended, no open ports):
-flowly setup channels          # add Telegram/Discord/Slack/…
+flowly setup channels          # add Telegram/Discord/Slack/Buzz/…
 flowly service install --start
 
 # 3b. Expose the gateway to network clients (e.g. the desktop app):
@@ -86,6 +86,14 @@ flowly service install --start --host 0.0.0.0 --port 18790 --token "$(openssl ra
 > - Always set a `--token`; clients must present it to connect.
 > - Prefer an **SSH tunnel** or a TLS reverse proxy over exposing `0.0.0.0` directly to the internet. Restrict the port with a firewall / security group.
 > - The agent has shell and filesystem access on the host — **treat gateway access as host access.** See the repo's [`SECURITY.md`](https://github.com/Nocetic/flowly/blob/main/SECURITY.md).
+
+For Buzz on a headless host, install the official `buzz` CLI on that host,
+store the identity key in the active profile's `.env`, and use an absolute CLI
+path if the service account cannot resolve it. Buzz traffic does not require
+opening the Flowly gateway port, but the host must be able to reach the
+community relay. The adapter is default-deny until `allowFrom` contains an
+allowed Nostr public key or `allowAllUsers` is explicitly enabled. See
+[Buzz](../channels/buzz.md#headless-and-manual-setup).
 
 ## 5. Sandbox
 

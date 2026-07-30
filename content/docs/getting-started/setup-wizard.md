@@ -17,7 +17,7 @@ This opens the first-run picker: **sign in with a Flowly account** (managed, not
 | Subcommand | What it does |
 |---|---|
 | `flowly setup` | Opens the first-run picker: a Flowly account or your own API key (the one mandatory step) |
-| `flowly setup channels` | Opens the TUI channels modal (Telegram, Discord, Slack, …) |
+| `flowly setup channels` | Opens the TUI channels modal (Telegram, Discord, Slack, Buzz, …) |
 | `flowly setup tools` | Opens the TUI integrations modal |
 | `flowly setup byok <slug> [--key K] [--no-set-active]` | Headless: store an API key for a provider, no TUI |
 | `flowly setup agents` | Configure multi-agent settings |
@@ -52,7 +52,13 @@ flowly setup byok openrouter --key sk-or-... --no-set-active
 
 ## Adding channels later
 
-You don't have to configure channels during first setup. Add a Telegram bot, Discord, Slack, or other channel any time with `flowly setup channels` (or the matching TUI modal). The gateway auto-restarts to pick up newly enabled channels. See [Channels overview](../channels/overview.md).
+You don't have to configure channels during first setup. Add Telegram, Discord, Slack, Buzz, or another channel any time with `flowly setup channels` (or the matching Desktop connection dialog). The gateway restarts to pick up newly enabled channels. See [Channels overview](../channels/overview.md).
+
+### Buzz setup
+
+The Buzz card requires a community relay URL, a Nostr private key for an identity that already belongs to that community, and the official `buzz` CLI on the gateway host. Leave **Watched channels** empty to follow every joined channel and leave **Home channel** empty for automatic fallback selection, so the TUI path does not require a channel UUID. Enter raw IDs only when you deliberately want an explicit subset or home channel. Desktop can discover the channels and present those choices by name. You must also add at least one allowed sender or deliberately enable access for all community members; the default empty allowlist denies everyone.
+
+The setup UI stores the key as `BUZZ_PRIVATE_KEY` in the active profile's owner-only `.env`, while the remaining settings are saved under `channels.buzz` in `config.json`. See [Buzz](../channels/buzz.md) for CLI discovery, credential fallbacks, transports, and troubleshooting.
 
 ## Related
 
@@ -61,4 +67,5 @@ You don't have to configure channels during first setup. Add a Telegram bot, Dis
 - [Providers and models](../using-flowly/providers-and-models.md)
 - [Configuration](../using-flowly/configuration.md)
 - [Channels overview](../channels/overview.md)
+- [Buzz](../channels/buzz.md)
 - [CLI commands](../reference/cli-commands.md)
