@@ -36,6 +36,12 @@ class Field:
     # ``choices`` is a list of (value, display) tuples for SELECT fields.
     choices: list[tuple[str, str]] = dc_field(default_factory=list)
     default: Any = None
+    # Optional richer editor a client MAY offer for a TEXT field — currently
+    # ``"media_model:<category>"``, which asks for a searchable model picker fed
+    # by ``media.models.search``. Deliberately a hint on TEXT rather than a new
+    # FieldType: a client that doesn't know it renders a perfectly usable text
+    # input, where a field type it had never seen might render nothing at all.
+    picker: str = ""
 
 
 ProbeStatus = Literal[

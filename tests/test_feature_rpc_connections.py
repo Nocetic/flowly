@@ -40,16 +40,63 @@ def _list_by_key(isolated_home) -> dict:
     return {c["key"]: c for c in result["connections"]}
 
 
-def test_connections_list_includes_fal_image(isolated_home):
+def test_connections_list_includes_media_generation(isolated_home):
     by_key = _list_by_key(isolated_home)
-    assert "fal_image" in by_key, "FAL image card must be listed for remote clients"
+    assert "fal_image" in by_key, "the media card must be listed for remote clients"
     card = by_key["fal_image"]
     assert card["category"] == "media"
-    # Rendered generically by the clients → it must carry its fields.
+    # Rendered generically by the clients → it must carry its fields. The card
+    # now covers video as well as images, with one model choice per kind.
     field_keys = {f["key"] for f in card["fields"]}
-    assert {"api_key", "model"} <= field_keys
+    assert {
+        "api_key",
+        "defaults.text_to_image",
+        "defaults.text_to_video",
+        "defaults.image_to_video",
+    } <= field_keys
     api_field = next(f for f in card["fields"] if f["key"] == "api_key")
     assert api_field["type"] == "password"
+
+
+def test_model_fields_ask_for_a_picker_without_pinning_a_list(isolated_home):
+    """The catalog changes weekly; a baked-in choice list would go stale.
+
+    So model fields stay plain text with a picker HINT: a client that
+    understands it shows a searchable picker fed by media.models.search, and
+    one that doesn't still renders a usable input.
+    """
+    card = _list_by_key(isolated_home)["fal_image"]
+    video = next(f for f in card["fields"] if f["key"] == "defaults.text_to_video")
+
+    assert video["type"] == "text"
+    assert video["picker"] == "media_model:text-to-video"
+    assert video["choices"] == []
+
+
+def test_fields_without_a_picker_omit_the_hint(isolated_home):
+    """Old clients must see exactly the payload they saw before."""
+    card = _list_by_key(isolated_home)["fal_image"]
+    api_field = next(f for f in card["fields"] if f["key"] == "api_key")
+    assert "picker" not in api_field
+
+
+def test_nested_model_choices_round_trip_to_config(isolated_home):
+    result, _restart = _dispatch("connections.set", {
+        "key": "fal_image",
+        "values": {
+            "enabled": True,
+            "api_key": "fal-secret",
+            "defaults.text_to_video": "vendor/t2v",
+        },
+    })
+    assert result["ok"] is True
+
+    from flowly.config.loader import load_config
+    from flowly.media.settings import resolve_media_settings
+
+    settings = resolve_media_settings(load_config().tools)
+    assert settings.text_to_video == "vendor/t2v"
+    assert settings.video_ready is True
 
 
 def test_connections_set_round_trips_media(isolated_home):

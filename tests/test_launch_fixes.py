@@ -144,15 +144,19 @@ def test_connections_set_accepts_valid_enum(isolated_home):
 
 
 def test_connections_set_accepts_offlist_fal_model(isolated_home):
-    # fal_image.model is a free str (its SELECT choices are only suggestions) —
-    # an off-list FAL model id must NOT be rejected (no over-rejection).
+    # Media model ids are free strings — the catalog is a suggestion list, not
+    # an allowlist, so a model Flowly has never heard of must NOT be rejected.
     result, _ = _dispatch("connections.set", {
         "key": "fal_image",
-        "values": {"enabled": True, "api_key": "fal-x", "model": "fal-ai/some-custom-model"},
+        "values": {
+            "enabled": True,
+            "api_key": "fal-x",
+            "defaults.text_to_image": "fal-ai/some-custom-model",
+        },
     })
     assert result["ok"] is True
     data = json.loads(_config_path().read_text(encoding="utf-8"))
-    assert data["tools"]["imageGeneration"]["model"] == "fal-ai/some-custom-model"
+    assert data["tools"]["mediaGeneration"]["defaults"]["textToImage"] == "fal-ai/some-custom-model"
 
 
 def test_connections_set_rejects_non_dict_values(isolated_home):

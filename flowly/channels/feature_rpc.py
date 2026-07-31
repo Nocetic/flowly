@@ -130,6 +130,9 @@ async def connections_list() -> dict:
                         "placeholder": f.placeholder,
                         "help": f.help,
                         "choices": f.choices,
+                        # Optional richer editor hint; absent for every existing
+                        # field, so old clients see the payload they always did.
+                        **({"picker": f.picker} if f.picker else {}),
                     }
                     for f in card.fields
                 ],
@@ -3356,6 +3359,80 @@ def system_capabilities() -> dict:
     }
 
 
+# ── media generation models ─────────────────────────────────────────────────
+#
+# The catalog is read server-side and only the resulting list crosses the wire.
+# The provider API key stays here: a picker on Desktop or iOS needs model names,
+# not a credential, and shipping one to a client turns every device into a place
+# the key can leak from.
+
+
+def _media_catalog():
+    from flowly.config.loader import load_config
+    from flowly.media.catalog import ModelCatalog
+    from flowly.media.settings import resolve_media_settings
+
+    settings = resolve_media_settings(load_config().tools)
+    return ModelCatalog(api_key=settings.api_key), settings
+
+
+async def media_models_list(params: dict) -> dict:
+    """Models for a category (or all), for a picker.
+
+    Never raises on a catalog failure — the underlying loader falls back to a
+    stale cache and then to a built-in shortlist, so a picker always opens.
+    """
+    catalog, settings = _media_catalog()
+    category = str(params.get("category") or "").strip() or None
+    models = await catalog.list_models(category=category, force=bool(params.get("refresh")))
+    return {
+        "provider": settings.provider,
+        "category": category,
+        "models": [m.to_dict() for m in models],
+        "defaults": {
+            "textToImage": settings.text_to_image,
+            "imageToImage": settings.image_to_image,
+            "textToVideo": settings.text_to_video,
+            "imageToVideo": settings.image_to_video,
+        },
+    }
+
+
+async def media_models_search(params: dict) -> dict:
+    catalog, settings = _media_catalog()
+    category = str(params.get("category") or "").strip() or None
+    limit = params.get("limit")
+    limit = int(limit) if isinstance(limit, (int, float)) and limit else 50
+    models = await catalog.search(
+        str(params.get("query") or ""), category=category, limit=max(1, min(limit, 200))
+    )
+    return {"provider": settings.provider, "models": [m.to_dict() for m in models]}
+
+
+async def media_models_get(params: dict) -> dict:
+    """One model, with the compatibility verdict its schema actually supports.
+
+    ``withSchema`` costs a round-trip to the provider, so it is opt-in — but it
+    is the only way to know whether a model can be driven, which is what a
+    picker needs before letting someone select it.
+    """
+    endpoint_id = str(params.get("endpointId") or params.get("id") or "").strip()
+    if not endpoint_id:
+        raise FeatureRpcError("INVALID_PARAMS", "endpointId is required")
+    catalog, _settings = _media_catalog()
+    model = await catalog.get(endpoint_id, with_schema=bool(params.get("withSchema")))
+    if model is None:
+        raise FeatureRpcError("NOT_FOUND", f"unknown model: {endpoint_id}")
+    return {"model": model.to_dict()}
+
+
+async def media_models_refresh(_params: dict) -> dict:
+    """Force a catalog sync — the picker's "check for new models"."""
+    catalog, _settings = _media_catalog()
+    models = await catalog.list_models(force=True)
+    return {"count": len(models)}
+
+
 # method → (handler, wants_params, restart_aware)
 #   wants_params  — call ``handler(params)`` vs ``handler()``
 #   restart_aware — a ``willRestart`` in the result means the transport should
@@ -3461,6 +3538,10 @@ _DISPATCH: dict[str, tuple] = {
     "audit.list": (audit_list, True, False),
     "audit.stats": (audit_stats, False, False),
     "audit.clear": (audit_clear, False, False),
+    "media.models.list": (media_models_list, True, False),
+    "media.models.search": (media_models_search, True, False),
+    "media.models.get": (media_models_get, True, False),
+    "media.models.refresh": (media_models_refresh, True, False),
     "pairing.list": (pairing_list, True, False),
     "pairing.approve": (pairing_approve, True, False),
 }
@@ -3471,7 +3552,12 @@ FEATURE_METHODS = frozenset(_DISPATCH)
 # These methods may legitimately wait for a human/browser or a slow server.
 # WebSocket transports dispatch them in tracked background tasks so their
 # receive loops keep processing control frames, pings, and unrelated RPCs.
-LONG_RUNNING_METHODS = frozenset({"mcp.test", "mcp.oauth_start"})
+LONG_RUNNING_METHODS = frozenset({
+    "mcp.test",
+    "mcp.oauth_start",
+    # A cold catalog sync walks every category over the network.
+    "media.models.refresh",
+})
 
 
 async def dispatch(method: str, params: dict) -> tuple[dict, bool]:

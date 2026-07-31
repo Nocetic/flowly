@@ -52,20 +52,41 @@ def read_card_values(card: IntegrationCard) -> dict[str, Any]:
     back to the raw snake_case key for round-trip resilience with older
     configs that may have been hand-edited.
     """
-    from flowly.config.loader import snake_to_camel
     raw = _load_raw()
     section = _descend(raw, card.config_path) or {}
     out: dict[str, Any] = {}
     for f in card.fields:
-        camel = snake_to_camel(f.key)
-        if camel in section:
-            v = section[camel]
-        elif f.key in section:
-            v = section[f.key]
-        else:
-            v = _empty_for(f)
-        out[f.key] = _coerce_in(f, v)
+        found, value = _read_field(section, f.key)
+        out[f.key] = _coerce_in(f, value if found else _empty_for(f))
     return out
+
+
+def _read_field(section: dict[str, Any], key: str) -> tuple[bool, Any]:
+    """Read one field value out of a card's config section.
+
+    A field key may be dotted (``defaults.text_to_video``) when the card edits
+    a nested block — grouping related settings under one object reads far
+    better in config.json than a flat wall of prefixed keys. On-disk keys are
+    camelCase; the raw snake_case spelling is also accepted so a hand-edited
+    config still round-trips.
+    """
+    from flowly.config.loader import snake_to_camel
+
+    node: Any = section
+    segments = key.split(".")
+    for index, segment in enumerate(segments):
+        if not isinstance(node, dict):
+            return False, None
+        camel = snake_to_camel(segment)
+        if camel in node:
+            node = node[camel]
+        elif segment in node:
+            node = node[segment]
+        else:
+            return False, None
+        if index == len(segments) - 1:
+            return True, node
+    return False, None
 
 
 # ── writing ────────────────────────────────────────────────────────
@@ -121,7 +142,12 @@ def apply_card_values(card: IntegrationCard, values: dict[str, Any]) -> None:
     path = get_config_path()
     raw = _load_raw_or_empty(path)
 
-    section_camel = convert_to_camel({f.key: _coerce_out(f, values.get(f.key)) for f in card.fields})
+    # Dotted field keys become nested objects, so a card can edit a sub-block
+    # without flattening it into prefixed keys on disk.
+    flat: dict[str, Any] = {}
+    for f in card.fields:
+        _nest(flat, f.key, _coerce_out(f, values.get(f.key)))
+    section_camel = convert_to_camel(flat)
     _set_path(raw, card.config_path, section_camel, merge=True)
 
     _assert_config_valid(raw)  # reject a value that would brick config.json at boot
@@ -140,6 +166,19 @@ def clear_card(card: IntegrationCard) -> None:
 
 
 # ── helpers ────────────────────────────────────────────────────────
+
+
+def _nest(target: dict[str, Any], dotted_key: str, value: Any) -> None:
+    """Place ``value`` at a dotted key inside ``target``, creating dicts."""
+    segments = dotted_key.split(".")
+    node = target
+    for segment in segments[:-1]:
+        existing = node.get(segment)
+        if not isinstance(existing, dict):
+            existing = {}
+            node[segment] = existing
+        node = existing
+    node[segments[-1]] = value
 
 
 def _load_raw() -> dict[str, Any]:

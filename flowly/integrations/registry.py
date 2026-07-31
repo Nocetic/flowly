@@ -52,8 +52,6 @@ from flowly.integrations.probes import (
     probe_zai_coding,
     probe_zhipu,
 )
-from flowly.media.image_models import DEFAULT_IMAGE_MODEL as _DEFAULT_IMAGE_MODEL
-from flowly.media.image_models import model_choices as _image_model_choices
 
 
 def _enabled_field(default: bool = False) -> Field:
@@ -612,18 +610,32 @@ _PROVIDERS: list[IntegrationCard] = [
 _MEDIA: list[IntegrationCard] = [
     IntegrationCard(
         key="fal_image",
-        label="FAL Image Generation",
+        label="Image & video generation",
         category="media",
-        description="Generate images from text (FLUX & more) via fal.ai.",
+        description="Generate images and short videos from a prompt, via fal.ai.",
         docs_url="https://fal.ai/dashboard/keys",
-        config_path="tools.image_generation",
+        config_path="tools.media_generation",
         fields=[
             _enabled_field(),
-            Field("api_key", "FAL API key", FieldType.PASSWORD, required=True,
+            Field("api_key", "fal API key", FieldType.PASSWORD, required=True,
                   placeholder="fal-…", help="From fal.ai/dashboard/keys."),
-            Field("model", "Image model", FieldType.SELECT,
-                  default=_DEFAULT_IMAGE_MODEL, choices=_image_model_choices(),
-                  help="Model to generate with — changeable later."),
+            # Model ids are free text with a picker hint rather than a fixed
+            # SELECT: the catalog runs to hundreds of models and changes weekly,
+            # so baking a choice list back into this card would recreate exactly
+            # the staleness the dynamic catalog was built to end. A client that
+            # understands the hint shows a searchable picker; one that doesn't
+            # gets a text field that still works.
+            Field("defaults.text_to_image", "Image model", FieldType.TEXT,
+                  placeholder="fal-ai/flux/dev", picker="media_model:text-to-image",
+                  help="Leave empty to use the default image model."),
+            Field("defaults.text_to_video", "Video model (from a prompt)", FieldType.TEXT,
+                  placeholder="fal-ai/kling-video/v3/standard/text-to-video",
+                  picker="media_model:text-to-video",
+                  help="Required before Flowly will generate video from text."),
+            Field("defaults.image_to_video", "Video model (from an image)", FieldType.TEXT,
+                  placeholder="fal-ai/kling-video/v3/standard/image-to-video",
+                  picker="media_model:image-to-video",
+                  help="Required before Flowly will animate an image."),
         ],
         probe=probe_fal_image,
         needs_gateway_restart=True,
