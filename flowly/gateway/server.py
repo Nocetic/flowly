@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
@@ -21,6 +22,7 @@ from flowly.artifacts.context import is_internal_context_artifact
 from flowly.artifacts.summary import artifact_summary
 from flowly.channels import feature_rpc
 from flowly.gateway.auth import (
+    MediaTicketStore,
     WsTicketStore,
     extract_request_token,
     host_origin_allowed,
@@ -57,7 +59,14 @@ async def _cors_middleware(request: web.Request, handler: Callable) -> web.Strea
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                # ``Range`` is here for the media streaming route — a player
+                # that preflights a byte-range request is refused without it.
+                "Access-Control-Allow-Headers": (
+                    "Content-Type, Authorization, X-Flowly-Token, Range"
+                ),
+                "Access-Control-Expose-Headers": (
+                    "Content-Range, Accept-Ranges, Content-Length, Content-Type"
+                ),
                 "Access-Control-Max-Age": "600",
             },
         )
@@ -109,6 +118,17 @@ _MAX_ATTACHMENT_B64_CHARS = 34 * 1024 * 1024
 _THUMB_MAX_DIMENSION = 512
 _THUMB_TARGET_BYTES = 48 * 1024
 _THUMB_INITIAL_QUALITY = 70
+
+# Ceiling for the byte-range streaming endpoint. Far above /api/media's 25 MB
+# base64 cap because streaming never buffers the file: aiohttp sends it from
+# disk in chunks, so the cost of a big clip is bandwidth, not memory. The cap
+# exists to bound what a single request can pull, not to protect the process.
+_MAX_STREAM_BYTES = 2 * 1024 * 1024 * 1024
+
+# What the streaming endpoint will serve. Generated media only — this is not a
+# general file server, and anything outside these families (archives, scripts,
+# documents) has no business being fetched by a chat client.
+_STREAMABLE_MIME_PREFIXES = ("image/", "video/", "audio/")
 
 # Browser providers share the same local WebSocket transport as desktop/chat
 # clients. Provider IDs are intentionally stricter than arbitrary display
@@ -240,44 +260,112 @@ def _thumbnail_b64(p: Path) -> tuple[str, str] | None:
     return result
 
 
-def _reply_media_attachments(media_paths: list) -> list[dict]:
+def _inline_preview_b64(asset: Any, path: Path) -> str | None:
+    """The base64 JPEG a client shows in the bubble before fetching anything.
+
+    For an image that is the image itself, downscaled. For a video it is the
+    poster frame ffmpeg pulled at generation time — a video file cannot be fed
+    to the image compressor, so without a poster there simply is no preview and
+    the client draws its own placeholder.
+    """
+    if asset.kind == "video":
+        poster = Path(asset.poster_path) if asset.poster_path else None
+        if poster is None or not poster.is_file():
+            return None
+        thumb = _thumbnail_b64(poster)
+        return thumb[0] if thumb else None
+    thumb = _thumbnail_b64(path)
+    return thumb[0] if thumb else None
+
+
+def _resolve_media_id(name: str) -> tuple[Path | None, str, int]:
+    """Resolve a media id (a bare basename) to a file inside the media dir.
+
+    Returns ``(path, "", 0)`` on success or ``(None, error, http_status)``.
+    Shared by every media route so the containment rules can't drift apart:
+
+      * the id is a BASENAME — any separator, ``..`` or leading dot is rejected
+        before it touches the filesystem;
+      * the RESOLVED target must still sit inside the RESOLVED media dir, which
+        is what stops a symlink planted in the media dir from reading elsewhere.
+    """
+    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
+        return None, "invalid id", 400
+    media_dir = (get_flowly_home() / "media").resolve()
+    try:
+        target = (media_dir / name).resolve()
+    except (OSError, RuntimeError):
+        return None, "invalid id", 400
+    if target != media_dir and media_dir not in target.parents:
+        return None, "forbidden", 403
+    if not target.is_file():
+        return None, "not found", 404
+    return target, "", 0
+
+
+def _reply_media_attachments(media_paths: list, assets: dict | None = None) -> list[dict]:
     """Attachments for media the agent produced THIS turn (image_generate /
-    screenshot), for delivery over the direct gateway WS — where there is no
-    relay/S3 to host a ``cdnUrl``.
+    video_generate / screenshot), for delivery over the direct gateway WS —
+    where there is no relay/S3 to host a ``cdnUrl``.
 
     Each local file carries a SMALL inline base64 ``thumbnail`` (~512 px / ~48 KB
-    JPEG, reusing the web channel's compressor at a thumbnail preset) so a remote
-    client (iOS / desktop) renders the bubble preview immediately with no fetch and
-    no auth. ``mediaId`` is always set so the client can pull the full-res original
-    on demand via ``GET /api/media?id=…`` (tap to zoom). Keeping the inline payload
-    small is what stops an image-heavy history reload from shipping megabytes of
-    base64. Remote URLs pass through as ``cdnUrl``. Best-effort per file —
-    unreadable entries are skipped.
+    JPEG) so a remote client (iOS / desktop) renders the bubble preview
+    immediately with no fetch and no auth. ``mediaId`` is always set so the
+    client can pull the original on demand — ``GET /api/media?id=…`` for images
+    (tap to zoom), ``GET /api/media/stream`` for video playback. Keeping the
+    inline payload small is what stops a media-heavy history reload from
+    shipping megabytes of base64. Remote URLs pass through as ``cdnUrl``.
+
+    ``assets`` maps path -> :class:`MediaAsset` for media generated this turn,
+    supplying duration/dimensions/poster that cannot be recovered from the path
+    alone. Media without an entry (screenshots, inbound user files, history
+    written before assets existed) is described from the file itself, so this
+    stays correct with no caller changes.
+
+    Best-effort per file — unreadable entries are skipped rather than handed to
+    a client as a broken bubble.
     """
+    from flowly.media.assets import attachment_v2, describe, guess_mime, kind_for_mime
+
+    by_path = assets or {}
     out: list[dict] = []
     for mp in media_paths:
         try:
             if not isinstance(mp, str) or not mp:
                 continue
             if mp.startswith(("http://", "https://")):
-                url_mime, _ = mimetypes.guess_type(mp)
-                out.append(
-                    {
-                        "fileName": mp.rsplit("/", 1)[-1] or mp,
-                        "mimeType": url_mime or "",
-                        "cdnUrl": mp,
-                    }
-                )
+                url_mime = guess_mime(mp)
+                file_name = mp.rsplit("/", 1)[-1] or mp
+                asset = by_path.get(mp)
+                if asset is not None:
+                    out.append(attachment_v2(asset, cdn_url=mp))
+                else:
+                    # Unknown remote file: keep the historical V1 shape rather
+                    # than inventing metadata we never measured.
+                    out.append(
+                        {
+                            "fileName": file_name,
+                            "mimeType": "" if url_mime == "application/octet-stream" else url_mime,
+                            "cdnUrl": mp,
+                        }
+                    )
                 continue
             p = Path(mp)
             if not p.is_file():
                 continue
-            mime, _ = mimetypes.guess_type(mp)
-            att: dict = {"fileName": p.name, "mimeType": mime or "image/png", "mediaId": p.name}
-            thumb = _thumbnail_b64(p)  # cached by path+mtime+size
-            if thumb is not None:
-                att["thumbnail"], att["mimeType"] = thumb
-            out.append(att)
+            asset = by_path.get(mp)
+            if asset is None:
+                # Probing here would shell out to ffprobe on every history
+                # reload; the generating tool already measured what it knows.
+                mime = guess_mime(p)
+                asset = describe(p, probe_media=kind_for_mime(mime) == "image")
+            out.append(
+                attachment_v2(
+                    asset,
+                    thumbnail=_inline_preview_b64(asset, p),
+                    media_id=p.name,
+                )
+            )
         except Exception:
             continue
     return out
@@ -349,6 +437,9 @@ class GatewayServer:
         self._auth_token = (auth_token or "").strip()
         self._require_auth = bool(self._auth_token) and not is_loopback_host(host)
         self._ticket_store = WsTicketStore()
+        # Playback tickets: short-lived, scoped to a single media id, reusable
+        # across the many Range requests one clip generates.
+        self._media_ticket_store = MediaTicketStore()
         # MCP write-plane control endpoint (Faz 3c). Additive + opt-in:
         # only active when BOTH a send callback and a token are supplied.
         # localhost-only + bearer-token authed. Lets `flowly mcp serve
@@ -434,6 +525,12 @@ class GatewayServer:
         # /api/media contract: basename-only id, media-dir containment (resolve +
         # symlink-safe), image allowlist, 25 MB cap.
         app.router.add_get("/api/media", self._handle_media)
+        # Byte-range media streaming. Video can't ride the base64 endpoint above
+        # (a player seeks, and a 200 MB JSON string is not a seek), so playback
+        # gets its own route: mint a media-scoped ticket with the static token,
+        # then stream with Range support using only that ticket.
+        app.router.add_post("/api/media/tickets", self._handle_media_ticket)
+        app.router.add_get("/api/media/stream", self._handle_media_stream)
         if self.on_provider_reload:
             app.router.add_post("/api/provider/reload", self._handle_provider_reload)
             app.router.add_get("/api/provider/active", self._handle_provider_active)
@@ -476,8 +573,12 @@ class GatewayServer:
     # ``/health`` is the public handshake clients probe to discover
     # ``auth_required``; ``/ws`` authenticates via a query-param ticket inside
     # the handler (not a header), so the header middleware skips it.
+    # ``/api/media/stream`` authenticates via a media-scoped ``?ticket=`` inside
+    # the handler for the same reason ``/ws`` does: the caller is a video
+    # element, which cannot set a header. ``/api/media/tickets`` — where that
+    # ticket is minted — is NOT listed and stays behind the static token.
     _AUTH_PUBLIC_PATHS = frozenset({"/health"})
-    _AUTH_SELF_GATED_PREFIXES = ("/ws", "/api/mcp")
+    _AUTH_SELF_GATED_PREFIXES = ("/ws", "/api/mcp", "/api/media/stream")
 
     def _make_auth_middleware(self):
         @web.middleware
@@ -634,18 +735,9 @@ class GatewayServer:
           * images only (allowlist), with a 25 MB ceiling.
         """
         name = (request.rel_url.query.get("id") or "").strip()
-        if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
-            return web.json_response({"error": "invalid id"}, status=400)
-
-        media_dir = (get_flowly_home() / "media").resolve()
-        try:
-            target = (media_dir / name).resolve()
-        except (OSError, RuntimeError):
-            return web.json_response({"error": "invalid id"}, status=400)
-        if target != media_dir and media_dir not in target.parents:
-            return web.json_response({"error": "forbidden"}, status=403)
-        if not target.is_file():
-            return web.json_response({"error": "not found"}, status=404)
+        target, error, status = _resolve_media_id(name)
+        if target is None:
+            return web.json_response({"error": error}, status=status)
 
         mime, _ = mimetypes.guess_type(str(target))
         mime = mime or ""
@@ -665,6 +757,88 @@ class GatewayServer:
                 "fileName": name,
                 "mimeType": mime,
             }
+        )
+
+    async def _handle_media_ticket(self, request: web.Request) -> web.Response:
+        """Mint a playback ticket for one media id.
+
+        Reaching this handler means the caller already proved the static token
+        (the auth middleware does not exempt this path), so the only work left
+        is confirming the file really exists and is streamable — minting a
+        ticket for a missing or forbidden id would just move the failure to
+        playback time, where the client can only report "video won't play".
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        name = str((body or {}).get("id") or "").strip()
+        target, error, status = _resolve_media_id(name)
+        if target is None:
+            return web.json_response({"error": error}, status=status)
+
+        mime, _ = mimetypes.guess_type(str(target))
+        mime = mime or ""
+        if not mime.startswith(_STREAMABLE_MIME_PREFIXES):
+            return web.json_response({"error": "unsupported media type"}, status=415)
+
+        ticket = self._media_ticket_store.mint(name)
+        return web.json_response(
+            {
+                "ticket": ticket,
+                "ttlSeconds": self._media_ticket_store.ttl_seconds,
+                "url": f"/api/media/stream?id={quote(name)}&ticket={quote(ticket)}",
+                "mimeType": mime,
+                "size": target.stat().st_size,
+            }
+        )
+
+    async def _handle_media_stream(self, request: web.Request) -> web.StreamResponse:
+        """Stream a media file with HTTP Range support.
+
+        Unlike ``/api/media`` this never loads the file into memory: aiohttp's
+        ``FileResponse`` reads from disk and honours ``Range`` itself, which is
+        what makes seeking in a video work (and what keeps a 200 MB clip from
+        costing 270 MB of base64 in RAM).
+
+        Auth: the middleware skips this path, so the ticket check below IS the
+        credential check. On a loopback gateway with no token configured there
+        is no credential to enforce in the first place, matching every other
+        route.
+        """
+        name = (request.rel_url.query.get("id") or "").strip()
+        if self._require_auth and not self._media_ticket_store.allows(
+            request.rel_url.query.get("ticket"), name
+        ):
+            return web.json_response(
+                {"error": "unauthorized", "detail": "Missing or invalid media ticket."},
+                status=401,
+            )
+
+        target, error, status = _resolve_media_id(name)
+        if target is None:
+            return web.json_response({"error": error}, status=status)
+
+        mime, _ = mimetypes.guess_type(str(target))
+        mime = mime or ""
+        if not mime.startswith(_STREAMABLE_MIME_PREFIXES):
+            return web.json_response({"error": "unsupported media type"}, status=415)
+        if target.stat().st_size > _MAX_STREAM_BYTES:
+            return web.json_response({"error": "file too large"}, status=413)
+
+        return web.FileResponse(
+            target,
+            headers={
+                "Content-Type": mime,
+                # Generated media is immutable: the filename is unique per
+                # generation, so a player may cache it for the session.
+                "Cache-Control": "private, max-age=3600",
+                # A browser-hosted player reads these off the response to build
+                # its scrubber; without the expose list CORS hides them.
+                "Access-Control-Expose-Headers": (
+                    "Content-Range, Accept-Ranges, Content-Length, Content-Type"
+                ),
+            },
         )
 
     async def _handle_extension_status(self, request: web.Request) -> web.Response:

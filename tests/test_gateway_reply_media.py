@@ -115,3 +115,99 @@ def test_thumbnail_cache_busts_on_mtime(tmp_path):
     os.utime(p, (st.st_atime + 10, st.st_mtime + 10))
     server._thumbnail_b64(p)
     assert len(server._THUMB_CACHE) == n_before + 1
+
+
+# ── Attachment V2: what makes a video renderable on a client ─────────────────
+
+def test_image_attachment_keeps_its_real_mime_type(tmp_path):
+    """The inline preview is always JPEG, but the ATTACHMENT is not.
+
+    The previous shape overwrote ``mimeType`` with the thumbnail's mime, which
+    was harmless for images (jpeg claiming to be jpeg) and fatal for video —
+    a clip announced as ``image/jpeg`` renders as a still on every client.
+    """
+    from PIL import Image
+
+    p = tmp_path / "pic.png"
+    Image.new("RGB", (64, 48), (9, 9, 9)).save(p)
+    att = _reply_media_attachments([str(p)])[0]
+
+    assert att["mimeType"] == "image/png"
+    assert att["kind"] == "image"
+    assert att["version"] == 2
+    assert att["thumbnail"]  # preview still present
+    assert (att["width"], att["height"]) == (64, 48)
+
+
+def test_video_attachment_carries_playback_metadata_and_poster(tmp_path):
+    from PIL import Image
+
+    from flowly.media.assets import MediaAsset
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00" * 2048)
+    poster = tmp_path / "clip.jpg"
+    Image.new("RGB", (320, 180), (30, 30, 30)).save(poster)
+
+    asset = MediaAsset(
+        path=str(clip),
+        kind="video",
+        file_name="clip.mp4",
+        mime_type="video/mp4",
+        size=2048,
+        width=1080,
+        height=1920,
+        duration_ms=6000,
+        poster_path=str(poster),
+        id="media_clip",
+    )
+    att = _reply_media_attachments([str(clip)], {str(clip): asset})[0]
+
+    assert att["kind"] == "video"
+    assert att["mimeType"] == "video/mp4"
+    assert att["mediaId"] == "clip.mp4"
+    assert att["durationMs"] == 6000
+    assert (att["width"], att["height"]) == (1080, 1920)
+    assert att["thumbnail"]  # the poster frame, not the mp4 bytes
+
+
+def test_video_without_a_poster_still_ships_as_a_video(tmp_path):
+    """No ffmpeg means no poster. It must NOT mean no video.
+
+    Dropping the attachment (or mislabelling it) is how a clip silently
+    degrades into a filename chip, which is exactly what this delivery path
+    exists to prevent.
+    """
+    from flowly.media.assets import MediaAsset
+
+    clip = tmp_path / "silent.mp4"
+    clip.write_bytes(b"\x00" * 512)
+    asset = MediaAsset(
+        path=str(clip), kind="video", file_name="silent.mp4", mime_type="video/mp4", id="media_x"
+    )
+    att = _reply_media_attachments([str(clip)], {str(clip): asset})[0]
+
+    assert att["kind"] == "video"
+    assert att["mimeType"] == "video/mp4"
+    assert att["mediaId"] == "silent.mp4"
+    assert "thumbnail" not in att
+
+
+def test_video_without_an_asset_entry_is_still_described(tmp_path):
+    """History written before assets existed must still render as video."""
+    clip = tmp_path / "legacy.mp4"
+    clip.write_bytes(b"\x00" * 64)
+    att = _reply_media_attachments([str(clip)])[0]
+
+    assert att["kind"] == "video"
+    assert att["mimeType"] == "video/mp4"
+    assert att["mediaId"] == "legacy.mp4"
+
+
+def test_attachments_never_leak_local_paths(tmp_path):
+    from PIL import Image
+
+    p = tmp_path / "leaky.png"
+    Image.new("RGB", (8, 8)).save(p)
+    att = _reply_media_attachments([str(p)])[0]
+    assert str(tmp_path) not in repr(att)
