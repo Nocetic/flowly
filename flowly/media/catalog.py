@@ -329,13 +329,33 @@ class ModelCatalog:
         if not with_schema:
             return None
         # Not in the cached list — it may be brand new, or the cache may be the
-        # built-in shortlist. Ask the provider directly before giving up.
-        probe = MediaModel(endpoint_id=endpoint_id, label=endpoint_id, category="")
-        resolved = await self._with_schema(probe)
-        return resolved if resolved.input_schema else None
+        # built-in shortlist, or the list may simply be stale. Ask the provider
+        # directly before declaring the id unknown.
+        return await self._fetch_one(endpoint_id)
+
+    async def _fetch_one(self, endpoint_id: str) -> MediaModel | None:
+        """Resolve one model straight from the provider, schema included.
+
+        Returns ``None`` ONLY when the provider does not know the endpoint id.
+        A model it does know but whose schema we couldn't read comes back with
+        ``input_schema=None``. Anything that stopped us from asking at all
+        raises :class:`~flowly.media.fal_catalog.CatalogError`.
+        """
+        from flowly.media.fal_catalog import fetch_model
+
+        # Deliberately NOT swallowed: a throttled or unreachable catalog is not
+        # evidence that the model is missing, and reporting it as "unknown id"
+        # sends the user off renaming a model that was fine all along.
+        entry = await fetch_model(endpoint_id, api_key=self._api_key)
+        if entry is None:
+            return None
+        model = model_from_catalog_entry(entry)
+        if model is None:
+            return None
+        return self._apply_openapi(model, entry.get("openapi"))
 
     async def _with_schema(self, model: MediaModel) -> MediaModel:
-        from flowly.media.adapters import input_schema_from_openapi, verdict_for
+        """Attach the schema to a model already known from the cached list."""
         from flowly.media.fal_catalog import fetch_openapi
 
         try:
@@ -343,7 +363,13 @@ class ModelCatalog:
         except CatalogError as exc:
             logger.debug("[media] schema fetch failed for {}: {}", model.endpoint_id, exc)
             return model
-        schema = input_schema_from_openapi(openapi)
+        return self._apply_openapi(model, openapi)
+
+    @staticmethod
+    def _apply_openapi(model: MediaModel, openapi: Any) -> MediaModel:
+        from flowly.media.adapters import input_schema_from_openapi, verdict_for
+
+        schema = input_schema_from_openapi(openapi if isinstance(openapi, dict) else None)
         if schema is None:
             return model
         return replace(

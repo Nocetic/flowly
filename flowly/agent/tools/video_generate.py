@@ -145,6 +145,15 @@ class VideoGenerateTool(Tool):
         if input_image and not input_image.startswith(("http://", "https://")):
             return "Error: 'input_image' must be a public https URL."
 
+        # Checked before any catalog work: without a key the catalog reads are
+        # anonymous and get throttled, which used to surface as a baffling
+        # "model has no input schema" instead of "you haven't added your key".
+        if not (self._api_key or "").strip():
+            return (
+                "Error: no fal API key is configured. Add it in the image & video "
+                "generation settings."
+            )
+
         endpoint_id = (kwargs.get("model") or "").strip() or self._default_model(mode)
         if not endpoint_id:
             return (
@@ -195,8 +204,14 @@ class VideoGenerateTool(Tool):
         noun = "video" if len(assets) == 1 else "videos"
         seconds = next((a.duration_ms for a in assets if a.duration_ms), None)
         length = f" ({round(seconds / 1000)}s)" if seconds else ""
+        # The saved path belongs in the summary. Without it the model has no
+        # idea the file exists on disk, and answers "where is it?" by inventing
+        # something — which is how a perfectly saved clip got described as
+        # never having been saved at all.
+        where = "\n".join(f"Saved to: {a.path}" for a in assets)
         return media_envelope(
             [a.path for a in assets],
-            f"Generated {len(assets)} {noun}{length} with {result.model}, attached to this reply.",
+            f"Generated {len(assets)} {noun}{length} with {result.model}, attached to "
+            f"this reply.\n{where}",
             assets=assets,
         )

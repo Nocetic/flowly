@@ -144,7 +144,14 @@ async def resolve_model(
     catalog: ModelCatalog, endpoint_id: str, *, category: str
 ) -> MediaModel:
     """Fetch a model with its schema and refuse it if Flowly can't drive it."""
-    model = await catalog.get(endpoint_id, with_schema=True)
+    from flowly.media.fal_catalog import CatalogError, CatalogRateLimitedError
+
+    try:
+        model = await catalog.get(endpoint_id, with_schema=True)
+    except CatalogRateLimitedError as exc:
+        raise GenerationError(f"{exc} Try again in a moment.") from exc
+    except CatalogError as exc:
+        raise GenerationError(f"couldn't reach the model catalog: {exc}") from exc
     if model is None:
         raise GenerationError(
             f"'{endpoint_id}' is not in the model catalog. Pick a different model."
@@ -181,8 +188,11 @@ async def generate_video(
     if not (api_key or "").strip():
         raise GenerationError("the fal API key is missing — add it in setup.")
     if model.input_schema is None:
+        # The model exists — resolve_model already confirmed that — so this is
+        # us failing to read its interface, not the user picking a bad id.
         raise GenerationError(
-            f"'{model.endpoint_id}' did not publish an input schema, so it can't be driven safely."
+            f"couldn't read what inputs '{model.endpoint_id}' takes, so it can't be "
+            "driven safely. Try again, or pick a different model."
         )
 
     try:

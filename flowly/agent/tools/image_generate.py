@@ -95,7 +95,10 @@ class ImageGenerateTool(Tool):
         noun = "image" if len(paths) == 1 else "images"
         # The loop attaches these to the assistant's reply (one bubble) and shows
         # the model this summary — no separate message-tool send needed.
+        # Same reason as video_generate: the model must know where the file
+        # landed, or it will make something up when asked.
+        where = "\n".join(f"Saved to: {p}" for p in paths)
         return media_envelope(
             paths,
-            f"Generated {len(paths)} {noun} with {model}, attached to this reply.",
+            f"Generated {len(paths)} {noun} with {model}, attached to this reply.\n{where}",
         )

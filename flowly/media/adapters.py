@@ -24,6 +24,7 @@ rather than sending a payload the provider will reject.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # Canonical field -> property names endpoints are known to use, best first.
@@ -48,9 +49,11 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 # property outside this set means we cannot drive the endpoint.
 _FILLABLE = frozenset(_ALIASES.keys())
 
-# Fields whose absence changes what the user gets, so dropping them silently is
-# not acceptable — the caller is told instead.
-_MUST_NOT_DROP = frozenset({"generate_audio", "input_image"})
+# Fields whose absence changes what the user GETS, so dropping them silently is
+# not acceptable — the caller is told instead. Aspect ratio belongs here for the
+# same reason audio does: asking for 9:16 and receiving landscape is a wrong
+# video, not a missing nicety.
+_MUST_NOT_DROP = frozenset({"generate_audio", "input_image", "aspect_ratio"})
 
 
 class AdapterError(ValueError):
@@ -184,10 +187,26 @@ def _snap_to_enum(value: Any, options: list[Any]) -> Any | None:
             return option
 
     def _as_number(candidate: Any) -> float | None:
-        try:
-            return float(str(candidate).strip())
-        except (TypeError, ValueError):
+        """Leading number in a value, unit suffix and all.
+
+        Enums are written for humans: durations come as ``"6s"``, resolutions
+        as ``"720p"``. Parsing those as plain floats fails, which used to drop
+        the field entirely — the user asked for 6 seconds and silently got the
+        model's default.
+        """
+        match = re.match(r"\s*(\d+(?:\.\d+)?)", str(candidate))
+        if match is None:
             return None
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+
+    # Ratios are not quantities. "9:16" starts with a 9, and snapping that to
+    # the nearest number among ["16:9", "1:1"] would hand back landscape when
+    # the user asked for portrait — a silently wrong video, not an error.
+    if any(":" in str(v) for v in [value, *options]):
+        return None
 
     wanted = _as_number(value)
     if wanted is None:
