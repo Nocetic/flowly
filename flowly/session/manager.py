@@ -12,6 +12,7 @@ from typing import Any
 
 from loguru import logger
 
+from flowly.media.assets import assets_to_meta as _assets_to_meta
 from flowly.utils.helpers import ensure_dir, safe_filename
 from flowly.profile import get_flowly_home
 
@@ -275,6 +276,7 @@ class Session:
         usage: dict[str, Any] | None = None,
         media: list[str] | None = None,
         reply_media: list[str] | None = None,
+        reply_media_assets: list | None = None,
         user_display_hidden: bool = False,
         aborted: bool = False,
         duration_ms: int | None = None,
@@ -388,6 +390,12 @@ class Session:
             # the image preview on the assistant bubble, same as the live reply.
             if i == closing_idx and reply_media:
                 extras["media"] = list(reply_media)
+            # Descriptors for that media. Without them a reloaded history would
+            # have to re-probe every file to learn a clip's duration — and on a
+            # host with no ffmpeg it simply couldn't, so the video would come
+            # back from history poorer than it was live.
+            if i == closing_idx and reply_media_assets:
+                extras["media_assets"] = _assets_to_meta(reply_media_assets)
             if i == closing_idx and aborted:
                 extras["aborted"] = True
             if i == closing_idx and duration_ms is not None:
@@ -414,6 +422,8 @@ class Session:
             extras = {"usage": clean_usage} if clean_usage else {}
             if reply_media:
                 extras["media"] = list(reply_media)
+            if reply_media_assets:
+                extras["media_assets"] = _assets_to_meta(reply_media_assets)
             if aborted:
                 extras["aborted"] = True
             if duration_ms is not None:

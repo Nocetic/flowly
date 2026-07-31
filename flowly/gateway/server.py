@@ -30,6 +30,7 @@ from flowly.gateway.auth import (
     loopback_ws_allowed,
     token_matches,
 )
+from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
@@ -276,6 +277,17 @@ def _inline_preview_b64(asset: Any, path: Path) -> str | None:
         return thumb[0] if thumb else None
     thumb = _thumbnail_b64(path)
     return thumb[0] if thumb else None
+
+
+def _assets_index(raw: Any) -> dict:
+    """Persisted/metadata asset dicts -> ``{path: MediaAsset}``.
+
+    Returns an empty map for anything unusable, so a turn recorded before
+    assets existed simply falls back to describing the files themselves.
+    """
+    from flowly.media.assets import assets_from_meta, index_by_path
+
+    return index_by_path(assets_from_meta(raw))
 
 
 def _resolve_media_id(name: str) -> tuple[Path | None, str, int]:
@@ -2217,7 +2229,13 @@ class GatewayServer:
             # reply path. (mediaId is still set for clients that want full-res.)
             media_paths = m.get("media")
             if isinstance(media_paths, list) and media_paths:
-                atts = _reply_media_attachments(media_paths)
+                # Descriptors persisted with the turn. Without them a reopened
+                # chat would have to re-probe every file to learn a clip's
+                # duration — and on a host with no ffmpeg it could not, so the
+                # video would come back from history poorer than it was live.
+                atts = _reply_media_attachments(
+                    media_paths, _assets_index(m.get("media_assets"))
+                )
                 if atts:
                     msg["attachments"] = atts
             if "timestamp" in m:
@@ -2479,7 +2497,9 @@ class GatewayServer:
             }
             reply_media = (metadata or {}).get("media") or []
             if reply_media:
-                atts = _reply_media_attachments(reply_media)
+                atts = _reply_media_attachments(
+                    reply_media, _assets_index((metadata or {}).get(ASSETS_META_KEY))
+                )
                 if atts:
                     final_message["attachments"] = atts
 

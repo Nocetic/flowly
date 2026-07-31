@@ -50,7 +50,8 @@ from flowly.agent.prompt_blocks import (
     detect_model_families,
 )
 from flowly.render_capabilities import normalize_render_capabilities
-from flowly.agent.reply_media import extract_reply_media
+from flowly.agent.reply_media import extract_reply_media, extract_reply_media_assets
+from flowly.media.assets import ASSETS_META_KEY, assets_to_meta
 from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
 
@@ -3516,6 +3517,7 @@ class AgentLoop:
         outbound_run_id: str = "",
         on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         reply_media: list[str] | None = None,
+        reply_media_assets: list | None = None,
         error_out: dict[str, Any] | None = None,
     ) -> tuple[str, list[dict[str, Any]], list[str], dict[str, Any], list[dict[str, Any]]]:
         """
@@ -4314,6 +4316,16 @@ class AgentLoop:
                             for _p in _attach_paths:
                                 if _p not in reply_media:
                                     reply_media.append(_p)
+                            # Descriptors for those files (duration, dimensions,
+                            # poster frame). Optional: a tool producing plain
+                            # images sends none, and the delivery layer then
+                            # describes the file itself.
+                            if reply_media_assets is not None:
+                                _known = {_a.path for _a in reply_media_assets}
+                                for _asset in extract_reply_media_assets(_tool_result):
+                                    if _asset.path not in _known:
+                                        reply_media_assets.append(_asset)
+                                        _known.add(_asset.path)
                             _tool_result = _attach_summary
                         _tool_success = not _tool_result.startswith("Error")
                         # Browser errors ride inside an {"error": ...} JSON
@@ -5663,6 +5675,9 @@ class AgentLoop:
         # Files a tool produces for this reply (image_generate, screenshot) land
         # here and ride the OutboundMessage below — no separate ``message`` send.
         reply_media: list[str] = []
+        # Descriptors for the files above, when the producing tool measured
+        # them (video duration/dimensions/poster). Same per-turn lifetime.
+        reply_media_assets: list = []
         provider_error: dict[str, Any] = {}
         final_content, tool_results, _executed_tools, usage, loop_messages = await self._run_llm_tool_loop(
             messages=messages,
@@ -5678,6 +5693,7 @@ class AgentLoop:
             outbound_run_id=msg.metadata.get("run_id") or "",
             on_iteration=on_iteration,
             reply_media=reply_media,
+            reply_media_assets=reply_media_assets,
             error_out=provider_error,
         )
         outbound_run_id = msg.metadata.get("run_id") or ""
@@ -5724,6 +5740,7 @@ class AgentLoop:
             usage=usage,
             media=msg.media or None,
             reply_media=reply_media or None,
+            reply_media_assets=reply_media_assets or None,
             aborted=turn_aborted,
             duration_ms=turn_duration_ms,
             # Provider failures are terminal, but they are not successful
@@ -5802,6 +5819,12 @@ class AgentLoop:
             content=final_content,
             media=reply_media,
             metadata={
+                # Descriptors for ``media`` above. The path list stays the
+                # delivery contract every channel reads; these ride alongside so
+                # the surfaces that CAN render richly (gateway, relay) know a
+                # clip's duration and poster without re-probing the file.
+                **({ASSETS_META_KEY: assets_to_meta(reply_media_assets)}
+                   if reply_media_assets else {}),
                 "tool_results": tool_results,
                 "executed_tools": _executed_tools,
                 "usage": usage,
@@ -5935,6 +5958,9 @@ class AgentLoop:
         # turn produced and what we need to persist.
         turn_start_idx = len(messages)
         reply_media: list[str] = []
+        # Descriptors for the files above, when the producing tool measured
+        # them (video duration/dimensions/poster). Same per-turn lifetime.
+        reply_media_assets: list = []
         final_content, tool_results, _executed_tools, system_usage, loop_messages = await self._run_llm_tool_loop(
             messages=messages,
             action_turn=action_turn,
@@ -5945,6 +5971,7 @@ class AgentLoop:
             outbound_chat_id=origin_chat_id,
             outbound_run_id=msg.metadata.get("run_id") or "",
             reply_media=reply_media,
+            reply_media_assets=reply_media_assets,
         )
 
         # No pending-action-lock bookkeeping here: a system/announce turn is a
@@ -5961,6 +5988,7 @@ class AgentLoop:
             final_content=final_content,
             usage=system_usage,
             reply_media=reply_media or None,
+            reply_media_assets=reply_media_assets or None,
             # System triggers (subagent/board/memory announces) drive this turn
             # and stay in the LLM context, but must never render in the chat as a
             # user message — only the assistant's summary is user-facing.
@@ -5991,6 +6019,11 @@ class AgentLoop:
             chat_id=origin_chat_id,
             content=final_content,
             media=reply_media,
+            metadata=(
+                {ASSETS_META_KEY: assets_to_meta(reply_media_assets)}
+                if reply_media_assets
+                else {}
+            ),
         )
 
     # ─── Activity tracker (inactivity-based timeout support) ────────────
@@ -6249,6 +6282,12 @@ class AgentLoop:
             # generated over a remote gateway (iOS/desktop direct WS) is lost.
             if response and response.media:
                 meta["media"] = list(response.media)
+                # Asset descriptors ride along so the gateway can build a
+                # playable video attachment (duration, poster) instead of a
+                # bare filename.
+                assets_meta = (response.metadata or {}).get(ASSETS_META_KEY)
+                if assets_meta:
+                    meta[ASSETS_META_KEY] = assets_meta
             return text, meta
         return text
 

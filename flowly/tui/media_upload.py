@@ -1,23 +1,41 @@
-"""Media upload helpers for the local TUI composer."""
+"""Media upload helpers for the local TUI composer.
+
+The upload call itself now lives in :mod:`flowly.media.hosted`: generated video
+needs the identical request on its way OUT to a relay client, and two copies of
+an upload contract is one copy too many. What stays here is the composer's own
+policy — which attachments need uploading at all, and what to tell a signed-out
+user who just dropped a large clip into the prompt.
+"""
 
 from __future__ import annotations
 
-import mimetypes
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-import httpx
-
-from flowly.account.auth import FLOWLY_API_BASE
+from flowly.media import hosted
+from flowly.media.hosted import MAX_UPLOAD_BYTES, UPLOAD_TIMEOUT
 from flowly.tui.attachments import build_attachment, is_video_path
 
 if TYPE_CHECKING:
     from flowly.account.auth import Account
 
 
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_SIGNED_OUT_INLINE_VIDEO_BYTES = 10 * 1024 * 1024
-UPLOAD_TIMEOUT = httpx.Timeout(120.0, connect=10.0, read=120.0, write=120.0)
+
+__all__ = [
+    "MAX_UPLOAD_BYTES",
+    "MAX_SIGNED_OUT_INLINE_VIDEO_BYTES",
+    "UPLOAD_TIMEOUT",
+    "AttachmentPreparationError",
+    "MediaUploadAuthRequiredError",
+    "MediaUploadTooLargeError",
+    "MediaUploadFailedError",
+    "MediaUploadAuthRequired",
+    "MediaUploadTooLarge",
+    "MediaUploadFailed",
+    "upload_media",
+    "prepare_media_attachments",
+]
 
 
 class AttachmentPreparationError(Exception):
@@ -41,21 +59,9 @@ MediaUploadTooLarge = MediaUploadTooLargeError
 MediaUploadFailed = MediaUploadFailedError
 
 
-def _size_mb(size: int) -> float:
-    return size / (1024 * 1024)
-
-
-def _mime_for(path: Path) -> str:
-    mime, _ = mimetypes.guess_type(str(path))
-    return mime or "application/octet-stream"
-
-
-def _upload_ready(account: "Account | None") -> bool:
-    return bool(
-        account
-        and getattr(account, "id_token", "")
-        and getattr(account, "server_id", "")
-    )
+_size_mb = hosted.size_mb
+_mime_for = hosted.guess_mime
+_upload_ready = hosted.upload_ready
 
 
 def _auth_required_message(path: Path, account: "Account | None") -> str:
@@ -80,62 +86,24 @@ async def upload_media(
     *,
     account: "Account",
     conversation_id: str,
-    client: httpx.AsyncClient | None = None,
+    client: Any | None = None,
 ) -> dict[str, Any]:
-    """Upload a media file to Flowly and return a chat attachment payload."""
+    """Upload a media file to Flowly and return a chat attachment payload.
 
-    size = path.stat().st_size
-    if size <= 0:
-        raise MediaUploadFailedError(f"`{path.name}` is empty.")
-    if size > MAX_UPLOAD_BYTES:
-        raise MediaUploadTooLargeError(
-            f"`{path.name}` is {_size_mb(size):.1f} MB. Max upload size is "
-            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
+    Thin wrapper over :func:`flowly.media.hosted.upload_media` that re-raises
+    in the composer's own exception vocabulary, which the TUI catches to show
+    an inline hint rather than a traceback.
+    """
+    try:
+        return await hosted.upload_media(
+            path, account=account, conversation_id=conversation_id, client=client
         )
-
-    mime = _mime_for(path)
-    url = f"{FLOWLY_API_BASE.rstrip('/')}/api/v1/uploads/media"
-    headers = {"Authorization": f"Bearer {account.id_token}"}
-    data = {
-        "serverId": account.server_id,
-        "conversationId": conversation_id,
-    }
-
-    async def _send(c: httpx.AsyncClient) -> dict[str, Any]:
-        with path.open("rb") as fh:
-            response = await c.post(
-                url,
-                headers=headers,
-                data=data,
-                files={"file": (path.name, fh, mime)},
-            )
-        if response.status_code >= 400:
-            detail = response.text[:200]
-            try:
-                body = response.json()
-                if isinstance(body, dict) and body.get("error"):
-                    detail = str(body["error"])
-            except ValueError:
-                pass
-            if response.status_code == 413:
-                raise MediaUploadTooLargeError(detail)
-            raise MediaUploadFailedError(f"video upload failed ({response.status_code}): {detail}")
-
-        body = response.json()
-        cdn_url = body.get("cdnUrl") if isinstance(body, dict) else None
-        if not isinstance(cdn_url, str) or not cdn_url.startswith(("http://", "https://")):
-            raise MediaUploadFailedError("video upload response did not include a valid cdnUrl.")
-        return {
-            "cdnUrl": cdn_url,
-            "fileName": str(body.get("fileName") or path.name),
-            "mimeType": str(body.get("mimeType") or mime),
-            "size": int(body.get("size") or size),
-        }
-
-    if client is not None:
-        return await _send(client)
-    async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT) as owned_client:
-        return await _send(owned_client)
+    except hosted.HostedUploadTooLargeError as exc:
+        raise MediaUploadTooLargeError(str(exc)) from exc
+    except hosted.HostedUploadAuthError as exc:
+        raise MediaUploadAuthRequiredError(str(exc)) from exc
+    except hosted.HostedUploadError as exc:
+        raise MediaUploadFailedError(f"video upload failed: {exc}") from exc
 
 
 async def prepare_media_attachments(

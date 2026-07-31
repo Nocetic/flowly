@@ -134,6 +134,28 @@ def _compress_image_for_transport(
         return None
 
 
+def _poster_b64(asset: Any) -> str | None:
+    """Base64 JPEG preview for a hosted attachment, from the asset's poster.
+
+    Video has no inline preview of its own — the relay's ``sharp`` thumbnailer
+    only understands images — so the poster ffmpeg pulled at generation time is
+    what a client shows before the first byte of the clip arrives. No poster
+    (no ffmpeg on this host) simply means no preview, never no attachment.
+    """
+    poster_path = getattr(asset, "poster_path", None)
+    if not poster_path:
+        return None
+    poster = Path(poster_path)
+    if not poster.is_file():
+        return None
+    compressed = _compress_image_for_transport(
+        poster, max_dimension=512, target_bytes=48 * 1024, initial_quality=70
+    )
+    if compressed is None:
+        return None
+    return base64.b64encode(compressed[0]).decode("ascii")
+
+
 def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
     """Resolve attachments to a media reference list.
 
@@ -333,6 +355,89 @@ class WebChannel(BaseChannel):
             await self._ws.close()
             self._ws = None
 
+    async def _hosted_attachments(self, msg: OutboundMessage) -> list[dict[str, Any]]:
+        """Upload this turn's non-image media and describe it as Attachment V2.
+
+        Images are deliberately left alone: they already reach the relay as
+        compressed base64 content blocks, that path works, and rerouting it
+        would risk a regression for the media people actually send today.
+
+        Everything else — video above all — goes to hosted storage and travels
+        as a ``cdnUrl``. When the upload fails the attachment is still emitted,
+        marked ``status: "failed"``: a clip that cannot be delivered has to be
+        visible as a failure, because silently dropping it leaves the user
+        reading "here's your video" next to an empty bubble.
+        """
+        from flowly.media.assets import (
+            ASSETS_META_KEY,
+            KIND_IMAGE,
+            STATUS_FAILED,
+            assets_from_meta,
+            attachment_v2,
+            describe,
+            index_by_path,
+            kind_for_mime,
+        )
+
+        by_path = index_by_path(assets_from_meta(msg.metadata.get(ASSETS_META_KEY)))
+        pending: list[tuple[Path, Any]] = []
+        for media_path in msg.media:
+            if not isinstance(media_path, str) or media_path.startswith(("http://", "https://")):
+                continue
+            p = Path(media_path)
+            if not p.is_file():
+                continue
+            asset = by_path.get(media_path)
+            if asset is None:
+                mime = mimetypes.guess_type(str(p))[0] or ""
+                if kind_for_mime(mime) == KIND_IMAGE:
+                    continue
+                asset = describe(p, probe_media=False)
+            if asset.kind == KIND_IMAGE:
+                continue
+            pending.append((p, asset))
+
+        if not pending:
+            return []
+
+        from flowly.account.auth import load_account_refreshing
+        from flowly.media import hosted
+
+        try:
+            account = await load_account_refreshing()
+        except Exception as exc:  # noqa: BLE001 - never break the reply
+            logger.warning(f"[WebChannel] could not load account for media upload: {exc}")
+            account = None
+
+        conversation_id = msg.chat_id or ""
+        out: list[dict[str, Any]] = []
+        for path, asset in pending:
+            thumbnail = _poster_b64(asset)
+            if account is None or not hosted.upload_ready(account):
+                logger.error(
+                    f"[WebChannel] cannot deliver {path.name}: hosted upload needs a "
+                    "signed-in Flowly account on a registered machine"
+                )
+                out.append(attachment_v2(asset, thumbnail=thumbnail, status=STATUS_FAILED))
+                continue
+            try:
+                uploaded = await hosted.upload_media(
+                    path, account=account, conversation_id=conversation_id
+                )
+            except hosted.HostedUploadError as exc:
+                logger.error(f"[WebChannel] hosted upload failed for {path.name}: {exc}")
+                out.append(attachment_v2(asset, thumbnail=thumbnail, status=STATUS_FAILED))
+                continue
+            att = attachment_v2(asset, thumbnail=thumbnail, cdn_url=uploaded["cdnUrl"])
+            if uploaded.get("s3Key"):
+                att["s3Key"] = uploaded["s3Key"]
+            logger.info(
+                f"[WebChannel] Attached {asset.kind} {path.name} "
+                f"({asset.size / 1024:.0f}KB) via hosted upload"
+            )
+            out.append(att)
+        return out
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send agent response back to the browser via the relay proxy.
 
@@ -397,6 +502,13 @@ class WebChannel(BaseChannel):
         if msg.content:
             content_blocks.append({"type": "text", "text": msg.content})
 
+        # Non-image media (video, audio) cannot ride the WS as base64: even a
+        # short clip is tens of megabytes and base64 inflates it by a third. It
+        # goes to hosted storage instead and travels as a URL. Done BEFORE the
+        # image loop so a delivery failure is known while the payload is still
+        # being assembled.
+        attachments_meta = await self._hosted_attachments(msg)
+
         # Encode media files as base64 image blocks (relay uploads to S3)
         for media_path in msg.media:
             try:
@@ -405,6 +517,7 @@ class WebChannel(BaseChannel):
                     continue
                 mime_type = mimetypes.guess_type(str(p))[0] or "image/png"
                 if not mime_type.startswith("image/"):
+                    # Already handled above — never a silent drop.
                     continue
                 compressed = _compress_image_for_transport(p)
                 if compressed is None:
@@ -479,6 +592,14 @@ class WebChannel(BaseChannel):
         model_meta = msg.metadata.get("model")
         if model_meta:
             data_block["model"] = str(model_meta)
+
+        # Attachment V2 for hosted media. The relay persists these onto the
+        # assistant message and forwards them on the live event, so a clip shows
+        # up in the same bubble as the text instead of arriving as nothing at
+        # all. Omitted entirely when the turn produced no non-image media, so an
+        # older relay sees precisely the wire shape it already handles.
+        if attachments_meta:
+            data_block["attachments"] = attachments_meta
 
         # Tool turn messages — the assistant_with_tool_calls / tool_result
         # entries the loop appended during this turn. The relay writes
