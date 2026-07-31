@@ -291,28 +291,15 @@ def _assets_index(raw: Any) -> dict:
 
 
 def _resolve_media_id(name: str) -> tuple[Path | None, str, int]:
-    """Resolve a media id (a bare basename) to a file inside the media dir.
+    """Resolve a media id to a file inside the media dir.
 
-    Returns ``(path, "", 0)`` on success or ``(None, error, http_status)``.
-    Shared by every media route so the containment rules can't drift apart:
-
-      * the id is a BASENAME — any separator, ``..`` or leading dot is rejected
-        before it touches the filesystem;
-      * the RESOLVED target must still sit inside the RESOLVED media dir, which
-        is what stops a symlink planted in the media dir from reading elsewhere.
+    Thin wrapper over :func:`flowly.media.serving.resolve_media_id` — the relay
+    bridge answers the same question over the agent socket, and the containment
+    rules must be one implementation, not two that drift.
     """
-    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
-        return None, "invalid id", 400
-    media_dir = (get_flowly_home() / "media").resolve()
-    try:
-        target = (media_dir / name).resolve()
-    except (OSError, RuntimeError):
-        return None, "invalid id", 400
-    if target != media_dir and media_dir not in target.parents:
-        return None, "forbidden", 403
-    if not target.is_file():
-        return None, "not found", 404
-    return target, "", 0
+    from flowly.media.serving import resolve_media_id
+
+    return resolve_media_id(name, get_flowly_home() / "media")
 
 
 def _reply_media_attachments(media_paths: list, assets: dict | None = None) -> list[dict]:

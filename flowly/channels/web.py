@@ -240,6 +240,10 @@ class WebChannel(BaseChannel):
         # so the next successful connection can flush it. Bounded to prevent
         # runaway growth on prolonged outages.
         self._outbound_queue: list[str] = []
+        # In-flight media.fetch replies (relay-bridged playback windows).
+        # Tracked only so an exception surfaces in logs instead of vanishing
+        # with the task; each one is short-lived (a single ≤4 MB disk read).
+        self._media_fetch_tasks: set[asyncio.Task] = set()
         # Stable cronSessionId provisioned by the relay during handshake.
         # Used as the default `to` for cron jobs with deliver=true, channel="web"
         # so bot-created crons route to the same "Scheduled Tasks" conversation
@@ -355,23 +359,24 @@ class WebChannel(BaseChannel):
             await self._ws.close()
             self._ws = None
 
-    async def _hosted_attachments(self, msg: OutboundMessage) -> list[dict[str, Any]]:
-        """Upload this turn's non-image media and describe it as Attachment V2.
+    async def _media_attachments(self, msg: OutboundMessage) -> list[dict[str, Any]]:
+        """Describe this turn's non-image media as Attachment V2, by media id.
 
         Images are deliberately left alone: they already reach the relay as
         compressed base64 content blocks, that path works, and rerouting it
         would risk a regression for the media people actually send today.
 
-        Everything else — video above all — goes to hosted storage and travels
-        as a ``cdnUrl``. When the upload fails the attachment is still emitted,
-        marked ``status: "failed"``: a clip that cannot be delivered has to be
-        visible as a failure, because silently dropping it leaves the user
-        reading "here's your video" next to an empty bubble.
+        Everything else — video above all — stays on this machine and travels
+        as a ``mediaId`` plus its poster. No cloud copy: clients that reach
+        this bot's gateway stream it directly, and clients that only reach the
+        relay stream it THROUGH the relay, which bridges the request to this
+        socket (``media.fetch``) without storing a byte. Delivery therefore
+        depends on nothing but the bot being online — no account, no hosted
+        storage, and nothing at rest anywhere else.
         """
         from flowly.media.assets import (
             ASSETS_META_KEY,
             KIND_IMAGE,
-            STATUS_FAILED,
             assets_from_meta,
             attachment_v2,
             describe,
@@ -380,7 +385,7 @@ class WebChannel(BaseChannel):
         )
 
         by_path = index_by_path(assets_from_meta(msg.metadata.get(ASSETS_META_KEY)))
-        pending: list[tuple[Path, Any]] = []
+        out: list[dict[str, Any]] = []
         for media_path in msg.media:
             if not isinstance(media_path, str) or media_path.startswith(("http://", "https://")):
                 continue
@@ -395,47 +400,11 @@ class WebChannel(BaseChannel):
                 asset = describe(p, probe_media=False)
             if asset.kind == KIND_IMAGE:
                 continue
-            pending.append((p, asset))
-
-        if not pending:
-            return []
-
-        from flowly.account.auth import load_account_refreshing
-        from flowly.media import hosted
-
-        try:
-            account = await load_account_refreshing()
-        except Exception as exc:  # noqa: BLE001 - never break the reply
-            logger.warning(f"[WebChannel] could not load account for media upload: {exc}")
-            account = None
-
-        conversation_id = msg.chat_id or ""
-        out: list[dict[str, Any]] = []
-        for path, asset in pending:
-            thumbnail = _poster_b64(asset)
-            if account is None or not hosted.upload_ready(account):
-                logger.error(
-                    f"[WebChannel] cannot deliver {path.name}: hosted upload needs a "
-                    "signed-in Flowly account on a registered machine"
-                )
-                out.append(attachment_v2(asset, thumbnail=thumbnail, status=STATUS_FAILED))
-                continue
-            try:
-                uploaded = await hosted.upload_media(
-                    path, account=account, conversation_id=conversation_id
-                )
-            except hosted.HostedUploadError as exc:
-                logger.error(f"[WebChannel] hosted upload failed for {path.name}: {exc}")
-                out.append(attachment_v2(asset, thumbnail=thumbnail, status=STATUS_FAILED))
-                continue
-            att = attachment_v2(asset, thumbnail=thumbnail, cdn_url=uploaded["cdnUrl"])
-            if uploaded.get("s3Key"):
-                att["s3Key"] = uploaded["s3Key"]
             logger.info(
-                f"[WebChannel] Attached {asset.kind} {path.name} "
-                f"({asset.size / 1024:.0f}KB) via hosted upload"
+                f"[WebChannel] Attached {asset.kind} {p.name} "
+                f"({asset.size / 1024:.0f}KB) by media id"
             )
-            out.append(att)
+            out.append(attachment_v2(asset, thumbnail=_poster_b64(asset), media_id=p.name))
         return out
 
     async def send(self, msg: OutboundMessage) -> None:
@@ -507,7 +476,7 @@ class WebChannel(BaseChannel):
         # goes to hosted storage instead and travels as a URL. Done BEFORE the
         # image loop so a delivery failure is known while the payload is still
         # being assembled.
-        attachments_meta = await self._hosted_attachments(msg)
+        attachments_meta = await self._media_attachments(msg)
 
         # Encode media files as base64 image blocks (relay uploads to S3)
         for media_path in msg.media:
@@ -982,6 +951,53 @@ class WebChannel(BaseChannel):
 
         self._ws = None
 
+    async def _serve_media_fetch(self, ws, msg: dict) -> None:
+        """Answer one relay-bridged media window request.
+
+        Stateless by design: read the requested window, send ONE
+        ``media.result`` frame, forget. The relay paces playback by simply not
+        asking for the next window until this one reached the client, so there
+        is no stream state here to leak when a socket drops mid-clip.
+
+        Every failure is answered, not just logged — the relay is holding a
+        client's HTTP request open and needs something to end it with.
+        """
+        request_id = str(msg.get("requestId") or "")
+        if not request_id:
+            return  # nothing to correlate a reply to
+        reply: dict[str, Any] = {"type": "media.result", "requestId": request_id}
+        try:
+            from flowly.media.serving import read_media_window
+
+            def _read():
+                offset = msg.get("offset")
+                length = msg.get("length")
+                return read_media_window(
+                    str(msg.get("mediaId") or ""),
+                    offset=int(offset) if isinstance(offset, (int, float)) else 0,
+                    length=int(length) if isinstance(length, (int, float)) else 0,
+                )
+
+            window = await asyncio.to_thread(_read)
+            if not window.ok:
+                reply.update({"ok": False, "error": window.error})
+            else:
+                reply.update({
+                    "ok": True,
+                    "size": window.size,
+                    "mimeType": window.mime_type,
+                    "eof": window.eof,
+                })
+                if window.data:
+                    reply["data"] = base64.b64encode(window.data).decode("ascii")
+        except Exception as exc:  # noqa: BLE001 - the relay must get an answer
+            logger.warning(f"[WebChannel] media.fetch failed: {exc}")
+            reply.update({"ok": False, "error": "internal"})
+        try:
+            await ws.send(json.dumps(reply))
+        except Exception as exc:  # noqa: BLE001 - socket may have dropped
+            logger.debug(f"[WebChannel] media.result send failed: {exc}")
+
     async def _handle_relay_message(self, ws, msg: dict) -> None:
         """Handle a message forwarded by the relay proxy."""
         msg_type = msg.get("type")
@@ -1021,6 +1037,14 @@ class WebChannel(BaseChannel):
             if session_id:
                 pong["sessionId"] = session_id
             await ws.send(json.dumps(pong))
+
+        elif msg_type == "media.fetch":
+            # The relay is bridging a client's playback request to this bot.
+            # Served in a task so a slow disk can't stall the receive loop —
+            # pings and unrelated RPCs must keep flowing while we read.
+            task = asyncio.create_task(self._serve_media_fetch(ws, msg))
+            self._media_fetch_tasks.add(task)
+            task.add_done_callback(self._media_fetch_tasks.discard)
 
         elif msg_type in ("cron.registered", "cron.unregistered"):
             # Relay ACKs the cron.register / cron.unregister we sent — no
