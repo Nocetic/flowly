@@ -3423,7 +3423,13 @@ async def media_models_get(params: dict) -> dict:
     model = await catalog.get(endpoint_id, with_schema=bool(params.get("withSchema")))
     if model is None:
         raise FeatureRpcError("NOT_FOUND", f"unknown model: {endpoint_id}")
-    return {"model": model.to_dict()}
+    # ``runnable`` is the question a picker is actually asking before it lets
+    # someone select something; ``reason`` is what makes a refusal actionable.
+    return {
+        "model": model.to_dict(),
+        "runnable": model.is_runnable,
+        "reason": model.incompatibility_reason,
+    }
 
 
 async def media_models_refresh(_params: dict) -> dict:

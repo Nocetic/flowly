@@ -71,6 +71,10 @@ class MediaModel:
     thumbnail_url: str = ""
     updated_at: str = ""
     compatibility: str = COMPAT_COMPATIBLE
+    #: Why an ``unsupported`` model was refused, e.g. "needs audio_url".
+    #: Empty for anything runnable — "this can't be used" is only useful if it
+    #: says what the model wanted.
+    incompatibility_reason: str = ""
     # Populated only after the endpoint's OpenAPI is fetched (on selection/run).
     input_schema: dict[str, Any] | None = field(default=None, compare=False)
 
@@ -96,6 +100,7 @@ class MediaModel:
             "thumbnailUrl": self.thumbnail_url,
             "updatedAt": self.updated_at,
             "compatibility": self.compatibility,
+            **({"reason": self.incompatibility_reason} if self.incompatibility_reason else {}),
         }
 
     @classmethod
@@ -367,13 +372,15 @@ class ModelCatalog:
 
     @staticmethod
     def _apply_openapi(model: MediaModel, openapi: Any) -> MediaModel:
-        from flowly.media.adapters import input_schema_from_openapi, verdict_for
+        from flowly.media.adapters import compatibility_report, input_schema_from_openapi
 
         schema = input_schema_from_openapi(openapi if isinstance(openapi, dict) else None)
         if schema is None:
             return model
+        verdict, reason = compatibility_report(model.category, schema)
         return replace(
             model,
             input_schema=schema,
-            compatibility=verdict_for(model.category, schema),
+            compatibility=verdict,
+            incompatibility_reason=reason,
         )

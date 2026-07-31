@@ -127,3 +127,90 @@ def test_none_of_these_ask_for_a_gateway_restart(isolated_home, stub_catalog):
     ):
         _result, restart = _dispatch(method, params)
         assert restart is False, method
+
+
+# ── selection-time validation ───────────────────────────────────────────────
+#
+# A picker's real question is "will this model work if I choose it?", and the
+# only honest answer needs the endpoint's schema. Answering it at SELECTION
+# time — one request — is what stops someone discovering the problem minutes
+# later when a generation fails.
+
+def test_get_answers_whether_a_model_can_be_run(isolated_home, monkeypatch):
+    from flowly.media.catalog import COMPAT_READY, MediaModel
+
+    ready = MediaModel("vendor/t2v", "Vendor T2V", "text-to-video", compatibility=COMPAT_READY)
+
+    class FakeCatalog:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def list_models(self, *, category=None, force=False):
+            return []
+
+        async def get(self, endpoint_id, *, with_schema=False):
+            return ready if with_schema else None
+
+    import flowly.media.catalog as catalog_mod
+
+    monkeypatch.setattr(catalog_mod, "ModelCatalog", FakeCatalog)
+    result, _restart = _dispatch("media.models.get", {"endpointId": "vendor/t2v", "withSchema": True})
+
+    assert result["runnable"] is True
+    assert result["reason"] == ""
+    assert result["model"]["compatibility"] == "ready"
+
+
+def test_an_unsupported_model_says_what_it_wanted(isolated_home, monkeypatch):
+    """"This model can't be used" is only useful if it names the missing input."""
+    from flowly.media.catalog import COMPAT_UNSUPPORTED, MediaModel
+
+    lipsync = MediaModel(
+        "vendor/lipsync",
+        "Lipsync",
+        "text-to-video",
+        compatibility=COMPAT_UNSUPPORTED,
+        incompatibility_reason="needs audio_url, video_url",
+    )
+
+    class FakeCatalog:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def list_models(self, *, category=None, force=False):
+            return []
+
+        async def get(self, endpoint_id, *, with_schema=False):
+            return lipsync
+
+    import flowly.media.catalog as catalog_mod
+
+    monkeypatch.setattr(catalog_mod, "ModelCatalog", FakeCatalog)
+    result, _restart = _dispatch(
+        "media.models.get", {"endpointId": "vendor/lipsync", "withSchema": True}
+    )
+
+    assert result["runnable"] is False
+    assert "audio_url" in result["reason"]
+    assert result["model"]["reason"] == "needs audio_url, video_url"
+
+
+def test_a_runnable_model_carries_no_reason_field(isolated_home, monkeypatch):
+    """Absent, not empty — a client should never render a blank explanation."""
+    from flowly.media.catalog import COMPAT_READY, MediaModel
+
+    class FakeCatalog:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def list_models(self, *, category=None, force=False):
+            return [MediaModel("a/b", "A", "text-to-video", compatibility=COMPAT_READY)]
+
+        async def get(self, endpoint_id, *, with_schema=False):
+            return MediaModel("a/b", "A", "text-to-video", compatibility=COMPAT_READY)
+
+    import flowly.media.catalog as catalog_mod
+
+    monkeypatch.setattr(catalog_mod, "ModelCatalog", FakeCatalog)
+    result, _restart = _dispatch("media.models.get", {"endpointId": "a/b"})
+    assert "reason" not in result["model"]

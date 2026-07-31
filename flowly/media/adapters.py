@@ -127,34 +127,43 @@ def _canonical_for_property(name: str) -> str | None:
     return None
 
 
-def verdict_for(category: str, schema: dict[str, Any] | None) -> str:
-    """``ready`` / ``compatible`` / ``unsupported`` for one endpoint.
+def compatibility_report(category: str, schema: dict[str, Any] | None) -> tuple[str, str]:
+    """``(verdict, reason)`` for one endpoint.
 
     ``ready`` means we can fill every required input AND the field that defines
     the category is present (a prompt for text-to-*, a still for image-to-*).
-    ``compatible`` means it will probably work but the defining field is
-    missing, so the caller should tread carefully. ``unsupported`` means a
-    required input is something Flowly has no way to provide.
+    ``compatible`` means the schema is unknown, so it will be judged when it
+    runs. ``unsupported`` means the endpoint needs something Flowly has no way
+    to provide — and the reason names it, because "this model can't be used" is
+    only useful if it says what the model wanted.
     """
     from flowly.media.catalog import COMPAT_COMPATIBLE, COMPAT_READY, COMPAT_UNSUPPORTED
 
     if not schema:
-        return COMPAT_COMPATIBLE
+        return COMPAT_COMPATIBLE, ""
 
-    for required in _required(schema):
-        canonical = _canonical_for_property(required)
-        if canonical is None or canonical not in _FILLABLE:
-            return COMPAT_UNSUPPORTED
+    unfillable = [
+        required
+        for required in _required(schema)
+        if (_canonical_for_property(required) or "") not in _FILLABLE
+    ]
+    if unfillable:
+        return COMPAT_UNSUPPORTED, "needs " + ", ".join(sorted(unfillable))
 
     needs_image = category in ("image-to-video", "image-to-image")
     has_prompt = resolve_property(schema, "prompt") is not None
     has_image = resolve_property(schema, "input_image") is not None
 
     if needs_image and not has_image:
-        return COMPAT_UNSUPPORTED
+        return COMPAT_UNSUPPORTED, "takes no starting image"
     if not needs_image and not has_prompt:
-        return COMPAT_UNSUPPORTED
-    return COMPAT_READY
+        return COMPAT_UNSUPPORTED, "takes no text prompt"
+    return COMPAT_READY, ""
+
+
+def verdict_for(category: str, schema: dict[str, Any] | None) -> str:
+    """Just the verdict from :func:`compatibility_report`."""
+    return compatibility_report(category, schema)[0]
 
 
 # -- value coercion ----------------------------------------------------------
