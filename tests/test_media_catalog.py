@@ -516,19 +516,59 @@ def test_an_unsupported_ratio_is_refused_not_approximated():
     assert coerce_value("9:16", {"enum": ["16:9", "9:16"]}) == "9:16"
 
 
-def test_an_explicit_aspect_ratio_the_model_cannot_do_is_refused():
-    """Following from the above: the caller asked for portrait by name, so the
-    tool says the model can't do it rather than quietly reframing the shot."""
+def test_an_explicit_aspect_ratio_a_text_to_video_model_cannot_do_is_refused():
+    """For text-to-video the ratio decides the framing and nothing else can
+    supply it, so the caller is told rather than quietly reframed."""
     schema = {
         "required": ["prompt"],
         "properties": {"prompt": {"type": "string"}, "aspect_ratio": {"enum": ["16:9", "1:1"]}},
     }
     with pytest.raises(AdapterError, match="aspect_ratio"):
         build_payload(
-            schema, {"prompt": "x", "aspect_ratio": "9:16"}, explicit=frozenset({"aspect_ratio"})
+            schema,
+            {"prompt": "x", "aspect_ratio": "9:16"},
+            explicit=frozenset({"aspect_ratio"}),
+            category="text-to-video",
         )
 
     # Not asked for by name → still just dropped, with a log line.
     payload, dropped = build_payload(schema, {"prompt": "x", "aspect_ratio": "9:16"})
     assert payload == {"prompt": "x"}
     assert dropped == ["aspect_ratio"]
+
+
+def test_image_to_video_ignores_a_ratio_it_has_no_field_for():
+    """The source still defines the frame there.
+
+    Every Kling image-to-video endpoint exposes no aspect field at all, and the
+    tool's own guidance nudges the agent to ask for 9:16 — refusing would fail
+    a request those models would have answered correctly.
+    """
+    schema = {
+        "required": ["prompt", "image_url"],
+        "properties": {"prompt": {"type": "string"}, "image_url": {"type": "string"}},
+    }
+    payload, dropped = build_payload(
+        schema,
+        {"prompt": "x", "input_image": "https://x/y.png", "aspect_ratio": "9:16"},
+        explicit=frozenset({"aspect_ratio", "input_image"}),
+        category="image-to-video",
+    )
+    assert payload == {"prompt": "x", "image_url": "https://x/y.png"}
+    assert dropped == ["aspect_ratio"]
+
+
+def test_audio_stays_consequential_in_every_category():
+    """Unlike framing, sound has no other source — a silent clip for someone
+    who asked for audio is wrong whatever the category."""
+    schema = {
+        "required": ["prompt", "image_url"],
+        "properties": {"prompt": {"type": "string"}, "image_url": {"type": "string"}},
+    }
+    with pytest.raises(AdapterError, match="generate_audio"):
+        build_payload(
+            schema,
+            {"prompt": "x", "input_image": "https://x/y.png", "generate_audio": True},
+            explicit=frozenset({"generate_audio"}),
+            category="image-to-video",
+        )

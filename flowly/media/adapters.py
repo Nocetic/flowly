@@ -50,10 +50,22 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 _FILLABLE = frozenset(_ALIASES.keys())
 
 # Fields whose absence changes what the user GETS, so dropping them silently is
-# not acceptable — the caller is told instead. Aspect ratio belongs here for the
-# same reason audio does: asking for 9:16 and receiving landscape is a wrong
-# video, not a missing nicety.
-_MUST_NOT_DROP = frozenset({"generate_audio", "input_image", "aspect_ratio"})
+# not acceptable — the caller is told instead.
+_MUST_NOT_DROP = frozenset({"generate_audio", "input_image"})
+
+# Aspect ratio is conditional. For text-to-video it decides the framing and
+# nothing else can supply it, so asking for 9:16 and receiving landscape is a
+# wrong video. For image-to-video the SOURCE STILL defines the frame — several
+# endpoints (every Kling image-to-video, for one) legitimately expose no aspect
+# field at all, and refusing them would fail a request the model would have
+# answered correctly.
+_ASPECT_DECIDES_FRAMING = frozenset({"text-to-video", "text-to-image"})
+
+
+def _must_not_drop_for(category: str) -> frozenset[str]:
+    if category in _ASPECT_DECIDES_FRAMING:
+        return _MUST_NOT_DROP | {"aspect_ratio"}
+    return _MUST_NOT_DROP
 
 
 class AdapterError(ValueError):
@@ -251,13 +263,16 @@ def build_payload(
     request: dict[str, Any],
     *,
     explicit: frozenset[str] = frozenset(),
+    category: str = "",
 ) -> tuple[dict[str, Any], list[str]]:
     """Canonical request → provider payload.
 
     Returns ``(payload, dropped)``. ``dropped`` names canonical fields the
     endpoint has no home for; the caller decides whether that is acceptable.
     ``explicit`` marks fields the user asked for by name, which turns a
-    consequential drop into an error instead of a surprise.
+    consequential drop into an error instead of a surprise — and ``category``
+    decides which drops are consequential, since a field that determines the
+    result for one kind of generation is redundant for another.
     """
     payload: dict[str, Any] = {}
     dropped: list[str] = []
@@ -275,7 +290,8 @@ def build_payload(
             continue
         payload[prop_name] = coerced
 
-    consequential = [f for f in dropped if f in _MUST_NOT_DROP and f in explicit]
+    must_not_drop = _must_not_drop_for(category)
+    consequential = [f for f in dropped if f in must_not_drop and f in explicit]
     if consequential:
         raise AdapterError(
             "this model does not support: " + ", ".join(sorted(consequential))

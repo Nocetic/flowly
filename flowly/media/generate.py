@@ -196,7 +196,9 @@ async def generate_video(
         )
 
     try:
-        payload, dropped = build_payload(model.input_schema, request, explicit=explicit)
+        payload, dropped = build_payload(
+            model.input_schema, request, explicit=explicit, category=model.category
+        )
     except AdapterError as exc:
         raise GenerationError(str(exc)) from exc
     if dropped:
