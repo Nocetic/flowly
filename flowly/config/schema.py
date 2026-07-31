@@ -783,16 +783,49 @@ class CodexSessionToolConfig(BaseModel):
 
 
 class ImageGenerationConfig(BaseModel):
-    """Image-generation tool configuration (provider-backed media).
+    """Legacy image-only settings, superseded by :class:`MediaGenerationConfig`.
 
-    Off by default; registers the ``image_generate`` tool only when ``enabled``
-    and an ``api_key`` are present. ``provider`` keeps the door open for non-FAL
-    backends later; ``model`` is the active model id (curated, user-selectable).
+    Kept so an existing ``tools.imageGeneration`` block on disk keeps working —
+    it is read at startup and folded into the media settings, so nobody loses
+    their key or their chosen model on upgrade. New writes go to
+    ``tools.mediaGeneration``.
     """
     enabled: bool = False
     provider: str = "fal"
     model: str = "fal-ai/flux/dev"
     api_key: str = ""
+
+
+class MediaGenerationDefaults(BaseModel):
+    """The model used for each kind of generation when the agent doesn't pick.
+
+    Every field defaults to empty, meaning "not chosen yet" — a real default
+    here would silently outrank the model an upgrading user already picked in
+    the older image-only config. The fallback chain lives in
+    :func:`flowly.media.settings.resolve_media_settings`, which is the only
+    place that can see both blocks at once.
+    """
+    text_to_image: str = ""
+    image_to_image: str = ""
+    text_to_video: str = ""
+    image_to_video: str = ""
+
+
+class MediaGenerationConfig(BaseModel):
+    """Image AND video generation (provider-backed media).
+
+    Off by default; the tools register only when ``enabled`` and an ``api_key``
+    are present. One key and one provider now cover both kinds — they are the
+    same account and the same catalog, and splitting them would mean asking for
+    the same credential twice.
+    """
+    enabled: bool = False
+    provider: str = "fal"
+    api_key: str = ""
+    defaults: MediaGenerationDefaults = Field(default_factory=MediaGenerationDefaults)
+    # Ceiling for one video generation before it is cancelled provider-side.
+    # Generous: a 1080p clip genuinely takes minutes.
+    video_timeout_seconds: int = 900
 
 
 class ToolsConfig(BaseModel):
@@ -804,6 +837,7 @@ class ToolsConfig(BaseModel):
     computer: ComputerConfig = Field(default_factory=ComputerConfig)
     codex_session: CodexSessionToolConfig = Field(default_factory=CodexSessionToolConfig)
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
+    media_generation: MediaGenerationConfig = Field(default_factory=MediaGenerationConfig)
 
 
 class AuditConfig(BaseModel):

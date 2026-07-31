@@ -149,6 +149,39 @@ def agent(
             result_preview = result_preview.replace("\n", " ")
             console.print(f"  {icon} [cyan]{name}[/cyan] [dim]{result_preview}[/dim]")
 
+    def _display_media(meta: dict) -> None:
+        """List the files this turn produced, by absolute path.
+
+        A terminal cannot play a clip, so the useful thing is to say exactly
+        where it landed. The paths come from the turn's metadata rather than
+        being parsed out of the reply text, and a file that is not actually on
+        disk is not listed — telling someone a video is ready when it isn't is
+        worse than saying nothing.
+        """
+        paths = [p for p in (meta.get("media") or []) if isinstance(p, str)]
+        if not paths:
+            return
+
+        from flowly.media.assets import assets_from_meta, index_by_path
+
+        assets = index_by_path(assets_from_meta(meta.get("media_assets")))
+        shown = 0
+        for raw in paths:
+            if raw.startswith(("http://", "https://")):
+                continue
+            path = Path(raw)
+            if not path.is_file():
+                continue
+            if shown == 0:
+                console.print("\n[dim]Saved:[/dim]")
+            shown += 1
+            asset = assets.get(raw)
+            kind = (asset.kind if asset else "") or "file"
+            console.print(f"  [cyan]{kind}[/cyan] {path.resolve()}")
+            poster = getattr(asset, "poster_path", None)
+            if poster and Path(poster).is_file():
+                console.print(f"  [dim]poster[/dim] {Path(poster).resolve()}")
+
     def _display_usage(meta: dict) -> None:
         """Show token usage from metadata."""
         usage = meta.get("usage", {})
@@ -182,6 +215,7 @@ def agent(
                 )
                 _display_tool_results(meta)
                 console.print(f"\n{__logo__} {response}")
+                _display_media(meta)
                 _display_usage(meta)
             asyncio.run(run_once())
     else:
@@ -269,6 +303,7 @@ def agent(
                     )
                     _display_tool_results(meta)
                     console.print(f"\n{__logo__} {response}")
+                    _display_media(meta)
                     _display_usage(meta)
                     console.print()
                 except KeyboardInterrupt:

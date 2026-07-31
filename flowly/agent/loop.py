@@ -1659,12 +1659,29 @@ class AgentLoop:
                     default_project=getattr(sentry_cfg, 'default_project', ''),
                 ))
 
-        # Image generation (FAL-backed, opt-in) — dual-gated on enabled + key.
+        # Media generation (provider-backed, opt-in). Settings are read through
+        # the resolver so an install still carrying the older image-only config
+        # keeps its key and its chosen model.
         if self._main_config and hasattr(self._main_config, 'tools'):
-            img_cfg = getattr(self._main_config.tools, 'image_generation', None)
-            if img_cfg and img_cfg.enabled and img_cfg.api_key:
+            from flowly.media.settings import resolve_media_settings
+            media_cfg = resolve_media_settings(self._main_config.tools)
+            if media_cfg.image_ready:
                 from flowly.agent.tools.image_generate import ImageGenerateTool
-                self.tools.register(ImageGenerateTool(api_key=img_cfg.api_key, model=img_cfg.model))
+                self.tools.register(ImageGenerateTool(
+                    api_key=media_cfg.api_key,
+                    model=media_cfg.text_to_image,
+                ))
+            # Video is gated on a chosen model as well as a key: there is no
+            # safe default, and picking one would spend the user's money on a
+            # model they never selected.
+            if media_cfg.video_ready:
+                from flowly.agent.tools.video_generate import VideoGenerateTool
+                self.tools.register(VideoGenerateTool(
+                    api_key=media_cfg.api_key,
+                    text_to_video_model=media_cfg.text_to_video,
+                    image_to_video_model=media_cfg.image_to_video,
+                    timeout_seconds=media_cfg.video_timeout_seconds,
+                ))
 
         # Home Assistant tools (if configured) — gated on both url AND
         # token so a half-finished setup doesn't expose tools that will
