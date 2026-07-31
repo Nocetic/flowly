@@ -333,3 +333,102 @@ async def test_a_good_download_lands_with_the_right_extension(tmp_path, monkeypa
     assert path.suffix == ".mp4"
     assert path.read_bytes() == b"abcdef"
     assert not path.name.startswith("."), "the temp name must not survive"
+
+
+# ── post-generation pruning ─────────────────────────────────────────────────
+#
+# Pruning only at gateway start meant an always-on agent could run for weeks
+# past its budget and then delete a month of history in one go at the next
+# restart. Doing it after each generation keeps the folder inside its budget
+# continuously — but it must never delete the clip that triggered it.
+
+
+async def test_a_new_clip_survives_the_prune_it_triggers(tmp_path, monkeypatch):
+    from flowly.media.generate import prune_after_generation
+
+    media = tmp_path / "media"
+    media.mkdir()
+    clip = media / "vid-new.mp4"
+    clip.write_bytes(b"\x00" * (3 * 1024 * 1024))
+    poster = media / "vid-new.jpg"
+    poster.write_bytes(b"\x00" * 1024)
+
+    import flowly.media.generate as generate
+    from flowly.config.schema import Config
+
+    monkeypatch.setattr(generate, "media_dir", lambda: media)
+    # A budget the new clip alone blows past.
+    config = Config()
+    config.media.retention.video_max_size_mb = 1
+    config.media.retention.retention_days = -1
+    monkeypatch.setattr("flowly.config.loader.load_config", lambda *a, **k: config)
+
+    await prune_after_generation([str(clip)])
+
+    assert clip.exists(), "the generation that triggered the prune must survive it"
+    assert poster.exists(), "and so must its poster"
+
+
+async def test_the_prune_still_reclaims_older_media(tmp_path, monkeypatch):
+    import os
+    import time
+
+    from flowly.media.generate import prune_after_generation
+
+    media = tmp_path / "media"
+    media.mkdir()
+    old = media / "vid-old.mp4"
+    old.write_bytes(b"\x00" * (2 * 1024 * 1024))
+    stale = time.time() - 90 * 86_400
+    os.utime(old, (stale, stale))
+    fresh = media / "vid-new.mp4"
+    fresh.write_bytes(b"\x00" * 1024)
+
+    import flowly.media.generate as generate
+    from flowly.config.schema import Config
+
+    monkeypatch.setattr(generate, "media_dir", lambda: media)
+    monkeypatch.setattr("flowly.config.loader.load_config", lambda *a, **k: Config())
+
+    await prune_after_generation([str(fresh)])
+
+    assert not old.exists()
+    assert fresh.exists()
+
+
+async def test_pruning_never_breaks_a_reply(tmp_path, monkeypatch):
+    """Reclaiming disk is housekeeping; a failure in it must not surface as a
+    failed generation."""
+    from flowly.media.generate import prune_after_generation
+
+    def _explode(*_a, **_k):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr("flowly.config.loader.load_config", _explode)
+    await prune_after_generation(["/tmp/whatever.mp4"])  # must not raise
+
+
+async def test_disabled_retention_prunes_nothing(tmp_path, monkeypatch):
+    import os
+    import time
+
+    from flowly.media.generate import prune_after_generation
+
+    media = tmp_path / "media"
+    media.mkdir()
+    ancient = media / "vid-ancient.mp4"
+    ancient.write_bytes(b"\x00" * 1024)
+    stale = time.time() - 400 * 86_400
+    os.utime(ancient, (stale, stale))
+
+    import flowly.media.generate as generate
+    from flowly.config.schema import Config
+
+    config = Config()
+    config.media.retention.enabled = False
+    monkeypatch.setattr(generate, "media_dir", lambda: media)
+    monkeypatch.setattr("flowly.config.loader.load_config", lambda *a, **k: config)
+
+    await prune_after_generation([])
+
+    assert ancient.exists()

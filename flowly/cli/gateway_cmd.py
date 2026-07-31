@@ -306,31 +306,37 @@ def gateway(
         except Exception as e:
             logger.debug(f"[Gateway] Audit retention skipped: {e}")
 
-    # Prune generated media (~/.flowly/media) so image generation can't fill the
-    # disk over time — the disk-cleanup plugin deliberately protects this folder,
-    # so nothing else reclaims it. Best-effort; never blocks startup. Tunable via
-    # FLOWLY_MEDIA_RETENTION_DAYS / FLOWLY_MEDIA_MAX_SIZE_MB (age -1 / size 0 = off).
-    try:
-        from flowly.media.retention import (
-            DEFAULT_MAX_SIZE_MB,
-            DEFAULT_RETENTION_DAYS,
-            prune_media,
-        )
-        from flowly.profile import get_flowly_home
+    # Prune generated media (~/.flowly/media) so generation can't fill the disk
+    # over time — the disk-cleanup plugin deliberately protects this folder, so
+    # nothing else reclaims it. Best-effort; never blocks startup. Settings live
+    # in config (media.retention); the FLOWLY_MEDIA_* env vars still override
+    # them for a one-off run.
+    if config.media.retention.enabled:
+        try:
+            from flowly.media.retention import prune_media
+            from flowly.profile import get_flowly_home
 
-        def _media_env_int(name: str, default: int) -> int:
-            try:
-                return int(os.environ[name])
-            except (KeyError, ValueError):
-                return default
+            def _media_env_int(name: str, default: int) -> int:
+                try:
+                    return int(os.environ[name])
+                except (KeyError, ValueError):
+                    return default
 
-        prune_media(
-            get_flowly_home() / "media",
-            retention_days=_media_env_int("FLOWLY_MEDIA_RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
-            max_size_mb=_media_env_int("FLOWLY_MEDIA_MAX_SIZE_MB", DEFAULT_MAX_SIZE_MB),
-        )
-    except Exception as e:
-        logger.debug(f"[Gateway] Media retention skipped: {e}")
+            retention = config.media.retention
+            prune_media(
+                get_flowly_home() / "media",
+                retention_days=_media_env_int(
+                    "FLOWLY_MEDIA_RETENTION_DAYS", retention.retention_days
+                ),
+                image_max_size_mb=_media_env_int(
+                    "FLOWLY_MEDIA_MAX_SIZE_MB", retention.image_max_size_mb
+                ),
+                video_max_size_mb=_media_env_int(
+                    "FLOWLY_MEDIA_VIDEO_MAX_SIZE_MB", retention.video_max_size_mb
+                ),
+            )
+        except Exception as e:
+            logger.debug(f"[Gateway] Media retention skipped: {e}")
 
     # Resolve persona: CLI flag overrides config
     active_persona = persona if persona else config.agents.defaults.persona

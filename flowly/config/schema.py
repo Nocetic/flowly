@@ -840,6 +840,30 @@ class ToolsConfig(BaseModel):
     media_generation: MediaGenerationConfig = Field(default_factory=MediaGenerationConfig)
 
 
+class MediaRetentionConfig(BaseModel):
+    """How long generated media is kept in ``~/.flowly/media``.
+
+    Age is about relevance, so one cap covers every kind. Size is about disk,
+    and video is one to two orders of magnitude larger than an image — a shared
+    budget would mean generating video silently evicts screenshots somebody
+    still wanted, so each kind gets its own. Audio and stray files share the
+    image budget; both are small.
+
+    ``retention_days = -1`` disables the age cap; a size budget of ``0``
+    disables that budget. A clip and its poster frame are always deleted
+    together — they are one attachment, not two files.
+    """
+    enabled: bool = True
+    retention_days: int = 30
+    image_max_size_mb: int = 500
+    video_max_size_mb: int = 2000
+
+
+class MediaConfig(BaseModel):
+    """Settings for the media Flowly stores on this machine."""
+    retention: MediaRetentionConfig = Field(default_factory=MediaRetentionConfig)
+
+
 class AuditConfig(BaseModel):
     """Audit log retention configuration.
 
@@ -957,6 +981,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
+    media: MediaConfig = Field(default_factory=MediaConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)

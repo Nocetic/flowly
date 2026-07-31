@@ -140,6 +140,44 @@ def _attach_poster(video_path: Path) -> str | None:
     return None
 
 
+async def prune_after_generation(new_paths: list[str]) -> None:
+    """Reclaim space right after producing media, protecting what we just made.
+
+    Pruning only at gateway start meant an always-on agent could generate for
+    weeks past its budget and then delete a month of history in one go at the
+    next restart. Doing it here keeps the folder inside its budget continuously.
+
+    ``new_paths`` are protected, so a clip larger than its own budget fails
+    loudly at the quota instead of vanishing the moment it lands. Best-effort
+    and off the event loop — reclaiming disk must never delay a reply or break
+    one.
+    """
+    try:
+        import asyncio
+
+        from flowly.config.loader import load_config
+        from flowly.media.retention import prune_media
+
+        retention = load_config().media.retention
+        if not retention.enabled:
+            return
+
+        directory = media_dir()
+        posters = [
+            str(Path(p).with_suffix(".jpg")) for p in new_paths
+        ]
+        await asyncio.to_thread(
+            prune_media,
+            directory,
+            retention.retention_days,
+            retention.image_max_size_mb,
+            retention.video_max_size_mb,
+            [*new_paths, *posters],
+        )
+    except Exception as exc:  # noqa: BLE001 - never break a reply over cleanup
+        logger.debug("[media] post-generation prune skipped: {}", exc)
+
+
 async def resolve_model(
     catalog: ModelCatalog, endpoint_id: str, *, category: str
 ) -> MediaModel:
@@ -241,4 +279,6 @@ async def generate_video(
 
     if not assets:
         raise GenerationError("the generated video could not be saved.")
+
+    await prune_after_generation([a.path for a in assets])
     return GenerationResult(assets=assets, model=model.endpoint_id, request_id=job.request_id)

@@ -1,0 +1,15 @@
+{
+  "timezone": "Europe/Istanbul",
+  "publishTimes": [
+    "20:30"
+  ],
+  "productionLeadHours": 6,
+  "publishGraceMinutes": 20,
+  "language": "en",
+  "durationSeconds": 45,
+  "resolution": "1080x1920",
+  "visibility": "public",
+  "aiDisclosure": true,
+  "channelConcept": "A YouTube channel operated end-to-end by Flowly, the personal AI agent you own.",
+  "series": "This Channel Is Run by Flowly"
+}
