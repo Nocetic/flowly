@@ -7,6 +7,7 @@ records, what retention removes, and what happens when they disagree.
 
 from __future__ import annotations
 
+import base64
 import json
 import struct
 import time
@@ -405,7 +406,10 @@ def test_thumbnails_are_generated_and_cached(home: Path, library: MediaLibrary):
     library.record([describe(_png(home / "media" / "img-a.png"))], source=SOURCE_GENERATED)
 
     items, _total = library.list(with_thumbs=True)
-    assert items[0]["thumbnail"].startswith("data:image/jpeg;base64,")
+    # Raw base64, exactly as a chat attachment carries it — clients wrap it.
+    assert items[0]["thumbnail"]
+    assert not items[0]["thumbnail"].startswith("data:")
+    assert base64.b64decode(items[0]["thumbnail"]).startswith(b"\xff\xd8")
     assert (thumbs_dir(home / "media") / "img-a.png.jpg").is_file()
 
 

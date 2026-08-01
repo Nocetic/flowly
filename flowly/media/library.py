@@ -1184,13 +1184,20 @@ def _session_key_for(session_file: Path) -> str:
 
 
 def _read_thumb_b64(path: Path) -> str:
+    """RAW base64, deliberately not a data URL.
+
+    ``thumbnail`` on a chat attachment has always been bare base64 that the
+    client wraps (``data:image/jpeg;base64,${thumbnail}``). Library items reuse
+    the same client-side rendering, so they must carry the same encoding — a
+    data URL here would double the prefix and break every tile.
+    """
     try:
         data = path.read_bytes()
     except OSError:
         return ""
     if not data:
         return ""
-    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+    return base64.b64encode(data).decode("ascii")
 
 
 def _write_thumbnail(source: Path, dest: Path) -> bool:

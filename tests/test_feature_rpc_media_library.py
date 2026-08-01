@@ -8,6 +8,7 @@ to this table generically, and the relay serves it.
 
 from __future__ import annotations
 
+import base64
 import struct
 import zlib
 from pathlib import Path
@@ -155,8 +156,10 @@ async def test_thumbnails_are_opt_in(seeded):
     )
 
     assert all("thumbnail" not in i for i in without["items"])
+    # Raw base64 — the same encoding a chat attachment carries, so a client
+    # renders a library tile with the component it already has.
     assert all(
-        i["thumbnail"].startswith("data:image/jpeg;base64,")
+        base64.b64decode(i["thumbnail"]).startswith(b"\xff\xd8")
         for i in with_thumbs["items"]
     )
 
