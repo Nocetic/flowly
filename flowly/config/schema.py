@@ -681,6 +681,33 @@ class ObsidianConfig(BaseModel):
     max_note_bytes: int = 1_000_000  # skip notes larger than this in index/read
 
 
+class ElevenLabsConfig(BaseModel):
+    """ElevenLabs as a voice provider in its own right.
+
+    The key used to live inside the Twilio voice card, which made it look like
+    a telephony detail — you could only reach it by configuring phone calls you
+    might not want, and nothing suggested the same key could also read a reply
+    aloud or write a song.
+
+    Everything here is chosen from the user's OWN account: the voices are the
+    ones in their library, the models the ones their plan can run. That is the
+    whole reason a voice provider is not an entry in a shared catalog.
+
+    The old location (``integrations.voice.elevenlabs_api_key``) is still read,
+    so nobody has to re-enter anything; see
+    :func:`flowly.voice.settings.resolve_elevenlabs`.
+    """
+    enabled: bool = False
+    api_key: str = ""
+    #: Which voice speaks — a voice id from the account's own library.
+    voice_id: str = ""
+    #: Which model reads it. Empty means "not chosen yet"; Flowly will not pick
+    #: one, because a model is a price the user never saw.
+    model_id: str = ""
+    #: Which model composes. Empty means Flowly will not write music.
+    music_model_id: str = ""
+
+
 class IntegrationsConfig(BaseModel):
     """External integrations configuration."""
     trello: TrelloConfig = Field(default_factory=TrelloConfig)
@@ -692,6 +719,7 @@ class IntegrationsConfig(BaseModel):
     sentry: SentryConfig = Field(default_factory=SentryConfig)
     home_assistant: HomeAssistantConfig = Field(default_factory=HomeAssistantConfig)
     obsidian: ObsidianConfig = Field(default_factory=ObsidianConfig)
+    elevenlabs: ElevenLabsConfig = Field(default_factory=ElevenLabsConfig)
 
 
 class ArtifactConfig(BaseModel):

@@ -1683,6 +1683,21 @@ class AgentLoop:
                     timeout_seconds=media_cfg.video_timeout_seconds,
                 ))
 
+        # Voice generation. A separate category from media on purpose: the
+        # provider is talked to directly, and the voice and model come from the
+        # user's own account rather than a shared catalog. Registered whenever a
+        # key exists, because the tool itself explains which half is missing —
+        # "no music model chosen" is a far better answer than a tool that
+        # silently isn't there.
+        if self._main_config and hasattr(self._main_config, "integrations"):
+            from flowly.voice.settings import resolve_elevenlabs
+
+            eleven = resolve_elevenlabs(self._main_config.integrations)
+            if eleven.enabled and eleven.configured:
+                from flowly.agent.tools.voice_generate import VoiceGenerateTool
+
+                self.tools.register(VoiceGenerateTool(elevenlabs=eleven))
+
         # Home Assistant tools (if configured) — gated on both url AND
         # token so a half-finished setup doesn't expose tools that will
         # only ever 401. Four tools register together as a unit.

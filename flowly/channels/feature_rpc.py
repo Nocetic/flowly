@@ -3409,6 +3409,49 @@ async def media_models_search(params: dict) -> dict:
     return {"provider": settings.provider, "models": [m.to_dict() for m in models]}
 
 
+async def picker_options(params: dict) -> dict:
+    """Fill an ``options:<source>`` picker.
+
+    One RPC for every provider-owned list, because the alternative is one RPC
+    per provider and a client release each time somebody adds a voice service.
+    The client treats ``source`` as opaque and hands it back untouched, so a
+    provider added on the bot lights up on Desktop and iOS with no change at
+    either end.
+
+    Never raises for an ordinary failure — a bad key, an unreachable service, a
+    source this build doesn't know. Those come back as ``{options: [], error}``,
+    because a picker that cannot open is worse than one that opens and explains
+    why it is empty; the field underneath is a plain text input either way.
+    """
+    source = str(params.get("source") or "").strip()
+    query = str(params.get("query") or "")
+
+    try:
+        options = await _resolve_picker_options(source, query)
+    except Exception as exc:  # noqa: BLE001 - a picker must still open
+        return {"source": source, "options": [], "error": str(exc)}
+    return {"source": source, "options": [o.to_dict() for o in options]}
+
+
+async def _resolve_picker_options(source: str, query: str) -> list:
+    """Route one picker source to whoever owns that list."""
+    from flowly.config.loader import load_config
+    from flowly.voice.providers import elevenlabs
+    from flowly.voice.settings import resolve_elevenlabs
+
+    if source.startswith("elevenlabs."):
+        key = resolve_elevenlabs(load_config().integrations).api_key
+        which = source.split(".", 1)[1]
+        if which == "voices":
+            return await elevenlabs.list_voices(key, query)
+        if which == "speech-models":
+            return await elevenlabs.list_speech_models(key, query)
+        if which == "music-models":
+            return await elevenlabs.list_music_models(key, query)
+
+    raise ValueError("unknown picker source: " + (source or "(none)"))
+
+
 async def media_models_get(params: dict) -> dict:
     """One model, with the compatibility verdict its schema actually supports.
 
@@ -3548,6 +3591,7 @@ _DISPATCH: dict[str, tuple] = {
     "media.models.search": (media_models_search, True, False),
     "media.models.get": (media_models_get, True, False),
     "media.models.refresh": (media_models_refresh, True, False),
+    "picker.options": (picker_options, True, False),
     "pairing.list": (pairing_list, True, False),
     "pairing.approve": (pairing_approve, True, False),
 }
