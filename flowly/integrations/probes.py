@@ -611,6 +611,41 @@ async def probe_google_workspace(values: dict[str, Any]) -> ProbeResult:
 # ── voice ──────────────────────────────────────────────────────────
 
 
+async def probe_elevenlabs(values: dict[str, Any]) -> ProbeResult:
+    """Verify the key against ElevenLabs' own account endpoint.
+
+    Worth a real call rather than a presence check: ``/v1/user`` costs nothing
+    and catches a wrong or revoked key here, instead of at the moment somebody
+    asks for a song and gets an error they cannot place.
+    """
+    key = (values.get("api_key") or "").strip()
+    if not values.get("enabled"):
+        return ProbeResult("disabled" if key else "not_configured",
+                           "key set · disabled" if key else "no API key")
+    if not key:
+        return ProbeResult("not_configured", "no API key")
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            response = await client.get(
+                "https://api.elevenlabs.io/v1/user",
+                headers={"xi-api-key": key, "User-Agent": _UA},
+            )
+    except Exception:  # noqa: BLE001 - a probe never raises
+        return ProbeResult("down", "could not reach ElevenLabs")
+
+    if response.status_code in (401, 403):
+        return ProbeResult("auth_failed", "key rejected")
+    if response.status_code != 200:
+        return ProbeResult("down", f"HTTP {response.status_code}")
+
+    try:
+        tier = (response.json().get("subscription") or {}).get("tier")
+    except ValueError:
+        tier = None
+    return ProbeResult("ok", f"connected · {tier}" if tier else "connected")
+
+
 async def probe_twilio(values: dict[str, Any]) -> ProbeResult:
     if not values.get("enabled"):
         return ProbeResult(

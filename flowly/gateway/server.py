@@ -268,7 +268,13 @@ def _inline_preview_b64(asset: Any, path: Path) -> str | None:
     poster frame ffmpeg pulled at generation time — a video file cannot be fed
     to the image compressor, so without a poster there simply is no preview and
     the client draws its own placeholder.
+
+    Audio has none at all, and asking for one is not merely useless: it hands
+    an mp3 to an image compressor, once per file, to be told what we already
+    knew. A sound file is listened to, and every client draws it as a row.
     """
+    if asset.kind == "audio":
+        return None
     if asset.kind == "video":
         poster = Path(asset.poster_path) if asset.poster_path else None
         if poster is None or not poster.is_file():
