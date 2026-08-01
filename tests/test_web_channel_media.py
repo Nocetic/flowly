@@ -320,3 +320,104 @@ async def test_the_dispatch_loop_serves_media_fetch_without_blocking(channel, fl
 
     assert ws.sent and ws.sent[0]["requestId"] == "r9"
     assert ws.sent[0]["ok"] is True
+
+
+# ── audio: the same two doors, nothing hosted ───────────────────────────────
+
+
+def _speech(tmp_path, name="speech.mp3", *, duration_ms=4200):
+    path = tmp_path / name
+    path.write_bytes(b"ID3" + b"\x00" * 2048)
+    return path, MediaAsset(
+        path=str(path),
+        kind="audio",
+        file_name=name,
+        mime_type="audio/mpeg",
+        size=2051,
+        duration_ms=duration_ms,
+        id="media_speech",
+    )
+
+
+async def test_generated_speech_is_playable_with_no_account_and_no_upload(channel, tmp_path):
+    """The whole promise of local-first delivery, for audio.
+
+    A generated file travels as an id and its duration. Nothing is uploaded,
+    nothing needs a signed-in account, and the client can draw a real player —
+    with the right length on it — before it fetches a single byte.
+    """
+    path, asset = _speech(tmp_path)
+    data = await _send(channel, asset, path)
+
+    att = data["attachments"][0]
+    assert att["kind"] == "audio"
+    assert att["mediaId"] == "speech.mp3"
+    assert att["durationMs"] == 4200
+    assert att["mimeType"] == "audio/mpeg"
+    # Not hosted anywhere: no URL to leak, and no account to require.
+    assert not att.get("cdnUrl")
+    assert not att.get("s3Key")
+
+
+async def test_audio_never_rides_the_websocket_as_base64(channel, tmp_path):
+    """Same reason as video: base64 inflates by a third and a long piece of
+    music is tens of megabytes. It is streamed on demand or not at all."""
+    path, asset = _speech(tmp_path)
+    data = await _send(channel, asset, path)
+
+    blob = json.dumps(data)
+    assert "ID3" not in blob
+    assert base64.b64encode(b"ID3").decode() not in blob
+    assert not [b for b in data.get("content", []) if b.get("type") == "image"]
+
+
+async def test_audio_carries_no_thumbnail_because_there_is_nothing_to_see(
+    channel, tmp_path
+):
+    """A sound file has no poster and needs none. Asking for one fed an mp3 to
+    an image compressor, once per file, to be told what we already knew."""
+    path, asset = _speech(tmp_path)
+    data = await _send(channel, asset, path)
+
+    assert not data["attachments"][0].get("thumbnail")
+
+
+async def test_audio_without_an_asset_entry_is_still_delivered(channel, tmp_path):
+    """A tool that produced no descriptors must not lose its audio — the mime
+    type alone is enough to classify it."""
+    path = tmp_path / "bare.mp3"
+    path.write_bytes(b"\x00" * 128)
+
+    await channel.send(
+        OutboundMessage(
+            channel="web",
+            chat_id="conv-1",
+            content="listen",
+            media=[str(path)],
+            metadata={"run_id": "r"},
+        )
+    )
+    att = channel._capture[-1]["data"]["attachments"][0]
+    assert att["kind"] == "audio"
+    assert att["mediaId"] == "bare.mp3"
+
+
+async def test_the_relay_bridges_an_audio_window_off_this_machine(channel, flowly_home):
+    """The relay path, for audio. Same door as video: the relay asks this
+    socket for a window and stores nothing of its own."""
+    data = bytes(range(256)) * 8  # 2048 bytes
+    (flowly_home / "media" / "speech.mp3").write_bytes(data)
+    ws = FakeWs()
+
+    reply = await _fetch(
+        channel, ws, requestId="a1", mediaId="speech.mp3", offset=128, length=256
+    )
+
+    assert reply["ok"] is True
+    assert base64.b64decode(reply["data"]) == data[128:384]
+    # ``size`` is the WHOLE file, not the window — it is what lets the relay
+    # answer a Range request with a truthful Content-Range, which is what makes
+    # the piece seekable instead of play-once-from-the-top.
+    assert reply["size"] == 2048
+    assert reply["mimeType"] == "audio/mpeg"
+    assert reply["eof"] is False
