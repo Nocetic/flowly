@@ -166,14 +166,24 @@ async def prune_after_generation(new_paths: list[str]) -> None:
         posters = [
             str(Path(p).with_suffix(".jpg")) for p in new_paths
         ]
-        await asyncio.to_thread(
+        summary = await asyncio.to_thread(
             prune_media,
             directory,
-            retention.retention_days,
-            retention.image_max_size_mb,
-            retention.video_max_size_mb,
-            [*new_paths, *posters],
+            retention_days=retention.retention_days,
+            image_max_size_mb=retention.image_max_size_mb,
+            video_max_size_mb=retention.video_max_size_mb,
+            audio_max_size_mb=retention.audio_max_size_mb,
+            protect=[*new_paths, *posters],
         )
+        # Expire exactly what this pass removed. Without it the library would
+        # keep offering tiles for bytes that no longer exist until the next
+        # gateway start reconciled them — a full rescan to learn what we were
+        # just told.
+        deleted = summary.get("deleted_paths") or []
+        if deleted:
+            from flowly.media.library import expire_paths_async
+
+            await expire_paths_async(deleted)
     except Exception as exc:  # noqa: BLE001 - never break a reply over cleanup
         logger.debug("[media] post-generation prune skipped: {}", exc)
 
@@ -262,6 +272,11 @@ async def generate_video(
     if not urls:
         raise GenerationError("the model finished but returned no video.")
 
+    # Carried onto the asset so the media library can be searched by intent.
+    # It is what the user actually asked for, which is the only handle anybody
+    # has on a file named ``vid-9f3a71c2b804.mp4`` three months later.
+    prompt = str(request.get("prompt") or "")
+
     assets: list[MediaAsset] = []
     for url in urls:
         path = await download_output(url, kind="video")
@@ -272,6 +287,7 @@ async def generate_video(
                 provider="fal",
                 model=model.endpoint_id,
                 request_id=job.request_id,
+                prompt=prompt,
                 source_url=url,
                 poster_path=poster,
             )

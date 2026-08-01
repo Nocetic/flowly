@@ -5781,6 +5781,9 @@ class AgentLoop:
             run_id=(outbound_run_id or None) if not provider_error else None,
         )
         self.sessions.save(session)
+        await self._index_turn_media(
+            session, reply_media_assets, msg.media, msg.channel
+        )
 
         # Auto-title the session from the first exchange so every
         # client — CLI, desktop, iOS — shows the SAME descriptive name instead
@@ -6028,6 +6031,9 @@ class AgentLoop:
             run_id=(msg.metadata.get("run_id") or None),
         )
         self.sessions.save(session)
+        # A system/announce turn has no inbound attachment — it is triggered by
+        # the agent's own machinery, not by a person handing it a file.
+        await self._index_turn_media(session, reply_media_assets, None, origin_channel)
 
         # Local clients (TUI / desktop) have no channel adapter, so a
         # system-triggered reply (board result, subagent announce, …) would
@@ -6057,6 +6063,62 @@ class AgentLoop:
                 else {}
             ),
         )
+
+    @staticmethod
+    def _turn_message_ts(session: Any, role: str, key: str) -> str:
+        """Timestamp of the newest message with *role* carrying *key*."""
+        return next(
+            (
+                str(m.get("timestamp") or "")
+                for m in reversed(session.messages)
+                if m.get("role") == role and m.get(key)
+            ),
+            "",
+        )
+
+    async def _index_turn_media(
+        self,
+        session: Any,
+        reply_assets: list,
+        inbound_paths: list | None,
+        channel: str,
+    ) -> None:
+        """Add this turn's media — produced and received — to the library index.
+
+        Called AFTER the session is saved, for one reason: the timestamp we
+        record has to be the one ``chat.history`` will publish. That pair —
+        session key plus message timestamp — is the whole mechanism behind
+        "Open in chat", so it is read back off the persisted message rather
+        than guessed from the clock.
+
+        ``extend_with_turn_messages`` puts produced media (``media_assets``) on
+        the closing assistant message and received media (``media``) on the user
+        message, so each side is found by scanning back for its own marker
+        instead of assuming a position in the list.
+        """
+        from flowly.media.library import (
+            SOURCE_GENERATED,
+            SOURCE_RECEIVED,
+            record_async,
+            record_paths_async,
+        )
+
+        if reply_assets:
+            await record_async(
+                reply_assets,
+                source=SOURCE_GENERATED,
+                session_key=session.key,
+                channel=channel,
+                message_ts=self._turn_message_ts(session, "assistant", "media_assets"),
+            )
+        if inbound_paths:
+            await record_paths_async(
+                list(inbound_paths),
+                source=SOURCE_RECEIVED,
+                session_key=session.key,
+                channel=channel,
+                message_ts=self._turn_message_ts(session, "user", "media"),
+            )
 
     # ─── Activity tracker (inactivity-based timeout support) ────────────
     def _touch_activity(self, desc: str, tool: str | None = None) -> None:

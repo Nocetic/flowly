@@ -874,8 +874,8 @@ class MediaRetentionConfig(BaseModel):
     Age is about relevance, so one cap covers every kind. Size is about disk,
     and video is one to two orders of magnitude larger than an image — a shared
     budget would mean generating video silently evicts screenshots somebody
-    still wanted, so each kind gets its own. Audio and stray files share the
-    image budget; both are small.
+    still wanted, so each kind gets its own. Stray non-media files ride the
+    image budget; they are rare and small.
 
     ``retention_days = -1`` disables the age cap; a size budget of ``0``
     disables that budget. A clip and its poster frame are always deleted
@@ -885,6 +885,9 @@ class MediaRetentionConfig(BaseModel):
     retention_days: int = 30
     image_max_size_mb: int = 500
     video_max_size_mb: int = 2000
+    # Added when the media library made audio browsable. An existing config
+    # without the key picks up this default, so nobody has to migrate.
+    audio_max_size_mb: int = 1000
 
 
 class MediaConfig(BaseModel):

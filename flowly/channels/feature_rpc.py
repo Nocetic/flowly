@@ -1796,6 +1796,127 @@ def artifacts_versions(params: dict) -> dict:
     return {"versions": _artifact_store().get_versions(artifact_id)}
 
 
+# ── Media library ────────────────────────────────────────────────────────────
+# The gallery surface: everything this agent produced or was handed, browsable
+# without opening the chat that produced it.
+#
+# Two properties are worth stating up front, because they are why this block is
+# so small.
+#
+# There is NO new delivery path. Every item carries the same ``mediaId`` a chat
+# bubble does, and clients resolve it through the doors they already use — a
+# hosted URL, a direct-gateway ticket, or the relay bridge. The library lists;
+# the existing transport serves.
+#
+# And these five entries in ``_DISPATCH`` reach every surface at once. The
+# direct gateway falls through to this dispatch generically for anything in
+# ``FEATURE_METHODS`` (``gateway/server.py``), and the relay serves the same
+# table — so desktop-local, desktop-remote, iOS-gateway and iOS-relay all light
+# up together, with no per-method WS branch to keep in step.
+
+
+def _media_library():
+    from flowly.media.library import get_library
+
+    return get_library()
+
+
+def _media_library_id(params: dict) -> str:
+    media_id = str(params.get("id", "") or "")
+    if not media_id:
+        raise FeatureRpcError("INVALID", "id required")
+    return media_id
+
+
+def media_library_list(params: dict) -> dict:
+    """A page of the library, newest first, starred floated to the top.
+
+    ``withThumbs`` inlines a small JPEG per item so a grid paints in one
+    round-trip. That matters most on the relay, where a per-tile fetch would be
+    a per-tile round-trip through the cloud; the page cap keeps the payload
+    inside the relay's frame budget.
+    """
+    from flowly.media.library import SOURCES
+
+    library = _media_library()
+    kind = str(params.get("kind", "") or "") or None
+    source = str(params.get("source", "") or "") or None
+    if source is not None and source not in SOURCES:
+        raise FeatureRpcError("INVALID", f"unknown source: {source}")
+
+    starred = params.get("starred")
+    items, total = library.list(
+        kind=kind,
+        source=source,
+        search=str(params.get("search", "") or "") or None,
+        session_key=str(params.get("sessionKey", "") or "") or None,
+        starred=bool(starred) if starred is not None else None,
+        include_expired=bool(params.get("includeExpired", False)),
+        limit=int(params.get("limit", 50) or 50),
+        offset=int(params.get("offset", 0) or 0),
+        with_thumbs=bool(params.get("withThumbs", False)),
+    )
+    return {"items": items, "total": total}
+
+
+def media_library_get(params: dict) -> dict:
+    item = _media_library().get(_media_library_id(params))
+    if item is None:
+        raise FeatureRpcError("NOT_FOUND", "Media not found")
+    return {"item": item}
+
+
+async def media_library_star(params: dict) -> dict:
+    from flowly.media.library import notify_change
+
+    item = _media_library().star(
+        _media_library_id(params), bool(params.get("starred", True))
+    )
+    if item is None:
+        raise FeatureRpcError("NOT_FOUND", "Media not found")
+    # Broadcast so a second window — or the phone — reorders too. One client
+    # changing something the others are also looking at is the normal case here.
+    await notify_change(starred=1)
+    return {"item": item}
+
+
+async def media_library_delete(params: dict) -> dict:
+    """Delete the row AND the bytes — file, poster sidecar, cached thumbnail.
+
+    The chat bubble that referenced this media then renders the ``expired``
+    placeholder that already exists for retention-pruned files, so "the media is
+    gone" looks the same however it went.
+    """
+    from flowly.media.library import notify_change
+
+    deleted = _media_library().delete(_media_library_id(params))
+    if deleted:
+        await notify_change(deleted=1)
+    return {"ok": deleted}
+
+
+def media_library_stats(params: dict) -> dict:
+    """Counts, bytes and the retention settings that govern them.
+
+    Bundling retention here is deliberate: it is the first surface that can
+    show a user what their media actually costs, and a number without the knob
+    that controls it is only half an answer.
+    """
+    from flowly.config.loader import load_config
+
+    retention = load_config().media.retention
+    return {
+        **_media_library().stats(),
+        "retention": {
+            "enabled": retention.enabled,
+            "retentionDays": retention.retention_days,
+            "imageMaxSizeMb": retention.image_max_size_mb,
+            "videoMaxSizeMb": retention.video_max_size_mb,
+            "audioMaxSizeMb": retention.audio_max_size_mb,
+        },
+    }
+
+
 # ── Flowlets ─────────────────────────────────────────────────────────────────
 # Agent-generated dynamic mini-screens. Read + interact over BOTH transports.
 # Creation/definition edits are agent-only (via the flowlet tool); the client
@@ -3556,6 +3677,11 @@ _DISPATCH: dict[str, tuple] = {
     "provider.set_key": (provider_set_key, True, True),
     "provider.set_flowly_account": (provider_set_flowly_account, True, True),
     "logs.tail": (logs_tail, True, False),
+    "media.library.list": (media_library_list, True, False),
+    "media.library.get": (media_library_get, True, False),
+    "media.library.star": (media_library_star, True, False),
+    "media.library.delete": (media_library_delete, True, False),
+    "media.library.stats": (media_library_stats, True, False),
     "artifacts.list": (artifacts_list, True, False),
     "artifacts.get": (artifacts_get, True, False),
     "artifacts.update": (artifacts_update, True, False),

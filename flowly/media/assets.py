@@ -72,6 +72,12 @@ class MediaAsset:
     ``path`` and ``poster_path`` are LOCAL paths and never leave the server.
     ``source_url`` is the provider's (often signed) download URL, kept for audit
     only — it is likewise never published.
+
+    ``prompt`` is what the user actually asked for. It is not part of the chat
+    wire (see :func:`attachment_v2`) — the bubble already sits underneath the
+    message that requested it. It exists so the media library can be *searched*
+    by intent months later, which is the only way to find a picture whose
+    filename is ``img-9f3a71c2b804.png``.
     """
 
     path: str
@@ -87,6 +93,7 @@ class MediaAsset:
     provider: str = ""
     model: str = ""
     request_id: str = ""
+    prompt: str = ""
     id: str = ""
     status: str = STATUS_READY
 
@@ -107,7 +114,7 @@ class MediaAsset:
             value = getattr(self, key)
             if value is not None:
                 out[key] = value
-        for key in ("provider", "model", "request_id"):
+        for key in ("provider", "model", "request_id", "prompt"):
             value = getattr(self, key)
             if value:
                 out[key] = value
@@ -154,6 +161,7 @@ class MediaAsset:
             provider=str(data.get("provider") or ""),
             model=str(data.get("model") or ""),
             request_id=str(data.get("request_id") or ""),
+            prompt=str(data.get("prompt") or ""),
             id=str(data.get("id") or "") or new_asset_id(),
             status=str(data.get("status") or STATUS_READY),
         )
@@ -165,6 +173,7 @@ def describe(
     provider: str = "",
     model: str = "",
     request_id: str = "",
+    prompt: str = "",
     source_url: str | None = None,
     poster_path: str | None = None,
     asset_id: str | None = None,
@@ -190,6 +199,7 @@ def describe(
         provider=provider,
         model=model,
         request_id=request_id,
+        prompt=prompt,
         id=asset_id or new_asset_id(),
         status=status,
     )
@@ -229,8 +239,11 @@ def attachment_v2(
     Absent fields are omitted entirely so the payload stays small and an old
     client sees exactly the V1 keys it already understands.
 
-    Local paths, provider request ids and signed source URLs are deliberately
-    NOT included — this function is the publication boundary.
+    Local paths, provider request ids, signed source URLs and the originating
+    ``prompt`` are deliberately NOT included — this function is the publication
+    boundary. (The media library publishes the prompt on its own list surface,
+    where it is the search key; a chat bubble does not need it because the
+    request is the message directly above it.)
     """
     out: dict[str, Any] = {
         "version": ATTACHMENT_VERSION,

@@ -15,7 +15,10 @@ video with no preview or a preview with no video. Pruning therefore works on
 everything — a month-old clip is as stale as a month-old screenshot — and
 SEPARATE size budgets per kind. Video is one to two orders of magnitude larger
 than an image, and a shared budget means generating video silently evicts
-screenshots somebody still wanted.
+screenshots somebody still wanted. Audio earned its own budget the moment the
+media library made tracks browsable: a handful of generated songs sits between
+an image and a clip in size, and under the image budget a short music session
+would quietly evict months of screenshots.
 
 **Nothing deletes what was just made.** Callers pruning right after a generation
 pass the new files as ``protect``, so a clip larger than its own budget fails
@@ -46,11 +49,15 @@ DEFAULT_RETENTION_DAYS = 30
 # differently because video arrived.
 DEFAULT_IMAGE_MAX_SIZE_MB = 500
 DEFAULT_VIDEO_MAX_SIZE_MB = 2000
+DEFAULT_AUDIO_MAX_SIZE_MB = 1000
 
-#: Bucket a kind falls into for the size cap. Audio and stray files share the
-#: image budget: both are small, and giving every kind its own knob would be
-#: more configuration than anyone wants to reason about.
-_BUDGET_FOR_KIND = {"video": "video", "image": "image", "audio": "image", "file": "image"}
+#: Bucket a kind falls into for the size cap. Stray files ride the image
+#: budget — they are rare, small, and not worth a knob of their own.
+_BUDGET_FOR_KIND = {"video": "video", "image": "image", "audio": "audio", "file": "image"}
+
+#: Every bucket, so totals start at zero even for a kind the directory happens
+#: not to contain yet.
+_BUDGETS = ("image", "video", "audio")
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,16 +176,24 @@ def prune_media(
     image_max_size_mb: int = DEFAULT_IMAGE_MAX_SIZE_MB,
     video_max_size_mb: int = DEFAULT_VIDEO_MAX_SIZE_MB,
     protect: Iterable[Path] = (),
+    audio_max_size_mb: int = DEFAULT_AUDIO_MAX_SIZE_MB,
 ) -> dict:
     """Trim old / oversized generated media. Never raises.
 
-    Returns a summary the caller can log. ``protect`` names files that must
-    survive regardless — what a caller just produced, so pruning immediately
-    after a generation can never delete the thing that triggered it.
+    Returns a summary the caller can log, including ``deleted_paths`` so the
+    media library can expire exactly the rows this pass removed instead of
+    rescanning the whole directory. ``protect`` names files that must survive
+    regardless — what a caller just produced, so pruning immediately after a
+    generation can never delete the thing that triggered it.
+
+    ``audio_max_size_mb`` sits after ``protect`` on purpose: callers already
+    pass the first four arguments positionally, and moving ``protect`` would
+    silently reinterpret a protect-list as a byte budget.
     """
-    summary = {
+    summary: dict = {
         "deleted_units": 0,
         "deleted_bytes": 0,
+        "deleted_paths": [],
         "remaining_units": 0,
         "remaining_bytes": 0,
         "skipped": False,
@@ -198,27 +213,36 @@ def prune_media(
     if not units:
         return summary
 
+    def _reclaim(unit: MediaUnit) -> None:
+        freed = _delete(unit)
+        if freed:
+            summary["deleted_units"] += 1
+            summary["deleted_bytes"] += freed
+            summary["deleted_paths"].extend(str(p) for p in unit.paths)
+
     # ── 1. Age cap — one rule for every kind ────────────────────────────
     survivors: list[MediaUnit] = []
     if retention_days >= 0:
         cutoff = time.time() - (retention_days * 86_400)
         for unit in units:
             if unit.mtime < cutoff and not _is_protected(unit):
-                freed = _delete(unit)
-                if freed:
-                    summary["deleted_units"] += 1
-                    summary["deleted_bytes"] += freed
+                _reclaim(unit)
             else:
                 survivors.append(unit)
     else:
         survivors = list(units)
 
     # ── 2. Size cap — one budget per kind ───────────────────────────────
-    budgets = {
-        "image": image_max_size_mb * 1024 * 1024 if image_max_size_mb > 0 else None,
-        "video": video_max_size_mb * 1024 * 1024 if video_max_size_mb > 0 else None,
+    megabytes = {
+        "image": image_max_size_mb,
+        "video": video_max_size_mb,
+        "audio": audio_max_size_mb,
     }
-    totals: dict[str, int] = {"image": 0, "video": 0}
+    budgets = {
+        name: (megabytes[name] * 1024 * 1024 if megabytes[name] > 0 else None)
+        for name in _BUDGETS
+    }
+    totals: dict[str, int] = dict.fromkeys(_BUDGETS, 0)
     for unit in survivors:
         totals[unit.budget] += unit.size
 
@@ -227,10 +251,7 @@ def prune_media(
         budget = budgets.get(unit.budget)
         over = budget is not None and totals[unit.budget] > budget
         if over and not _is_protected(unit):
-            freed = _delete(unit)
-            if freed:
-                summary["deleted_units"] += 1
-                summary["deleted_bytes"] += freed
+            _reclaim(unit)
             totals[unit.budget] -= unit.size
         else:
             kept.append(unit)
