@@ -37,7 +37,7 @@ import json
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -1072,8 +1072,15 @@ class MediaLibrary:
             except (OSError, UnicodeDecodeError) as exc:
                 logger.debug("[library] backfill read failed for {}: {}", transcript, exc)
                 continue
+            # The prompt of the most recent media-generating tool call seen so
+            # far in this transcript. See :func:`_prompt_from_tool_calls` for
+            # why this is worth the extra pass.
+            pending_prompt = ""
+
             for line in lines:
-                if '"media_assets"' not in line:
+                has_assets = '"media_assets"' in line
+                has_tools = '"tool_calls"' in line
+                if not has_assets and not has_tools:
                     continue
                 try:
                     message = json.loads(line)
@@ -1081,6 +1088,12 @@ class MediaLibrary:
                     continue
                 if not isinstance(message, dict):
                     continue
+
+                if has_tools:
+                    recovered = _prompt_from_tool_calls(message.get("tool_calls"))
+                    if recovered:
+                        pending_prompt = recovered
+
                 assets = assets_from_meta(message.get("media_assets"))
                 if not assets:
                     continue
@@ -1091,12 +1104,18 @@ class MediaLibrary:
                     if message.get("role") == "assistant"
                     else SOURCE_RECEIVED
                 )
+                if pending_prompt and source == SOURCE_GENERATED:
+                    assets = [
+                        a if a.prompt else replace(a, prompt=pending_prompt)
+                        for a in assets
+                    ]
                 summary["enriched"] += self.record(
                     assets,
                     source=source,
                     session_key=session_key,
                     message_ts=_clean_str(message.get("timestamp"), 64),
                 )
+                pending_prompt = ""
 
         self._meta_set(_BACKFILL_KEY, str(int(time.time())))
         return summary
@@ -1162,6 +1181,51 @@ def _fts_query(term: str) -> str:
     """
     tokens = [t.replace('"', "") for t in term.split() if t.strip()]
     return " AND ".join(f'"{t}"*' for t in tokens[:12]) or '""'
+
+
+#: Tools whose call arguments carry the request a file was made from.
+_PROMPT_TOOLS = frozenset({"image_generate", "video_generate", "voice_generate"})
+
+
+def _prompt_from_tool_calls(raw: Any) -> str:
+    """The prompt from a media-generating tool call, or ``''``.
+
+    Without this, backfill recovers WHERE a file came from but not WHAT was
+    asked for — and prompt search, the whole reason the index has an FTS table,
+    finds nothing for anything generated before this feature existed. Which is
+    to say: everything a real user already has.
+
+    ``MediaAsset.prompt`` was only added with the index, so no historical asset
+    descriptor carries one. The text is still on disk though, in the arguments
+    of the tool call that produced the file, one message earlier in the same
+    transcript. This reads it back.
+
+    Tolerant throughout: ``arguments`` is a JSON string from most providers and
+    already a dict from some, a transcript may be hand-edited, and a missing
+    prompt is a row without search text — never a failed backfill.
+    """
+    if not isinstance(raw, list):
+        return ""
+    for call in raw:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        if not isinstance(function, dict):
+            continue
+        if str(function.get("name") or "") not in _PROMPT_TOOLS:
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if not isinstance(arguments, dict):
+            continue
+        prompt = arguments.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            return prompt.strip()
+    return ""
 
 
 def _session_key_for(session_file: Path) -> str:

@@ -595,3 +595,183 @@ def test_created_at_only_ever_moves_earlier(home: Path, library: MediaLibrary):
     library.record([describe(path)], source=SOURCE_GENERATED)
 
     assert library.get("img-a.png")["createdAt"] == first
+
+
+# ── Backfill: recovering the prompt from tool calls ───────────────────────────
+
+
+def test_backfill_recovers_the_prompt_from_the_tool_call(home: Path, library: MediaLibrary):
+    """The point of the whole FTS table, for media that predates the index.
+
+    `MediaAsset.prompt` only exists from this feature onward, so no historical
+    descriptor carries one — and without this, prompt search finds nothing for
+    everything a real user already has.
+    """
+    path = _png(home / "media" / "img-a.png")
+    _transcript(
+        home / "sessions",
+        "web_abc123",
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "image_generate",
+                            "arguments": '{"prompt": "a single red tulip", "num_images": 1}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "here you go",
+                "timestamp": "2026-01-01T00:00:09",
+                "media_assets": [describe(path, provider="fal").to_dict()],
+            },
+        ],
+    )
+
+    library.backfill_from_sessions(home / "sessions")
+
+    item = library.get("img-a.png")
+    assert item["prompt"] == "a single red tulip"
+    # And it is searchable, which is the actual deliverable.
+    found, total = library.list(search="tulip")
+    assert total == 1 and found[0]["mediaId"] == "img-a.png"
+
+
+def test_backfill_accepts_tool_arguments_as_a_dict(home: Path, library: MediaLibrary):
+    """Most providers hand back a JSON string; some hand back an object."""
+    path = _png(home / "media" / "img-a.png")
+    _transcript(
+        home / "sessions",
+        "cli_main",
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "video_generate", "arguments": {"prompt": "a blue boat"}}}
+                ],
+            },
+            {"role": "assistant", "media_assets": [describe(path).to_dict()]},
+        ],
+    )
+
+    library.backfill_from_sessions(home / "sessions")
+
+    assert library.get("img-a.png")["prompt"] == "a blue boat"
+
+
+def test_a_recorded_prompt_wins_over_a_recovered_one(home: Path, library: MediaLibrary):
+    """Media generated after this feature carries its own, better prompt."""
+    path = _png(home / "media" / "img-a.png")
+    _transcript(
+        home / "sessions",
+        "cli_main",
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "image_generate", "arguments": '{"prompt": "stale"}'}}
+                ],
+            },
+            {
+                "role": "assistant",
+                "media_assets": [describe(path, prompt="the real prompt").to_dict()],
+            },
+        ],
+    )
+
+    library.backfill_from_sessions(home / "sessions")
+
+    assert library.get("img-a.png")["prompt"] == "the real prompt"
+
+
+def test_a_prompt_is_not_carried_to_the_next_turn(home: Path, library: MediaLibrary):
+    """A screenshot two turns later must not inherit an earlier generation."""
+    media = home / "media"
+    generated = _png(media / "img-a.png")
+    shot = _png(media / "shot-b.png")
+    _transcript(
+        home / "sessions",
+        "cli_main",
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "image_generate", "arguments": '{"prompt": "a red car"}'}}
+                ],
+            },
+            {"role": "assistant", "media_assets": [describe(generated).to_dict()]},
+            {"role": "assistant", "media_assets": [describe(shot).to_dict()]},
+        ],
+    )
+
+    library.backfill_from_sessions(home / "sessions")
+
+    assert library.get("img-a.png")["prompt"] == "a red car"
+    assert "prompt" not in library.get("shot-b.png")
+
+
+def test_a_users_own_upload_never_inherits_a_prompt(home: Path, library: MediaLibrary):
+    path = _png(home / "media" / "upload-d.png")
+    _transcript(
+        home / "sessions",
+        "cli_main",
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "image_generate", "arguments": '{"prompt": "a red car"}'}}
+                ],
+            },
+            {"role": "user", "media_assets": [describe(path).to_dict()]},
+        ],
+    )
+
+    library.backfill_from_sessions(home / "sessions")
+
+    item = library.get("upload-d.png")
+    assert item["source"] == SOURCE_RECEIVED
+    assert "prompt" not in item
+
+
+def test_backfill_ignores_tool_calls_that_are_not_generators(home: Path, library: MediaLibrary):
+    path = _png(home / "media" / "shot-b.png")
+    _transcript(
+        home / "sessions",
+        "cli_main",
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "web_search", "arguments": '{"prompt": "not this"}'}}
+                ],
+            },
+            {"role": "assistant", "media_assets": [describe(path).to_dict()]},
+        ],
+    )
+
+    library.backfill_from_sessions(home / "sessions")
+
+    assert "prompt" not in library.get("shot-b.png")
+
+
+def test_backfill_survives_unparseable_tool_arguments(home: Path, library: MediaLibrary):
+    path = _png(home / "media" / "img-a.png")
+    _transcript(
+        home / "sessions",
+        "cli_main",
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [{"function": {"name": "image_generate", "arguments": "{not json"}}],
+            },
+            {"role": "assistant", "media_assets": [describe(path).to_dict()]},
+        ],
+    )
+
+    assert library.backfill_from_sessions(home / "sessions")["enriched"] == 1
+    assert "prompt" not in library.get("img-a.png")

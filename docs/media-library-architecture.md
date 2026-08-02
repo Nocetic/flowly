@@ -198,11 +198,24 @@ an image sharing a stem with a video or audio file is that file's preview — so
 clip does not appear twice in the grid.
 
 **Backfill** walks session transcripts once, guarded by a `meta` flag, and
-recovers provider/model/prompt/session for files that predate the index. It
-reads `<key>.full.jsonl` in preference to `<key>.jsonl`: the canonical file is
-the LLM working context, which compaction rewrites as `[summary] + recent`, so
-on any long conversation the early turns — and the media they carried — are
-simply not in it.
+recovers provider/model/session for files that predate the index. It reads
+`<key>.full.jsonl` in preference to `<key>.jsonl`: the canonical file is the
+LLM working context, which compaction rewrites as `[summary] + recent`, so on
+any long conversation the early turns — and the media they carried — are simply
+not in it.
+
+**The prompt needs a second source.** `MediaAsset.prompt` only exists from this
+feature onward, so *no* historical asset descriptor carries one — which means a
+first version of backfill recovered where a file came from but not what was
+asked for, and prompt search found nothing for everything a real user already
+had. The text is still on disk: in the `arguments` of the `image_generate` /
+`video_generate` / `voice_generate` call one message earlier in the same
+transcript. `_prompt_from_tool_calls` reads it back, and the pending prompt is
+cleared after each media message so a screenshot two turns later cannot inherit
+it. A prompt the generator actually recorded always wins over a recovered one.
+
+Measured against a real install (395 transcripts): 3 of 3 generated items
+recovered their prompt, 0 missed.
 
 Both run on a daemon thread at gateway start (`_start_media_library_sync`). The
 work is pure disk I/O, worthless to wait for, and if the process exits mid-scan
