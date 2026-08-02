@@ -162,8 +162,8 @@ def test_size_cap_deletes_oldest_first_within_a_budget(tmp_path):
     assert "shot-0.png" not in remaining  # oldest goes first
 
 
-def test_audio_and_stray_files_share_the_image_budget(tmp_path):
-    _write(tmp_path / "note.mp3", size_mb=2, age_days=5)
+def test_stray_files_share_the_image_budget(tmp_path):
+    _write(tmp_path / "notes.pdf", size_mb=2, age_days=5)
     time.sleep(0.01)
     _write(tmp_path / "shot.png", size_mb=2)
 
@@ -171,6 +171,51 @@ def test_audio_and_stray_files_share_the_image_budget(tmp_path):
 
     # One of them had to go, and it was the older one.
     assert _names(tmp_path) == {"shot.png"}
+
+
+def test_audio_has_its_own_budget(tmp_path):
+    """Music is big enough that a shared image budget would evict screenshots.
+
+    Two 2 MB tracks against a 3 MB audio budget: the older one goes, and the
+    picture — a different budget entirely — is untouched.
+    """
+    _write(tmp_path / "music-old.mp3", size_mb=2, age_days=5)
+    time.sleep(0.01)
+    _write(tmp_path / "music-new.mp3", size_mb=2)
+    _write(tmp_path / "shot.png", size_mb=2)
+
+    prune_media(
+        tmp_path, retention_days=-1, image_max_size_mb=500, audio_max_size_mb=3
+    )
+
+    assert _names(tmp_path) == {"music-new.mp3", "shot.png"}
+
+
+def test_audio_does_not_evict_images(tmp_path):
+    _write(tmp_path / "shot.png", size_mb=1, age_days=10)
+    time.sleep(0.01)
+    for i in range(4):
+        _write(tmp_path / f"track-{i}.mp3", size_mb=1)
+
+    prune_media(
+        tmp_path, retention_days=-1, image_max_size_mb=500, audio_max_size_mb=2
+    )
+
+    assert "shot.png" in _names(tmp_path)
+
+
+def test_summary_reports_what_it_deleted(tmp_path):
+    """The media library expires exactly these rows instead of rescanning."""
+    _write(tmp_path / "clip.mp4", size_mb=1, age_days=90)
+    _write(tmp_path / "clip.jpg", size_mb=1, age_days=90)
+    _write(tmp_path / "keep.png", size_mb=1)
+
+    summary = prune_media(tmp_path, retention_days=30)
+
+    deleted = {Path(p).name for p in summary["deleted_paths"]}
+    # A clip and its poster are one attachment, so both names come back.
+    assert deleted == {"clip.mp4", "clip.jpg"}
+    assert summary["deleted_units"] == 1
 
 
 # ── nothing deletes what was just made ──────────────────────────────────────

@@ -60,15 +60,20 @@ def probe_image(path: Path) -> MediaProbe:
         return MediaProbe()
 
 
-def probe_video(path: Path) -> MediaProbe:
-    """Video dimensions + duration via ffprobe. Empty probe when unavailable."""
+def _ffprobe_json(path: Path, select_stream: str, show_entries: str) -> dict | None:
+    """Run one ffprobe query and return its parsed JSON, or ``None``.
+
+    Every failure mode — no ffprobe, a non-zero exit, a timeout, unparseable
+    output — collapses to ``None`` so callers only ever have to distinguish
+    "we learned something" from "we didn't".
+    """
     if not have_ffprobe():
-        return MediaProbe()
+        return None
     cmd = [
         "ffprobe",
         "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height:format=duration",
+        "-select_streams", select_stream,
+        "-show_entries", show_entries,
         "-of", "json",
         str(path),
     ]
@@ -78,13 +83,33 @@ def probe_video(path: Path) -> MediaProbe:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("[media] ffprobe failed for {}: {}", path, exc)
-        return MediaProbe()
+        return None
     if proc.returncode != 0:
         logger.debug("[media] ffprobe returned {} for {}", proc.returncode, path)
-        return MediaProbe()
+        return None
     try:
         data = json.loads(proc.stdout or "{}")
     except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _format_duration_ms(data: dict) -> int | None:
+    """Milliseconds from an ffprobe ``format.duration``, or ``None``."""
+    fmt = data.get("format")
+    raw = fmt.get("duration") if isinstance(fmt, dict) else None
+    if raw is None:
+        return None
+    try:
+        return max(0, int(round(float(raw) * 1000)))
+    except (TypeError, ValueError):
+        return None
+
+
+def probe_video(path: Path) -> MediaProbe:
+    """Video dimensions + duration via ffprobe. Empty probe when unavailable."""
+    data = _ffprobe_json(path, "v:0", "stream=width,height:format=duration")
+    if data is None:
         return MediaProbe()
 
     streams = data.get("streams") or []
@@ -92,20 +117,25 @@ def probe_video(path: Path) -> MediaProbe:
     width = stream.get("width") if isinstance(stream, dict) else None
     height = stream.get("height") if isinstance(stream, dict) else None
 
-    duration_ms: int | None = None
-    fmt = data.get("format")
-    raw_duration = fmt.get("duration") if isinstance(fmt, dict) else None
-    if raw_duration is not None:
-        try:
-            duration_ms = max(0, int(round(float(raw_duration) * 1000)))
-        except (TypeError, ValueError):
-            duration_ms = None
-
     return MediaProbe(
         width=int(width) if isinstance(width, int) else None,
         height=int(height) if isinstance(height, int) else None,
-        duration_ms=duration_ms,
+        duration_ms=_format_duration_ms(data),
     )
+
+
+def probe_audio(path: Path) -> MediaProbe:
+    """Audio duration via ffprobe. Empty probe when unavailable.
+
+    A track has no dimensions, so only ``duration_ms`` is ever populated — but
+    that one number is what lets a player draw a scrub bar and show a total
+    time before the first byte is fetched, on a surface (the Audio tab) where
+    every row wants it and nobody wants to download the file to find out.
+    """
+    data = _ffprobe_json(path, "a:0", "format=duration")
+    if data is None:
+        return MediaProbe()
+    return MediaProbe(duration_ms=_format_duration_ms(data))
 
 
 def probe(path: Path, mime_type: str) -> MediaProbe:
@@ -114,6 +144,8 @@ def probe(path: Path, mime_type: str) -> MediaProbe:
         return probe_image(path)
     if mime_type.startswith("video/"):
         return probe_video(path)
+    if mime_type.startswith("audio/"):
+        return probe_audio(path)
     return MediaProbe()
 
 

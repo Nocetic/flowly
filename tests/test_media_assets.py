@@ -171,3 +171,44 @@ def test_describe_uses_given_poster_and_source(tmp_path):
     assert art.source_url == "https://fal.media/x.mp4"
     assert art.kind == KIND_VIDEO
     assert Path(art.path) == p
+
+
+# ── prompt: indexed, never published ──────────────────────────────────────────
+
+
+def test_prompt_survives_a_persistence_round_trip():
+    a = MediaAsset(path="/m/a.png", kind=KIND_IMAGE, prompt="a red car")
+
+    restored = assets_from_meta(assets_to_meta([a]))[0]
+
+    assert restored.prompt == "a red car"
+
+
+def test_prompt_is_absent_when_empty():
+    """Empty strings stay out of the persisted dict, as every other field does."""
+    assert "prompt" not in MediaAsset(path="/m/a.png").to_dict()
+
+
+def test_a_transcript_written_before_prompts_existed_still_loads():
+    restored = assets_from_meta([{"path": "/m/a.png", "kind": KIND_IMAGE}])
+
+    assert restored[0].prompt == ""
+
+
+def test_attachment_v2_never_publishes_the_prompt():
+    """The chat wire is the publication boundary; the library is not.
+
+    A bubble sits directly under the message that requested it, so the prompt
+    adds nothing there — and keeping it off the wire means history payloads
+    don't grow by a paragraph per image.
+    """
+    a = MediaAsset(path="/m/a.png", kind=KIND_IMAGE, prompt="a red car")
+
+    assert "prompt" not in attachment_v2(a)
+
+
+def test_describe_accepts_a_prompt(tmp_path):
+    p = tmp_path / "a.png"
+    p.write_bytes(b"\x00" * 8)
+
+    assert describe(p, prompt="a red car", probe_media=False).prompt == "a red car"

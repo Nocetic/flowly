@@ -82,12 +82,19 @@ def save_audio(data: bytes, *, output_format: str, stem: str = "") -> Path:
     return final
 
 
-async def _finish(path: Path, *, provider: str, model: str) -> VoiceResult:
-    """Describe the file, then reclaim space around it."""
+async def _finish(
+    path: Path, *, provider: str, model: str, prompt: str = ""
+) -> VoiceResult:
+    """Describe the file, then reclaim space around it.
+
+    ``prompt`` is the spoken text or the music brief. It never reaches a chat
+    bubble, but it is the only thing that makes a track findable in the media
+    library — ``speech_4c1a90b7e2.mp3`` says nothing about what was said.
+    """
     from flowly.media.assets import describe
     from flowly.media.generate import prune_after_generation
 
-    asset = describe(path, provider=provider, model=model)
+    asset = describe(path, provider=provider, model=model, prompt=prompt)
     # Protected, so a piece longer than its own budget fails loudly at the
     # quota instead of vanishing the moment it lands.
     await prune_after_generation([str(path)])
@@ -145,4 +152,4 @@ async def generate_elevenlabs(
         output_format=elevenlabs.DEFAULT_OUTPUT_FORMAT,
         stem=f"{'music' if mode == MODE_MUSIC else 'speech'}_{uuid.uuid4().hex[:10]}",
     )
-    return await _finish(path, provider="elevenlabs", model=model)
+    return await _finish(path, provider="elevenlabs", model=model, prompt=prompt)

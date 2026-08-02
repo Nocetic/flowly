@@ -90,8 +90,21 @@ class ImageGenerateTool(Tool):
             return f"Image generation error: {exc}"
 
         from flowly.agent.reply_media import media_envelope
+        from flowly.media.assets import describe
 
         paths = result["paths"]
+        # Descriptors, so this reply carries the same provenance video and voice
+        # already do. Nothing in the chat bubble needs them — an image tells a
+        # client everything by being openable — but the media library does: a
+        # generated picture with no provider, model or prompt is indistinguishable
+        # from a photo somebody sent, and unsearchable besides.
+        # No ``source_url``: ``generate_image`` records every candidate URL but
+        # only appends a path for the ones that downloaded, so the two lists can
+        # fall out of step and a wrong attribution is worse than none.
+        assets = [
+            describe(path, provider="fal", model=model, prompt=prompt)
+            for path in paths
+        ]
         noun = "image" if len(paths) == 1 else "images"
         # The loop attaches these to the assistant's reply (one bubble) and shows
         # the model this summary — no separate message-tool send needed.
@@ -101,4 +114,5 @@ class ImageGenerateTool(Tool):
         return media_envelope(
             paths,
             f"Generated {len(paths)} {noun} with {model}, attached to this reply.\n{where}",
+            assets=assets,
         )

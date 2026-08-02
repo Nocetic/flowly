@@ -96,6 +96,41 @@ def _install_gateway_file_sink(level: str = "INFO") -> None:
         logger.warning(f"[gateway] daily file log sink not installed: {exc}")
 
 
+def _start_media_library_sync() -> None:
+    """Reconcile the media library on a daemon thread. Never raises.
+
+    ``gateway()`` is still synchronous here — the event loop does not exist
+    yet — so this cannot be a task. A daemon thread is the right shape anyway:
+    the work is pure disk I/O, it is worthless to wait for, and if the process
+    exits mid-scan the next start simply picks up where this one left off.
+    """
+    import threading
+
+    def _run() -> None:
+        try:
+            from flowly.media.library import get_library
+            from flowly.profile import get_flowly_home
+
+            library = get_library()
+            reconciled = library.reconcile()
+            backfilled = library.backfill_from_sessions(get_flowly_home() / "sessions")
+            if reconciled["added"] or reconciled["expired"] or backfilled["enriched"]:
+                logger.debug(
+                    "[Gateway] Media library: +{} new, {} expired, {} recovered "
+                    "from {} transcripts",
+                    reconciled["added"],
+                    reconciled["expired"],
+                    backfilled["enriched"],
+                    backfilled["sessions"],
+                )
+        except Exception as e:  # noqa: BLE001 - indexing never blocks a gateway
+            logger.debug(f"[Gateway] Media library sync skipped: {e}")
+
+    threading.Thread(
+        target=_run, name="flowly-media-library-sync", daemon=True
+    ).start()
+
+
 def _should_drop_stderr_sink(stream) -> bool:
     """True when stderr is redirected (a service manager) rather than a terminal.
 
@@ -334,9 +369,20 @@ def gateway(
                 video_max_size_mb=_media_env_int(
                     "FLOWLY_MEDIA_VIDEO_MAX_SIZE_MB", retention.video_max_size_mb
                 ),
+                audio_max_size_mb=_media_env_int(
+                    "FLOWLY_MEDIA_AUDIO_MAX_SIZE_MB", retention.audio_max_size_mb
+                ),
             )
         except Exception as e:
             logger.debug(f"[Gateway] Media retention skipped: {e}")
+
+    # Bring the media library index in step with the directory we just pruned,
+    # and — once, on the first run that has this feature — recover provenance
+    # for everything generated before the index existed. Both are I/O in a
+    # worker thread and neither may delay the gateway coming up, so this is
+    # fire-and-forget: a library that is a few seconds stale is invisible; a
+    # gateway that takes a few seconds longer to accept connections is not.
+    _start_media_library_sync()
 
     # Resolve persona: CLI flag overrides config
     active_persona = persona if persona else config.agents.defaults.persona
@@ -1349,6 +1395,27 @@ Respond to the user now:"""
             artifact_tool.set_on_change(_broadcast_artifact)
             # Share with SubagentManager so subagent artifacts also sync to S3
             agent.subagents._artifact_on_change = _broadcast_artifact
+
+    # Wire media-library broadcast — the same desktop(gateway)+relay fan-out.
+    # Without it a Library grid would only learn about a new image by polling,
+    # which is exactly the difference between a gallery that feels live and one
+    # that feels stale. The relay leg carries no bytes: it is a "something
+    # changed" ping, and the client re-reads the page it is on.
+    from flowly.media.library import set_on_change as _set_media_on_change
+
+    async def _broadcast_media(event_name: str, data: dict) -> None:
+        await gateway_server.broadcast_event(event_name, data)
+        _web = channels.get_channel("web")
+        if _web and hasattr(_web, "_ws") and _web._ws:
+            import json as _json
+            try:
+                await _web._ws.send(_json.dumps({
+                    "type": "event", "event": event_name, "data": data,
+                }))
+            except Exception:
+                pass  # relay fan-out is best-effort
+
+    _set_media_on_change(_broadcast_media)
 
     # Wire flowlet broadcast + agent-action runner — same desktop(gateway)+relay
     # fan-out as artifacts. The broadcast callback also backs feature_rpc's
