@@ -62,8 +62,14 @@ class CompactionConfig:
     # 0.6 keeps more history context than 0.5 (less aggressive pruning).
     max_history_share: float = 0.6
 
-    # Context window size (model-specific, will be auto-detected)
+    # Fallback context window, used only when the model's real window can't
+    # be resolved from the catalog or a family heuristic.
     context_window: int = 128_000
+
+    # True when the user pinned ``contextWindow`` in config.json. An explicit
+    # operator setting overrides catalog detection — if someone caps the
+    # window deliberately, auto-detection must not quietly raise it again.
+    context_window_explicit: bool = False
 
     # Memory flush settings
     memory_flush: MemoryFlushConfig = field(default_factory=MemoryFlushConfig)
@@ -90,6 +96,15 @@ class CompactionResult:
     kept_messages: list = field(default_factory=list)
 
 
+class CompactionError(RuntimeError):
+    """A compaction attempt could not produce a usable summary.
+
+    Raised instead of returning placeholder text so the caller keeps the
+    uncompacted history. Committing a placeholder would replace the whole
+    conversation with a sentence that carries none of it.
+    """
+
+
 # Constants (matching moltbot)
 BASE_CHUNK_RATIO = 0.4
 MIN_CHUNK_RATIO = 0.15
@@ -97,6 +112,22 @@ SAFETY_MARGIN = 1.2  # 20% buffer for token estimation inaccuracy
 
 DEFAULT_SUMMARY_FALLBACK = "No prior history."
 DEFAULT_PARTS = 2
+
+# The marker prefixing a compaction summary in the working context.
+# The manual (/compact) path historically wrote a different string, so both
+# are recognised when detecting an existing summary — sessions compacted by
+# older builds must still be understood.
+SUMMARY_MARKER = "[Previous conversation summary]"
+LEGACY_SUMMARY_MARKER = "[Compacted conversation summary]"
+SUMMARY_MARKERS = (SUMMARY_MARKER, LEGACY_SUMMARY_MARKER)
+
+
+def is_summary_message(message: dict) -> bool:
+    """True if ``message`` is a compaction summary this system wrote."""
+    if message.get("role") != "system":
+        return False
+    content = message.get("content", "")
+    return isinstance(content, str) and content.lstrip().startswith(SUMMARY_MARKERS)
 
 MERGE_SUMMARIES_INSTRUCTIONS = (
     "Merge these partial summaries into a single cohesive summary. "

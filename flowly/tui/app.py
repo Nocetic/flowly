@@ -289,6 +289,9 @@ class FlowlyTUI(App[None]):
         self._client = client if client is not None else GatewayClient(host=host, port=port)
         self._session_key = session_key
         self._model_hint = model_hint
+        # True while a user-initiated /compact owns the progress reporting, so
+        # the gateway's broadcast for the same run isn't printed twice.
+        self._compact_in_flight = False
         self._restored_draft: str = str(state.get("last_draft") or "")
         # Optional modal to auto-open after launch (e.g. `flowly setup`
         # passes "integrations" so the catalogue surfaces immediately).
@@ -1076,15 +1079,37 @@ class FlowlyTUI(App[None]):
             return
 
         if isinstance(ev, CompactionEvent):
+            # The gateway broadcasts to every connected client, so an event
+            # for a different chat (another device, a cron session) must not
+            # land in this transcript.
+            if ev.session_key and ev.session_key != self._session_key:
+                return
+            if ev.phase == "started":
+                # The manual path prints its own progress line; only announce
+                # the automatic one, which the user did not ask for.
+                if not self._compact_in_flight:
+                    transcript.add_system("⚡ compacting context…")
+                return
+            if ev.phase == "failed":
+                transcript.add_error(
+                    "context compaction failed — history kept, will retry"
+                )
+                return
+            saved = max(0, ev.before_tokens - ev.after_tokens)
             transcript.add_system(
-                f"⚡ context compacted · {ev.before_messages}→{ev.after_messages} msgs"
+                f"⚡ context compacted · {ev.messages_removed} msgs summarized"
                 + (
-                    f" · {ev.before_tokens:,}→{ev.after_tokens:,} tokens"
+                    f" · {ev.before_tokens:,}→{ev.after_tokens:,} tokens "
+                    f"(−{saved:,})"
                     if ev.before_tokens
                     else ""
                 )
             )
             status.cmp_count += 1
+            # Compaction shrinks the prompt — reset the running tally so the
+            # context bar reflects the new, smaller context immediately.
+            status.tokens_in = 0
+            status.tokens_out = 0
             return
 
         if isinstance(ev, Reconnecting):
@@ -2271,6 +2296,10 @@ class FlowlyTUI(App[None]):
             f"compacting context…  {instructions!r}" if instructions
             else "compacting context…"
         )
+        # The gateway also broadcasts started/completed for this compaction.
+        # Suppress the event-driven lines while we own the progress reporting,
+        # otherwise one /compact prints the same news three times.
+        self._compact_in_flight = True
         try:
             result = await self._client.chat_compact(self._session_key, instructions)
         except Exception as exc:
@@ -2278,13 +2307,21 @@ class FlowlyTUI(App[None]):
             self._set_state("error")
             status.hint = prior_hint
             return
-        before = result.get("beforeMessages") or result.get("before_messages")
-        after = result.get("afterMessages") or result.get("after_messages")
-        before_tokens = result.get("beforeTokens") or result.get("before_tokens")
-        after_tokens = result.get("afterTokens") or result.get("after_tokens")
+        finally:
+            self._compact_in_flight = False
+        if not result.get("success", True):
+            transcript.add_error(
+                str(result.get("message") or "compaction did not run")
+            )
+            self._set_state(prior_state if prior_state != "busy" else "idle")
+            status.hint = prior_hint
+            return
+        removed = result.get("messagesRemoved") or result.get("messages_removed")
+        before_tokens = result.get("tokensBefore") or result.get("tokens_before")
+        after_tokens = result.get("tokensAfter") or result.get("tokens_after")
         bits: list[str] = []
-        if before is not None and after is not None:
-            bits.append(f"{before} → {after} messages")
+        if removed:
+            bits.append(f"{removed} messages summarized")
         if before_tokens and after_tokens:
             bits.append(f"{before_tokens:,} → {after_tokens:,} tokens")
         suffix = "  ·  " + " · ".join(bits) if bits else ""

@@ -11,12 +11,38 @@ from flowly.compaction.pruning import (
     is_oversized_for_summary,
 )
 from flowly.compaction.types import (
+    CompactionError,
     DEFAULT_SUMMARY_FALLBACK,
     DEFAULT_PARTS,
     MERGE_SUMMARIES_INSTRUCTIONS,
     SAFETY_MARGIN,
 )
 from flowly.providers.base import LLMProvider
+
+# Providers do not raise on API failures — they return an ordinary
+# LLMResponse carrying the error text (see e.g. OpenRouterProvider's
+# ``_error_response``). Accepting that as a summary would commit the
+# outage message as the conversation's entire remembered history.
+PROVIDER_ERROR_PREFIX = "Error calling LLM:"
+
+
+def validated_summary_text(response: Any) -> str:
+    """Return the summary text of ``response``, or raise CompactionError.
+
+    Guards the three ways a summarization call comes back unusable:
+    an explicit ``finish_reason="error"``, an error envelope delivered
+    as ordinary content, or an empty body.
+    """
+    finish_reason = (getattr(response, "finish_reason", "") or "").lower()
+    content = (getattr(response, "content", "") or "").strip()
+
+    if finish_reason == "error" or content.startswith(PROVIDER_ERROR_PREFIX):
+        raise CompactionError(
+            f"summarization provider call failed: {content[:300] or finish_reason}"
+        )
+    if not content:
+        raise CompactionError("summarization returned an empty summary")
+    return content
 
 
 def _strip_tool_results_for_compaction(
@@ -135,7 +161,7 @@ async def generate_summary(
         max_tokens=reserve_tokens,
     )
 
-    return response.content or DEFAULT_SUMMARY_FALLBACK
+    return validated_summary_text(response)
 
 
 async def summarize_chunks(
@@ -211,6 +237,7 @@ async def summarize_with_fallback(
         return previous_summary or DEFAULT_SUMMARY_FALLBACK
 
     # Try full summarization first
+    last_error: Exception | None = None
     try:
         return await summarize_chunks(
             messages,
@@ -222,6 +249,7 @@ async def summarize_with_fallback(
             previous_summary,
         )
     except Exception as e:
+        last_error = e
         logger.warning(f"Full summarization failed, trying partial: {e}")
 
     # Fallback 1: Summarize only small messages, note oversized ones
@@ -252,13 +280,16 @@ async def summarize_with_fallback(
             notes = "\n\n" + "\n".join(oversized_notes) if oversized_notes else ""
             return partial_summary + notes
         except Exception as e:
+            last_error = e
             logger.warning(f"Partial summarization also failed: {e}")
 
-    # Final fallback: Just note what was there
-    return (
-        f"Context contained {len(messages)} messages "
-        f"({len(oversized_notes)} oversized). "
-        "Summary unavailable due to size limits."
+    # Nothing produced a real summary. Fail loudly rather than returning a
+    # placeholder: the caller commits whatever comes back as the entire
+    # remembered history, so a "summary unavailable" sentence here would
+    # erase the conversation exactly when summarization was broken.
+    raise CompactionError(
+        f"summarization failed for {len(messages)} messages "
+        f"({len(oversized_notes)} oversized): {last_error}"
     )
 
 

@@ -508,6 +508,36 @@ def chat_inflight(params: dict) -> dict:
     return result
 
 
+# ── Compaction ──────────────────────────────────────────────────────────────
+
+# Coroutine the host registers so ``chat.compact`` can reach the agent.
+# Signature: ``async (session_key, instructions) -> dict``.
+_compact_cb = None
+
+
+def set_compact_callback(cb) -> None:
+    """Register the host's manual-compaction entry point."""
+    global _compact_cb
+    _compact_cb = cb
+
+
+async def chat_compact(params: dict) -> dict:
+    """Summarize a session's history on demand (the ``/compact`` command).
+
+    Served over BOTH relay and direct gateway so every client compacts through
+    the same call. Without it here, relay clients had to send ``/compact`` as
+    chat text and parse the reply — same effect, different contract, and no
+    structured result to render.
+    """
+    if _compact_cb is None:
+        return {"success": False, "message": "Compaction is not available."}
+    session_key = (params.get("sessionKey") or "").strip()
+    if not session_key:
+        return {"success": False, "message": "sessionKey is required."}
+    instructions = (params.get("instructions") or "").strip() or None
+    return await _compact_cb(session_key, instructions)
+
+
 # ── Plan mode ───────────────────────────────────────────────────────────────
 
 # Coroutine the host (gateway) registers so plan.resume can start a fresh agent
@@ -3628,6 +3658,7 @@ _DISPATCH: dict[str, tuple] = {
     "push.register": (push_register, True, False),
     "push.unregister": (push_unregister, True, False),
     "chat.inflight": (chat_inflight, True, False),
+    "chat.compact": (chat_compact, True, False),
     "plan.get": (plan_get, True, False),
     "plan.list": (plan_list, True, False),
     "plan.resolve": (plan_resolve, True, False),

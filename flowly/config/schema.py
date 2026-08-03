@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -22,13 +22,44 @@ class MemoryFlushConfig(BaseModel):
     )
 
 
+class MicrocompactConfig(BaseModel):
+    """Truncation of old tool results, applied before full compaction."""
+    enabled: bool = True
+    keep_recent_full: int = Field(default=5, ge=1)
+    truncate_chars: int = Field(default=200, ge=50)
+
+
+class KeepRecentConfig(BaseModel):
+    """How much recent conversation survives compaction verbatim."""
+    enabled: bool = True
+    min_tokens: int = Field(default=5000, ge=0)
+    min_messages: int = Field(default=3, ge=0)
+    max_tokens: int = Field(default=20000, ge=1)
+
+
 class CompactionConfig(BaseModel):
     """Context compaction configuration."""
     mode: Literal["default", "safeguard"] = "safeguard"
-    reserve_tokens_floor: int = 20000
-    max_history_share: float = 0.5  # 0.1-0.9
-    context_window: int = 128000
+    # Headroom kept free for the model's reply and the next prompt. Must stay
+    # well under the context window or compaction would trigger on every turn.
+    reserve_tokens_floor: int = Field(default=20000, ge=1000)
+    max_history_share: float = Field(default=0.5, ge=0.1, le=0.9)
+    # Fallback only — the real window is detected from the model catalog
+    # unless this is set explicitly in config.json.
+    context_window: int = Field(default=128000, ge=4000)
     memory_flush: MemoryFlushConfig = Field(default_factory=MemoryFlushConfig)
+    microcompact: MicrocompactConfig = Field(default_factory=MicrocompactConfig)
+    keep_recent: KeepRecentConfig = Field(default_factory=KeepRecentConfig)
+
+    @model_validator(mode="after")
+    def _check_budget_fits(self) -> "CompactionConfig":
+        """A reserve at or above the window leaves no room to converse."""
+        if self.reserve_tokens_floor >= self.context_window:
+            raise ValueError(
+                f"compaction.reserveTokensFloor ({self.reserve_tokens_floor}) must be "
+                f"smaller than compaction.contextWindow ({self.context_window})"
+            )
+        return self
 
 
 class WhatsAppConfig(BaseModel):

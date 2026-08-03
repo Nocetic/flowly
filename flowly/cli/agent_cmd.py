@@ -66,20 +66,8 @@ def agent(
     cron = CronService(cron_store_path)
 
     # Build compaction config
-    from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
-    compaction_cfg = config.agents.defaults.compaction
-    compaction_config = CompactionConfig(
-        mode=compaction_cfg.mode,
-        reserve_tokens_floor=compaction_cfg.reserve_tokens_floor,
-        max_history_share=compaction_cfg.max_history_share,
-        context_window=compaction_cfg.context_window,
-        memory_flush=MemoryFlushConfig(
-            enabled=compaction_cfg.memory_flush.enabled,
-            soft_threshold_tokens=compaction_cfg.memory_flush.soft_threshold_tokens,
-            prompt=compaction_cfg.memory_flush.prompt,
-            system_prompt=compaction_cfg.memory_flush.system_prompt,
-        ),
-    )
+    from flowly.compaction.builder import build_compaction_config
+    compaction_config = build_compaction_config(config.agents.defaults.compaction)
 
     # Build exec config
     from flowly.exec.types import ExecConfig
@@ -259,6 +247,14 @@ def agent(
                         elif cmd == "/model":
                             if args:
                                 agent_loop.model = args.strip()
+                                # Compaction budgets and counts tokens against
+                                # the ACTIVE model — leaving them on the old one
+                                # sizes the context window and the per-message
+                                # overheads for a model that is no longer in use.
+                                agent_loop.compaction.model = agent_loop.model
+                                from flowly.compaction.estimator import set_active_model
+
+                                set_active_model(agent_loop.model)
                                 console.print(f"[green]✓[/green] Model set to [cyan]{args.strip()}[/cyan]")
                             else:
                                 console.print(f"[cyan]Current model:[/cyan] {agent_loop.model}")

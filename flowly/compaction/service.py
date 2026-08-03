@@ -1,25 +1,58 @@
 """Compaction service for managing context compression."""
 
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
 
-from flowly.compaction.estimator import (
-    estimate_messages_tokens,
-    estimate_message_tokens,
-)
+from flowly.compaction.estimator import estimate_messages_tokens
 from flowly.compaction.pruning import (
     prune_history_for_context_share,
     compute_adaptive_chunk_ratio,
+    split_into_turn_blocks,
 )
 from flowly.compaction.summarizer import summarize_in_stages
 from flowly.compaction.types import (
     CompactionConfig,
+    CompactionError,
     CompactionResult,
     SILENT_REPLY_TOKEN,
     SAFETY_MARGIN,
+    SUMMARY_MARKER,
 )
 from flowly.providers.base import LLMProvider
+
+
+def _heuristic_context_window(model: str) -> int | None:
+    """Rough context window by model family, for a cold catalog.
+
+    Deliberately conservative: guessing small compacts a bit early, while
+    guessing large sails past the provider's limit and 413s mid-turn.
+    """
+    m = (model or "").lower()
+    if not m:
+        return None
+    if "gemini" in m:
+        return 1_000_000
+    if "kimi" in m:
+        return 262_144
+    if "claude" in m or "sonnet" in m or "opus" in m or "haiku" in m:
+        return 200_000
+    if "gpt-4o" in m or "gpt-4-turbo" in m or "gpt-4.1" in m:
+        return 128_000
+    if "gpt-3.5" in m:
+        return 16_385
+    return None
+
+
+@dataclass
+class _SessionState:
+    """Compaction bookkeeping for one conversation."""
+
+    compaction_count: int = 0
+    memory_flush_at_count: int | None = None
+    consecutive_failures: int = 0
+    checks_since_suppression: int = 0
 
 
 class CompactionService:
@@ -31,6 +64,14 @@ class CompactionService:
     - Memory flush before compaction
     - Safeguard mode with adaptive chunking and pruning
     """
+
+    # Consecutive failures before a session backs off compaction attempts.
+    MAX_CONSECUTIVE_FAILURES = 2
+    # While backed off, allow one probe every N over-threshold checks so a
+    # session recovers by itself once the provider is healthy again.
+    FAILURE_PROBE_INTERVAL = 10
+    # Upper bound on tracked sessions before the oldest counters are dropped.
+    MAX_TRACKED_SESSIONS = 500
 
     def __init__(
         self,
@@ -54,56 +95,146 @@ class CompactionService:
         # Budgeting against the model's 128K while the wire chops at 80K is
         # how mid-turn 413s happen — clamp when the active provider is flowly.
         self.FLOWLY_PROXY_MAX_INPUT_TOKENS = 80_000
-        self._compaction_count = 0
-        self._memory_flush_compaction_count: int | None = None
-        self._consecutive_failures = 0  # prevent compression death spiral
+        # Compaction bookkeeping is PER SESSION. A single service instance
+        # serves every chat on the gateway, so a global counter let one
+        # conversation's memory-flush cycle cancel another's, and one
+        # conversation's outage suppress compaction for all of them.
+        self._sessions: dict[str, _SessionState] = {}
+
+    def _state(self, session_key: str = "") -> "_SessionState":
+        """Per-session counters, created on first use.
+
+        The empty key is a real bucket, used by callers that have no
+        session (tests, one-off summarization).
+        """
+        key = session_key or ""
+        state = self._sessions.get(key)
+        if state is None:
+            state = _SessionState()
+            self._sessions[key] = state
+            self._evict_stale_sessions()
+        return state
+
+    def _evict_stale_sessions(self) -> None:
+        """Bound the counter map on a long-lived gateway.
+
+        Sessions come and go for months; a few ints each is small but
+        unbounded. Dropping the oldest entries only resets a memory-flush
+        cycle and a failure count, both of which re-derive on their own.
+        """
+        overflow = len(self._sessions) - self.MAX_TRACKED_SESSIONS
+        if overflow <= 0:
+            return
+        for key in list(self._sessions)[:overflow]:
+            if key:  # keep the default bucket
+                self._sessions.pop(key, None)
+
+    @property
+    def model_context_window(self) -> int:
+        """The active model's real context window.
+
+        Resolution order:
+
+        1. **Live catalog** — the provider's own ``context_length``, so a
+           32K model compacts early and a 1M model doesn't compact at 8%
+           full. Cache-only and unwarmed on a cold gateway, hence the
+           fallbacks.
+        2. **Family heuristics** — enough to be roughly right for the
+           common families before the catalog lands.
+        3. **Configured value** — the user's explicit setting, and the
+           last resort.
+
+        A user who pinned ``compaction.contextWindow`` themselves always
+        wins: an operator override must not be second-guessed by a catalog.
+        """
+        if self.config.context_window_explicit:
+            return self.config.context_window
+
+        try:
+            from flowly.integrations.model_catalog import get_context_window
+
+            live = get_context_window(self.model)
+            if live and live > 0:
+                return live
+        except Exception:  # noqa: BLE001 - catalog is best-effort
+            pass
+
+        heuristic = _heuristic_context_window(self.model)
+        if heuristic:
+            return heuristic
+        return self.config.context_window
 
     @property
     def effective_context_window(self) -> int:
-        """The window we can actually USE: the model's configured window,
-        clamped to the Flowly proxy's input cap when that's the active
-        provider (it rejects bigger prompts with 413 regardless of model)."""
-        window = self.config.context_window
+        """The window we can actually USE: the model's real window, clamped
+        to the Flowly proxy's input cap when that's the active provider (it
+        rejects bigger prompts with 413 regardless of model)."""
+        window = self.model_context_window
         if getattr(self.provider, "provider_name", "") == "flowly":
             return min(window, self.FLOWLY_PROXY_MAX_INPUT_TOKENS)
         return window
 
-    def should_compact(self, total_tokens: int) -> bool:
+    @property
+    def compaction_threshold(self) -> int:
+        """Token count at which this session starts compacting."""
+        return max(1, self.effective_context_window - self.config.reserve_tokens_floor)
+
+    def should_compact(self, total_tokens: int, session_key: str = "") -> bool:
         """
         Check if compaction should be triggered.
 
-        Refuses to compact if 2+ consecutive compactions have failed
-        (prevents death spiral where compact → fail → compact → fail).
+        Backs off after repeated failures (prevents a death spiral where
+        compact → fail → compact → fail burns tokens every turn), but the
+        back-off is a cooldown, not a life sentence: one probe is allowed
+        every ``FAILURE_PROBE_INTERVAL`` checks so a session recovers on
+        its own once the provider does.
 
         Args:
             total_tokens: Current total tokens in context.
+            session_key: Session these counters belong to.
 
         Returns:
             True if compaction is needed.
         """
-        if self._consecutive_failures >= 2:
-            logger.warning(
-                "Compaction suppressed — %d consecutive failures (death spiral prevention)",
-                self._consecutive_failures,
-            )
-            return False
         threshold = self.effective_context_window - self.config.reserve_tokens_floor
-        return total_tokens > threshold
+        if total_tokens <= threshold:
+            return False
 
-    def record_compaction_success(self) -> None:
+        state = self._state(session_key)
+        if state.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+            state.checks_since_suppression += 1
+            if state.checks_since_suppression < self.FAILURE_PROBE_INTERVAL:
+                logger.warning(
+                    f"Compaction suppressed for {session_key or '<default>'} — "
+                    f"{state.consecutive_failures} consecutive failures "
+                    f"(retry in {self.FAILURE_PROBE_INTERVAL - state.checks_since_suppression} checks)"
+                )
+                return False
+            state.checks_since_suppression = 0
+            logger.info(
+                f"Compaction probe after back-off for {session_key or '<default>'}"
+            )
+        return True
+
+    def record_compaction_success(self, session_key: str = "") -> None:
         """Reset failure counter after successful compaction."""
-        self._consecutive_failures = 0
+        state = self._state(session_key)
+        state.consecutive_failures = 0
+        state.checks_since_suppression = 0
 
-    def record_compaction_failure(self) -> None:
+    def record_compaction_failure(self, session_key: str = "") -> None:
         """Increment failure counter to detect death spirals."""
-        self._consecutive_failures += 1
+        state = self._state(session_key)
+        state.consecutive_failures += 1
+        state.checks_since_suppression = 0
 
-    def should_memory_flush(self, total_tokens: int) -> bool:
+    def should_memory_flush(self, total_tokens: int, session_key: str = "") -> bool:
         """
         Check if memory flush should run before compaction.
 
         Args:
             total_tokens: Current total tokens in context.
+            session_key: Session these counters belong to.
 
         Returns:
             True if memory flush should run.
@@ -112,7 +243,8 @@ class CompactionService:
             return False
 
         # Check if already flushed in this compaction cycle
-        if self._memory_flush_compaction_count == self._compaction_count:
+        state = self._state(session_key)
+        if state.memory_flush_at_count == state.compaction_count:
             return False
 
         # Calculate soft threshold
@@ -136,9 +268,10 @@ class CompactionService:
             self.config.memory_flush.system_prompt,
         )
 
-    def mark_memory_flush_done(self) -> None:
+    def mark_memory_flush_done(self, session_key: str = "") -> None:
         """Mark that memory flush has been done for this compaction cycle."""
-        self._memory_flush_compaction_count = self._compaction_count
+        state = self._state(session_key)
+        state.memory_flush_at_count = state.compaction_count
 
     def is_silent_reply(self, response: str) -> bool:
         """
@@ -231,8 +364,13 @@ class CompactionService:
         """
         Determine which recent messages to preserve after compaction.
 
-        Walks backward from the end of messages, accumulating until
-        min_tokens AND min_messages thresholds are met (or max_tokens hit).
+        Walks backward one TURN BLOCK at a time — a user message plus every
+        assistant/tool message that answers it — accumulating until
+        min_tokens AND min_messages are met (or max_tokens would be
+        exceeded). Blocks, not individual messages, are the unit: cutting
+        mid-block strands a ``tool`` result away from the
+        ``assistant.tool_calls`` that produced it, and providers reject
+        that sequence with a 400.
 
         Args:
             messages: The FULL history BEFORE compaction.
@@ -244,37 +382,44 @@ class CompactionService:
         if not cfg.enabled or not messages:
             return []
 
-        kept: list[dict[str, Any]] = []
+        blocks = split_into_turn_blocks(messages)
+        kept_blocks: list[list[dict[str, Any]]] = []
         tokens_acc = 0
         text_msg_count = 0
 
-        for msg in reversed(messages):
-            msg_tokens = estimate_message_tokens(msg)
+        for block in reversed(blocks):
+            block_tokens = estimate_messages_tokens(block)
 
-            # Hard cap
-            if tokens_acc + msg_tokens > cfg.max_tokens:
+            # Hard cap — never split a block to squeeze under it.
+            if kept_blocks and tokens_acc + block_tokens > cfg.max_tokens:
                 break
+            if not kept_blocks and block_tokens > cfg.max_tokens:
+                # Even the newest block alone busts the cap; summarize
+                # everything rather than emit a half block.
+                return []
 
-            kept.append(msg)
-            tokens_acc += msg_tokens
+            kept_blocks.append(block)
+            tokens_acc += block_tokens
 
-            if msg.get("role") in ("user", "assistant"):
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    text_msg_count += 1
+            for msg in block:
+                if msg.get("role") in ("user", "assistant"):
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        text_msg_count += 1
 
             # Met both minimums — stop
             if tokens_acc >= cfg.min_tokens and text_msg_count >= cfg.min_messages:
                 break
 
-        kept.reverse()
-        return kept
+        kept_blocks.reverse()
+        return [msg for block in kept_blocks for msg in block]
 
     async def compact(
         self,
         messages: list[dict[str, Any]],
         custom_instructions: str | None = None,
         previous_summary: str | None = None,
+        session_key: str = "",
     ) -> CompactionResult:
         """
         Compact messages by generating a summary.
@@ -283,9 +428,14 @@ class CompactionService:
             messages: Messages to compact.
             custom_instructions: Optional custom instructions for summarization.
             previous_summary: Optional previous summary to incorporate.
+            session_key: Session whose counters this attempt belongs to.
 
         Returns:
             CompactionResult with summary and statistics.
+
+        Raises:
+            CompactionError: The summary could not be produced or would not
+                shrink the context. The caller must keep its history intact.
         """
         if not messages:
             return CompactionResult(
@@ -296,6 +446,11 @@ class CompactionService:
             )
 
         tokens_before = estimate_messages_tokens(messages)
+        # Size every summarisation call against the window we can actually
+        # use — the model's real window, clamped by the active provider's
+        # input cap. Budgeting chunks against a configured 128K while the
+        # wire chops at 80K is how the summariser itself gets 413'd.
+        window = self.effective_context_window
 
         # Determine which recent messages to preserve verbatim
         kept_messages = self._calculate_keep_recent(messages)
@@ -317,10 +472,14 @@ class CompactionService:
         dropped_messages = 0
         dropped_tokens = 0
 
-        # Safeguard mode: prune if needed
+        # Safeguard mode: prune if needed.
+        # Budget the SUMMARISATION INPUT, not the whole history — the kept
+        # tail is preserved verbatim, so including it here would both
+        # summarize it a second time (duplicating it into the summary AND
+        # the working context) and skew every count we report.
         if self.config.mode == "safeguard":
             pruned = prune_history_for_context_share(
-                messages,
+                messages_to_summarize,
                 self.effective_context_window,
                 self.config.max_history_share,
                 parts=2,
@@ -336,76 +495,78 @@ class CompactionService:
                 dropped_messages = pruned["dropped_messages"]
                 dropped_tokens = pruned["dropped_tokens"]
 
-                # Summarize dropped messages separately
+                # Summarize dropped messages separately. A failure here is
+                # fatal to the whole attempt: these messages are about to
+                # leave the working context, so if they don't make it into
+                # a summary they are simply lost.
                 if pruned["dropped_messages_list"]:
-                    try:
-                        dropped_chunk_ratio = compute_adaptive_chunk_ratio(
-                            pruned["dropped_messages_list"],
-                            self.config.context_window,
-                        )
-                        dropped_max_chunk_tokens = max(
-                            1,
-                            int(self.config.context_window * dropped_chunk_ratio),
-                        )
-                        dropped_summary = await summarize_in_stages(
-                            pruned["dropped_messages_list"],
-                            self.provider,
-                            self.model,
-                            self.config.reserve_tokens_floor,
-                            dropped_max_chunk_tokens,
-                            self.config.context_window,
-                            custom_instructions,
-                            previous_summary,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to summarize dropped messages: {e}"
-                        )
+                    dropped_chunk_ratio = compute_adaptive_chunk_ratio(
+                        pruned["dropped_messages_list"],
+                        window,
+                    )
+                    dropped_max_chunk_tokens = max(
+                        1,
+                        int(window * dropped_chunk_ratio),
+                    )
+                    dropped_summary = await summarize_in_stages(
+                        pruned["dropped_messages_list"],
+                        self.provider,
+                        self.model,
+                        self.config.reserve_tokens_floor,
+                        dropped_max_chunk_tokens,
+                        window,
+                        custom_instructions,
+                        previous_summary,
+                    )
 
         # Calculate adaptive chunk ratio
         adaptive_ratio = compute_adaptive_chunk_ratio(
             messages_to_summarize,
-            self.config.context_window,
+            window,
         )
         max_chunk_tokens = max(
             1,
-            int(self.config.context_window * adaptive_ratio),
+            int(window * adaptive_ratio),
         )
 
         # Use dropped summary as previous summary if available
         effective_previous = dropped_summary or previous_summary
 
-        # Generate summary
-        try:
-            summary = await summarize_in_stages(
-                messages_to_summarize,
-                self.provider,
-                self.model,
-                self.config.reserve_tokens_floor,
-                max_chunk_tokens,
-                self.config.context_window,
-                custom_instructions,
-                effective_previous,
-            )
-        except Exception as e:
-            logger.error(f"Compaction summarization failed: {e}")
-            summary = (
-                f"Context contained {len(messages)} messages. "
-                "Summary unavailable due to error."
-            )
+        # Generate summary. Any failure propagates as CompactionError so the
+        # caller keeps its uncompacted history — there is no summary text
+        # worth committing in place of a conversation we failed to read.
+        summary = await summarize_in_stages(
+            messages_to_summarize,
+            self.provider,
+            self.model,
+            self.config.reserve_tokens_floor,
+            max_chunk_tokens,
+            window,
+            custom_instructions,
+            effective_previous,
+        )
 
         # Estimate tokens after (summary + kept messages)
         from flowly.compaction.estimator import estimate_tokens
         tokens_after = estimate_tokens(summary) + estimate_messages_tokens(kept_messages)
 
-        # Increment compaction count
-        self._compaction_count += 1
+        # A "compaction" that doesn't shrink anything is not worth the
+        # history it destroys. Refuse it and let the caller carry on.
+        if tokens_after >= tokens_before:
+            raise CompactionError(
+                f"compaction would not reduce context "
+                f"({tokens_before} → {tokens_after} tokens); refusing to commit"
+            )
+
+        self._state(session_key).compaction_count += 1
 
         return CompactionResult(
             summary=summary,
             tokens_before=tokens_before,
             tokens_after=tokens_after,
-            messages_removed=len(messages_to_summarize),
+            # Net messages leaving the working context — NOT the size of the
+            # summarisation input, which safeguard pruning also shrinks.
+            messages_removed=len(messages) - len(kept_messages),
             dropped_chunks=dropped_chunks,
             dropped_messages=dropped_messages,
             dropped_tokens=dropped_tokens,
@@ -416,6 +577,7 @@ class CompactionService:
         self,
         messages: list[dict[str, Any]],
         custom_instructions: str | None = None,
+        session_key: str = "",
     ) -> tuple[list[dict[str, Any]], CompactionResult | None]:
         """
         Compact messages if threshold exceeded.
@@ -423,30 +585,46 @@ class CompactionService:
         Args:
             messages: Current messages.
             custom_instructions: Optional custom instructions.
+            session_key: Session whose counters this attempt belongs to.
 
         Returns:
             Tuple of (possibly compacted messages, CompactionResult or None).
+            On failure the ORIGINAL messages come back with a None result —
+            never a partially-applied compaction.
         """
         total_tokens = estimate_messages_tokens(messages)
 
-        if not self.should_compact(total_tokens):
+        if not self.should_compact(total_tokens, session_key):
             return messages, None
 
         logger.info(
             f"Compacting context: {total_tokens} tokens exceeds threshold"
         )
 
-        result = await self.compact(messages, custom_instructions)
+        try:
+            result = await self.compact(
+                messages, custom_instructions, session_key=session_key,
+            )
+        except CompactionError as e:
+            logger.error(f"Compaction failed, keeping full history: {e}")
+            self.record_compaction_failure(session_key)
+            return messages, None
+
+        self.record_compaction_success(session_key)
 
         # Replace messages with summary + kept recent messages
         summary_message = {
             "role": "system",
-            "content": f"[Previous conversation summary]\n\n{result.summary}",
+            "content": f"{SUMMARY_MARKER}\n\n{result.summary}",
         }
 
         return [summary_message] + result.kept_messages, result
 
     @property
     def compaction_count(self) -> int:
-        """Get the number of compactions performed."""
-        return self._compaction_count
+        """Total compactions performed across every session."""
+        return sum(s.compaction_count for s in self._sessions.values())
+
+    def compaction_count_for(self, session_key: str = "") -> int:
+        """Compactions performed for one session."""
+        return self._state(session_key).compaction_count

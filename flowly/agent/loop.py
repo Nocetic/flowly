@@ -39,8 +39,18 @@ from flowly.agent.subagent import SubagentManager
 from flowly.session.manager import SessionManager
 from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
-from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
-from flowly.compaction.estimator import estimate_messages_tokens, estimate_tokens
+from flowly.compaction.types import (
+    CompactionConfig,
+    MemoryFlushConfig,
+    SUMMARY_MARKER,
+    is_summary_message,
+)
+from flowly.compaction.pruning import split_into_turn_blocks
+from flowly.compaction.estimator import (
+    estimate_message_tokens,
+    estimate_messages_tokens,
+    estimate_tokens,
+)
 from flowly.exec.types import ExecConfig
 from flowly.config.schema import TrelloConfig, VoiceBridgeConfig, XConfig, MemorySearchConfig
 from flowly.audit.logger import get_audit_logger
@@ -393,6 +403,14 @@ def _relabel_codex_projected_pair(
 # prefixed so the provider layer strips it before the API call.
 _EPHEMERAL_NUDGE = "_ephemeral_nudge"
 
+# Human messaging surfaces have no renderer for the ``[context-optimized]``
+# separator, so sending it there delivers the literal string to the user as a
+# message from their agent. Rich clients (relay web, desktop, iOS) draw it as
+# a divider and DO want it.
+_MARKER_UNSUPPORTED_CHANNELS = frozenset({
+    "telegram", "discord", "slack", "teams", "whatsapp", "imessage", "email",
+})
+
 
 def _drop_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter internal corrective nudges out of a turn's messages before
@@ -402,6 +420,39 @@ def _drop_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any
     if not any(m.get(_EPHEMERAL_NUDGE) for m in messages):
         return messages
     return [m for m in messages if not m.get(_EPHEMERAL_NUDGE)]
+
+
+def _emergency_trim(
+    messages: list[dict[str, Any]],
+    keep_last: int = 20,
+) -> list[dict[str, Any]]:
+    """Shrink a history we failed to summarise, without breaking tool pairs.
+
+    Used only when compaction errored and the turn still has to go out. Keeps
+    every system message plus the most recent whole turn blocks that fit in
+    ``keep_last`` messages. Slicing raw messages instead would strand a
+    ``tool`` result from its ``assistant.tool_calls`` and earn a provider 400
+    on top of the failure we're already recovering from.
+
+    This affects the turn's working copy only — the session on disk keeps
+    everything.
+    """
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
+    blocks = split_into_turn_blocks(non_system)
+    if not blocks:
+        return system_msgs
+
+    kept: list[dict[str, Any]] = []
+    for block in reversed(blocks):
+        if kept and len(kept) + len(block) > keep_last:
+            break
+        kept = block + kept
+    if not kept:
+        # Newest block alone exceeds the budget — take it anyway; a whole
+        # block is the smallest thing we are allowed to send.
+        kept = blocks[-1]
+    return system_msgs + kept
 
 
 def _strip_old_tool_results(
@@ -651,6 +702,8 @@ class AgentLoop:
             logger.warning("Session indexer init failed (search disabled): {}", e)
 
         self._running = False
+        # (tool_count, tokens) memo for the tool-schema share of each request.
+        self._tool_schema_token_cache: tuple[int, int] = (-1, 0)
         self._on_compaction: Callable | None = None  # set by CLI after creation
         # Fired (session_key, title) when a session is auto-titled. The CLI
         # wires this to the web channel so the relay can encrypt + persist the
@@ -3671,15 +3724,17 @@ class AgentLoop:
             # within reserve distance of the EFFECTIVE window (model window,
             # clamped to the Flowly proxy's 80K input cap), microcompact it —
             # old tool results collapse to stubs, recent ones stay verbatim.
-            if iteration > 1:
-                _guard_tokens = estimate_messages_tokens(messages)
-                _guard_limit = (
-                    self.compaction.effective_context_window
-                    - self.compaction.config.reserve_tokens_floor
-                )
-                if _guard_tokens > _guard_limit:
-                    messages = self.compaction.microcompact(messages)
-                    _guard_after = estimate_messages_tokens(messages)
+            #
+            # This runs on the FIRST iteration too: a single oversized message
+            # (a pasted log, a large attachment) can bust the window before any
+            # tool has run, and skipping iteration 1 meant that request went out
+            # unguarded and 413'd.
+            _guard_tokens = estimate_messages_tokens(messages)
+            _guard_limit = self.compaction.compaction_threshold
+            if _guard_tokens > _guard_limit:
+                messages = self.compaction.microcompact(messages)
+                _guard_after = estimate_messages_tokens(messages)
+                if _guard_after < _guard_tokens:
                     logger.info(
                         f"Mid-turn microcompact: {_guard_tokens} → {_guard_after} tokens "
                         f"(limit {_guard_limit}, iteration {iteration})"
@@ -5134,7 +5189,19 @@ class AgentLoop:
                     msg.session_key, command_args or None
                 )
                 if result.get("success"):
-                    # Send a compact marker — relay saves to Firestore, client renders as separator
+                    # Rich clients render the marker as a persistent separator
+                    # (the relay also saves it to Firestore). On plain messaging
+                    # channels that would just be a cryptic string, so report
+                    # the outcome in words instead.
+                    if msg.channel in _MARKER_UNSUPPORTED_CHANNELS:
+                        saved = result.get("tokens_before", 0) - result.get("tokens_after", 0)
+                        return OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content=(
+                                f"✅ {result.get('message', 'Compacted')}"
+                                + (f" (~{saved:,} tokens freed)" if saved > 0 else "")
+                            ),
+                        )
                     return OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
                         content="[context-optimized]",
@@ -5502,7 +5569,7 @@ class AgentLoop:
         session.metadata["persona"] = current_persona
 
         # Get history and check for compaction
-        history = session.get_history(max_messages=self.context_messages)
+        history = self._history_with_summary_anchor(session)
 
         # Estimate total context: history + system prompt overhead.
         # Build actual system prompt to get accurate token count (avoids fixed 6K estimate drift).
@@ -5519,112 +5586,74 @@ class AgentLoop:
             system_prompt_tokens = estimate_tokens(sys_prompt)
         except Exception:
             system_prompt_tokens = 6000  # fallback
-        total_tokens = estimate_messages_tokens(history) + system_prompt_tokens
+        # Everything else the FIRST provider call will carry: the incoming
+        # message, its attachments, and the tool schemas. Leaving these out
+        # let a turn pass the check at 55K and then hit the wire at 80K —
+        # the request is what has to fit, not the history alone.
+        turn_input_tokens = self._estimate_turn_input_tokens(msg)
+        fixed_overhead = system_prompt_tokens + turn_input_tokens
+        total_tokens = estimate_messages_tokens(history) + fixed_overhead
 
-        if self.compaction.should_memory_flush(total_tokens):
+        if self.compaction.should_memory_flush(total_tokens, msg.session_key):
             logger.info("Running pre-compaction memory flush")
             await self._run_memory_flush(session, msg.channel, msg.chat_id)
-            self.compaction.mark_memory_flush_done()
+            self.compaction.mark_memory_flush_done(msg.session_key)
             # Reload history after flush
-            history = session.get_history(max_messages=self.context_messages)
-            total_tokens = estimate_messages_tokens(history) + system_prompt_tokens
+            history = self._history_with_summary_anchor(session)
+            total_tokens = estimate_messages_tokens(history) + fixed_overhead
 
         # Microcompaction: truncate old tool results to delay full compaction
         history = self.compaction.microcompact(history)
 
         # Re-estimate after microcompaction
-        total_tokens = estimate_messages_tokens(history) + system_prompt_tokens
+        total_tokens = estimate_messages_tokens(history) + fixed_overhead
 
         # Check if compaction is needed
-        if self.compaction.should_compact(total_tokens):
+        if self.compaction.should_compact(total_tokens, msg.session_key):
             logger.info(f"Compacting context: {total_tokens} tokens exceeds threshold")
+            # Announce BEFORE the work: staged summarisation can take several
+            # LLM calls, and without this the clients show a frozen agent.
+            await self._emit_compaction_event(
+                msg.session_key, "started", total_tokens, 0, 0,
+            )
             try:
-                result = await self.compaction.compact(history)
+                result = await self.compaction.compact(
+                    history, session_key=msg.session_key,
+                )
             except Exception as e:
                 logger.error(f"Compaction failed: {e}")
-                self.compaction.record_compaction_failure()
+                self.compaction.record_compaction_failure(msg.session_key)
                 # Fall through with uncompacted history — better than crashing
                 result = None
 
             if result is None:
-                # Compaction failed — trim to last 20 messages as emergency fallback
-                system_msgs = [m for m in history if m.get("role") == "system"]
-                non_system = [m for m in history if m.get("role") != "system"]
-                history = system_msgs + non_system[-20:]
-                logger.warning("Compaction failed — emergency trim to last 20 messages")
+                # Compaction failed. The SESSION IS LEFT UNTOUCHED — only this
+                # turn's working copy is trimmed, so nothing is lost on disk
+                # and the next turn can try again.
+                history = _emergency_trim(history)
+                logger.warning(
+                    "Compaction failed — emergency trim for this turn "
+                    f"({len(history)} messages); session history preserved"
+                )
+                await self._emit_compaction_event(
+                    msg.session_key, "failed", total_tokens, total_tokens, 0,
+                )
             else:
-                self.compaction.record_compaction_success()
+                self.compaction.record_compaction_success(msg.session_key)
                 logger.info(
                     f"Compaction complete: {result.tokens_before} -> {result.tokens_after} tokens, "
                     f"removed {result.messages_removed} messages, "
                     f"kept {len(result.kept_messages)} recent"
                 )
-                # Persist compaction: clear session, write summary + kept messages.
-                # kept_messages may carry assistant_with_tool_calls /
-                # tool_result entries the compactor decided to preserve
-                # verbatim (recent turns the protect_last_n window
-                # covers). We must persist ``tool_calls`` / ``tool_call_id``
-                # / ``name`` alongside ``content``; otherwise the
-                # post-compaction history ends with broken tool sequences
-                # and the next chat call hits a provider 400.
-                # Preserve the full pre-compaction history in the append-only
-                # display transcript before trimming the LLM context jsonl.
-                self.sessions.flush_full(session)
-                session.clear()
-                summary_msg = f"[Previous conversation summary]\n\n{result.summary}"
-                # An approved plan mid-execution must survive compaction in the
-                # model's CONTEXT, not just on disk — otherwise the model keeps
-                # working with no memory of the contract it's bound to.
-                try:
-                    from flowly.plans.manager import get_plan_manager as _get_pm
-
-                    _plan_note = _get_pm().compaction_note(msg.session_key)
-                    if _plan_note:
-                        summary_msg += f"\n\n{_plan_note}"
-                except Exception:
-                    logger.debug("[plan] compaction note skipped (non-fatal)")
-                session.add_message("system", summary_msg)
-                for kept_msg in result.kept_messages:
-                    extras = {
-                        k: kept_msg[k]
-                        for k in ("tool_calls", "tool_call_id", "name")
-                        if k in kept_msg
-                    }
-                    session.add_message(
-                        kept_msg.get("role", "user"),
-                        kept_msg.get("content", ""),
-                        **extras,
-                    )
-                self.sessions.mark_full_synced(session)
-                session.metadata["last_compaction_summary"] = result.summary
-                session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
-                self.sessions.save(session)
-                # Compaction is a snapshot boundary: drop the frozen memory block
-                # so post-compaction turns re-inject freshly-written memory.
-                self.context.invalidate_memory_snapshot(msg.session_key)
-                history = [{"role": "system", "content": summary_msg}] + result.kept_messages
-
-                # Send marker message so relay saves to Firestore (persistent separator)
-                try:
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="[context-optimized]",
-                    ))
-                except Exception:
-                    pass
-
-                # Notify connected clients about compaction (real-time event)
-                if self._on_compaction:
-                    try:
-                        await self._on_compaction(
-                            msg.session_key,
-                            result.tokens_before,
-                            result.tokens_after,
-                            result.messages_removed,
-                            "completed",
-                        )
-                    except Exception as e:
-                        logger.debug(f"Compaction notification error: {e}")
+                history = self._commit_compaction(session, result, msg.session_key)
+                await self._publish_compaction_marker(msg.channel, msg.chat_id)
+                await self._emit_compaction_event(
+                    msg.session_key,
+                    "completed",
+                    result.tokens_before,
+                    result.tokens_after,
+                    result.messages_removed,
+                )
 
         # Build initial messages. Cron runs pass skip_memory and
         # skip_context_files via metadata so MEMORY.md / AGENTS.md /
@@ -6562,6 +6591,153 @@ class AgentLoop:
 
         return "\n".join(lines)
 
+    def _tool_schema_tokens(self) -> int:
+        """Token cost of the tool schemas sent with every request.
+
+        Memoized on the tool count: schemas are static per registered tool,
+        and re-serializing ~40 of them on every turn is pure waste.
+        """
+        try:
+            definitions = self.tools.get_definitions()
+        except Exception:  # noqa: BLE001
+            return 0
+        key = len(definitions)
+        cached_key, cached_tokens = self._tool_schema_token_cache
+        if cached_key == key:
+            return cached_tokens
+        try:
+            tokens = estimate_tokens(json.dumps(definitions))
+        except Exception:  # noqa: BLE001
+            tokens = 0
+        self._tool_schema_token_cache = (key, tokens)
+        return tokens
+
+    def _estimate_turn_input_tokens(self, msg: InboundMessage) -> int:
+        """Tokens this turn adds on top of the history: the user's message,
+        their attachments, and the tool schemas."""
+        tokens = self._tool_schema_tokens()
+        try:
+            tokens += estimate_tokens(msg.content or "")
+        except Exception:  # noqa: BLE001
+            pass
+        if getattr(msg, "media", None):
+            # Images dominate a multimodal request — an unaccounted screenshot
+            # is thousands of tokens. Price them through the estimator's own
+            # per-image overhead rather than guessing here.
+            tokens += estimate_message_tokens(
+                {"role": "user", "content": [{"type": "image_url"} for _ in msg.media]}
+            )
+        return tokens
+
+    def _history_with_summary_anchor(self, session: Any) -> list[dict[str, Any]]:
+        """Session history for the LLM, with the compaction summary pinned.
+
+        ``get_history`` returns a sliding window over the last N messages, and
+        a compaction summary is an ordinary message inside it. After N further
+        messages the summary slides out and the model silently loses every
+        earlier turn compaction was preserving — while the chat UI still shows
+        the whole conversation, so nobody notices. Re-inject the stored summary
+        at the head whenever the window no longer carries one.
+        """
+        history = session.get_history(max_messages=self.context_messages)
+        try:
+            summary = session.metadata.get("last_compaction_summary")
+        except AttributeError:
+            return history
+        if not summary or any(is_summary_message(m) for m in history):
+            return history
+        anchor = {"role": "system", "content": f"{SUMMARY_MARKER}\n\n{summary}"}
+        return [anchor] + history
+
+    async def _emit_compaction_event(
+        self,
+        session_key: str,
+        phase: str,
+        tokens_before: int,
+        tokens_after: int,
+        messages_removed: int,
+    ) -> None:
+        """Push one compaction lifecycle event. Never raises."""
+        if not self._on_compaction:
+            return
+        try:
+            await self._on_compaction(
+                session_key, tokens_before, tokens_after, messages_removed, phase,
+            )
+        except Exception as e:
+            logger.debug(f"Compaction notification error: {e}")
+
+    async def _publish_compaction_marker(self, channel: str, chat_id: str) -> None:
+        """Emit the ``[context-optimized]`` separator on channels that render it.
+
+        Rich clients (relay web, desktop, iOS) turn this into a visual divider
+        in the transcript. A human messaging channel has no such renderer, so
+        the user would just receive the literal string as a message from their
+        agent — noise at best, confusing at worst.
+        """
+        if channel in _MARKER_UNSUPPORTED_CHANNELS:
+            return
+        try:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=channel, chat_id=chat_id, content="[context-optimized]",
+            ))
+        except Exception:
+            pass
+
+    def _commit_compaction(
+        self,
+        session: Any,
+        result: Any,
+        session_key: str,
+    ) -> list[dict[str, Any]]:
+        """Persist a successful compaction and return the new working history.
+
+        Shared by the automatic and manual paths so both produce identical
+        on-disk state. Called ONLY after the summary has been validated —
+        it clears the session's working context, which is unrecoverable
+        except from the append-only display transcript flushed just before.
+        """
+        # Preserve the full pre-compaction history in the append-only display
+        # transcript before trimming the LLM context jsonl.
+        self.sessions.flush_full(session)
+        session.clear()
+        summary_msg = f"{SUMMARY_MARKER}\n\n{result.summary}"
+        # An approved plan mid-execution must survive compaction in the
+        # model's CONTEXT, not just on disk — otherwise the model keeps
+        # working with no memory of the contract it's bound to.
+        try:
+            from flowly.plans.manager import get_plan_manager as _get_pm
+
+            _plan_note = _get_pm().compaction_note(session_key)
+            if _plan_note:
+                summary_msg += f"\n\n{_plan_note}"
+        except Exception:
+            logger.debug("[plan] compaction note skipped (non-fatal)")
+        session.add_message("system", summary_msg)
+        # kept_messages may carry assistant_with_tool_calls / tool_result
+        # entries preserved verbatim. Their ``tool_calls`` / ``tool_call_id``
+        # / ``name`` fields must persist alongside ``content`` or the next
+        # chat call hits a provider 400 on a malformed sequence.
+        for kept_msg in result.kept_messages:
+            extras = {
+                k: kept_msg[k]
+                for k in ("tool_calls", "tool_call_id", "name")
+                if k in kept_msg
+            }
+            session.add_message(
+                kept_msg.get("role", "user"),
+                kept_msg.get("content", ""),
+                **extras,
+            )
+        self.sessions.mark_full_synced(session)
+        session.metadata["last_compaction_summary"] = result.summary
+        session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
+        self.sessions.save(session)
+        # Compaction is a snapshot boundary: drop the frozen memory block
+        # so post-compaction turns re-inject freshly-written memory.
+        self.context.invalidate_memory_snapshot(session_key)
+        return [{"role": "system", "content": summary_msg}] + result.kept_messages
+
     async def compact_session(
         self,
         session_key: str,
@@ -6578,7 +6754,7 @@ class AgentLoop:
             Dict with compaction results.
         """
         session = self.sessions.get_or_create(session_key)
-        history = session.get_history(max_messages=self.context_messages)
+        history = self._history_with_summary_anchor(session)
 
         if not history:
             return {
@@ -6590,11 +6766,9 @@ class AgentLoop:
 
         tokens_before = estimate_messages_tokens(history)
 
-        # Check if already compacted (first message is a compaction summary)
+        # Check if already compacted (history is just a compaction summary)
         is_already_compacted = (
-            len(history) == 1
-            and history[0].get("role") == "system"
-            and "[Compacted conversation summary]" in history[0].get("content", "")
+            len(history) == 1 and is_summary_message(history[0])
         )
 
         if is_already_compacted:
@@ -6626,78 +6800,50 @@ class AgentLoop:
             }
 
         # Notify clients that compaction is starting
-        if self._on_compaction:
-            try:
-                await self._on_compaction(
-                    session_key, tokens_before, 0, 0, "started",
-                )
-            except Exception:
-                pass
-
-        # Run compaction
-        result = await self.compaction.compact(
-            history,
-            custom_instructions=custom_instructions,
+        await self._emit_compaction_event(
+            session_key, "started", tokens_before, 0, 0,
         )
 
-        # Clear session and add summary + kept recent messages.
-        # Same tool-field preservation as the auto-compaction path:
-        # kept_messages from the protect_last_n window may include
-        # tool-call assistants + tool results that must keep their
-        # protocol fields (``tool_calls`` / ``tool_call_id`` / ``name``)
-        # or the next chat call rejects the malformed sequence.
-        # Preserve the FULL pre-compaction history in the append-only display
-        # transcript before we trim the context jsonl, so the chat UI keeps every
-        # early message (compaction only shrinks the LLM working context).
-        self.sessions.flush_full(session)
-        session.clear()
-        compacted_msg = f"[Compacted conversation summary]\n\n{result.summary}"
-        # Same plan re-injection as the auto-compaction path: an approved plan
-        # mid-execution must survive /compact in the model's context too.
+        # Run compaction. A failure must leave the session exactly as it was:
+        # the manual path is the one users reach for when context is already
+        # tight, so silently replacing their history with an error string is
+        # the worst possible outcome.
         try:
-            from flowly.plans.manager import get_plan_manager as _get_pm
-
-            _plan_note = _get_pm().compaction_note(session_key)
-            if _plan_note:
-                compacted_msg += f"\n\n{_plan_note}"
-        except Exception:
-            logger.debug("[plan] compaction note skipped (non-fatal)")
-        session.add_message("system", compacted_msg)
-        for kept_msg in result.kept_messages:
-            extras = {
-                k: kept_msg[k]
-                for k in ("tool_calls", "tool_call_id", "name")
-                if k in kept_msg
-            }
-            session.add_message(
-                kept_msg.get("role", "user"),
-                kept_msg.get("content", ""),
-                **extras,
+            result = await self.compaction.compact(
+                history,
+                custom_instructions=custom_instructions,
+                session_key=session_key,
             )
-        # The summary + kept turns are already in (or excluded from) the display
-        # log; declare them synced so save() doesn't mirror the summary.
-        self.sessions.mark_full_synced(session)
-        session.metadata["last_compaction_summary"] = result.summary
-        session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
-        self.sessions.save(session)
+        except Exception as e:
+            logger.error(f"Manual compaction failed: {e}")
+            self.compaction.record_compaction_failure(session_key)
+            await self._emit_compaction_event(
+                session_key, "failed", tokens_before, tokens_before, 0,
+            )
+            return {
+                "success": False,
+                "message": f"Compaction failed: {e}. Your history is unchanged.",
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_before,
+            }
+
+        self.compaction.record_compaction_success(session_key)
+        self._commit_compaction(session, result, session_key)
 
         # Notify connected clients — compaction completed
-        if self._on_compaction:
-            try:
-                await self._on_compaction(
-                    session_key,
-                    result.tokens_before,
-                    result.tokens_after,
-                    result.messages_removed,
-                    "completed",
-                )
-            except Exception:
-                pass
+        await self._emit_compaction_event(
+            session_key,
+            "completed",
+            result.tokens_before,
+            result.tokens_after,
+            result.messages_removed,
+        )
 
         return {
             "success": True,
             "message": f"Compacted {result.messages_removed} messages",
             "tokens_before": result.tokens_before,
             "tokens_after": result.tokens_after,
+            "messages_removed": result.messages_removed,
             "summary_preview": result.summary[:200] + "..." if len(result.summary) > 200 else result.summary,
         }

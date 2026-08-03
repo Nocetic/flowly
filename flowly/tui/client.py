@@ -117,11 +117,16 @@ class SubagentCompleted:
 
 @dataclass
 class CompactionEvent:
-    """Gateway broadcasts this when context auto-compacts mid-conversation."""
-    before_messages: int
-    after_messages: int
+    """Gateway broadcasts this when context compacts mid-conversation.
+
+    ``phase`` is ``started``, ``completed`` or ``failed``; the token counts
+    are only meaningful once the phase is terminal.
+    """
+    phase: str
+    messages_removed: int
     before_tokens: int
     after_tokens: int
+    session_key: str
     raw: dict[str, Any]
 
 
@@ -872,18 +877,26 @@ class GatewayClient:
             return
 
         if ev_name == "compaction":
-            def _g(k1: str, k2: str) -> int:
-                v = payload.get(k1) or payload.get(k2) or 0
-                try:
-                    return int(v)
-                except (TypeError, ValueError):
-                    return 0
+            # Field names must match what the gateway actually sends
+            # (``tokensBefore`` / ``tokensAfter`` / ``messagesRemoved``).
+            # Reading a different spelling silently yields zeroes, which is
+            # how this reported "0→0 msgs" for every compaction.
+            def _g(*keys: str) -> int:
+                for key in keys:
+                    v = payload.get(key)
+                    if v is not None:
+                        try:
+                            return int(v)
+                        except (TypeError, ValueError):
+                            return 0
+                return 0
             await self._inbox.put(
                 CompactionEvent(
-                    before_messages=_g("beforeMessages", "before_messages"),
-                    after_messages=_g("afterMessages", "after_messages"),
-                    before_tokens=_g("beforeTokens", "before_tokens"),
-                    after_tokens=_g("afterTokens", "after_tokens"),
+                    phase=str(payload.get("phase") or "completed"),
+                    messages_removed=_g("messagesRemoved", "messages_removed"),
+                    before_tokens=_g("tokensBefore", "tokens_before"),
+                    after_tokens=_g("tokensAfter", "tokens_after"),
+                    session_key=str(payload.get("sessionKey") or ""),
                     raw=payload,
                 )
             )

@@ -3430,8 +3430,23 @@ class GatewayServer:
             await self._ws_send(ws, event)
 
     async def _broadcast_compaction_event(self, data: dict) -> None:
-        """Push compaction event to all connected WS clients."""
+        """Push a compaction event to clients watching that session.
+
+        Compaction is a property of one conversation, so a blanket broadcast
+        put another chat's (or a cron run's) compaction notice into every open
+        transcript. Clients still filter defensively, but the server should not
+        be sending them the event in the first place.
+        """
         event = {"type": "event", "event": "compaction", "data": data}
+        session_key = str(data.get("sessionKey") or "")
+        target = self._session_ws.get(session_key) if session_key else None
+        if target is not None and not target.closed:
+            await self._ws_send(target, event)
+            return
+        # No live socket bound to this session (a client that connected but
+        # hasn't sent yet, or a rebind in flight). Fall back to everyone —
+        # a redundant notice beats a missing one, and clients filter on
+        # sessionKey anyway.
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 

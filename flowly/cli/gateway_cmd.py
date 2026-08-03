@@ -435,20 +435,8 @@ def gateway(
     cron = CronService(cron_store_path)
 
     # Build compaction config from settings
-    from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
-    compaction_cfg = config.agents.defaults.compaction
-    compaction_config = CompactionConfig(
-        mode=compaction_cfg.mode,
-        reserve_tokens_floor=compaction_cfg.reserve_tokens_floor,
-        max_history_share=compaction_cfg.max_history_share,
-        context_window=compaction_cfg.context_window,
-        memory_flush=MemoryFlushConfig(
-            enabled=compaction_cfg.memory_flush.enabled,
-            soft_threshold_tokens=compaction_cfg.memory_flush.soft_threshold_tokens,
-            prompt=compaction_cfg.memory_flush.prompt,
-            system_prompt=compaction_cfg.memory_flush.system_prompt,
-        ),
-    )
+    from flowly.compaction.builder import build_compaction_config
+    compaction_config = build_compaction_config(config.agents.defaults.compaction)
 
     # Build exec config
     from flowly.exec.types import ExecConfig
@@ -1280,11 +1268,21 @@ Respond to the user now:"""
         agent.provider = new_provider
         agent.model = new_model
         # Keep the compaction service in lockstep: it holds its own
-        # provider/model refs (summarization + the flowly-proxy window
-        # clamp both read them) — a hot-swap must not leave them stale.
+        # provider/model refs (summarization, the flowly-proxy window clamp
+        # and the model's real context window all read them) — a hot-swap
+        # must not leave them stale. The token estimator is global and
+        # model-family aware, so it has to move too, or a Claude→GPT switch
+        # keeps counting with the wrong per-message overheads.
         try:
             agent.compaction.provider = new_provider
             agent.compaction.model = new_model
+            from flowly.compaction.estimator import set_active_model
+
+            set_active_model(new_model)
+            logger.info(
+                f"[provider] compaction window now "
+                f"{agent.compaction.effective_context_window} tokens for {new_model}"
+            )
         except Exception:  # noqa: BLE001
             pass
         # This reload is how the TUI/CLI applies an xAI Grok login — so
@@ -1317,6 +1315,9 @@ Respond to the user now:"""
 
     try:
         from flowly.channels import feature_rpc as _feature_rpc
+        # chat.compact over the shared surface: relay clients (iOS, Desktop)
+        # and the direct gateway now compact through one implementation.
+        _feature_rpc.set_compact_callback(on_compact)
         _feature_rpc.set_provider_reload_callback(on_provider_reload)
         # Codex policy (codex.policy.set) applied live — drop warm sessions +
         # re-register the tool so the next turn spawns with the new config.
