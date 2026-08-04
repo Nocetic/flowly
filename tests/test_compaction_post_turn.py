@@ -1,0 +1,278 @@
+"""Post-turn compaction and mid-summarisation message safety.
+
+Two behaviours live here:
+
+  * The pre-turn check only runs when a message ARRIVES. A session whose
+    final tool-heavy turn pushed it over budget used to sit there full until
+    the user's next message — and then made THAT message pay the whole
+    summarisation wait. ``_post_turn_compaction`` runs the same check in the
+    background once the reply is out.
+  * Summarisation takes real wall-clock time. Anything appended to the
+    session in that window (the user's next message, a concurrent device's
+    turn) is not in the summary, and the commit used to ``clear()`` it away.
+    ``_commit_compaction`` now carries that appended tail across the rewrite.
+"""
+
+import asyncio
+
+from flowly.agent.loop import AgentLoop
+from flowly.bus.events import InboundMessage
+from flowly.compaction.service import CompactionService
+from flowly.compaction.types import (
+    CompactionConfig,
+    CompactionResult,
+    MemoryFlushConfig,
+    is_summary_message,
+)
+from flowly.providers.base import LLMResponse
+from flowly.session.manager import Session
+
+
+class _Provider:
+    """Returns a valid summary; counts calls so tests can assert 'no LLM spend'."""
+
+    provider_name = "stub"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, *args, **kwargs) -> LLMResponse:
+        self.calls += 1
+        return LLMResponse(
+            content="The conversation covered a long debugging session.",
+            finish_reason="stop",
+        )
+
+
+class _Sessions:
+    """The SessionManager surface the compaction paths touch."""
+
+    def __init__(self, session: Session):
+        self.session = session
+        self.saves = 0
+
+    def get_or_create(self, key: str) -> Session:
+        return self.session
+
+    def flush_full(self, session: Session) -> None:
+        pass
+
+    def mark_full_synced(self, session: Session) -> None:
+        pass
+
+    def save(self, session: Session) -> None:
+        self.saves += 1
+
+
+class _Context:
+    def build_system_prompt(self, **kwargs) -> str:
+        return "system prompt"
+
+    def invalidate_memory_snapshot(self, key: str) -> None:
+        pass
+
+
+class _Harness:
+    """Real AgentLoop compaction methods over stub collaborators."""
+
+    context_messages = 100
+    _memory_manager = None
+    model = "m"
+
+    _commit_compaction = AgentLoop._commit_compaction
+    _history_with_summary_anchor = AgentLoop._history_with_summary_anchor
+    _compaction_generation = staticmethod(AgentLoop._compaction_generation)
+    _post_turn_compaction = AgentLoop._post_turn_compaction
+    _schedule_post_turn_compaction = AgentLoop._schedule_post_turn_compaction
+
+    def __init__(self, session: Session, context_window: int = 2_000):
+        self.sessions = _Sessions(session)
+        self.context = _Context()
+        self.provider = _Provider()
+        self.compaction = CompactionService(
+            provider=self.provider,
+            model="m",
+            config=CompactionConfig(
+                mode="default",
+                context_window=context_window,
+                context_window_explicit=True,
+                reserve_tokens_floor=100,
+                memory_flush=MemoryFlushConfig(enabled=False),
+            ),
+        )
+        self.events: list[str] = []
+        self.markers = 0
+        self._post_turn_compaction_tasks: dict[str, asyncio.Task] = {}
+
+    def _tool_schema_tokens(self) -> int:
+        return 0
+
+    async def _emit_compaction_event(self, session_key, phase, *a) -> None:
+        self.events.append(phase)
+
+    async def _publish_compaction_marker(self, channel, chat_id) -> None:
+        self.markers += 1
+
+    async def _run_memory_flush(self, session, channel, chat_id) -> None:
+        raise AssertionError("memory flush is disabled in this harness")
+
+
+def _big_session(turns: int = 40) -> Session:
+    session = Session(key="web:conv-1")
+    filler = "the deploy log shows a retry storm on shard nine "
+    for i in range(turns):
+        session.add_message("user", f"q{i} {filler * 6}")
+        session.add_message("assistant", f"a{i} {filler * 6}")
+    return session
+
+
+def _msg() -> InboundMessage:
+    return InboundMessage(channel="web", sender_id="u", chat_id="conv-1", content="hi")
+
+
+# ── The post-turn pass ────────────────────────────────────────────────────
+
+
+async def test_post_turn_pass_compacts_an_over_budget_session():
+    session = _big_session()
+    harness = _Harness(session)
+
+    await harness._post_turn_compaction(_msg())
+
+    assert is_summary_message(session.messages[0]), (
+        "the session was left full; the user's next message would pay the wait"
+    )
+    assert harness._compaction_generation(session) == 1
+    assert harness.events[0] == "started"
+    assert harness.events[-1] == "completed"
+    assert harness.markers == 1
+
+
+async def test_post_turn_pass_is_a_noop_under_budget():
+    session = Session(key="web:conv-1")
+    session.add_message("user", "hello")
+    session.add_message("assistant", "hi there")
+    harness = _Harness(session, context_window=100_000)
+    before = [dict(m) for m in session.messages]
+
+    await harness._post_turn_compaction(_msg())
+
+    assert session.messages == before
+    assert harness.events == [], "an idle check must not flash UI notices"
+    assert harness.provider.calls == 0
+
+
+async def test_post_turn_pass_defers_to_a_concurrent_compaction():
+    """While we wait on the session lock, someone else compacts. The re-check
+    inside the lock must notice and spend nothing."""
+    session = _big_session()
+    harness = _Harness(session)
+
+    async with harness.compaction.session_lock(session.key):
+        task = asyncio.create_task(harness._post_turn_compaction(_msg()))
+        await asyncio.sleep(0.05)  # let it emit "started" and block on the lock
+        # A manual /compact wins the race: session shrinks, generation bumps.
+        session.clear()
+        session.add_message(
+            "system", "[Previous conversation summary]\n\nAll prior work.",
+        )
+        session.metadata["compaction_count"] = 1
+        session.metadata["last_compaction_summary"] = "All prior work."
+    await task
+
+    assert harness.provider.calls == 0, (
+        "summarised history that a concurrent compaction had already replaced"
+    )
+    assert harness.events[-1] == "completed", "the started notice must be closed"
+    assert harness._compaction_generation(session) == 1, "no second commit"
+
+
+async def test_post_turn_failure_leaves_the_session_untouched():
+    class _Exploding(_Provider):
+        async def chat(self, *args, **kwargs) -> LLMResponse:
+            self.calls += 1
+            raise RuntimeError("provider down")
+
+    session = _big_session()
+    harness = _Harness(session)
+    harness.provider = _Exploding()
+    harness.compaction.provider = harness.provider
+    if hasattr(harness.compaction, "summarizer"):
+        harness.compaction.summarizer.provider = harness.provider
+    before = [dict(m) for m in session.messages]
+
+    await harness._post_turn_compaction(_msg())
+
+    assert session.messages == before
+    assert harness.events[-1] == "failed"
+
+
+async def test_scheduler_runs_at_most_one_pass_per_session():
+    session = _big_session(turns=2)
+    harness = _Harness(session, context_window=100_000)
+    started = []
+    release = asyncio.Event()
+
+    async def _slow_pass(msg):
+        started.append(msg.session_key)
+        await release.wait()
+
+    harness._post_turn_compaction = _slow_pass  # bypass the bound real method
+
+    msg = _msg()
+    harness._schedule_post_turn_compaction(msg)
+    harness._schedule_post_turn_compaction(msg)
+    await asyncio.sleep(0.02)
+    release.set()
+    await asyncio.gather(*harness._post_turn_compaction_tasks.values())
+
+    assert started == ["web:conv-1"], (
+        "a second turn ending must not stack another pass behind the first"
+    )
+
+
+# ── Mid-summarisation appends survive the commit ──────────────────────────
+
+
+def _result() -> CompactionResult:
+    return CompactionResult(
+        summary="Earlier: a long debugging session.",
+        tokens_before=5_000,
+        tokens_after=100,
+        messages_removed=80,
+        kept_messages=[{"role": "user", "content": "kept question"}],
+    )
+
+
+def test_commit_preserves_messages_appended_during_summarisation():
+    session = _big_session(turns=3)
+    harness = _Harness(session)
+    snapshot_len = len(session.messages)
+    # These land while the summariser is running — they are NOT in the summary.
+    session.add_message("user", "one more thing — check the cron job")
+    session.add_message("assistant", "On it.")
+
+    history = harness._commit_compaction(
+        session, _result(), session.key, source_message_count=snapshot_len,
+    )
+
+    contents = [m.get("content") for m in session.messages]
+    assert "one more thing — check the cron job" in contents
+    assert "On it." in contents
+    assert contents.index("kept question") < contents.index("On it."), (
+        "late arrivals must follow the kept tail, in order"
+    )
+    # The returned working history sees them too, in bare LLM shape.
+    assert history[-1] == {"role": "assistant", "content": "On it."}
+    assert is_summary_message(session.messages[0])
+
+
+def test_commit_without_a_snapshot_behaves_exactly_as_before():
+    session = _big_session(turns=3)
+    harness = _Harness(session)
+
+    history = harness._commit_compaction(session, _result(), session.key)
+
+    roles = [m["role"] for m in session.messages]
+    assert roles == ["system", "user"], "summary + kept tail only"
+    assert history[-1] == {"role": "user", "content": "kept question"}

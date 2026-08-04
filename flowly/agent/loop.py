@@ -742,6 +742,12 @@ class AgentLoop:
         # finish — exactly the "no title on the server" failure mode.
         self._title_tasks: set[asyncio.Task] = set()
 
+        # One in-flight post-turn compaction per session (strong refs, same
+        # GC rationale as _title_tasks). Keyed by session_key so a turn that
+        # ends while the previous turn's background pass is still summarising
+        # doesn't stack a second one behind it on the session lock.
+        self._post_turn_compaction_tasks: dict[str, asyncio.Task] = {}
+
         # One controller owns per-run cancellation for every transport.
         # Streams poll its marker; active tool awaitables are registered with
         # it so Stop can cancel the current tool without cancelling the parent
@@ -5091,6 +5097,14 @@ class AgentLoop:
         finally:
             self.subagents.mark_idle(msg.session_key)
             self.tools.set_active_session("")
+            # After the reply is on its way: if THIS turn's tool traffic
+            # pushed the session over budget, summarise now in the background
+            # instead of making the user's next message pay the wait.
+            if completed:
+                try:
+                    self._schedule_post_turn_compaction(msg)
+                except Exception as e:  # noqa: BLE001 — never fail the turn
+                    logger.debug(f"Post-turn compaction scheduling skipped: {e}")
             # Clear codex-tool turn state so a concurrent session's
             # codex_session call can't read this turn's stream callback.
             self._codex_active_session_key = ""
@@ -5569,8 +5583,12 @@ class AgentLoop:
             )
         session.metadata["persona"] = current_persona
 
-        # Get history and check for compaction
+        # Get history and check for compaction. The session-length snapshot
+        # travels with the history snapshot: if this turn ends up committing a
+        # compaction, anything appended past this point by a concurrent turn
+        # is preserved across the rewrite (see _commit_compaction).
         history = self._history_with_summary_anchor(session)
+        session_snapshot_len = len(session.messages)
 
         # Estimate total context: history + system prompt overhead.
         # Build actual system prompt to get accurate token count (avoids fixed 6K estimate drift).
@@ -5604,6 +5622,7 @@ class AgentLoop:
             self.compaction.mark_memory_flush_done(msg.session_key)
             # Reload history after flush
             history = self._history_with_summary_anchor(session)
+            session_snapshot_len = len(session.messages)
             history_tokens = estimate_messages_tokens(history)
             total_tokens = history_tokens + fixed_overhead
 
@@ -5635,47 +5654,83 @@ class AgentLoop:
             # this lock is an asyncio.Lock and is NOT reentrant, so a turn
             # that both handled /compact and fell through to here would wait
             # on itself forever.
+            _pre_lock_generation = self._compaction_generation(session)
             async with self.compaction.session_lock(msg.session_key):
                 _generation = self._compaction_generation(session)
-                # Stop must reach compaction too. Staged summarisation is
-                # several provider round trips, so without this the user
-                # watches a turn they already cancelled run to completion.
-                _run_id = str(msg.metadata.get("run_id") or "")
-
-                def _cancelled() -> bool:
-                    return bool(_run_id) and self.is_run_aborted(_run_id)
-
-                try:
-                    result = await self.compaction.compact(
-                        history,
-                        session_key=msg.session_key,
-                        should_cancel=_cancelled,
-                        history_budget=self.compaction.history_budget(fixed_overhead),
-                    )
-                except Exception as e:
-                    logger.error(f"Compaction failed: {e}")
-                    self.compaction.record_compaction_failure(msg.session_key)
-                    # Fall through with uncompacted history — better than crashing
-                    result = None
-
-                if result is not None and self._compaction_generation(session) != _generation:
-                    # A manual compaction landed while we summarised; its
-                    # result is already committed and ours describes history
-                    # that no longer exists.
-                    logger.info(
-                        "Discarding auto-compaction — session was compacted concurrently"
-                    )
+                if _generation != _pre_lock_generation:
+                    # Whoever held the lock before us (manual /compact, the
+                    # post-turn background pass) already compacted this
+                    # session. Our snapshot describes history that no longer
+                    # exists — summarising it again would burn an LLM call to
+                    # produce a stale result the generation guard below would
+                    # discard anyway.
                     result = None
                     history = self._history_with_summary_anchor(session)
+                    session_snapshot_len = len(session.messages)
                     _concurrent = True
                 else:
-                    _concurrent = False
+                    # Stop must reach compaction too. Staged summarisation is
+                    # several provider round trips, so without this the user
+                    # watches a turn they already cancelled run to completion.
+                    _run_id = str(msg.metadata.get("run_id") or "")
+
+                    def _cancelled() -> bool:
+                        return bool(_run_id) and self.is_run_aborted(_run_id)
+
+                    try:
+                        result = await self.compaction.compact(
+                            history,
+                            session_key=msg.session_key,
+                            should_cancel=_cancelled,
+                            history_budget=self.compaction.history_budget(fixed_overhead),
+                        )
+                    except Exception as e:
+                        logger.error(f"Compaction failed: {e}")
+                        self.compaction.record_compaction_failure(msg.session_key)
+                        # Fall through with uncompacted history — better than crashing
+                        result = None
+
+                    if result is not None and self._compaction_generation(session) != _generation:
+                        # A manual compaction landed while we summarised; its
+                        # result is already committed and ours describes history
+                        # that no longer exists.
+                        logger.info(
+                            "Discarding auto-compaction — session was compacted concurrently"
+                        )
+                        result = None
+                        history = self._history_with_summary_anchor(session)
+                        session_snapshot_len = len(session.messages)
+                        _concurrent = True
+                    else:
+                        _concurrent = False
+
+                if result is not None:
+                    # Commit INSIDE the lock: releasing it first would let a
+                    # queued waiter (manual /compact, the post-turn pass)
+                    # re-read the still-uncompacted session and start a
+                    # redundant summarisation before our commit lands.
+                    self.compaction.record_compaction_success(msg.session_key)
+                    logger.info(
+                        f"Compaction complete: {result.tokens_before} -> {result.tokens_after} tokens, "
+                        f"removed {result.messages_removed} messages, "
+                        f"kept {len(result.kept_messages)} recent"
+                    )
+                    history = self._commit_compaction(
+                        session, result, msg.session_key,
+                        source_message_count=session_snapshot_len,
+                    )
 
             if result is None and _concurrent:
                 # Not a failure: someone else's compaction already shrank this
                 # session, and `history` was re-read from it above. Nothing to
-                # trim and nothing to announce.
-                pass
+                # trim — but we DID emit "started" before taking the lock, so
+                # close the lifecycle in case the other path's "completed"
+                # fired before our "started" (event ordering across tasks is
+                # not guaranteed). A duplicate "completed" is harmless.
+                _tokens_now = estimate_messages_tokens(history)
+                await self._emit_compaction_event(
+                    msg.session_key, "completed", _tokens_now, _tokens_now, 0,
+                )
             elif result is None:
                 # Compaction failed. The SESSION IS LEFT UNTOUCHED — only this
                 # turn's working copy is trimmed, so nothing is lost on disk
@@ -5689,13 +5744,8 @@ class AgentLoop:
                     msg.session_key, "failed", total_tokens, total_tokens, 0,
                 )
             else:
-                self.compaction.record_compaction_success(msg.session_key)
-                logger.info(
-                    f"Compaction complete: {result.tokens_before} -> {result.tokens_after} tokens, "
-                    f"removed {result.messages_removed} messages, "
-                    f"kept {len(result.kept_messages)} recent"
-                )
-                history = self._commit_compaction(session, result, msg.session_key)
+                # Already committed inside the lock — announce outside it so
+                # slow channel I/O never extends the critical section.
                 await self._publish_compaction_marker(msg.channel, msg.chat_id)
                 await self._emit_compaction_event(
                     msg.session_key,
@@ -6819,6 +6869,7 @@ class AgentLoop:
         session: Any,
         result: Any,
         session_key: str,
+        source_message_count: int | None = None,
     ) -> list[dict[str, Any]]:
         """Persist a successful compaction and return the new working history.
 
@@ -6826,7 +6877,18 @@ class AgentLoop:
         on-disk state. Called ONLY after the summary has been validated —
         it clears the session's working context, which is unrecoverable
         except from the append-only display transcript flushed just before.
+
+        ``source_message_count`` is ``len(session.messages)`` at the moment
+        the caller snapshotted the history it summarised. Summarisation takes
+        real wall-clock time (background post-turn compaction especially), and
+        anything appended to the session in that window — the user's next
+        message, a concurrent device's turn, a subagent announce — is NOT in
+        the summary. Clearing the session would silently destroy it. We carry
+        that appended tail across the rewrite instead.
         """
+        appended_tail: list[dict[str, Any]] = []
+        if source_message_count is not None and 0 <= source_message_count < len(session.messages):
+            appended_tail = [dict(m) for m in session.messages[source_message_count:]]
         # Preserve the full pre-compaction history in the append-only display
         # transcript before trimming the LLM context jsonl.
         self.sessions.flush_full(session)
@@ -6862,6 +6924,10 @@ class AgentLoop:
                 kept_msg.get("content", ""),
                 **extras,
             )
+        # Re-append messages that landed while we were summarising — raw
+        # dicts, so their timestamps and internal flags survive verbatim.
+        for late_msg in appended_tail:
+            session.messages.append(late_msg)
         self.sessions.mark_full_synced(session)
         session.metadata["last_compaction_summary"] = result.summary
         session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
@@ -6869,7 +6935,21 @@ class AgentLoop:
         # Compaction is a snapshot boundary: drop the frozen memory block
         # so post-compaction turns re-inject freshly-written memory.
         self.context.invalidate_memory_snapshot(session_key)
-        return [{"role": "system", "content": summary_msg}] + result.kept_messages
+        # The working history mirrors what was just persisted: summary, kept
+        # tail, and any late arrivals — projected to bare LLM-protocol shape.
+        tail_projection = [
+            {
+                k: m[k]
+                for k in ("role", "content", "tool_calls", "tool_call_id", "name")
+                if k in m
+            }
+            for m in appended_tail
+        ]
+        return (
+            [{"role": "system", "content": summary_msg}]
+            + result.kept_messages
+            + tail_projection
+        )
 
     async def compact_session(
         self,
@@ -6915,6 +6995,7 @@ class AgentLoop:
             # Re-read inside the lock: whoever held it before us may have
             # already compacted, in which case our snapshot is stale.
             history = self._history_with_summary_anchor(session)
+            source_len = len(session.messages)
             # Re-apply the eligibility checks to what we ACTUALLY hold. Running
             # them only on the pre-lock snapshot meant a second device could
             # pass them, wait for the first compaction, then spend an LLM call
@@ -6974,7 +7055,9 @@ class AgentLoop:
                 }
 
             self.compaction.record_compaction_success(session_key)
-            self._commit_compaction(session, result, session_key)
+            self._commit_compaction(
+                session, result, session_key, source_message_count=source_len,
+            )
 
         # Notify connected clients — compaction completed
         await self._emit_compaction_event(
@@ -6993,3 +7076,153 @@ class AgentLoop:
             "messages_removed": result.messages_removed,
             "summary_preview": result.summary[:200] + "..." if len(result.summary) > 200 else result.summary,
         }
+
+    def _schedule_post_turn_compaction(self, msg: InboundMessage) -> None:
+        """Kick off a background compaction check once the turn's reply is out.
+
+        The pre-turn check only runs when a message ARRIVES — a session whose
+        final tool-heavy turn pushed it over budget would otherwise sit there
+        full until the user's next message, and then make THAT message pay the
+        whole summarisation wait. Running the check after delivery means the
+        user comes back to a session that is already clean.
+
+        Fire-and-forget by design: never delays the reply, never raises into
+        the turn, at most one in flight per session.
+        """
+        key = msg.session_key
+        existing = self._post_turn_compaction_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._post_turn_compaction(msg))
+        self._post_turn_compaction_tasks[key] = task
+
+        def _reap(t: asyncio.Task, key: str = key) -> None:
+            if self._post_turn_compaction_tasks.get(key) is t:
+                self._post_turn_compaction_tasks.pop(key, None)
+            if not t.cancelled():
+                t.exception()  # retrieve, or asyncio logs "never retrieved"
+
+        task.add_done_callback(_reap)
+
+    async def _post_turn_compaction(self, msg: InboundMessage) -> None:
+        """Background twin of the pre-turn compaction block.
+
+        Same signal, same lock, same commit path — the only differences are
+        WHEN it runs (after the reply, off the user's critical path) and that
+        there is no run to cancel it from. Every failure mode ends in "leave
+        the session untouched": the pre-turn check still guards the next turn.
+        """
+        session_key = msg.session_key
+        try:
+            session = self.sessions.get_or_create(session_key)
+            history = self._history_with_summary_anchor(session)
+            history_tokens = estimate_messages_tokens(history)
+            # Overhead the NEXT turn will carry. Its inbound message size is
+            # unknowable here, so this is system prompt + tool schemas only —
+            # slightly optimistic, and the pre-turn check (which sees the real
+            # message) remains the backstop.
+            try:
+                sys_prompt = self.context.build_system_prompt(
+                    memory_search_enabled=self._memory_manager is not None,
+                    model=self.model,
+                    channel=msg.channel,
+                )
+                overhead = estimate_tokens(sys_prompt) + self._tool_schema_tokens()
+            except Exception:
+                overhead = 6000 + self._tool_schema_tokens()
+
+            # Memory flush first, exactly like the pre-turn order: extract
+            # durable memories from the history WHILE it is still verbatim.
+            if self.compaction.should_memory_flush(
+                history_tokens, session_key, overhead_tokens=overhead,
+            ):
+                logger.info("Running post-turn memory flush")
+                await self._run_memory_flush(session, msg.channel, msg.chat_id)
+                self.compaction.mark_memory_flush_done(session_key)
+                history = self._history_with_summary_anchor(session)
+                history_tokens = estimate_messages_tokens(history)
+
+            if not self.compaction.should_compact(
+                history_tokens, session_key, overhead_tokens=overhead,
+            ):
+                return
+
+            logger.info(
+                f"Post-turn compaction: {history_tokens} history tokens over "
+                "budget — summarising in the background"
+            )
+            await self._emit_compaction_event(
+                session_key, "started", history_tokens + overhead, 0, 0,
+            )
+            async with self.compaction.session_lock(session_key):
+                generation = self._compaction_generation(session)
+                # Re-read inside the lock — a manual /compact or a turn's own
+                # pre-turn pass may have already done the work while we waited.
+                history = self._history_with_summary_anchor(session)
+                source_len = len(session.messages)
+                history_tokens = estimate_messages_tokens(history)
+                if not self.compaction.should_compact(
+                    history_tokens, session_key, overhead_tokens=overhead,
+                ):
+                    await self._emit_compaction_event(
+                        session_key, "completed", history_tokens, history_tokens, 0,
+                    )
+                    return
+
+                try:
+                    result = await self.compaction.compact(
+                        history,
+                        session_key=session_key,
+                        history_budget=self.compaction.history_budget(overhead),
+                    )
+                except Exception as e:
+                    logger.error(f"Post-turn compaction failed: {e}")
+                    self.compaction.record_compaction_failure(session_key)
+                    await self._emit_compaction_event(
+                        session_key, "failed", history_tokens, history_tokens, 0,
+                    )
+                    return
+
+                if self._compaction_generation(session) != generation:
+                    logger.info(
+                        "Discarding post-turn compaction — session was "
+                        "compacted concurrently"
+                    )
+                    tokens_now = estimate_messages_tokens(
+                        self._history_with_summary_anchor(session)
+                    )
+                    await self._emit_compaction_event(
+                        session_key, "completed", tokens_now, tokens_now, 0,
+                    )
+                    return
+
+                self.compaction.record_compaction_success(session_key)
+                logger.info(
+                    f"Post-turn compaction complete: {result.tokens_before} -> "
+                    f"{result.tokens_after} tokens, removed "
+                    f"{result.messages_removed} messages, "
+                    f"kept {len(result.kept_messages)} recent"
+                )
+                self._commit_compaction(
+                    session, result, session_key,
+                    source_message_count=source_len,
+                )
+
+            await self._publish_compaction_marker(msg.channel, msg.chat_id)
+            await self._emit_compaction_event(
+                session_key,
+                "completed",
+                result.tokens_before,
+                result.tokens_after,
+                result.messages_removed,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Belt-and-braces: nothing in a background pass may take the
+            # agent down or leave the UI stuck on "started".
+            logger.error(f"Post-turn compaction pass failed: {e}")
+            try:
+                await self._emit_compaction_event(session_key, "failed", 0, 0, 0)
+            except Exception:
+                pass
