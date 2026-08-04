@@ -212,9 +212,31 @@ class CompactionService:
         """Token count at which this session starts compacting."""
         return max(1, self.effective_context_window - self.config.reserve_tokens_floor)
 
-    def should_compact(self, total_tokens: int, session_key: str = "") -> bool:
+    def history_budget(self, overhead_tokens: int = 0) -> int:
+        """Tokens the conversation itself may occupy.
+
+        The window has to hold three things: the fixed overhead of every
+        request (system prompt, tool schemas, the incoming message), the reply
+        we reserve room for, and the history. Only the last of those is
+        something compaction can shrink.
+        """
+        return self.compaction_threshold - max(0, overhead_tokens)
+
+    def should_compact(
+        self,
+        history_tokens: int,
+        session_key: str = "",
+        overhead_tokens: int = 0,
+    ) -> bool:
         """
         Check if compaction should be triggered.
+
+        Judged on the HISTORY against the room left for it — not on the total
+        request size. Compaction can only summarise the conversation; it
+        cannot shrink the system prompt or the tool schemas. Comparing the
+        total against the window meant a large fixed overhead alone tripped
+        the threshold, and the agent then tried to compact a two-message chat,
+        failed to reduce anything, and reported that as an error every turn.
 
         Backs off after repeated failures (prevents a death spiral where
         compact → fail → compact → fail burns tokens every turn), but the
@@ -223,14 +245,25 @@ class CompactionService:
         its own once the provider does.
 
         Args:
-            total_tokens: Current total tokens in context.
+            history_tokens: Tokens the conversation history occupies.
             session_key: Session these counters belong to.
+            overhead_tokens: Everything else the request carries.
 
         Returns:
             True if compaction is needed.
         """
-        threshold = self.effective_context_window - self.config.reserve_tokens_floor
-        if total_tokens <= threshold:
+        budget = self.history_budget(overhead_tokens)
+        if budget <= 0:
+            # The request cannot fit no matter how much history we remove.
+            # Summarising here burns a call to change nothing; the mid-turn
+            # guard and overflow recovery are what handle this.
+            logger.warning(
+                f"Fixed request overhead ({overhead_tokens} tokens) leaves no room "
+                f"in a {self.effective_context_window}-token window — compaction "
+                "cannot help; raise the context window or trim tools/prompt"
+            )
+            return False
+        if history_tokens <= budget:
             return False
 
         state = self._state(session_key)
@@ -261,13 +294,25 @@ class CompactionService:
         state.consecutive_failures += 1
         state.checks_since_suppression = 0
 
-    def should_memory_flush(self, total_tokens: int, session_key: str = "") -> bool:
+    def should_memory_flush(
+        self,
+        history_tokens: int,
+        session_key: str = "",
+        overhead_tokens: int = 0,
+    ) -> bool:
         """
         Check if memory flush should run before compaction.
 
+        Measured the same way as :meth:`should_compact` — history against the
+        room left for it. The flush exists to save durable memories shortly
+        BEFORE a compaction, so it has to fire on the same signal; judged on
+        the total instead, it ran on every turn of an idle chat whose request
+        overhead happened to be large.
+
         Args:
-            total_tokens: Current total tokens in context.
+            history_tokens: Tokens the conversation history occupies.
             session_key: Session these counters belong to.
+            overhead_tokens: Everything else the request carries.
 
         Returns:
             True if memory flush should run.
@@ -280,14 +325,10 @@ class CompactionService:
         if state.memory_flush_at_count == state.compaction_count:
             return False
 
-        # Calculate soft threshold
-        threshold = (
-            self.effective_context_window
-            - self.config.reserve_tokens_floor
-            - self.config.memory_flush.soft_threshold_tokens
-        )
-
-        return total_tokens > threshold
+        budget = self.history_budget(overhead_tokens)
+        if budget <= 0:
+            return False
+        return history_tokens > budget - self.config.memory_flush.soft_threshold_tokens
 
     def get_memory_flush_prompt(self) -> tuple[str, str]:
         """

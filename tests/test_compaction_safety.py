@@ -384,3 +384,71 @@ def test_session_counters_do_not_grow_without_bound():
     # The newest session keeps its state despite the eviction.
     newest = f"session-{service.MAX_TRACKED_SESSIONS + 249}"
     assert service._state(newest).consecutive_failures == 1
+
+
+# ── 6. The trigger must be about history, not request size ────────────────
+
+
+def test_a_large_system_prompt_alone_does_not_trigger_compaction():
+    """The bug this pins: a real install carries ~70K of system prompt and
+    tool schemas on EVERY request. Judging the trigger on the total meant
+    saying "hello" tripped the threshold, the agent tried to compact a
+    two-message chat, could not reduce anything, and reported that failure
+    to the user every single turn."""
+    service = _service(
+        _Provider(LLMResponse(content="s", finish_reason="stop")),
+        context_window=120_000,
+        reserve_tokens_floor=20_000,
+    )
+
+    # "hello" — 45 tokens of history behind 70K of fixed overhead.
+    assert service.should_compact(45, "s1", overhead_tokens=70_000) is False
+
+
+def test_history_that_fills_the_remaining_room_does_trigger():
+    service = _service(
+        _Provider(LLMResponse(content="s", finish_reason="stop")),
+        context_window=120_000,
+        reserve_tokens_floor=20_000,
+    )
+
+    # Budget = 120k - 20k reserve - 70k overhead = 30k for history.
+    assert service.should_compact(29_000, "s1", overhead_tokens=70_000) is False
+    assert service.should_compact(31_000, "s1", overhead_tokens=70_000) is True
+
+
+def test_overhead_bigger_than_the_window_refuses_instead_of_looping():
+    """Nothing compaction removes can make this request fit. Trying anyway
+    burns a summarisation call per turn to change nothing."""
+    service = _service(
+        _Provider(LLMResponse(content="s", finish_reason="stop")),
+        context_window=66_000,
+        reserve_tokens_floor=3_000,
+    )
+
+    assert service.should_compact(500, "s1", overhead_tokens=70_000) is False
+    assert service.history_budget(70_000) <= 0
+
+
+def test_memory_flush_follows_the_same_signal():
+    """It exists to save memories shortly before a compaction, so firing it
+    on total size made it run every turn of an idle chat."""
+    service = _service(
+        _Provider(LLMResponse(content="s", finish_reason="stop")),
+        context_window=120_000,
+        reserve_tokens_floor=20_000,
+    )
+
+    assert service.should_memory_flush(45, "s1", overhead_tokens=70_000) is False
+    assert service.should_memory_flush(29_000, "s1", overhead_tokens=70_000) is True
+
+
+def test_budget_shrinks_as_overhead_grows():
+    service = _service(
+        _Provider(LLMResponse(content="s", finish_reason="stop")),
+        context_window=100_000,
+        reserve_tokens_floor=10_000,
+    )
+
+    assert service.history_budget(0) == 90_000
+    assert service.history_budget(30_000) == 60_000

@@ -5593,24 +5593,33 @@ class AgentLoop:
         # the request is what has to fit, not the history alone.
         turn_input_tokens = self._estimate_turn_input_tokens(msg)
         fixed_overhead = system_prompt_tokens + turn_input_tokens
-        total_tokens = estimate_messages_tokens(history) + fixed_overhead
+        history_tokens = estimate_messages_tokens(history)
+        total_tokens = history_tokens + fixed_overhead
 
-        if self.compaction.should_memory_flush(total_tokens, msg.session_key):
+        if self.compaction.should_memory_flush(
+            history_tokens, msg.session_key, overhead_tokens=fixed_overhead,
+        ):
             logger.info("Running pre-compaction memory flush")
             await self._run_memory_flush(session, msg.channel, msg.chat_id)
             self.compaction.mark_memory_flush_done(msg.session_key)
             # Reload history after flush
             history = self._history_with_summary_anchor(session)
-            total_tokens = estimate_messages_tokens(history) + fixed_overhead
+            history_tokens = estimate_messages_tokens(history)
+            total_tokens = history_tokens + fixed_overhead
 
         # Microcompaction: truncate old tool results to delay full compaction
         history = self.compaction.microcompact(history)
 
         # Re-estimate after microcompaction
-        total_tokens = estimate_messages_tokens(history) + fixed_overhead
+        history_tokens = estimate_messages_tokens(history)
+        total_tokens = history_tokens + fixed_overhead
 
-        # Check if compaction is needed
-        if self.compaction.should_compact(total_tokens, msg.session_key):
+        # Compaction is judged on the HISTORY against the room left for it.
+        # The overhead is what shrinks that room, but summarising cannot
+        # reduce the overhead itself — only the conversation.
+        if self.compaction.should_compact(
+            history_tokens, msg.session_key, overhead_tokens=fixed_overhead,
+        ):
             logger.info(f"Compacting context: {total_tokens} tokens exceeds threshold")
             # Announce BEFORE the work: staged summarisation can take several
             # LLM calls, and without this the clients show a frozen agent.
