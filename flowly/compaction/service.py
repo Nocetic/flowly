@@ -49,6 +49,27 @@ def _heuristic_context_window(model: str) -> int | None:
     return None
 
 
+def _essential_turn_tail(block: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The irreducible verbatim core of a turn block: the user's question and
+    the final plain-text answer.
+
+    Used when the newest block is too big to preserve whole (a turn whose
+    tool traffic dwarfs its words). Tool members and tool-calling assistant
+    messages are deliberately left out — the summary carries what the tools
+    did, and keeping only messages WITHOUT ``tool_calls`` keeps the sequence
+    protocol-clean (no dangling call awaiting its result).
+    """
+    user = next((m for m in block if m.get("role") == "user"), None)
+    final = None
+    for m in reversed(block):
+        if m.get("role") == "assistant" and not m.get("tool_calls"):
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                final = m
+                break
+    return [m for m in (user, final) if m is not None]
+
+
 @dataclass
 class _SessionState:
     """Compaction bookkeeping for one conversation."""
@@ -513,8 +534,24 @@ class CompactionService:
             if kept_blocks and tokens_acc + block_tokens > cap:
                 break
             if not kept_blocks and block_tokens > cap:
-                # Even the newest block alone busts the cap; summarize
-                # everything rather than emit a half block.
+                # Even the newest block alone busts the share cap. Returning
+                # nothing here produced "kept 0 recent" live: the agent came
+                # back from compaction having verbatim-forgotten the very
+                # message it was answering. The tail must never be empty —
+                # keep the whole block while it fits in half the history
+                # budget; past that, keep the user's question and the final
+                # text answer and let the summary carry the tool traffic.
+                hard_limit = (
+                    max(cap, history_budget // 2) if history_budget > 0 else cap
+                )
+                if block_tokens <= hard_limit:
+                    return list(block)
+                essential = _essential_turn_tail(block)
+                if (
+                    essential
+                    and estimate_messages_tokens(essential) <= hard_limit
+                ):
+                    return essential
                 return []
 
             kept_blocks.append(block)
@@ -582,13 +619,30 @@ class CompactionService:
         kept_messages = self._calculate_keep_recent(messages, history_budget)
         kept_count = len(kept_messages)
 
-        # Only summarize messages NOT in the kept set
-        if kept_count > 0 and kept_count < len(messages):
+        # Only summarize messages NOT in the kept set — valid only when the
+        # kept tail IS the history's suffix. The essential-tail fallback
+        # returns an EXTRACT of the last block (user question + final
+        # answer), and suffix arithmetic on an extract silently loses the
+        # block's other members from both the summary and the tail. An
+        # extracted tail therefore summarizes everything; its verbatim copy
+        # rides on top, at the cost of a little duplication.
+        is_suffix = (
+            0 < kept_count < len(messages)
+            and kept_messages == messages[-kept_count:]
+        )
+        if is_suffix:
             messages_to_summarize = messages[:-kept_count]
             logger.info(
                 f"Keeping {kept_count} recent messages "
                 f"(~{estimate_messages_tokens(kept_messages)} tokens), "
                 f"summarizing {len(messages_to_summarize)}"
+            )
+        elif kept_count > 0 and kept_count < len(messages):
+            messages_to_summarize = messages
+            logger.info(
+                f"Keeping the essential tail ({kept_count} messages, "
+                f"~{estimate_messages_tokens(kept_messages)} tokens) verbatim; "
+                f"summarizing all {len(messages)}"
             )
         else:
             messages_to_summarize = messages

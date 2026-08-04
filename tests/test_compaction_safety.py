@@ -491,3 +491,79 @@ async def test_a_tiny_budget_still_produces_a_reduction():
     result = await service.compact(messages, history_budget=1_500)
 
     assert result.tokens_after < result.tokens_before
+
+
+# ── The preserved tail must never be empty ────────────────────────────────
+
+
+def _tool_heavy_block(user_words: int = 8, tool_chars: int = 40_000) -> list[dict]:
+    """One turn whose tool traffic dwarfs its words — the live 'kept 0
+    recent' shape: the newest block alone busts the share cap."""
+    return [
+        {"role": "user", "content": "check the deploy logs " + "word " * user_words},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "function": {"name": "exec", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "name": "exec",
+         "content": "log line " * (tool_chars // 9)},
+        {"role": "assistant", "content": "The deploy failed on shard nine."},
+    ]
+
+
+def test_a_cap_busting_newest_block_is_kept_when_it_fits_the_budget():
+    """Share cap says no, but half the history budget says yes: the user's
+    last exchange survives whole instead of 'kept 0 recent'."""
+    service = _service(_Provider(LLMResponse(content="s", finish_reason="stop")))
+    block = _tool_heavy_block(tool_chars=12_000)  # ~3K tokens
+    messages = _conversation(10) + block
+    budget = 8_000  # share cap = 2K < block; half-budget limit = 4K ≥ block
+    from flowly.compaction.estimator import estimate_messages_tokens
+
+    block_tokens = estimate_messages_tokens(block)
+    assert block_tokens > service._keep_recent_cap(budget), "must bust the cap"
+    assert block_tokens <= budget // 2, "must fit the half-budget limit"
+
+    kept = service._calculate_keep_recent(messages, history_budget=budget)
+
+    assert kept == block, (
+        "the newest block must survive whole instead of 'kept 0 recent'"
+    )
+
+
+def test_a_block_too_big_for_the_budget_degrades_to_question_and_answer():
+    service = _service(_Provider(LLMResponse(content="s", finish_reason="stop")))
+    block = _tool_heavy_block(tool_chars=60_000)  # ~15K tokens of tool output
+    messages = _conversation(10) + block
+
+    kept = service._calculate_keep_recent(messages, history_budget=6_000)
+
+    assert kept, "the tail must never be empty"
+    roles = [m.get("role") for m in kept]
+    assert roles[0] == "user"
+    assert roles[-1] == "assistant"
+    assert all(r != "tool" for r in roles), "tool traffic belongs to the summary"
+    assert all(not m.get("tool_calls") for m in kept), "no dangling tool calls"
+    assert "deploy failed on shard nine" in kept[-1]["content"]
+
+
+async def test_an_extracted_tail_still_summarizes_the_whole_block():
+    """Suffix arithmetic on an extracted tail would silently drop the block's
+    tool traffic from BOTH the summary and the tail. Extract mode must feed
+    the full history to the summarizer instead."""
+    provider = _Provider(
+        LLMResponse(content="A summary of the deploy investigation.",
+                    finish_reason="stop")
+    )
+    service = _service(provider)
+    block = _tool_heavy_block(tool_chars=60_000)
+    messages = _conversation(10) + block
+
+    result = await service.compact(messages, history_budget=6_000)
+
+    assert [m.get("role") for m in result.kept_messages] == ["user", "assistant"]
+    assert provider.saw("check the deploy logs"), (
+        "the oversized block never reached the summarizer"
+    )
+    assert result.messages_removed == len(messages) - len(result.kept_messages)
