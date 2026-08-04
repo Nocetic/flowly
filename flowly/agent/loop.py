@@ -5617,17 +5617,40 @@ class AgentLoop:
             await self._emit_compaction_event(
                 msg.session_key, "started", total_tokens, 0, 0,
             )
-            try:
-                result = await self.compaction.compact(
-                    history, session_key=msg.session_key,
-                )
-            except Exception as e:
-                logger.error(f"Compaction failed: {e}")
-                self.compaction.record_compaction_failure(msg.session_key)
-                # Fall through with uncompacted history — better than crashing
-                result = None
+            # Serialise against a manual /compact arriving from another client
+            # mid-turn: both paths commit by clearing and rewriting the same
+            # session object.
+            async with self.compaction.session_lock(msg.session_key):
+                _generation = self._compaction_generation(session)
+                try:
+                    result = await self.compaction.compact(
+                        history, session_key=msg.session_key,
+                    )
+                except Exception as e:
+                    logger.error(f"Compaction failed: {e}")
+                    self.compaction.record_compaction_failure(msg.session_key)
+                    # Fall through with uncompacted history — better than crashing
+                    result = None
 
-            if result is None:
+                if result is not None and self._compaction_generation(session) != _generation:
+                    # A manual compaction landed while we summarised; its
+                    # result is already committed and ours describes history
+                    # that no longer exists.
+                    logger.info(
+                        "Discarding auto-compaction — session was compacted concurrently"
+                    )
+                    result = None
+                    history = self._history_with_summary_anchor(session)
+                    _concurrent = True
+                else:
+                    _concurrent = False
+
+            if result is None and _concurrent:
+                # Not a failure: someone else's compaction already shrank this
+                # session, and `history` was re-read from it above. Nothing to
+                # trim and nothing to announce.
+                pass
+            elif result is None:
                 # Compaction failed. The SESSION IS LEFT UNTOUCHED — only this
                 # turn's working copy is trimmed, so nothing is lost on disk
                 # and the next turn can try again.
@@ -6672,6 +6695,19 @@ class AgentLoop:
         anchor = {"role": "system", "content": content}
         return [anchor] + history
 
+    @staticmethod
+    def _compaction_generation(session: Any) -> int:
+        """How many times this session has been compacted.
+
+        Doubles as a generation counter: a caller that snapshots it before
+        summarising can tell, on the way back, whether the history it just
+        described is still the history on disk.
+        """
+        try:
+            return int(session.metadata.get("compaction_count", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
     async def _emit_compaction_event(
         self,
         session_key: str,
@@ -6830,31 +6866,67 @@ class AgentLoop:
             session_key, "started", tokens_before, 0, 0,
         )
 
-        # Run compaction. A failure must leave the session exactly as it was:
-        # the manual path is the one users reach for when context is already
-        # tight, so silently replacing their history with an error string is
-        # the worst possible outcome.
-        try:
-            result = await self.compaction.compact(
-                history,
-                custom_instructions=custom_instructions,
-                session_key=session_key,
-            )
-        except Exception as e:
-            logger.error(f"Manual compaction failed: {e}")
-            self.compaction.record_compaction_failure(session_key)
-            await self._emit_compaction_event(
-                session_key, "failed", tokens_before, tokens_before, 0,
-            )
-            return {
-                "success": False,
-                "message": f"Compaction failed: {e}. Your history is unchanged.",
-                "tokens_before": tokens_before,
-                "tokens_after": tokens_before,
-            }
+        # Serialise against the automatic path and against another device
+        # asking for the same thing. Both end in a commit that clears the
+        # session, and every caller shares one session object.
+        async with self.compaction.session_lock(session_key):
+            generation = self._compaction_generation(session)
+            # Re-read inside the lock: whoever held it before us may have
+            # already compacted, in which case our snapshot is stale.
+            history = self._history_with_summary_anchor(session)
+            if not history:
+                return {
+                    "success": False,
+                    "message": "No history to compact.",
+                    "tokens_before": tokens_before,
+                    "tokens_after": tokens_before,
+                }
 
-        self.compaction.record_compaction_success(session_key)
-        self._commit_compaction(session, result, session_key)
+            # Run compaction. A failure must leave the session exactly as it
+            # was: the manual path is the one users reach for when context is
+            # already tight, so silently replacing their history with an error
+            # string is the worst possible outcome.
+            try:
+                result = await self.compaction.compact(
+                    history,
+                    custom_instructions=custom_instructions,
+                    session_key=session_key,
+                )
+            except Exception as e:
+                logger.error(f"Manual compaction failed: {e}")
+                self.compaction.record_compaction_failure(session_key)
+                await self._emit_compaction_event(
+                    session_key, "failed", tokens_before, tokens_before, 0,
+                )
+                return {
+                    "success": False,
+                    "message": f"Compaction failed: {e}. Your history is unchanged.",
+                    "tokens_before": tokens_before,
+                    "tokens_after": tokens_before,
+                }
+
+            # Someone compacted this session while we were summarising. Our
+            # summary describes history that no longer exists, so committing
+            # it would overwrite their work with a stale view.
+            if self._compaction_generation(session) != generation:
+                logger.info(
+                    f"Discarding manual compaction for {session_key} — "
+                    "the session was compacted concurrently"
+                )
+                await self._emit_compaction_event(
+                    session_key, "completed", tokens_before, tokens_before, 0,
+                )
+                return {
+                    "success": False,
+                    "message": "Already compacted just now — nothing further to do.",
+                    "tokens_before": tokens_before,
+                    "tokens_after": estimate_messages_tokens(
+                        self._history_with_summary_anchor(session)
+                    ),
+                }
+
+            self.compaction.record_compaction_success(session_key)
+            self._commit_compaction(session, result, session_key)
 
         # Notify connected clients — compaction completed
         await self._emit_compaction_event(

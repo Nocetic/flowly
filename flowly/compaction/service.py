@@ -1,5 +1,6 @@
 """Compaction service for managing context compression."""
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,9 @@ class _SessionState:
     memory_flush_at_count: int | None = None
     consecutive_failures: int = 0
     checks_since_suppression: int = 0
+    # Created on first use — building an asyncio.Lock outside a running loop
+    # binds it to the wrong one.
+    lock: "asyncio.Lock | None" = None
 
 
 class CompactionService:
@@ -101,6 +105,24 @@ class CompactionService:
         # conversation's outage suppress compaction for all of them.
         self._sessions: dict[str, _SessionState] = {}
 
+    def session_lock(self, session_key: str = "") -> asyncio.Lock:
+        """The lock serialising compaction for one conversation.
+
+        Manual ``/compact`` and automatic compaction both end in a commit that
+        clears the session and rewrites it, and ``get_or_create`` hands every
+        caller the SAME session object — so without this, two compactions can
+        interleave and the loser writes a summary derived from history the
+        winner already replaced.
+
+        Held across the summarisation call, which is a network round trip, so
+        every caller must be prepared to wait. The lock is per session: a slow
+        compaction in one conversation never blocks another.
+        """
+        state = self._state(session_key)
+        if state.lock is None:
+            state.lock = asyncio.Lock()
+        return state.lock
+
     def _state(self, session_key: str = "") -> "_SessionState":
         """Per-session counters, created on first use.
 
@@ -126,8 +148,15 @@ class CompactionService:
         if overflow <= 0:
             return
         for key in list(self._sessions)[:overflow]:
-            if key:  # keep the default bucket
-                self._sessions.pop(key, None)
+            if not key:  # keep the default bucket
+                continue
+            state = self._sessions.get(key)
+            # Never evict a session mid-compaction: dropping its state would
+            # hand the next caller a brand-new lock and undo the exclusion the
+            # in-flight commit is relying on.
+            if state is not None and state.lock is not None and state.lock.locked():
+                continue
+            self._sessions.pop(key, None)
 
     @property
     def model_context_window(self) -> int:

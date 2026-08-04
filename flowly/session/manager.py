@@ -202,7 +202,74 @@ def _repair_tool_sequence(
         # Anything else (user, system, plain assistant) is a clean tail.
         break
 
-    return result
+    return _drop_orphan_tool_pairs(result)
+
+
+def _tool_call_id(call: Any) -> str:
+    """The id a tool result will reference.
+
+    Some provider formats carry both an ``id`` and a ``call_id`` and they are
+    not always the same value. Read both, preferring the one results are keyed
+    by, so this never matches on the wrong field — a sanitizer keyed to the
+    wrong id is worse than no sanitizer, because it silently removes valid
+    turns while leaving the broken ones in place.
+    """
+    if isinstance(call, dict):
+        return str(call.get("call_id") or call.get("id") or "")
+    return str(getattr(call, "call_id", "") or getattr(call, "id", "") or "")
+
+
+def _drop_orphan_tool_pairs(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove tool calls and tool results that lost their partner.
+
+    ``_repair_tool_sequence`` walks only the tail, which is where a crash
+    leaves damage. This pass covers the whole list, so the invariant "what we
+    send is well-formed" is checked rather than inferred from the fact that
+    every producer happens to behave.
+
+    Both directions are handled: a result whose issuing call is gone, and a
+    call whose results are gone. Providers reject either with a 400.
+    """
+    issued: set[str] = set()
+    answered: set[str] = set()
+    for msg in messages:
+        role = msg.get("role")
+        if role == "assistant":
+            for call in msg.get("tool_calls") or []:
+                cid = _tool_call_id(call)
+                if cid:
+                    issued.add(cid)
+        elif role == "tool":
+            tcid = str(msg.get("tool_call_id") or "")
+            if tcid:
+                answered.add(tcid)
+
+    if answered <= issued and issued <= answered:
+        return messages  # already well-formed; keep the exact list
+
+    cleaned: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "tool":
+            if str(msg.get("tool_call_id") or "") in issued:
+                cleaned.append(msg)
+            continue
+        if role == "assistant" and msg.get("tool_calls"):
+            kept_calls = [
+                c for c in msg["tool_calls"] if _tool_call_id(c) in answered
+            ]
+            if len(kept_calls) == len(msg["tool_calls"]):
+                cleaned.append(msg)
+            elif kept_calls:
+                cleaned.append({**msg, "tool_calls": kept_calls})
+            elif str(msg.get("content") or "").strip():
+                # Keep the assistant's words, drop the unanswered calls.
+                cleaned.append({k: v for k, v in msg.items() if k != "tool_calls"})
+            continue
+        cleaned.append(msg)
+    return cleaned
 
 
 @dataclass
