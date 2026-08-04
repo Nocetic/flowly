@@ -188,6 +188,63 @@ def _strip_subagent_tool_results(
     return result
 
 
+# Headroom left for the subagent's own reply. Smaller than the main loop's
+# reserve: a subagent answers with a result, not a conversation.
+_SUBAGENT_RESERVE_TOKENS = 8_000
+
+
+def _subagent_context_budget(model: str) -> int:
+    """Tokens a subagent may spend on its message list for ``model``.
+
+    Resolved from the model's real window rather than a constant, because a
+    subagent on a 32K model and one on a 200K model are not the same problem.
+    """
+    from flowly.compaction.service import _heuristic_context_window
+
+    window = 0
+    try:
+        from flowly.integrations.model_catalog import get_context_window
+
+        window = get_context_window(model) or 0
+    except Exception:  # noqa: BLE001 — catalog is best-effort
+        window = 0
+    if not window:
+        window = _heuristic_context_window(model) or 128_000
+    return max(8_000, window - _SUBAGENT_RESERVE_TOKENS)
+
+
+def _trim_to_context_budget(
+    messages: list[dict[str, Any]],
+    model: str,
+) -> list[dict[str, Any]]:
+    """Collapse old tool results until the list fits the model's window.
+
+    Subagents deliberately do NOT summarize: their context is disposable by
+    design, and a summarization call inside one doubles its cost for work
+    that is thrown away when it returns. Progressive truncation is the cheap
+    half of what the main loop does, and it is what keeps a long subagent
+    from dying on a provider 413 instead of returning its result.
+    """
+    from flowly.compaction.estimator import estimate_messages_tokens
+
+    budget = _subagent_context_budget(model)
+    if estimate_messages_tokens(messages) <= budget:
+        return messages
+
+    for keep_last, max_chars in ((2, 200), (1, 120), (1, 60)):
+        messages = _strip_subagent_tool_results(
+            messages, keep_last=keep_last, max_old_chars=max_chars,
+        )
+        if estimate_messages_tokens(messages) <= budget:
+            return messages
+
+    logger.warning(
+        "Subagent context still over budget after truncation "
+        f"({estimate_messages_tokens(messages)} > {budget}); the provider may reject it"
+    )
+    return messages
+
+
 class SubagentManager:
     """
     Manages background subagent execution.
@@ -705,6 +762,9 @@ class SubagentManager:
             _tool_trace: list[dict[str, Any]] = []
             _consecutive_errors = 0  # Global error counter (not per-iteration)
             _MAX_CONSECUTIVE_ERRORS = 3
+            # Context overflow gets one rescue attempt per run. Beyond that the
+            # task genuinely does not fit and retrying only burns tokens.
+            _overflow_recovered = False
 
             # P1.1 — subagent→parent activity heartbeat. Called at each
             # iteration + tool boundary so a 10-min subagent keeps the
@@ -766,6 +826,11 @@ class SubagentManager:
                     messages = _strip_subagent_tool_results(
                         messages, keep_last=2, max_old_chars=150,
                     )
+                # Iteration count is a poor proxy for context pressure: three
+                # iterations that each read a large file overflow long before
+                # the fixed thresholds above fire, and a small-window model
+                # overflows sooner still. Measure the actual budget too.
+                messages = _trim_to_context_budget(messages, model)
 
                 response = await self.provider.chat(
                     messages=messages,
@@ -865,6 +930,26 @@ class SubagentManager:
                         _category = classify_response(response)
                         _delay = backoff_for(_category, _consecutive_errors)
                         _err_snippet = (response.content or "")[:100]
+
+                        # One-shot overflow recovery. Giving up here throws
+                        # away everything the subagent has already done, when
+                        # the fix is usually just old tool output it no longer
+                        # needs. Trim hard and retry once; a second overflow
+                        # means the task really is too big.
+                        if (
+                            _category == ErrorCategory.CONTEXT_OVERFLOW
+                            and not _overflow_recovered
+                        ):
+                            _overflow_recovered = True
+                            _before = len(messages)
+                            messages = _strip_subagent_tool_results(
+                                messages, keep_last=1, max_old_chars=60,
+                            )
+                            logger.warning(
+                                f"[SubagentManager] [{run_id[:8]}] context overflow — "
+                                f"trimmed tool history ({_before} messages) and retrying once"
+                            )
+                            continue
 
                         if _delay is None:
                             logger.error(
