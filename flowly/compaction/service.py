@@ -226,16 +226,25 @@ class CompactionService:
         history_tokens: int,
         session_key: str = "",
         overhead_tokens: int = 0,
+        observed_total_tokens: int = 0,
     ) -> bool:
         """
         Check if compaction should be triggered.
 
         Judged on the HISTORY against the room left for it — not on the total
-        request size. Compaction can only summarise the conversation; it
-        cannot shrink the system prompt or the tool schemas. Comparing the
-        total against the window meant a large fixed overhead alone tripped
-        the threshold, and the agent then tried to compact a two-message chat,
-        failed to reduce anything, and reported that as an error every turn.
+        request size. Judged on the total, a large fixed overhead alone
+        tripped the threshold, and the agent then tried to compact a
+        two-message chat, failed to reduce anything, and reported that as an
+        error every turn. Compaction can only summarise the conversation; it
+        cannot shrink the system prompt or the tool schemas.
+
+        ``observed_total_tokens`` is the PROVIDER's own count of the last
+        request (``usage.prompt_tokens`` + completion) — ground truth where
+        everything else here is an estimate. Local estimators drift by model
+        and language (10-20% is normal), and 75 tool schemas amplify the
+        error: a session can sit comfortably under the estimated budget while
+        its real requests already exceed the window's threshold. When the
+        provider says the context is full, believe the provider.
 
         Backs off after repeated failures (prevents a death spiral where
         compact → fail → compact → fail burns tokens every turn), but the
@@ -244,9 +253,11 @@ class CompactionService:
         its own once the provider does.
 
         Args:
-            history_tokens: Tokens the conversation history occupies.
+            history_tokens: Tokens the conversation history occupies (estimate).
             session_key: Session these counters belong to.
-            overhead_tokens: Everything else the request carries.
+            overhead_tokens: Everything else the request carries (estimate).
+            observed_total_tokens: Provider-reported size of the last turn's
+                request, 0 when unknown.
 
         Returns:
             True if compaction is needed.
@@ -262,7 +273,16 @@ class CompactionService:
                 "cannot help; raise the context window or trim tools/prompt"
             )
             return False
-        if history_tokens <= budget:
+        over_by_estimate = history_tokens > budget
+        over_by_observation = observed_total_tokens > self.compaction_threshold
+        if over_by_observation and not over_by_estimate:
+            logger.info(
+                f"Compaction triggered by provider-reported usage: "
+                f"{observed_total_tokens} tokens exceeds the "
+                f"{self.compaction_threshold}-token threshold "
+                f"(estimate saw only {history_tokens} history / {budget} budget)"
+            )
+        if not (over_by_estimate or over_by_observation):
             return False
 
         state = self._state(session_key)
@@ -298,6 +318,7 @@ class CompactionService:
         history_tokens: int,
         session_key: str = "",
         overhead_tokens: int = 0,
+        observed_total_tokens: int = 0,
     ) -> bool:
         """
         Check if memory flush should run before compaction.
@@ -306,12 +327,16 @@ class CompactionService:
         room left for it. The flush exists to save durable memories shortly
         BEFORE a compaction, so it has to fire on the same signal; judged on
         the total instead, it ran on every turn of an idle chat whose request
-        overhead happened to be large.
+        overhead happened to be large. The provider-observed total joins for
+        the same reason: a compaction triggered by real usage must still get
+        its flush first, or the summarised turns are never mined for memory.
 
         Args:
             history_tokens: Tokens the conversation history occupies.
             session_key: Session these counters belong to.
             overhead_tokens: Everything else the request carries.
+            observed_total_tokens: Provider-reported size of the last turn's
+                request, 0 when unknown.
 
         Returns:
             True if memory flush should run.
@@ -327,7 +352,11 @@ class CompactionService:
         budget = self.history_budget(overhead_tokens)
         if budget <= 0:
             return False
-        return history_tokens > budget - self.config.memory_flush.soft_threshold_tokens
+        soft = self.config.memory_flush.soft_threshold_tokens
+        return (
+            history_tokens > budget - soft
+            or observed_total_tokens > self.compaction_threshold - soft
+        )
 
     def get_memory_flush_prompt(self) -> tuple[str, str]:
         """

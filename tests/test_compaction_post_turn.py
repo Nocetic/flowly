@@ -104,6 +104,7 @@ class _Harness:
         self.events: list[str] = []
         self.markers = 0
         self._post_turn_compaction_tasks: dict[str, asyncio.Task] = {}
+        self._last_turn_total_tokens: dict[str, int] = {}
 
     def _tool_schema_tokens(self) -> int:
         return 0
@@ -230,6 +231,54 @@ async def test_scheduler_runs_at_most_one_pass_per_session():
     assert started == ["web:conv-1"], (
         "a second turn ending must not stack another pass behind the first"
     )
+
+
+# ── The provider's count is ground truth ──────────────────────────────────
+
+
+async def test_observed_usage_triggers_when_the_estimate_says_fits():
+    """The live failure: estimate ~72K in a 79K window ("fits"), provider
+    counted 82K (over). Estimators drift by model and language — when the
+    provider says the window is full, the estimate doesn't get a veto."""
+    session = _big_session(turns=3)  # tiny by estimate
+    harness = _Harness(session, context_window=100_000)
+    harness._last_turn_total_tokens[session.key] = 100_500  # provider: over
+
+    await harness._post_turn_compaction(_msg())
+
+    assert is_summary_message(session.messages[0]), (
+        "the provider reported an overflowing window and nothing happened"
+    )
+    assert harness.events[-1] == "completed"
+
+
+async def test_a_commit_clears_the_observation():
+    """The observed count described the PRE-compaction context. Kept, it
+    would re-trigger compaction against the fresh summary forever."""
+    session = _big_session(turns=3)
+    harness = _Harness(session, context_window=100_000)
+    harness._last_turn_total_tokens[session.key] = 100_500
+
+    await harness._post_turn_compaction(_msg())
+    calls_after_first = harness.provider.calls
+
+    await harness._post_turn_compaction(_msg())
+
+    assert session.key not in harness._last_turn_total_tokens
+    assert harness.provider.calls == calls_after_first, (
+        "a stale observation re-compacted an already-summarised session"
+    )
+
+
+def test_service_trigger_prefers_the_provider_over_the_estimate():
+    service = _Harness(_big_session(turns=1)).compaction
+
+    # Estimate comfortably under budget, provider over the threshold.
+    assert service.should_compact(100, "s", overhead_tokens=0,
+                                  observed_total_tokens=2_000)
+    # Both under: stays quiet.
+    assert not service.should_compact(100, "s", overhead_tokens=0,
+                                      observed_total_tokens=1_000)
 
 
 # ── Mid-summarisation appends survive the commit ──────────────────────────

@@ -747,6 +747,12 @@ class AgentLoop:
         # doesn't stack a second one behind it on the session lock.
         self._post_turn_compaction_tasks: dict[str, asyncio.Task] = {}
 
+        # Provider-reported total (prompt + completion tokens) of each
+        # session's last turn — ground truth where the compaction trigger's
+        # other inputs are estimates. Cleared on every compaction commit so a
+        # stale reading can't re-trigger against already-summarised history.
+        self._last_turn_total_tokens: dict[str, int] = {}
+
         # One controller owns per-run cancellation for every transport.
         # Streams poll its marker; active tool awaitables are registered with
         # it so Stop can cancel the current tool without cancelling the parent
@@ -5088,8 +5094,10 @@ class AgentLoop:
             ))
 
         completed = True
+        outcome: OutboundMessage | None = None
         try:
-            return await self._process_message_inner(msg)
+            outcome = await self._process_message_inner(msg)
+            return outcome
         except Exception:
             completed = False
             raise
@@ -5101,6 +5109,7 @@ class AgentLoop:
             # instead of making the user's next message pay the wait.
             if completed:
                 try:
+                    self._note_turn_usage(msg.session_key, outcome)
                     self._schedule_post_turn_compaction(msg)
                 except Exception as e:  # noqa: BLE001 — never fail the turn
                     logger.debug(f"Post-turn compaction scheduling skipped: {e}")
@@ -5601,8 +5610,11 @@ class AgentLoop:
         history_tokens = estimate_messages_tokens(history)
         total_tokens = history_tokens + fixed_overhead
 
+        observed_total = self._last_turn_total_tokens.get(msg.session_key, 0)
+
         if self.compaction.should_memory_flush(
             history_tokens, msg.session_key, overhead_tokens=fixed_overhead,
+            observed_total_tokens=observed_total,
         ):
             logger.info("Running pre-compaction memory flush")
             await self._run_memory_flush(session, msg.channel, msg.chat_id)
@@ -5622,9 +5634,12 @@ class AgentLoop:
 
         # Compaction is judged on the HISTORY against the room left for it.
         # The overhead is what shrinks that room, but summarising cannot
-        # reduce the overhead itself — only the conversation.
+        # reduce the overhead itself — only the conversation. The provider's
+        # own count of the last turn joins as ground truth: when it says the
+        # window is full, the estimates don't get a veto.
         if self.compaction.should_compact(
             history_tokens, msg.session_key, overhead_tokens=fixed_overhead,
+            observed_total_tokens=observed_total,
         ):
             logger.info(
                 f"Compacting context: {history_tokens}-token history over its "
@@ -6942,6 +6957,10 @@ class AgentLoop:
         # Compaction is a snapshot boundary: drop the frozen memory block
         # so post-compaction turns re-inject freshly-written memory.
         self.context.invalidate_memory_snapshot(session_key)
+        # The provider's last-turn count described the PRE-compaction context;
+        # kept, it would re-trigger compaction against the fresh summary until
+        # the next turn overwrote it.
+        self._last_turn_total_tokens.pop(session_key, None)
         # The working history mirrors what was just persisted: summary, kept
         # tail, and any late arrivals — projected to bare LLM-protocol shape.
         tail_projection = [
@@ -7084,6 +7103,32 @@ class AgentLoop:
             "summary_preview": result.summary[:200] + "..." if len(result.summary) > 200 else result.summary,
         }
 
+    def _note_turn_usage(self, session_key: str, outcome: Any) -> None:
+        """Record the provider's own count of the turn that just ended.
+
+        ``usage.prompt_tokens + completion_tokens`` is what the NEXT request
+        will roughly weigh before its new message — ground truth against
+        which the estimate-based compaction trigger is cross-checked. Local
+        estimators drift by model and language, and a session can sit under
+        the estimated budget while its real requests already exceed the
+        window (observed live: estimate ~72K while the provider counted 82K
+        in a 79K window).
+        """
+        try:
+            usage = (getattr(outcome, "metadata", None) or {}).get("usage") or {}
+            total = int(usage.get("prompt_tokens", 0) or 0) + int(
+                usage.get("completion_tokens", 0) or 0
+            )
+        except (AttributeError, TypeError, ValueError):
+            return
+        if total > 0:
+            self._last_turn_total_tokens[session_key] = total
+            # Bounded: sessions come and go on a long-lived gateway.
+            if len(self._last_turn_total_tokens) > 512:
+                self._last_turn_total_tokens.pop(
+                    next(iter(self._last_turn_total_tokens)), None,
+                )
+
     def _schedule_post_turn_compaction(self, msg: InboundMessage) -> None:
         """Kick off a background compaction check once the turn's reply is out.
 
@@ -7130,10 +7175,13 @@ class AgentLoop:
             # message) remains the backstop.
             overhead = self._system_prompt_tokens(msg.channel) + self._tool_schema_tokens()
 
+            observed_total = self._last_turn_total_tokens.get(session_key, 0)
+
             # Memory flush first, exactly like the pre-turn order: extract
             # durable memories from the history WHILE it is still verbatim.
             if self.compaction.should_memory_flush(
                 history_tokens, session_key, overhead_tokens=overhead,
+                observed_total_tokens=observed_total,
             ):
                 logger.info("Running post-turn memory flush")
                 await self._run_memory_flush(session, msg.channel, msg.chat_id)
@@ -7143,6 +7191,7 @@ class AgentLoop:
 
             if not self.compaction.should_compact(
                 history_tokens, session_key, overhead_tokens=overhead,
+                observed_total_tokens=observed_total,
             ):
                 return
 
@@ -7160,8 +7209,14 @@ class AgentLoop:
                 history = self._history_with_summary_anchor(session)
                 source_len = len(session.messages)
                 history_tokens = estimate_messages_tokens(history)
+                # Re-read the observation too: a commit that happened while we
+                # waited on the lock clears it, which is what makes this
+                # re-check able to say "already handled".
                 if not self.compaction.should_compact(
                     history_tokens, session_key, overhead_tokens=overhead,
+                    observed_total_tokens=self._last_turn_total_tokens.get(
+                        session_key, 0,
+                    ),
                 ):
                     await self._emit_compaction_event(
                         session_key, "completed", history_tokens, history_tokens, 0,
