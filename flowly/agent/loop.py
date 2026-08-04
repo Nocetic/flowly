@@ -43,6 +43,7 @@ from flowly.compaction.types import (
     CompactionConfig,
     MemoryFlushConfig,
     SUMMARY_MARKER,
+    SUMMARY_METADATA_KEY,
     is_summary_message,
 )
 from flowly.compaction.pruning import split_into_turn_blocks
@@ -6644,7 +6645,15 @@ class AgentLoop:
             summary = session.metadata.get("last_compaction_summary")
         except AttributeError:
             return history
-        if not summary or any(is_summary_message(m) for m in history):
+        if not summary:
+            return history
+        # Check the RAW messages, not the projection: the summary flag is
+        # stripped on the way to the LLM, so the projected history only ever
+        # carries the text marker.
+        window = getattr(session, "messages", [])[-self.context_messages:]
+        if any(is_summary_message(m) for m in window) or any(
+            is_summary_message(m) for m in history
+        ):
             return history
         content = f"{SUMMARY_MARKER}\n\n{summary}"
         # The plan note is baked into the summary MESSAGE at compaction time
@@ -6727,7 +6736,10 @@ class AgentLoop:
                 summary_msg += f"\n\n{_plan_note}"
         except Exception:
             logger.debug("[plan] compaction note skipped (non-fatal)")
-        session.add_message("system", summary_msg)
+        # Flag it as a summary rather than relying on the text prefix. The
+        # session store's allowlist projection strips this before the message
+        # reaches a provider, so it stays an internal fact.
+        session.add_message("system", summary_msg, **{SUMMARY_METADATA_KEY: True})
         # kept_messages may carry assistant_with_tool_calls / tool_result
         # entries preserved verbatim. Their ``tool_calls`` / ``tool_call_id``
         # / ``name`` fields must persist alongside ``content`` or the next

@@ -18,6 +18,18 @@ from flowly.session.manager import Session
 from flowly.tui.client import CompactionEvent, GatewayClient
 
 
+@pytest.fixture
+def temp_flowly_home(tmp_path, monkeypatch):
+    """Redirect FLOWLY_HOME so SessionManager writes into tmp_path."""
+    home = tmp_path / "flowly-home"
+    home.mkdir()
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    from flowly import profile
+    if hasattr(profile, "_cached_home"):
+        profile._cached_home = None
+    return home
+
+
 class _Loop:
     """The two AgentLoop members ``_history_with_summary_anchor`` touches."""
 
@@ -217,3 +229,52 @@ def test_relay_compaction_event_carries_the_session_key():
     assert (data["tokensBefore"], data["tokensAfter"], data["messagesRemoved"]) == (
         90_000, 10_000, 30,
     )
+
+
+def test_summary_message_is_flagged_not_just_prefixed():
+    """Detection reads a recorded fact; the text prefix is only a fallback."""
+    from flowly.compaction.types import SUMMARY_METADATA_KEY
+
+    flagged = {"role": "system", "content": "anything at all",
+               SUMMARY_METADATA_KEY: True}
+
+    assert is_summary_message(flagged)
+
+
+def test_user_message_quoting_the_marker_is_not_a_summary():
+    assert not is_summary_message({"role": "user", "content": SUMMARY_MARKER})
+
+
+def test_flag_survives_the_session_round_trip_but_never_reaches_the_llm(temp_flowly_home):
+    from pathlib import Path
+
+    from flowly.compaction.types import SUMMARY_METADATA_KEY
+    from flowly.session.manager import SessionManager
+
+    manager = SessionManager(workspace=Path("/tmp"))
+    session = manager.get_or_create("cli:flagtest")
+    session.add_message("system", f"{SUMMARY_MARKER}\n\nx", **{SUMMARY_METADATA_KEY: True})
+    session.add_message("user", "hi")
+    manager.save(session)
+
+    manager._cache.clear()
+    reloaded = manager.get_or_create("cli:flagtest")
+
+    raw = [m for m in reloaded.messages if m.get("role") == "system"]
+    assert raw and raw[0].get(SUMMARY_METADATA_KEY) is True, "flag must persist"
+    assert all(
+        SUMMARY_METADATA_KEY not in m for m in reloaded.get_history(max_messages=10)
+    ), "flag must never ride out to a provider"
+
+
+def test_anchor_not_duplicated_when_the_window_holds_a_flagged_summary():
+    from flowly.compaction.types import SUMMARY_METADATA_KEY
+
+    session = Session(key="cli:test")
+    session.metadata["last_compaction_summary"] = "prior work"
+    session.add_message("system", "prior work summary", **{SUMMARY_METADATA_KEY: True})
+    session.add_message("user", "next")
+
+    history = _Loop()._history_with_summary_anchor(session)
+
+    assert sum(1 for m in history if is_summary_message(m)) <= 1

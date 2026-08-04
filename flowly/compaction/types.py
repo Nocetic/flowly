@@ -121,11 +121,24 @@ SUMMARY_MARKER = "[Previous conversation summary]"
 LEGACY_SUMMARY_MARKER = "[Compacted conversation summary]"
 SUMMARY_MARKERS = (SUMMARY_MARKER, LEGACY_SUMMARY_MARKER)
 
+# Recorded on the summary message when compaction commits. A stored fact beats
+# guessing from the text: a user can paste the marker into a message of their
+# own, and the anchor's de-duplication depends on telling the two apart.
+#
+# The session store projects messages through a strict allowlist before they
+# reach a provider, so this flag never travels on the wire — but that also
+# means it is absent from the PROJECTED history. Detection therefore has to
+# read the raw session messages; the content check below remains the fallback
+# for projected views and for sessions written before this flag existed.
+SUMMARY_METADATA_KEY = "_compaction_summary"
+
 
 def is_summary_message(message: dict) -> bool:
     """True if ``message`` is a compaction summary this system wrote."""
     if message.get("role") != "system":
         return False
+    if message.get(SUMMARY_METADATA_KEY):
+        return True
     content = message.get("content", "")
     return isinstance(content, str) and content.lstrip().startswith(SUMMARY_MARKERS)
 
