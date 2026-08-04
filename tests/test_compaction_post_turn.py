@@ -185,7 +185,11 @@ async def test_post_turn_pass_defers_to_a_concurrent_compaction():
     assert harness.provider.calls == 0, (
         "summarised history that a concurrent compaction had already replaced"
     )
-    assert harness.events[-1] == "completed", "the started notice must be closed"
+    assert harness.events == [], (
+        "a pass that queued behind another must stay silent — a second "
+        "started/completed pair makes the UI notice flap (the live "
+        "'broken shimmer')"
+    )
     assert harness._compaction_generation(session) == 1, "no second commit"
 
 
@@ -240,7 +244,7 @@ async def test_observed_usage_triggers_when_the_estimate_says_fits():
     """The live failure: estimate ~72K in a 79K window ("fits"), provider
     counted 82K (over). Estimators drift by model and language — when the
     provider says the window is full, the estimate doesn't get a veto."""
-    session = _big_session(turns=3)  # tiny by estimate
+    session = _big_session()  # ~5.6K estimated — under budget, over the floor
     harness = _Harness(session, context_window=100_000)
     harness._last_turn_total_tokens[session.key] = 100_500  # provider: over
 
@@ -255,7 +259,7 @@ async def test_observed_usage_triggers_when_the_estimate_says_fits():
 async def test_a_commit_clears_the_observation():
     """The observed count described the PRE-compaction context. Kept, it
     would re-trigger compaction against the fresh summary forever."""
-    session = _big_session(turns=3)
+    session = _big_session()
     harness = _Harness(session, context_window=100_000)
     harness._last_turn_total_tokens[session.key] = 100_500
 
@@ -271,14 +275,20 @@ async def test_a_commit_clears_the_observation():
 
 
 def test_service_trigger_prefers_the_provider_over_the_estimate():
-    service = _Harness(_big_session(turns=1)).compaction
+    service = _Harness(_big_session(turns=1), context_window=100_000).compaction
+    floor = service.MIN_OBSERVED_TRIGGER_HISTORY_TOKENS
 
-    # Estimate comfortably under budget, provider over the threshold.
-    assert service.should_compact(100, "s", overhead_tokens=0,
-                                  observed_total_tokens=2_000)
+    # Estimate comfortably under budget, provider over the threshold, and
+    # enough history to make summarising worthwhile.
+    assert service.should_compact(floor + 1_000, "s", overhead_tokens=0,
+                                  observed_total_tokens=100_500)
     # Both under: stays quiet.
-    assert not service.should_compact(100, "s", overhead_tokens=0,
-                                      observed_total_tokens=1_000)
+    assert not service.should_compact(floor + 1_000, "s", overhead_tokens=0,
+                                      observed_total_tokens=50_000)
+    # Provider over, but almost no history — the overflow is fixed overhead,
+    # which summarising cannot shrink (observed live at 1.8K history).
+    assert not service.should_compact(1_800, "s", overhead_tokens=0,
+                                      observed_total_tokens=100_500)
 
 
 # ── Mid-summarisation appends survive the commit ──────────────────────────

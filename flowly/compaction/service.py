@@ -100,6 +100,11 @@ class CompactionService:
     FAILURE_PROBE_INTERVAL = 10
     # Upper bound on tracked sessions before the oldest counters are dropped.
     MAX_TRACKED_SESSIONS = 500
+    # The provider-observed trigger needs at least this much (estimated)
+    # history before it may fire — roughly the size of a summary. Below it,
+    # the request is over the threshold on fixed overhead the summariser
+    # cannot shrink, and compacting just churns the session.
+    MIN_OBSERVED_TRIGGER_HISTORY_TOKENS = 4_000
 
     def __init__(
         self,
@@ -295,7 +300,15 @@ class CompactionService:
             )
             return False
         over_by_estimate = history_tokens > budget
-        over_by_observation = observed_total_tokens > self.compaction_threshold
+        # The observation only justifies compacting when there is meaningful
+        # history to reclaim. A real request can exceed the threshold on
+        # fixed overhead alone (observed live: 76.4K real with 1.8K of
+        # history in a 79K window) — summarising a couple of messages there
+        # frees almost nothing and just churns the session.
+        over_by_observation = (
+            observed_total_tokens > self.compaction_threshold
+            and history_tokens > self.MIN_OBSERVED_TRIGGER_HISTORY_TOKENS
+        )
         if over_by_observation and not over_by_estimate:
             logger.info(
                 f"Compaction triggered by provider-reported usage: "

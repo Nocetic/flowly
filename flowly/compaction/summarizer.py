@@ -1,5 +1,6 @@
 """Message summarization for compaction."""
 
+import asyncio
 import re
 from collections.abc import Callable
 from typing import Any
@@ -264,6 +265,57 @@ def reject_invented_user_attribution(
         )
 
 
+# Hard ceiling on ONE summarisation call. Observed live: a provider call sat
+# for 6.5 minutes (internal retries riding a slow upstream) while the session
+# lock was held INSIDE the user's turn — message blocked, Stop ignored. The
+# per-call bound turns that into an ordinary compaction failure: emergency
+# trim, session untouched, turn proceeds.
+SUMMARY_CALL_TIMEOUT_SECONDS = 120.0
+
+# How often the in-flight call re-checks the deadline and the cancel flag.
+_CALL_POLL_SECONDS = 0.5
+
+
+async def _chat_bounded(
+    provider: LLMProvider,
+    *,
+    messages: list[dict[str, Any]],
+    model: str,
+    max_tokens: int,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Any:
+    """One summarisation call, bounded in time and abortable mid-flight.
+
+    ``should_cancel`` used to be polled only BETWEEN provider round trips, so
+    a Stop pressed during a slow call changed nothing until the call chose to
+    return. Racing the call against a poll loop honours both the deadline and
+    the abort while the request is still on the wire.
+    """
+    call = asyncio.ensure_future(provider.chat(
+        messages=messages, model=model, max_tokens=max_tokens,
+    ))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SUMMARY_CALL_TIMEOUT_SECONDS
+    try:
+        while True:
+            if should_cancel is not None and should_cancel():
+                raise CompactionError("summarization cancelled")
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise CompactionError(
+                    "summarization call timed out after "
+                    f"{SUMMARY_CALL_TIMEOUT_SECONDS:.0f}s"
+                )
+            done, _ = await asyncio.wait(
+                {call}, timeout=min(_CALL_POLL_SECONDS, remaining),
+            )
+            if done:
+                return call.result()
+    finally:
+        if not call.done():
+            call.cancel()
+
+
 async def generate_summary(
     messages: list[dict[str, Any]],
     provider: LLMProvider,
@@ -271,6 +323,7 @@ async def generate_summary(
     reserve_tokens: int,
     custom_instructions: str | None = None,
     previous_summary: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str:
     """
     Generate a summary of messages using the LLM.
@@ -282,6 +335,7 @@ async def generate_summary(
         reserve_tokens: Tokens to reserve for output.
         custom_instructions: Optional custom instructions.
         previous_summary: Optional previous summary to incorporate.
+        should_cancel: Polled while the provider call is in flight.
 
     Returns:
         Summary text.
@@ -311,10 +365,12 @@ async def generate_summary(
     # to the model's mood that call.
     output_budget = max(reserve_tokens, MIN_SUMMARY_OUTPUT_TOKENS)
 
-    response = await provider.chat(
+    response = await _chat_bounded(
+        provider,
         messages=prompt_messages,
         model=model,
         max_tokens=output_budget,
+        should_cancel=should_cancel,
     )
 
     # NOTE: the invented-user check deliberately does NOT run here. This
@@ -334,10 +390,12 @@ async def generate_summary(
             f"Summarization returned an empty body — retrying with "
             f"{output_budget * 2} output tokens"
         )
-        response = await provider.chat(
+        response = await _chat_bounded(
+            provider,
             messages=prompt_messages,
             model=model,
             max_tokens=output_budget * 2,
+            should_cancel=should_cancel,
         )
         return validated_summary_text(response)
 
@@ -387,6 +445,7 @@ async def summarize_chunks(
             reserve_tokens,
             custom_instructions,
             summary,
+            should_cancel=should_cancel,
         )
 
     return summary or DEFAULT_SUMMARY_FALLBACK

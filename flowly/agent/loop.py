@@ -5646,22 +5646,28 @@ class AgentLoop:
                 f"{self.compaction.history_budget(fixed_overhead)}-token budget "
                 f"({fixed_overhead} fixed overhead, {total_tokens} total)"
             )
-            # Announce BEFORE the work: staged summarisation can take several
-            # LLM calls, and without this the clients show a frozen agent.
-            await self._emit_compaction_event(
-                msg.session_key, "started", total_tokens, 0, 0,
-            )
             # Serialise against a manual /compact arriving from another client
-            # mid-turn: both paths commit by clearing and rewriting the same
-            # session object.
+            # mid-turn and against the post-turn background pass: every path
+            # commits by clearing and rewriting the same session object.
             #
             # LOAD-BEARING: the ``/compact`` command branch earlier in this
             # method returns before reaching here. It must keep doing so —
             # this lock is an asyncio.Lock and is NOT reentrant, so a turn
             # that both handled /compact and fell through to here would wait
             # on itself forever.
+            _session_lock = self.compaction.session_lock(msg.session_key)
+            # Announce BEFORE the work: staged summarisation can take several
+            # LLM calls, and without this the clients show a frozen agent.
+            # But only when no other pass already owns this session's cycle —
+            # a second "started" while the first pass runs makes the UI
+            # notice flap between phases (observed live as a broken shimmer).
+            _announced = not _session_lock.locked()
+            if _announced:
+                await self._emit_compaction_event(
+                    msg.session_key, "started", total_tokens, 0, 0,
+                )
             _pre_lock_generation = self._compaction_generation(session)
-            async with self.compaction.session_lock(msg.session_key):
+            async with _session_lock:
                 _generation = self._compaction_generation(session)
                 if _generation != _pre_lock_generation:
                     # Whoever held the lock before us (manual /compact, the
@@ -5675,6 +5681,14 @@ class AgentLoop:
                     session_snapshot_len = len(session.messages)
                     _concurrent = True
                 else:
+                    if not _announced:
+                        # We queued behind a pass that did NOT commit (it
+                        # failed or bailed); the cycle is ours now — open it.
+                        await self._emit_compaction_event(
+                            msg.session_key, "started", total_tokens, 0, 0,
+                        )
+                        _announced = True
+
                     # Stop must reach compaction too. Staged summarisation is
                     # several provider round trips, so without this the user
                     # watches a turn they already cancelled run to completion.
@@ -5729,14 +5743,16 @@ class AgentLoop:
             if result is None and _concurrent:
                 # Not a failure: someone else's compaction already shrank this
                 # session, and `history` was re-read from it above. Nothing to
-                # trim — but we DID emit "started" before taking the lock, so
-                # close the lifecycle in case the other path's "completed"
-                # fired before our "started" (event ordering across tasks is
-                # not guaranteed). A duplicate "completed" is harmless.
-                _tokens_now = estimate_messages_tokens(history)
-                await self._emit_compaction_event(
-                    msg.session_key, "completed", _tokens_now, _tokens_now, 0,
-                )
+                # trim. If we DID emit "started" before taking the lock, close
+                # the lifecycle in case the other path's "completed" fired
+                # before our "started" (event ordering across tasks is not
+                # guaranteed); if we never announced, stay silent — the other
+                # pass owns the UI cycle.
+                if _announced:
+                    _tokens_now = estimate_messages_tokens(history)
+                    await self._emit_compaction_event(
+                        msg.session_key, "completed", _tokens_now, _tokens_now, 0,
+                    )
             elif result is None:
                 # Compaction failed. The SESSION IS LEFT UNTOUCHED — only this
                 # turn's working copy is trimmed, so nothing is lost on disk
@@ -7008,15 +7024,20 @@ class AgentLoop:
                 "tokens_after": tokens_before,
             }
 
-        # Notify clients that compaction is starting
-        await self._emit_compaction_event(
-            session_key, "started", tokens_before, 0, 0,
-        )
+        # Notify clients that compaction is starting — unless another pass
+        # already owns this session's cycle (its "started" is on screen; a
+        # second one makes the notice flap between phases).
+        _session_lock = self.compaction.session_lock(session_key)
+        _announced = not _session_lock.locked()
+        if _announced:
+            await self._emit_compaction_event(
+                session_key, "started", tokens_before, 0, 0,
+            )
 
         # Serialise against the automatic path and against another device
         # asking for the same thing. Both end in a commit that clears the
         # session, and every caller shares one session object.
-        async with self.compaction.session_lock(session_key):
+        async with _session_lock:
             generation = self._compaction_generation(session)
             # Re-read inside the lock: whoever held it before us may have
             # already compacted, in which case our snapshot is stale.
@@ -7029,12 +7050,26 @@ class AgentLoop:
             not_worth_it = self._compaction_ineligible_reason(history)
             if not_worth_it:
                 tokens_now = estimate_messages_tokens(history)
+                if _announced:
+                    # Close the lifecycle we opened, or the notice sits on
+                    # "started" with nothing running behind it.
+                    await self._emit_compaction_event(
+                        session_key, "completed", tokens_now, tokens_now, 0,
+                    )
                 return {
                     "success": False,
                     "message": not_worth_it,
                     "tokens_before": tokens_now,
                     "tokens_after": tokens_now,
                 }
+
+            if not _announced:
+                # Queued behind a pass that did not commit — the cycle is
+                # ours now, open it.
+                await self._emit_compaction_event(
+                    session_key, "started", tokens_before, 0, 0,
+                )
+                _announced = True
 
             # Run compaction. A failure must leave the session exactly as it
             # was: the manual path is the one users reach for when context is
@@ -7199,10 +7234,15 @@ class AgentLoop:
                 f"Post-turn compaction: {history_tokens} history tokens over "
                 "budget — summarising in the background"
             )
-            await self._emit_compaction_event(
-                session_key, "started", history_tokens + overhead, 0, 0,
-            )
-            async with self.compaction.session_lock(session_key):
+            _session_lock = self.compaction.session_lock(session_key)
+            # Same announce discipline as the pre-turn path: a second
+            # "started" while another pass runs makes the UI notice flap.
+            _announced = not _session_lock.locked()
+            if _announced:
+                await self._emit_compaction_event(
+                    session_key, "started", history_tokens + overhead, 0, 0,
+                )
+            async with _session_lock:
                 generation = self._compaction_generation(session)
                 # Re-read inside the lock — a manual /compact or a turn's own
                 # pre-turn pass may have already done the work while we waited.
@@ -7218,10 +7258,20 @@ class AgentLoop:
                         session_key, 0,
                     ),
                 ):
-                    await self._emit_compaction_event(
-                        session_key, "completed", history_tokens, history_tokens, 0,
-                    )
+                    if _announced:
+                        await self._emit_compaction_event(
+                            session_key, "completed",
+                            history_tokens, history_tokens, 0,
+                        )
                     return
+
+                if not _announced:
+                    # Queued behind a pass that did not commit — the cycle
+                    # is ours now, open it.
+                    await self._emit_compaction_event(
+                        session_key, "started", history_tokens + overhead, 0, 0,
+                    )
+                    _announced = True
 
                 try:
                     result = await self.compaction.compact(
@@ -7242,12 +7292,13 @@ class AgentLoop:
                         "Discarding post-turn compaction — session was "
                         "compacted concurrently"
                     )
-                    tokens_now = estimate_messages_tokens(
-                        self._history_with_summary_anchor(session)
-                    )
-                    await self._emit_compaction_event(
-                        session_key, "completed", tokens_now, tokens_now, 0,
-                    )
+                    if _announced:
+                        tokens_now = estimate_messages_tokens(
+                            self._history_with_summary_anchor(session)
+                        )
+                        await self._emit_compaction_event(
+                            session_key, "completed", tokens_now, tokens_now, 0,
+                        )
                     return
 
                 self.compaction.record_compaction_success(session_key)
