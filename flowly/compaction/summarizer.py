@@ -63,6 +63,14 @@ def strip_reasoning_blocks(text: str) -> str:
     return cleaned.strip()
 
 
+# Finish reasons meaning "I stopped because I ran out of room", across the
+# provider dialects we speak. A body that arrives with one of these is a
+# fragment, however well-formed its first paragraph looks.
+_TRUNCATED_FINISH_REASONS = frozenset({
+    "length", "max_tokens", "incomplete", "content_filter",
+})
+
+
 def validated_summary_text(response: Any) -> str:
     """Return the summary text of ``response``, or raise CompactionError.
 
@@ -76,6 +84,16 @@ def validated_summary_text(response: Any) -> str:
     if finish_reason == "error" or content.startswith(PROVIDER_ERROR_PREFIX):
         raise CompactionError(
             f"summarization provider call failed: {content[:300] or finish_reason}"
+        )
+
+    # A summary that ran out of output budget is a summary that stops
+    # mid-sentence — and it REPLACES the conversation. Whatever it had not
+    # reached yet is simply gone. The caller retries with a larger budget
+    # (see ``generate_summary``); failing that, the history is kept intact.
+    if finish_reason in _TRUNCATED_FINISH_REASONS:
+        raise CompactionError(
+            f"summarization was cut off (finish_reason={finish_reason!r}) — "
+            "committing it would silently drop whatever it had not summarised"
         )
 
     content = strip_reasoning_blocks(content)
@@ -393,13 +411,15 @@ async def generate_summary(
     try:
         return validated_summary_text(response)
     except CompactionError as e:
-        if "empty summary" not in str(e):
-            raise
-        # One more attempt with doubled room: the common cause of an empty
-        # body is reasoning that outgrew the budget, and doubling it is
+        # Both failures say the same thing — the output budget was too small.
+        # An empty body is reasoning that ate all of it; a truncated one is an
+        # answer that outgrew what was left. One retry with doubled room is
         # cheaper than failing the whole compaction into an emergency trim.
+        reason = str(e)
+        if "empty summary" not in reason and "cut off" not in reason:
+            raise
         logger.warning(
-            f"Summarization returned an empty body — retrying with "
+            f"Summarization came back unusable ({reason[:80]}) — retrying with "
             f"{output_budget * 2} output tokens"
         )
         response = await _chat_bounded(

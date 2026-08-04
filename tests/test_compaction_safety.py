@@ -567,3 +567,55 @@ async def test_an_extracted_tail_still_summarizes_the_whole_block():
         "the oversized block never reached the summarizer"
     )
     assert result.messages_removed == len(messages) - len(result.kept_messages)
+
+
+# ── Small models must still be able to compact ────────────────────────────
+
+
+def test_a_reserve_larger_than_the_window_cannot_wedge_compaction():
+    """The default reserve (20K) is sized for a 128K window. Applied literally
+    to a 16,385-token model it exceeded the window: threshold collapsed to 1,
+    the history budget went NEGATIVE, and should_compact then refused every
+    turn with "fixed overhead leaves no room" — so the request never fit and
+    compaction could never help."""
+    from flowly.config.schema import CompactionConfig as SchemaConfig
+
+    service = _service(
+        _Provider(LLMResponse(content="s", finish_reason="stop")),
+        context_window=16_385,
+        context_window_explicit=True,
+        reserve_tokens_floor=SchemaConfig().reserve_tokens_floor,  # the real default
+    )
+
+    assert service.effective_reserve_tokens < service.effective_context_window
+    assert service.compaction_threshold > 1
+    assert service.history_budget(5_000) > 0
+    assert service.should_compact(50_000, "s", overhead_tokens=5_000), (
+        "a 16K model with an over-full history still could not compact"
+    )
+
+
+@pytest.mark.parametrize("window", [4_000, 8_192, 16_385, 32_768, 128_000, 1_000_000])
+def test_the_reserve_always_leaves_room_for_a_conversation(window):
+    service = _service(
+        _Provider(LLMResponse(content="s", finish_reason="stop")),
+        context_window=window,
+        context_window_explicit=True,
+        reserve_tokens_floor=20_000,
+    )
+
+    assert 0 < service.effective_reserve_tokens < window
+    assert service.compaction_threshold > 0
+    assert service.history_budget() > 0
+
+
+def test_a_large_window_keeps_the_configured_reserve():
+    """The clamp is a ceiling for small models, not a rewrite for everyone."""
+    service = _service(
+        _Provider(LLMResponse(content="s", finish_reason="stop")),
+        context_window=200_000,
+        context_window_explicit=True,
+        reserve_tokens_floor=20_000,
+    )
+
+    assert service.effective_reserve_tokens == 20_000

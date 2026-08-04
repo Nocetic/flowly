@@ -100,6 +100,13 @@ class CompactionService:
     FAILURE_PROBE_INTERVAL = 10
     # Upper bound on tracked sessions before the oldest counters are dropped.
     MAX_TRACKED_SESSIONS = 500
+    # A reply reserve may never eat more than this share of the window, however
+    # it was configured. Above it there is no room left to hold a conversation
+    # and compaction has nothing it can do.
+    MAX_RESERVE_SHARE = 0.35
+    # …and never less than this, or a tiny window would reserve nothing and the
+    # reply itself would overflow the request.
+    MIN_RESERVE_TOKENS = 512
     # The provider-observed trigger needs at least this much (estimated)
     # history before it may fire — roughly the size of a summary. Below it,
     # the request is over the threshold on fixed overhead the summariser
@@ -165,6 +172,24 @@ class CompactionService:
             self._sessions[key] = state
             self._evict_stale_sessions()
         return state
+
+    def reset_session(self, session_key: str = "") -> None:
+        """Forget everything this service knows about a conversation.
+
+        Called when the conversation itself is reset (``/clear``, ``/new``):
+        the failure cooldown, the memory-flush cycle and the compaction count
+        all describe history that no longer exists, and carrying them into a
+        fresh chat suppresses its first legitimate compaction.
+
+        Never drops a session whose lock is held — an in-flight commit is
+        relying on that exclusion.
+        """
+        state = self._sessions.get(session_key or "")
+        if state is None:
+            return
+        if state.lock is not None and state.lock.locked():
+            return
+        self._sessions.pop(session_key or "", None)
 
     def _evict_stale_sessions(self) -> None:
         """Bound the counter map on a long-lived gateway.
@@ -233,9 +258,31 @@ class CompactionService:
         return window
 
     @property
+    def effective_reserve_tokens(self) -> int:
+        """Headroom kept free for the reply, CLAMPED TO THE WINDOW.
+
+        The configured reserve is sized for the big models most people run
+        (20K of a 128K window). Applied literally to a small one it exceeds
+        the window outright: a 16,385-token model minus a 20,000-token reserve
+        gave a threshold of 1 and a NEGATIVE history budget — so the request
+        never fit and compaction refused to run ("overhead leaves no room"),
+        every single turn.
+
+        A reserve is a share of the window, not an absolute. Small models get
+        the share; large ones keep the configured value, which is smaller than
+        the share and therefore wins.
+        """
+        configured = max(0, self.config.reserve_tokens_floor)
+        window = max(1, self.effective_context_window)
+        return max(
+            self.MIN_RESERVE_TOKENS,
+            min(configured, int(window * self.MAX_RESERVE_SHARE)),
+        )
+
+    @property
     def compaction_threshold(self) -> int:
         """Token count at which this session starts compacting."""
-        return max(1, self.effective_context_window - self.config.reserve_tokens_floor)
+        return max(1, self.effective_context_window - self.effective_reserve_tokens)
 
     def history_budget(self, overhead_tokens: int = 0) -> int:
         """Tokens the conversation itself may occupy.

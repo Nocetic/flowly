@@ -14,6 +14,7 @@ Two behaviours live here:
 """
 
 import asyncio
+import contextlib
 
 from flowly.agent.loop import AgentLoop
 from flowly.bus.events import InboundMessage
@@ -449,6 +450,63 @@ async def test_a_wedged_pass_does_not_disable_the_session_forever():
         # And the session can schedule again.
         harness._schedule_post_turn_compaction(msg)
         assert msg.session_key in harness._post_turn_compaction_tasks
-        harness._post_turn_compaction_tasks[msg.session_key].cancel()
+        second = harness._post_turn_compaction_tasks[msg.session_key]
+        # Let the task take its first step before cancelling: cancelled before
+        # it ever runs, the coroutine it wraps is never awaited and Python
+        # reports that as a warning — noise that hides real ones.
+        await asyncio.sleep(0)
+        second.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await second
     finally:
         loop_module.POST_TURN_COMPACTION_TIMEOUT_SECONDS = monkey
+
+
+# ── Lifecycle ownership is atomic ─────────────────────────────────────────
+
+
+async def test_two_passes_starting_together_announce_one_cycle():
+    """The TOCTOU the first fix missed. Emitting an event YIELDS (it writes to
+    a socket), so a pass that checks `lock.locked()` and then announces gives a
+    second pass a window in which the lock still looks free — both announce,
+    both close, and the notice flaps between phases though one compaction ran.
+
+    The rule that fixes it: the cycle belongs to whoever HOLDS the lock."""
+    session = _big_session()
+    harness = _Harness(session)
+
+    async def yielding_emit(session_key, phase, *a):
+        await asyncio.sleep(0)  # what a real WS send does
+        harness.events.append(phase)
+
+    harness._emit_compaction_event = yielding_emit
+
+    await asyncio.gather(
+        harness._post_turn_compaction(_msg()),
+        harness._post_turn_compaction(_msg()),
+    )
+
+    assert harness.events == ["started", "completed"], (
+        f"one compaction, one UI cycle — got {harness.events}"
+    )
+    assert harness._compaction_generation(session) == 1
+    assert harness.provider.calls > 0
+
+
+async def test_a_started_cycle_is_always_closed():
+    """Whatever happens after 'started', the notice must not be left running —
+    a stuck shimmer is how a delivered reply got hidden once already."""
+    class _Exploding(_Provider):
+        async def chat(self, *args, **kwargs) -> LLMResponse:
+            self.calls += 1
+            raise RuntimeError("provider down")
+
+    session = _big_session()
+    harness = _Harness(session)
+    harness.provider = _Exploding()
+    harness.compaction.provider = harness.provider
+
+    await harness._post_turn_compaction(_msg())
+
+    assert harness.events[0] == "started"
+    assert harness.events[-1] in ("completed", "failed")

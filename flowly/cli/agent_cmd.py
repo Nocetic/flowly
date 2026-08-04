@@ -231,7 +231,11 @@ def agent(
                             continue
                         elif cmd == "/clear":
                             session = agent_loop.sessions.get_or_create(session_id)
-                            session.clear()
+                            # Drops the compaction summary too — plain clear()
+                            # leaves it in metadata and the summary anchor
+                            # re-injects it on the next turn.
+                            session.reset_conversation_context()
+                            agent_loop.compaction.reset_session(session_id)
                             agent_loop.sessions.save(session)
                             console.print("[green]✓[/green] Session cleared")
                             continue

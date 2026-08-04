@@ -209,3 +209,32 @@ def test_the_trigger_believes_the_provider_over_the_estimate():
         5_000, "s", overhead_tokens=0,
         observed_total_tokens=service.compaction_threshold + 1,
     )
+
+
+async def test_a_truncated_summary_is_retried_then_refused():
+    """A summary that ran out of output budget stops mid-sentence, and it
+    REPLACES the conversation — whatever it had not reached is gone. It looks
+    like a good summary, which is why it has to be caught by finish_reason
+    rather than by inspecting the prose."""
+    provider = ChaosProvider(mode="truncated")
+    service = _service(provider)
+
+    with pytest.raises(CompactionError):
+        await service.compact(_history())
+
+    assert provider.calls >= 2, "a truncated body deserves the same retry as an empty one"
+    assert provider.max_tokens_seen[1] == provider.max_tokens_seen[0] * 2
+
+
+@pytest.mark.parametrize(
+    "finish_reason", ["length", "max_tokens", "incomplete", "content_filter"],
+)
+def test_every_out_of_room_finish_reason_is_refused(finish_reason):
+    """Providers spell it differently; a fragment is a fragment."""
+    from flowly.compaction.summarizer import validated_summary_text
+    from flowly.providers.base import LLMResponse
+
+    with pytest.raises(CompactionError):
+        validated_summary_text(
+            LLMResponse(content="The conversation cov", finish_reason=finish_reason)
+        )

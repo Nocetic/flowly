@@ -5224,8 +5224,17 @@ class AgentLoop:
         if is_command and command in ("new", "clear"):
             session = self.sessions.get_or_create(msg.session_key)
             msg_count = len(session.messages)
-            session.clear()
+            # Not session.clear(): that keeps the compaction summary in
+            # metadata, and the summary anchor re-injects it on the next turn —
+            # so the model carried the whole previous conversation into a chat
+            # the user had just emptied.
+            session.reset_conversation_context()
             session.metadata["persona"] = self.context.persona
+            # The compaction service's own per-session counters describe
+            # history that no longer exists.
+            self.compaction.reset_session(msg.session_key)
+            self._last_turn_total_tokens.pop(msg.session_key, None)
+            self.context.invalidate_memory_snapshot(msg.session_key)
             self.sessions.save(session)
             logger.info(f"Session {msg.session_key} cleared via /{command}")
             if msg.channel in ("web", "imessage"):
@@ -5688,17 +5697,14 @@ class AgentLoop:
             # that both handled /compact and fell through to here would wait
             # on itself forever.
             _session_lock = self.compaction.session_lock(msg.session_key)
-            # Announce BEFORE the work: staged summarisation can take several
-            # LLM calls, and without this the clients show a frozen agent.
-            # But only when no other pass already owns this session's cycle —
-            # a second "started" while the first pass runs makes the UI
-            # notice flap between phases (observed live as a broken shimmer).
-            _announced = not _session_lock.locked()
-            if _announced:
-                await self._emit_compaction_event(
-                    msg.session_key, "started", total_tokens, 0, 0,
-                )
             _pre_lock_generation = self._compaction_generation(session)
+            # The UI cycle is owned by whoever HOLDS the lock — never by
+            # whoever observed it free. Announcing before acquiring looks
+            # equivalent but is not: emitting the event yields (it writes to a
+            # socket), and in that window a second pass sees an unlocked lock
+            # and announces too. Both then close their own cycle and the notice
+            # flaps between phases even though only one compaction ran.
+            _announced = False
             async with _session_lock:
                 _generation = self._compaction_generation(session)
                 if _generation != _pre_lock_generation:
@@ -5707,19 +5713,19 @@ class AgentLoop:
                     # session. Our snapshot describes history that no longer
                     # exists — summarising it again would burn an LLM call to
                     # produce a stale result the generation guard below would
-                    # discard anyway.
+                    # discard anyway. Silent: their cycle told the story.
                     result = None
                     history = self._history_with_summary_anchor(session)
                     session_snapshot_len = len(session.messages)
                     _concurrent = True
                 else:
-                    if not _announced:
-                        # We queued behind a pass that did NOT commit (it
-                        # failed or bailed); the cycle is ours now — open it.
-                        await self._emit_compaction_event(
-                            msg.session_key, "started", total_tokens, 0, 0,
-                        )
-                        _announced = True
+                    # Announce now that the cycle is provably ours. Staged
+                    # summarisation is several LLM calls, and without this the
+                    # clients show a frozen agent.
+                    await self._emit_compaction_event(
+                        msg.session_key, "started", total_tokens, 0, 0,
+                    )
+                    _announced = True
 
                     # Stop must reach compaction too. Staged summarisation is
                     # several provider round trips, so without this the user
@@ -5775,16 +5781,9 @@ class AgentLoop:
             if result is None and _concurrent:
                 # Not a failure: someone else's compaction already shrank this
                 # session, and `history` was re-read from it above. Nothing to
-                # trim. If we DID emit "started" before taking the lock, close
-                # the lifecycle in case the other path's "completed" fired
-                # before our "started" (event ordering across tasks is not
-                # guaranteed); if we never announced, stay silent — the other
-                # pass owns the UI cycle.
-                if _announced:
-                    _tokens_now = estimate_messages_tokens(history)
-                    await self._emit_compaction_event(
-                        msg.session_key, "completed", _tokens_now, _tokens_now, 0,
-                    )
+                # trim and — since we never announced — nothing to close. The
+                # pass that did the work owns the UI cycle.
+                pass
             elif result is None:
                 # Compaction failed. The SESSION IS LEFT UNTOUCHED — only this
                 # turn's working copy is trimmed, so nothing is lost on disk
@@ -7056,19 +7055,14 @@ class AgentLoop:
                 "tokens_after": tokens_before,
             }
 
-        # Notify clients that compaction is starting — unless another pass
-        # already owns this session's cycle (its "started" is on screen; a
-        # second one makes the notice flap between phases).
-        _session_lock = self.compaction.session_lock(session_key)
-        _announced = not _session_lock.locked()
-        if _announced:
-            await self._emit_compaction_event(
-                session_key, "started", tokens_before, 0, 0,
-            )
-
         # Serialise against the automatic path and against another device
         # asking for the same thing. Both end in a commit that clears the
         # session, and every caller shares one session object.
+        #
+        # The UI cycle is announced from INSIDE the lock — see the pre-turn
+        # path for why observing an unlocked lock is not the same as owning it.
+        _session_lock = self.compaction.session_lock(session_key)
+        _announced = False
         async with _session_lock:
             generation = self._compaction_generation(session)
             # Re-read inside the lock: whoever held it before us may have
@@ -7081,13 +7075,9 @@ class AgentLoop:
             # summarising the tiny result — and report it as a failure.
             not_worth_it = self._compaction_ineligible_reason(history)
             if not_worth_it:
+                # Nothing announced yet, so nothing to close — the caller gets
+                # the reason as an RPC result instead.
                 tokens_now = estimate_messages_tokens(history)
-                if _announced:
-                    # Close the lifecycle we opened, or the notice sits on
-                    # "started" with nothing running behind it.
-                    await self._emit_compaction_event(
-                        session_key, "completed", tokens_now, tokens_now, 0,
-                    )
                 return {
                     "success": False,
                     "message": not_worth_it,
@@ -7095,13 +7085,12 @@ class AgentLoop:
                     "tokens_after": tokens_now,
                 }
 
-            if not _announced:
-                # Queued behind a pass that did not commit — the cycle is
-                # ours now, open it.
-                await self._emit_compaction_event(
-                    session_key, "started", tokens_before, 0, 0,
-                )
-                _announced = True
+            # The cycle is provably ours now: we hold the lock and we know
+            # there is work to do.
+            await self._emit_compaction_event(
+                session_key, "started", tokens_before, 0, 0,
+            )
+            _announced = True
 
             # Run compaction. A failure must leave the session exactly as it
             # was: the manual path is the one users reach for when context is
@@ -7275,15 +7264,16 @@ class AgentLoop:
                 "budget — summarising in the background"
             )
             _session_lock = self.compaction.session_lock(session_key)
-            # Same announce discipline as the pre-turn path: a second
-            # "started" while another pass runs makes the UI notice flap.
-            _announced = not _session_lock.locked()
-            if _announced:
-                await self._emit_compaction_event(
-                    session_key, "started", history_tokens + overhead, 0, 0,
-                )
+            # Same ownership rule as the pre-turn path: the cycle belongs to
+            # whoever HOLDS the lock, not to whoever saw it free. See there.
+            _announced = False
+            pre_lock_generation = self._compaction_generation(session)
             async with _session_lock:
                 generation = self._compaction_generation(session)
+                if generation != pre_lock_generation:
+                    # Someone compacted while we queued. Their cycle already
+                    # told the user; ours would be a duplicate.
+                    return
                 # Re-read inside the lock — a manual /compact or a turn's own
                 # pre-turn pass may have already done the work while we waited.
                 history = self._history_with_summary_anchor(session)
@@ -7298,20 +7288,15 @@ class AgentLoop:
                         session_key, 0,
                     ),
                 ):
-                    if _announced:
-                        await self._emit_compaction_event(
-                            session_key, "completed",
-                            history_tokens, history_tokens, 0,
-                        )
+                    # Nothing to do and nothing announced — stay silent.
                     return
 
-                if not _announced:
-                    # Queued behind a pass that did not commit — the cycle
-                    # is ours now, open it.
-                    await self._emit_compaction_event(
-                        session_key, "started", history_tokens + overhead, 0, 0,
-                    )
-                    _announced = True
+                # The cycle is provably ours: we hold the lock and the
+                # generation still matches what we measured against.
+                await self._emit_compaction_event(
+                    session_key, "started", history_tokens + overhead, 0, 0,
+                )
+                _announced = True
 
                 try:
                     result = await self.compaction.compact(

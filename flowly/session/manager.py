@@ -5,17 +5,16 @@ import os
 import secrets
 from collections import OrderedDict
 from collections.abc import Iterator
-from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from flowly.media.assets import assets_to_meta as _assets_to_meta
-from flowly.utils.helpers import ensure_dir, safe_filename
 from flowly.profile import get_flowly_home
-
+from flowly.utils.helpers import ensure_dir, safe_filename
 
 # Suffix of the append-only DISPLAY transcript that rides alongside each
 # canonical ``<key>.jsonl``. It shares the ``*.jsonl`` glob, so EVERY consumer
@@ -532,9 +531,47 @@ class Session:
             self.metadata["last_turn_usage"] = clean_usage
 
     def clear(self) -> None:
-        """Clear all messages in the session."""
+        """Clear all messages in the session.
+
+        Messages ONLY. Metadata that carries conversational context survives —
+        see :meth:`reset_conversation_context`, which is what ``/clear`` and
+        ``/new`` must call.
+        """
         self.messages = []
         self.updated_at = datetime.now()
+
+    #: Metadata that survives a ``/clear``. An ALLOWLIST, deliberately: these
+    #: describe the conversation's identity and settings, not its content.
+    #: Anything else is treated as content-derived and dropped, so a metadata
+    #: key added later cannot silently leak the old conversation into the new
+    #: one — the failure mode this list exists to prevent.
+    CONTEXT_FREE_METADATA_KEYS = frozenset({
+        "persona",            # the agent's configured voice, not conversation
+        "title",              # the chat's name in every client's list
+        "title_provisional",  # whether that name is still a placeholder
+        "cwd",                # the working directory pinned to this chat
+        "model_override",     # the model the user picked for this chat
+        "visibility",
+    })
+
+    def reset_conversation_context(self) -> None:
+        """Start a fresh conversation under the same session key.
+
+        Clearing the message list alone is not a fresh start. The compaction
+        summary lives in ``metadata['last_compaction_summary']`` and is
+        re-injected at the head of every subsequent turn by the summary
+        anchor — so after ``/clear`` the model kept being told everything the
+        previous conversation had established, while the user (and the
+        transcript) saw an empty chat.
+
+        Group-chat buffers, compaction bookkeeping and any other
+        content-derived state are dropped for the same reason.
+        """
+        self.clear()
+        self.metadata = {
+            k: v for k, v in self.metadata.items()
+            if k in self.CONTEXT_FREE_METADATA_KEYS
+        }
 
     def drop_last_assistant_chain(self) -> str | None:
         """Remove trailing assistant + tool messages; return last user text.

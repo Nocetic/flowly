@@ -161,4 +161,9 @@ DESTRUCTIVE_MODES: tuple[ChaosMode, ...] = (
     "error_envelope",
     "error_finish",
     "raise",
+    # A truncated summary reads like a good one — well-formed prose that
+    # simply stops. Committed, it replaces the conversation with a fragment
+    # and everything it had not reached yet is gone. It belongs here, and its
+    # absence is exactly why the gap survived a green suite.
+    "truncated",
 )
