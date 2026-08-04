@@ -1176,7 +1176,20 @@ class WebChannel(BaseChannel):
                             "type": "event",
                             "sessionId": session_id,
                             "event": "chat",
-                            "data": {"state": "streaming", "runId": run_id, "delta": delta},
+                            # sessionKey is how the relay routes this to the
+                            # CONVERSATION rather than to the socket the turn
+                            # started on. Without it the relay falls back to
+                            # the originating session id — and a client that
+                            # reconnected mid-turn (a long compaction is
+                            # enough) never receives the rest of its own
+                            # reply. It shows up only on re-entry, restored
+                            # from chat.inflight.
+                            "data": {
+                                "state": "streaming",
+                                "runId": run_id,
+                                "sessionKey": session_key,
+                                "delta": delta,
+                            },
                         }
                     )
                 )
@@ -1286,7 +1299,14 @@ class WebChannel(BaseChannel):
                             "type": "event",
                             "sessionId": session_id,
                             "event": "chat",
-                            "data": {"state": "aborted", "runId": run_id},
+                            # Same routing requirement as the streaming and
+                            # final events: without sessionKey the relay can
+                            # only reach the socket the turn started on.
+                            "data": {
+                                "state": "aborted",
+                                "runId": run_id,
+                                "sessionKey": self._session_key_for_relay_id(session_id),
+                            },
                         }
                     )
                 )

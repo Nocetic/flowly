@@ -249,7 +249,13 @@ async def test_legacy_abort_keeps_terminal_event_for_old_embedders(channel) -> N
 
     assert ws.send.await_count == 2
     terminal = json.loads(ws.send.await_args_list[1].args[0])
-    assert terminal["data"] == {"state": "aborted", "runId": "run-stopped"}
+    assert terminal["data"]["state"] == "aborted"
+    assert terminal["data"]["runId"] == "run-stopped"
+    # sessionKey is how the relay routes this to the CONVERSATION rather than
+    # to the socket the turn started on — a client that reconnected mid-turn
+    # would otherwise never learn the run had ended. Additive: old embedders
+    # ignore fields they do not read.
+    assert terminal["data"]["sessionKey"] == "web:sess-1"
 
 
 @pytest.mark.asyncio

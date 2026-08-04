@@ -278,3 +278,25 @@ def test_anchor_not_duplicated_when_the_window_holds_a_flagged_summary():
     history = _Loop()._history_with_summary_anchor(session)
 
     assert sum(1 for m in history if is_summary_message(m)) <= 1
+
+
+def test_every_relay_chat_event_carries_its_session_key():
+    """The relay routes conversation-scoped events by data.sessionKey and only
+    falls back to the ORIGINATING session id. A client that reconnected
+    mid-turn — a long compaction is enough — then never receives the rest of
+    its own reply; it surfaces only on re-entry via chat.inflight.
+
+    streaming and aborted were missing it while final and iteration_step
+    carried it, so a long turn silently stopped updating live."""
+    import re
+    from pathlib import Path
+
+    src = Path("flowly/channels/web.py").read_text()
+    # Every relay-bound `"event": "chat"` payload must include sessionKey.
+    blocks = re.findall(r'"event": "chat",\s*(?:#[^\n]*\n\s*)*"data": \{(.*?)\}', src, re.S)
+    assert blocks, "no relay chat events found — did the shape change?"
+    for block in blocks:
+        assert "sessionKey" in block, (
+            f"a relay chat event omits sessionKey and can only reach the "
+            f"originating socket:\n{block[:200]}"
+        )
