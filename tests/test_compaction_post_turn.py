@@ -326,3 +326,81 @@ def test_commit_without_a_snapshot_behaves_exactly_as_before():
     roles = [m["role"] for m in session.messages]
     assert roles == ["system", "user"], "summary + kept tail only"
     assert history[-1] == {"role": "user", "content": "kept question"}
+
+
+# ── Reasoning models must not starve the summary ──────────────────────────
+
+
+class _ReasoningStarvedProvider(_Provider):
+    """Empty body unless the output budget is generous — the observed live
+    failure mode: max_tokens bounds hidden reasoning AND the answer together,
+    and a 3000-token reserve let the reasoning eat all of it."""
+
+    def __init__(self, needs: int):
+        super().__init__()
+        self.needs = needs
+        self.budgets_seen: list[int] = []
+
+    async def chat(self, *args, **kwargs):
+        from flowly.providers.base import LLMResponse
+
+        self.calls += 1
+        budget = int(kwargs.get("max_tokens") or 0)
+        self.budgets_seen.append(budget)
+        if budget < self.needs:
+            return LLMResponse(content="", finish_reason="length")
+        return LLMResponse(
+            content="A grounded summary of the debugging session.",
+            finish_reason="stop",
+        )
+
+
+async def test_summary_call_never_runs_on_a_starving_budget():
+    from flowly.compaction.summarizer import (
+        MIN_SUMMARY_OUTPUT_TOKENS,
+        generate_summary,
+    )
+
+    provider = _ReasoningStarvedProvider(needs=MIN_SUMMARY_OUTPUT_TOKENS)
+    text = await generate_summary(
+        [{"role": "user", "content": "long story"}],
+        provider,
+        "m",
+        reserve_tokens=3000,  # the live config that starved the call
+    )
+
+    assert "grounded summary" in text
+    assert provider.budgets_seen[0] >= MIN_SUMMARY_OUTPUT_TOKENS
+
+
+async def test_an_empty_body_gets_one_doubled_retry_then_fails_loudly():
+    from flowly.compaction.summarizer import (
+        MIN_SUMMARY_OUTPUT_TOKENS,
+        generate_summary,
+    )
+    from flowly.compaction.types import CompactionError
+
+    # Succeeds only on the doubled retry.
+    provider = _ReasoningStarvedProvider(needs=MIN_SUMMARY_OUTPUT_TOKENS * 2)
+    text = await generate_summary(
+        [{"role": "user", "content": "long story"}], provider, "m",
+        reserve_tokens=3000,
+    )
+    assert "grounded summary" in text
+    assert provider.budgets_seen == [
+        MIN_SUMMARY_OUTPUT_TOKENS,
+        MIN_SUMMARY_OUTPUT_TOKENS * 2,
+    ]
+
+    # Never succeeds: exactly two attempts, then the error propagates so the
+    # caller keeps its uncompacted history.
+    hopeless = _ReasoningStarvedProvider(needs=10**9)
+    try:
+        await generate_summary(
+            [{"role": "user", "content": "long story"}], hopeless, "m",
+            reserve_tokens=3000,
+        )
+        raise AssertionError("an empty summary was accepted")
+    except CompactionError:
+        pass
+    assert hopeless.calls == 2

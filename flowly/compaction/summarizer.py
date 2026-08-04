@@ -90,6 +90,12 @@ def validated_summary_text(response: Any) -> str:
 # know WHICH file, not to carry it again.
 _MAX_TOOL_ARG_CHARS = 200
 
+# Floor for the summarization call's ``max_tokens``. On reasoning models the
+# limit bounds hidden thinking AND the answer together, so a small configured
+# reserve starves the answer out entirely. The reserve still wins when it is
+# larger; this only stops it starving the call.
+MIN_SUMMARY_OUTPUT_TOKENS = 8192
+
 
 def _render_tool_calls(message: dict[str, Any]) -> str:
     """Render an assistant turn's tool calls as readable transcript lines.
@@ -293,15 +299,22 @@ async def generate_summary(
         custom_instructions=custom_instructions or "No additional instructions.",
         previous_summary=previous_summary or "No previous context.",
     )
+    prompt_messages = [
+        {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    # Call LLM
+    # ``max_tokens`` bounds reasoning AND answer together on reasoning models
+    # (DeepSeek, o-series, …). A small configured reserve (observed live:
+    # 3000) lets the model burn the whole budget on hidden thinking and hand
+    # back an empty body — flakily, because whether the reasoning fits is up
+    # to the model's mood that call.
+    output_budget = max(reserve_tokens, MIN_SUMMARY_OUTPUT_TOKENS)
+
     response = await provider.chat(
-        messages=[
-            {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
+        messages=prompt_messages,
         model=model,
-        max_tokens=reserve_tokens,
+        max_tokens=output_budget,
     )
 
     # NOTE: the invented-user check deliberately does NOT run here. This
@@ -309,7 +322,24 @@ async def generate_summary(
     # contain no user message (a long assistant + tool run), so checking here
     # would reject legitimate summaries and fail the whole compaction. The
     # caller applies it once, against the full message set.
-    return validated_summary_text(response)
+    try:
+        return validated_summary_text(response)
+    except CompactionError as e:
+        if "empty summary" not in str(e):
+            raise
+        # One more attempt with doubled room: the common cause of an empty
+        # body is reasoning that outgrew the budget, and doubling it is
+        # cheaper than failing the whole compaction into an emergency trim.
+        logger.warning(
+            f"Summarization returned an empty body — retrying with "
+            f"{output_budget * 2} output tokens"
+        )
+        response = await provider.chat(
+            messages=prompt_messages,
+            model=model,
+            max_tokens=output_budget * 2,
+        )
+        return validated_summary_text(response)
 
 
 async def summarize_chunks(
