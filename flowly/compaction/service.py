@@ -9,8 +9,8 @@ from loguru import logger
 
 from flowly.compaction.estimator import estimate_messages_tokens
 from flowly.compaction.pruning import (
-    prune_history_for_context_share,
     compute_adaptive_chunk_ratio,
+    prune_history_for_context_share,
     split_into_turn_blocks,
 )
 from flowly.compaction.summarizer import (
@@ -18,11 +18,10 @@ from flowly.compaction.summarizer import (
     summarize_in_stages,
 )
 from flowly.compaction.types import (
+    SILENT_REPLY_TOKEN,
     CompactionConfig,
     CompactionError,
     CompactionResult,
-    SILENT_REPLY_TOKEN,
-    SAFETY_MARGIN,
     build_summary_content,
 )
 from flowly.providers.base import LLMProvider

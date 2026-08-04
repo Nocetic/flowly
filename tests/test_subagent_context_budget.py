@@ -20,7 +20,6 @@ from flowly.agent.subagent import (
 )
 from flowly.compaction.estimator import estimate_messages_tokens
 
-
 # Realistic prose, not a repeated character: a long run of one character is a
 # pathological input for BPE tokenizers and made this file take minutes.
 _LINE = "2026-08-04 04:12:33 INFO worker finished batch 41 in 182ms; queue depth 7\n"

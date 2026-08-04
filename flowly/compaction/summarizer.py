@@ -6,19 +6,19 @@ from typing import Any
 
 from loguru import logger
 
-from flowly.compaction.estimator import estimate_messages_tokens, estimate_message_tokens
+from flowly.compaction.estimator import estimate_message_tokens, estimate_messages_tokens
 from flowly.compaction.pruning import (
     chunk_messages_by_max_tokens,
-    split_messages_by_token_share,
     is_oversized_for_summary,
+    split_messages_by_token_share,
 )
 from flowly.compaction.redaction import redact_secrets
 from flowly.compaction.types import (
-    CompactionError,
-    DEFAULT_SUMMARY_FALLBACK,
     DEFAULT_PARTS,
+    DEFAULT_SUMMARY_FALLBACK,
     MERGE_SUMMARIES_INSTRUCTIONS,
     SAFETY_MARGIN,
+    CompactionError,
 )
 from flowly.providers.base import LLMProvider
 

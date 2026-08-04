@@ -22,10 +22,10 @@ import pytest
 
 from flowly.compaction.service import CompactionService
 from flowly.compaction.types import (
+    SUMMARY_MARKER,
     CompactionConfig,
     CompactionError,
     KeepRecentConfig,
-    SUMMARY_MARKER,
     is_summary_message,
 )
 from flowly.providers.base import LLMResponse

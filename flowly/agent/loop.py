@@ -41,7 +41,6 @@ from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
 from flowly.compaction.types import (
     CompactionConfig,
-    MemoryFlushConfig,
     SUMMARY_METADATA_KEY,
     build_summary_content,
     is_summary_message,
@@ -5590,27 +5589,15 @@ class AgentLoop:
         history = self._history_with_summary_anchor(session)
         session_snapshot_len = len(session.messages)
 
-        # Estimate total context: history + system prompt overhead.
-        # Build actual system prompt to get accurate token count (avoids fixed 6K estimate drift).
-        # Pass self.model AND msg.channel so the family-aware block
-        # and the channel hint are both counted toward the estimate;
-        # otherwise GPT/Gemini/Chinese + non-cli channels would
-        # under-estimate by ~1-3K tokens and trip compaction late.
-        try:
-            sys_prompt = self.context.build_system_prompt(
-                memory_search_enabled=self._memory_manager is not None,
-                model=self.model,
-                channel=msg.channel,
-            )
-            system_prompt_tokens = estimate_tokens(sys_prompt)
-        except Exception:
-            system_prompt_tokens = 6000  # fallback
-        # Everything else the FIRST provider call will carry: the incoming
-        # message, its attachments, and the tool schemas. Leaving these out
-        # let a turn pass the check at 55K and then hit the wire at 80K —
-        # the request is what has to fit, not the history alone.
-        turn_input_tokens = self._estimate_turn_input_tokens(msg)
-        fixed_overhead = system_prompt_tokens + turn_input_tokens
+        # Estimate the fixed overhead the FIRST provider call will carry: the
+        # system prompt plus the incoming message, its attachments, and the
+        # tool schemas. Leaving these out let a turn pass the check at 55K and
+        # then hit the wire at 80K — the request is what has to fit, not the
+        # history alone.
+        fixed_overhead = (
+            self._system_prompt_tokens(msg.channel)
+            + self._estimate_turn_input_tokens(msg)
+        )
         history_tokens = estimate_messages_tokens(history)
         total_tokens = history_tokens + fixed_overhead
 
@@ -5639,7 +5626,11 @@ class AgentLoop:
         if self.compaction.should_compact(
             history_tokens, msg.session_key, overhead_tokens=fixed_overhead,
         ):
-            logger.info(f"Compacting context: {total_tokens} tokens exceeds threshold")
+            logger.info(
+                f"Compacting context: {history_tokens}-token history over its "
+                f"{self.compaction.history_budget(fixed_overhead)}-token budget "
+                f"({fixed_overhead} fixed overhead, {total_tokens} total)"
+            )
             # Announce BEFORE the work: staged summarisation can take several
             # LLM calls, and without this the clients show a frozen agent.
             await self._emit_compaction_event(
@@ -6712,6 +6703,22 @@ class AgentLoop:
         self._tool_schema_token_cache = (key, tokens)
         return tokens
 
+    def _system_prompt_tokens(self, channel: str) -> int:
+        """Token cost of the system prompt as the next request will carry it.
+
+        Built for real (not a fixed estimate) so model-family blocks and the
+        channel hint are counted; the 6K fallback only covers a build failure.
+        """
+        try:
+            sys_prompt = self.context.build_system_prompt(
+                memory_search_enabled=self._memory_manager is not None,
+                model=self.model,
+                channel=channel,
+            )
+            return estimate_tokens(sys_prompt)
+        except Exception:  # noqa: BLE001
+            return 6000
+
     def _estimate_turn_input_tokens(self, msg: InboundMessage) -> int:
         """Tokens this turn adds on top of the history: the user's message,
         their attachments, and the tool schemas."""
@@ -7121,15 +7128,7 @@ class AgentLoop:
             # unknowable here, so this is system prompt + tool schemas only —
             # slightly optimistic, and the pre-turn check (which sees the real
             # message) remains the backstop.
-            try:
-                sys_prompt = self.context.build_system_prompt(
-                    memory_search_enabled=self._memory_manager is not None,
-                    model=self.model,
-                    channel=msg.channel,
-                )
-                overhead = estimate_tokens(sys_prompt) + self._tool_schema_tokens()
-            except Exception:
-                overhead = 6000 + self._tool_schema_tokens()
+            overhead = self._system_prompt_tokens(msg.channel) + self._tool_schema_tokens()
 
             # Memory flush first, exactly like the pre-turn order: extract
             # durable memories from the history WHILE it is still verbatim.

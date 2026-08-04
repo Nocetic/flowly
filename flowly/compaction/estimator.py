@@ -5,8 +5,9 @@ different tokenizer internally but cl100k_base is a close enough
 proxy (typically within 5-10% of actual Claude token counts).
 """
 
-import tiktoken
 from typing import Any
+
+import tiktoken
 
 # Cache the encoder
 _encoder: tiktoken.Encoding | None = None

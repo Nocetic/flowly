@@ -81,6 +81,7 @@ class _Harness:
 
     _commit_compaction = AgentLoop._commit_compaction
     _history_with_summary_anchor = AgentLoop._history_with_summary_anchor
+    _system_prompt_tokens = AgentLoop._system_prompt_tokens
     _compaction_generation = staticmethod(AgentLoop._compaction_generation)
     _post_turn_compaction = AgentLoop._post_turn_compaction
     _schedule_post_turn_compaction = AgentLoop._schedule_post_turn_compaction

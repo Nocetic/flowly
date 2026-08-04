@@ -18,7 +18,6 @@ from flowly.compaction.summarizer import (
 from flowly.compaction.types import CompactionError
 from flowly.providers.base import LLMResponse
 
-
 # ── Reasoning traces ──────────────────────────────────────────────────────
 
 

@@ -2,12 +2,12 @@
 
 from typing import Any
 
-from flowly.compaction.estimator import estimate_messages_tokens, estimate_message_tokens
+from flowly.compaction.estimator import estimate_message_tokens, estimate_messages_tokens
 from flowly.compaction.types import (
     BASE_CHUNK_RATIO,
+    DEFAULT_PARTS,
     MIN_CHUNK_RATIO,
     SAFETY_MARGIN,
-    DEFAULT_PARTS,
 )
 
 
