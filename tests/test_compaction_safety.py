@@ -452,3 +452,42 @@ def test_budget_shrinks_as_overhead_grows():
 
     assert service.history_budget(0) == 90_000
     assert service.history_budget(30_000) == 60_000
+
+
+def test_the_preserved_tail_scales_with_the_room_available():
+    """The second live failure. keep_recent's cap was an absolute 20K, so on a
+    small budget it preserved 93% of an 8K history verbatim, left almost
+    nothing to summarise, and produced a "compaction" that GREW the context:
+
+        Keeping 13 recent messages (~7716 tokens), summarizing 8
+        would not reduce context (8269 -> 8351 tokens)
+    """
+    service = _service(_Provider(LLMResponse(content="s", finish_reason="stop")))
+
+    assert service._keep_recent_cap(6_300) < 6_300 / 2, "tail must leave room to compress"
+    assert service._keep_recent_cap(0) == service.config.keep_recent.max_tokens
+    # Never exceeds the absolute ceiling on a large window.
+    assert service._keep_recent_cap(10_000_000) == service.config.keep_recent.max_tokens
+
+
+async def test_the_exact_live_failure_now_reduces():
+    """Reproduces the logged numbers: ~8K of history inside a ~6.3K budget."""
+    provider = _Provider(LLMResponse(content="## Decisions\nShort.", finish_reason="stop"))
+    service = _service(provider, context_window=79_000, reserve_tokens_floor=3_000)
+    budget = service.history_budget(69_700)
+
+    messages = _conversation(21, filler="word " * 90)
+    result = await service.compact(messages, history_budget=budget)
+
+    assert result.tokens_after < result.tokens_before
+    assert result.tokens_after <= budget, "the point is to fit in the room we have"
+
+
+async def test_a_tiny_budget_still_produces_a_reduction():
+    provider = _Provider(LLMResponse(content="Summary.", finish_reason="stop"))
+    service = _service(provider, context_window=20_000, reserve_tokens_floor=2_000)
+
+    messages = _conversation(30)
+    result = await service.compact(messages, history_budget=1_500)
+
+    assert result.tokens_after < result.tokens_before

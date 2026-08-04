@@ -432,8 +432,24 @@ class CompactionService:
 
         return result
 
+    def _keep_recent_cap(self, history_budget: int) -> int:
+        """How many tokens the preserved tail may occupy.
+
+        A share of the room available for history, floored by the configured
+        ceiling. An absolute cap alone is wrong in both directions: on a large
+        window it preserves too little to be useful, and on a small one it
+        preserves nearly everything, leaving compaction nothing to compress.
+        """
+        cap = self.config.keep_recent.max_tokens
+        if history_budget > 0:
+            share = max(0.05, min(self.config.keep_recent.max_share, 0.8))
+            cap = min(cap, max(1, int(history_budget * share)))
+        return cap
+
     def _calculate_keep_recent(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        history_budget: int = 0,
     ) -> list[dict[str, Any]]:
         """
         Determine which recent messages to preserve after compaction.
@@ -456,6 +472,7 @@ class CompactionService:
         if not cfg.enabled or not messages:
             return []
 
+        cap = self._keep_recent_cap(history_budget)
         blocks = split_into_turn_blocks(messages)
         kept_blocks: list[list[dict[str, Any]]] = []
         tokens_acc = 0
@@ -465,9 +482,9 @@ class CompactionService:
             block_tokens = estimate_messages_tokens(block)
 
             # Hard cap — never split a block to squeeze under it.
-            if kept_blocks and tokens_acc + block_tokens > cfg.max_tokens:
+            if kept_blocks and tokens_acc + block_tokens > cap:
                 break
-            if not kept_blocks and block_tokens > cfg.max_tokens:
+            if not kept_blocks and block_tokens > cap:
                 # Even the newest block alone busts the cap; summarize
                 # everything rather than emit a half block.
                 return []
@@ -482,7 +499,7 @@ class CompactionService:
                         text_msg_count += 1
 
             # Met both minimums — stop
-            if tokens_acc >= cfg.min_tokens and text_msg_count >= cfg.min_messages:
+            if tokens_acc >= min(cfg.min_tokens, cap) and text_msg_count >= cfg.min_messages:
                 break
 
         kept_blocks.reverse()
@@ -495,6 +512,7 @@ class CompactionService:
         previous_summary: str | None = None,
         session_key: str = "",
         should_cancel: "Callable[[], bool] | None" = None,
+        history_budget: int = 0,
     ) -> CompactionResult:
         """
         Compact messages by generating a summary.
@@ -506,6 +524,9 @@ class CompactionService:
             session_key: Session whose counters this attempt belongs to.
             should_cancel: Polled between provider round trips; returning True
                 aborts the attempt and leaves the history untouched.
+            history_budget: Room the conversation may occupy after this runs.
+                Sizes the preserved tail — without it the tail is capped by an
+                absolute number that can exceed the whole history.
 
         Returns:
             CompactionResult with summary and statistics.
@@ -530,7 +551,7 @@ class CompactionService:
         window = self.effective_context_window
 
         # Determine which recent messages to preserve verbatim
-        kept_messages = self._calculate_keep_recent(messages)
+        kept_messages = self._calculate_keep_recent(messages, history_budget)
         kept_count = len(kept_messages)
 
         # Only summarize messages NOT in the kept set
@@ -698,6 +719,7 @@ class CompactionService:
         try:
             result = await self.compact(
                 messages, custom_instructions, session_key=session_key,
+                history_budget=self.history_budget(),
             )
         except CompactionError as e:
             logger.error(f"Compaction failed, keeping full history: {e}")

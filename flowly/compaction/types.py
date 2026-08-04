@@ -42,8 +42,13 @@ class KeepRecentConfig:
     min_tokens: int = 5_000
     # Minimum number of user/assistant text messages to preserve
     min_messages: int = 3
-    # Maximum tokens of recent messages to preserve (hard cap)
+    # Absolute ceiling on the preserved tail.
     max_tokens: int = 20_000
+    # …and the one that actually governs. The tail must be a SHARE of the room
+    # available for history, never a fixed number: preserving 20K of an 8K
+    # history keeps 93% of it verbatim, leaves almost nothing to summarise, and
+    # produces a "compaction" that grows the context instead of shrinking it.
+    max_share: float = 0.25
 
 
 @dataclass

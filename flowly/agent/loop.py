@@ -5650,6 +5650,7 @@ class AgentLoop:
                         history,
                         session_key=msg.session_key,
                         should_cancel=_cancelled,
+                        history_budget=self.compaction.history_budget(fixed_overhead),
                     )
                 except Exception as e:
                     logger.error(f"Compaction failed: {e}")
@@ -6937,6 +6938,7 @@ class AgentLoop:
                     history,
                     custom_instructions=custom_instructions,
                     session_key=session_key,
+                    history_budget=self.compaction.history_budget(),
                 )
             except Exception as e:
                 logger.error(f"Manual compaction failed: {e}")
