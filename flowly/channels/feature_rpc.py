@@ -505,6 +505,18 @@ def chat_inflight(params: dict) -> dict:
         result["plan"] = plan.public_view() if plan else None
     except Exception:
         result["plan"] = None
+    # Same idea for compaction: a client reopening a chat while the agent is
+    # summarising would otherwise see an idle transcript and a stalled turn.
+    try:
+        import time as _time
+
+        from flowly.agent import compaction_status
+
+        result["compaction"] = (
+            compaction_status.get(session_key, _time.time()) if session_key else None
+        )
+    except Exception:
+        result["compaction"] = None
     return result
 
 

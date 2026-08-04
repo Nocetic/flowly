@@ -1,6 +1,7 @@
 """Compaction service for managing context compression."""
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -452,6 +453,7 @@ class CompactionService:
         custom_instructions: str | None = None,
         previous_summary: str | None = None,
         session_key: str = "",
+        should_cancel: "Callable[[], bool] | None" = None,
     ) -> CompactionResult:
         """
         Compact messages by generating a summary.
@@ -461,6 +463,8 @@ class CompactionService:
             custom_instructions: Optional custom instructions for summarization.
             previous_summary: Optional previous summary to incorporate.
             session_key: Session whose counters this attempt belongs to.
+            should_cancel: Polled between provider round trips; returning True
+                aborts the attempt and leaves the history untouched.
 
         Returns:
             CompactionResult with summary and statistics.
@@ -549,6 +553,7 @@ class CompactionService:
                         window,
                         custom_instructions,
                         previous_summary,
+                        should_cancel=should_cancel,
                     )
 
         # Calculate adaptive chunk ratio
@@ -576,6 +581,7 @@ class CompactionService:
             window,
             custom_instructions,
             effective_previous,
+            should_cancel=should_cancel,
         )
 
         # Applied once, against the WHOLE conversation rather than a chunk: a

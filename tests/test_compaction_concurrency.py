@@ -348,3 +348,96 @@ async def test_the_session_lock_is_not_reentrant():
             await asyncio.wait_for(
                 service.session_lock("s1").acquire(), timeout=0.2,
             )
+
+
+# ── Cancellation and re-entry ─────────────────────────────────────────────
+
+
+async def test_compaction_stops_when_the_run_is_cancelled():
+    """Stop must reach compaction. Staged summarisation is several provider
+    round trips; without a check between them the user watches a turn they
+    already cancelled run to completion."""
+    from flowly.compaction.types import CompactionError
+
+    provider = _SlowProvider(delay=0.01)
+    service = _service(provider)
+    cancelled = {"now": False}
+
+    long_history = []
+    for i in range(40):
+        long_history.append({"role": "user", "content": f"q{i} " + "word " * 120})
+        long_history.append({"role": "assistant", "content": f"a{i} " + "word " * 120})
+
+    with pytest.raises(CompactionError, match="cancelled"):
+        await service.compact(
+            long_history,
+            should_cancel=lambda: cancelled["now"] or _flip(cancelled),
+        )
+
+
+def _flip(state):
+    """Report not-cancelled once, then cancelled — i.e. cancel mid-run."""
+    state["now"] = True
+    return False
+
+
+async def test_a_cancelled_compaction_changes_nothing():
+    from flowly.compaction.types import CompactionError
+
+    service = _service(_SlowProvider(delay=0.01))
+    history = [{"role": "user", "content": "x " + "word " * 200}] * 20
+    snapshot = [dict(m) for m in history]
+
+    with pytest.raises(CompactionError):
+        await service.compact(history, should_cancel=lambda: True)
+
+    assert history == snapshot
+
+
+def test_compaction_status_is_readable_by_a_returning_client():
+    """A client that reopens a chat mid-summarisation has missed the event.
+    chat.inflight is the re-entry handshake, so the state has to live
+    somewhere it can read."""
+    from flowly.agent import compaction_status
+
+    compaction_status.clear("s1")
+    compaction_status.record("s1", "started", 90_000, 0, 0, now=1_000.0)
+
+    state = compaction_status.get("s1", now=1_005.0)
+
+    assert state is not None
+    assert state["phase"] == "started"
+    assert state["sessionKey"] == "s1"
+    assert "at" not in state, "internal timestamp must not reach clients"
+
+
+def test_a_running_compaction_is_reported_however_long_it_takes():
+    from flowly.agent import compaction_status
+
+    compaction_status.clear("s2")
+    compaction_status.record("s2", "started", 90_000, 0, 0, now=0.0)
+
+    assert compaction_status.get("s2", now=10_000.0) is not None
+
+
+def test_a_finished_compaction_stops_being_news():
+    """Otherwise every reopened chat greets the user with a summarisation
+    that happened yesterday."""
+    from flowly.agent import compaction_status
+
+    compaction_status.clear("s3")
+    compaction_status.record("s3", "completed", 90_000, 12_000, 40, now=0.0)
+
+    assert compaction_status.get("s3", now=5.0) is not None, "recent: still shown"
+    assert compaction_status.get(
+        "s3", now=compaction_status.TERMINAL_TTL_SECONDS + 1,
+    ) is None, "stale: dropped"
+
+
+def test_status_map_does_not_grow_without_bound():
+    from flowly.agent import compaction_status
+
+    for i in range(compaction_status.MAX_TRACKED + 100):
+        compaction_status.record(f"bulk-{i}", "completed", 1, 0, 1, now=float(i))
+
+    assert len(compaction_status._STATE) <= compaction_status.MAX_TRACKED

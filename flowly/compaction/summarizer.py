@@ -1,6 +1,7 @@
 """Message summarization for compaction."""
 
 import re
+from collections.abc import Callable
 from typing import Any
 
 from loguru import logger
@@ -319,6 +320,7 @@ async def summarize_chunks(
     max_chunk_tokens: int,
     custom_instructions: str | None = None,
     previous_summary: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str:
     """
     Summarize messages by chunking them first.
@@ -342,6 +344,12 @@ async def summarize_chunks(
     summary = previous_summary
 
     for chunk in chunks:
+        # Staged summarisation is several provider round trips. Without a
+        # check between them, pressing Stop left the user watching a turn they
+        # had already cancelled. Cancelling raises, which routes into the
+        # ordinary failure path — history untouched.
+        if should_cancel is not None and should_cancel():
+            raise CompactionError("compaction cancelled")
         summary = await generate_summary(
             chunk,
             provider,
@@ -363,6 +371,7 @@ async def summarize_with_fallback(
     context_window: int,
     custom_instructions: str | None = None,
     previous_summary: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str:
     """
     Summarize with progressive fallback for handling oversized messages.
@@ -394,6 +403,7 @@ async def summarize_with_fallback(
             max_chunk_tokens,
             custom_instructions,
             previous_summary,
+            should_cancel,
         )
     except Exception as e:
         last_error = e
@@ -423,6 +433,7 @@ async def summarize_with_fallback(
                 max_chunk_tokens,
                 custom_instructions,
                 previous_summary,
+                should_cancel,
             )
             notes = "\n\n" + "\n".join(oversized_notes) if oversized_notes else ""
             return partial_summary + notes
@@ -451,6 +462,7 @@ async def summarize_in_stages(
     previous_summary: str | None = None,
     parts: int = DEFAULT_PARTS,
     min_messages_for_split: int = 4,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str:
     """
     Summarize messages in stages for better quality.
@@ -496,6 +508,7 @@ async def summarize_in_stages(
             context_window,
             custom_instructions,
             previous_summary,
+            should_cancel=should_cancel,
         )
 
     # Split messages by token share
@@ -513,6 +526,7 @@ async def summarize_in_stages(
             context_window,
             custom_instructions,
             previous_summary,
+            should_cancel=should_cancel,
         )
 
     # Summarize each part
@@ -527,6 +541,7 @@ async def summarize_in_stages(
             context_window,
             custom_instructions,
             previous_summary=None,  # Don't chain previous for parts
+            should_cancel=should_cancel,
         )
         partial_summaries.append(summary)
 
@@ -553,6 +568,7 @@ async def summarize_in_stages(
         context_window,
         merge_instructions,
         previous_summary,
+        should_cancel=should_cancel,
     )
 
 

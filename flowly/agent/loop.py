@@ -5628,9 +5628,19 @@ class AgentLoop:
             # on itself forever.
             async with self.compaction.session_lock(msg.session_key):
                 _generation = self._compaction_generation(session)
+                # Stop must reach compaction too. Staged summarisation is
+                # several provider round trips, so without this the user
+                # watches a turn they already cancelled run to completion.
+                _run_id = str(msg.metadata.get("run_id") or "")
+
+                def _cancelled() -> bool:
+                    return bool(_run_id) and self.is_run_aborted(_run_id)
+
                 try:
                     result = await self.compaction.compact(
-                        history, session_key=msg.session_key,
+                        history,
+                        session_key=msg.session_key,
+                        should_cancel=_cancelled,
                     )
                 except Exception as e:
                     logger.error(f"Compaction failed: {e}")
@@ -6752,7 +6762,22 @@ class AgentLoop:
         tokens_after: int,
         messages_removed: int,
     ) -> None:
-        """Push one compaction lifecycle event. Never raises."""
+        """Push one compaction lifecycle event. Never raises.
+
+        Also records the phase so ``chat.inflight`` can hand it to a client
+        that arrives after the event fired — reopening a chat mid-summarisation
+        otherwise shows an idle transcript while the turn is visibly stalled.
+        """
+        try:
+            from flowly.agent import compaction_status
+
+            compaction_status.record(
+                session_key, phase, tokens_before, tokens_after,
+                messages_removed, time.time(),
+            )
+        except Exception:  # noqa: BLE001 — status is a convenience, not the event
+            logger.debug("[compaction] status record skipped (non-fatal)")
+
         if not self._on_compaction:
             return
         try:
