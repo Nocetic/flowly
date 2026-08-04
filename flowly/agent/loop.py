@@ -408,8 +408,26 @@ _EPHEMERAL_NUDGE = "_ephemeral_nudge"
 # message from their agent. Rich clients (relay web, desktop, iOS) draw it as
 # a divider and DO want it.
 _MARKER_UNSUPPORTED_CHANNELS = frozenset({
+    # Human messaging surfaces: no divider renderer, so the user would just
+    # receive the literal string as a message from their agent.
     "telegram", "discord", "slack", "teams", "whatsapp", "imessage", "email",
+    # Internal channels that reach no adapter at all. "cron" in particular is
+    # explicitly undeliverable (ChannelManager logs "Unknown channel: cron"),
+    # and post-turn compaction means a cron session can now compact with no
+    # user turn in sight — one warning per compaction, delivering nothing.
+    "cron", "system", "heartbeat",
 })
+
+# A memory-flush turn is one provider round trip. Bounded for the same reason
+# every other call on the compaction path is (see
+# ``summarizer.SUMMARY_CALL_TIMEOUT_SECONDS``).
+MEMORY_FLUSH_TIMEOUT_SECONDS = 120.0
+
+# Backstop for one whole post-turn pass (flush + staged summarisation + commit).
+# Generous: every call inside is already individually bounded, so reaching this
+# means something unforeseen wedged — and the session's background slot must
+# free itself rather than stay taken until the process restarts.
+POST_TURN_COMPACTION_TIMEOUT_SECONDS = 900.0
 
 
 def _drop_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4984,12 +5002,21 @@ class AgentLoop:
         # Add system prompt for flush context
         messages[0]["content"] += f"\n\n{system_prompt}"
 
-        # Run a single turn with tools available
+        # Run a single turn with tools available.
+        #
+        # Bounded like every other provider call on this path. Unbounded, a
+        # hung flush blocks the user's message outright on the pre-turn path
+        # (it runs before the turn's own LLM call), and on the post-turn path
+        # it wedges that session's background slot for the life of the
+        # process — no further post-turn compaction until a restart.
         try:
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
+            response = await asyncio.wait_for(
+                self.provider.chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                ),
+                timeout=MEMORY_FLUSH_TIMEOUT_SECONDS,
             )
 
             # Execute any tool calls (agent might want to write to memory)
@@ -5017,9 +5044,14 @@ class AgentLoop:
             session.add_message("assistant", content)
             self.sessions.save(session)
 
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Memory flush timed out after {MEMORY_FLUSH_TIMEOUT_SECONDS:.0f}s "
+                "— continuing without it"
+            )
         except Exception as e:
             logger.warning(f"Memory flush failed: {e}")
-    
+
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a single inbound message.
@@ -7180,7 +7212,15 @@ class AgentLoop:
         existing = self._post_turn_compaction_tasks.get(key)
         if existing is not None and not existing.done():
             return
-        task = asyncio.create_task(self._post_turn_compaction(msg))
+        # Bounded as a whole, not just per provider call: staged summarisation
+        # is many calls, and the "one pass per session" rule above means a
+        # single wedged pass would disable post-turn compaction for that
+        # session until the process restarts. The cap is generous — it is a
+        # backstop, not a deadline.
+        task = asyncio.create_task(asyncio.wait_for(
+            self._post_turn_compaction(msg),
+            timeout=POST_TURN_COMPACTION_TIMEOUT_SECONDS,
+        ))
         self._post_turn_compaction_tasks[key] = task
 
         def _reap(t: asyncio.Task, key: str = key) -> None:

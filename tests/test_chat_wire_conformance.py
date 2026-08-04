@@ -276,3 +276,14 @@ def test_chat_inflight_is_null_when_nothing_is_running():
     assert result["inflight"] is None
     assert result["compaction"] is None
     assert result["plan"] is None
+
+
+def test_the_marker_is_withheld_from_internal_channels():
+    """Post-turn compaction means a cron/system session can compact with no
+    user turn in sight. Those channel names reach no adapter at all — "cron"
+    is explicitly undeliverable — so publishing there is one warning per
+    compaction that delivers nothing."""
+    from flowly.agent.loop import _MARKER_UNSUPPORTED_CHANNELS
+
+    for channel_name in ("cron", "system", "heartbeat"):
+        assert channel_name in _MARKER_UNSUPPORTED_CHANNELS

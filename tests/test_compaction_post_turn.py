@@ -414,3 +414,41 @@ async def test_an_empty_body_gets_one_doubled_retry_then_fails_loudly():
     except CompactionError:
         pass
     assert hopeless.calls == 2
+
+
+# ── The background slot must always free itself ───────────────────────────
+
+
+async def test_a_wedged_pass_does_not_disable_the_session_forever():
+    """One pass per session is the rule; a pass that never returns would make
+    that rule permanent. Every call inside is individually bounded, so the
+    overall cap is a backstop — but without it, a single unforeseen wedge
+    means no post-turn compaction for that session until a restart."""
+    import flowly.agent.loop as loop_module
+
+    session = _big_session(turns=2)
+    harness = _Harness(session, context_window=100_000)
+    monkey = loop_module.POST_TURN_COMPACTION_TIMEOUT_SECONDS
+    loop_module.POST_TURN_COMPACTION_TIMEOUT_SECONDS = 0.1
+    try:
+        async def _wedged(msg):
+            await asyncio.sleep(3600)
+
+        harness._post_turn_compaction = _wedged
+
+        msg = _msg()
+        harness._schedule_post_turn_compaction(msg)
+        wedged_task = harness._post_turn_compaction_tasks[msg.session_key]
+        await asyncio.sleep(0.3)
+
+        assert wedged_task.done(), "the wedged pass was never cut off"
+        assert msg.session_key not in harness._post_turn_compaction_tasks, (
+            "the session's background slot stayed taken"
+        )
+
+        # And the session can schedule again.
+        harness._schedule_post_turn_compaction(msg)
+        assert msg.session_key in harness._post_turn_compaction_tasks
+        harness._post_turn_compaction_tasks[msg.session_key].cancel()
+    finally:
+        loop_module.POST_TURN_COMPACTION_TIMEOUT_SECONDS = monkey
