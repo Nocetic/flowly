@@ -409,6 +409,11 @@ _EPHEMERAL_NUDGE = "_ephemeral_nudge"
 # ``summarizer.SUMMARY_CALL_TIMEOUT_SECONDS``).
 MEMORY_FLUSH_TIMEOUT_SECONDS = 120.0
 
+# How long the post-turn pass waits before doing anything, so the turn's own
+# reply is on the wire before its compaction announces itself. See
+# ``_post_turn_compaction`` — this is an ordering requirement, not a fudge.
+POST_TURN_SETTLE_SECONDS = 2.0
+
 # Backstop for one whole post-turn pass (flush + staged summarisation + commit).
 # Generous: every call inside is already individually bounded, so reaching this
 # means something unforeseen wedged — and the session's background slot must
@@ -7239,6 +7244,16 @@ class AgentLoop:
         the session untouched": the pre-turn check still guards the next turn.
         """
         session_key = msg.session_key
+        # Let the turn's own reply reach the client first. This pass is
+        # scheduled from _process_message's finally, which runs BEFORE the
+        # caller publishes the reply — so without a settle the "started"
+        # notice can overtake it on the wire. Clients treat arriving content
+        # as proof a compaction finished (a stuck notice once hid a delivered
+        # answer), so an early "started" is wiped the instant the reply lands:
+        # observed live as a 15-second compaction with no visible shimmer.
+        # It also reads better — the answer, then the summarising notice.
+        if POST_TURN_SETTLE_SECONDS > 0:
+            await asyncio.sleep(POST_TURN_SETTLE_SECONDS)
         try:
             session = self.sessions.get_or_create(session_key)
             history = self._history_with_summary_anchor(session)

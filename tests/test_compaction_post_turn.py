@@ -16,6 +16,8 @@ Two behaviours live here:
 import asyncio
 import contextlib
 
+import pytest
+
 from flowly.agent.loop import AgentLoop
 from flowly.bus.events import InboundMessage
 from flowly.compaction.service import CompactionService
@@ -135,6 +137,17 @@ def _big_session(turns: int = 40) -> Session:
         session.add_message("user", f"q{i} {filler * 6}")
         session.add_message("assistant", f"a{i} {filler * 6}")
     return session
+
+
+@pytest.fixture(autouse=True)
+def _no_settle(monkeypatch):
+    """The pass waits for the turn's reply to reach the client before it
+    announces (see POST_TURN_SETTLE_SECONDS). Tests drive it directly, so the
+    wait is pure latency here — the ordering it protects is asserted in
+    test_the_settle_lets_the_reply_land_first."""
+    import flowly.agent.loop as loop_module
+
+    monkeypatch.setattr(loop_module, "POST_TURN_SETTLE_SECONDS", 0)
 
 
 def _msg() -> InboundMessage:
@@ -541,4 +554,40 @@ async def test_a_commit_marks_the_boundary_for_disk_based_history():
     cycle_ids = {cid for _, cid in harness.cycles}
     assert harness.sessions.boundaries[0] in cycle_ids, (
         "the persisted divider is not the cycle the client was told about"
+    )
+
+
+async def test_the_settle_lets_the_reply_land_first(monkeypatch):
+    """The pass is scheduled from _process_message's finally, which runs
+    BEFORE the caller publishes the turn's reply. Announcing immediately let
+    the "started" notice overtake the reply on the wire — and clients treat
+    arriving content as proof a compaction finished, so the notice was wiped
+    the instant the reply landed (live: a 15s compaction, no visible shimmer).
+    """
+    import flowly.agent.loop as loop_module
+
+    monkeypatch.setattr(loop_module, "POST_TURN_SETTLE_SECONDS", 0.05)
+    session = _big_session()
+    harness = _Harness(session)
+    order: list[str] = []
+
+    async def emit(session_key, phase, *a, compaction_id: str = ""):
+        order.append(f"event:{phase}")
+        harness.events.append(phase)
+        harness.cycles.append((phase, compaction_id))
+
+    harness._emit_compaction_event = emit
+
+    async def deliver_reply():
+        # What _process_turn does immediately after scheduling this pass.
+        await asyncio.sleep(0)
+        order.append("reply")
+
+    await asyncio.gather(
+        harness._post_turn_compaction(_msg()),
+        deliver_reply(),
+    )
+
+    assert order[0] == "reply", (
+        f"the compaction announced before the turn's own reply: {order}"
     )
