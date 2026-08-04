@@ -275,6 +275,12 @@ SUMMARY_CALL_TIMEOUT_SECONDS = 120.0
 # How often the in-flight call re-checks the deadline and the cancel flag.
 _CALL_POLL_SECONDS = 0.5
 
+# How long we wait for a cancelled call to actually unwind. ``cancel()`` only
+# REQUESTS cancellation; without waiting, the request is merely un-awaited —
+# still open, still holding its connection. Bounded so a provider that
+# swallows CancelledError cannot hold up the failure path.
+_CANCEL_GRACE_SECONDS = 2.0
+
 
 async def _chat_bounded(
     provider: LLMProvider,
@@ -314,6 +320,12 @@ async def _chat_bounded(
     finally:
         if not call.done():
             call.cancel()
+            try:
+                await asyncio.wait({call}, timeout=_CANCEL_GRACE_SECONDS)
+            except asyncio.CancelledError:
+                # Our own task is being cancelled too — the request above
+                # already got its cancel; nothing further to wait for.
+                pass
 
 
 async def generate_summary(

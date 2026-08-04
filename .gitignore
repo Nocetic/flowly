@@ -45,6 +45,9 @@ amp
 # Compiled iMessage send helper (built per-platform by helpers/build.sh)
 flowly/channels/helpers/Flowly iMessage Helper.app/
 !docs/feature-rpc-architecture.md
+# The chat wire contract — bot, relay, desktop and iOS all implement it, so
+# it has to be readable by anyone cloning any of them.
+!docs/chat-wire-protocol.md
 
 # Internal engineering notes (not shipped)
 STREAMING_ENGINEERING.md
