@@ -818,6 +818,12 @@ class WebChannel(BaseChannel):
                 "tokensBefore": tokens_before,
                 "tokensAfter": tokens_after,
                 "messagesRemoved": messages_removed,
+                # The relay routes conversation-scoped events by the payload's
+                # sessionKey (same as plan.*), falling back to the origin
+                # session id. Sending it means every device viewing this chat
+                # gets the event, not just the socket that happened to be the
+                # envelope's origin.
+                "sessionKey": session_key,
             },
         }
         try:

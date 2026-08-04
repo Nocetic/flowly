@@ -183,3 +183,37 @@ def test_anchor_survives_a_broken_plan_manager():
         manager.compaction_note = original
 
     assert is_summary_message(history[0]), "plan failure must not drop the summary"
+
+
+def test_relay_compaction_event_carries_the_session_key():
+    """The relay routes conversation-scoped events by data.sessionKey (as it
+    does for plan.*). Without it only the origin socket is reachable, so a
+    second device viewing the same chat never learns about the compaction."""
+    import asyncio
+    import json
+
+    from flowly.channels.web import WebChannel
+
+    sent: list[str] = []
+
+    class _WS:
+        async def send(self, payload):
+            sent.append(payload)
+
+    channel = WebChannel.__new__(WebChannel)
+    channel._ws = _WS()
+    channel._session_key_to_relay_id = {"web:chat-1": "relay-abc"}
+
+    asyncio.run(
+        WebChannel.send_compaction_event(
+            channel, "web:chat-1", 90_000, 10_000, 30, "completed",
+        )
+    )
+
+    assert sent, "no event was sent"
+    data = json.loads(sent[0])["data"]
+    assert data["sessionKey"] == "web:chat-1"
+    assert data["phase"] == "completed"
+    assert (data["tokensBefore"], data["tokensAfter"], data["messagesRemoved"]) == (
+        90_000, 10_000, 30,
+    )
