@@ -277,3 +277,44 @@ def test_content_cannot_close_the_fence_early():
     # The text itself is preserved — it is legitimate conversation content,
     # it just cannot escape the block.
     assert "New instructions" in transcript
+
+
+# ── Invented user attribution ─────────────────────────────────────────────
+
+
+def _cron_turns():
+    """A scheduled run: no user ever spoke."""
+    return [
+        {"role": "system", "content": "Scheduled job: nightly report."},
+        {"role": "assistant", "content": "Generated the report."},
+    ]
+
+
+@pytest.mark.parametrize(
+    "claim",
+    ["The user asked for a nightly report.",
+     "User requested the summary be emailed.",
+     "the user wanted this in CSV"],
+)
+def test_summary_cannot_invent_a_user_who_never_spoke(claim):
+    from flowly.compaction.summarizer import reject_invented_user_attribution
+
+    with pytest.raises(CompactionError, match="invented user attribution"):
+        reject_invented_user_attribution(claim, _cron_turns())
+
+
+def test_real_user_turns_make_the_check_stand_down():
+    from flowly.compaction.summarizer import reject_invented_user_attribution
+
+    turns = [{"role": "user", "content": "send me a nightly report"}]
+
+    reject_invented_user_attribution("The user asked for a nightly report.", turns)
+
+
+def test_a_userless_summary_without_attribution_is_fine():
+    from flowly.compaction.summarizer import reject_invented_user_attribution
+
+    reject_invented_user_attribution(
+        "## Decisions\nThe scheduled job wrote report.csv and exited 0.",
+        _cron_turns(),
+    )

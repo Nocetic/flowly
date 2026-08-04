@@ -42,8 +42,8 @@ from flowly.compaction.service import CompactionService
 from flowly.compaction.types import (
     CompactionConfig,
     MemoryFlushConfig,
-    SUMMARY_MARKER,
     SUMMARY_METADATA_KEY,
+    build_summary_content,
     is_summary_message,
 )
 from flowly.compaction.pruning import split_into_turn_blocks
@@ -6678,7 +6678,7 @@ class AgentLoop:
             is_summary_message(m) for m in history
         ):
             return history
-        content = f"{SUMMARY_MARKER}\n\n{summary}"
+        content = build_summary_content(summary)
         # The plan note is baked into the summary MESSAGE at compaction time
         # but not into the stored summary text. Re-attach the CURRENT note
         # here, or an approved plan would drop out of the model's context at
@@ -6760,7 +6760,7 @@ class AgentLoop:
         # transcript before trimming the LLM context jsonl.
         self.sessions.flush_full(session)
         session.clear()
-        summary_msg = f"{SUMMARY_MARKER}\n\n{result.summary}"
+        summary_msg = build_summary_content(result.summary)
         # An approved plan mid-execution must survive compaction in the
         # model's CONTEXT, not just on disk — otherwise the model keeps
         # working with no memory of the contract it's bound to.

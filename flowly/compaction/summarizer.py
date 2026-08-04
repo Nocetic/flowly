@@ -217,6 +217,40 @@ Previous context (if any):
 {previous_summary}"""
 
 
+_INVENTED_USER_ATTRIBUTION = re.compile(
+    r"\b(?:the\s+)?user\s+(?:asked|requested|wanted|said|reported|complained)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_user_turn(messages: list[dict[str, Any]]) -> bool:
+    return any(m.get("role") == "user" for m in messages)
+
+
+def reject_invented_user_attribution(
+    summary: str,
+    messages: list[dict[str, Any]],
+) -> None:
+    """Raise if a summary attributes speech to a user who never spoke.
+
+    Cron jobs, subagents and system-driven turns have no user-authored
+    message. A summary claiming "the user asked for X" there is invented, and
+    because summaries persist and are re-injected, the fabrication becomes
+    something the agent then treats as an instruction it was given.
+
+    Only checked when the source genuinely has no user turn — where the
+    judgement is unambiguous.
+    """
+    if _has_user_turn(messages):
+        return
+    match = _INVENTED_USER_ATTRIBUTION.search(summary)
+    if match:
+        raise CompactionError(
+            "summary invented user attribution for a session with no user "
+            f"turns: {match.group(0)!r}"
+        )
+
+
 async def generate_summary(
     messages: list[dict[str, Any]],
     provider: LLMProvider,
@@ -263,7 +297,10 @@ async def generate_summary(
         max_tokens=reserve_tokens,
     )
 
-    return validated_summary_text(response)
+    summary = validated_summary_text(response)
+    # Raises into the retry/fallback ladder rather than storing a fabrication.
+    reject_invented_user_attribution(summary, messages)
+    return summary
 
 
 async def summarize_chunks(

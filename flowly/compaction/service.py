@@ -19,7 +19,7 @@ from flowly.compaction.types import (
     CompactionResult,
     SILENT_REPLY_TOKEN,
     SAFETY_MARGIN,
-    SUMMARY_MARKER,
+    build_summary_content,
 )
 from flowly.providers.base import LLMProvider
 
@@ -609,7 +609,17 @@ class CompactionService:
         session_key: str = "",
     ) -> tuple[list[dict[str, Any]], CompactionResult | None]:
         """
-        Compact messages if threshold exceeded.
+        Compact messages if threshold exceeded, without touching a session.
+
+        This is the STATELESS form: messages in, messages out. The agent loop
+        does not use it — it owns persistence (flushing the display
+        transcript, clearing and rewriting the session, emitting lifecycle
+        events), which cannot be expressed here.
+
+        Keep the two in step. This method and the loop share the decision
+        (:meth:`should_compact`), the summarisation (:meth:`compact`) and the
+        failure policy — return the ORIGINAL messages, never a partial
+        compaction — so a change to any of those belongs in both.
 
         Args:
             messages: Current messages.
@@ -644,7 +654,7 @@ class CompactionService:
         # Replace messages with summary + kept recent messages
         summary_message = {
             "role": "system",
-            "content": f"{SUMMARY_MARKER}\n\n{result.summary}",
+            "content": build_summary_content(result.summary),
         }
 
         return [summary_message] + result.kept_messages, result

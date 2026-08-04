@@ -133,6 +133,16 @@ SUMMARY_MARKERS = (SUMMARY_MARKER, LEGACY_SUMMARY_MARKER)
 SUMMARY_METADATA_KEY = "_compaction_summary"
 
 
+def build_summary_content(summary: str) -> str:
+    """The exact text a compaction summary is stored and injected as.
+
+    One definition, because the stateless helper and the agent loop both write
+    it and both anchor against it — three copies of a format string is how the
+    marker and the detector drift apart.
+    """
+    return f"{SUMMARY_MARKER}\n\n{summary}"
+
+
 def is_summary_message(message: dict) -> bool:
     """True if ``message`` is a compaction summary this system wrote."""
     if message.get("role") != "system":
