@@ -6646,7 +6646,21 @@ class AgentLoop:
             return history
         if not summary or any(is_summary_message(m) for m in history):
             return history
-        anchor = {"role": "system", "content": f"{SUMMARY_MARKER}\n\n{summary}"}
+        content = f"{SUMMARY_MARKER}\n\n{summary}"
+        # The plan note is baked into the summary MESSAGE at compaction time
+        # but not into the stored summary text. Re-attach the CURRENT note
+        # here, or an approved plan would drop out of the model's context at
+        # the exact moment the original message slides out of the window —
+        # the same silent loss this anchor exists to prevent.
+        try:
+            from flowly.plans.manager import get_plan_manager as _get_pm
+
+            plan_note = _get_pm().compaction_note(session.key)
+            if plan_note:
+                content += f"\n\n{plan_note}"
+        except Exception:
+            logger.debug("[plan] anchor note skipped (non-fatal)")
+        anchor = {"role": "system", "content": content}
         return [anchor] + history
 
     async def _emit_compaction_event(

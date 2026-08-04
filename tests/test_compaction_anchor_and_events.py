@@ -143,3 +143,43 @@ def test_missing_counts_degrade_to_zero_not_crash():
     assert event.before_tokens == 0
     assert event.messages_removed == 0
     assert event.session_key == ""
+
+
+def test_anchor_keeps_an_approved_plan_in_context():
+    """The plan note is baked into the summary MESSAGE, not the stored text.
+    When that message slides out, the anchor must carry the plan forward."""
+    from flowly.plans.manager import get_plan_manager
+
+    session = _session_with_summary(200)
+    manager = get_plan_manager()
+    note = "[ACTIVE PLAN] step 1 pending"
+
+    original = manager.compaction_note
+    manager.compaction_note = lambda key: note
+    try:
+        history = _Loop()._history_with_summary_anchor(session)
+    finally:
+        manager.compaction_note = original
+
+    assert note in history[0]["content"], (
+        "an approved plan vanished from context when the summary slid out"
+    )
+
+
+def test_anchor_survives_a_broken_plan_manager():
+    from flowly.plans.manager import get_plan_manager
+
+    session = _session_with_summary(200)
+    manager = get_plan_manager()
+
+    def _boom(key):
+        raise RuntimeError("plan store unavailable")
+
+    original = manager.compaction_note
+    manager.compaction_note = _boom
+    try:
+        history = _Loop()._history_with_summary_anchor(session)
+    finally:
+        manager.compaction_note = original
+
+    assert is_summary_message(history[0]), "plan failure must not drop the summary"
