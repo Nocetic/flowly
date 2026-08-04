@@ -35,8 +35,14 @@ def record(
     tokens_after: int,
     messages_removed: int,
     now: float,
+    compaction_id: str = "",
 ) -> None:
-    """Note the phase a session's compaction just reached."""
+    """Note the phase a session's compaction just reached.
+
+    ``compaction_id`` travels with it so a client restoring state through
+    ``chat.inflight`` can tell whether a later ``completed`` closes the cycle
+    it is showing or belongs to a different pass.
+    """
     if not session_key:
         return
     _STATE[session_key] = {
@@ -46,6 +52,7 @@ def record(
         "messagesRemoved": int(messages_removed or 0),
         "sessionKey": session_key,
         "at": float(now),
+        **({"compactionId": compaction_id} if compaction_id else {}),
     }
     if len(_STATE) > MAX_TRACKED:
         for key in list(_STATE)[: len(_STATE) - MAX_TRACKED]:

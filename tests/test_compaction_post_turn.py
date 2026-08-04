@@ -84,6 +84,7 @@ class _Harness:
     _history_with_summary_anchor = AgentLoop._history_with_summary_anchor
     _system_prompt_tokens = AgentLoop._system_prompt_tokens
     _compaction_generation = staticmethod(AgentLoop._compaction_generation)
+    _new_compaction_id = staticmethod(AgentLoop._new_compaction_id)
     _post_turn_compaction = AgentLoop._post_turn_compaction
     _schedule_post_turn_compaction = AgentLoop._schedule_post_turn_compaction
 
@@ -103,18 +104,20 @@ class _Harness:
             ),
         )
         self.events: list[str] = []
-        self.markers = 0
+        # (phase, compactionId) pairs — the id is what lets a client tell
+        # whether a "completed" closes the "started" it is showing.
+        self.cycles: list[tuple[str, str]] = []
         self._post_turn_compaction_tasks: dict[str, asyncio.Task] = {}
         self._last_turn_total_tokens: dict[str, int] = {}
 
     def _tool_schema_tokens(self) -> int:
         return 0
 
-    async def _emit_compaction_event(self, session_key, phase, *a) -> None:
+    async def _emit_compaction_event(
+        self, session_key, phase, *a, compaction_id: str = "",
+    ) -> None:
         self.events.append(phase)
-
-    async def _publish_compaction_marker(self, channel, chat_id) -> None:
-        self.markers += 1
+        self.cycles.append((phase, compaction_id))
 
     async def _run_memory_flush(self, session, channel, chat_id) -> None:
         raise AssertionError("memory flush is disabled in this harness")
@@ -148,7 +151,11 @@ async def test_post_turn_pass_compacts_an_over_budget_session():
     assert harness._compaction_generation(session) == 1
     assert harness.events[0] == "started"
     assert harness.events[-1] == "completed"
-    assert harness.markers == 1
+    # Both phases carry the SAME cycle id — that correlation is the whole
+    # point of compactionId, and it is also what keys the relay's transcript
+    # boundary row (so a retried event cannot draw two dividers).
+    ids = {cid for _, cid in harness.cycles}
+    assert len(ids) == 1 and ids != {""}, harness.cycles
 
 
 async def test_post_turn_pass_is_a_noop_under_budget():
@@ -475,9 +482,10 @@ async def test_two_passes_starting_together_announce_one_cycle():
     session = _big_session()
     harness = _Harness(session)
 
-    async def yielding_emit(session_key, phase, *a):
+    async def yielding_emit(session_key, phase, *a, compaction_id: str = ""):
         await asyncio.sleep(0)  # what a real WS send does
         harness.events.append(phase)
+        harness.cycles.append((phase, compaction_id))
 
     harness._emit_compaction_event = yielding_emit
 
@@ -491,6 +499,9 @@ async def test_two_passes_starting_together_announce_one_cycle():
     )
     assert harness._compaction_generation(session) == 1
     assert harness.provider.calls > 0
+    assert len({cid for _, cid in harness.cycles}) == 1, (
+        f"the surviving cycle must be one identity: {harness.cycles}"
+    )
 
 
 async def test_a_started_cycle_is_always_closed():

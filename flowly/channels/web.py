@@ -798,8 +798,17 @@ class WebChannel(BaseChannel):
         tokens_after: int,
         messages_removed: int,
         phase: str = "completed",
+        compaction_id: str = "",
     ) -> None:
-        """Notify the browser/iOS that context is being compacted or was compacted."""
+        """Notify the browser/iOS that context is being compacted or was compacted.
+
+        On ``phase="completed"`` this event is ALSO what makes the relay write
+        the transcript's context-boundary row. The bot used to publish that row
+        itself as an ordinary reply carrying ``[context-optimized]`` — which
+        every consumer of turn terminals then had to recognise by its text to
+        avoid settling a turn that was still streaming. Keyed off a typed event
+        instead, no reply-shaped message is involved and nothing has to guess.
+        """
         if not self._ws:
             return
 
@@ -824,6 +833,10 @@ class WebChannel(BaseChannel):
                 # gets the event, not just the socket that happened to be the
                 # envelope's origin.
                 "sessionKey": session_key,
+                # Identity of this compaction cycle: correlates started with
+                # completed, and gives the relay a stable document id for the
+                # boundary row so a duplicate event cannot draw two dividers.
+                **({"compactionId": compaction_id} if compaction_id else {}),
             },
         }
         try:

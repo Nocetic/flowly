@@ -130,45 +130,38 @@ async def test_a_provider_error_is_marked_and_not_a_success(channel):
 # ── §4.2: the compaction separator is not a turn terminal ─────────────────
 
 
-def test_the_marker_string_is_the_one_clients_guard_on():
-    """Producer and guards must agree character for character. The desktop
-    (isCompactionMarkerContent), the relay (isCompactionMarker) and iOS all
-    compare against this literal; a change here silently un-guards all three."""
+def test_the_bot_never_puts_the_separator_on_the_wire():
+    """The root fix: no reply-shaped message carries the separator any more.
+
+    It used to ride `state:"final"`, so every consumer of turn terminals had
+    to recognise the string or it would settle a turn that was still
+    streaming — and each new surface had to remember. The transcript boundary
+    is written by the transport from the typed `compaction` event instead, so
+    there is nothing to recognise and nothing to forget.
+    """
     import inspect
 
     from flowly.agent import loop as loop_module
 
-    source = inspect.getsource(loop_module.AgentLoop._publish_compaction_marker)
-    assert "[context-optimized]" in source
+    source = inspect.getsource(loop_module)
+    producing_lines = [
+        line for line in source.splitlines()
+        if "[context-optimized]" in line and not line.strip().startswith("#")
+    ]
+    assert not producing_lines, (
+        "the bot is emitting the separator again: " + "; ".join(producing_lines)
+    )
 
 
-async def test_the_marker_rides_the_same_shape_as_a_reply(channel):
-    """This is WHY the guards are needed, pinned as a fact rather than a
-    comment: the marker is indistinguishable from a real reply except by its
-    content, so every consumer of terminals must inspect content."""
-    await channel.send(OutboundMessage(
-        channel="web", chat_id="relay-sess-1", content="[context-optimized]",
-        metadata={"run_id": "marker-1"},
-    ))
-
+async def test_a_manual_compact_replies_in_words(channel):
+    """The /compact reply IS its turn's terminal. Sending the separator there
+    made consumers treat the terminal as "not a terminal", so the run never
+    settled and the chat sat on "replying" forever."""
+    await channel.send(_final(run_id="compact-1"))
     data = channel._capture[0]["data"]
-    assert data["state"] in TERMINAL_STATES, (
-        "if this ever stops being a final, the client guards can be removed — "
-        "update docs/chat-wire-protocol.md §4.2 in the same commit"
-    )
-    text = "".join(
-        block.get("text", "") for block in data["message"]["content"]
-    )
-    assert text.strip() == "[context-optimized]"
+    text = "".join(b.get("text", "") for b in data["message"]["content"])
 
-
-def test_the_marker_is_withheld_from_channels_that_cannot_render_it():
-    """A human messaging surface has no divider renderer, so the user would
-    receive the literal string as a message from their agent."""
-    from flowly.agent.loop import _MARKER_UNSUPPORTED_CHANNELS
-
-    for channel_name in ("telegram", "whatsapp", "imessage"):
-        assert channel_name in _MARKER_UNSUPPORTED_CHANNELS
+    assert text.strip() != "[context-optimized]"
 
 
 # ── §3/§5: the compaction event ───────────────────────────────────────────
@@ -278,12 +271,47 @@ def test_chat_inflight_is_null_when_nothing_is_running():
     assert result["plan"] is None
 
 
-def test_the_marker_is_withheld_from_internal_channels():
-    """Post-turn compaction means a cron/system session can compact with no
-    user turn in sight. Those channel names reach no adapter at all — "cron"
-    is explicitly undeliverable — so publishing there is one warning per
-    compaction that delivers nothing."""
-    from flowly.agent.loop import _MARKER_UNSUPPORTED_CHANNELS
+def test_a_compaction_cycle_is_identifiable():
+    """§5: without an id a client cannot tell whether the `completed` it just
+    received closes the `started` it is showing or belongs to another pass —
+    it has to guess, and across a reconnect or a second device it guesses
+    wrong. The id is also the relay's document key for the boundary row, so a
+    duplicated event cannot draw two dividers."""
+    from flowly.agent import compaction_status
+    from flowly.agent.loop import AgentLoop
 
-    for channel_name in ("cron", "system", "heartbeat"):
-        assert channel_name in _MARKER_UNSUPPORTED_CHANNELS
+    first, second = AgentLoop._new_compaction_id(), AgentLoop._new_compaction_id()
+    assert first != second
+    assert first.startswith("cmp_")
+
+    compaction_status.clear("s-id")
+    compaction_status.record(
+        "s-id", "started", 90_000, 0, 0, now=1_000.0, compaction_id=first,
+    )
+    state = compaction_status.get("s-id", now=1_001.0)
+
+    assert state["compactionId"] == first, (
+        "a client restoring through chat.inflight cannot correlate the cycle"
+    )
+    compaction_status.clear("s-id")
+
+
+async def test_the_compaction_event_carries_its_cycle_id(channel):
+    sent = _bind_relay_session(channel).frames
+
+    await channel.send_compaction_event(
+        "web:conv-1", 96_000, 12_500, 42, phase="completed",
+        compaction_id="cmp_abc123",
+    )
+
+    assert sent[0]["data"]["compactionId"] == "cmp_abc123"
+
+
+async def test_an_old_notifier_shape_still_works(channel):
+    """Additive-only: omitting the id must reproduce the previous wire bytes,
+    for a relay or client that predates it."""
+    sent = _bind_relay_session(channel).frames
+
+    await channel.send_compaction_event("web:conv-1", 1, 1, 0, phase="started")
+
+    assert "compactionId" not in sent[0]["data"]

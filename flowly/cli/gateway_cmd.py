@@ -1626,7 +1626,7 @@ Respond to the user now:"""
     # Wire auto-compaction notification — push to relay (web channel) + desktop (gateway)
     async def _on_auto_compaction(
         session_key: str, tokens_before: int, tokens_after: int, messages_removed: int,
-        phase: str = "completed",
+        phase: str = "completed", compaction_id: str = "",
     ) -> None:
         data = {
             "phase": phase,
@@ -1634,11 +1634,18 @@ Respond to the user now:"""
             "tokensAfter": tokens_after,
             "messagesRemoved": messages_removed,
             "sessionKey": session_key,
+            # Ties this phase to its cycle. Also what the relay keys the
+            # transcript boundary row off, so a retried event cannot write
+            # the divider twice.
+            **({"compactionId": compaction_id} if compaction_id else {}),
         }
         # Relay (web channel)
         web = channels.get_channel("web")
         if web and hasattr(web, "send_compaction_event"):
-            await web.send_compaction_event(session_key, tokens_before, tokens_after, messages_removed, phase)
+            await web.send_compaction_event(
+                session_key, tokens_before, tokens_after, messages_removed, phase,
+                compaction_id=compaction_id,
+            )
         # Desktop clients (direct WS)
         await gateway_server._broadcast_compaction_event(data)
 

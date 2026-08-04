@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -402,21 +403,6 @@ def _relabel_codex_projected_pair(
 # they surface in the transcript as if the user typed them. Underscore-
 # prefixed so the provider layer strips it before the API call.
 _EPHEMERAL_NUDGE = "_ephemeral_nudge"
-
-# Human messaging surfaces have no renderer for the ``[context-optimized]``
-# separator, so sending it there delivers the literal string to the user as a
-# message from their agent. Rich clients (relay web, desktop, iOS) draw it as
-# a divider and DO want it.
-_MARKER_UNSUPPORTED_CHANNELS = frozenset({
-    # Human messaging surfaces: no divider renderer, so the user would just
-    # receive the literal string as a message from their agent.
-    "telegram", "discord", "slack", "teams", "whatsapp", "imessage", "email",
-    # Internal channels that reach no adapter at all. "cron" in particular is
-    # explicitly undeliverable (ChannelManager logs "Unknown channel: cron"),
-    # and post-turn compaction means a cron session can now compact with no
-    # user turn in sight — one warning per compaction, delivering nothing.
-    "cron", "system", "heartbeat",
-})
 
 # A memory-flush turn is one provider round trip. Bounded for the same reason
 # every other call on the compaction path is (see
@@ -5253,22 +5239,20 @@ class AgentLoop:
                     msg.session_key, command_args or None
                 )
                 if result.get("success"):
-                    # Rich clients render the marker as a persistent separator
-                    # (the relay also saves it to Firestore). On plain messaging
-                    # channels that would just be a cryptic string, so report
-                    # the outcome in words instead.
-                    if msg.channel in _MARKER_UNSUPPORTED_CHANNELS:
-                        saved = result.get("tokens_before", 0) - result.get("tokens_after", 0)
-                        return OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content=(
-                                f"✅ {result.get('message', 'Compacted')}"
-                                + (f" (~{saved:,} tokens freed)" if saved > 0 else "")
-                            ),
-                        )
+                    # Every channel gets the outcome in words. This reply is a
+                    # real turn terminal, so it must not be the separator
+                    # string: consumers treat that as "not a terminal" (it
+                    # normally arrives mid-turn), and the run would never
+                    # settle — the chat would sit on "replying" forever. The
+                    # transcript divider comes from the compaction event
+                    # instead; see docs/chat-wire-protocol.md §4.2.
+                    saved = result.get("tokens_before", 0) - result.get("tokens_after", 0)
                     return OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
-                        content="[context-optimized]",
+                        content=(
+                            f"✅ {result.get('message', 'Compacted')}"
+                            + (f" (~{saved:,} tokens freed)" if saved > 0 else "")
+                        ),
                     )
                 else:
                     return OutboundMessage(
@@ -5722,8 +5706,10 @@ class AgentLoop:
                     # Announce now that the cycle is provably ours. Staged
                     # summarisation is several LLM calls, and without this the
                     # clients show a frozen agent.
+                    _compaction_id = self._new_compaction_id()
                     await self._emit_compaction_event(
                         msg.session_key, "started", total_tokens, 0, 0,
+                        compaction_id=_compaction_id,
                     )
                     _announced = True
 
@@ -5795,17 +5781,25 @@ class AgentLoop:
                 )
                 await self._emit_compaction_event(
                     msg.session_key, "failed", total_tokens, total_tokens, 0,
+                    compaction_id=_compaction_id,
                 )
             else:
                 # Already committed inside the lock — announce outside it so
                 # slow channel I/O never extends the critical section.
-                await self._publish_compaction_marker(msg.channel, msg.chat_id)
+                #
+                # No transcript separator is published here. The boundary row
+                # is written by whichever transport persists the conversation,
+                # keyed off this event — see docs/chat-wire-protocol.md §4.2.
+                # Publishing it as a reply meant every consumer of terminals
+                # had to recognise a magic string to avoid settling a turn that
+                # was still streaming.
                 await self._emit_compaction_event(
                     msg.session_key,
                     "completed",
                     result.tokens_before,
                     result.tokens_after,
                     result.messages_removed,
+                    compaction_id=_compaction_id,
                 )
 
         # Build initial messages. Cron runs pass skip_memory and
@@ -6890,8 +6884,14 @@ class AgentLoop:
         tokens_before: int,
         tokens_after: int,
         messages_removed: int,
+        compaction_id: str = "",
     ) -> None:
         """Push one compaction lifecycle event. Never raises.
+
+        ``compaction_id`` ties a cycle's phases together. Without it a client
+        cannot tell whether the ``completed`` it just received closes the
+        ``started`` it is showing or belongs to a different pass — it has to
+        guess, and across a reconnect or a second device it guesses wrong.
 
         Also records the phase so ``chat.inflight`` can hand it to a client
         that arrives after the event fired — reopening a chat mid-summarisation
@@ -6902,7 +6902,7 @@ class AgentLoop:
 
             compaction_status.record(
                 session_key, phase, tokens_before, tokens_after,
-                messages_removed, time.time(),
+                messages_removed, time.time(), compaction_id=compaction_id,
             )
         except Exception:  # noqa: BLE001 — status is a convenience, not the event
             logger.debug("[compaction] status record skipped (non-fatal)")
@@ -6912,26 +6912,20 @@ class AgentLoop:
         try:
             await self._on_compaction(
                 session_key, tokens_before, tokens_after, messages_removed, phase,
+                compaction_id,
+            )
+        except TypeError:
+            # An older notifier that predates ``compaction_id``.
+            await self._on_compaction(
+                session_key, tokens_before, tokens_after, messages_removed, phase,
             )
         except Exception as e:
             logger.debug(f"Compaction notification error: {e}")
 
-    async def _publish_compaction_marker(self, channel: str, chat_id: str) -> None:
-        """Emit the ``[context-optimized]`` separator on channels that render it.
-
-        Rich clients (relay web, desktop, iOS) turn this into a visual divider
-        in the transcript. A human messaging channel has no such renderer, so
-        the user would just receive the literal string as a message from their
-        agent — noise at best, confusing at worst.
-        """
-        if channel in _MARKER_UNSUPPORTED_CHANNELS:
-            return
-        try:
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=channel, chat_id=chat_id, content="[context-optimized]",
-            ))
-        except Exception:
-            pass
+    @staticmethod
+    def _new_compaction_id() -> str:
+        """Identity for one compaction cycle, minted when it is announced."""
+        return f"cmp_{uuid.uuid4().hex[:12]}"
 
     def _commit_compaction(
         self,
@@ -7087,8 +7081,10 @@ class AgentLoop:
 
             # The cycle is provably ours now: we hold the lock and we know
             # there is work to do.
+            compaction_id = self._new_compaction_id()
             await self._emit_compaction_event(
                 session_key, "started", tokens_before, 0, 0,
+                compaction_id=compaction_id,
             )
             _announced = True
 
@@ -7108,6 +7104,7 @@ class AgentLoop:
                 self.compaction.record_compaction_failure(session_key)
                 await self._emit_compaction_event(
                     session_key, "failed", tokens_before, tokens_before, 0,
+                    compaction_id=compaction_id,
                 )
                 return {
                     "success": False,
@@ -7126,6 +7123,7 @@ class AgentLoop:
                 )
                 await self._emit_compaction_event(
                     session_key, "completed", tokens_before, tokens_before, 0,
+                    compaction_id=compaction_id,
                 )
                 return {
                     "success": False,
@@ -7141,13 +7139,16 @@ class AgentLoop:
                 session, result, session_key, source_message_count=source_len,
             )
 
-        # Notify connected clients — compaction completed
+        # Notify connected clients — compaction completed. No transcript
+        # separator is published: the boundary row is written by whichever
+        # transport persists the conversation, keyed off this event.
         await self._emit_compaction_event(
             session_key,
             "completed",
             result.tokens_before,
             result.tokens_after,
             result.messages_removed,
+            compaction_id=compaction_id,
         )
 
         return {
@@ -7293,8 +7294,10 @@ class AgentLoop:
 
                 # The cycle is provably ours: we hold the lock and the
                 # generation still matches what we measured against.
+                compaction_id = self._new_compaction_id()
                 await self._emit_compaction_event(
                     session_key, "started", history_tokens + overhead, 0, 0,
+                    compaction_id=compaction_id,
                 )
                 _announced = True
 
@@ -7309,6 +7312,7 @@ class AgentLoop:
                     self.compaction.record_compaction_failure(session_key)
                     await self._emit_compaction_event(
                         session_key, "failed", history_tokens, history_tokens, 0,
+                        compaction_id=compaction_id,
                     )
                     return
 
@@ -7323,6 +7327,7 @@ class AgentLoop:
                         )
                         await self._emit_compaction_event(
                             session_key, "completed", tokens_now, tokens_now, 0,
+                            compaction_id=compaction_id,
                         )
                     return
 
@@ -7338,13 +7343,14 @@ class AgentLoop:
                     source_message_count=source_len,
                 )
 
-            await self._publish_compaction_marker(msg.channel, msg.chat_id)
+            # No transcript separator here either — see the pre-turn path.
             await self._emit_compaction_event(
                 session_key,
                 "completed",
                 result.tokens_before,
                 result.tokens_after,
                 result.messages_removed,
+                compaction_id=compaction_id,
             )
         except asyncio.CancelledError:
             raise

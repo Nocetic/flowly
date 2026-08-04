@@ -72,9 +72,15 @@ Discriminated by `data.state`.
 ### `compaction` — history being summarised
 
 `data`: `phase` (`started` | `completed` | `failed`), `sessionKey`,
-`tokensBefore`, `tokensAfter`, `messagesRemoved`.
+`compactionId`, `tokensBefore`, `tokensAfter`, `messagesRemoved`.
 
-Lifecycle rules in §5.
+`compactionId` identifies one cycle: every phase of it carries the same value,
+so a client can tell whether the `completed` it just received closes the
+`started` it is showing. It is also the document key the relay uses for the
+transcript boundary row, which makes writing that row idempotent.
+
+On `phase:"completed"` this event is what draws the transcript's context
+boundary — see §4.2. Lifecycle rules in §5.
 
 ### Others
 
@@ -103,23 +109,34 @@ After a terminal, later `streaming` deltas for that `runId` are late and MUST
 be dropped; a client that reopens the bubble on a late chunk leaks one turn's
 text into the next.
 
-**4.2 — A terminal must belong to the turn it ends.** Any message the bot
-publishes through the ordinary outbound path arrives as `state:"final"`. If
-such a message is NOT a turn terminal, every consumer of terminals must skip
-it — including the relay's persistence side effects.
+**4.2 — Only a turn terminal may wear a terminal state.** `state:"final"`
+means "this turn is over". Nothing else may ride it, and no consumer should
+have to inspect a message's TEXT to find out whether a terminal is real.
 
-> **The compaction separator.** `[context-optimized]` is a transcript marker,
-> published mid-turn while the run that triggered compaction is still
-> streaming. Treated as a terminal it: finalised the live run (every later
-> delta dropped as "late" — the turn looked dead while the bot streamed on),
-> played the end-of-reply chime early, cleared the relay's `pending` flag
-> (killing the "replying" shimmer in the chat list), overwrote the chat-list
-> preview with the literal marker string, and pushed a notification reading
-> "[context-optimized]".
+> **The compaction separator, and why it is no longer a message.**
+> `[context-optimized]` was a transcript divider published mid-turn — while
+> the run that triggered compaction was still streaming — through the ordinary
+> reply path, so it arrived as `state:"final"`. Treated as the terminal it
+> claimed to be, it: finalised the live run (every later delta dropped as
+> "late", so the turn looked dead while the bot streamed on), played the
+> end-of-reply chime early, cleared the relay's `pending` flag (killing the
+> "replying" shimmer), overwrote the chat-list preview with the literal marker,
+> and pushed a notification reading "[context-optimized]".
 >
-> Rule: **the marker gets its transcript row and nothing else.** See
-> `isCompactionMarkerContent` (desktop), the `isCompactionMarker` guard
-> (relay), and the early return in `MoltbotClient` (iOS).
+> Guarding it by string worked, but made the contract *"every surface must
+> remember to recognise this text"* — one forgotten guard reproduces all five
+> symptoms, and a model that genuinely replied with that exact string would
+> hang the turn.
+>
+> **The bot no longer emits it at all.** The divider is written by whichever
+> transport persists the conversation, keyed off the typed `compaction` event
+> (§5): the relay writes a boundary row carrying `kind:"context_boundary"` and
+> `compactionId`, plus the legacy `content` string so existing clients render
+> it unchanged. Direct-gateway clients never received the marker anyway — they
+> read the same typed event.
+>
+> The string guards stay in the clients and the relay for bots older than this
+> change. They are compatibility, not contract.
 
 **4.3 — Stop is cooperative.** `chat.abort` marks the run aborted. The turn
 still delivers `final` with `aborted: true` — that is the authoritative
