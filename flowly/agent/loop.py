@@ -5762,6 +5762,7 @@ class AgentLoop:
                     history = self._commit_compaction(
                         session, result, msg.session_key,
                         source_message_count=session_snapshot_len,
+                        compaction_id=_compaction_id,
                     )
 
             if result is None and _concurrent:
@@ -6933,6 +6934,7 @@ class AgentLoop:
         result: Any,
         session_key: str,
         source_message_count: int | None = None,
+        compaction_id: str = "",
     ) -> list[dict[str, Any]]:
         """Persist a successful compaction and return the new working history.
 
@@ -6955,6 +6957,12 @@ class AgentLoop:
         # Preserve the full pre-compaction history in the append-only display
         # transcript before trimming the LLM context jsonl.
         self.sessions.flush_full(session)
+        # Mark the boundary in the display transcript, between the turns that
+        # were summarised and what follows. The relay writes the equivalent row
+        # into Firestore for its own clients; this is the copy the transports
+        # that read history from disk (direct gateway: desktop, iOS) rely on —
+        # without it a reopened chat gave no hint anything had been summarised.
+        self.sessions.append_context_boundary(session, compaction_id)
         session.clear()
         summary_msg = build_summary_content(result.summary)
         # An approved plan mid-execution must survive compaction in the
@@ -7137,6 +7145,7 @@ class AgentLoop:
             self.compaction.record_compaction_success(session_key)
             self._commit_compaction(
                 session, result, session_key, source_message_count=source_len,
+                compaction_id=compaction_id,
             )
 
         # Notify connected clients — compaction completed. No transcript
@@ -7341,6 +7350,7 @@ class AgentLoop:
                 self._commit_compaction(
                     session, result, session_key,
                     source_message_count=source_len,
+                    compaction_id=compaction_id,
                 )
 
             # No transcript separator here either — see the pre-turn path.

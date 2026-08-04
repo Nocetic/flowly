@@ -51,12 +51,17 @@ class _Sessions:
     def __init__(self, session: Session):
         self.session = session
         self.saves = 0
+        self.boundaries: list[str] = []
 
     def get_or_create(self, key: str) -> Session:
         return self.session
 
     def flush_full(self, session: Session) -> None:
         pass
+
+    def append_context_boundary(self, session: Session, compaction_id: str = "") -> None:
+        # The divider the direct-gateway surfaces read back from disk.
+        self.boundaries.append(compaction_id)
 
     def mark_full_synced(self, session: Session) -> None:
         pass
@@ -521,3 +526,19 @@ async def test_a_started_cycle_is_always_closed():
 
     assert harness.events[0] == "started"
     assert harness.events[-1] in ("completed", "failed")
+
+
+async def test_a_commit_marks_the_boundary_for_disk_based_history():
+    """Relay clients read the divider from a Firestore row the relay writes;
+    direct-gateway clients read history from disk. Both must get one, keyed by
+    the same cycle id, or the two transports show different transcripts."""
+    session = _big_session()
+    harness = _Harness(session)
+
+    await harness._post_turn_compaction(_msg())
+
+    assert len(harness.sessions.boundaries) == 1
+    cycle_ids = {cid for _, cid in harness.cycles}
+    assert harness.sessions.boundaries[0] in cycle_ids, (
+        "the persisted divider is not the cycle the client was told about"
+    )

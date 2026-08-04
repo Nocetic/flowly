@@ -315,3 +315,37 @@ async def test_an_old_notifier_shape_still_works(channel):
     await channel.send_compaction_event("web:conv-1", 1, 1, 0, phase="started")
 
     assert "compactionId" not in sent[0]["data"]
+
+
+# ── The direct gateway is not a second-class surface ──────────────────────
+
+
+def test_the_boundary_is_persisted_for_transports_without_firestore(tmp_path, monkeypatch):
+    """A relay client gets its divider from a Firestore row the relay writes.
+    A direct-gateway client (desktop on a local/remote WS, iOS the same) reads
+    history from disk instead — so the same boundary has to be written there,
+    or a reopened chat gives no hint that anything was ever summarised."""
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path))
+    from flowly import profile
+
+    if hasattr(profile, "_cached_home"):
+        profile._cached_home = None
+    from flowly.session.manager import SessionManager
+
+    manager = SessionManager(workspace=tmp_path)
+    session = manager.get_or_create("desktop:default")
+    session.add_message("user", "first question")
+    session.add_message("assistant", "first answer")
+    manager.flush_full(session)
+
+    manager.append_context_boundary(session, "cmp_deadbeef")
+
+    rows = manager.get_full_messages("desktop:default")
+    boundary = [r for r in rows if r.get("kind") == "context_boundary"]
+    assert len(boundary) == 1, rows
+    assert boundary[0]["compactionId"] == "cmp_deadbeef"
+    assert boundary[0]["content"] == "[context-optimized]", (
+        "the legacy text must stay: clients that match on it predate `kind`"
+    )
+    # And the real conversation is still all there, in order.
+    assert [r["role"] for r in rows] == ["user", "assistant", "assistant"]

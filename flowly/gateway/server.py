@@ -2210,6 +2210,16 @@ class GatewayServer:
                 msg["tool_call_id"] = m["tool_call_id"]
             if m.get("name"):
                 msg["name"] = m["name"]
+            # Context-boundary rows (a compaction happened here). Typed fields
+            # ride alongside the legacy text so a client can render the divider
+            # without matching a string — the relay's Firestore row carries the
+            # same pair, so both transports look identical to a client.
+            if m.get("kind"):
+                msg["kind"] = m["kind"]
+            if m.get("boundaryKind"):
+                msg["boundaryKind"] = m["boundaryKind"]
+            if m.get("compactionId"):
+                msg["compactionId"] = m["compactionId"]
             # Reconstruct attachment previews from the media paths saved on the
             # user turn. Images get a small base64 JPEG thumbnail (not the full
             # original — that could be 25 MB) so the desktop shows the same

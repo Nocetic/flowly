@@ -14,6 +14,11 @@ from loguru import logger
 
 from flowly.media.assets import assets_to_meta as _assets_to_meta
 from flowly.profile import get_flowly_home
+
+#: Text of a context-boundary row. Clients that predate the typed ``kind``
+#: field match on this, so it is a compatibility shim — not something the bot
+#: ever puts on the wire as a reply. See ``docs/chat-wire-protocol.md`` §4.2.
+COMPACTION_BOUNDARY_CONTENT = "[context-optimized]"
 from flowly.utils.helpers import ensure_dir, safe_filename
 
 # Suffix of the append-only DISPLAY transcript that rides alongside each
@@ -723,6 +728,38 @@ class SessionManager:
             session.metadata[self._FULL_WATERMARK_KEY] = total
         except Exception as e:  # pragma: no cover - disk best-effort
             logger.debug("Display-log flush failed for {}: {}", session.key, e)
+
+    def append_context_boundary(
+        self, session: "Session", compaction_id: str = "",
+    ) -> None:
+        """Record a compaction boundary in the display transcript.
+
+        The relay writes this row into Firestore for its own clients; this is
+        the same row for the transports that read history from disk instead —
+        the direct gateway (desktop over a local/remote WS, iOS over the same).
+        Without it those surfaces got a live notice that vanished on reload,
+        so a reopened chat gave no hint that anything had been summarised.
+
+        Carries the typed fields AND the legacy text, so a client that renders
+        the divider by matching content is unchanged while new ones can read
+        ``kind``. Best-effort: never blocks a commit.
+        """
+        row: dict[str, Any] = {
+            "role": "assistant",
+            "content": COMPACTION_BOUNDARY_CONTENT,
+            "kind": "context_boundary",
+            "boundaryKind": "compaction",
+            "timestamp": datetime.now().isoformat(),
+        }
+        if compaction_id:
+            row["compactionId"] = compaction_id
+        try:
+            path = self._get_full_path(session.key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception as e:  # pragma: no cover - disk best-effort
+            logger.debug("Context boundary append failed for {}: {}", session.key, e)
 
     def mark_full_synced(self, session: "Session") -> None:
         """Declare the current ``session.messages`` as already represented in the
