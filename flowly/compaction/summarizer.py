@@ -240,6 +240,12 @@ def reject_invented_user_attribution(
 
     Only checked when the source genuinely has no user turn — where the
     judgement is unambiguous.
+
+    Call this with the WHOLE conversation, never with a chunk. Staged
+    summarization splits messages into parts, and a part of a perfectly
+    ordinary conversation can contain no user message at all (a long
+    assistant + tool run). Judging a chunk would reject legitimate summaries
+    and fail the compaction outright.
     """
     if _has_user_turn(messages):
         return
@@ -297,10 +303,12 @@ async def generate_summary(
         max_tokens=reserve_tokens,
     )
 
-    summary = validated_summary_text(response)
-    # Raises into the retry/fallback ladder rather than storing a fabrication.
-    reject_invented_user_attribution(summary, messages)
-    return summary
+    # NOTE: the invented-user check deliberately does NOT run here. This
+    # function sees one CHUNK, and a chunk of a real conversation can easily
+    # contain no user message (a long assistant + tool run), so checking here
+    # would reject legitimate summaries and fail the whole compaction. The
+    # caller applies it once, against the full message set.
+    return validated_summary_text(response)
 
 
 async def summarize_chunks(

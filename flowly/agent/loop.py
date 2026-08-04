@@ -5620,6 +5620,12 @@ class AgentLoop:
             # Serialise against a manual /compact arriving from another client
             # mid-turn: both paths commit by clearing and rewriting the same
             # session object.
+            #
+            # LOAD-BEARING: the ``/compact`` command branch earlier in this
+            # method returns before reaching here. It must keep doing so —
+            # this lock is an asyncio.Lock and is NOT reentrant, so a turn
+            # that both handled /compact and fell through to here would wait
+            # on itself forever.
             async with self.compaction.session_lock(msg.session_key):
                 _generation = self._compaction_generation(session)
                 try:
@@ -6695,6 +6701,36 @@ class AgentLoop:
         anchor = {"role": "system", "content": content}
         return [anchor] + history
 
+    # A summary of a two-line chat costs an LLM call and buys nothing.
+    _COMPACT_MIN_TURNS = 3
+    _COMPACT_MIN_TOKENS = 1000
+
+    @classmethod
+    def _compaction_ineligible_reason(cls, history: list[dict[str, Any]]) -> str | None:
+        """Why this history should not be compacted, or None if it should.
+
+        One definition, applied both before taking the session lock (to reject
+        cheaply) and again after acquiring it — because by then another
+        compaction may have already shrunk the history out from under us.
+        """
+        if not history:
+            return "No history to compact."
+        if len(history) == 1 and is_summary_message(history[0]):
+            return "Already compacted. Send more messages first."
+        turns = [m for m in history if m.get("role") in ("user", "assistant")]
+        if len(turns) < cls._COMPACT_MIN_TURNS:
+            return (
+                f"Not enough messages to compact ({len(turns)} messages). "
+                f"Need at least {cls._COMPACT_MIN_TURNS}."
+            )
+        tokens = estimate_messages_tokens(history)
+        if tokens < cls._COMPACT_MIN_TOKENS:
+            return (
+                f"History too small to compact ({tokens} tokens). "
+                f"Need at least {cls._COMPACT_MIN_TOKENS}."
+            )
+        return None
+
     @staticmethod
     def _compaction_generation(session: Any) -> int:
         """How many times this session has been compacted.
@@ -6817,46 +6853,16 @@ class AgentLoop:
         """
         session = self.sessions.get_or_create(session_key)
         history = self._history_with_summary_anchor(session)
-
-        if not history:
-            return {
-                "success": False,
-                "message": "No history to compact.",
-                "tokens_before": 0,
-                "tokens_after": 0,
-            }
-
         tokens_before = estimate_messages_tokens(history)
 
-        # Check if already compacted (history is just a compaction summary)
-        is_already_compacted = (
-            len(history) == 1 and is_summary_message(history[0])
-        )
-
-        if is_already_compacted:
+        # Cheap rejection before announcing anything or taking the lock. The
+        # same checks run again inside the lock against the history we
+        # actually end up holding.
+        ineligible = self._compaction_ineligible_reason(history)
+        if ineligible:
             return {
                 "success": False,
-                "message": "Already compacted. Send more messages first.",
-                "tokens_before": tokens_before,
-                "tokens_after": tokens_before,
-            }
-
-        # Check if too few messages to compact (need at least 3 messages)
-        # Filter out system messages for this count
-        user_assistant_messages = [m for m in history if m.get("role") in ("user", "assistant")]
-        if len(user_assistant_messages) < 3:
-            return {
-                "success": False,
-                "message": f"Not enough messages to compact ({len(user_assistant_messages)} messages). Need at least 3.",
-                "tokens_before": tokens_before,
-                "tokens_after": tokens_before,
-            }
-
-        # Check if token count is too low to bother compacting (< 1000 tokens)
-        if tokens_before < 1000:
-            return {
-                "success": False,
-                "message": f"History too small to compact ({tokens_before} tokens). Need at least 1000.",
+                "message": ineligible,
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_before,
             }
@@ -6874,12 +6880,18 @@ class AgentLoop:
             # Re-read inside the lock: whoever held it before us may have
             # already compacted, in which case our snapshot is stale.
             history = self._history_with_summary_anchor(session)
-            if not history:
+            # Re-apply the eligibility checks to what we ACTUALLY hold. Running
+            # them only on the pre-lock snapshot meant a second device could
+            # pass them, wait for the first compaction, then spend an LLM call
+            # summarising the tiny result — and report it as a failure.
+            not_worth_it = self._compaction_ineligible_reason(history)
+            if not_worth_it:
+                tokens_now = estimate_messages_tokens(history)
                 return {
                     "success": False,
-                    "message": "No history to compact.",
-                    "tokens_before": tokens_before,
-                    "tokens_after": tokens_before,
+                    "message": not_worth_it,
+                    "tokens_before": tokens_now,
+                    "tokens_after": tokens_now,
                 }
 
             # Run compaction. A failure must leave the session exactly as it

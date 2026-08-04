@@ -255,3 +255,96 @@ def test_sanitizer_runs_as_part_of_get_history():
     history = session.get_history(max_messages=10)
 
     assert all(m.get("role") != "tool" for m in history)
+
+
+def test_both_repairs_agree_on_which_id_a_result_references():
+    """The tail repair and the whole-list pass must read the SAME id field.
+    If they disagree, each 'fixes' what the other considers valid — and a
+    complete pair keyed by call_id looks like an orphan to one of them."""
+    from flowly.session.manager import _repair_tool_sequence
+
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "internal-1", "call_id": "wire-1",
+                            "function": {"name": "run", "arguments": "{}"}}],
+        },
+        _tool_result("wire-1"),
+    ]
+
+    repaired = _repair_tool_sequence([dict(m) for m in messages])
+
+    assert len(repaired) == 3, (
+        "a complete call/result pair keyed by call_id was trimmed as an orphan"
+    )
+    assert repaired[-1]["role"] == "tool"
+
+
+# ── Eligibility is judged against what we actually hold ───────────────────
+
+
+def _eligible(history):
+    from flowly.agent.loop import AgentLoop
+
+    return AgentLoop._compaction_ineligible_reason(history)
+
+
+def _chat(turns: int, words: int = 60):
+    filler = "word " * words
+    out = []
+    for i in range(turns):
+        out.append({"role": "user", "content": f"q{i} {filler}"})
+        out.append({"role": "assistant", "content": f"a{i} {filler}"})
+    return out
+
+
+def test_a_substantial_conversation_is_eligible():
+    assert _eligible(_chat(10)) is None
+
+
+@pytest.mark.parametrize(
+    "history,expected",
+    [
+        ([], "No history"),
+        ([{"role": "system", "content": "[Previous conversation summary]\n\nx"}],
+         "Already compacted"),
+        (_chat(1), "Not enough messages"),
+        (_chat(3, words=1), "too small"),
+    ],
+)
+def test_ineligible_histories_are_named(history, expected):
+    reason = _eligible(history)
+
+    assert reason is not None
+    assert expected in reason
+
+
+def test_a_history_shrunk_by_a_concurrent_compaction_becomes_ineligible():
+    """The second device to ask for /compact re-checks after the lock. Without
+    that it would spend an LLM call summarising the tiny result of the first
+    compaction, then report the outcome as a failure."""
+    before = _chat(20)
+    assert _eligible(before) is None
+
+    # What the winner leaves behind: a summary plus a short kept tail.
+    after = [
+        {"role": "system", "content": "[Previous conversation summary]\n\nprior work"},
+        {"role": "user", "content": "ok"},
+    ]
+
+    assert _eligible(after) is not None
+
+
+async def test_the_session_lock_is_not_reentrant():
+    """The auto-compaction path holds this lock across summarisation while the
+    /compact command path returns before reaching it. That early return is
+    load-bearing: re-entering here would wait on ourselves forever."""
+    service = _service(_SlowProvider())
+
+    async with service.session_lock("s1"):
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                service.session_lock("s1").acquire(), timeout=0.2,
+            )

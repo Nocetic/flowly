@@ -182,8 +182,12 @@ def _repair_tool_sequence(
                 result = result[: idx + 1]
                 continue
             issuing = result[idx]
+            # Same id resolution as the whole-list pass below. Two repairs
+            # reading different id fields is worse than one: they would
+            # disagree about which pairs are complete, and each would "fix"
+            # what the other considers valid.
             declared_ids = {
-                tc.get("id")
+                _tool_call_id(tc)
                 for tc in (issuing.get("tool_calls") or [])
                 if isinstance(tc, dict)
             }

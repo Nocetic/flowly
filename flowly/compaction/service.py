@@ -12,7 +12,10 @@ from flowly.compaction.pruning import (
     compute_adaptive_chunk_ratio,
     split_into_turn_blocks,
 )
-from flowly.compaction.summarizer import summarize_in_stages
+from flowly.compaction.summarizer import (
+    reject_invented_user_attribution,
+    summarize_in_stages,
+)
 from flowly.compaction.types import (
     CompactionConfig,
     CompactionError,
@@ -574,6 +577,11 @@ class CompactionService:
             custom_instructions,
             effective_previous,
         )
+
+        # Applied once, against the WHOLE conversation rather than a chunk: a
+        # chunk can legitimately have no user turn even when the conversation
+        # does, and rejecting on that would fail real compactions.
+        reject_invented_user_attribution(summary, messages)
 
         # Estimate tokens after (summary + kept messages)
         from flowly.compaction.estimator import estimate_tokens

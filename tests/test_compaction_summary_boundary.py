@@ -318,3 +318,69 @@ def test_a_userless_summary_without_attribution_is_fine():
         "## Decisions\nThe scheduled job wrote report.csv and exited 0.",
         _cron_turns(),
     )
+
+
+async def test_a_chunk_without_a_user_turn_does_not_fail_a_real_conversation():
+    """Staged summarization feeds CHUNKS to the summarizer, and a chunk of a
+    real conversation can easily be all assistant + tool. Checking attribution
+    per chunk would reject legitimate summaries and fail the compaction."""
+    from flowly.compaction.service import CompactionService
+    from flowly.compaction.types import CompactionConfig
+
+    class _Provider:
+        provider_name = "stub"
+
+        async def chat(self, *args, **kwargs):
+            return LLMResponse(
+                content="The user asked for the log to be checked.",
+                finish_reason="stop",
+            )
+
+    # A user speaks once, then a long tool-only run — exactly the shape that
+    # produces a user-less chunk.
+    messages = [{"role": "user", "content": "check the log " + "word " * 200}]
+    for i in range(20):
+        messages.append({"role": "assistant", "content": f"step {i} " + "word " * 200})
+        messages.append({"role": "tool", "tool_call_id": f"c{i}",
+                         "content": f"result {i} " + "word " * 200})
+
+    service = CompactionService(
+        provider=_Provider(), model="m",
+        config=CompactionConfig(mode="default", context_window=4_000,
+                                reserve_tokens_floor=200),
+    )
+
+    result = await service.compact(messages)
+
+    assert "user asked" in result.summary, (
+        "a real conversation's summary must survive; the guard only applies "
+        "when nobody spoke at all"
+    )
+
+
+async def test_a_genuinely_userless_session_still_rejects_attribution():
+    from flowly.compaction.service import CompactionService
+    from flowly.compaction.types import CompactionConfig
+
+    class _Provider:
+        provider_name = "stub"
+
+        async def chat(self, *args, **kwargs):
+            return LLMResponse(
+                content="The user asked for a nightly report.", finish_reason="stop",
+            )
+
+    messages = [
+        {"role": "system", "content": "Scheduled job. " + "word " * 200},
+        {"role": "assistant", "content": "Report written. " + "word " * 200},
+        {"role": "assistant", "content": "Exited 0. " + "word " * 200},
+    ]
+
+    service = CompactionService(
+        provider=_Provider(), model="m",
+        config=CompactionConfig(mode="default", context_window=4_000,
+                                reserve_tokens_floor=200),
+    )
+
+    with pytest.raises(CompactionError, match="invented user attribution"):
+        await service.compact(messages)
