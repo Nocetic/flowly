@@ -4967,6 +4967,7 @@ class AgentLoop:
         session: Any,
         channel: str,
         chat_id: str,
+        announce: bool = True,
     ) -> None:
         """
         Run a pre-compaction memory flush turn.
@@ -5016,11 +5017,17 @@ class AgentLoop:
                     logger.debug(f"Memory flush tool: {tool_call.name}")
                     await self.tools.execute(tool_call.name, tool_call.arguments)
 
-            # Check if response should be silent
+            # Check if response should be silent. ``announce`` is False on the
+            # background path: there, nobody is waiting on a turn, so a message
+            # from the flush is not a reply — it is the agent messaging the user
+            # unprompted about its own housekeeping.
             content = response.content or ""
-            if not self.compaction.is_silent_reply(content):
-                # Agent wants to communicate something
-                stripped = self.compaction.strip_silent_token(content)
+            if announce and not self.compaction.is_silent_reply(content):
+                # Agent wants to communicate something. Strip before testing:
+                # a whitespace-only reply is not silent by the token rule, but
+                # it is still nothing to say — unstripped it published an empty
+                # "📝" message to the user.
+                stripped = self.compaction.strip_silent_token(content).strip()
                 if stripped:
                     logger.info(f"Memory flush response: {stripped[:100]}...")
                     # Optionally send to user
@@ -5030,10 +5037,25 @@ class AgentLoop:
                         content=f"📝 {stripped}"
                     ))
 
-            # Save flush interaction to session
-            session.add_message("user", f"[System: Memory Flush] {user_prompt}")
-            session.add_message("assistant", content)
-            self.sessions.save(session)
+            # The flush exchange is NOT written back to the session.
+            #
+            # It used to be, as a "user" turn carrying the flush instruction
+            # ("save any durable facts to disk…") plus the model's reply. Two
+            # things followed. The pair reached the display transcript, so the
+            # user's own chat history grew fake turns they never sent. Worse,
+            # the model reads that history on every later turn and treats a
+            # recent user instruction as still standing: observed live, a user
+            # who answered "thanks" got a file written to their memory folder
+            # and a report about it, because the last instruction the model
+            # could see told it to save memories.
+            #
+            # Nothing is lost by dropping it. Whatever mattered is already on
+            # disk (that is what the flush DOES), and "has this cycle flushed"
+            # is tracked by the compaction service, not by reading history.
+            logger.debug(
+                f"[memory-flush] completed for {session.key} "
+                f"({len(content)} chars, silent={self.compaction.is_silent_reply(content)})"
+            )
 
         except asyncio.TimeoutError:
             logger.warning(
@@ -7273,7 +7295,9 @@ class AgentLoop:
                 observed_total_tokens=observed_total,
             ):
                 logger.info("Running post-turn memory flush")
-                await self._run_memory_flush(session, msg.channel, msg.chat_id)
+                await self._run_memory_flush(
+                    session, msg.channel, msg.chat_id, announce=False,
+                )
                 self.compaction.mark_memory_flush_done(session_key)
                 history = self._history_with_summary_anchor(session)
                 history_tokens = estimate_messages_tokens(history)
