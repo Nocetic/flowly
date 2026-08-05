@@ -383,6 +383,14 @@ def test_the_notice_is_placed_above_a_reply_that_has_not_arrived():
     assert source.index("placeholder.remove()") < source.index(
         "add_compaction_notice"
     ), "the notice must be mounted after the empty placeholder is removed"
+    # …and it stays down: an empty reply box under a "compacting" notice says
+    # nothing the status bar is not already saying, and there is no reply
+    # being written while the summary is.
+    started = source.index("add_compaction_notice")
+    rest = source[started:started + 400]
+    assert "start_assistant()" not in rest, (
+        "the empty placeholder is reopened while compaction runs"
+    )
 
 
 def test_a_terminal_without_a_running_notice_still_reports():

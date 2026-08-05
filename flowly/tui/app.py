@@ -1108,19 +1108,21 @@ class FlowlyTUI(App[None]):
                     # user hits send, so a notice mounted now lands BELOW a
                     # reply that has not been written yet — and once it fills
                     # in, the transcript claims the compaction happened after
-                    # the answer. Take the empty placeholder down, mark the
-                    # boundary where it actually falls, and put it back.
+                    # the answer it preceded.
+                    #
+                    # The placeholder comes down and stays down: while the
+                    # summary is being written there is no reply being written,
+                    # so an empty box below the notice says nothing the status
+                    # bar ("thinking · 13s") is not already saying. The delta
+                    # handler opens a fresh bubble the moment real content
+                    # arrives.
                     placeholder = self._current_bubble
-                    reopen = placeholder is not None and placeholder.is_empty
-                    if reopen and placeholder is not None:
+                    if placeholder is not None and placeholder.is_empty:
                         placeholder.remove()
                         self._current_bubble = None
                     self._compaction_notice = transcript.add_compaction_notice(
                         "compacting context…"
                     )
-                    if reopen:
-                        self._current_bubble = transcript.start_assistant()
-                        self._current_bubble.mark_streaming(True)
                 return
             # A terminal closes the cycle it belongs to. Without the id an
             # event from an earlier pass (a retry, a second device, a reorder
