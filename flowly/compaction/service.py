@@ -23,6 +23,7 @@ from flowly.compaction.types import (
     CompactionError,
     CompactionResult,
     build_summary_content,
+    is_summary_message,
 )
 from flowly.providers.base import LLMProvider
 
@@ -47,6 +48,32 @@ def _heuristic_context_window(model: str) -> int | None:
     if "gpt-3.5" in m:
         return 16_385
     return None
+
+
+def count_conversational_messages(messages: list[dict[str, Any]]) -> int:
+    """How many of these a person would call messages.
+
+    The working context also holds tool-call frames, tool results and the
+    compaction summary — real entries the model reads, but not things the user
+    sees as messages. Counting them made a three-exchange chat report "12 msgs
+    summarized", which reads as either a bug or a lie about what was thrown
+    away.
+    """
+    total = 0
+    for message in messages:
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue  # tool results, system scaffolding
+        if message.get("tool_calls"):
+            continue  # the model asking for a tool, not speaking
+        if is_summary_message(message):
+            continue  # a previous compaction's summary, not a turn
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            total += 1
+        elif isinstance(content, list) and content:
+            total += 1
+    return total
 
 
 def _essential_turn_tail(block: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -811,9 +838,14 @@ class CompactionService:
             summary=summary,
             tokens_before=tokens_before,
             tokens_after=tokens_after,
-            # Net messages leaving the working context — NOT the size of the
-            # summarisation input, which safeguard pruning also shrinks.
-            messages_removed=len(messages) - len(kept_messages),
+            # What a PERSON would count as messages, because this number is
+            # only ever shown to one. The raw protocol delta (tool frames and
+            # all) goes to the log below instead.
+            messages_removed=max(
+                0,
+                count_conversational_messages(messages)
+                - count_conversational_messages(kept_messages),
+            ),
             dropped_chunks=dropped_chunks,
             dropped_messages=dropped_messages,
             dropped_tokens=dropped_tokens,

@@ -5784,7 +5784,8 @@ class AgentLoop:
                     self.compaction.record_compaction_success(msg.session_key)
                     logger.info(
                         f"Compaction complete: {result.tokens_before} -> {result.tokens_after} tokens, "
-                        f"removed {result.messages_removed} messages, "
+                        f"removed {result.messages_removed} messages "
+                        f"({len(history) - len(result.kept_messages)} context entries), "
                         f"kept {len(result.kept_messages)} recent"
                     )
                     history = self._commit_compaction(
@@ -7474,7 +7475,8 @@ class AgentLoop:
                 logger.info(
                     f"Post-turn compaction complete: {result.tokens_before} -> "
                     f"{result.tokens_after} tokens, removed "
-                    f"{result.messages_removed} messages, "
+                    f"{result.messages_removed} messages "
+                    f"({len(history) - len(result.kept_messages)} context entries), "
                     f"kept {len(result.kept_messages)} recent"
                 )
                 self._commit_compaction(

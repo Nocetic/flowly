@@ -566,7 +566,9 @@ async def test_an_extracted_tail_still_summarizes_the_whole_block():
     assert provider.saw("check the deploy logs"), (
         "the oversized block never reached the summarizer"
     )
-    assert result.messages_removed == len(messages) - len(result.kept_messages)
+    # The reported count is what a person would count, so it is SMALLER than
+    # the protocol delta (this block's tool frames are not messages to them).
+    assert 0 < result.messages_removed < len(messages) - len(result.kept_messages)
 
 
 # ── Small models must still be able to compact ────────────────────────────
@@ -619,3 +621,61 @@ def test_a_large_window_keeps_the_configured_reserve():
     )
 
     assert service.effective_reserve_tokens == 20_000
+
+
+# ── The reported count is the one a person can verify ─────────────────────
+
+
+def test_tool_traffic_is_not_counted_as_messages():
+    """A three-exchange chat reported "12 msgs summarized" because tool-call
+    frames, tool results and the previous summary are all messages to the
+    model. The number is only ever shown to a human, who counts bubbles."""
+    from flowly.compaction.service import count_conversational_messages
+
+    history = [
+        {"role": "system", "content": f"{SUMMARY_MARKER}\n\nearlier work"},
+        {"role": "user", "content": "read the log"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "…4000 lines…"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c2"}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "…"},
+        {"role": "assistant", "content": "Here is what the log says."},
+        {"role": "user", "content": "thanks"},
+        {"role": "assistant", "content": "anytime"},
+    ]
+
+    assert len(history) == 9
+    assert count_conversational_messages(history) == 4
+
+
+def test_multimodal_turns_still_count():
+    from flowly.compaction.service import count_conversational_messages
+
+    assert count_conversational_messages([
+        {"role": "user", "content": [{"type": "image_url"}]},
+    ]) == 1
+
+
+def test_empty_turns_do_not_count():
+    from flowly.compaction.service import count_conversational_messages
+
+    assert count_conversational_messages([
+        {"role": "assistant", "content": ""},
+        {"role": "assistant", "content": "   "},
+    ]) == 0
+
+
+async def test_the_result_reports_what_the_user_can_count():
+    provider = _Provider(LLMResponse(content="A summary.", finish_reason="stop"))
+    service = _service(provider, context_window=2_000, reserve_tokens_floor=100)
+    history: list[dict] = []
+    for i in range(6):
+        history.extend(_tool_turn(i))
+
+    result = await service.compact(history)
+
+    protocol_frames = len(history) - len(result.kept_messages)
+    assert result.messages_removed < protocol_frames, (
+        "tool frames are being reported to the user as messages again"
+    )
+    assert result.messages_removed > 0
