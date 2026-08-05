@@ -41,6 +41,8 @@ amp
 *_PLAN.md
 # Internal audit reports (MEMORY_AUDIT.md, TUI_UX_AUDIT.md, …) — same deal.
 *_AUDIT.md
+# Local scratch output from agent runs (3D models, renders, pilots) — keep local.
+artifacts/
 
 # Compiled iMessage send helper (built per-platform by helpers/build.sh)
 flowly/channels/helpers/Flowly iMessage Helper.app/
