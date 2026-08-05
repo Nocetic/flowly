@@ -226,6 +226,8 @@ async def test_every_compaction_phase_is_deliverable(channel, phase):
 def test_chat_inflight_returns_the_whole_live_turn():
     """A client that reconnects mid-turn rebuilds from this alone. Anything
     live that is missing here is invisible until the turn ends."""
+    import time as _time
+
     from flowly.agent import compaction_status, inflight
     from flowly.channels.feature_rpc import chat_inflight
 
@@ -235,7 +237,9 @@ def test_chat_inflight_returns_the_whole_live_turn():
     inflight.append_iteration(session_key, "run-9", {
         "runId": "run-9", "iterationIdx": 0, "role": "assistant", "content": "",
     })
-    compaction_status.record(session_key, "started", 90_000, 0, 0, now=1_000.0)
+    # Real clock: chat_inflight reads time.time(), and a "started" older than
+    # the backstop is deliberately dropped.
+    compaction_status.record(session_key, "started", 90_000, 0, 0, now=_time.time())
 
     result = chat_inflight({"sessionKey": session_key})
 

@@ -25,6 +25,13 @@ _STATE: dict[str, dict[str, Any]] = {}
 # resurrect a stale banner.
 TERMINAL_TTL_SECONDS = 60.0
 
+# A "started" that is never closed would otherwise be reported forever, so a
+# client re-entering hours later would find a compaction still running. Every
+# path is supposed to emit a terminal — this is the backstop for the one that
+# does not, e.g. a process killed mid-summary. Generous: a staged summary of a
+# huge history is minutes of real work.
+RUNNING_MAX_AGE_SECONDS = 900.0
+
 MAX_TRACKED = 200
 
 
@@ -70,6 +77,11 @@ def get(session_key: str, now: float) -> dict[str, Any] | None:
     if not state:
         return None
     if state["phase"] == "started":
+        if now - state["at"] > RUNNING_MAX_AGE_SECONDS:
+            # Nobody closed it. Reporting it forever means a chat opened
+            # tomorrow still shows a spinner for work that died today.
+            _STATE.pop(session_key, None)
+            return None
         return {k: v for k, v in state.items() if k != "at"}
     if now - state["at"] <= TERMINAL_TTL_SECONDS:
         return {k: v for k, v in state.items() if k != "at"}

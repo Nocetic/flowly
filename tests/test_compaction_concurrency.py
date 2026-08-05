@@ -411,13 +411,29 @@ def test_compaction_status_is_readable_by_a_returning_client():
     assert "at" not in state, "internal timestamp must not reach clients"
 
 
-def test_a_running_compaction_is_reported_however_long_it_takes():
+def test_a_running_compaction_is_reported_for_as_long_as_it_plausibly_runs():
+    """Staged summarisation of a huge history is minutes of real work, so a
+    running notice must not expire while the work is genuinely in flight."""
     from flowly.agent import compaction_status
 
     compaction_status.clear("s2")
     compaction_status.record("s2", "started", 90_000, 0, 0, now=0.0)
 
-    assert compaction_status.get("s2", now=10_000.0) is not None
+    assert compaction_status.get("s2", now=600.0) is not None
+
+
+def test_a_running_compaction_that_nobody_closed_eventually_stops_being_news():
+    """Every path is supposed to emit a terminal. This is the backstop for the
+    one that does not — a process killed mid-summary would otherwise leave a
+    chat opened tomorrow still showing a spinner for work that died today."""
+    from flowly.agent import compaction_status
+
+    compaction_status.clear("s2b")
+    compaction_status.record("s2b", "started", 90_000, 0, 0, now=0.0)
+
+    assert compaction_status.get(
+        "s2b", now=compaction_status.RUNNING_MAX_AGE_SECONDS + 1,
+    ) is None
 
 
 def test_a_finished_compaction_stops_being_news():

@@ -702,3 +702,34 @@ async def test_a_reset_drops_the_persisted_reading_too():
     harness.reset_conversation(session.key)
 
     assert "last_turn_total_tokens" not in session.metadata
+
+
+async def test_a_refused_commit_still_closes_the_cycle_with_its_id():
+    """The manual path committed outside its try, so a reset landing
+    mid-summary escaped to the caller with the notice still spinning. Every
+    announced cycle gets a terminal, and it carries the SAME id."""
+    session = _big_session()
+    harness = _Harness(session)
+    barrier = asyncio.Event()
+    original = harness.provider.chat
+
+    async def parked(*a, **k):
+        await barrier.wait()
+        return await original(*a, **k)
+
+    harness.provider.chat = parked
+    task = asyncio.create_task(harness._post_turn_compaction(_msg()))
+    await asyncio.sleep(0.05)
+    harness.reset_conversation(session.key)
+    barrier.set()
+    await task
+
+    phases = [p for p, _ in harness.cycles]
+    assert phases[0] == "started"
+    assert phases[-1] in ("failed", "completed")
+    opened = harness.cycles[0][1]
+    closed = harness.cycles[-1][1]
+    assert opened and closed == opened, (
+        f"the cycle was opened as {opened!r} and closed as {closed!r} — a "
+        "client keying on the id cannot match them"
+    )

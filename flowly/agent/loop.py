@@ -6985,6 +6985,12 @@ class AgentLoop:
         self.compaction.reset_session(session_key)
         self._last_turn_total_tokens.pop(session_key, None)
         try:
+            from flowly.agent import compaction_status
+
+            compaction_status.clear(session_key)
+        except Exception:  # noqa: BLE001 — status is a convenience
+            logger.debug("[reset] compaction status clear skipped")
+        try:
             self.context.invalidate_memory_snapshot(session_key)
         except Exception:  # noqa: BLE001 — snapshot is a cache
             logger.debug("[reset] memory snapshot invalidation skipped")
@@ -7227,10 +7233,29 @@ class AgentLoop:
                 }
 
             self.compaction.record_compaction_success(session_key)
-            self._commit_compaction(
-                session, result, session_key, source_message_count=source_len,
-                compaction_id=compaction_id, source_epoch=source_epoch,
-            )
+            try:
+                self._commit_compaction(
+                    session, result, session_key, source_message_count=source_len,
+                    compaction_id=compaction_id, source_epoch=source_epoch,
+                )
+            except CompactionError as exc:
+                # A reset landed while we summarised (or any other refusal to
+                # commit). The cycle was announced, so it MUST be closed here —
+                # letting this escape left the notice spinning forever on every
+                # client and a permanent "started" in the re-entry handshake.
+                logger.info(f"Manual compaction not committed: {exc}")
+                await self._emit_compaction_event(
+                    session_key, "failed", tokens_before, tokens_before, 0,
+                    compaction_id=compaction_id,
+                )
+                return {
+                    "success": False,
+                    "message": f"{exc}",
+                    "tokens_before": tokens_before,
+                    "tokens_after": estimate_messages_tokens(
+                        self._history_with_summary_anchor(session)
+                    ),
+                }
 
         # Notify connected clients — compaction completed. No transcript
         # separator is published: the boundary row is written by whichever
@@ -7311,6 +7336,10 @@ class AgentLoop:
             try:
                 session = self.sessions.get_or_create(session_key)
                 session.metadata["last_turn_total_tokens"] = total
+                # Writing the attribute is not persisting it: the turn's own
+                # save already happened, so without this the reading lives only
+                # in this process — exactly the case it exists to cover.
+                self.sessions.save(session)
             except Exception:  # noqa: BLE001 — the in-memory copy still works
                 logger.debug("[compaction] usage persist skipped (non-fatal)")
             # Bounded: sessions come and go on a long-lived gateway.
@@ -7354,6 +7383,26 @@ class AgentLoop:
 
         task.add_done_callback(_reap)
 
+    async def await_post_turn_compaction(self, session_key: str) -> None:
+        """Block until this session's background compaction finishes.
+
+        For callers whose process ends with the turn — ``flowly agent -m`` runs
+        one process per message, and ``asyncio.run`` cancels every pending task
+        on the way out. Without this the one-shot CLI got the post-turn CHECK
+        but never the work, so the session stayed over budget and the next
+        invocation paid for it. A long-lived gateway never calls this: there,
+        not blocking is the entire point.
+        """
+        task = self._post_turn_compaction_tasks.get(session_key)
+        if task is None or task.done():
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — already logged inside the pass
+            logger.debug(f"Post-turn compaction ended with: {e}")
+
     async def _post_turn_compaction(self, msg: InboundMessage) -> None:
         """Background twin of the pre-turn compaction block.
 
@@ -7363,6 +7412,10 @@ class AgentLoop:
         the session untouched": the pre-turn check still guards the next turn.
         """
         session_key = msg.session_key
+        # Hoisted so the outermost failure path can close the cycle it opened
+        # — a terminal without the id cannot be matched to its `started`, and
+        # clients that key on the id would leave the notice running forever.
+        compaction_id = ""
         # Let the turn's own reply reach the client first. This pass is
         # scheduled from _process_message's finally, which runs BEFORE the
         # caller publishes the reply — so without a settle the "started"
@@ -7508,6 +7561,9 @@ class AgentLoop:
             # agent down or leave the UI stuck on "started".
             logger.error(f"Post-turn compaction pass failed: {e}")
             try:
-                await self._emit_compaction_event(session_key, "failed", 0, 0, 0)
+                await self._emit_compaction_event(
+                    session_key, "failed", 0, 0, 0,
+                    compaction_id=compaction_id,
+                )
             except Exception:
                 pass

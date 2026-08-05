@@ -274,6 +274,12 @@ def agent(
                 console.print(f"\n{__logo__} {response}")
                 _display_media(meta)
                 _display_usage(meta)
+                # A one-shot run ends when this coroutine returns, and
+                # asyncio.run() then cancels whatever is still pending —
+                # including the post-turn compaction this turn just scheduled.
+                # So the CLI got the check but never the work: the session
+                # stayed over budget and the NEXT invocation paid for it.
+                await agent_loop.await_post_turn_compaction(session_id)
             asyncio.run(run_once())
     else:
         # Interactive mode
