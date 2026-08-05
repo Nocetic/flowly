@@ -339,3 +339,57 @@ def test_the_tui_only_closes_the_cycle_it_opened():
     source = inspect.getsource(tui_app.FlowlyTUI._handle_event)
     assert "self._compaction_cycle = ev.compaction_id" in source
     assert "ev.compaction_id != self._compaction_cycle" in source
+
+
+# ── The TUI notice is one animated row, in the right place ────────────────
+
+
+def test_a_bubble_knows_whether_anything_was_written_to_it():
+    """A turn opens a placeholder the instant the user hits send, so "is there
+    a bubble" and "has the agent said anything" are different questions — and
+    the compaction notice has to tell them apart to land in the right place."""
+    from flowly.tui.panes.transcript import Bubble
+
+    assert Bubble("assistant", "").is_empty
+    assert Bubble("assistant", "   \n ").is_empty
+    assert not Bubble("assistant", "Deployed.").is_empty
+
+
+def test_the_notice_spins_and_then_becomes_its_own_result():
+    """A static line gives no way to tell "working" from "stuck", and a
+    separate outcome line leaves an orphaned "compacting…" above it."""
+    from flowly.tui.panes.transcript import CompactionNotice
+
+    notice = CompactionNotice("compacting context…")
+    assert len(notice.FRAMES) > 1, "a one-frame animation is a static line"
+
+    notice.finish("context compacted · 8 msgs summarized")
+
+    assert notice._timer is None, "the spinner kept running after the result"
+    assert "compacted" in notice._label
+
+
+def test_the_notice_is_placed_above_a_reply_that_has_not_arrived():
+    """The empty placeholder is taken down, the boundary is marked where it
+    actually falls, and the placeholder is put back — otherwise the transcript
+    claims the compaction happened after an answer it preceded."""
+    import inspect
+
+    from flowly.tui import app as tui_app
+
+    source = inspect.getsource(tui_app.FlowlyTUI._handle_event)
+    assert "placeholder.is_empty" in source
+    assert "placeholder.remove()" in source
+    assert source.index("placeholder.remove()") < source.index(
+        "add_compaction_notice"
+    ), "the notice must be mounted after the empty placeholder is removed"
+
+
+def test_a_terminal_without_a_running_notice_still_reports():
+    """A client that reconnected mid-compaction never saw the "started"."""
+    import inspect
+
+    from flowly.tui import app as tui_app
+
+    source = inspect.getsource(tui_app.FlowlyTUI._handle_event)
+    assert "transcript.add_system(f\"⚡ {summary_line}\")" in source

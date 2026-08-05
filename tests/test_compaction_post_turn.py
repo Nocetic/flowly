@@ -93,6 +93,7 @@ class _Harness:
     _compaction_generation = staticmethod(AgentLoop._compaction_generation)
     _new_compaction_id = staticmethod(AgentLoop._new_compaction_id)
     context_epoch = AgentLoop.context_epoch
+    _observed_total_tokens = AgentLoop._observed_total_tokens
     reset_conversation = AgentLoop.reset_conversation
     _post_turn_compaction = AgentLoop._post_turn_compaction
     _schedule_post_turn_compaction = AgentLoop._schedule_post_turn_compaction
@@ -670,3 +671,34 @@ def test_cached_input_counts_toward_the_observed_size():
     harness._note_turn_usage(session.key, _Outcome())
 
     assert harness._last_turn_total_tokens[session.key] == 78_000
+
+
+async def test_the_observed_size_survives_the_process():
+    """`flowly agent -m` runs ONE process per message, so an in-memory reading
+    is gone before the next turn can use it — the provider-observed trigger
+    could never fire there. A restarted gateway lost it the same way."""
+    session = _big_session(turns=1)
+    harness = _Harness(session, context_window=100_000)
+
+    class _Outcome:
+        metadata = {"usage": {"prompt_tokens": 80_000, "completion_tokens": 1_000}}
+
+    harness._note_turn_usage = AgentLoop._note_turn_usage.__get__(harness)
+    harness._note_turn_usage(session.key, _Outcome())
+
+    assert session.metadata["last_turn_total_tokens"] == 81_000
+
+    # A fresh process: nothing in memory, everything on the session.
+    reborn = _Harness(session, context_window=100_000)
+    assert reborn._observed_total_tokens(session.key, session) == 81_000
+
+
+async def test_a_reset_drops_the_persisted_reading_too():
+    """It describes a context the user just discarded."""
+    session = _big_session(turns=1)
+    harness = _Harness(session, context_window=100_000)
+    session.metadata["last_turn_total_tokens"] = 81_000
+
+    harness.reset_conversation(session.key)
+
+    assert "last_turn_total_tokens" not in session.metadata

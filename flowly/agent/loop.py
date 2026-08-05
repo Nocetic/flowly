@@ -5663,7 +5663,7 @@ class AgentLoop:
         history_tokens = estimate_messages_tokens(history)
         total_tokens = history_tokens + fixed_overhead
 
-        observed_total = self._last_turn_total_tokens.get(msg.session_key, 0)
+        observed_total = self._observed_total_tokens(msg.session_key, session)
 
         if self.compaction.should_memory_flush(
             history_tokens, msg.session_key, overhead_tokens=fixed_overhead,
@@ -7246,6 +7246,22 @@ class AgentLoop:
             "summary_preview": result.summary[:200] + "..." if len(result.summary) > 200 else result.summary,
         }
 
+    def _observed_total_tokens(self, session_key: str, session: Any = None) -> int:
+        """The provider's last reported request size for this conversation.
+
+        Prefers the in-memory reading and falls back to the one persisted on
+        the session, so a per-message CLI process — or a restarted gateway —
+        still has ground truth to check the estimate against.
+        """
+        live = self._last_turn_total_tokens.get(session_key, 0)
+        if live > 0:
+            return live
+        try:
+            stored = int((session.metadata or {}).get("last_turn_total_tokens", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        return max(0, stored)
+
     def _note_turn_usage(self, session_key: str, outcome: Any) -> None:
         """Record the provider's own count of the turn that just ended.
 
@@ -7279,6 +7295,17 @@ class AgentLoop:
             return
         if total > 0:
             self._last_turn_total_tokens[session_key] = total
+            # Also on the session, so the reading survives the process. The
+            # CLI runs one process per message, so an in-memory observation is
+            # gone before the next turn can use it — the trigger this exists
+            # for could never fire there. A gateway restart lost it the same
+            # way. It is content-derived, so a /clear drops it with everything
+            # else (see Session.CONTEXT_FREE_METADATA_KEYS).
+            try:
+                session = self.sessions.get_or_create(session_key)
+                session.metadata["last_turn_total_tokens"] = total
+            except Exception:  # noqa: BLE001 — the in-memory copy still works
+                logger.debug("[compaction] usage persist skipped (non-fatal)")
             # Bounded: sessions come and go on a long-lived gateway.
             if len(self._last_turn_total_tokens) > 512:
                 self._last_turn_total_tokens.pop(
@@ -7349,7 +7376,7 @@ class AgentLoop:
             # message) remains the backstop.
             overhead = self._system_prompt_tokens(msg.channel) + self._tool_schema_tokens()
 
-            observed_total = self._last_turn_total_tokens.get(session_key, 0)
+            observed_total = self._observed_total_tokens(session_key, session)
 
             # Memory flush first, exactly like the pre-turn order: extract
             # durable memories from the history WHILE it is still verbatim.
@@ -7397,8 +7424,8 @@ class AgentLoop:
                 # re-check able to say "already handled".
                 if not self.compaction.should_compact(
                     history_tokens, session_key, overhead_tokens=overhead,
-                    observed_total_tokens=self._last_turn_total_tokens.get(
-                        session_key, 0,
+                    observed_total_tokens=self._observed_total_tokens(
+                        session_key, session,
                     ),
                 ):
                     # Nothing to do and nothing announced — stay silent.

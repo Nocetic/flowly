@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -102,10 +103,18 @@ def agent(
         main_config=config,
     )
 
+    # Set while a user-requested /compact runs, so the automatic-compaction
+    # hook below does not narrate a compaction the user is already watching.
+    _manual_compact_in_flight = {"value": False}
+
     async def handle_compact(instructions: str | None = None) -> None:
         """Handle /compact command."""
         console.print("[cyan]⚙️ Compacting conversation history...[/cyan]")
-        result = await agent_loop.compact_session(session_id, instructions)
+        _manual_compact_in_flight["value"] = True
+        try:
+            result = await agent_loop.compact_session(session_id, instructions)
+        finally:
+            _manual_compact_in_flight["value"] = False
         if result["success"]:
             console.print(
                 f"[green]✓[/green] {result['message']} "
@@ -114,6 +123,66 @@ def agent(
             console.print(f"\n[dim]Summary preview:[/dim]\n{result['summary_preview']}")
         else:
             console.print(f"[yellow]{result['message']}[/yellow]")
+
+    # Automatic compaction was invisible here: the notification hook is wired
+    # by the gateway, and the CLI runs the agent in-process. So a conversation
+    # would stall for many seconds mid-turn with nothing on screen to say why.
+    _compaction_spinner: dict[str, Any] = {"status": None, "cycle": ""}
+
+    def _stop_compaction_spinner() -> None:
+        status = _compaction_spinner.get("status")
+        if status is not None:
+            try:
+                status.stop()
+            except Exception:  # noqa: BLE001 — cosmetic
+                pass
+        _compaction_spinner["status"] = None
+
+    async def _on_cli_compaction(
+        session_key: str,
+        tokens_before: int,
+        tokens_after: int,
+        messages_removed: int,
+        phase: str = "completed",
+        compaction_id: str = "",
+    ) -> None:
+        if session_key and session_key != session_id:
+            return
+        if phase == "started":
+            # The manual /compact path prints its own progress; announcing
+            # again would double every line.
+            _compaction_spinner["cycle"] = compaction_id
+            if _manual_compact_in_flight["value"]:
+                return
+            status = console.status(
+                "[cyan]Compacting context…[/cyan]", spinner="dots"
+            )
+            status.start()
+            _compaction_spinner["status"] = status
+            return
+        # A terminal closes the cycle it belongs to — an event from another
+        # pass (a retry, a reorder) must not close the notice on screen and
+        # report its own numbers.
+        cycle = _compaction_spinner.get("cycle") or ""
+        if compaction_id and cycle and compaction_id != cycle:
+            return
+        _compaction_spinner["cycle"] = ""
+        _stop_compaction_spinner()
+        if _manual_compact_in_flight["value"]:
+            return
+        if phase == "failed":
+            console.print(
+                "[yellow]⚠ context compaction failed — history kept[/yellow]"
+            )
+            return
+        saved = max(0, tokens_before - tokens_after)
+        console.print(
+            f"[dim]⚡ context compacted · {messages_removed} messages"
+            + (f" · −{saved:,} tokens" if saved else "")
+            + "[/dim]"
+        )
+
+    agent_loop._on_compaction = _on_cli_compaction
 
     def _format_tokens(n: int) -> str:
         if n >= 1_000_000:
@@ -230,14 +299,16 @@ def agent(
                             await handle_compact(args)
                             continue
                         elif cmd == "/clear":
-                            session = agent_loop.sessions.get_or_create(session_id)
-                            # Drops the compaction summary too — plain clear()
-                            # leaves it in metadata and the summary anchor
-                            # re-injects it on the next turn.
-                            session.reset_conversation_context()
-                            agent_loop.compaction.reset_session(session_id)
-                            agent_loop.sessions.save(session)
-                            console.print("[green]✓[/green] Session cleared")
+                            # One entry point: it drops the compaction summary
+                            # (plain clear() leaves it in metadata and the
+                            # summary anchor re-injects it next turn) AND bumps
+                            # the context epoch, which is what stops a
+                            # compaction already in flight from committing the
+                            # old conversation over the empty one.
+                            removed = agent_loop.reset_conversation(session_id)
+                            console.print(
+                                f"[green]✓[/green] Session cleared ({removed} messages)"
+                            )
                             continue
                         elif cmd in ("/quit", "/exit", "/q"):
                             console.print("Goodbye!")

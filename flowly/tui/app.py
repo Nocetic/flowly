@@ -296,6 +296,9 @@ class FlowlyTUI(App[None]):
         # The compaction cycle whose notice is currently on screen. A terminal
         # for any other cycle is stale and must not close this one.
         self._compaction_cycle = ""
+        #: The live notice widget, so its terminal can turn it into the result
+        #: rather than printing a second line underneath.
+        self._compaction_notice = None
         self._restored_draft: str = str(state.get("last_draft") or "")
         # Optional modal to auto-open after launch (e.g. `flowly setup`
         # passes "integrations" so the catalogue surfaces immediately).
@@ -1101,7 +1104,23 @@ class FlowlyTUI(App[None]):
                 # the automatic one, which the user did not ask for.
                 self._compaction_cycle = ev.compaction_id
                 if not self._compact_in_flight:
-                    transcript.add_system("⚡ compacting context…")
+                    # A turn opens an empty assistant bubble the moment the
+                    # user hits send, so a notice mounted now lands BELOW a
+                    # reply that has not been written yet — and once it fills
+                    # in, the transcript claims the compaction happened after
+                    # the answer. Take the empty placeholder down, mark the
+                    # boundary where it actually falls, and put it back.
+                    placeholder = self._current_bubble
+                    reopen = placeholder is not None and placeholder.is_empty
+                    if reopen and placeholder is not None:
+                        placeholder.remove()
+                        self._current_bubble = None
+                    self._compaction_notice = transcript.add_compaction_notice(
+                        "compacting context…"
+                    )
+                    if reopen:
+                        self._current_bubble = transcript.start_assistant()
+                        self._current_bubble.mark_streaming(True)
                 return
             # A terminal closes the cycle it belongs to. Without the id an
             # event from an earlier pass (a retry, a second device, a reorder
@@ -1115,13 +1134,19 @@ class FlowlyTUI(App[None]):
                 return
             self._compaction_cycle = ""
             if ev.phase == "failed":
-                transcript.add_error(
-                    "context compaction failed — history kept, will retry"
-                )
+                if self._compaction_notice is not None:
+                    self._compaction_notice.finish(
+                        "context compaction failed — history kept"
+                    )
+                    self._compaction_notice = None
+                else:
+                    transcript.add_error(
+                        "context compaction failed — history kept, will retry"
+                    )
                 return
             saved = max(0, ev.before_tokens - ev.after_tokens)
-            transcript.add_system(
-                f"⚡ context compacted · {ev.messages_removed} msgs summarized"
+            summary_line = (
+                f"context compacted · {ev.messages_removed} msgs summarized"
                 + (
                     f" · {ev.before_tokens:,}→{ev.after_tokens:,} tokens "
                     f"(−{saved:,})"
@@ -1129,6 +1154,13 @@ class FlowlyTUI(App[None]):
                     else ""
                 )
             )
+            # The running notice BECOMES the result — one row per compaction,
+            # instead of an orphaned "compacting…" line above its own outcome.
+            if self._compaction_notice is not None:
+                self._compaction_notice.finish(summary_line)
+                self._compaction_notice = None
+            else:
+                transcript.add_system(f"⚡ {summary_line}")
             status.cmp_count += 1
             # Compaction shrinks the prompt — reset the running tally so the
             # context bar reflects the new, smaller context immediately.
