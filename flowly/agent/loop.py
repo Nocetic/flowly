@@ -423,6 +423,72 @@ POST_TURN_SETTLE_SECONDS = 2.0
 POST_TURN_COMPACTION_TIMEOUT_SECONDS = 900.0
 
 
+class _CompactionCycle:
+    """One compaction's UI lifecycle, with the invariants enforced here.
+
+    Use as an async context manager. Leaving the block closes the cycle if the
+    caller did not: nothing announced stays silent, anything announced always
+    gets a terminal.
+    """
+
+    def __init__(self, loop: "AgentLoop", session_key: str) -> None:
+        self._loop = loop
+        self._session_key = session_key
+        self.id: str = ""
+        self._closed = False
+        self._epoch = loop.context_epoch(session_key)
+
+    @property
+    def announced(self) -> bool:
+        return bool(self.id)
+
+    async def start(self, tokens_before: int) -> str:
+        """Announce. Callers do this only once they own the session lock."""
+        if self.announced:
+            return self.id
+        self.id = self._loop._new_compaction_id()
+        await self._loop._emit_compaction_event(
+            self._session_key, "started", tokens_before, 0, 0,
+            compaction_id=self.id,
+        )
+        return self.id
+
+    async def complete(self, before: int, after: int, removed: int) -> None:
+        await self._close("completed", before, after, removed)
+
+    async def fail(self, before: int = 0, after: int = 0) -> None:
+        await self._close("failed", before, after, 0)
+
+    async def _close(self, phase: str, before: int, after: int, removed: int) -> None:
+        # A terminal for work that never announced would show the user a
+        # result for something they were never told had begun.
+        if not self.announced or self._closed:
+            return
+        self._closed = True
+        if self._loop.context_epoch(self._session_key) != self._epoch:
+            # The conversation was reset while this ran. Its clients were
+            # already told (the reset clears the live status), and re-recording
+            # a terminal here would hand the FRESH chat an old compaction's
+            # failure through the re-entry handshake for the next minute.
+            logger.debug(
+                "[compaction] dropping terminal for a conversation that was reset"
+            )
+            return
+        await self._loop._emit_compaction_event(
+            self._session_key, phase, before, after, removed,
+            compaction_id=self.id,
+        )
+
+    async def __aenter__(self) -> "_CompactionCycle":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        # Whatever happened — a refusal to commit, a provider blowing up, a
+        # cancellation — an announced cycle does not leave a notice running.
+        await self.fail()
+        return False
+
+
 def _drop_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter internal corrective nudges out of a turn's messages before
     persistence. The nudges did their job steering the model live; the real
@@ -5151,6 +5217,10 @@ class AgentLoop:
 
         completed = True
         outcome: OutboundMessage | None = None
+        # The conversation's identity when this turn began. A /clear from
+        # another device mid-turn makes everything this turn measured describe
+        # history the user has discarded.
+        turn_epoch = self.context_epoch(msg.session_key)
         try:
             outcome = await self._process_message_inner(msg)
             return outcome
@@ -5165,7 +5235,7 @@ class AgentLoop:
             # instead of making the user's next message pay the wait.
             if completed:
                 try:
-                    self._note_turn_usage(msg.session_key, outcome)
+                    self._note_turn_usage(msg.session_key, outcome, turn_epoch)
                     self._schedule_post_turn_compaction(msg)
                 except Exception as e:  # noqa: BLE001 — never fail the turn
                     logger.debug(f"Post-turn compaction scheduling skipped: {e}")
@@ -5711,6 +5781,7 @@ class AgentLoop:
             # on itself forever.
             _session_lock = self.compaction.session_lock(msg.session_key)
             _pre_lock_generation = self._compaction_generation(session)
+            _cycle = self.compaction_cycle(msg.session_key)
             # The UI cycle is owned by whoever HOLDS the lock — never by
             # whoever observed it free. Announcing before acquiring looks
             # equivalent but is not: emitting the event yields (it writes to a
@@ -5735,11 +5806,7 @@ class AgentLoop:
                     # Announce now that the cycle is provably ours. Staged
                     # summarisation is several LLM calls, and without this the
                     # clients show a frozen agent.
-                    _compaction_id = self._new_compaction_id()
-                    await self._emit_compaction_event(
-                        msg.session_key, "started", total_tokens, 0, 0,
-                        compaction_id=_compaction_id,
-                    )
+                    _compaction_id = await _cycle.start(total_tokens)
                     _announced = True
 
                     # Stop must reach compaction too. Staged summarisation is
@@ -5789,12 +5856,24 @@ class AgentLoop:
                         f"({len(history) - len(result.kept_messages)} context entries), "
                         f"kept {len(result.kept_messages)} recent"
                     )
-                    history = self._commit_compaction(
-                        session, result, msg.session_key,
-                        source_message_count=session_snapshot_len,
-                        compaction_id=_compaction_id,
-                        source_epoch=session_epoch,
-                    )
+                    try:
+                        history = self._commit_compaction(
+                            session, result, msg.session_key,
+                            source_message_count=session_snapshot_len,
+                            compaction_id=_compaction_id,
+                            source_epoch=session_epoch,
+                        )
+                    except Exception as _commit_exc:  # noqa: BLE001
+                        # A reset landed while we summarised, or the save
+                        # failed. Either way this turn must continue: the
+                        # user asked a question, and a compaction they never
+                        # requested must not answer it with an error.
+                        logger.warning(
+                            f"Compaction not committed: {_commit_exc}"
+                        )
+                        self.compaction.record_compaction_failure(msg.session_key)
+                        result = None
+                        history = self._history_with_summary_anchor(session)
 
             if result is None and _concurrent:
                 # Not a failure: someone else's compaction already shrank this
@@ -5811,10 +5890,7 @@ class AgentLoop:
                     "Compaction failed — emergency trim for this turn "
                     f"({len(history)} messages); session history preserved"
                 )
-                await self._emit_compaction_event(
-                    msg.session_key, "failed", total_tokens, total_tokens, 0,
-                    compaction_id=_compaction_id,
-                )
+                await _cycle.fail(total_tokens, total_tokens)
             else:
                 # Already committed inside the lock — announce outside it so
                 # slow channel I/O never extends the critical section.
@@ -5825,13 +5901,9 @@ class AgentLoop:
                 # Publishing it as a reply meant every consumer of terminals
                 # had to recognise a magic string to avoid settling a turn that
                 # was still streaming.
-                await self._emit_compaction_event(
-                    msg.session_key,
-                    "completed",
-                    result.tokens_before,
-                    result.tokens_after,
+                await _cycle.complete(
+                    result.tokens_before, result.tokens_after,
                     result.messages_removed,
-                    compaction_id=_compaction_id,
                 )
 
         # Build initial messages. Cron runs pass skip_memory and
@@ -6959,9 +7031,30 @@ class AgentLoop:
         except Exception as e:
             logger.debug(f"Compaction notification error: {e}")
 
+    def compaction_cycle(self, session_key: str) -> "_CompactionCycle":
+        """Own one compaction's lifecycle: at most one announce, exactly one
+        terminal, both carrying the same id.
+
+        Three paths compact (pre-turn, post-turn, manual) and each used to
+        hand-roll this. They drifted, and every drift was a real bug: a
+        commit that refused outside its try left the notice spinning forever;
+        a failure before any announce published a terminal for work that
+        never started; a terminal without the id could not be matched to what
+        a client was showing.
+        """
+        return _CompactionCycle(self, session_key)
+
     def context_epoch(self, session_key: str) -> int:
-        """How many times this conversation has been reset."""
-        return self._context_epoch.get(session_key, 0)
+        """How many times this conversation has been reset.
+
+        Tolerates a half-built instance: gateway test doubles are constructed
+        with ``object.__new__`` and never run ``__init__``, and a conversation
+        nobody has reset is epoch 0 either way.
+        """
+        epochs = getattr(self, "_context_epoch", None)
+        if not isinstance(epochs, dict):
+            return 0
+        return epochs.get(session_key, 0)
 
     def reset_conversation(self, session_key: str) -> int:
         """Start a fresh conversation under an existing key. Returns the count.
@@ -7153,8 +7246,8 @@ class AgentLoop:
         # The UI cycle is announced from INSIDE the lock — see the pre-turn
         # path for why observing an unlocked lock is not the same as owning it.
         _session_lock = self.compaction.session_lock(session_key)
-        _announced = False
-        async with _session_lock:
+        cycle = self.compaction_cycle(session_key)
+        async with cycle, _session_lock:
             generation = self._compaction_generation(session)
             # Re-read inside the lock: whoever held it before us may have
             # already compacted, in which case our snapshot is stale.
@@ -7179,12 +7272,7 @@ class AgentLoop:
 
             # The cycle is provably ours now: we hold the lock and we know
             # there is work to do.
-            compaction_id = self._new_compaction_id()
-            await self._emit_compaction_event(
-                session_key, "started", tokens_before, 0, 0,
-                compaction_id=compaction_id,
-            )
-            _announced = True
+            await cycle.start(tokens_before)
 
             # Run compaction. A failure must leave the session exactly as it
             # was: the manual path is the one users reach for when context is
@@ -7200,10 +7288,7 @@ class AgentLoop:
             except Exception as e:
                 logger.error(f"Manual compaction failed: {e}")
                 self.compaction.record_compaction_failure(session_key)
-                await self._emit_compaction_event(
-                    session_key, "failed", tokens_before, tokens_before, 0,
-                    compaction_id=compaction_id,
-                )
+                await cycle.fail(tokens_before, tokens_before)
                 return {
                     "success": False,
                     "message": f"Compaction failed: {e}. Your history is unchanged.",
@@ -7219,10 +7304,7 @@ class AgentLoop:
                     f"Discarding manual compaction for {session_key} — "
                     "the session was compacted concurrently"
                 )
-                await self._emit_compaction_event(
-                    session_key, "completed", tokens_before, tokens_before, 0,
-                    compaction_id=compaction_id,
-                )
+                await cycle.complete(tokens_before, tokens_before, 0)
                 return {
                     "success": False,
                     "message": "Already compacted just now — nothing further to do.",
@@ -7236,18 +7318,15 @@ class AgentLoop:
             try:
                 self._commit_compaction(
                     session, result, session_key, source_message_count=source_len,
-                    compaction_id=compaction_id, source_epoch=source_epoch,
+                    compaction_id=cycle.id, source_epoch=source_epoch,
                 )
-            except CompactionError as exc:
-                # A reset landed while we summarised (or any other refusal to
-                # commit). The cycle was announced, so it MUST be closed here —
-                # letting this escape left the notice spinning forever on every
-                # client and a permanent "started" in the re-entry handshake.
+            except Exception as exc:  # noqa: BLE001
+                # A reset landing mid-summary, or the session save failing.
+                # Catching only CompactionError left an OSError to escape with
+                # the notice still spinning — and the in-memory session already
+                # rewritten while the canonical file still held the old one.
                 logger.info(f"Manual compaction not committed: {exc}")
-                await self._emit_compaction_event(
-                    session_key, "failed", tokens_before, tokens_before, 0,
-                    compaction_id=compaction_id,
-                )
+                await cycle.fail(tokens_before, tokens_before)
                 return {
                     "success": False,
                     "message": f"{exc}",
@@ -7257,16 +7336,10 @@ class AgentLoop:
                     ),
                 }
 
-        # Notify connected clients — compaction completed. No transcript
-        # separator is published: the boundary row is written by whichever
-        # transport persists the conversation, keyed off this event.
-        await self._emit_compaction_event(
-            session_key,
-            "completed",
-            result.tokens_before,
-            result.tokens_after,
-            result.messages_removed,
-            compaction_id=compaction_id,
+        # No transcript separator is published: the boundary row is written by
+        # whichever transport persists the conversation, keyed off this event.
+        await cycle.complete(
+            result.tokens_before, result.tokens_after, result.messages_removed,
         )
 
         return {
@@ -7294,7 +7367,9 @@ class AgentLoop:
             return 0
         return max(0, stored)
 
-    def _note_turn_usage(self, session_key: str, outcome: Any) -> None:
+    def _note_turn_usage(
+        self, session_key: str, outcome: Any, epoch: int | None = None,
+    ) -> None:
         """Record the provider's own count of the turn that just ended.
 
         What the NEXT request will roughly weigh before its new message —
@@ -7314,6 +7389,7 @@ class AgentLoop:
         """
         try:
             usage = (getattr(outcome, "metadata", None) or {}).get("usage") or {}
+            epoch = self.context_epoch(session_key) if epoch is None else epoch
             total = sum(
                 int(usage.get(field, 0) or 0)
                 for field in (
@@ -7326,6 +7402,11 @@ class AgentLoop:
         except (AttributeError, TypeError, ValueError):
             return
         if total > 0:
+            if self.context_epoch(session_key) != epoch:
+                # The conversation was reset while this turn ran; its size
+                # describes history the user discarded, and using it would
+                # decide the fresh chat's first compaction.
+                return
             self._last_turn_total_tokens[session_key] = total
             # Also on the session, so the reading survives the process. The
             # CLI runs one process per message, so an in-memory observation is
@@ -7415,7 +7496,7 @@ class AgentLoop:
         # Hoisted so the outermost failure path can close the cycle it opened
         # — a terminal without the id cannot be matched to its `started`, and
         # clients that key on the id would leave the notice running forever.
-        compaction_id = ""
+        cycle = self.compaction_cycle(session_key)
         # Let the turn's own reply reach the client first. This pass is
         # scheduled from _process_message's finally, which runs BEFORE the
         # caller publishes the reply — so without a settle the "started"
@@ -7493,11 +7574,7 @@ class AgentLoop:
 
                 # The cycle is provably ours: we hold the lock and the
                 # generation still matches what we measured against.
-                compaction_id = self._new_compaction_id()
-                await self._emit_compaction_event(
-                    session_key, "started", history_tokens + overhead, 0, 0,
-                    compaction_id=compaction_id,
-                )
+                await cycle.start(history_tokens + overhead)
                 _announced = True
 
                 try:
@@ -7509,10 +7586,7 @@ class AgentLoop:
                 except Exception as e:
                     logger.error(f"Post-turn compaction failed: {e}")
                     self.compaction.record_compaction_failure(session_key)
-                    await self._emit_compaction_event(
-                        session_key, "failed", history_tokens, history_tokens, 0,
-                        compaction_id=compaction_id,
-                    )
+                    await cycle.fail(history_tokens, history_tokens)
                     return
 
                 if self._compaction_generation(session) != generation:
@@ -7520,14 +7594,10 @@ class AgentLoop:
                         "Discarding post-turn compaction — session was "
                         "compacted concurrently"
                     )
-                    if _announced:
-                        tokens_now = estimate_messages_tokens(
-                            self._history_with_summary_anchor(session)
-                        )
-                        await self._emit_compaction_event(
-                            session_key, "completed", tokens_now, tokens_now, 0,
-                            compaction_id=compaction_id,
-                        )
+                    tokens_now = estimate_messages_tokens(
+                        self._history_with_summary_anchor(session)
+                    )
+                    await cycle.complete(tokens_now, tokens_now, 0)
                     return
 
                 self.compaction.record_compaction_success(session_key)
@@ -7541,18 +7611,14 @@ class AgentLoop:
                 self._commit_compaction(
                     session, result, session_key,
                     source_message_count=source_len,
-                    compaction_id=compaction_id,
+                    compaction_id=cycle.id,
                     source_epoch=source_epoch,
                 )
 
             # No transcript separator here either — see the pre-turn path.
-            await self._emit_compaction_event(
-                session_key,
-                "completed",
-                result.tokens_before,
-                result.tokens_after,
+            await cycle.complete(
+                result.tokens_before, result.tokens_after,
                 result.messages_removed,
-                compaction_id=compaction_id,
             )
         except asyncio.CancelledError:
             raise
@@ -7561,9 +7627,9 @@ class AgentLoop:
             # agent down or leave the UI stuck on "started".
             logger.error(f"Post-turn compaction pass failed: {e}")
             try:
-                await self._emit_compaction_event(
-                    session_key, "failed", 0, 0, 0,
-                    compaction_id=compaction_id,
-                )
+                # A no-op unless this pass actually announced — publishing a
+                # failure for work that never started showed the user a result
+                # for something they were never told had begun.
+                await cycle.fail()
             except Exception:
                 pass

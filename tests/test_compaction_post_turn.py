@@ -92,6 +92,7 @@ class _Harness:
     _system_prompt_tokens = AgentLoop._system_prompt_tokens
     _compaction_generation = staticmethod(AgentLoop._compaction_generation)
     _new_compaction_id = staticmethod(AgentLoop._new_compaction_id)
+    compaction_cycle = AgentLoop.compaction_cycle
     context_epoch = AgentLoop.context_epoch
     _observed_total_tokens = AgentLoop._observed_total_tokens
     reset_conversation = AgentLoop.reset_conversation
@@ -633,7 +634,9 @@ async def test_clearing_the_chat_beats_a_compaction_already_running():
     assert harness.sessions.boundaries == [], (
         "a boundary was drawn for a conversation that no longer exists"
     )
-    assert harness.events[-1] == "failed", "the announced cycle must still close"
+    # The terminal is dropped on purpose — see
+    # test_a_refused_commit_still_closes_the_cycle_with_its_id.
+    assert harness.events == ["started"]
 
 
 async def test_a_reset_bumps_the_epoch_even_while_the_lock_is_held():
@@ -725,11 +728,11 @@ async def test_a_refused_commit_still_closes_the_cycle_with_its_id():
     await task
 
     phases = [p for p, _ in harness.cycles]
-    assert phases[0] == "started"
-    assert phases[-1] in ("failed", "completed")
-    opened = harness.cycles[0][1]
-    closed = harness.cycles[-1][1]
-    assert opened and closed == opened, (
-        f"the cycle was opened as {opened!r} and closed as {closed!r} — a "
-        "client keying on the id cannot match them"
+    assert phases == ["started"], (
+        f"expected the terminal to be dropped for a reset conversation: {phases}"
     )
+    # Deliberate: the reset already ended this story for every client — it
+    # clears the live status, and the /clear turn's own reply clears the
+    # notice on each device. Recording a terminal here would hand the FRESH
+    # chat an old compaction's outcome through the re-entry handshake.
+    assert harness.cycles[0][1], "the cycle still has to be identifiable"

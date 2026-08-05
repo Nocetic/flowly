@@ -121,10 +121,12 @@ def test_observed_usage_is_readable_by_a_new_process(tmp_path, monkeypatch):
 
     class _Harness:
         _note_turn_usage = AgentLoop._note_turn_usage
+        context_epoch = AgentLoop.context_epoch
 
         def __init__(self, sessions):
             self.sessions = sessions
             self._last_turn_total_tokens: dict[str, int] = {}
+            self._context_epoch: dict[str, int] = {}
 
     class _Outcome:
         metadata = {"usage": {"prompt_tokens": 80_000, "completion_tokens": 1_000}}
@@ -193,3 +195,93 @@ async def test_a_failing_background_pass_does_not_break_the_caller():
     harness._post_turn_compaction_tasks["s"] = asyncio.create_task(boom())
 
     await harness.await_post_turn_compaction("s")  # must not raise
+
+
+# ── One owner for all three paths ─────────────────────────────────────────
+
+
+class _CycleHarness:
+    """Just the surface _CompactionCycle touches."""
+
+    compaction_cycle = AgentLoop.compaction_cycle
+    context_epoch = AgentLoop.context_epoch
+    _new_compaction_id = staticmethod(AgentLoop._new_compaction_id)
+
+    def __init__(self):
+        self._context_epoch: dict[str, int] = {}
+        self.events: list[tuple[str, str]] = []
+
+    async def _emit_compaction_event(
+        self, session_key, phase, *a, compaction_id: str = "",
+    ) -> None:
+        self.events.append((phase, compaction_id))
+
+
+async def test_work_that_never_announced_never_reports():
+    """A failure before the cycle starts published 'compaction failed' for
+    something the user was never told had begun."""
+    harness = _CycleHarness()
+
+    async with harness.compaction_cycle("s") as cycle:
+        await cycle.fail(1, 1)
+
+    assert harness.events == []
+
+
+async def test_an_announced_cycle_is_closed_even_when_the_body_raises():
+    harness = _CycleHarness()
+
+    with pytest.raises(RuntimeError):
+        async with harness.compaction_cycle("s") as cycle:
+            await cycle.start(90_000)
+            raise RuntimeError("provider exploded")
+
+    phases = [p for p, _ in harness.events]
+    assert phases == ["started", "failed"]
+    ids = {cid for _, cid in harness.events}
+    assert len(ids) == 1 and "" not in ids
+
+
+async def test_a_cycle_is_closed_exactly_once():
+    harness = _CycleHarness()
+
+    async with harness.compaction_cycle("s") as cycle:
+        await cycle.start(90_000)
+        await cycle.complete(90_000, 12_000, 40)
+        await cycle.fail(1, 1)  # ignored — already closed
+
+    assert [p for p, _ in harness.events] == ["started", "completed"]
+
+
+async def test_a_terminal_for_a_reset_conversation_is_dropped():
+    """The old pass finishing after a /clear would otherwise hand the FRESH
+    chat an old compaction's failure through chat.inflight for a minute."""
+    harness = _CycleHarness()
+
+    async with harness.compaction_cycle("s") as cycle:
+        await cycle.start(90_000)
+        harness._context_epoch["s"] = harness.context_epoch("s") + 1  # /clear
+        await cycle.fail(90_000, 90_000)
+
+    assert [p for p, _ in harness.events] == ["started"]
+
+
+def test_usage_measured_before_a_reset_is_not_attributed_to_the_new_chat():
+    class _Harness:
+        _note_turn_usage = AgentLoop._note_turn_usage
+        context_epoch = AgentLoop.context_epoch
+
+        def __init__(self):
+            self._context_epoch = {"s": 1}
+            self._last_turn_total_tokens: dict[str, int] = {}
+            self.sessions = None
+
+    class _Outcome:
+        metadata = {"usage": {"prompt_tokens": 80_000, "completion_tokens": 1_000}}
+
+    harness = _Harness()
+    harness._note_turn_usage("s", _Outcome(), epoch=0)  # turn began before /clear
+
+    assert harness._last_turn_total_tokens == {}, (
+        "the fresh chat's first compaction would be decided by the old one"
+    )
