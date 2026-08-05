@@ -42,6 +42,7 @@ from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
 from flowly.compaction.types import (
     CompactionConfig,
+    CompactionError,
     SUMMARY_METADATA_KEY,
     build_summary_content,
     is_summary_message,
@@ -761,6 +762,15 @@ class AgentLoop:
         # other inputs are estimates. Cleared on every compaction commit so a
         # stale reading can't re-trigger against already-summarised history.
         self._last_turn_total_tokens: dict[str, int] = {}
+
+        # How many times each conversation has been RESET (``/clear``, ``/new``).
+        # Deliberately not in session metadata: a reset wipes metadata, so a
+        # counter living there reads the same before and after and cannot
+        # witness the very event it exists to detect. A compaction captures
+        # this alongside its history snapshot and refuses to commit if it
+        # moved — otherwise a summary of the old conversation lands on top of
+        # the empty one the user just asked for.
+        self._context_epoch: dict[str, int] = {}
 
         # One controller owns per-run cancellation for every transport.
         # Streams poll its marker; active tool awaitables are registered with
@@ -5235,19 +5245,9 @@ class AgentLoop:
                 command_args = parts[1] if len(parts) > 1 else ""
 
         if is_command and command in ("new", "clear"):
+            msg_count = self.reset_conversation(msg.session_key)
             session = self.sessions.get_or_create(msg.session_key)
-            msg_count = len(session.messages)
-            # Not session.clear(): that keeps the compaction summary in
-            # metadata, and the summary anchor re-injects it on the next turn —
-            # so the model carried the whole previous conversation into a chat
-            # the user had just emptied.
-            session.reset_conversation_context()
             session.metadata["persona"] = self.context.persona
-            # The compaction service's own per-session counters describe
-            # history that no longer exists.
-            self.compaction.reset_session(msg.session_key)
-            self._last_turn_total_tokens.pop(msg.session_key, None)
-            self.context.invalidate_memory_snapshot(msg.session_key)
             self.sessions.save(session)
             logger.info(f"Session {msg.session_key} cleared via /{command}")
             if msg.channel in ("web", "imessage"):
@@ -5649,6 +5649,7 @@ class AgentLoop:
         # is preserved across the rewrite (see _commit_compaction).
         history = self._history_with_summary_anchor(session)
         session_snapshot_len = len(session.messages)
+        session_epoch = self.context_epoch(msg.session_key)
 
         # Estimate the fixed overhead the FIRST provider call will carry: the
         # system prompt plus the incoming message, its attachments, and the
@@ -5790,6 +5791,7 @@ class AgentLoop:
                         session, result, msg.session_key,
                         source_message_count=session_snapshot_len,
                         compaction_id=_compaction_id,
+                        source_epoch=session_epoch,
                     )
 
             if result is None and _concurrent:
@@ -6950,6 +6952,38 @@ class AgentLoop:
         except Exception as e:
             logger.debug(f"Compaction notification error: {e}")
 
+    def context_epoch(self, session_key: str) -> int:
+        """How many times this conversation has been reset."""
+        return self._context_epoch.get(session_key, 0)
+
+    def reset_conversation(self, session_key: str) -> int:
+        """Start a fresh conversation under an existing key. Returns the count.
+
+        One place, because a reset is not just "empty the message list": the
+        compaction summary lives in metadata and is re-injected by the summary
+        anchor, the compaction service holds counters describing history that
+        no longer exists, the last observed request size describes a context
+        that is gone, and the memory snapshot was frozen for the old chat.
+
+        Bumping the epoch is what makes it safe against an IN-FLIGHT
+        compaction. That compaction may be parked in a provider call holding
+        history the user just discarded; when it comes back it compares the
+        epoch it captured, sees this reset, and drops its result instead of
+        committing the old conversation over the new one.
+        """
+        session = self.sessions.get_or_create(session_key)
+        removed = len(session.messages)
+        self._context_epoch[session_key] = self.context_epoch(session_key) + 1
+        session.reset_conversation_context()
+        self.compaction.reset_session(session_key)
+        self._last_turn_total_tokens.pop(session_key, None)
+        try:
+            self.context.invalidate_memory_snapshot(session_key)
+        except Exception:  # noqa: BLE001 — snapshot is a cache
+            logger.debug("[reset] memory snapshot invalidation skipped")
+        self.sessions.save(session)
+        return removed
+
     @staticmethod
     def _new_compaction_id() -> str:
         """Identity for one compaction cycle, minted when it is announced."""
@@ -6962,6 +6996,7 @@ class AgentLoop:
         session_key: str,
         source_message_count: int | None = None,
         compaction_id: str = "",
+        source_epoch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Persist a successful compaction and return the new working history.
 
@@ -6978,6 +7013,20 @@ class AgentLoop:
         the summary. Clearing the session would silently destroy it. We carry
         that appended tail across the rewrite instead.
         """
+        if (
+            source_epoch is not None
+            and self.context_epoch(session_key) != source_epoch
+        ):
+            # The user reset this conversation while we were summarising. Our
+            # summary describes turns they discarded; committing it would put
+            # the old conversation back on top of the empty one they asked
+            # for — and the generation guard cannot see this, because a reset
+            # wipes the counter it compares. Raising keeps every caller's
+            # existing "compaction failed, history untouched" path.
+            raise CompactionError(
+                "conversation was reset while summarising — discarding the "
+                "summary rather than restoring what the user cleared"
+            )
         appended_tail: list[dict[str, Any]] = []
         if source_message_count is not None and 0 <= source_message_count < len(session.messages):
             appended_tail = [dict(m) for m in session.messages[source_message_count:]]
@@ -7098,6 +7147,7 @@ class AgentLoop:
             # already compacted, in which case our snapshot is stale.
             history = self._history_with_summary_anchor(session)
             source_len = len(session.messages)
+            source_epoch = self.context_epoch(session_key)
             # Re-apply the eligibility checks to what we ACTUALLY hold. Running
             # them only on the pre-lock snapshot meant a second device could
             # pass them, wait for the first compaction, then spend an LLM call
@@ -7172,7 +7222,7 @@ class AgentLoop:
             self.compaction.record_compaction_success(session_key)
             self._commit_compaction(
                 session, result, session_key, source_message_count=source_len,
-                compaction_id=compaction_id,
+                compaction_id=compaction_id, source_epoch=source_epoch,
             )
 
         # Notify connected clients — compaction completed. No transcript
@@ -7199,18 +7249,31 @@ class AgentLoop:
     def _note_turn_usage(self, session_key: str, outcome: Any) -> None:
         """Record the provider's own count of the turn that just ended.
 
-        ``usage.prompt_tokens + completion_tokens`` is what the NEXT request
-        will roughly weigh before its new message — ground truth against
-        which the estimate-based compaction trigger is cross-checked. Local
-        estimators drift by model and language, and a session can sit under
-        the estimated budget while its real requests already exceed the
-        window (observed live: estimate ~72K while the provider counted 82K
-        in a 79K window).
+        What the NEXT request will roughly weigh before its new message —
+        ground truth against which the estimate-based compaction trigger is
+        cross-checked. Local estimators drift by model and language, and a
+        session can sit under the estimated budget while its real requests
+        already exceed the window (observed live: estimate ~72K while the
+        provider counted 82K in a 79K window).
+
+        CACHED INPUT COUNTS. Anthropic reports ``input_tokens`` for the
+        uncached remainder only, with the cached prefix in separate
+        ``cache_read``/``cache_write`` fields — so a well-cached 78K request
+        reports ~2K of prompt. Summing only prompt+completion made the
+        trigger blind on exactly the path where caching is standard: it would
+        watch a full window report 3K and never fire. Cache tokens occupy the
+        context window like any other input; only the price differs.
         """
         try:
             usage = (getattr(outcome, "metadata", None) or {}).get("usage") or {}
-            total = int(usage.get("prompt_tokens", 0) or 0) + int(
-                usage.get("completion_tokens", 0) or 0
+            total = sum(
+                int(usage.get(field, 0) or 0)
+                for field in (
+                    "prompt_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "completion_tokens",
+                )
             )
         except (AttributeError, TypeError, ValueError):
             return
@@ -7327,6 +7390,7 @@ class AgentLoop:
                 # pre-turn pass may have already done the work while we waited.
                 history = self._history_with_summary_anchor(session)
                 source_len = len(session.messages)
+                source_epoch = self.context_epoch(session_key)
                 history_tokens = estimate_messages_tokens(history)
                 # Re-read the observation too: a commit that happened while we
                 # waited on the lock clears it, which is what makes this
@@ -7390,6 +7454,7 @@ class AgentLoop:
                     session, result, session_key,
                     source_message_count=source_len,
                     compaction_id=compaction_id,
+                    source_epoch=source_epoch,
                 )
 
             # No transcript separator here either — see the pre-turn path.

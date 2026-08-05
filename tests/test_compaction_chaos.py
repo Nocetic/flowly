@@ -238,3 +238,44 @@ def test_every_out_of_room_finish_reason_is_refused(finish_reason):
         validated_summary_text(
             LLMResponse(content="The conversation cov", finish_reason=finish_reason)
         )
+
+
+# ── The request must fit the model, not just the trigger ──────────────────
+
+
+@pytest.mark.parametrize("window", [8_192, 16_385, 32_768, 128_000])
+def test_a_summary_call_never_asks_for_more_room_than_the_model_has(window):
+    """The trigger was clamped to the window but the CALL was not: a
+    16,385-token model was asked for max_tokens=20000 (the raw configured
+    reserve), which a provider rejects outright — so compaction could never
+    succeed there however correct the decision to run it was. The truncated
+    retry doubled it to 40000."""
+    from flowly.compaction.summarizer import resolve_summary_output_budget
+
+    service = _service(ChaosProvider(mode="healthy"))
+    service.config.context_window = window
+    service.config.context_window_explicit = True
+    service.config.reserve_tokens_floor = 20_000
+
+    budget = resolve_summary_output_budget(service.effective_reserve_tokens, window)
+    retry = resolve_summary_output_budget(budget * 2, window)
+
+    assert budget < window, f"{budget} output tokens on a {window}-token model"
+    assert retry <= window
+    # And the input the same call carries still has room beside it.
+    assert budget + service.history_budget() <= window
+
+
+async def test_the_live_call_respects_the_window():
+    """End to end through the real service: whatever it asks the provider for
+    has to fit the model it is talking to."""
+    provider = ChaosProvider(mode="healthy")
+    service = _service(provider)
+    service.config.context_window = 16_385
+    service.config.context_window_explicit = True
+    service.config.reserve_tokens_floor = 20_000
+
+    await service.compact(_history())
+
+    assert provider.max_tokens_seen
+    assert max(provider.max_tokens_seen) < 16_385, provider.max_tokens_seen

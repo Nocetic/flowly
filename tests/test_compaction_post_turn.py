@@ -92,6 +92,8 @@ class _Harness:
     _system_prompt_tokens = AgentLoop._system_prompt_tokens
     _compaction_generation = staticmethod(AgentLoop._compaction_generation)
     _new_compaction_id = staticmethod(AgentLoop._new_compaction_id)
+    context_epoch = AgentLoop.context_epoch
+    reset_conversation = AgentLoop.reset_conversation
     _post_turn_compaction = AgentLoop._post_turn_compaction
     _schedule_post_turn_compaction = AgentLoop._schedule_post_turn_compaction
 
@@ -116,6 +118,7 @@ class _Harness:
         self.cycles: list[tuple[str, str]] = []
         self._post_turn_compaction_tasks: dict[str, asyncio.Task] = {}
         self._last_turn_total_tokens: dict[str, int] = {}
+        self._context_epoch: dict[str, int] = {}
 
     def _tool_schema_tokens(self) -> int:
         return 0
@@ -591,3 +594,79 @@ async def test_the_settle_lets_the_reply_land_first(monkeypatch):
     assert order[0] == "reply", (
         f"the compaction announced before the turn's own reply: {order}"
     )
+
+
+# ── A reset always wins over an in-flight compaction ──────────────────────
+
+
+async def test_clearing_the_chat_beats_a_compaction_already_running():
+    """The user hits /clear while a compaction sits in its provider call. Its
+    summary describes turns they just discarded — committing it would put the
+    old conversation back on top of the empty one they asked for.
+
+    The generation counter cannot catch this: a reset wipes the very metadata
+    it compares, so before and after both read 0. Hence the epoch, which lives
+    outside the session."""
+    session = _big_session()
+    harness = _Harness(session)
+    barrier = asyncio.Event()
+    original = harness.provider.chat
+
+    async def parked(*a, **k):
+        await barrier.wait()
+        return await original(*a, **k)
+
+    harness.provider.chat = parked
+    task = asyncio.create_task(harness._post_turn_compaction(_msg()))
+    await asyncio.sleep(0.05)  # now inside the provider call
+
+    harness.reset_conversation(session.key)
+
+    barrier.set()
+    await task
+
+    assert session.messages == [], (
+        f"the cleared conversation came back: {[m.get('role') for m in session.messages]}"
+    )
+    assert not session.metadata.get("last_compaction_summary")
+    assert harness.sessions.boundaries == [], (
+        "a boundary was drawn for a conversation that no longer exists"
+    )
+    assert harness.events[-1] == "failed", "the announced cycle must still close"
+
+
+async def test_a_reset_bumps_the_epoch_even_while_the_lock_is_held():
+    """reset_session() deliberately skips a locked session (an in-flight
+    commit relies on that exclusion), so the epoch cannot live there either."""
+    session = _big_session()
+    harness = _Harness(session)
+
+    async with harness.compaction.session_lock(session.key):
+        before = harness.context_epoch(session.key)
+        harness.reset_conversation(session.key)
+
+        assert harness.context_epoch(session.key) == before + 1
+
+
+# ── Cached input still occupies the window ────────────────────────────────
+
+
+def test_cached_input_counts_toward_the_observed_size():
+    """Anthropic reports input_tokens for the UNCACHED remainder only. Summing
+    prompt+completion made the trigger blind on the path where caching is
+    standard — a full window reporting 3K."""
+    session = _big_session(turns=1)
+    harness = _Harness(session)
+
+    class _Outcome:
+        metadata = {"usage": {
+            "prompt_tokens": 2_000,
+            "cache_read_tokens": 75_000,
+            "cache_write_tokens": 0,
+            "completion_tokens": 1_000,
+        }}
+
+    harness._note_turn_usage = AgentLoop._note_turn_usage.__get__(harness)
+    harness._note_turn_usage(session.key, _Outcome())
+
+    assert harness._last_turn_total_tokens[session.key] == 78_000

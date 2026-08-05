@@ -115,6 +115,29 @@ _MAX_TOOL_ARG_CHARS = 200
 # larger; this only stops it starving the call.
 MIN_SUMMARY_OUTPUT_TOKENS = 8192
 
+# A summary's output may never claim more than this share of the model's
+# window. Beyond it there is no room left for the transcript we are asking it
+# to read, and the provider rejects the request outright.
+MAX_SUMMARY_OUTPUT_SHARE = 0.25
+
+
+def resolve_summary_output_budget(requested: int, context_window: int = 0) -> int:
+    """How many output tokens one summarisation call may ask for.
+
+    The configured reserve is sized for the big models most people run (20K of
+    a 128K window). Handed straight to a small model it exceeds the window
+    outright: a 16,385-token model was asked for ``max_tokens=20000``, which
+    the provider rejects — so compaction could never succeed there, however
+    correct the trigger was. The floor exists for the opposite reason (a tiny
+    reserve starves a reasoning model's answer), so the budget is both floored
+    and capped, and the cap wins on a small window.
+    """
+    budget = max(int(requested or 0), MIN_SUMMARY_OUTPUT_TOKENS)
+    if context_window > 0:
+        ceiling = max(1, int(context_window * MAX_SUMMARY_OUTPUT_SHARE))
+        budget = min(budget, ceiling)
+    return budget
+
 
 def _render_tool_calls(message: dict[str, Any]) -> str:
     """Render an assistant turn's tool calls as readable transcript lines.
@@ -354,6 +377,7 @@ async def generate_summary(
     custom_instructions: str | None = None,
     previous_summary: str | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    context_window: int = 0,
 ) -> str:
     """
     Generate a summary of messages using the LLM.
@@ -393,7 +417,7 @@ async def generate_summary(
     # 3000) lets the model burn the whole budget on hidden thinking and hand
     # back an empty body — flakily, because whether the reasoning fits is up
     # to the model's mood that call.
-    output_budget = max(reserve_tokens, MIN_SUMMARY_OUTPUT_TOKENS)
+    output_budget = resolve_summary_output_budget(reserve_tokens, context_window)
 
     response = await _chat_bounded(
         provider,
@@ -420,13 +444,20 @@ async def generate_summary(
             raise
         logger.warning(
             f"Summarization came back unusable ({reason[:80]}) — retrying with "
-            f"{output_budget * 2} output tokens"
+            "a larger output budget"
         )
+        retry_budget = resolve_summary_output_budget(
+            output_budget * 2, context_window,
+        )
+        if retry_budget <= output_budget:
+            # No room to grow — asking again with the same budget would just
+            # buy the same failure at the price of another call.
+            raise
         response = await _chat_bounded(
             provider,
             messages=prompt_messages,
             model=model,
-            max_tokens=output_budget * 2,
+            max_tokens=retry_budget,
             should_cancel=should_cancel,
         )
         return validated_summary_text(response)
@@ -441,6 +472,7 @@ async def summarize_chunks(
     custom_instructions: str | None = None,
     previous_summary: str | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    context_window: int = 0,
 ) -> str:
     """
     Summarize messages by chunking them first.
@@ -478,6 +510,7 @@ async def summarize_chunks(
             custom_instructions,
             summary,
             should_cancel=should_cancel,
+            context_window=context_window,
         )
 
     return summary or DEFAULT_SUMMARY_FALLBACK
@@ -525,6 +558,7 @@ async def summarize_with_fallback(
             custom_instructions,
             previous_summary,
             should_cancel,
+            context_window=context_window,
         )
     except Exception as e:
         last_error = e
@@ -555,6 +589,7 @@ async def summarize_with_fallback(
                 custom_instructions,
                 previous_summary,
                 should_cancel,
+                context_window=context_window,
             )
             notes = "\n\n" + "\n".join(oversized_notes) if oversized_notes else ""
             return partial_summary + notes
