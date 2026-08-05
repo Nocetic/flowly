@@ -66,6 +66,9 @@ def count_conversational_messages(messages: list[dict[str, Any]]) -> int:
             continue  # tool results, system scaffolding
         if message.get("tool_calls"):
             continue  # the model asking for a tool, not speaking
+        if message.get("_display_hidden"):
+            continue  # an internal trigger (subagent announce, board result)
+            # wearing the user role — nobody typed it
         if is_summary_message(message):
             continue  # a previous compaction's summary, not a turn
         content = message.get("content")

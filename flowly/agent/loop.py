@@ -48,6 +48,7 @@ from flowly.compaction.types import (
     is_summary_message,
 )
 from flowly.compaction.pruning import split_into_turn_blocks
+from flowly.compaction.service import count_conversational_messages
 from flowly.compaction.estimator import (
     estimate_message_tokens,
     estimate_messages_tokens,
@@ -6881,10 +6882,15 @@ class AgentLoop:
             return "No history to compact."
         if len(history) == 1 and is_summary_message(history[0]):
             return "Already compacted. Send more messages first."
-        turns = [m for m in history if m.get("role") in ("user", "assistant")]
-        if len(turns) < cls._COMPACT_MIN_TURNS:
+        # ONE definition of "a message", shared with what we report afterwards.
+        # Filtering by role alone kept assistant tool-call frames — the model
+        # asking for a tool, not speaking — so a single exchange wrapped in
+        # three tool calls counted as five and passed a threshold meant to
+        # mean "there is a conversation here worth summarising".
+        turn_count = count_conversational_messages(history)
+        if turn_count < cls._COMPACT_MIN_TURNS:
             return (
-                f"Not enough messages to compact ({len(turns)} messages). "
+                f"Not enough messages to compact ({turn_count} messages). "
                 f"Need at least {cls._COMPACT_MIN_TURNS}."
             )
         tokens = estimate_messages_tokens(history)

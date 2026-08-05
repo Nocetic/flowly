@@ -679,3 +679,42 @@ async def test_the_result_reports_what_the_user_can_count():
         "tool frames are being reported to the user as messages again"
     )
     assert result.messages_removed > 0
+
+
+def test_internal_triggers_wearing_the_user_role_do_not_count():
+    """Subagent announces and board results are written as user turns so the
+    agent reacts to them, but nobody typed them. Counting them would report
+    messages the user cannot find in their own transcript."""
+    from flowly.compaction.service import count_conversational_messages
+
+    assert count_conversational_messages([
+        {"role": "user", "content": "[System: subagent] finished", "_display_hidden": True},
+        {"role": "user", "content": "what did it find?"},
+        {"role": "assistant", "content": "It found three retries."},
+    ]) == 2
+
+
+def test_one_definition_of_a_message_across_the_feature():
+    """Eligibility used to filter by role alone, so a single exchange wrapped
+    in three tool calls counted as five and passed a threshold that means
+    'there is a conversation here worth summarising'."""
+    from flowly.agent.loop import AgentLoop
+    from flowly.compaction.service import count_conversational_messages
+
+    history = [
+        {"role": "user", "content": "read the log"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "…"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c2"}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "…"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c3"}]},
+        {"role": "tool", "tool_call_id": "c3", "content": "…"},
+        {"role": "assistant", "content": "Here it is."},
+    ]
+
+    reason = AgentLoop._compaction_ineligible_reason(history)
+
+    assert reason is not None and "Not enough messages" in reason
+    assert f"({count_conversational_messages(history)} messages)" in reason, (
+        "the refusal reports a different count than the feature's own"
+    )
