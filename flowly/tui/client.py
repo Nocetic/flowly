@@ -128,6 +128,10 @@ class CompactionEvent:
     after_tokens: int
     session_key: str
     raw: dict[str, Any]
+    #: Identity of this compaction cycle. Every phase of one cycle carries the
+    #: same value, so a terminal can be matched to the ``started`` it closes
+    #: instead of closing whatever notice happens to be on screen.
+    compaction_id: str = ""
 
 
 @dataclass
@@ -898,6 +902,7 @@ class GatewayClient:
                     after_tokens=_g("tokensAfter", "tokens_after"),
                     session_key=str(payload.get("sessionKey") or ""),
                     raw=payload,
+                    compaction_id=str(payload.get("compactionId") or ""),
                 )
             )
             return

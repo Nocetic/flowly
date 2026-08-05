@@ -349,3 +349,23 @@ def test_the_boundary_is_persisted_for_transports_without_firestore(tmp_path, mo
     )
     # And the real conversation is still all there, in order.
     assert [r["role"] for r in rows] == ["user", "assistant", "assistant"]
+
+
+def test_every_history_renderer_prefers_the_typed_boundary():
+    """A boundary row is a seam in the transcript, not something the agent
+    said. The TUI replayed it as an ordinary assistant bubble, so a reopened
+    session showed the agent apparently replying '[context-optimized]'.
+
+    Pinned as source inspection because the render loop needs a live Textual
+    app to exercise: what matters is that it branches on the typed field
+    BEFORE falling back to the text."""
+    import inspect
+
+    from flowly.tui import app as tui_app
+
+    source = inspect.getsource(tui_app.FlowlyTUI._preload_history_inner)
+    assert 'msg.get("kind") == "context_boundary"' in source
+    assert "COMPACTION_BOUNDARY_CONTENT" in source
+    assert source.index('kind") == "context_boundary"') < source.index(
+        "COMPACTION_BOUNDARY_CONTENT"
+    ), "the typed field must be checked before the legacy text"

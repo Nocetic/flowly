@@ -191,14 +191,25 @@ def _strip_subagent_tool_results(
 # Headroom left for the subagent's own reply. Smaller than the main loop's
 # reserve: a subagent answers with a result, not a conversation.
 _SUBAGENT_RESERVE_TOKENS = 8_000
+# …but never more than this share of a small model's window, or the reserve
+# alone swallows the context the subagent is supposed to think with.
+_SUBAGENT_MAX_RESERVE_SHARE = 0.35
+# Cap on one reply. Also clamped to the window: asked for 16,384 output
+# tokens, a 16,385-token model has nothing left to read the request with.
+_SUBAGENT_MAX_OUTPUT_TOKENS = 16_384
+_SUBAGENT_MAX_OUTPUT_SHARE = 0.25
+# Everything a request carries besides the messages: tool schemas and the
+# system preamble. Counted so the three parts are budgeted against ONE window
+# instead of each being sized as if it were alone.
+_SUBAGENT_OVERHEAD_TOKENS = 4_000
+# Slack between the planned request and the hard limit. The message-list size
+# is an ESTIMATE (tokenisers disagree by model and language), so a plan that
+# lands exactly on the window lands over it about half the time.
+_SUBAGENT_SAFETY_MARGIN_SHARE = 0.05
 
 
-def _subagent_context_budget(model: str) -> int:
-    """Tokens a subagent may spend on its message list for ``model``.
-
-    Resolved from the model's real window rather than a constant, because a
-    subagent on a 32K model and one on a 200K model are not the same problem.
-    """
+def subagent_context_window(model: str) -> int:
+    """The model's real window, or a conservative guess."""
     from flowly.compaction.service import _heuristic_context_window
 
     window = 0
@@ -210,7 +221,37 @@ def _subagent_context_budget(model: str) -> int:
         window = 0
     if not window:
         window = _heuristic_context_window(model) or 128_000
-    return max(8_000, window - _SUBAGENT_RESERVE_TOKENS)
+    return max(1, window)
+
+
+def subagent_output_budget(model: str) -> int:
+    """Output tokens one subagent reply may claim.
+
+    A constant 16,384 was sent to every model. On a 16,385-token model that
+    leaves one token for the entire request — the provider rejects it, and no
+    amount of trimming the message list can help, because the overflow is the
+    reply budget itself.
+    """
+    window = subagent_context_window(model)
+    return max(512, min(_SUBAGENT_MAX_OUTPUT_TOKENS,
+                        int(window * _SUBAGENT_MAX_OUTPUT_SHARE)))
+
+
+def _subagent_context_budget(model: str) -> int:
+    """Tokens a subagent may spend on its message list for ``model``.
+
+    Sized against the SAME window as the reply and the fixed overhead, so the
+    three together fit one request. Budgeting the message list alone let a
+    16,385-token model be handed 8,385 tokens of messages plus a 16,384-token
+    reply plus tool schemas — 25K+ into a 16K window, rejected every time.
+    """
+    window = subagent_context_window(model)
+    reserve = max(
+        subagent_output_budget(model),
+        min(_SUBAGENT_RESERVE_TOKENS, int(window * _SUBAGENT_MAX_RESERVE_SHARE)),
+    )
+    margin = int(window * _SUBAGENT_SAFETY_MARGIN_SHARE)
+    return max(1_000, window - reserve - _SUBAGENT_OVERHEAD_TOKENS - margin)
 
 
 def _trim_to_context_budget(
@@ -836,7 +877,7 @@ class SubagentManager:
                     messages=messages,
                     tools=tools.get_definitions(),
                     model=model,
-                    max_tokens=16384,
+                    max_tokens=subagent_output_budget(model),
                     timeout=_llm_call_timeout,
                 )
 

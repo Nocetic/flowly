@@ -13,6 +13,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 
 from flowly.integrations import Field, FieldType, IntegrationCard
+from flowly.session.manager import COMPACTION_BOUNDARY_CONTENT
 from flowly.tui.artifact_open import (
     is_external_artifact_type,
     open_artifact_external,
@@ -292,6 +293,9 @@ class FlowlyTUI(App[None]):
         # True while a user-initiated /compact owns the progress reporting, so
         # the gateway's broadcast for the same run isn't printed twice.
         self._compact_in_flight = False
+        # The compaction cycle whose notice is currently on screen. A terminal
+        # for any other cycle is stale and must not close this one.
+        self._compaction_cycle = ""
         self._restored_draft: str = str(state.get("last_draft") or "")
         # Optional modal to auto-open after launch (e.g. `flowly setup`
         # passes "integrations" so the catalogue surfaces immediately).
@@ -885,6 +889,14 @@ class FlowlyTUI(App[None]):
             text = _flatten_content(msg.get("content"))
             if not text:
                 continue
+            # A context boundary is a seam in the transcript, not something the
+            # agent said. Rendered as an ordinary assistant bubble it read as
+            # the agent replying "[context-optimized]" — which is exactly what
+            # a reopened session showed. Prefer the typed field; the text is
+            # the fallback for rows written before it existed.
+            if msg.get("kind") == "context_boundary" or text.strip() == COMPACTION_BOUNDARY_CONTENT:
+                transcript.add_marker("· context compacted ·")
+                continue
             if role == "user":
                 transcript.add_user(text, timestamp=msg.get("timestamp"))
             elif role == "assistant":
@@ -1087,9 +1099,21 @@ class FlowlyTUI(App[None]):
             if ev.phase == "started":
                 # The manual path prints its own progress line; only announce
                 # the automatic one, which the user did not ask for.
+                self._compaction_cycle = ev.compaction_id
                 if not self._compact_in_flight:
                     transcript.add_system("⚡ compacting context…")
                 return
+            # A terminal closes the cycle it belongs to. Without the id an
+            # event from an earlier pass (a retry, a second device, a reorder
+            # after reconnect) closed whatever notice happened to be on
+            # screen and reported ITS numbers.
+            if (
+                ev.compaction_id
+                and self._compaction_cycle
+                and ev.compaction_id != self._compaction_cycle
+            ):
+                return
+            self._compaction_cycle = ""
             if ev.phase == "failed":
                 transcript.add_error(
                     "context compaction failed — history kept, will retry"

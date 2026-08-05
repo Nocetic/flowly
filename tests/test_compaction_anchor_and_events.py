@@ -300,3 +300,42 @@ def test_every_relay_chat_event_carries_its_session_key():
             f"a relay chat event omits sessionKey and can only reach the "
             f"originating socket:\n{block[:200]}"
         )
+
+
+# ── A terminal closes its own cycle, not whichever notice is showing ──────
+
+
+def test_the_tui_event_carries_its_cycle_id():
+    """Without it, an event from an earlier pass (a retry, a second device, a
+    reorder after reconnect) closed whatever notice happened to be on screen
+    and reported ITS numbers as the outcome."""
+    from flowly.tui.client import CompactionEvent
+
+    event = CompactionEvent(
+        phase="completed", messages_removed=42, before_tokens=96_000,
+        after_tokens=12_500, session_key="cli:default", raw={},
+        compaction_id="cmp_abc123",
+    )
+
+    assert event.compaction_id == "cmp_abc123"
+
+
+def test_the_tui_event_defaults_the_id_for_older_bots():
+    from flowly.tui.client import CompactionEvent
+
+    event = CompactionEvent(
+        phase="started", messages_removed=0, before_tokens=0, after_tokens=0,
+        session_key="cli:default", raw={},
+    )
+
+    assert event.compaction_id == ""
+
+
+def test_the_tui_only_closes_the_cycle_it_opened():
+    import inspect
+
+    from flowly.tui import app as tui_app
+
+    source = inspect.getsource(tui_app.FlowlyTUI._handle_event)
+    assert "self._compaction_cycle = ev.compaction_id" in source
+    assert "ev.compaction_id != self._compaction_cycle" in source
