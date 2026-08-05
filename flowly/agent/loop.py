@@ -7379,26 +7379,29 @@ class AgentLoop:
         already exceed the window (observed live: estimate ~72K while the
         provider counted 82K in a 79K window).
 
-        CACHED INPUT COUNTS. Anthropic reports ``input_tokens`` for the
-        uncached remainder only, with the cached prefix in separate
-        ``cache_read``/``cache_write`` fields — so a well-cached 78K request
-        reports ~2K of prompt. Summing only prompt+completion made the
-        trigger blind on exactly the path where caching is standard: it would
-        watch a full window report 3K and never fire. Cache tokens occupy the
-        context window like any other input; only the price differs.
+        CACHED INPUT COUNTS, ONCE. Native Anthropic reports ``input_tokens``
+        for the uncached remainder, with the cached prefix in separate
+        ``cache_read``/``cache_write`` fields. OpenAI-compatible providers do
+        the opposite: ``prompt_tokens`` is already the full input and their
+        cache fields are a diagnostic subset. Treating both shapes like
+        Anthropic double-counted a cached OpenRouter request and could trigger
+        compaction far too early. Cache tokens occupy the context window like
+        any other input; the provider dialect only decides where they live in
+        the usage envelope.
         """
         try:
             usage = (getattr(outcome, "metadata", None) or {}).get("usage") or {}
             epoch = self.context_epoch(session_key) if epoch is None else epoch
-            total = sum(
-                int(usage.get(field, 0) or 0)
-                for field in (
-                    "prompt_tokens",
-                    "cache_read_tokens",
-                    "cache_write_tokens",
-                    "completion_tokens",
-                )
-            )
+            prompt = int(usage.get("prompt_tokens", 0) or 0)
+            completion = int(usage.get("completion_tokens", 0) or 0)
+            total = prompt + completion
+            provider = getattr(self, "provider", None)
+            if getattr(provider, "provider_name", "") == "anthropic":
+                total += int(usage.get("cache_read_tokens", 0) or 0)
+                total += int(usage.get("cache_write_tokens", 0) or 0)
+            if total <= 0:
+                # Older/custom providers sometimes expose only the aggregate.
+                total = int(usage.get("total_tokens", 0) or 0)
         except (AttributeError, TypeError, ValueError):
             return
         if total > 0:

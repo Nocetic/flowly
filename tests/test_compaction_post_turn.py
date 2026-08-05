@@ -655,12 +655,12 @@ async def test_a_reset_bumps_the_epoch_even_while_the_lock_is_held():
 # ── Cached input still occupies the window ────────────────────────────────
 
 
-def test_cached_input_counts_toward_the_observed_size():
-    """Anthropic reports input_tokens for the UNCACHED remainder only. Summing
-    prompt+completion made the trigger blind on the path where caching is
-    standard — a full window reporting 3K."""
+def test_native_anthropic_cached_input_counts_toward_the_observed_size():
+    """Native Anthropic reports the cached prefix outside ``input_tokens``.
+    The cache still occupies the model window, so it must be added once."""
     session = _big_session(turns=1)
     harness = _Harness(session)
+    harness.provider.provider_name = "anthropic"
 
     class _Outcome:
         metadata = {"usage": {
@@ -668,6 +668,30 @@ def test_cached_input_counts_toward_the_observed_size():
             "cache_read_tokens": 75_000,
             "cache_write_tokens": 0,
             "completion_tokens": 1_000,
+            "total_tokens": 3_000,
+        }}
+
+    harness._note_turn_usage = AgentLoop._note_turn_usage.__get__(harness)
+    harness._note_turn_usage(session.key, _Outcome())
+
+    assert harness._last_turn_total_tokens[session.key] == 78_000
+
+
+def test_openai_shaped_cached_input_is_not_counted_twice():
+    """OpenRouter/OpenAI ``prompt_tokens`` already includes cached input.
+    Adding its cache breakdown again made a 78K request look like 153K and
+    triggered needless compaction on cache-heavy conversations."""
+    session = _big_session(turns=1)
+    harness = _Harness(session)
+    harness.provider.provider_name = "openrouter"
+
+    class _Outcome:
+        metadata = {"usage": {
+            "prompt_tokens": 77_000,
+            "cache_read_tokens": 75_000,
+            "cache_write_tokens": 0,
+            "completion_tokens": 1_000,
+            "total_tokens": 78_000,
         }}
 
     harness._note_turn_usage = AgentLoop._note_turn_usage.__get__(harness)
