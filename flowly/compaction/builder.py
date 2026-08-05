@@ -23,7 +23,21 @@ def build_compaction_config(settings: Any) -> CompactionConfig:
     Fields the user actually wrote in config.json are marked explicit so
     auto-detection can defer to them.
     """
-    explicit = getattr(settings, "model_fields_set", set())
+    # "Did the operator pin this?" cannot be answered by asking whether the
+    # field is PRESENT: config.json is written with model_dump(), so every
+    # default is materialised into the file and every field looks set. Read
+    # literally, that made context_window explicit for everyone and killed
+    # model-aware detection outright — a Gemini or Claude user was capped at
+    # the 128K fallback. A pin is a value that DIFFERS from the default.
+    schema_defaults = {
+        name: field.default
+        for name, field in type(settings).model_fields.items()
+    }
+
+    def _pinned(name: str) -> bool:
+        if name not in getattr(settings, "model_fields_set", set()):
+            return False
+        return getattr(settings, name, None) != schema_defaults.get(name)
 
     flush = settings.memory_flush
     micro = getattr(settings, "microcompact", None)
@@ -34,7 +48,7 @@ def build_compaction_config(settings: Any) -> CompactionConfig:
         reserve_tokens_floor=settings.reserve_tokens_floor,
         max_history_share=settings.max_history_share,
         context_window=settings.context_window,
-        context_window_explicit="context_window" in explicit,
+        context_window_explicit=_pinned("context_window"),
         memory_flush=MemoryFlushConfig(
             enabled=flush.enabled,
             soft_threshold_tokens=flush.soft_threshold_tokens,

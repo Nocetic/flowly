@@ -759,3 +759,50 @@ def test_wire_shaped_history_counts_the_same():
          "content": [{"type": "text", "text": "…"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "here it is"}]},
     ]) == 2
+
+
+def test_a_materialised_default_is_not_an_operator_pin():
+    """config.json is written with model_dump(), so every default is
+    materialised into the file and every field looks "set". Read literally,
+    that made contextWindow explicit for EVERY user and killed model-aware
+    detection outright — a Gemini or Claude user was capped at the 128K
+    fallback while the catalog knew better."""
+    from flowly.compaction.builder import build_compaction_config
+    from flowly.config.schema import CompactionConfig as SchemaConfig
+
+    # What the loader produces from a file containing the whole block.
+    written_out = SchemaConfig.model_validate(SchemaConfig().model_dump())
+
+    assert "context_window" in written_out.model_fields_set, (
+        "this test is meaningless unless the field really does look set"
+    )
+    assert not build_compaction_config(written_out).context_window_explicit
+
+
+def test_a_deliberate_pin_still_wins():
+    """An operator who caps the window on purpose must not be second-guessed
+    by a catalog that thinks the model is bigger."""
+    from flowly.compaction.builder import build_compaction_config
+    from flowly.config.schema import CompactionConfig as SchemaConfig
+
+    pinned = SchemaConfig(context_window=32_000)
+
+    assert build_compaction_config(pinned).context_window_explicit
+
+
+def test_detection_reaches_the_model_when_nothing_is_pinned():
+    from flowly.compaction.builder import build_compaction_config
+    from flowly.config.schema import CompactionConfig as SchemaConfig
+
+    config = build_compaction_config(
+        SchemaConfig.model_validate(SchemaConfig().model_dump())
+    )
+    service = CompactionService(
+        provider=_Provider(LLMResponse(content="s", finish_reason="stop")),
+        model="anthropic/claude-haiku-4.5",
+        config=config,
+    )
+
+    assert service.effective_context_window == 200_000, (
+        "a 200K model was still being compacted as if it held 128K"
+    )
