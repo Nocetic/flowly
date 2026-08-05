@@ -13,6 +13,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 
 from flowly.integrations import Field, FieldType, IntegrationCard
+from flowly.compaction.service import count_conversational_messages
 from flowly.session.manager import COMPACTION_BOUNDARY_CONTENT
 from flowly.tui.artifact_open import (
     is_external_artifact_type,
@@ -906,8 +907,12 @@ class FlowlyTUI(App[None]):
                 transcript.add_assistant(text)
             elif role == "system":
                 transcript.add_system(text)
+        # Counted the way the reader counts: `messages` is the wire history,
+        # which also carries tool-call frames, tool results and compaction
+        # boundaries. Reporting its length told a user with three exchanges
+        # that seventeen messages had been resumed.
         transcript.add_marker(
-            f"· resumed {len(messages)} messages ·"
+            f"· resumed {count_conversational_messages(messages)} messages ·"
         )
 
     # --- event pump ------------------------------------------------

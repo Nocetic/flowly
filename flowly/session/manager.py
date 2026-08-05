@@ -12,14 +12,14 @@ from typing import Any
 
 from loguru import logger
 
+from flowly.compaction.types import CONTEXT_BOUNDARY_CONTENT
 from flowly.media.assets import assets_to_meta as _assets_to_meta
 from flowly.profile import get_flowly_home
-
-#: Text of a context-boundary row. Clients that predate the typed ``kind``
-#: field match on this, so it is a compatibility shim — not something the bot
-#: ever puts on the wire as a reply. See ``docs/chat-wire-protocol.md`` §4.2.
-COMPACTION_BOUNDARY_CONTENT = "[context-optimized]"
 from flowly.utils.helpers import ensure_dir, safe_filename
+
+#: Re-exported so callers that write the row can reach it from here; the
+#: definition lives with the other compaction constants.
+COMPACTION_BOUNDARY_CONTENT = CONTEXT_BOUNDARY_CONTENT
 
 # Suffix of the append-only DISPLAY transcript that rides alongside each
 # canonical ``<key>.jsonl``. It shares the ``*.jsonl`` glob, so EVERY consumer

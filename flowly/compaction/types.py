@@ -123,6 +123,29 @@ DEFAULT_PARTS = 2
 # are recognised when detecting an existing summary — sessions compacted by
 # older builds must still be understood.
 SUMMARY_MARKER = "[Previous conversation summary]"
+
+#: Text of a transcript context-boundary row. Clients that predate the typed
+#: ``kind`` field match on this, so it is a compatibility shim — the bot never
+#: puts it on the wire as a reply. See ``docs/chat-wire-protocol.md`` §4.2.
+CONTEXT_BOUNDARY_CONTENT = "[context-optimized]"
+
+
+def is_context_boundary(message: dict) -> bool:
+    """Is this row the seam a compaction left, rather than a message?
+
+    Prefers the typed field; the text is the fallback for rows persisted
+    before it existed.
+    """
+    if not isinstance(message, dict):
+        return False
+    if message.get("kind") == "context_boundary":
+        return True
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+    return isinstance(content, str) and content.strip() == CONTEXT_BOUNDARY_CONTENT
 LEGACY_SUMMARY_MARKER = "[Compacted conversation summary]"
 SUMMARY_MARKERS = (SUMMARY_MARKER, LEGACY_SUMMARY_MARKER)
 

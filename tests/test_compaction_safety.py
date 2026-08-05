@@ -718,3 +718,44 @@ def test_one_definition_of_a_message_across_the_feature():
     assert f"({count_conversational_messages(history)} messages)" in reason, (
         "the refusal reports a different count than the feature's own"
     )
+
+
+def test_the_compaction_seam_is_not_itself_a_message():
+    """The boundary row a compaction leaves is a divider. Counted, a resumed
+    session reported one more message than the user could see — and every
+    compaction added another phantom."""
+    from flowly.compaction.service import count_conversational_messages
+    from flowly.compaction.types import CONTEXT_BOUNDARY_CONTENT
+
+    history = [
+        {"role": "user", "content": "read the log"},
+        {"role": "assistant", "content": "here it is"},
+        {"role": "assistant", "content": CONTEXT_BOUNDARY_CONTENT,
+         "kind": "context_boundary"},
+        {"role": "user", "content": "thanks"},
+    ]
+
+    assert count_conversational_messages(history) == 3
+
+
+def test_a_boundary_written_before_the_typed_field_still_does_not_count():
+    from flowly.compaction.service import count_conversational_messages
+    from flowly.compaction.types import CONTEXT_BOUNDARY_CONTENT
+
+    assert count_conversational_messages([
+        {"role": "assistant", "content": CONTEXT_BOUNDARY_CONTENT},
+    ]) == 0
+
+
+def test_wire_shaped_history_counts_the_same():
+    """chat.history hands clients content as a list of blocks, not a string."""
+    from flowly.compaction.service import count_conversational_messages
+
+    assert count_conversational_messages([
+        {"role": "user", "content": [{"type": "text", "text": "read the log"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": ""}],
+         "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1",
+         "content": [{"type": "text", "text": "…"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "here it is"}]},
+    ]) == 2

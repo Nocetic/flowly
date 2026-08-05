@@ -23,6 +23,7 @@ from flowly.compaction.types import (
     CompactionError,
     CompactionResult,
     build_summary_content,
+    is_context_boundary,
     is_summary_message,
 )
 from flowly.providers.base import LLMProvider
@@ -69,8 +70,8 @@ def count_conversational_messages(messages: list[dict[str, Any]]) -> int:
         if message.get("_display_hidden"):
             continue  # an internal trigger (subagent announce, board result)
             # wearing the user role — nobody typed it
-        if is_summary_message(message):
-            continue  # a previous compaction's summary, not a turn
+        if is_summary_message(message) or is_context_boundary(message):
+            continue  # a previous compaction's summary or its seam, not a turn
         content = message.get("content")
         if isinstance(content, str) and content.strip():
             total += 1
