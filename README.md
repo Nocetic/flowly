@@ -220,7 +220,10 @@ scripts/dev-gateway.sh
 It installs uv if needed, builds the environment on first run, stops the
 installed gateway, serves its port from your checkout against your real
 `~/.flowly` — so Desktop attaches with your existing config and keys, nothing
-to set up twice — and restores the service when you're done.
+to set up twice — and restores the service when you're done. If you exported
+`FLOWLY_HOME` for isolated work, `unset` it first: Desktop's chat needs the
+relay credentials in the real `~/.flowly`, and the script refuses to run
+against an isolated home for that reason.
 
 ---
 

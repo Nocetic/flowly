@@ -188,6 +188,18 @@ uses, so there is nothing to configure again. It does everything below, and
 restores the service on Ctrl+C. (Tests and lint need one extra step:
 `uv pip install -e ".[dev]"`.)
 
+**If you were just in Mode A: `unset FLOWLY_HOME` first** (and remove the
+export from your shell profile if you added it there). The script refuses to
+run with it set, because an isolated home produces the most confusing failure
+this setup has: Desktop's chat rides the **relay**, and the gateway only joins
+the relay with the credentials Desktop wrote into the real
+`~/.flowly/config.json` (`channels.web` → `serverId`/`authToken`, created when
+you sign in on Desktop). Booted from a dev home, the gateway prints
+`Warning: No channels enabled`, Desktop's **dashboard** still shows it running
+(that's a local port health check), but the **composer never sees the bot**.
+That log line is the tell; sign in on Desktop first if your real config has no
+`channels.web` credentials either.
+
 By hand:
 
 ```bash

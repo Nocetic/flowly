@@ -92,6 +92,22 @@ if [[ ${#missing_deps[@]} -gt 0 ]]; then
   esac
 fi
 
+# Guard against the two-configs trap. This script exists to serve Desktop and
+# iOS, and they only ever read the real ~/.flowly — the relay credentials the
+# composer needs (channels.web serverId/authToken, written by Desktop sign-in)
+# live in THAT config. With FLOWLY_HOME pointing at an isolated dev home (Mode A
+# in CONTRIBUTING.md), the gateway boots from a config with no channels, prints
+# "Warning: No channels enabled", and the dashboard shows it running while the
+# composer never sees it. Refuse that silent half-working state.
+if [[ -n "${FLOWLY_HOME:-}" && "${FLOWLY_HOME%/}" != "${HOME}/.flowly" ]]; then
+  warn "FLOWLY_HOME is set to: ${FLOWLY_HOME}"
+  warn "Desktop and iOS only read ~/.flowly — with an isolated home the gateway"
+  warn "has no relay credentials, so the dashboard will show it running but the"
+  warn "composer/chat will never see it."
+  warn "  fix:  unset FLOWLY_HOME   (also remove it from ~/.zshrc etc.), re-run"
+  die  "  (running an isolated instance on purpose? use 'uv run flowly gateway' directly — this script is only for the Desktop/iOS handover)"
+fi
+
 # The port Desktop/iOS will look for: --port wins, else config, else the default.
 if [[ -z "$PORT" ]]; then
   PORT="$(python3 - <<'EOF' 2>/dev/null || true
