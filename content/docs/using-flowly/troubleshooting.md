@@ -102,22 +102,17 @@ No. `flowly service install` tries Task Scheduler first and, if that's denied,
 automatically falls back to a Startup-folder launcher that runs the gateway at
 logon — no elevation required either way.
 
-**A `~lowly-ai` folder appears / "flowly" isn't recognized (packaged pip install).**
-Specific to a `pip install --user flowly-ai` install: an interrupted `pip`
-upgrade — or one that ran while `flowly.exe` was locked — can leave a partial
-`~`-prefixed folder in your user site-packages. `flowly update` now relaunches
-itself on Windows to avoid the locked-exe case, but if you land in a half-broken
-state, delete the leftover and reinstall:
+**A `~lowly-ai` folder appears / "flowly" isn't recognized (legacy pip install).**
+Specific to the old PyPI-era `pip install --user flowly-ai` installs: an
+interrupted `pip` upgrade could leave a partial `~`-prefixed folder in your
+user site-packages. Those installs no longer receive updates — clean up the
+leftover and migrate to the current install, which never touches site-packages:
 
 ```powershell
 $sp = python -m site --user-site
 Remove-Item (Join-Path $sp "~lowly*") -Recurse -Force -ErrorAction SilentlyContinue
-pip install --user --force-reinstall flowly-ai
+irm https://useflowlyapp.com/install.ps1 | iex
 ```
-
-A git-checkout install — the default from the install script — never touches
-site-packages, so this can't happen to it; re-run the installer or `flowly
-update` to repair one.
 
 **A `UnicodeEncodeError` / `cp1252` traceback on Windows.**
 Flowly's `✦` logo (and other Unicode) can't encode on a non-UTF-8 Windows

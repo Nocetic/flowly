@@ -12,9 +12,8 @@ For what's open-source vs. cloud-only, see [Open source vs. Desktop & Cloud](des
 
 ```bash
 # One command — sets up uv, Python, git, and a Flowly git checkout that
-# `flowly update` keeps current with `git pull` (no waiting on a PyPI release)
+# `flowly update` keeps current with `git pull`
 curl -fsSL https://useflowlyapp.com/install.sh | bash
-# prefer a packaged PyPI install?  uv tool install flowly-ai
 ```
 
 The checkout and its virtualenv live under `~/.local/share/flowly/` (`repo/` + `venv/`); everything Flowly *stores* lives under `~/.flowly/` (config, workspace, plugins, skills, memory, session db). See [Installation](../getting-started/installation.md) and [File layout](../reference/file-layout.md).

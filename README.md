@@ -1,7 +1,6 @@
 <div align="center">
   <img src="assets/banner.png" alt="Flowly — the personal AI agent you own, everywhere you are" width="100%">
   <p>
-    <a href="https://pypi.org/project/flowly-ai/"><img src="https://img.shields.io/pypi/v/flowly-ai?style=for-the-badge&label=pypi&color=7C5CFC" alt="PyPI"></a>
     <img src="https://img.shields.io/badge/python-≥3.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
     <img src="https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-14181F?style=for-the-badge" alt="Platform">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-3B82F6?style=for-the-badge" alt="License"></a>
@@ -29,9 +28,9 @@
 ## Quick start
 
 ```bash
-# Install — sets up uv, Python, and a Flowly git checkout that `flowly update` keeps current
-curl -fsSL https://useflowlyapp.com/install.sh | bash
-# (prefer a packaged PyPI install? `uv tool install flowly-ai`)
+# Install — sets up uv, Python, and Flowly itself; `flowly update` keeps it current
+curl -fsSL https://useflowlyapp.com/install.sh | bash     # macOS / Linux
+irm https://useflowlyapp.com/install.ps1 | iex            # Windows (PowerShell)
 
 # First-time setup — pick an LLM provider, add any channels
 flowly setup
@@ -41,6 +40,13 @@ flowly
 ```
 
 `flowly setup` walks you through a provider (OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI/Grok, Zhipu, or a local model) and any channels you want. Two minutes, done. Add a Telegram bot? `flowly setup` → Telegram → paste token. The gateway hot-reloads each channel as you save.
+
+To keep the agent running with nobody at the terminal — channels reachable,
+cron firing, across reboots:
+
+```bash
+flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Scheduler (Windows)
+```
 
 ---
 
@@ -90,7 +96,7 @@ Adapters for **[OpenRouter](https://openrouter.ai), [Anthropic](https://www.anth
 ```bash
 flowly                     # open the chat
 /provider openrouter       # pick provider
-/model anthropic/claude-sonnet-4-6
+/model anthropic/claude-haiku-4.5
 ```
 
 Or edit `~/.flowly/config.json`. When nothing is pinned, Flowly cascades through whatever you've configured (OpenRouter → Anthropic → OpenAI → xAI → …) so it always has a working model.
@@ -149,26 +155,6 @@ Other command groups: `flowly channels · cron · plugins · skills · bundles �
 </div>
 
 The gateway runs as a local daemon, and the **whole process runs inside the OS sandbox** (`sandbox-exec` on macOS, `bwrap` on Linux). Channels route through an in-process message bus; the TUI, desktop, and mobile apps connect as clients over one WebSocket protocol (`ws://127.0.0.1:18790`) — desktop and mobile can also reach it remotely via the Flowly Cloud relay. Config lives at `~/.flowly/config.json`, shared by every client. → [internal RPC protocol](docs/internal-gateway-rpc-architecture.md)
-
----
-
-## Installation paths
-
-| Method | Command | When |
-|---|---|---|
-| Install script | `curl -fsSL https://useflowlyapp.com/install.sh \| bash` | Recommended — git checkout in a uv venv; `flowly update` pulls new versions between releases (Windows: `irm https://useflowlyapp.com/install.ps1 \| iex`) |
-| `uv tool` | `uv tool install flowly-ai` | Packaged PyPI install; tracks releases |
-| Source | `git clone … && uv pip install -e ".[dev]"` | Contributors — see [Develop from source](#develop-from-source) |
-
-After install, run `flowly setup` to pick a provider, then `flowly` to chat — it
-starts the gateway for you if none is running.
-
-To keep it up without anyone running `flowly` (channels reachable, cron jobs
-firing, across reboots):
-
-```bash
-flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Scheduler (Windows)
-```
 
 ---
 

@@ -7,12 +7,11 @@ description: The fastest path from nothing to a working agent — install, pick 
 ## 1. Install
 
 ```bash
-curl -fsSL https://useflowlyapp.com/install.sh | bash   # recommended (macOS / Linux)
+curl -fsSL https://useflowlyapp.com/install.sh | bash   # macOS / Linux
 # Windows: irm https://useflowlyapp.com/install.ps1 | iex
-# or a packaged PyPI install: uv tool install flowly-ai
 ```
 
-The native script manages Python for you (via uv) and installs a git checkout, so `flowly update` can pull new versions between releases. The packaged `uv tool` / `pip` installs need **Python ≥ 3.11** and track PyPI. Works on macOS, Linux, and Windows. See [Installation](./installation.md) for all methods.
+The script manages Python for you (via uv) and installs Flowly as a git checkout, so `flowly update` pulls new versions between releases. Works on macOS, Linux, and Windows. See [Installation](./installation.md) for details.
 
 ## 2. Pick a provider
 

@@ -104,14 +104,9 @@ backends are optional and lazy-loaded — install them with the `search` extra,
 into the same environment Flowly runs from:
 
 ```bash
-# git-checkout install (default from the install script) — reinstall the
-# checkout editable WITH the extra, so it stays a live git checkout
+# Reinstall the checkout editable WITH the extra, so it stays a live git checkout
 uv pip install --python ~/.local/share/flowly/venv/bin/python \
-  -e ~/.local/share/flowly/repo"[search]"
-
-# packaged pip / uv-tool install
-pip install "flowly-ai[search]"                 # ddgs, exa-py, firecrawl-py, parallel-web
-uv tool install flowly-ai --with "flowly-ai[search]"
+  -e ~/.local/share/flowly/repo"[search]"       # ddgs, exa-py, firecrawl-py, parallel-web
 ```
 
 If a backend's package isn't installed, its card shows that and the tool returns
