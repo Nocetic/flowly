@@ -57,3 +57,7 @@ GATEWAY_CONNECTION_PLAN.md
 
 # Local agent guidance — contains local paths + private repo names; never publish.
 CLAUDE.md
+
+# dev-install.sh artifacts (in-repo mode)
+.dev-home/
+/flowly-dev

@@ -24,9 +24,9 @@
 # not install:  uv pip install -e ".[dev]"
 #
 # This runs your development code against your REAL ~/.flowly — the same
-# memory, sessions, and channel tokens your everyday agent uses. For work that
-# doesn't need Desktop or iOS, use an isolated FLOWLY_HOME instead; see
-# CONTRIBUTING.md ("Two development modes").
+# memory, sessions, and channel tokens your everyday agent uses. For everyday
+# isolated development use scripts/dev-install.sh instead; this script is the
+# advanced path (see CONTRIBUTING.md, "running against your REAL install").
 #
 # Usage: scripts/dev-gateway.sh [--port N] [-- <extra flowly gateway args>]
 
@@ -95,8 +95,8 @@ fi
 # Guard against the two-configs trap. This script exists to serve Desktop and
 # iOS, and they only ever read the real ~/.flowly — the relay credentials the
 # composer needs (channels.web serverId/authToken, written by Desktop sign-in)
-# live in THAT config. With FLOWLY_HOME pointing at an isolated dev home (Mode A
-# in CONTRIBUTING.md), the gateway boots from a config with no channels, prints
+# live in THAT config. With FLOWLY_HOME pointing at an isolated dev home (a
+# dev-install.sh setup), the gateway boots from a config with no channels, prints
 # "Warning: No channels enabled", and the dashboard shows it running while the
 # composer never sees it. Refuse that silent half-working state.
 if [[ -n "${FLOWLY_HOME:-}" && "${FLOWLY_HOME%/}" != "${HOME}/.flowly" ]]; then

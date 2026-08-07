@@ -174,56 +174,46 @@ flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Sch
 
 ## Develop from source
 
-Everything in this repo runs straight from a checkout — the same code the
-Desktop app embeds. You need [uv](https://docs.astral.sh/uv/), Git, and
-(for voice/media and the agent's shell tooling) `ffmpeg` and `ripgrep`.
+One command, like the user install — but everything lands in one directory,
+fully isolated from any Flowly you already run:
 
 ```bash
-# uv itself — the install script normally does this for you. It lands in
-# ~/.local/bin, so open a new terminal afterwards (or export that on PATH),
-# otherwise the next line is "uv: command not found".
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-git clone https://github.com/Nocetic/flowly.git
-cd flowly
-
-uv venv --python 3.12
-uv pip install -e ".[dev]"
-
-export FLOWLY_HOME=~/flowly-dev-home   # keep dev state out of your real install
-uv run flowly bootstrap                # seed the workspace
-uv run flowly setup byok openrouter --key sk-or-...
-
-uv run flowly gateway --port 18999     # your code, in the foreground, off the real port
-uv run pytest                          # ~3,800 tests, about a minute
+mkdir flowly-development && cd flowly-development
+curl -fsSL https://raw.githubusercontent.com/Nocetic/flowly/main/scripts/dev-install.sh | bash
 ```
 
-Two things bite everyone on day one, and both fail silently:
+That gives you:
 
-- **`flowly` on your PATH is your _installed_ copy, not this checkout** — inside
-  the repo, run `uv run flowly …`.
-- **Clients attach to whatever gateway is already listening** (18790 by
-  default), so a running install serves your edits back as old code. Hence the
-  `--port` above — set the same value as `gateway.port` in
-  `$FLOWLY_HOME/config.json` and the terminal UI will find your instance too.
+```
+flowly-development/
+├── flowly/        the git checkout — edit code here
+├── home/          this instance's own config, workspace, and memory
+└── flowly-dev     launcher: runs the checkout against home/
+```
 
-The full walkthrough — system deps, isolated vs. Desktop-attached development,
-the config values `FLOWLY_HOME` doesn't cover, tests, PR conventions — is in
+The script installs uv if it's missing, clones the repo, builds the
+environment, and sets up the dev instance's home. If you already use Flowly,
+your real `~/.flowly/config.json` is **copied** — providers and API keys work
+immediately — and then made safe: its own gateway port (18890), its own
+workspace, all channels disabled, so it can never collide with your real
+agent. New machine with no config? You get the normal `flowly setup` wizard,
+same as any user.
+
+Then:
+
+```bash
+./flowly-dev                  # terminal UI, running your checkout
+./flowly-dev gateway          # dev gateway in the foreground
+cd flowly && uv run pytest    # ~3,800 tests, about a minute
+```
+
+Edit code under `flowly/`, re-run — the install is editable, changes are live
+on the next start. Re-running the install script is safe and refreshes
+everything.
+
+The full walkthrough — what the script does, testing against Flowly Desktop,
+the manual setup, tests, PR conventions — is in
 **[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
-
-To develop against Flowly Desktop or the iOS app, clone and run one command:
-
-```bash
-scripts/dev-gateway.sh
-```
-
-It installs uv if needed, builds the environment on first run, stops the
-installed gateway, serves its port from your checkout against your real
-`~/.flowly` — so Desktop attaches with your existing config and keys, nothing
-to set up twice — and restores the service when you're done. If you exported
-`FLOWLY_HOME` for isolated work, `unset` it first: Desktop's chat needs the
-relay credentials in the real `~/.flowly`, and the script refuses to run
-against an isolated home for that reason.
 
 ---
 

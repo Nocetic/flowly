@@ -29,37 +29,75 @@ Most new capabilities should be a **skill** or a **plugin**, not a core tool.
 
 ## Development setup
 
-The install script (`install.sh`) does a lot of setup silently. Doing it by hand
-is five commands, but two of them are ones nobody guesses. Read the whole
-section once — the two traps in *Which `flowly` am I running?* cost more time
-than everything else here.
+### The short way — `dev-install.sh`
 
-### Prerequisites
+```bash
+mkdir flowly-development && cd flowly-development
+curl -fsSL https://raw.githubusercontent.com/Nocetic/flowly/main/scripts/dev-install.sh | bash
+```
+
+This is `install.sh`'s sibling for people hacking on Flowly itself. It installs
+uv if missing, clones the repo into `./flowly`, builds the venv with the dev
+tooling (pytest + ruff), and creates an isolated instance home at `./home`:
+
+- If you have a real `~/.flowly/config.json`, it is **copied** — your providers
+  and API keys work immediately — and then three things are changed so the dev
+  instance can never interfere with your real one: `gateway.port` → **18890**
+  (your real gateway keeps 18790; Desktop's screenshot server owns 18791-2),
+  the workspace moves inside `./home` (so the dev agent can't write into your
+  real memory), and **every channel is disabled** (two bots on one Telegram
+  token or one relay identity steal each other's messages).
+- No config? You get the normal `flowly setup` wizard, same as any new user.
+
+It writes a `./flowly-dev` launcher that runs the checkout against `./home`:
+
+```bash
+./flowly-dev                  # terminal UI
+./flowly-dev gateway          # dev gateway, foreground, port 18890
+./flowly-dev doctor           # config + runtime health
+cd flowly && uv run pytest    # test suite
+```
+
+Edit code under `flowly/`; the install is editable, so the next start runs
+your changes. Re-running `dev-install.sh` is safe — it refreshes the checkout
+(only fast-forwarding a clean `main`; local work is never touched) and
+re-applies the isolation settings. Run from inside a checkout it uses that
+checkout and puts the home at `.dev-home/` (gitignored).
+
+**Testing your changes through Flowly Desktop** (engineers with the desktop
+repo): point a dev Desktop at this home —
+
+```bash
+FLOWLY_HOME=~/flowly-development/home npm run dev
+```
+
+then sign in inside that Desktop. Signing in writes fresh relay credentials
+into the dev home, so the composer chats with *this* bot — while the installed
+Flowly and your real Desktop keep running, untouched, on their own port. (The
+composer talks to the bot over the relay; without that sign-in the dashboard
+will show the dev gateway running but the composer won't see it. The gateway
+log line `Warning: No channels enabled` is the tell.)
+
+### Prerequisites (manual path)
+
+Everything below is what `dev-install.sh` automates — read on if you prefer to
+set things up yourself, or need to understand what it did.
 
 [uv](https://docs.astral.sh/uv/) (it manages Python for you) and Git. Python
 **3.11+** is required (`pyproject.toml`); 3.12 is what the installer and CI use.
-
-`install.sh` installs uv for you — a source checkout doesn't, so install it
-first. This is the same command the installer runs:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh          # macOS / Linux
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
 ```
 
-It lands in `~/.local/bin`, which your current shell may not have on PATH yet —
+uv lands in `~/.local/bin`, which your current shell may not have on PATH yet —
 `uv: command not found` right after installing means exactly that. Open a new
-terminal, or for this one:
+terminal, or `export PATH="$HOME/.local/bin:$PATH"`.
 
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-uv --version
-```
-
-Two system tools the install script installs for you, and a source checkout does
-not: **ffmpeg** (voice notes, the media library, `video_analyze`) and
-**ripgrep** (the `rg` binary the agent's shell tooling reaches for). Flowly runs
-without them — the features that need them just fail.
+Two optional system tools: **ffmpeg** (voice notes, the media library,
+`video_analyze`) and **ripgrep** (the `rg` binary the agent's shell tooling
+reaches for). Flowly runs without them — the features that need them just fail.
 
 ```bash
 brew install ffmpeg ripgrep                  # macOS
@@ -67,7 +105,7 @@ sudo apt install -y ffmpeg ripgrep           # Debian / Ubuntu
 winget install Gyan.FFmpeg BurntSushi.ripgrep.MSVC   # Windows
 ```
 
-### Clone and install
+### Clone and install (manual path)
 
 ```bash
 git clone https://github.com/Nocetic/flowly.git
@@ -117,20 +155,10 @@ gateway if nothing is there. With your installed Flowly running, you'd be
 talking to the old build while your edits sit untouched. Pick one of the two
 modes below so that can't happen.
 
-### Two development modes
+### Isolated by hand (what dev-install.sh sets up for you)
 
-|  | **Mode A — core only** | **Mode B — with Desktop / iOS** |
-|---|---|---|
-| For | tools, providers, channels, memory, TUI, tests — most contributions | changes you need to see through Flowly Desktop or the iOS app |
-| State | a throwaway `FLOWLY_HOME`, your real `~/.flowly` untouched | your **real** `~/.flowly` |
-| Port | your own (e.g. 18999) | 18790 — you take it over from the installed gateway |
-| Risk | none | dev code runs against your real memory, sessions, and channel tokens |
-
-Start with Mode A. Desktop and iOS hardcode `~/.flowly` and connect to the
-configured port, so Mode B is the only way to exercise them — there is no
-isolation to be had there.
-
-#### Mode A — isolated
+`dev-install.sh` gives you all of this; do it manually only when you need
+something different. The moving parts:
 
 ```bash
 export FLOWLY_HOME=~/flowly-dev-home     # every path Flowly touches moves here
@@ -147,7 +175,7 @@ Two values need a manual edit, because `FLOWLY_HOME` does not cover them:
 
 ```jsonc
 {
-  "gateway": { "port": 18999 },                     // don't collide with, or attach to, your real gateway
+  "gateway": { "port": 18890 },                     // don't collide with, or attach to, your real gateway
   "agents": { "defaults": {
     "workspace": "/Users/you/flowly-dev-home/workspace"   // written as "~/.flowly/workspace" — literally
   }}
@@ -156,23 +184,23 @@ Two values need a manual edit, because `FLOWLY_HOME` does not cover them:
 
 The workspace one matters: the gateway builds the agent from
 `agents.defaults.workspace` as written, so left alone, an "isolated" dev agent
-reads and writes the memory in your real workspace.
-
-Then:
+reads and writes the memory in your real workspace. Then:
 
 ```bash
-uv run flowly doctor         # config + runtime health
 uv run flowly gateway        # foreground, your code, your port
 uv run flowly                # terminal UI, in a second shell (same FLOWLY_HOME)
-
-curl -s http://127.0.0.1:18999/health     # {"status": "ok", …}
 ```
 
 Export `FLOWLY_HOME` in every shell you use for dev work — a shell without it
 talks to your real install. `uv run flowly -p dev <command>` is the alternative:
 it keeps state in `~/.flowly/profiles/dev/` instead.
 
-#### Mode B — against Desktop / iOS
+### Advanced: running against your REAL install (Desktop attached)
+
+Sometimes the isolated instance isn't what you're debugging: you need your dev
+code running against your real memory, sessions, and channels, with the
+*installed* Desktop app attached. That means taking over the real gateway
+port, and dev code touching your real data — deliberate, not the default.
 
 The rule: **stop the installed gateway, then serve 18790 from your checkout.**
 
@@ -188,7 +216,7 @@ uses, so there is nothing to configure again. It does everything below, and
 restores the service on Ctrl+C. (Tests and lint need one extra step:
 `uv pip install -e ".[dev]"`.)
 
-**If you were just in Mode A: `unset FLOWLY_HOME` first** (and remove the
+**If you were just working in an isolated home: `unset FLOWLY_HOME` first** (and remove the
 export from your shell profile if you added it there). The script refuses to
 run with it set, because an isolated home produces the most confusing failure
 this setup has: Desktop's chat rides the **relay**, and the gateway only joins
