@@ -1382,7 +1382,13 @@ class WebChannel(BaseChannel):
                 "type": "rpc",
                 "id": rpc_id,
                 "sessionId": session_id,
-                "result": build_commands_catalogue(),
+                "result": build_commands_catalogue(
+                    surface=(
+                        params.get("surface")
+                        if isinstance(params.get("surface"), str)
+                        else None
+                    ),
+                ),
             }
             await ws.send(json.dumps(ack))
 

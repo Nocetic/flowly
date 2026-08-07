@@ -1679,7 +1679,14 @@ class GatewayServer:
         """
         from flowly.agent.skill_bundles import build_commands_catalogue
 
-        await self._ws_rpc_reply(ws, rpc_id, build_commands_catalogue())
+        surface = params.get("surface")
+        await self._ws_rpc_reply(
+            ws,
+            rpc_id,
+            build_commands_catalogue(
+                surface=surface if isinstance(surface, str) else None,
+            ),
+        )
 
     # --- RPC: subagents.list ---
 
