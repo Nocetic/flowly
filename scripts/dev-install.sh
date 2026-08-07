@@ -60,6 +60,11 @@ ok()   { printf '\033[32m[flowly-dev]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[flowly-dev]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m[flowly-dev]\033[0m %s\n' "$*" >&2; exit 1; }
 
+printf '\n\033[1m  Flowly DEVELOPMENT setup\033[0m\n'
+printf '  For hacking on Flowly itself. Everything stays in this directory —\n'
+printf '  your installed Flowly (if any) is not touched. Users install with\n'
+printf '  https://useflowlyapp.com/install.sh instead.\n\n'
+
 # ── Layout ──────────────────────────────────────────────────────────────────
 # Run from an empty/new directory → everything under it (flowly/, home/).
 # Run from inside a checkout (scripts/dev-install.sh) → the checkout is the
@@ -147,53 +152,59 @@ mkdir -p "$DEV_HOME"
 REAL_CONFIG="$HOME/.flowly/config.json"
 DEV_CONFIG="$DEV_HOME/config.json"
 
-if [[ ! -f "$DEV_CONFIG" && -f "$REAL_CONFIG" ]]; then
-  log "Copying your real config (providers and keys work immediately)…"
-  cp "$REAL_CONFIG" "$DEV_CONFIG"
-fi
-
-if [[ -f "$DEV_CONFIG" ]]; then
-  # Patch on every run: the isolation invariants must hold even if the
-  # developer re-copied a config by hand.
+# Applied on every run: port + workspace are the isolation invariants.
+# Channel state is NOT touched here — signing in from a dev Desktop enables
+# the dev instance's own relay channel, and a re-run must not sever it.
+patch_invariants() {
   "$VENV/bin/python" - "$DEV_CONFIG" "$DEV_HOME" "$FLOWLY_DEV_PORT" <<'EOF'
 import json, sys
 from pathlib import Path
-
 cfg_path, dev_home, port = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 cfg = json.loads(cfg_path.read_text())
-
 cfg.setdefault("gateway", {})["port"] = port
 cfg.setdefault("agents", {}).setdefault("defaults", {})["workspace"] = str(Path(dev_home) / "workspace")
+cfg_path.write_text(json.dumps(cfg, indent=4, ensure_ascii=False) + "\n")
+EOF
+}
 
-# Channels off: two bots sharing one Telegram token or one relay identity
-# steal each other's messages. The dev instance gets its own relay identity
-# the moment you sign in from a FLOWLY_HOME-pointed Desktop.
+if [[ ! -f "$DEV_CONFIG" && -f "$REAL_CONFIG" ]]; then
+  log "Copying your real config (providers and keys work immediately)…"
+  cp "$REAL_CONFIG" "$DEV_CONFIG"
+  # Once, at copy time: the copied channel credentials belong to the REAL
+  # bot. Two bots sharing one Telegram token or one relay identity steal
+  # each other's messages, so everything copied starts disabled. The dev
+  # instance earns its own relay identity (a separate "<machine>-dev"
+  # server) the moment you sign in — from ./flowly-dev login, or inside a
+  # FLOWLY_HOME-pointed Desktop — and that state is never touched again.
+  "$VENV/bin/python" - "$DEV_CONFIG" <<'EOF'
+import json, sys
+from pathlib import Path
+cfg_path = Path(sys.argv[1])
+cfg = json.loads(cfg_path.read_text())
 for channel in (cfg.get("channels") or {}).values():
     if isinstance(channel, dict) and channel.get("enabled"):
         channel["enabled"] = False
-
 cfg_path.write_text(json.dumps(cfg, indent=4, ensure_ascii=False) + "\n")
 EOF
-  ok "Dev config ready: port ${FLOWLY_DEV_PORT}, isolated workspace, channels disabled."
+  patch_invariants
+  ok "Dev config ready: port ${FLOWLY_DEV_PORT}, isolated workspace, copied channels disabled."
+elif [[ -f "$DEV_CONFIG" ]]; then
+  patch_invariants
+  ok "Dev config refreshed: port ${FLOWLY_DEV_PORT}, isolated workspace (channel state untouched)."
 else
   log "No existing Flowly config found — running the normal setup wizard…"
+  printf '\n'
+  warn "You are configuring the DEVELOPMENT instance (its own home, port ${FLOWLY_DEV_PORT})."
+  warn "Signing in with a Flowly account here registers a separate \"<machine>-dev\""
+  warn "server — your real Flowly, if you install one later, is unaffected."
+  printf '\n'
   if [[ -t 0 || -c /dev/tty ]] && FLOWLY_HOME="$DEV_HOME" "$VENV/bin/flowly" setup </dev/tty; then
     :
   else
     warn "No terminal for the wizard — run ./flowly-dev setup later to pick a provider."
   fi
-  # Whatever setup wrote (or didn't), enforce the same isolation invariants.
-  if [[ -f "$DEV_CONFIG" ]]; then
-    "$VENV/bin/python" - "$DEV_CONFIG" "$DEV_HOME" "$FLOWLY_DEV_PORT" <<'EOF'
-import json, sys
-from pathlib import Path
-cfg_path, dev_home, port = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-cfg = json.loads(cfg_path.read_text())
-cfg.setdefault("gateway", {})["port"] = port
-cfg.setdefault("agents", {}).setdefault("defaults", {})["workspace"] = str(Path(dev_home) / "workspace")
-cfg_path.write_text(json.dumps(cfg, indent=4, ensure_ascii=False) + "\n")
-EOF
-  fi
+  # Whatever setup wrote (or didn't), enforce the isolation invariants.
+  [[ -f "$DEV_CONFIG" ]] && patch_invariants
 fi
 
 FLOWLY_HOME="$DEV_HOME" "$VENV/bin/flowly" bootstrap >/dev/null 2>&1 || true
