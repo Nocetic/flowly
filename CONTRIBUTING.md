@@ -39,6 +39,23 @@ than everything else here.
 [uv](https://docs.astral.sh/uv/) (it manages Python for you) and Git. Python
 **3.11+** is required (`pyproject.toml`); 3.12 is what the installer and CI use.
 
+`install.sh` installs uv for you — a source checkout doesn't, so install it
+first. This is the same command the installer runs:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh          # macOS / Linux
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
+```
+
+It lands in `~/.local/bin`, which your current shell may not have on PATH yet —
+`uv: command not found` right after installing means exactly that. Open a new
+terminal, or for this one:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
 Two system tools the install script installs for you, and a source checkout does
 not: **ffmpeg** (voice notes, the media library, `video_analyze`) and
 **ripgrep** (the `rg` binary the agent's shell tooling reaches for). Flowly runs

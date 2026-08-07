@@ -179,6 +179,11 @@ Desktop app embeds. You need [uv](https://docs.astral.sh/uv/), Git, and
 (for voice/media and the agent's shell tooling) `ffmpeg` and `ripgrep`.
 
 ```bash
+# uv itself — the install script normally does this for you. It lands in
+# ~/.local/bin, so open a new terminal afterwards (or export that on PATH),
+# otherwise the next line is "uv: command not found".
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 git clone https://github.com/Nocetic/flowly.git
 cd flowly
 

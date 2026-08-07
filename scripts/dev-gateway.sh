@@ -42,7 +42,13 @@ log()  { printf '\033[34m[dev-gateway]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[dev-gateway]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m[dev-gateway]\033[0m %s\n' "$*" >&2; exit 1; }
 
-command -v uv >/dev/null 2>&1 || die "uv is not installed — see https://docs.astral.sh/uv/"
+if ! command -v uv >/dev/null 2>&1; then
+  warn "uv is not on PATH."
+  warn "  install it:  curl -LsSf https://astral.sh/uv/install.sh | sh"
+  warn "  already did? it's in ~/.local/bin — open a new terminal, or:"
+  warn "               export PATH=\"\$HOME/.local/bin:\$PATH\""
+  exit 1
+fi
 
 # The port Desktop/iOS will look for: --port wins, else config, else the default.
 if [[ -z "$PORT" ]]; then
