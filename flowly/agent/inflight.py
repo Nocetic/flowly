@@ -81,6 +81,16 @@ def append_iteration(session_key: str, run_id: str, event: dict) -> None:
     iters.append(event)
     if len(iters) > _MAX_ITERATIONS:
         del iters[: len(iters) - _MAX_ITERATIONS]
+    # A tool-call boundary MOVES the streamed preamble out of the live
+    # bubble: the event we just stored carries that text as the panel
+    # group's preamble, and every live client clears its bubble on the
+    # matching iteration_step. Reset the partial here too, so a client
+    # restoring mid-run gets only the text streamed AFTER the last
+    # boundary — not every preamble re-glued into one bubble. Guarded on
+    # tool_calls: an assistant event without them has no panel entry the
+    # text could have moved into.
+    if event.get("role") == "assistant" and event.get("tool_calls"):
+        cur["text"] = ""
     cur["updatedAt"] = time.time()
 
 
