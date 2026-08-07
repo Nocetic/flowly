@@ -758,17 +758,29 @@ def _confirm_external_credential() -> bool:
     from InquirerPy.base.control import Choice
 
     console.print()
-    console.print(f"  Found a [b]{found.label}[/b] login from {found.origin}.")
-    console.print("  [dim]Flowly can use it as-is — nothing else to configure.[/dim]")
+    console.print(f"  [dim]Found a {found.label} login from {found.origin}.[/dim]")
     console.print()
+    # Flowly's own account leads, always. The found credential is a
+    # convenience, not a recommendation: it bills someone else's plan, its
+    # model list is theirs, and nothing about Flowly's hosted setup gets
+    # configured by it. Offering it first would make the machine's leftovers
+    # decide what this install is.
     choice = _select_with_back(
-        "Use it?",
+        "How do you want to power Flowly?",
         [
-            Choice(value="use", name=f"Yes, use my {found.label}"),
-            Choice(value="other", name="No, choose a different provider"),
+            Choice(value="flowly", name="Sign in with Flowly      (recommended — hosted, nothing to configure)"),
+            Choice(value="use", name=f"Use the {found.label} found on this machine"),
+            Choice(value="other", name="Something else  ·  bring your own API key"),
         ],
-        default="use",
+        default="flowly",
     )
+    if choice == "flowly":
+        _run_managed_login()
+        if not _already_configured():
+            _warn_signed_in_but_unusable()
+            return False
+        _verify_provider(label="Flowly account")
+        return True
     if choice != "use":
         return False
 
