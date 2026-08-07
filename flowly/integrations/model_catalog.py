@@ -369,13 +369,34 @@ def _catalog_contains(models: list[Model], model_id: str) -> bool:
     return any("locked" not in model.tags and model.id in candidates for model in models)
 
 
-async def reconcile_flowly_model(*, force_refresh: bool = True) -> str | None:
-    """Replace a model unavailable to this Flowly account with its backend default.
+# The ONLY values reconcile may rewrite without the user asking. These are old
+# *schema defaults* a config can still carry from before the account catalog
+# existed — not choices anyone made. Everything else is a user's explicit
+# selection, and validating it against the catalog is not safe grounds to
+# replace it: the TUI runs this against a possibly-stale cached catalog at
+# boot, so a freshly released model that's absent from yesterday's cache would
+# otherwise be silently reverted to the backend default on every restart.
+_LEGACY_SCHEMA_DEFAULTS = frozenset({"moonshotai/kimi-k2.5"})
 
-    The authenticated ``/models`` response is authoritative. A valid current
-    choice — including a paid user's deliberate Kimi selection — is preserved.
-    Network/auth/catalog failures are fail-safe no-ops; they never rewrite the
-    user's config from an unverified OpenRouter fallback.
+
+def _is_legacy_schema_default(model_id: str) -> bool:
+    m = model_id.strip().lower()
+    return any(
+        cand in _LEGACY_SCHEMA_DEFAULTS
+        for cand in (m, _dash_to_dot_version(m), _dot_to_dash_version(m))
+    )
+
+
+async def reconcile_flowly_model(*, force_refresh: bool = True) -> str | None:
+    """Migrate a stale legacy default to the account catalog's default model.
+
+    Scope is deliberately narrow: only an old schema default (or an empty
+    model) is ever replaced, and only when the authenticated catalog confirms
+    it's unavailable while the backend default is. A model the user actually
+    chose is NEVER rewritten here — if their plan can't serve it, the request
+    itself will say so, which is honest; a background rewrite that keeps
+    snapping the config back to the default is not. Network/auth/catalog
+    failures are fail-safe no-ops.
     """
     models = await fetch_models("flowly", force_refresh=force_refresh)
     policy = _FLOWLY_POLICY
@@ -385,6 +406,8 @@ async def reconcile_flowly_model(*, force_refresh: bool = True) -> str | None:
     from flowly.config.loader import load_config
 
     current = (load_config().agents.defaults.model or "").strip()
+    if current and not _is_legacy_schema_default(current):
+        return None
     if current and _catalog_contains(models, current):
         return None
     if not _catalog_contains(models, policy.default_model):
