@@ -51,6 +51,19 @@ def _heuristic_context_window(model: str) -> int | None:
     return None
 
 
+def _flowly_proxy_max_input_tokens(model: str) -> int:
+    """The Flowly proxy's per-model input ceiling.
+
+    MIRROR of ``modelMaxInputTokens`` in flowly-app's
+    ``app/api/v1/chat/completions/route.ts`` — keep the two in step. The
+    ceiling IS the model's window (family table above); an unknown family
+    gets the backend's conservative 128K fallback. Budgeting against a
+    window the wire would 413 is how mid-turn failures happen, so the bot
+    must never assume more than the proxy accepts.
+    """
+    return _heuristic_context_window(model) or 128_000
+
+
 def count_conversational_messages(messages: list[dict[str, Any]]) -> int:
     """How many of these a person would call messages.
 
@@ -161,11 +174,6 @@ class CompactionService:
         self.provider = provider
         self.model = model
         self.config = config or CompactionConfig()
-        # The Flowly proxy hard-caps request input at ~80K tokens
-        # (flowly-app MAX_INPUT_TOKENS) regardless of the model's window.
-        # Budgeting against the model's 128K while the wire chops at 80K is
-        # how mid-turn 413s happen — clamp when the active provider is flowly.
-        self.FLOWLY_PROXY_MAX_INPUT_TOKENS = 80_000
         # Compaction bookkeeping is PER SESSION. A single service instance
         # serves every chat on the gateway, so a global counter let one
         # conversation's memory-flush cycle cancel another's, and one
@@ -281,11 +289,13 @@ class CompactionService:
     @property
     def effective_context_window(self) -> int:
         """The window we can actually USE: the model's real window, clamped
-        to the Flowly proxy's input cap when that's the active provider (it
-        rejects bigger prompts with 413 regardless of model)."""
+        to the Flowly proxy's PER-MODEL input ceiling when that's the active
+        provider (it rejects bigger prompts with 413). The ceiling follows
+        the model family, so a 200K Claude gets its 200K — the old flat 80K
+        cap choked every large model to a fraction of its window."""
         window = self.model_context_window
         if getattr(self.provider, "provider_name", "") == "flowly":
-            return min(window, self.FLOWLY_PROXY_MAX_INPUT_TOKENS)
+            return min(window, _flowly_proxy_max_input_tokens(self.model))
         return window
 
     @property

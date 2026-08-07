@@ -340,11 +340,22 @@ def test_explicit_user_setting_wins_over_detection():
     )
 
 
-def test_flowly_proxy_input_cap_still_clamps():
+def test_flowly_proxy_cap_is_the_model_window():
+    # The proxy's input ceiling IS the model's window now (flowly-app's
+    # modelMaxInputTokens mirrors the same family table) — an 80K flat cap
+    # used to choke a 200K Claude for no reason.
     service = _built_service("anthropic/claude-haiku-4.5", provider_name="flowly")
 
     assert service.model_context_window == 200_000
-    assert service.effective_context_window == service.FLOWLY_PROXY_MAX_INPUT_TOKENS
+    assert service.effective_context_window == 200_000
+
+
+def test_flowly_proxy_unknown_family_falls_back_conservatively():
+    # An unknown family gets the backend's fallback ceiling (128K): the bot
+    # must never budget more than the proxy will accept.
+    service = _built_service("acme/mystery-model-9", provider_name="flowly")
+
+    assert service.effective_context_window <= 128_000
 
 
 def test_threshold_tracks_the_window():
