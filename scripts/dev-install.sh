@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
 #
-# dev-install.sh — one-shot developer setup: install.sh's sibling for people
-# hacking on Flowly itself.
+# dev-install.sh — build an ISOLATED Flowly instance for development.
 #
-#   mkdir flowly-development && cd flowly-development
-#   curl -fsSL https://raw.githubusercontent.com/Nocetic/flowly/main/scripts/dev-install.sh | bash
+# This is NOT the normal way to work on Flowly. Day to day, clone the repo and
+# run `scripts/dev-gateway.sh`: your checkout serves the usual gateway port
+# against your real ~/.flowly, so your providers, memory, channels and Desktop
+# keep working while you develop, with no second config to keep in sync.
 #
-# One command, like the user installer — but everything lands in the directory
-# you run it from, fully isolated from any installed Flowly:
+# Use this script when sharing that state would be wrong — a migration that
+# rewrites memory, a destructive experiment, a second agent running beside your
+# own. It creates an instance that cannot touch your real one: its own home,
+# its own gateway port, its own account registration ("<machine>-dev"), and
+# every copied channel disabled so two bots never fight over one Telegram token
+# or one relay identity.
 #
-#   flowly-development/
+#   mkdir ~/flowly-isolated && cd ~/flowly-isolated
+#   bash /path/to/flowly/scripts/dev-install.sh
+#
+# Everything lands in the directory you run it from:
+#
+#   flowly-isolated/
 #   ├── flowly/        the git checkout (editable install — edit and run)
 #   ├── home/          this instance's FLOWLY_HOME (config, workspace, memory)
 #   └── flowly-dev     launcher: runs the checkout against home/
@@ -60,10 +70,10 @@ ok()   { printf '\033[32m[flowly-dev]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[flowly-dev]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m[flowly-dev]\033[0m %s\n' "$*" >&2; exit 1; }
 
-printf '\n\033[1m  Flowly DEVELOPMENT setup\033[0m\n'
-printf '  For hacking on Flowly itself. Everything stays in this directory —\n'
-printf '  your installed Flowly (if any) is not touched. Users install with\n'
-printf '  https://useflowlyapp.com/install.sh instead.\n\n'
+printf '\n\033[1m  Flowly — ISOLATED development instance\033[0m\n'
+printf '  Its own home, port, and account: it cannot touch your real Flowly.\n'
+printf '  Day-to-day development does not need this — clone the repo and run\n'
+printf '  scripts/dev-gateway.sh, which serves YOUR checkout against ~/.flowly.\n\n'
 
 # ── Layout ──────────────────────────────────────────────────────────────────
 # Run from an empty/new directory → everything under it (flowly/, home/).
@@ -362,8 +372,10 @@ printf '\n'
 printf 'Your real Flowly install is untouched: this instance has its own home\n'
 printf '(%s),\nits own port (%s), and no channels enabled.\n' "$DEV_HOME" "$FLOWLY_DEV_PORT"
 printf '\n'
-printf 'Working on Flowly Desktop too? In the flowly-desktop repo, run this as\n'
-printf 'ONE line (a prefix for that command — nothing to export, nothing to paste\n'
-printf 'into this shell):\n\n'
-printf '  FLOWLY_HOME=%s npm run dev\n\n' "$DEV_HOME"
+printf 'To reach this instance from Flowly Desktop, run a SECOND Desktop beside\n'
+printf 'your real one — in the flowly-desktop repo, as one command:\n\n'
+printf '  FLOWLY_HOME=%s \\\n' "$DEV_HOME"
+printf '  FLOWLY_DESKTOP_USER_DATA_DIR=%s/desktop-data \\\n' "$DEV_ROOT"
+printf '  FLOWLY_DESKTOP_APP_NAME=FlowlyDev \\\n'
+printf '    npm run dev\n\n'
 printf 'Then sign in inside that Desktop — the composer then chats with this bot.\n'

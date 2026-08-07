@@ -23,10 +23,12 @@
 # For tests and lint you also want the dev tooling, which `uv run` alone does
 # not install:  uv pip install -e ".[dev]"
 #
-# This runs your development code against your REAL ~/.flowly — the same
-# memory, sessions, and channel tokens your everyday agent uses. For everyday
-# isolated development use scripts/dev-install.sh instead; this script is the
-# advanced path (see CONTRIBUTING.md, "running against your REAL install").
+# This is the normal way to work on Flowly: your code runs against your REAL
+# ~/.flowly, so providers, memory, channels and Desktop keep working exactly as
+# they did — there is no second config to keep in sync. When sharing that state
+# would be wrong (a migration that rewrites memory, a destructive experiment, a
+# second agent beside your own), scripts/dev-install.sh builds an isolated
+# instance instead.
 #
 # Usage: scripts/dev-gateway.sh [--port N] [-- <extra flowly gateway args>]
 

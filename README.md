@@ -174,46 +174,42 @@ flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Sch
 
 ## Develop from source
 
-One command, like the user install — but everything lands in one directory,
-fully isolated from any Flowly you already run:
+Clone it anywhere and run it. Flowly keeps its state in one place — `~/.flowly`
+— and a checkout uses that same state, so there is no second config to keep in
+sync, no separate account, no extra setup:
 
 ```bash
-mkdir flowly-development && cd flowly-development
-curl -fsSL https://raw.githubusercontent.com/Nocetic/flowly/main/scripts/dev-install.sh | bash
+git clone https://github.com/Nocetic/flowly.git
+cd flowly
+
+scripts/dev-gateway.sh          # installs uv + deps on first run, then serves
+                                # the gateway from THIS checkout
 ```
 
-That gives you:
+That's the whole loop. The script stops the installed gateway (if you have
+one), runs yours in its place, and hands the machine back when you press
+Ctrl+C. Your providers, memory, channels, and Flowly Desktop keep working
+exactly as they did — they're talking to your code now.
 
-```
-flowly-development/
-├── flowly/        the git checkout — edit code here
-├── home/          this instance's own config, workspace, and memory
-└── flowly-dev     launcher: runs the checkout against home/
-```
-
-The script installs uv if it's missing, clones the repo, builds the
-environment, and sets up the dev instance's home. If you already use Flowly,
-your real `~/.flowly/config.json` is **copied** — providers and API keys work
-immediately — and then made safe: its own gateway port (18890), its own
-workspace, all channels disabled, so it can never collide with your real
-agent. New machine with no config? You get the normal `flowly setup` wizard,
-same as any user.
-
-Then:
+Other things you'll want:
 
 ```bash
-./flowly-dev                  # terminal UI, running your checkout
-./flowly-dev gateway          # dev gateway in the foreground
-cd flowly && uv run pytest    # ~3,800 tests, about a minute
+uv pip install -e ".[dev]"    # pytest + ruff
+uv run pytest                 # ~3,800 tests, about a minute
+uv run flowly doctor          # config + runtime health
 ```
 
-Edit code under `flowly/`, re-run — the install is editable, changes are live
-on the next start. Re-running the install script is safe and refreshes
-everything.
+**Working on Flowly Desktop or the iOS app?** Nothing extra to do — they
+connect to the gateway on its usual port, which is now yours.
 
-The full walkthrough — what the script does, testing against Flowly Desktop,
-the manual setup, tests, PR conventions — is in
-**[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
+**Want an instance that can't touch your real one?** For risky work — a
+migration, a destructive experiment, a second agent running side by side —
+`scripts/dev-install.sh` builds a fully isolated instance (its own home, port,
+and account) in a directory of your choice. It's the exception, not the
+starting point.
+
+The full walkthrough — system dependencies, the isolated instance, tests, PR
+conventions — is in **[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
 
 ---
 
