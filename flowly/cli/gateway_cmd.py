@@ -163,6 +163,97 @@ def resolve_gateway_port(cli_port: int, config) -> int:
     return cli_port or config.gateway.port
 
 
+def _installed_service_unit():
+    """The machine's gateway-service unit file, if one is installed."""
+    from flowly.cli.service_cmd import DEFAULT_SERVICE_LABEL, _service_paths
+
+    mac_plist, linux_unit, win_xml = _service_paths(DEFAULT_SERVICE_LABEL)
+    for unit in (mac_plist, linux_unit, win_xml):
+        if unit is not None and unit.exists():
+            return unit
+    return None
+
+
+def _port_in_use(port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _run_cli(*args: str) -> int:
+    """Run a flowly CLI command in a child process.
+
+    The service commands are typer entry points; running them as a child
+    keeps this caller decoupled from their signatures and streams their
+    output unchanged. The child inherits FLOWLY_HOME.
+    """
+    return subprocess.run([sys.executable, "-m", "flowly", *args]).returncode
+
+
+def take_over_port(port: int) -> bool:
+    """Offer to stop the installed gateway service that holds *port*.
+
+    Developing on Flowly means serving the port everything already talks to
+    — Desktop, the TUI, iOS via the relay — and on an installed machine the
+    background service is what's holding it. Stopping that by hand is a
+    two-command dance people get wrong in both directions: ``kill`` doesn't
+    stick (launchd's KeepAlive and systemd's Restart=always bring it right
+    back), and the service is easy to forget to restore afterwards, leaving
+    the machine with no agent for channels or cron. So the gateway command
+    handles the handover itself and puts the service back on exit.
+
+    Only the machine's own service is ever touched: a busy port with no
+    installed unit (another app, a gateway started by hand) is left alone
+    and surfaces as the normal bind error.
+
+    Returns True when the service was stopped and must be restored on exit.
+    """
+    if not _port_in_use(port):
+        return False
+    if _installed_service_unit() is None:
+        return False
+
+    console.print(
+        f"[yellow]Port {port} is held by your installed Flowly gateway service.[/]"
+    )
+    if not sys.stdin.isatty():
+        console.print(
+            "  Stop it first:  [bold]flowly service stop[/bold]\n"
+            "  When finished:  [bold]flowly service install --start[/bold]"
+        )
+        raise typer.Exit(code=1)
+
+    from rich.prompt import Confirm
+
+    if not Confirm.ask("  Stop it and serve this port from this checkout?", default=True):
+        console.print("  Left it running — nothing changed.")
+        raise typer.Exit(code=0)
+
+    if _run_cli("service", "stop") != 0:
+        console.print(
+            "[red]✗[/red] Couldn't stop the service — run "
+            "[bold]flowly service stop[/bold] yourself, then retry."
+        )
+        raise typer.Exit(code=1)
+    console.print(
+        "[green]✓[/green] Service stopped — it will be restored when this gateway exits."
+    )
+    return True
+
+
+def restore_service(port: int) -> None:
+    """Reinstall + restart the service ``take_over_port`` stopped."""
+    console.print("\nRestoring the background service…")
+    if _run_cli("service", "install", "--port", str(port), "--start") == 0:
+        console.print(f"[green]✓[/green] Background service is back on port {port}.")
+    else:
+        console.print(
+            "[yellow]Couldn't restore it — run: flowly service install --start[/yellow]"
+        )
+
+
 def gateway(
     port: int = typer.Option(0, "--port", "-p", help="Gateway port. Overrides config.gateway.port (default 18790)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
@@ -273,6 +364,12 @@ def gateway(
     # `flowly gateway` became invisible to the desktop dashboard even though
     # it was perfectly healthy. One source of truth ends that split.
     port = resolve_gateway_port(port, config)
+
+    # If the installed background service holds this port, offer to take it
+    # over for this session (and restore it on exit). This is the entire
+    # "develop from a checkout" story: no separate script, no second config.
+    service_taken_over = take_over_port(port)
+
     console.print(f"Starting gateway on port {port}...")
 
     # ── Remote access: bind host + auth token resolution ──────────────────
@@ -1960,4 +2057,8 @@ Respond to the user now:"""
             await channels.stop_all()
             console.print("[green]✓[/green] Shutdown complete")
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    finally:
+        if service_taken_over:
+            restore_service(port)

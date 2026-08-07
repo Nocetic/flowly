@@ -3,9 +3,10 @@
 # dev-install.sh — build an ISOLATED Flowly instance for development.
 #
 # This is NOT the normal way to work on Flowly. Day to day, clone the repo and
-# run `scripts/dev-gateway.sh`: your checkout serves the usual gateway port
-# against your real ~/.flowly, so your providers, memory, channels and Desktop
-# keep working while you develop, with no second config to keep in sync.
+# run `uv run flowly gateway`: your checkout serves the usual gateway port
+# against your real ~/.flowly (offering to stop and later restore the installed
+# service if it holds the port), so your providers, memory, channels and
+# Desktop keep working while you develop, with no second config to keep in sync.
 #
 # Use this script when sharing that state would be wrong — a migration that
 # rewrites memory, a destructive experiment, a second agent running beside your
@@ -73,7 +74,7 @@ die()  { printf '\033[31m[flowly-dev]\033[0m %s\n' "$*" >&2; exit 1; }
 printf '\n\033[1m  Flowly — ISOLATED development instance\033[0m\n'
 printf '  Its own home, port, and account: it cannot touch your real Flowly.\n'
 printf '  Day-to-day development does not need this — clone the repo and run\n'
-printf '  scripts/dev-gateway.sh, which serves YOUR checkout against ~/.flowly.\n\n'
+printf '  `uv run flowly gateway` from your checkout — it serves ~/.flowly directly.\n\n'
 
 # ── Layout ──────────────────────────────────────────────────────────────────
 # Run from an empty/new directory → everything under it (flowly/, home/).

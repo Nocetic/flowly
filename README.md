@@ -176,40 +176,41 @@ flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Sch
 
 Clone it anywhere and run it. Flowly keeps its state in one place — `~/.flowly`
 — and a checkout uses that same state, so there is no second config to keep in
-sync, no separate account, no extra setup:
+sync and nothing to set up twice:
 
 ```bash
 git clone https://github.com/Nocetic/flowly.git
 cd flowly
 
-scripts/dev-gateway.sh          # installs uv + deps on first run, then serves
-                                # the gateway from THIS checkout
+uv run flowly gateway     # your code, serving the usual gateway port
 ```
 
-That's the whole loop. The script stops the installed gateway (if you have
-one), runs yours in its place, and hands the machine back when you press
-Ctrl+C. Your providers, memory, channels, and Flowly Desktop keep working
-exactly as they did — they're talking to your code now.
+That's it. Your providers, memory, channels, and Flowly Desktop keep working
+exactly as they did — they're talking to your code now. Edit, restart, repeat.
 
-Other things you'll want:
+If Flowly is already installed and running, its service holds that port — and
+the gateway handles the handover itself: it asks, stops the service, serves in
+its place, and restores the service when you press Ctrl+C. Nothing else to
+learn.
+
+Tests and lint:
 
 ```bash
 uv pip install -e ".[dev]"    # pytest + ruff
 uv run pytest                 # ~3,800 tests, about a minute
-uv run flowly doctor          # config + runtime health
+uv run ruff check flowly/
 ```
 
-**Working on Flowly Desktop or the iOS app?** Nothing extra to do — they
-connect to the gateway on its usual port, which is now yours.
+**Working on Flowly Desktop or the iOS app?** Nothing extra — they connect to
+the gateway on its usual port, which is now yours.
 
 **Want an instance that can't touch your real one?** For risky work — a
 migration, a destructive experiment, a second agent running side by side —
 `scripts/dev-install.sh` builds a fully isolated instance (its own home, port,
-and account) in a directory of your choice. It's the exception, not the
-starting point.
+and account). It's the exception, not the starting point.
 
-The full walkthrough — system dependencies, the isolated instance, tests, PR
-conventions — is in **[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
+Full walkthrough — system dependencies, the isolated instance, PR conventions —
+in **[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
 
 ---
 

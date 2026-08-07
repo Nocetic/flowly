@@ -37,8 +37,7 @@ config. No second account, no state to keep in sync.
 ### Prerequisites
 
 [uv](https://docs.astral.sh/uv/) (it manages Python for you) and Git. Python
-**3.11+** is required (`pyproject.toml`); 3.12 is what CI uses. `dev-gateway.sh`
-installs uv for you; to do it by hand:
+**3.11+** is required (`pyproject.toml`); 3.12 is what CI uses. Install uv:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh          # macOS / Linux
@@ -65,18 +64,24 @@ winget install Gyan.FFmpeg BurntSushi.ripgrep.MSVC   # Windows
 git clone https://github.com/Nocetic/flowly.git
 cd flowly
 
-scripts/dev-gateway.sh
+uv run flowly gateway
 ```
 
-The script installs uv if needed, builds the virtualenv and installs Flowly on
-first use (`uv run` does that), stops the installed gateway service, and serves
-its port from your checkout. Edit code, restart it, done. On exit — Ctrl+C
-included — it reinstalls and restarts the service it stopped, so the machine
-goes back to normal.
+`uv run` builds the virtualenv and installs Flowly on first use, so this is the
+whole setup. The gateway serves its usual port (18790) against your real
+`~/.flowly`. Edit code, restart, repeat.
 
-`flowly service stop` is what the script runs, and it matters: `kill` is not
-enough, because launchd (`KeepAlive`) and systemd (`Restart=always`) bring the
-service straight back.
+**If Flowly is already installed and running,** its background service holds
+that port — and the gateway handles the handover itself. It detects the
+service, asks before stopping it, serves the port from your checkout, and
+reinstalls + restarts the service when you exit (Ctrl+C included). Only the
+machine's own service is ever touched; anything else on the port is left alone
+and surfaces as the normal bind error. Without a terminal it refuses and
+prints the two commands (`flowly service stop`, then
+`flowly service install --start`) so automation never stops a service
+silently. Don't `kill` the service by hand — launchd (`KeepAlive`) and systemd
+(`Restart=always`) bring it straight back; that's exactly why the gateway does
+this dance for you.
 
 For tests and lint, add the dev tooling once:
 
