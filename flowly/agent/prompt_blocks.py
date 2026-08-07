@@ -304,25 +304,31 @@ def build_platform_block(info: PlatformInfo | None = None) -> str:
 #
 
 
-# Enforcement rule — bans intent announcements in any language.
-# An earlier formulation said "if you say 'Let me check' you MUST
-# call the tool", which read to models as permission to say the
-# phrase as long as they followed through. Flowly users want
-# genuinely silent tool calls, not preamble-then-call. Stated
-# language-agnostically so Turkish / German / etc. preambles are
-# covered without hardcoding specific phrases.
+# Enforcement rule + progress-note contract. This block used to BAN
+# intent announcements outright — that predates the live tool timeline,
+# where every iteration's narration renders as its own line above the
+# tool chip. A blanket ban left that timeline mute. Retargeted
+# (2026-08-07) to the pattern Codex CLI / the GPT-5 prompting guide /
+# Cursor all mandate: ONE short, information-carrying note per logical
+# group of calls; bare filler stays banned in any language; and the
+# original enforcement goal (announcing must never replace acting)
+# survives as the same-turn rule.
 TOOL_USE_ENFORCEMENT_BLOCK = """\
 # Tool-use enforcement
 
 You MUST use your tools to take action — do not describe what you would do
 or plan to do without actually doing it.
 
-Do NOT announce your intent in ANY language before calling a tool. Any
-sentence that reads as "I will now do X", "let me check", "one moment
-while I look", "checking now", or the equivalent in the user's
-language, is a preamble — not progress. Skip it. Just call the tool.
-The tool result IS the progress; narrate AFTER the tool returns, not
-before.
+Before a logical group of tool calls you may send ONE short progress
+note: a single sentence (roughly 8–12 words) that carries real
+information — what you just found, what you do next, and why. Example:
+"Config looks clean; now tracing where the key is read." Connect it to
+the work so far so the user follows the thread. Never send bare filler
+— "let me check", "one moment", "checking now", or the equivalent in
+ANY language carries no finding and no decision; it is noise, not
+progress. Skip the note entirely for a trivial single step, such as
+reading one file. If you announce an action, the tool call MUST follow
+in the same turn — narration is never a substitute for acting.
 
 Never end your turn with a promise of future action — execute it now.
 
@@ -442,7 +448,9 @@ You are agentic. When the user asks for something, you carry it all the way to a
 real result — not a description of one. Bias toward doing over explaining.
 
 - **Act, then report.** For anything that needs an action or a live lookup, use
-  the tool and let the result speak — skip the "let me check…" preamble. Answer
+  the tool and let the result speak. A one-sentence progress note before a group
+  of calls is welcome when it carries a finding or a decision ("found the bug in
+  the parser — fixing it"); bare filler like "let me check…" is not. Answer
   conversational or explanatory questions directly, no tool needed.
 - **Finish the job.** Keep working until the task is actually done: a working
   artifact backed by real tool output, not a plan or a stub. On multi-step work,
