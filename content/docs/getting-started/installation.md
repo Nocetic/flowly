@@ -11,7 +11,7 @@ description: Flowly is a single Python package, flowly-ai, that runs entirely on
 | Native script | `curl -fsSL https://useflowlyapp.com/install.sh \| bash` | **Recommended** — git checkout; `flowly update` pulls new versions between releases |
 | `uv tool` | `uv tool install flowly-ai` | Packaged PyPI install, isolated env |
 | `pip --user` | `pip install --user flowly-ai` | Standard Python users |
-| Source | `git clone … && pip install -e .` | Contributors |
+| Source | `git clone … && uv pip install -e ".[dev]"` | Contributors — full walkthrough in [CONTRIBUTING.md](https://github.com/Nocetic/flowly/blob/main/CONTRIBUTING.md#development-setup) |
 
 ```bash
 # Recommended (macOS / Linux)

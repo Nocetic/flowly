@@ -29,32 +29,170 @@ Most new capabilities should be a **skill** or a **plugin**, not a core tool.
 
 ## Development setup
 
-**Prerequisites:** [uv](https://docs.astral.sh/uv/) (it manages Python for you)
-and Git. Python **3.11+** is required (`pyproject.toml`); 3.12 is the default the
-installer uses.
+The install script (`install.sh`) does a lot of setup silently. Doing it by hand
+is five commands, but two of them are ones nobody guesses. Read the whole
+section once — the two traps in *Which `flowly` am I running?* cost more time
+than everything else here.
+
+### Prerequisites
+
+[uv](https://docs.astral.sh/uv/) (it manages Python for you) and Git. Python
+**3.11+** is required (`pyproject.toml`); 3.12 is what the installer and CI use.
+
+Two system tools the install script installs for you, and a source checkout does
+not: **ffmpeg** (voice notes, the media library, `video_analyze`) and
+**ripgrep** (the `rg` binary the agent's shell tooling reaches for). Flowly runs
+without them — the features that need them just fail.
+
+```bash
+brew install ffmpeg ripgrep                  # macOS
+sudo apt install -y ffmpeg ripgrep           # Debian / Ubuntu
+winget install Gyan.FFmpeg BurntSushi.ripgrep.MSVC   # Windows
+```
+
+### Clone and install
 
 ```bash
 git clone https://github.com/Nocetic/flowly.git
 cd flowly
 
 uv venv --python 3.12
-source .venv/bin/activate         # Windows: .venv\Scripts\activate
-
 uv pip install -e ".[dev]"
 
-# Point Flowly at an LLM provider (writes ~/.flowly/config.json)
-flowly setup byok openrouter --key sk-or-...
-# …or run the full wizard:
-flowly setup
-
-# Sanity check
-flowly doctor
-flowly                            # opens the terminal UI
+uv run flowly --version      # ✦ flowly v3.x.y
 ```
 
-Config lives at `~/.flowly/config.json` (keys are **camelCase**). To keep dev
-state isolated from your real install, set `FLOWLY_HOME=/tmp/flowly-dev` (or use
-`-p <profile>`) before running any command.
+`[dev]` is pytest + ruff. Web search backends (ddgs, Exa, Firecrawl, Parallel)
+are a separate extra — without it web search reports a missing dependency
+instead of failing mysteriously:
+
+```bash
+uv pip install -e ".[dev,search]"
+```
+
+### Which `flowly` am I running?
+
+**Trap 1 — the `flowly` on your PATH is not your checkout.** If you have ever
+installed Flowly, that install owns the name: `install.sh` puts its own checkout
+in `~/.local/share/flowly/repo` and symlinks its launcher onto your PATH; a
+`uv tool install` lives under `~/.local/share/uv/tools/`. Editing your clone
+changes nothing about what `flowly` runs, silently.
+
+```bash
+which flowly                 # the installed copy — not this repo
+```
+
+Inside the checkout, always run the CLI through uv, which uses the venv you just
+built:
+
+```bash
+uv run flowly <command>      # anything: gateway, doctor, setup, agent…
+```
+
+(The first `uv run` re-syncs `.venv` from `uv.lock`; the editable install of
+`flowly` plus pytest and ruff survive that. `source .venv/bin/activate` works
+too, but then a second terminal that forgot to activate is back to trap 1.)
+
+**Trap 2 — the terminal UI attaches to whatever gateway is already running.**
+`flowly` doesn't necessarily start your code: it connects to whatever is
+listening on the configured gateway port (18790 by default) and only starts a
+gateway if nothing is there. With your installed Flowly running, you'd be
+talking to the old build while your edits sit untouched. Pick one of the two
+modes below so that can't happen.
+
+### Two development modes
+
+|  | **Mode A — core only** | **Mode B — with Desktop / iOS** |
+|---|---|---|
+| For | tools, providers, channels, memory, TUI, tests — most contributions | changes you need to see through Flowly Desktop or the iOS app |
+| State | a throwaway `FLOWLY_HOME`, your real `~/.flowly` untouched | your **real** `~/.flowly` |
+| Port | your own (e.g. 18999) | 18790 — you take it over from the installed gateway |
+| Risk | none | dev code runs against your real memory, sessions, and channel tokens |
+
+Start with Mode A. Desktop and iOS hardcode `~/.flowly` and connect to the
+configured port, so Mode B is the only way to exercise them — there is no
+isolation to be had there.
+
+#### Mode A — isolated
+
+```bash
+export FLOWLY_HOME=~/flowly-dev-home     # every path Flowly touches moves here
+
+uv run flowly bootstrap                  # seed workspace: SOUL/USER/AGENTS/MEMORY + personas
+uv run flowly setup byok openrouter --key sk-or-...   # or: uv run flowly setup
+```
+
+`flowly setup byok` writes a complete `$FLOWLY_HOME/config.json` (keys are
+**camelCase** on disk — `providers.openrouter.apiKey`). Don't hand-write that
+file; let the CLI create it, then change what you need.
+
+Two values need a manual edit, because `FLOWLY_HOME` does not cover them:
+
+```jsonc
+{
+  "gateway": { "port": 18999 },                     // don't collide with, or attach to, your real gateway
+  "agents": { "defaults": {
+    "workspace": "/Users/you/flowly-dev-home/workspace"   // written as "~/.flowly/workspace" — literally
+  }}
+}
+```
+
+The workspace one matters: the gateway builds the agent from
+`agents.defaults.workspace` as written, so left alone, an "isolated" dev agent
+reads and writes the memory in your real workspace.
+
+Then:
+
+```bash
+uv run flowly doctor         # config + runtime health
+uv run flowly gateway        # foreground, your code, your port
+uv run flowly                # terminal UI, in a second shell (same FLOWLY_HOME)
+
+curl -s http://127.0.0.1:18999/health     # {"status": "ok", …}
+```
+
+Export `FLOWLY_HOME` in every shell you use for dev work — a shell without it
+talks to your real install. `uv run flowly -p dev <command>` is the alternative:
+it keeps state in `~/.flowly/profiles/dev/` instead.
+
+#### Mode B — against Desktop / iOS
+
+The rule: **stop the installed gateway, then serve 18790 from your checkout.**
+
+```bash
+scripts/dev-gateway.sh       # does all of the below, and restores the service on Ctrl+C
+```
+
+By hand:
+
+```bash
+flowly service stop                          # NOT `kill`: launchd (KeepAlive) and
+                                             # systemd (Restart=always) respawn it
+lsof -nP -iTCP:18790 -sTCP:LISTEN            # confirm nothing is listening
+
+uv run flowly gateway                        # your code, real ~/.flowly, port 18790
+# … work, with Desktop / the iOS app attached …
+
+flowly service install --start               # hand the machine back when you're done
+```
+
+**Yes, Desktop just sees it.** There is nothing to register or pair: Desktop
+polls `http://localhost:<gateway.port>/health` and accepts any response carrying
+the gateway's identity marker, no matter how the process was started. A gateway
+you launched by hand from a checkout answers that check like any other, and
+Desktop attaches to it — it shows up as an *external* instance (Desktop knows
+it doesn't own it, so it won't try to keep it alive or restart it). The iOS app
+reaches the same gateway through the relay.
+
+The one thing to avoid: while your foreground gateway is up, don't use Desktop's
+own start/restart control. It runs `flowly service install --port … --start
+--force`, which puts the installed build back on the port and takes yours down.
+
+### Don't run `flowly update` in your checkout
+
+It is the *user* update path, and it acts on whatever checkout it's running
+from: fetch, autostash your uncommitted work, `git pull --ff-only`, reinstall
+dependencies, restart the gateway. Use `git` directly on a dev clone.
 
 ---
 
@@ -67,10 +205,16 @@ ruff check flowly/      # lint
 ruff check --fix flowly/
 ```
 
-CI runs `ruff check` and `pytest` on every PR. Run both locally first. Tests use
-`pytest-asyncio` in `auto` mode — write `async def test_...` directly, no
-decorator needed. Keep new tests hermetic (no network, no real keys): use
-`monkeypatch` and `tmp_path`.
+From a checkout, prefix with `uv run` (`uv run pytest`) unless you've activated
+the venv. The suite is ~3,800 tests and finishes in about a minute; keep
+`FLOWLY_HOME` pointed at your dev home while running it, so nothing can reach
+into your real state.
+
+CI runs `ruff check` and `pytest` on every PR (Ubuntu, Python 3.11 + 3.12). Run
+both locally first. Tests use `pytest-asyncio` in `auto` mode — write
+`async def test_...` directly, no decorator needed. Keep new tests hermetic (no
+network, no real keys): use `monkeypatch` and `tmp_path`, and set `FLOWLY_HOME`
+via `monkeypatch.setenv` in any test that touches user state.
 
 ---
 

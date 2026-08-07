@@ -158,7 +158,7 @@ The gateway runs as a local daemon, and the **whole process runs inside the OS s
 |---|---|---|
 | Install script | `curl -fsSL https://useflowlyapp.com/install.sh \| bash` | Recommended — git checkout in a uv venv; `flowly update` pulls new versions between releases (Windows: `irm https://useflowlyapp.com/install.ps1 \| iex`) |
 | `uv tool` | `uv tool install flowly-ai` | Packaged PyPI install; tracks releases |
-| Source | `git clone … && pip install -e ".[dev]"` | Contributors |
+| Source | `git clone … && uv pip install -e ".[dev]"` | Contributors — see [Develop from source](#develop-from-source) |
 
 After install, run `flowly setup` to pick a provider, then `flowly` to chat — it
 starts the gateway for you if none is running.
@@ -169,6 +169,45 @@ firing, across reboots):
 ```bash
 flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Scheduler (Windows)
 ```
+
+---
+
+## Develop from source
+
+Everything in this repo runs straight from a checkout — the same code the
+Desktop app embeds. You need [uv](https://docs.astral.sh/uv/), Git, and
+(for voice/media and the agent's shell tooling) `ffmpeg` and `ripgrep`.
+
+```bash
+git clone https://github.com/Nocetic/flowly.git
+cd flowly
+
+uv venv --python 3.12
+uv pip install -e ".[dev]"
+
+export FLOWLY_HOME=~/flowly-dev-home   # keep dev state out of your real install
+uv run flowly bootstrap                # seed the workspace
+uv run flowly setup byok openrouter --key sk-or-...
+
+uv run flowly gateway --port 18999     # your code, in the foreground, off the real port
+uv run pytest                          # ~3,800 tests, about a minute
+```
+
+Two things bite everyone on day one, and both fail silently:
+
+- **`flowly` on your PATH is your _installed_ copy, not this checkout** — inside
+  the repo, run `uv run flowly …`.
+- **Clients attach to whatever gateway is already listening** (18790 by
+  default), so a running install serves your edits back as old code. Hence the
+  `--port` above — set the same value as `gateway.port` in
+  `$FLOWLY_HOME/config.json` and the terminal UI will find your instance too.
+
+The full walkthrough — system deps, isolated vs. Desktop-attached development,
+the config values `FLOWLY_HOME` doesn't cover, tests, PR conventions — is in
+**[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**. To develop against
+Flowly Desktop or the iOS app, `scripts/dev-gateway.sh` stops the installed
+gateway, serves 18790 from your checkout, and restores the service when you're
+done.
 
 ---
 
