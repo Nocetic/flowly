@@ -116,3 +116,57 @@ async def test_cron_context_short_circuits(monkeypatch):
     result = await mgr.request_and_wait(_pending())
     assert result is None
     assert mgr.list_pending() == []
+
+
+# ── close callbacks: a tray must never outlive its question ─────────────
+
+
+@pytest.mark.asyncio
+async def test_close_callback_fires_on_answer():
+    mgr = ClarifyManager()
+    closed: list[tuple[str, str]] = []
+
+    async def on_close(clarify_id: str, reason: str, session_key: str) -> None:
+        closed.append((clarify_id, reason))
+
+    mgr.add_close_callback(on_close)
+    pending = _pending()
+
+    async def answer_soon():
+        await asyncio.sleep(0.01)
+        mgr.resolve(pending.id, "A")
+
+    asyncio.create_task(answer_soon())
+    await mgr.request_and_wait(pending)
+    assert closed == [(pending.id, "answered")]
+
+
+@pytest.mark.asyncio
+async def test_close_callback_fires_on_timeout():
+    mgr = ClarifyManager()
+    closed: list[tuple[str, str]] = []
+
+    async def on_close(clarify_id: str, reason: str, session_key: str) -> None:
+        closed.append((clarify_id, reason))
+
+    mgr.add_close_callback(on_close)
+    await mgr.request_and_wait(_pending(timeout=0.05))
+    assert closed == [("abc123", "timeout")]
+
+
+@pytest.mark.asyncio
+async def test_close_callback_failure_does_not_break_the_answer():
+    mgr = ClarifyManager()
+
+    async def boom(clarify_id: str, reason: str, session_key: str) -> None:
+        raise RuntimeError("surface exploded")
+
+    mgr.add_close_callback(boom)
+    pending = _pending()
+
+    async def answer_soon():
+        await asyncio.sleep(0.01)
+        mgr.resolve(pending.id, "A")
+
+    asyncio.create_task(answer_soon())
+    assert await mgr.request_and_wait(pending) == "A"
