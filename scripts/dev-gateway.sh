@@ -7,13 +7,21 @@
 # (18790 by default), so there is no isolated way to develop against them: the
 # dev build has to take over that port. This script does the handover safely.
 #
-#   1. Stops the installed background service, if there is one. (`kill` is not
+# Clone the repo and run this — it needs nothing else on the machine:
+#
+#   1. Installs uv if it's missing (same installer install.sh uses). `uv run`
+#      then builds the virtualenv and installs Flowly on first use, so there is
+#      no separate setup step. The first run takes a minute; later ones don't.
+#   2. Stops the installed background service, if there is one. (`kill` is not
 #      enough — launchd KeepAlive and systemd Restart=always bring it back.)
-#   2. Refuses to continue if anything else still holds the port, naming it,
+#   3. Refuses to continue if anything else still holds the port, naming it,
 #      rather than killing a process it doesn't own.
-#   3. Runs `uv run flowly gateway` from this checkout, in the foreground.
-#   4. On exit (Ctrl+C included), reinstalls and restarts the service it
+#   4. Runs `uv run flowly gateway` from this checkout, in the foreground.
+#   5. On exit (Ctrl+C included), reinstalls and restarts the service it
 #      stopped, so the machine goes back to its normal setup.
+#
+# For tests and lint you also want the dev tooling, which `uv run` alone does
+# not install:  uv pip install -e ".[dev]"
 #
 # This runs your development code against your REAL ~/.flowly — the same
 # memory, sessions, and channel tokens your everyday agent uses. For work that
@@ -42,12 +50,46 @@ log()  { printf '\033[34m[dev-gateway]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[dev-gateway]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m[dev-gateway]\033[0m %s\n' "$*" >&2; exit 1; }
 
-if ! command -v uv >/dev/null 2>&1; then
-  warn "uv is not on PATH."
-  warn "  install it:  curl -LsSf https://astral.sh/uv/install.sh | sh"
-  warn "  already did? it's in ~/.local/bin — open a new terminal, or:"
-  warn "               export PATH=\"\$HOME/.local/bin:\$PATH\""
-  exit 1
+# uv is the only prerequisite, and installing it is not the developer's problem
+# any more than it is a user's — install.sh does this for them, so do it here.
+# Everything after it (the virtualenv, the dependencies, Flowly itself) is built
+# by `uv run` on first use.
+refresh_path() {
+  export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
+}
+
+ensure_uv() {
+  refresh_path
+  command -v uv >/dev/null 2>&1 && return 0
+
+  log "Installing uv (the one prerequisite)…"
+  if command -v curl >/dev/null 2>&1; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- https://astral.sh/uv/install.sh | sh
+  else
+    die "curl or wget is required to install uv."
+  fi
+  refresh_path
+
+  command -v uv >/dev/null 2>&1 \
+    || die "uv installed but isn't on PATH — open a new terminal and re-run."
+  log "Using uv $(uv --version 2>/dev/null | awk '{print $2}')"
+}
+ensure_uv
+
+# Not fatal: Flowly runs without these, but voice/media (ffmpeg) and the agent's
+# shell tooling (ripgrep) don't. install.sh installs them; say so rather than
+# letting those features fail later for no visible reason.
+missing_deps=()
+command -v ffmpeg >/dev/null 2>&1 || missing_deps+=("ffmpeg")
+command -v rg >/dev/null 2>&1 || missing_deps+=("ripgrep")
+if [[ ${#missing_deps[@]} -gt 0 ]]; then
+  warn "Missing (optional): ${missing_deps[*]} — voice/media and the agent's search tooling need them."
+  case "$(uname -s)" in
+    Darwin) warn "  brew install ${missing_deps[*]}" ;;
+    Linux)  warn "  sudo apt install -y ${missing_deps[*]}" ;;
+  esac
 fi
 
 # The port Desktop/iOS will look for: --port wins, else config, else the default.

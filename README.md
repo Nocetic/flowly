@@ -209,10 +209,18 @@ Two things bite everyone on day one, and both fail silently:
 
 The full walkthrough — system deps, isolated vs. Desktop-attached development,
 the config values `FLOWLY_HOME` doesn't cover, tests, PR conventions — is in
-**[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**. To develop against
-Flowly Desktop or the iOS app, `scripts/dev-gateway.sh` stops the installed
-gateway, serves 18790 from your checkout, and restores the service when you're
-done.
+**[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
+
+To develop against Flowly Desktop or the iOS app, clone and run one command:
+
+```bash
+scripts/dev-gateway.sh
+```
+
+It installs uv if needed, builds the environment on first run, stops the
+installed gateway, serves its port from your checkout against your real
+`~/.flowly` — so Desktop attaches with your existing config and keys, nothing
+to set up twice — and restores the service when you're done.
 
 ---
 

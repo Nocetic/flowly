@@ -177,8 +177,16 @@ it keeps state in `~/.flowly/profiles/dev/` instead.
 The rule: **stop the installed gateway, then serve 18790 from your checkout.**
 
 ```bash
-scripts/dev-gateway.sh       # does all of the below, and restores the service on Ctrl+C
+git clone https://github.com/Nocetic/flowly.git && cd flowly
+scripts/dev-gateway.sh
 ```
+
+That is the whole setup for this mode: the script installs uv if it's missing,
+`uv run` builds the virtualenv and installs Flowly on first use, and it uses
+your real `~/.flowly` — the same config, keys, and memory your everyday agent
+uses, so there is nothing to configure again. It does everything below, and
+restores the service on Ctrl+C. (Tests and lint need one extra step:
+`uv pip install -e ".[dev]"`.)
 
 By hand:
 
