@@ -71,12 +71,15 @@ repo): point a dev Desktop at this home —
 FLOWLY_HOME=~/flowly-development/home npm run dev
 ```
 
-then sign in inside that Desktop. Signing in writes fresh relay credentials
-into the dev home, so the composer chats with *this* bot — while the installed
-Flowly and your real Desktop keep running, untouched, on their own port. (The
-composer talks to the bot over the relay; without that sign-in the dashboard
-will show the dev gateway running but the composer won't see it. The gateway
-log line `Warning: No channels enabled` is the tell.)
+then sign in inside that Desktop. Signing in registers a **separate server
+named `<machine>-dev`** (the dev home carries its own machine identity, so it
+can never rebind your real bot's relay connection) and writes its relay
+credentials into the dev home — the composer then chats with *this* bot,
+while the installed Flowly and your real Desktop keep running, untouched, on
+their own port. (The composer talks to the bot over the relay; without that
+sign-in the dashboard will show the dev gateway running but the composer
+won't see it. The gateway log line `Warning: No channels enabled` is the
+tell.)
 
 ### Prerequisites (manual path)
 
