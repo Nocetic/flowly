@@ -139,13 +139,28 @@ else
 fi
 
 # ── Environment ─────────────────────────────────────────────────────────────
-if [[ ! -x "$VENV/bin/python" ]]; then
-  log "Creating virtualenv (Python ${FLOWLY_PYTHON})…"
-  (cd "$REPO" && uv venv --python "$FLOWLY_PYTHON")
+# Self-healing: a venv can be left half-built (an interrupted install, a
+# machine that went down mid-write, a `uv run` that got killed). The symptom
+# is `error: Failed to spawn: flowly` and it looks like a broken checkout, so
+# repair it here instead of making anyone diagnose it.
+build_env() {
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    log "Creating virtualenv (Python ${FLOWLY_PYTHON})…"
+    (cd "$REPO" && uv venv --python "$FLOWLY_PYTHON")
+  fi
+  log "Installing Flowly editable (with dev tooling)…"
+  uv pip install --python "$VENV/bin/python" -e "$REPO[dev]" --quiet
+}
+
+build_env
+if [[ ! -x "$VENV/bin/flowly" ]] || ! "$VENV/bin/flowly" --version >/dev/null 2>&1; then
+  warn "The virtualenv is incomplete (this happens after an interrupted install) — rebuilding it."
+  rm -rf "$VENV"
+  build_env
+  "$VENV/bin/flowly" --version >/dev/null 2>&1 \
+    || die "Rebuild still didn't produce a working flowly at ${VENV}/bin/flowly."
+  ok "Virtualenv rebuilt."
 fi
-log "Installing Flowly editable (with dev tooling)…"
-uv pip install --python "$VENV/bin/python" -e "$REPO[dev]" --quiet
-"$VENV/bin/flowly" --version >/dev/null || die "The editable install did not produce a working flowly."
 
 # ── Dev home ────────────────────────────────────────────────────────────────
 mkdir -p "$DEV_HOME"
@@ -209,6 +224,92 @@ fi
 
 FLOWLY_HOME="$DEV_HOME" "$VENV/bin/flowly" bootstrap >/dev/null 2>&1 || true
 
+# Marker the CLI looks for: running `uv run flowly …` inside this checkout
+# targets ~/.flowly, not this instance, and every symptom after that points
+# at the wrong problem. With this file present the CLI says so in one line.
+printf 'created by scripts/dev-install.sh\n' > "$DEV_HOME/.dev-install"
+
+# ── Stale background service ────────────────────────────────────────────────
+# The gateway service label is ONE global name per machine, and its unit bakes
+# in the FLOWLY_HOME that installed it. An earlier isolated session (or a
+# Desktop started with FLOWLY_HOME set) can therefore leave a unit pointing at
+# a home that no longer exists — `flowly doctor` then reports "Service
+# FLOWLY_HOME does not match the active profile" on every instance, forever.
+# Clean up ONLY a unit that is provably dead: its home or its executable is
+# gone. A live unit (the real install's) is reported, never touched.
+check_stale_service() {
+  local label="ai.flowly.gateway"
+  local unit=""
+  case "$(uname -s)" in
+    Darwin) unit="${HOME}/Library/LaunchAgents/${label}.plist" ;;
+    Linux)  unit="${HOME}/.config/systemd/user/${label}.service" ;;
+    *) return 0 ;;
+  esac
+  [[ -f "$unit" ]] || return 0
+
+  local unit_home unit_exec
+  unit_home="$("$VENV/bin/python" - "$unit" <<'EOF' 2>/dev/null || true
+import plistlib, re, sys
+from pathlib import Path
+unit = Path(sys.argv[1])
+try:
+    if unit.suffix == ".plist":
+        print((plistlib.loads(unit.read_bytes()).get("EnvironmentVariables") or {}).get("FLOWLY_HOME", ""))
+    else:
+        for line in unit.read_text(encoding="utf-8").splitlines():
+            m = re.match(r'Environment="?FLOWLY_HOME=([^"]*)"?', line.strip())
+            if m:
+                print(m.group(1)); break
+except Exception:
+    pass
+EOF
+)"
+  unit_exec="$("$VENV/bin/python" - "$unit" <<'EOF' 2>/dev/null || true
+import plistlib, shlex, sys
+from pathlib import Path
+unit = Path(sys.argv[1])
+try:
+    if unit.suffix == ".plist":
+        argv = plistlib.loads(unit.read_bytes()).get("ProgramArguments") or []
+        print(argv[0] if argv else "")
+    else:
+        for line in unit.read_text(encoding="utf-8").splitlines():
+            if line.startswith("ExecStart="):
+                t = shlex.split(line.split("=", 1)[1].strip())
+                print(t[0] if t else ""); break
+except Exception:
+    pass
+EOF
+)"
+
+  local dead=0
+  [[ -n "$unit_home" && ! -d "$unit_home" ]] && dead=1
+  [[ -n "$unit_exec" && ! -x "$unit_exec" ]] && dead=1
+  if [[ "$dead" == "0" ]]; then
+    if [[ -n "$unit_home" && "${unit_home%/}" != "${HOME}/.flowly" ]]; then
+      warn "A background gateway service belongs to another home (${unit_home}) — left untouched."
+    fi
+    return 0
+  fi
+
+  log "Removing a dead background service (its home or binary is gone: ${unit_home:-$unit_exec})…"
+  case "$(uname -s)" in
+    Darwin)
+      launchctl bootout "gui/$(id -u)/${label}" >/dev/null 2>&1 || true
+      launchctl unload "$unit" >/dev/null 2>&1 || true
+      ;;
+    Linux)
+      systemctl --user stop "$label" >/dev/null 2>&1 || true
+      systemctl --user disable "$label" >/dev/null 2>&1 || true
+      ;;
+  esac
+  rm -f "$unit"
+  [[ -n "$unit_home" ]] && rm -f "${unit_home}/.${label}.launchd-fallback"
+  rm -f "${HOME}/.flowly/.${label}.launchd-fallback"
+  ok "Dead service removed — 'flowly doctor' stops reporting a home mismatch."
+}
+check_stale_service
+
 # ── Launcher ────────────────────────────────────────────────────────────────
 cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
@@ -217,6 +318,31 @@ export FLOWLY_HOME="$DEV_HOME"
 exec "$VENV/bin/flowly" "\$@"
 EOF
 chmod +x "$LAUNCHER"
+
+# ── Verify ──────────────────────────────────────────────────────────────────
+# Prove the instance actually works before claiming success — a setup script
+# that says "ready" and then fails on the first command is worse than one that
+# says what's still missing.
+printf '\n'
+log "Verifying the development instance…"
+DOCTOR_OUT="$("$LAUNCHER" doctor 2>&1 || true)"
+if printf '%s' "$DOCTOR_OUT" | grep -qE "^\s*[✗x]" ; then
+  warn "'flowly doctor' still reports problems in this instance:"
+  printf '%s\n' "$DOCTOR_OUT" | grep -E "^\s*[✗x]" | head -6
+  warn "Run  ./flowly-dev doctor --fix  and re-run this script if it persists."
+else
+  ok "Instance healthy (./flowly-dev doctor)."
+fi
+
+# A copied config can be provider-less (a fresh ~/.flowly that `doctor --fix`
+# scaffolded, for instance). The agent cannot answer without one, and the
+# failure arrives later as an unexplained gateway error — say it now.
+if printf '%s' "$DOCTOR_OUT" | grep -q "No provider credential"; then
+  printf '\n'
+  warn "This instance has no LLM provider yet — the gateway won't start without one:"
+  warn "  ./flowly-dev setup                              (wizard, or sign in)"
+  warn "  ./flowly-dev setup byok openrouter --key sk-or-...   (one-shot)"
+fi
 
 # ── Done ────────────────────────────────────────────────────────────────────
 printf '\n'
