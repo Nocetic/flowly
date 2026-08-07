@@ -326,7 +326,13 @@ chmod +x "$LAUNCHER"
 printf '\n'
 log "Verifying the development instance…"
 DOCTOR_OUT="$("$LAUNCHER" doctor 2>&1 || true)"
-if printf '%s' "$DOCTOR_OUT" | grep -qE "^\s*[✗x]" ; then
+if printf '%s' "$DOCTOR_OUT" | grep -q "Config does not exist"; then
+  # The wizard was skipped (or there was no config to copy). This is the one
+  # remaining step, so name it instead of printing a raw doctor failure.
+  printf '\n'
+  warn "This instance has no config yet — one command finishes it:"
+  warn "  ./${LAUNCHER##*/} setup        (pick a provider, or sign in with a Flowly account)"
+elif printf '%s' "$DOCTOR_OUT" | grep -qE "^\s*[✗x]" ; then
   warn "'flowly doctor' still reports problems in this instance:"
   printf '%s\n' "$DOCTOR_OUT" | grep -E "^\s*[✗x]" | head -6
   warn "Run  ./flowly-dev doctor --fix  and re-run this script if it persists."
@@ -356,6 +362,8 @@ printf '\n'
 printf 'Your real Flowly install is untouched: this instance has its own home\n'
 printf '(%s),\nits own port (%s), and no channels enabled.\n' "$DEV_HOME" "$FLOWLY_DEV_PORT"
 printf '\n'
-printf 'Working on Flowly Desktop too? Point it at this home:\n'
-printf '  FLOWLY_HOME=%s npm run dev\n' "$DEV_HOME"
-printf 'and sign in inside that Desktop — the composer then chats with this bot.\n'
+printf 'Working on Flowly Desktop too? In the flowly-desktop repo, run this as\n'
+printf 'ONE line (a prefix for that command — nothing to export, nothing to paste\n'
+printf 'into this shell):\n\n'
+printf '  FLOWLY_HOME=%s npm run dev\n\n' "$DEV_HOME"
+printf 'Then sign in inside that Desktop — the composer then chats with this bot.\n'
