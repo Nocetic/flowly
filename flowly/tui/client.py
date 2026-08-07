@@ -152,6 +152,28 @@ class PlanApprovalRequested:
     plan: dict[str, Any]
 
 
+@dataclass
+class ClarifyRequested:
+    """The agent asked a question and is BLOCKED on the answer.
+
+    ``choices`` is empty for an open-ended question; surfaces always offer a
+    free-text answer on top of whatever choices came in.
+    """
+    clarify_id: str
+    question: str
+    choices: tuple[str, ...]
+    session_key: str
+    expires_at: float
+
+
+@dataclass
+class ClarifyClosed:
+    """The question stopped waiting — answered elsewhere, or timed out."""
+    clarify_id: str
+    reason: str
+    session_key: str
+
+
 Event = (
     StreamDelta
     | ChatFinal
@@ -169,6 +191,8 @@ Event = (
     | ArtifactEvent
     | PlanUpdated
     | PlanApprovalRequested
+    | ClarifyRequested
+    | ClarifyClosed
     | dict[str, Any]
 )
 
@@ -611,6 +635,27 @@ class GatewayClient:
         reply = await self._await_reply(rid, timeout=5.0)
         return bool(reply.get("sticky"))
 
+    # --- clarify ----------------------------------------------------
+
+    async def clarify_resolve(self, clarify_id: str, answer: str) -> bool:
+        """Send the user's answer back to the waiting agent.
+
+        ``False`` means the question was already settled (answered on another
+        device, or expired) — the caller should drop its prompt.
+        """
+        rid = await self._rpc(
+            "agent.clarify.resolve", {"id": clarify_id, "answer": answer}
+        )
+        reply = await self._await_reply(rid, timeout=10.0)
+        return bool(reply.get("ok")) and not reply.get("error")
+
+    async def clarify_list(self) -> list[dict[str, Any]]:
+        """Questions still waiting for an answer (resume after a restart)."""
+        rid = await self._rpc("agent.clarify.list", {})
+        reply = await self._await_reply(rid, timeout=5.0)
+        items = reply.get("clarifies")
+        return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+
     async def chat_inflight(self, session_key: str) -> dict[str, Any]:
         """Snapshot of a still-streaming run (+ current plan) for re-entry.
 
@@ -878,6 +923,32 @@ class GatewayClient:
 
         if ev_name == "plan.approval.requested":
             await self._inbox.put(PlanApprovalRequested(plan=dict(payload)))
+            return
+
+        if ev_name == "agent.clarify.requested":
+            raw_choices = payload.get("choices")
+            choices = tuple(
+                str(c) for c in raw_choices if str(c).strip()
+            ) if isinstance(raw_choices, list) else ()
+            await self._inbox.put(
+                ClarifyRequested(
+                    clarify_id=str(payload.get("id") or ""),
+                    question=str(payload.get("question") or ""),
+                    choices=choices,
+                    session_key=str(payload.get("sessionKey") or ""),
+                    expires_at=float(payload.get("expiresAt") or 0.0),
+                )
+            )
+            return
+
+        if ev_name == "agent.clarify.closed":
+            await self._inbox.put(
+                ClarifyClosed(
+                    clarify_id=str(payload.get("id") or ""),
+                    reason=str(payload.get("reason") or ""),
+                    session_key=str(payload.get("sessionKey") or ""),
+                )
+            )
             return
 
         if ev_name == "compaction":

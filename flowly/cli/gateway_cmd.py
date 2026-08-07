@@ -2017,6 +2017,21 @@ Respond to the user now:"""
 
             _clarify_mgr.add_notify_callback(_notify_clarify)
 
+            async def _close_clarify(
+                clarify_id: str, reason: str, session_key: str
+            ) -> None:
+                """The question stopped waiting — retire the prompt everywhere.
+
+                Without this a surface keeps a dead question on screen: answered
+                on another device, or timed out after five minutes, with the
+                agent long since moved on.
+                """
+                await gateway_server.broadcast_clarify_closed(
+                    clarify_id, reason, session_key
+                )
+
+            _clarify_mgr.add_close_callback(_close_clarify)
+
             # Run until shutdown signal
             async def run_until_shutdown():
                 await asyncio.gather(

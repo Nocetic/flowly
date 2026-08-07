@@ -1550,6 +1550,30 @@ class GatewayServer:
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 
+    async def broadcast_clarify_closed(
+        self,
+        clarify_id: str,
+        reason: str,
+        session_key: str | None,
+    ) -> None:
+        """Tell clients a clarify stopped waiting (``answered`` / ``timeout``).
+
+        The counterpart of ``broadcast_clarify_request``: a surface that drew a
+        prompt needs to retire it when the question is settled elsewhere or
+        expires, or the user answers into a prompt nothing is listening to.
+        """
+        event = {
+            "type": "event",
+            "event": "agent.clarify.closed",
+            "data": {
+                "id": clarify_id,
+                "reason": reason,
+                "sessionKey": session_key or "",
+            },
+        }
+        for ws in list(self._ws_clients.values()):
+            await self._ws_send(ws, event)
+
     # exec.policy.* (standing approval policy) is served from the shared
     # flowly.channels.feature_rpc surface — dispatched at the top of
     # _ws_dispatch via ``method in feature_rpc.FEATURE_METHODS`` so it lights

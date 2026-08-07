@@ -29,6 +29,8 @@ from flowly.tui.client import (
     ChatAborted,
     ChatError,
     ChatFinal,
+    ClarifyClosed,
+    ClarifyRequested,
     CompactionEvent,
     ConnectionLost,
     GatewayClient,
@@ -67,6 +69,8 @@ from flowly.tui.panes.browser_modal import BrowserPanel
 from flowly.tui.panes.composer import (
     ApprovalPrompt,
     ApprovalPromptRequest,
+    ClarifyPrompt,
+    ClarifyPromptRequest,
     Composer,
     InlineSecretPrompt,
     InlineSecretPromptRequest,
@@ -321,6 +325,11 @@ class FlowlyTUI(App[None]):
         # can re-surface it), plus a guard against double-submitting.
         self._pending_plan_approval: dict | None = None
         self._plan_resolve_busy = False
+        # Clarify: the question this session's agent is BLOCKED on, kept for
+        # the same reasons as the plan snapshot above (re-surface after an
+        # approval, or after the tray was hidden with Esc).
+        self._pending_clarify: ClarifyPromptRequest | None = None
+        self._clarify_resolve_busy = False
         self._inline_secret_future: asyncio.Future[str | None] | None = None
         self._inline_setup_future: asyncio.Future[dict[str, object] | None] | None = None
         self._composer_picker_future: asyncio.Future[Any] | None = None
@@ -798,6 +807,7 @@ class FlowlyTUI(App[None]):
         finally:
             await self._restore_inflight()
             await self._restore_plan_state()
+            await self._restore_clarify_state()
 
     async def _preload_history_inner(self) -> None:
         # A preload can render an empty session or a history without usage
@@ -1008,6 +1018,7 @@ class FlowlyTUI(App[None]):
                 self._current_bubble.mark_streaming(False)
             transcript.add_system("⊘ aborted")
             self._discard_skill_notice(ev.run_id)
+            self._drop_pending_clarify()
             self._current_bubble = None
             self._current_run = None
             self._set_state("idle")
@@ -1019,6 +1030,7 @@ class FlowlyTUI(App[None]):
                 self._current_bubble.mark_streaming(False)
             transcript.add_error(f"error: {ev.message}")
             self._discard_skill_notice(ev.run_id)
+            self._drop_pending_clarify()
             self._current_bubble = None
             self._current_run = None
             self._set_state("error")
@@ -1039,6 +1051,14 @@ class FlowlyTUI(App[None]):
 
         if isinstance(ev, PlanUpdated):
             self._on_plan_updated(ev.plan)
+            return
+
+        if isinstance(ev, ClarifyRequested):
+            self._on_clarify_requested(ev)
+            return
+
+        if isinstance(ev, ClarifyClosed):
+            self._on_clarify_closed(ev)
             return
 
         if isinstance(ev, ArtifactEvent):
@@ -1203,6 +1223,9 @@ class FlowlyTUI(App[None]):
             # rebind + repaint the partial, and refresh the plan strip/tray.
             asyncio.create_task(self._restore_inflight())
             asyncio.create_task(self._restore_plan_state())
+            # A question asked while the socket was down never reached us —
+            # the requested event is fire-and-forget.
+            asyncio.create_task(self._restore_clarify_state())
             return
 
         if isinstance(ev, ConnectionLost):
@@ -1243,6 +1266,12 @@ class FlowlyTUI(App[None]):
                     self.query_one(Composer).show_plan_approval(
                         self._pending_plan_approval
                     )
+                except Exception:
+                    pass
+            elif self._pending_clarify is not None:
+                # Same deferral for a question the agent is blocked on.
+                try:
+                    self.query_one(Composer).show_clarify(self._pending_clarify)
                 except Exception:
                     pass
 
@@ -1402,6 +1431,141 @@ class FlowlyTUI(App[None]):
             self.query_one(TranscriptPane).add_system(
                 "plan approval hidden — type /plan to reopen it"
             )
+
+    # --- clarify --------------------------------------------------------
+
+    def _on_clarify_requested(self, ev: ClarifyRequested) -> None:
+        """The agent asked something and its turn is parked on the answer.
+
+        Exec approvals outrank it (they expire far sooner); when one is on
+        screen the tray is deferred and re-surfaced by the drain loop's tail,
+        exactly like a plan approval.
+        """
+        if ev.session_key and ev.session_key != self._session_key:
+            return
+        if not ev.clarify_id:
+            return
+        request = ClarifyPromptRequest(
+            id=ev.clarify_id,
+            question=ev.question,
+            choices=ev.choices,
+            session_key=ev.session_key,
+            expires_at=ev.expires_at,
+        )
+        self._pending_clarify = request
+        if self._approval_active:
+            return  # deferred — re-shown when the exec approval queue drains
+        self.query_one(Composer).show_clarify(request)
+
+    def _drop_pending_clarify(self) -> None:
+        """Retire the tray because the turn behind it ended.
+
+        The ``closed`` broadcast rides the agent coroutine's exit path, which a
+        cancelled turn can skip — so an aborted or errored run would otherwise
+        leave the question on screen with nothing left to answer.
+        """
+        if self._pending_clarify is None:
+            return
+        self._pending_clarify = None
+        try:
+            self.query_one(Composer).clear_clarify()
+        except Exception:
+            pass
+
+    def _on_clarify_closed(self, ev: ClarifyClosed) -> None:
+        """Answered on another device, or expired — retire the tray.
+
+        Without this the prompt would sit there collecting an answer the
+        manager has already forgotten about.
+        """
+        if self._pending_clarify is None or self._pending_clarify.id != ev.clarify_id:
+            return
+        self._pending_clarify = None
+        self.query_one(Composer).clear_clarify()
+        if ev.reason == "timeout":
+            self._add_notice("question timed out — the agent moved on")
+        elif ev.reason == "answered":
+            self._add_notice("question answered on another device")
+
+    @on(ClarifyPrompt.Answered)
+    async def _on_clarify_answered(self, event: ClarifyPrompt.Answered) -> None:
+        event.stop()
+        if self._clarify_resolve_busy:
+            return
+        self._clarify_resolve_busy = True
+        composer = self.query_one(Composer)
+        transcript = self.query_one(TranscriptPane)
+        # Retire the tray BEFORE the round-trip. The gateway's ``closed``
+        # broadcast races the RPC reply, and a question still marked pending
+        # when it lands reports our own answer as somebody else's.
+        pending = self._pending_clarify
+        self._pending_clarify = None
+        composer.clear_clarify()
+        try:
+            ok = await self._client.clarify_resolve(event.clarify_id, event.answer)
+        except Exception as exc:
+            transcript.add_error(f"answer not delivered: {exc}")
+            # Nothing was delivered — the agent is still parked on it.
+            self._pending_clarify = pending
+            return
+        finally:
+            self._clarify_resolve_busy = False
+        if ok:
+            self._add_notice(f"↩ {event.answer}")
+        else:
+            # The question expired or someone else answered it first.
+            self._add_notice("that question is no longer waiting for an answer")
+
+    @on(ClarifyPrompt.Dismissed)
+    def _on_clarify_dismissed(self, event: ClarifyPrompt.Dismissed) -> None:
+        event.stop()
+        self.query_one(Composer).clear_clarify()
+        if self._pending_clarify is not None:
+            self.query_one(TranscriptPane).add_system(
+                "question hidden — type /clarify to answer it"
+            )
+
+    async def _restore_clarify_state(self) -> None:
+        """Re-open a question this session is still blocked on.
+
+        The event that opened it fired while the TUI was elsewhere (another
+        session, a restart, a dropped socket), so the pending list is the only
+        way back to it. It is also the authority the other way round: switching
+        sessions must not leave the previous one's question on screen.
+
+        Silent on any error — a failed list leaves the tray exactly as it is
+        rather than tearing down a question that is still waiting.
+        """
+        try:
+            items = await self._client.clarify_list()
+        except Exception:
+            return
+        mine = next(
+            (
+                item
+                for item in items
+                if not str(item.get("sessionKey") or "")
+                or str(item.get("sessionKey")) == self._session_key
+            ),
+            None,
+        )
+        if mine is None:
+            if self._pending_clarify is not None:
+                self._pending_clarify = None
+                self.query_one(Composer).clear_clarify()
+            return
+        raw_choices = mine.get("choices")
+        self._on_clarify_requested(
+            ClarifyRequested(
+                clarify_id=str(mine.get("id") or ""),
+                question=str(mine.get("question") or ""),
+                choices=tuple(
+                    str(c) for c in raw_choices if str(c).strip()
+                ) if isinstance(raw_choices, list) else (),
+                session_key=str(mine.get("sessionKey") or ""),
+                expires_at=float(mine.get("expiresAt") or 0.0),
+            )
+        )
 
     async def _restore_plan_state(self) -> None:
         """Fetch this session's plan (canonical resume source) and rebuild the
@@ -1981,6 +2145,16 @@ class FlowlyTUI(App[None]):
             new_key = fresh_session_key()
             await self._switch_session(new_key)
             self.query_one(TranscriptPane).add_system(f"new session · {new_key}")
+            return
+        if head == "/clarify":
+            # Purely local: bring back the question tray that Esc hid. The
+            # agent is still parked on the answer until it expires.
+            if self._pending_clarify is not None:
+                self.query_one(Composer).show_clarify(self._pending_clarify)
+            else:
+                self.query_one(TranscriptPane).add_system(
+                    "no question is waiting for an answer"
+                )
             return
         if head == "/plan":
             # Bare /plan with a decision already pending → reopen the tray

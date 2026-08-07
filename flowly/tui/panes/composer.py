@@ -28,6 +28,7 @@ from textual.widgets.option_list import Option
 # One source of truth: a command added to flowly/agent/slash_commands.py shows
 # up here and in the gateway/desktop catalogue automatically.
 from flowly.agent.slash_commands import cli_commands as _cli_commands
+from flowly.clarify.types import MAX_CHOICES
 from flowly.tui.attachments import (
     FileDrop,
     detect_media_drop,
@@ -416,6 +417,15 @@ class _Editor(TextArea):
                 event.prevent_default()
                 return
             # Key not handled (e.g. feedback input owns it) — fall through.
+
+        clarify_open = composer is not None and composer.has_class("clarify-open")
+        if clarify_open and composer is not None:
+            if composer.route_clarify_key(key):
+                composer.focus_clarify()
+                event.stop()
+                event.prevent_default()
+                return
+            # Key not handled (the answer field owns it) — fall through.
 
         if composer is not None and composer.artifact_navigation_active():
             if composer.route_artifact_key(key):
@@ -901,6 +911,265 @@ class PlanApprovalPrompt(Vertical):
     def _set_feedback_visible(self, visible: bool) -> None:
         try:
             self.query_one("#plan-approval-feedback-row").display = visible
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True)
+class ClarifyPromptRequest:
+    """A question the agent is blocked on, as the composer needs it."""
+
+    id: str
+    question: str
+    choices: tuple[str, ...] = ()
+    session_key: str = ""
+    expires_at: float = 0.0
+
+
+# Label of the row that always follows the agent's choices. The clarify tool
+# is explicitly told NOT to offer a catch-all option because every surface
+# adds this itself.
+CLARIFY_OWN_ANSWER = "Type my own answer…"
+
+
+class _ClarifyOptionRow(Static):
+    """One selectable answer row. Fixed slots, shown/hidden per question —
+    the number of choices varies between questions."""
+
+    def __init__(self, slot: int) -> None:
+        super().__init__("", classes="clarify-option", markup=False)
+        self.slot = slot
+        self.choice_index: int | None = None
+        self.renderable_text = ""
+
+    def set_row(self, index: int, text: str, *, selected: bool) -> None:
+        self.choice_index = index
+        self.renderable_text = text
+        self.display = True
+        marker = "›" if selected else " "
+        self.update(f"{marker} {index + 1}  {text}")
+        self.set_class(selected, "selected")
+
+    def clear_row(self) -> None:
+        self.choice_index = None
+        self.renderable_text = ""
+        self.display = False
+        self.update("")
+        self.remove_class("selected")
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        if self.choice_index is None:
+            return
+        tray = next((n for n in self.ancestors if isinstance(n, ClarifyPrompt)), None)
+        if tray is not None:
+            tray.choose_index(self.choice_index)
+
+
+class _ClarifyAnswerInput(Input):
+    """Free-text answer field that lets the tray own Esc (back to the rows)."""
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "escape":
+            event.stop()
+            event.prevent_default()
+            tray = next(
+                (n for n in self.ancestors if isinstance(n, ClarifyPrompt)), None
+            )
+            if tray is not None:
+                tray.exit_typing_mode()
+
+
+class ClarifyPrompt(Vertical):
+    """Inline clarify — the agent asked something and its turn is PAUSED on
+    the answer. Pick one of its choices or type your own; Esc hides the tray
+    (the question keeps waiting until it's answered or expires).
+
+    Everything drawn here is agent text, so every Static renders with
+    ``markup=False`` — a question containing brackets must never be parsed as
+    style markup.
+    """
+
+    can_focus = True
+
+    class Answered(Message):
+        def __init__(self, clarify_id: str, answer: str) -> None:
+            super().__init__()
+            self.clarify_id = clarify_id
+            self.answer = answer
+
+    class Dismissed(Message):
+        pass
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._request: ClarifyPromptRequest | None = None
+        self._options: list[str] = []
+        self._selected_idx = 0
+        self._typing = False
+
+    def compose(self) -> ComposeResult:
+        from textual.containers import Horizontal
+
+        yield Static("Flowly needs an answer", id="clarify-title", markup=False)
+        yield Static("", id="clarify-question", markup=False)
+        # One slot per possible choice plus the "type my own answer" row.
+        for slot in range(MAX_CHOICES + 1):
+            yield _ClarifyOptionRow(slot)
+        with Horizontal(id="clarify-answer-row"):
+            yield Static("›", id="clarify-answer-prefix", markup=False)
+            yield _ClarifyAnswerInput(
+                id="clarify-answer",
+                placeholder="Your answer…",
+            )
+        yield Static(
+            "↑/↓ choose · Enter select · Esc hide (still waiting)",
+            id="clarify-hint",
+            markup=False,
+        )
+
+    def on_mount(self) -> None:
+        self._render_options()
+        self._set_answer_visible(False)
+
+    # ── state ───────────────────────────────────────────────────────────
+
+    @property
+    def request(self) -> ClarifyPromptRequest | None:
+        return self._request
+
+    @property
+    def question_text(self) -> str:
+        return self._request.question if self._request else ""
+
+    @property
+    def answer_visible(self) -> bool:
+        try:
+            return bool(self.query_one("#clarify-answer-row").display)
+        except Exception:
+            return False
+
+    def set_request(self, request: ClarifyPromptRequest) -> None:
+        choices = [c for c in request.choices if str(c).strip()][:MAX_CHOICES]
+        self._request = request
+        # An open-ended question has nothing to pick from — go straight to the
+        # field rather than showing a one-row list saying "type an answer".
+        self._options = ([*choices, CLARIFY_OWN_ANSWER] if choices else [])
+        self._selected_idx = 0
+        self._typing = not self._options
+        self.query_one("#clarify-question", Static).update(request.question[:400])
+        self.query_one("#clarify-answer", Input).value = ""
+        self._render_options()
+        self._set_answer_visible(self._typing)
+        if self._typing:
+            self.focus_answer()
+        else:
+            self.focus_options()
+
+    def clear_request(self) -> None:
+        self._request = None
+        self._options = []
+        self._selected_idx = 0
+        self._typing = False
+        try:
+            self.query_one("#clarify-question", Static).update("")
+            self.query_one("#clarify-answer", Input).value = ""
+            self._render_options()
+            self._set_answer_visible(False)
+        except Exception:
+            pass
+
+    def focus_options(self) -> None:
+        try:
+            self.focus()
+        except Exception:
+            pass
+
+    def focus_answer(self) -> None:
+        try:
+            self.query_one("#clarify-answer", Input).focus()
+        except Exception:
+            pass
+
+    # ── interaction ─────────────────────────────────────────────────────
+
+    def route_editor_key(self, key: str) -> bool:
+        if self._typing:
+            # The Input owns the keys while an answer is being typed.
+            return False
+        normalized = key.lower().replace("_", "+")
+        if normalized == "up":
+            self._move_selection(-1)
+            return True
+        if normalized == "down":
+            self._move_selection(1)
+            return True
+        if normalized in ("enter", "return"):
+            self.choose_index(self._selected_idx)
+            return True
+        if normalized in ("escape", "ctrl+c"):
+            self.post_message(self.Dismissed())
+            return True
+        if normalized.isdigit():
+            idx = int(normalized) - 1
+            if 0 <= idx < len(self._options):
+                self.choose_index(idx)
+                return True
+        return False
+
+    def on_key(self, event: events.Key) -> None:
+        if not self.route_editor_key(event.key):
+            return
+        event.stop()
+        event.prevent_default()
+
+    def choose_index(self, index: int) -> None:
+        if not self._request or not (0 <= index < len(self._options)):
+            return
+        choice = self._options[index]
+        if choice == CLARIFY_OWN_ANSWER:
+            self._enter_typing_mode()
+            return
+        self.post_message(self.Answered(self._request.id, choice))
+
+    def _enter_typing_mode(self) -> None:
+        self._typing = True
+        self._set_answer_visible(True)
+        self.focus_answer()
+
+    def exit_typing_mode(self) -> None:
+        if not self._options:
+            # Open-ended: there are no rows to fall back to — hide instead.
+            self.post_message(self.Dismissed())
+            return
+        self._typing = False
+        self._set_answer_visible(False)
+        self.focus_options()
+
+    @on(Input.Submitted, "#clarify-answer")
+    def _submit_answer(self, event: Input.Submitted) -> None:
+        event.stop()
+        value = event.value.strip()
+        if not value or not self._request:
+            return
+        self.post_message(self.Answered(self._request.id, value))
+
+    def _move_selection(self, delta: int) -> None:
+        if not self._options:
+            return
+        self._selected_idx = (self._selected_idx + delta) % len(self._options)
+        self._render_options()
+
+    def _render_options(self) -> None:
+        for slot, row in enumerate(self.query(_ClarifyOptionRow)):
+            if slot >= len(self._options):
+                row.clear_row()
+                continue
+            row.set_row(slot, self._options[slot], selected=slot == self._selected_idx)
+
+    def _set_answer_visible(self, visible: bool) -> None:
+        try:
+            self.query_one("#clarify-answer-row").display = visible
         except Exception:
             pass
 
@@ -1603,6 +1872,7 @@ class Composer(Vertical):
     }
     Composer.approval-open > #composer-input-row,
     Composer.plan-approval-open > #composer-input-row,
+    Composer.clarify-open > #composer-input-row,
     Composer.secret-open > #composer-input-row,
     Composer.setup-open > #composer-input-row,
     Composer.review-open > #composer-input-row,
@@ -1611,6 +1881,7 @@ class Composer(Vertical):
     Composer.picker-inline-open > #composer-input-row,
     Composer.approval-open > #composer-hint,
     Composer.plan-approval-open > #composer-hint,
+    Composer.clarify-open > #composer-hint,
     Composer.secret-open > #composer-hint,
     Composer.setup-open > #composer-hint,
     Composer.review-open > #composer-hint,
@@ -1776,6 +2047,53 @@ class Composer(Vertical):
         border: none;
     }
     Composer > #composer-plan-approval > #plan-approval-hint {
+        height: 1;
+        color: #83b8c2;
+    }
+    Composer > #composer-clarify {
+        display: none;
+        height: auto;
+        padding: 1 2;
+        margin: 0;
+    }
+    Composer.clarify-open > #composer-clarify {
+        display: block;
+    }
+    Composer > #composer-clarify > #clarify-title {
+        height: 1;
+        text-style: bold;
+        color: #00a6c8;
+    }
+    Composer > #composer-clarify > #clarify-question {
+        height: auto;
+        max-height: 6;
+        text-style: bold;
+    }
+    Composer > #composer-clarify > .clarify-option {
+        height: 1;
+        margin: 0;
+    }
+    Composer > #composer-clarify > .clarify-option.selected {
+        color: #e6fbff;
+        background: #050505;
+        text-style: bold;
+    }
+    Composer > #composer-clarify > #clarify-answer-row {
+        height: 3;
+        margin: 0;
+    }
+    Composer > #composer-clarify > #clarify-answer-row > #clarify-answer-prefix {
+        width: 2;
+        height: 1;
+        margin: 1 0 0 0;
+        color: #00a6c8;
+    }
+    Composer > #composer-clarify > #clarify-answer-row > #clarify-answer {
+        width: 1fr;
+        background: #050505;
+        border: none;
+    }
+    Composer > #composer-clarify > #clarify-hint {
         height: 1;
         color: #83b8c2;
     }
@@ -2033,6 +2351,7 @@ class Composer(Vertical):
         yield PlanPanel(id="composer-plan-panel")
         yield ApprovalPrompt(id="composer-approval")
         yield PlanApprovalPrompt(id="composer-plan-approval")
+        yield ClarifyPrompt(id="composer-clarify")
         yield InlineSecretPrompt(id="composer-secret")
         yield InlineSetupPrompt(id="composer-setup")
         yield MemoryReviewPanel(id="composer-review")
@@ -2319,6 +2638,7 @@ class Composer(Vertical):
         self.cancel_artifact_navigation()
         self.remove_class("palette-open")
         self.remove_class("plan-approval-open")
+        self.remove_class("clarify-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("usage-open")
@@ -2356,6 +2676,7 @@ class Composer(Vertical):
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("plan-approval-open")
+        self.remove_class("clarify-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("usage-open")
@@ -2393,6 +2714,51 @@ class Composer(Vertical):
         except Exception:
             return None
 
+    # --- clarify --------------------------------------------------------
+
+    def show_clarify(self, request: ClarifyPromptRequest) -> None:
+        self.cancel_artifact_navigation()
+        self.remove_class("palette-open")
+        self.remove_class("approval-open")
+        self.remove_class("plan-approval-open")
+        self.remove_class("clarify-open")
+        self.remove_class("secret-open")
+        self.remove_class("setup-open")
+        self.remove_class("usage-open")
+        self.remove_class("status-open")
+        self._remove_picker_classes()
+        self.add_class("clarify-open")
+        tray = self.query_one("#composer-clarify", ClarifyPrompt)
+        tray.set_request(request)
+
+    def clear_clarify(self) -> None:
+        try:
+            self.query_one("#composer-clarify", ClarifyPrompt).clear_request()
+        except Exception:
+            pass
+        self.remove_class("clarify-open")
+        self.focus_input_safely()
+
+    def focus_clarify(self) -> None:
+        try:
+            self.query_one("#composer-clarify", ClarifyPrompt).focus_options()
+        except Exception:
+            pass
+
+    def route_clarify_key(self, key: str) -> bool:
+        try:
+            tray = self.query_one("#composer-clarify", ClarifyPrompt)
+        except Exception:
+            return False
+        return tray.route_editor_key(key)
+
+    def clarify_request(self) -> ClarifyPromptRequest | None:
+        """The question currently shown in the clarify tray, if any."""
+        try:
+            return self.query_one("#composer-clarify", ClarifyPrompt).request
+        except Exception:
+            return None
+
     def set_plan(self, plan: dict | None) -> None:
         """Update (or hide, with ``None``) the persistent plan strip."""
         try:
@@ -2405,6 +2771,7 @@ class Composer(Vertical):
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("plan-approval-open")
+        self.remove_class("clarify-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("usage-open")
@@ -2427,6 +2794,7 @@ class Composer(Vertical):
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("plan-approval-open")
+        self.remove_class("clarify-open")
         self.remove_class("setup-open")
         self.remove_class("usage-open")
         self.remove_class("status-open")
@@ -2454,6 +2822,7 @@ class Composer(Vertical):
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("plan-approval-open")
+        self.remove_class("clarify-open")
         self.remove_class("secret-open")
         self.remove_class("usage-open")
         self.remove_class("status-open")
@@ -2475,6 +2844,7 @@ class Composer(Vertical):
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("plan-approval-open")
+        self.remove_class("clarify-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("review-open")
@@ -2495,6 +2865,7 @@ class Composer(Vertical):
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("plan-approval-open")
+        self.remove_class("clarify-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("review-open")
@@ -2515,6 +2886,7 @@ class Composer(Vertical):
         self.remove_class("palette-open")
         self.remove_class("approval-open")
         self.remove_class("plan-approval-open")
+        self.remove_class("clarify-open")
         self.remove_class("secret-open")
         self.remove_class("setup-open")
         self.remove_class("review-open")

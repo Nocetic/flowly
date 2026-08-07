@@ -66,6 +66,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # side effect runs. "/plan <task>" plans just that one task.
     CommandDef("plan", "Plan mode: propose a plan and wait for approval before acting",
                "Session", args_hint="[task | on | off | status]"),
+    # Purely local: reopens a question tray hidden with Esc. cli_only because
+    # the other surfaces keep their question on screen until it's answered —
+    # there's nothing to bring back.
+    CommandDef("clarify", "Reopen the question Flowly is waiting on", "Session",
+               cli_only=True),
     CommandDef("usage", "Token & cost this session (+ Flowly account credits)", "Info",
                cli_only=True),
     CommandDef("whoami", "Show user / server / conversation", "Info"),
