@@ -151,8 +151,20 @@ def _should_drop_stderr_sink(stream) -> bool:
 # ============================================================================
 
 
+def resolve_gateway_port(cli_port: int, config) -> int:
+    """Effective gateway port: explicit ``--port`` wins, else config.
+
+    ``cli_port`` is 0 when the flag wasn't given (typer default). The
+    configured ``gateway.port`` is the same value the desktop's local-bot
+    health probe reads, so honouring it here keeps an externally-started
+    gateway visible on the dashboard even when the configured port has
+    drifted from the historical 18790 default.
+    """
+    return cli_port or config.gateway.port
+
+
 def gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    port: int = typer.Option(0, "--port", "-p", help="Gateway port. Overrides config.gateway.port (default 18790)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     persona: str = typer.Option("", "--persona", help="Bot persona (default, jarvis, pirate, samurai, casual, professor, butler, friday)"),
     host: str = typer.Option("", "--host", help="Bind address. Use 0.0.0.0 (or the VPS IP) to accept remote desktop clients. Overrides config.gateway.host (default 127.0.0.1)."),
@@ -238,7 +250,6 @@ def gateway(
 
     from flowly import __banner__
     console.print(f"[cyan]{__banner__.format(version=__version__)}[/cyan]")
-    console.print(f"Starting gateway on port {port}...")
 
     # Load .env from data dir (contains MOLTBOT_PROXY_JWT_SECRET, API keys, etc.)
     data_dir = get_data_dir()
@@ -254,6 +265,15 @@ def gateway(
                 os.environ[key] = value
 
     config = load_config()
+
+    # Port resolution: an explicit --port wins; otherwise the configured
+    # gateway.port. The CLI used to hardcode 18790 here while the desktop's
+    # local-bot health probe reads gateway.port from config — the moment the
+    # configured port drifted from the default, an externally-started
+    # `flowly gateway` became invisible to the desktop dashboard even though
+    # it was perfectly healthy. One source of truth ends that split.
+    port = resolve_gateway_port(port, config)
+    console.print(f"Starting gateway on port {port}...")
 
     # ── Remote access: bind host + auth token resolution ──────────────────
     # --host overrides the configured bind address. Loopback (127.0.0.1) needs
