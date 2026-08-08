@@ -54,6 +54,13 @@ If you are already signed in and everything is healthy, `flowly login` is a no-o
 > [!NOTE]
 > Sign-in tokens are stored via your OS keychain when available, falling back to a `0600` file at `~/.flowly/credentials/account.json`. The id token is refreshed automatically before it expires.
 
+> [!NOTE]
+> On macOS the CLI runs inside Flowly's own sandbox, and that sandbox
+> deliberately hides `~/Library/Keychains` from the agent. Tokens therefore
+> go to the `0600` file instead — expected, not a failure, and nothing you
+> need to fix. An unsandboxed run (`FLOWLY_SANDBOX=0`) and Flowly Desktop
+> still use the keychain. See [Sandbox and approvals](./sandbox-and-approvals.md).
+
 ## What signing in registers — your machine
 
 Flowly identifies your machine with a stable `machineId`. It reuses the same identifier the Flowly Desktop app writes (a UUID at the desktop app's data path), so the same physical machine de-duplicates to a single server entry across Desktop and CLI installs. If that path isn't writable, it falls back to a hash of the hardware UUID.

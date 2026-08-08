@@ -1,7 +1,7 @@
 ---
 title: Installation
 eyebrow: Getting Started
-description: Flowly is a single Python package, flowly-ai, that runs entirely on your machine. It needs Python ≥ 3.11 and runs on macOS, Linux, and Windows; the first-run picker (sign in with a Flowly account or enter your own API key) opens automatically after install.
+description: Flowly runs entirely on your machine — one install script sets up Python, the agent, and a git checkout it can keep current. Works on macOS, Linux, and Windows; first-run setup (a Flowly account or your own API key) opens automatically once it finishes.
 ---
 
 ## Install methods
@@ -25,7 +25,7 @@ The script clones the repo into an isolated, uv-managed virtualenv and installs 
 
 ## First run
 
-On a fresh machine the **first-run picker opens automatically** right after the install script finishes. It asks how to power Flowly — **sign in with a Flowly account** (managed, nothing else to configure) or **enter your own API key** — which is the one mandatory step before the agent can run. The same picker also seeds your workspace and offers to start the gateway.
+On a fresh machine **setup opens automatically** right after the install script finishes. It seeds your workspace and asks how to power Flowly — sign in with a Flowly account (nothing else to configure) or bring your own API key — which is the one mandatory step before the agent can run. It then checks that the provider answers, and offers to keep the gateway running in the background. See [Setup wizard](./setup-wizard.md) for the whole flow.
 
 If it didn't open automatically (e.g. the install ran in a non-interactive shell), run it yourself:
 

@@ -134,8 +134,30 @@ flowly chat
 
 **A clean demo.** Use a dedicated profile when you want a predictable, empty-history environment to show Flowly to someone, so your personal sessions and memory stay private.
 
-> [!TIP]
-> Most things scoped to a profile — including the background gateway service — are name-aware, so running the same profile in different terminals stays consistent.
+## Two things profiles do NOT separate
+
+Everything Flowly *stores* follows `FLOWLY_HOME`. Two machine-level resources don't, because the machine only has one of each — plan for them if you intend to run profiles at the same time:
+
+**The gateway port.** Every profile starts from the same default (`18790`), so a second gateway can't bind while the first is running. Give each profile its own port in its `config.json`:
+
+```json
+{ "gateway": { "port": 18890 } }
+```
+
+**The background service.** The service label is one global name (`ai.flowly.gateway`), so installing the service from a second profile replaces the first profile's definition. Pass a distinct label if you truly need two:
+
+```bash
+flowly -p work service install --start --label ai.flowly.gateway.work
+```
+
+Running profiles one at a time — the common case — needs neither.
+
+> [!NOTE]
+> **Signing in from a non-default profile registers its own server.** Flowly's
+> backend identifies a machine by a stored id, so a profile carries its own
+> `.machine-id` and appears as `<machine>-dev` rather than taking over the
+> server your default profile registered. Your everyday bot keeps its relay
+> connection; the profile gets a separate one.
 
 ## Related
 

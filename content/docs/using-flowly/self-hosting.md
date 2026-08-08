@@ -20,7 +20,7 @@ The checkout and its virtualenv live under `~/.local/share/flowly/` (`repo/` + `
 
 ## 2. Bring your own key
 
-Pick any provider — OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI/Grok, Zhipu, Kimi, or any OpenAI-compatible local model (Ollama, LM Studio, vLLM):
+Pick any provider — OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI/Grok, Zhipu, Sakana, or any OpenAI-compatible local model (Ollama, LM Studio, vLLM). Those eight slugs are what `setup byok` accepts; subscription sign-ins (ChatGPT via Codex, Grok, GLM Coding Plan) have their own commands — see [Providers and models](providers-and-models.md):
 
 ```bash
 flowly setup byok openrouter --key sk-or-...

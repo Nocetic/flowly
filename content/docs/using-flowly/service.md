@@ -102,6 +102,12 @@ flowly restart
 
 `flowly restart` is a smart dispatch: it detects how the gateway is running (launchd / systemd / Task Scheduler, or a plain foreground process) and restarts it the right way. Some actions — such as changing the active persona — auto-restart the gateway for you.
 
+### Running a gateway in the foreground while the service is installed
+
+Both can't hold the port, so `flowly gateway` handles the handover: it notices the service owns the port, asks whether to take over, stops the service, serves the port itself, and reinstalls + restarts the service when you exit (Ctrl+C included). Nothing to remember, and nothing left in a half state.
+
+Stopping the service by hand with `kill` does **not** work — launchd (`KeepAlive`) and systemd (`Restart=always`) bring it straight back. Use `flowly service stop`.
+
 ## Related
 
 - [Installation](../getting-started/installation.md)
