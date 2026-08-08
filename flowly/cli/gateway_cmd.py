@@ -1854,7 +1854,17 @@ Respond to the user now:"""
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
-        console.print("[yellow]Warning: No channels enabled[/yellow]")
+        # Not a warning: a gateway with no messaging channel is the normal
+        # state for anyone using the terminal or the desktop app, which is
+        # every developer running this from a checkout. Phrased as one it
+        # reads like the setup failed — the first thing a new contributor
+        # sees after `uv run flowly gateway`, with nothing telling them
+        # whether to act. Say what it means and what the two options are.
+        console.print(
+            "[dim]Channels: none — chat with [cyan]flowly[/cyan] in another "
+            "terminal, or add Telegram/Discord/Slack with "
+            "[cyan]flowly setup channels[/cyan][/dim]"
+        )
 
     cron_status = cron.status()
     if cron_status["jobs"] > 0:

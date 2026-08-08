@@ -64,12 +64,25 @@ winget install Gyan.FFmpeg BurntSushi.ripgrep.MSVC   # Windows
 git clone https://github.com/Nocetic/flowly.git
 cd flowly
 
+uv run flowly setup       # only on a machine that has never run Flowly
 uv run flowly gateway
 ```
 
-`uv run` builds the virtualenv and installs Flowly on first use, so this is the
-whole setup. The gateway serves its usual port (18790) against your real
-`~/.flowly`. Edit code, restart, repeat.
+`uv run` builds the virtualenv and installs Flowly on first use, so there is no
+separate install step. The gateway then serves its usual port (18790) against
+your real `~/.flowly`. Edit code, restart, repeat.
+
+**`setup` is for the empty machine.** Flowly needs one provider before the
+agent can answer anything, and a fresh checkout inherits nothing — there is no
+config yet to inherit from. `flowly setup` asks that one question (sign in, or
+paste a key) and is a no-op for anyone who already uses Flowly, so it is safe
+to run either way. Skip it and `flowly gateway` stops with
+`Error: No LLM provider available` and the same instruction, which works but
+wastes a round trip.
+
+A gateway with no messaging channel is normal for development — you talk to it
+from the terminal (`flowly`) or from Flowly Desktop. It says so at startup;
+`flowly setup channels` is there when you actually want Telegram or Slack.
 
 **If Flowly is already installed and running,** its background service holds
 that port — and the gateway handles the handover itself. It detects the
@@ -141,9 +154,9 @@ FLOWLY_DESKTOP_APP_NAME=FlowlyDev \
 
 Then sign in inside that Desktop: it registers a separate `<machine>-dev`
 server and writes that instance's relay credentials into the isolated home, so
-its composer talks to the isolated bot. Until you do, the gateway logs
-`Warning: No channels enabled` and Desktop's dashboard shows it running while
-the composer can't see it — that log line is the tell.
+its composer talks to the isolated bot. Until you do, the gateway starts with
+no channels and Desktop's dashboard shows it running while the composer can't
+see it — the `Channels: none` line at startup is the tell.
 
 ### Don't run `flowly update` in your checkout
 

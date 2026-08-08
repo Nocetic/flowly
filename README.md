@@ -168,11 +168,16 @@ sync and nothing to set up twice:
 git clone https://github.com/Nocetic/flowly.git
 cd flowly
 
+uv run flowly setup       # first time on this machine: pick a provider
 uv run flowly gateway     # your code, serving the usual gateway port
 ```
 
-That's it. Your providers, memory, channels, and Flowly Desktop keep working
-exactly as they did — they're talking to your code now. Edit, restart, repeat.
+**Already use Flowly?** Skip the first line — your provider, memory and
+channels are already there, and the gateway will use them. **New to it?** The
+agent can't answer without a provider, so `setup` is the one step that isn't
+optional; it takes a minute and you never repeat it.
+
+That's it. Edit, restart, repeat.
 
 If Flowly is already installed and running, its service holds that port — and
 the gateway handles the handover itself: it asks, stops the service, serves in
