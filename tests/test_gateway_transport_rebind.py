@@ -106,6 +106,53 @@ async def test_chat_history_surfaces_assistant_completion_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_history_projects_deferred_tool_identity_for_clients() -> None:
+    canonical_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "tool_call",
+                    "arguments": (
+                        '{"name":"mcp_context7_query_docs",'
+                        '"arguments":{"query":"useEffect"}}'
+                    ),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "content": "docs",
+            "tool_call_id": "call-1",
+            "name": "tool_call",
+        },
+    ]
+    srv = _bare_server()
+    srv.sessions = SimpleNamespace(
+        get_or_create=lambda _key: SimpleNamespace(metadata={}),
+        get_full_messages=lambda _key: canonical_messages,
+    )
+    srv._ws_rpc_reply = AsyncMock()
+
+    await srv._ws_rpc_chat_history(
+        _FakeWS(),
+        "rpc-1",
+        {"sessionKey": "desktop:chat-1"},
+    )
+
+    payload = srv._ws_rpc_reply.await_args.args[2]
+    call = payload["messages"][0]["tool_calls"][0]
+    assert call["function"]["name"] == "mcp_context7_query_docs"
+    assert call["tool_activity"]["protocol_name"] == "tool_call"
+    assert payload["messages"][1]["name"] == "mcp_context7_query_docs"
+    # The gateway read path must never rewrite canonical session records.
+    assert canonical_messages[0]["tool_calls"][0]["function"]["name"] == "tool_call"
+
+
+@pytest.mark.asyncio
 async def test_offline_chat_final_schedules_push(monkeypatch) -> None:
     srv = _bare_server()
     calls: list[dict] = []

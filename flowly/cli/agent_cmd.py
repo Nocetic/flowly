@@ -1,20 +1,172 @@
 """CLI commands — agent_cmd."""
 
 import asyncio
-import os
-import platform
-import shutil
-import subprocess
-import sys
+import math
 from pathlib import Path
+from typing import Any, Coroutine
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
-from flowly import __version__, __logo__
+from flowly import __logo__
 
 console = Console()
+
+_MCP_DISCOVERY_GRACE_SECONDS = 5.0
+_MCP_DISCOVERY_HARD_LIMIT_SECONDS = 185.0
+
+
+def _mcp_discovery_wait_timeout(config) -> float:
+    """Return a bounded CLI wait matching configured MCP connect budgets."""
+
+    servers = getattr(config, "mcp_servers", None) or {}
+    timeouts: list[float] = []
+    for server in servers.values():
+        enabled = (
+            server.get("enabled", True)
+            if isinstance(server, dict)
+            else getattr(server, "enabled", True)
+        )
+        if not enabled:
+            continue
+        raw_timeout = (
+            server.get("connect_timeout", 60.0)
+            if isinstance(server, dict)
+            else getattr(server, "connect_timeout", 60.0)
+        )
+        try:
+            value = float(raw_timeout)
+        except (TypeError, ValueError):
+            value = 0.0
+        if math.isfinite(value) and value > 0:
+            timeouts.append(value)
+
+    if not timeouts:
+        return 0.0
+    return min(
+        _MCP_DISCOVERY_HARD_LIMIT_SECONDS,
+        max(timeouts) + _MCP_DISCOVERY_GRACE_SECONDS,
+    )
+
+
+def _wait_for_initial_mcp_tools(agent_loop, config) -> bool:
+    """Stabilize the direct CLI tool catalog before its first model turn."""
+
+    timeout = _mcp_discovery_wait_timeout(config)
+    if timeout <= 0 or not agent_loop.mcp_discovery_pending:
+        return True
+
+    with console.status("[dim]Connecting external tools…[/dim]"):
+        ready = agent_loop.wait_for_mcp_discovery(timeout=timeout)
+    if not ready:
+        console.print(
+            "[yellow]External tool discovery is still running; "
+            "this turn may not see every configured integration.[/yellow]"
+        )
+    return ready
+
+
+def _offer_semantic_tool_routing(agent_loop) -> dict[str, Any]:
+    """Offer the local routing model once in an interactive terminal.
+
+    This is deliberately never called by ``--message`` automation. A decline
+    is durable across CLI/Desktop because the decision lives in bot config.
+    """
+
+    from rich.prompt import Confirm
+
+    from flowly.agent.tools.semantic_feature import (
+        begin_install,
+        feature_status,
+        finish_install,
+        install_semantic_model,
+        persist_semantic_preference,
+    )
+
+    status = feature_status(agent_loop.semantic_tool_routing_metrics())
+    if status["state"] not in {"recommended", "needs_download", "failed"}:
+        return status
+
+    tool_count = int(status.get("deferredToolCount") or 0)
+    model_mib = int(status.get("modelBytes") or 0) / (1024 * 1024)
+    console.print(
+        "\n[bold]Use smarter local tool routing?[/bold]\n"
+        f"[dim]{tool_count} connected tool schemas are currently kept behind "
+        "the tool catalog. Flowly can choose relevant tools more directly with "
+        f"a private local model ({model_mib:.0f} MiB download). No chat data is stored.[/dim]"
+    )
+    retry = status["state"] in {"needs_download", "failed"}
+    accepted = Confirm.ask(
+        "Retry the local model setup?" if retry else "Download and enable it?",
+        default=False,
+    )
+    if not accepted:
+        metrics = agent_loop.semantic_tool_routing_metrics()
+        persist_semantic_preference(
+            consent="dismissed",
+            enabled=False,
+            dismissed_tool_count=int(metrics.get("deferredToolCount") or 0),
+            dismissed_schema_tokens=int(metrics.get("deferredSchemaTokens") or 0),
+        )
+        return feature_status(agent_loop.semantic_tool_routing_metrics())
+
+    if not begin_install():
+        console.print("[yellow]The local routing model is already downloading.[/yellow]")
+        return feature_status(agent_loop.semantic_tool_routing_metrics())
+    persist_semantic_preference(consent="enabled", enabled=False)
+    try:
+        with console.status("[dim]Downloading and verifying the local routing model…[/dim]"):
+            install_semantic_model()
+        persist_semantic_preference(consent="enabled", enabled=True)
+        finish_install()
+        if not agent_loop.activate_semantic_tool_routing():
+            raise RuntimeError("the installed local model could not be activated")
+    except Exception as exc:
+        from flowly.mcp.security import sanitize_error
+
+        detail = sanitize_error(str(exc)).strip() or type(exc).__name__
+        persist_semantic_preference(consent="enabled", enabled=False)
+        finish_install(detail)
+        console.print(
+            "[yellow]Local tool routing could not be enabled; the complete "
+            f"tool catalog remains available. {detail}[/yellow]"
+        )
+    else:
+        console.print(
+            "[green]✓[/green] Local tool routing is enabled. The complete "
+            "catalog fallback remains available."
+        )
+    return feature_status(agent_loop.semantic_tool_routing_metrics())
+
+
+def _run_agent_coroutine(coro: Coroutine[Any, Any, Any]) -> Any:
+    """Run one CLI coroutine behind a credential-safe error boundary."""
+
+    try:
+        return asyncio.run(coro)
+    except typer.Exit:
+        raise
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        raise typer.Exit(130)
+    except Exception as exc:
+        from flowly.mcp.security import sanitize_error
+
+        detail = sanitize_error(str(exc)).strip() or type(exc).__name__
+        console.print(f"[red]Agent command failed:[/red] {detail}")
+        raise typer.Exit(1)
+
+
+def _run_agent_coroutine_with_cleanup(
+    coro: Coroutine[Any, Any, Any],
+    agent_loop: Any,
+) -> Any:
+    """Run a CLI interaction and always release its background resources."""
+
+    try:
+        return _run_agent_coroutine(coro)
+    finally:
+        agent_loop.stop()
 
 # ============================================================================
 # Agent Commands
@@ -26,11 +178,11 @@ def agent(
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
 ):
     """Interact with the agent directly."""
-    from flowly.config.loader import load_config, get_data_dir
-    from flowly.bus.queue import MessageBus
-    from flowly.providers.factory import build_provider
     from flowly.agent.loop import AgentLoop
+    from flowly.bus.queue import MessageBus
+    from flowly.config.loader import get_data_dir, load_config
     from flowly.cron.service import CronService
+    from flowly.providers.factory import build_provider
 
     config = load_config()
 
@@ -113,6 +265,7 @@ def agent(
         state_dir=get_data_dir(),
         main_config=config,
     )
+    _wait_for_initial_mcp_tools(agent_loop, config)
 
     async def handle_compact(instructions: str | None = None) -> None:
         """Handle /compact command."""
@@ -207,7 +360,10 @@ def agent(
         if message.strip().startswith("/compact"):
             parts = message.strip().split(" ", 1)
             instructions = parts[1] if len(parts) > 1 else None
-            asyncio.run(handle_compact(instructions))
+            _run_agent_coroutine_with_cleanup(
+                handle_compact(instructions),
+                agent_loop,
+            )
         else:
             async def run_once():
                 response, meta = await agent_loop.process_direct(
@@ -217,9 +373,10 @@ def agent(
                 console.print(f"\n{__logo__} {response}")
                 _display_media(meta)
                 _display_usage(meta)
-            asyncio.run(run_once())
+            _run_agent_coroutine_with_cleanup(run_once(), agent_loop)
     else:
         # Interactive mode
+        _offer_semantic_tool_routing(agent_loop)
         console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)")
         _show_status_bar()
         console.print("[dim]Commands: /help for all commands[/dim]\n")
@@ -282,6 +439,8 @@ def agent(
                             continue
                         elif cmd == "/tasks":
                             from flowly.agent.subagent_registry import SubagentRegistry
+                            from flowly.cli.approvals_cmd import _render_sessions_table
+
                             registry = SubagentRegistry()
                             _render_sessions_table(registry.all())
                             continue
@@ -310,4 +469,4 @@ def agent(
                     console.print("\nGoodbye!")
                     break
 
-        asyncio.run(run_interactive())
+        _run_agent_coroutine_with_cleanup(run_interactive(), agent_loop)

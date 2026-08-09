@@ -24,12 +24,13 @@ Contract
 
 Sync vs async
 -------------
-Only :func:`connections_list` is ``async`` (integration-card probes are
-awaitable). Everything else is synchronous; callers invoke them directly.
+Most handlers are synchronous. Long-running handlers and handlers that probe
+integrations may be ``async``; dispatchers support both forms.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -411,6 +412,144 @@ def config_set(params: dict) -> dict:
     merged = _deep_merge(_load_raw_or_empty(path), patch)
     _atomic_write_json(path, merged)
     return {"ok": True, "willRestart": bool(params.get("restart"))}
+
+
+# ── Optional local semantic tool routing ───────────────────────────────────
+
+
+_semantic_tool_metrics_provider = None
+_semantic_install_tasks: set[asyncio.Task[str]] = set()
+
+
+def set_semantic_tool_metrics_provider(provider) -> None:
+    """Register the live agent's ``() -> recommendation metrics`` accessor."""
+
+    global _semantic_tool_metrics_provider
+    _semantic_tool_metrics_provider = provider
+
+
+def _semantic_tool_metrics() -> dict:
+    if _semantic_tool_metrics_provider is None:
+        return {}
+    try:
+        value = _semantic_tool_metrics_provider()
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def semantic_tool_routing_status() -> dict:
+    """Read the shared consent/install/recommendation state."""
+
+    from flowly.agent.tools.semantic_feature import feature_status
+
+    return feature_status(_semantic_tool_metrics())
+
+
+def semantic_tool_routing_dismiss(params: dict) -> dict:
+    """Persist a recommendation dismissal so every surface stops asking."""
+
+    from flowly.agent.tools.semantic_feature import (
+        feature_status,
+        persist_semantic_preference,
+    )
+
+    current = feature_status(_semantic_tool_metrics())
+    if current.get("enabled"):
+        raise FeatureRpcError(
+            "ALREADY_ENABLED",
+            "semantic tool routing is already enabled; disable it explicitly instead",
+        )
+    metrics = _semantic_tool_metrics()
+    persist_semantic_preference(
+        consent="dismissed",
+        enabled=False,
+        dismissed_tool_count=int(metrics.get("deferredToolCount") or 0),
+        dismissed_schema_tokens=int(metrics.get("deferredSchemaTokens") or 0),
+    )
+    return {**feature_status(_semantic_tool_metrics()), "ok": True, "willRestart": False}
+
+
+def semantic_tool_routing_disable(params: dict) -> dict:
+    """Disable inference without deleting the verified model cache."""
+
+    from flowly.agent.tools.semantic_feature import (
+        feature_status,
+        persist_semantic_preference,
+    )
+
+    metrics = _semantic_tool_metrics()
+    persist_semantic_preference(
+        consent="dismissed",
+        enabled=False,
+        dismissed_tool_count=int(metrics.get("deferredToolCount") or 0),
+        dismissed_schema_tokens=int(metrics.get("deferredSchemaTokens") or 0),
+    )
+    return {**feature_status(_semantic_tool_metrics()), "ok": True, "willRestart": True}
+
+
+async def semantic_tool_routing_enable(params: dict) -> dict:
+    """Explicitly install and enable the pinned local routing model."""
+
+    from flowly.agent.tools.semantic_feature import (
+        begin_install,
+        feature_status,
+        finish_install,
+        install_semantic_model,
+        persist_semantic_preference,
+        semantic_runtime_available,
+    )
+
+    current = feature_status(_semantic_tool_metrics())
+    if current.get("enabled"):
+        return {**current, "ok": True, "willRestart": False}
+    if not semantic_runtime_available():
+        raise FeatureRpcError(
+            "RUNTIME_UNAVAILABLE",
+            "this Flowly build does not include the local semantic routing runtime",
+        )
+    if not begin_install():
+        raise FeatureRpcError("INSTALL_IN_PROGRESS", "the local model is already downloading")
+
+    # Remember the affirmative choice before network work starts. A crash or
+    # failed download therefore resumes as an explicit retry, never another
+    # unsolicited recommendation.
+    persist_semantic_preference(consent="enabled", enabled=False)
+    async def complete_install() -> str:
+        try:
+            await asyncio.to_thread(install_semantic_model)
+            persist_semantic_preference(consent="enabled", enabled=True)
+        except Exception as exc:
+            from flowly.mcp.security import sanitize_error
+
+            detail = sanitize_error(str(exc)).strip() or type(exc).__name__
+            finish_install(detail)
+            return detail
+        finish_install()
+        return ""
+
+    # Relay/gateway transports cancel their request task when a WebSocket
+    # disconnects. The verified download is owned by the bot process, not by
+    # that transient socket: keep it alive so a network blip cannot strand the
+    # process forever in INSTALL_IN_PROGRESS after the worker thread finishes.
+    install_task = asyncio.create_task(
+        complete_install(),
+        name="semantic-tool-routing-install",
+    )
+    _semantic_install_tasks.add(install_task)
+    install_task.add_done_callback(_semantic_install_tasks.discard)
+    detail = await asyncio.shield(install_task)
+    if detail:
+        raise FeatureRpcError(
+            "INSTALL_FAILED",
+            f"the local semantic routing model could not be installed: {detail}",
+        )
+
+    return {
+        **feature_status(_semantic_tool_metrics()),
+        "ok": True,
+        "willRestart": bool(params.get("restart", True)),
+    }
 
 
 # ── Pet (Petdex floating companion) ─────────────────────────────────────────
@@ -3637,6 +3776,10 @@ _DISPATCH: dict[str, tuple] = {
     "plan.mode.set": (plan_mode_set, True, False),
     "config.get": (config_get, False, False),
     "config.set": (config_set, True, True),
+    "tools.semantic.status": (semantic_tool_routing_status, False, False),
+    "tools.semantic.enable": (semantic_tool_routing_enable, True, True),
+    "tools.semantic.dismiss": (semantic_tool_routing_dismiss, True, False),
+    "tools.semantic.disable": (semantic_tool_routing_disable, True, True),
     "exec.policy.get": (exec_policy_get, False, False),
     "exec.policy.set": (exec_policy_set, True, False),
     "exec.policy.allowlist.remove": (exec_policy_allowlist_remove, True, False),
@@ -3731,6 +3874,8 @@ FEATURE_METHODS = frozenset(_DISPATCH)
 LONG_RUNNING_METHODS = frozenset({
     "mcp.test",
     "mcp.oauth_start",
+    # Explicit opt-in may download and verify ~245 MiB of pinned local assets.
+    "tools.semantic.enable",
     # A cold catalog sync walks every category over the network.
     "media.models.refresh",
 })

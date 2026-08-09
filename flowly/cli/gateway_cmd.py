@@ -629,7 +629,14 @@ def gateway(
                         context_tool.set_context(delivery_channel, delivery_to)
 
             try:
-                result = await agent.tools.execute(tool_name, job.payload.tool_args or {})
+                enabled_toolsets, disabled_toolsets = agent._resolve_toolset_route("cron")
+                result = await agent.tools.execute(
+                    tool_name,
+                    job.payload.tool_args or {},
+                    platform="cron",
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                )
             except Exception as e:
                 err = f"Tool '{tool_name}' raised an exception: {e}"
                 logger.error(f"Cron job '{job.name}' tool_call failed: {e}")
@@ -1328,6 +1335,9 @@ Respond to the user now:"""
         # Subagent registry — read-only, for board.card's run/tool-trace audit.
         _feature_rpc.set_registry_provider(
             lambda: getattr(getattr(agent, "subagents", None), "registry", None)
+        )
+        _feature_rpc.set_semantic_tool_metrics_provider(
+            agent.semantic_tool_routing_metrics
         )
         # Subagent manager — for subagents.spawn (manual background subagent).
         _feature_rpc.set_subagent_manager_provider(
