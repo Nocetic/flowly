@@ -17,8 +17,13 @@ their own fallback.
 import asyncio
 
 from flowly.agent.loop import AgentLoop, context_occupancy_tokens
-from flowly.compaction.service import CompactionService
+from flowly.compaction.service import (
+    CompactionService,
+    _flowly_proxy_max_input_tokens,
+)
 from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
+from flowly.integrations import model_catalog as mc
+from flowly.integrations.model_catalog import Model
 from flowly.tui.client import ChatFinal, GatewayClient
 from flowly.tui.panes.status import StatusBar, _model_budget, _TokenBar
 
@@ -140,6 +145,75 @@ def test_an_unresolvable_window_is_reported_as_unknown():
     harness.compaction = _Broken()
 
     assert harness._effective_context_window() == 0
+
+
+# ── Finding the model in the catalogue at all ─────────────────────────────
+
+
+def test_a_dated_snapshot_resolves_to_its_undated_catalogue_entry():
+    """Providers pin a date onto an id (`-0731`) while the catalogue lists the
+    undated family entry. An exact-match lookup missed, so a 1M model fell all
+    the way through to the 128K default — the reported symptom."""
+    mc._CACHE["test"] = [Model(
+        id="deepseek/deepseek-v4-flash", name="V4 Flash", context_window=1_048_576)]
+    try:
+        assert mc.get_context_window("deepseek/deepseek-v4-flash-0731") == 1_048_576
+        assert mc.get_context_window("deepseek/deepseek-v4-flash-20260731") == 1_048_576
+        assert mc.get_context_window("deepseek/deepseek-v4-flash") == 1_048_576
+    finally:
+        mc._CACHE.pop("test", None)
+
+
+def test_a_version_component_is_not_mistaken_for_a_date():
+    """`claude-sonnet-4-5` must never degrade to `claude-sonnet-4` — that is a
+    DIFFERENT model, and answering for it would be worse than not answering.
+    Only a run of four or more digits reads as a snapshot date."""
+    mc._CACHE["test"] = [
+        Model(id="anthropic/claude-sonnet-4", name="S4", context_window=200_000),
+        Model(id="anthropic/claude-sonnet-4.5", name="S4.5", context_window=500_000),
+    ]
+    try:
+        # Resolves to 4.5 via the dash/dot rule, not to 4 via suffix stripping.
+        assert mc.get_context_window("anthropic/claude-sonnet-4-5") == 500_000
+        # Dated snapshot of 4.5 still lands on 4.5.
+        assert mc.get_context_window("anthropic/claude-sonnet-4-5-20250929") == 500_000
+    finally:
+        mc._CACHE.pop("test", None)
+
+
+def test_an_unknown_model_still_reports_nothing():
+    """Stripping must not turn a miss into a wrong hit."""
+    mc._CACHE["test"] = [Model(
+        id="deepseek/deepseek-v4-flash", name="V4", context_window=1_048_576)]
+    try:
+        assert mc.get_context_window("someone/other-model-0731") is None
+    finally:
+        mc._CACHE.pop("test", None)
+
+
+# ── The proxy ceiling the bot mirrors ─────────────────────────────────────
+
+
+def test_the_proxy_ceiling_follows_the_real_window_when_known():
+    """The bot mirrors the proxy's per-model input ceiling. Both sides now read
+    the real context length first; the four-family table alone capped a 1M
+    model at 128K and compacted it eight times too early."""
+    mc._CACHE["test"] = [Model(
+        id="deepseek/deepseek-v4-flash", name="V4", context_window=1_048_576)]
+    try:
+        assert _flowly_proxy_max_input_tokens(
+            "deepseek/deepseek-v4-flash-0731") == 1_048_576
+    finally:
+        mc._CACHE.pop("test", None)
+
+
+def test_a_cold_catalogue_falls_back_to_the_family_table():
+    """Cache-only on both sides. A cold bot must land at or below the proxy's
+    answer — never above it, or it builds prompts the proxy 413s."""
+    mc._CACHE.pop("test", None)
+
+    assert _flowly_proxy_max_input_tokens("deepseek/deepseek-v4-flash-0731") == 128_000
+    assert _flowly_proxy_max_input_tokens("anthropic/claude-haiku-4.5") == 200_000
 
 
 # ── The TUI is a client of that wire, like the desktop ────────────────────

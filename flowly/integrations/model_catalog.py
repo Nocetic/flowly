@@ -112,17 +112,18 @@ def get_context_window(model_id: str) -> int | None:
     back to its own heuristics. The status bar uses this to size its
     token-budget bar without baking in per-model magic numbers.
 
-    Also normalizes between Flowly's LiteLLM dash convention
-    (``claude-sonnet-4-5``) and OpenRouter's dot convention
-    (``claude-sonnet-4.5``) — the Flowly proxy rewrites dashes to dots
-    when forwarding, so the user's config can hold either form and we
-    still find the catalog entry. Mirrors ``normalizeModelForOpenRouter``
-    in ``flowly-app/app/api/v1/chat/completions/route.ts``.
+    Matching goes through :func:`_id_candidates`, which covers the LiteLLM
+    dash convention (``claude-sonnet-4-5``) against OpenRouter's dot
+    convention (``claude-sonnet-4.5``) — the Flowly proxy rewrites dashes to
+    dots when forwarding, so a config can hold either form — and the dated
+    snapshot suffix a provider pins onto an id while its catalogue lists the
+    undated entry (``deepseek/deepseek-v4-flash-0731``). Mirrors
+    ``normalizeModelForOpenRouter`` in
+    ``flowly-app/app/api/v1/chat/completions/route.ts``.
     """
     if not model_id:
         return None
-    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
-    candidates.discard("")
+    candidates = _id_candidates(model_id)
     for models in _CACHE.values():
         for m in models:
             if m.id in candidates and m.context_window:
@@ -141,8 +142,7 @@ def get_pricing(model_id: str) -> tuple[float | None, float | None] | None:
     """
     if not model_id:
         return None
-    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
-    candidates.discard("")
+    candidates = _id_candidates(model_id)
     for models in _CACHE.values():
         for m in models:
             if m.id in candidates and (m.pricing_in is not None or m.pricing_out is not None):
@@ -160,8 +160,7 @@ def get_vision_support(model_id: str) -> bool | None:
     """
     if not model_id:
         return None
-    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
-    candidates.discard("")
+    candidates = _id_candidates(model_id)
     found_false = False
     for models in _CACHE.values():
         for model in models:
@@ -198,6 +197,46 @@ def _dot_to_dash_version(mid: str) -> str:
     # Only rewrite when the preceding chunk looks like a version anchor
     # (digit). Avoids mangling names with legitimate dots.
     return _re.sub(r"(\d)\.(\d)", r"\1-\2", mid)
+
+
+# A dated snapshot pinned onto a model id: ``-0731``, ``-20250929``, ``-0613``.
+# FOUR digits minimum, deliberately. A shorter run is a version component, not
+# a date, and stripping it would silently answer for a DIFFERENT model —
+# ``claude-sonnet-4-5`` would degrade to ``claude-sonnet-4``. Dates are the
+# only suffix a catalogue reliably omits while still describing the same
+# model's window.
+_DATED_SNAPSHOT_RE = _re.compile(r"-\d{4,}$")
+
+
+def _without_dated_snapshot(mid: str) -> str:
+    """``deepseek/deepseek-v4-flash-0731`` → ``deepseek/deepseek-v4-flash``.
+
+    Providers pin a snapshot date onto an id while their catalogue lists the
+    undated family entry. The two share a context window; only the exact id
+    differs, so an exact-match lookup misses and the caller falls back to a
+    guess. Returns the input unchanged when there is no dated suffix.
+    """
+    if not mid:
+        return mid
+    return _DATED_SNAPSHOT_RE.sub("", mid)
+
+
+def _id_candidates(model_id: str) -> set[str]:
+    """Every spelling of ``model_id`` worth trying against a cached catalogue.
+
+    Covers the dash/dot version convention in both directions and the dated
+    snapshot suffix, including their combination (``claude-sonnet-4-5-20250929``
+    → ``claude-sonnet-4.5``).
+    """
+    if not model_id:
+        return set()
+    out: set[str] = set()
+    for base in (model_id, _without_dated_snapshot(model_id)):
+        if not base:
+            continue
+        out.update({base, _dash_to_dot_version(base), _dot_to_dash_version(base)})
+    out.discard("")
+    return out
 
 
 async def warm_cache(provider_key: str) -> None:

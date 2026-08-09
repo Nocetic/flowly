@@ -55,12 +55,30 @@ def _flowly_proxy_max_input_tokens(model: str) -> int:
     """The Flowly proxy's per-model input ceiling.
 
     MIRROR of ``modelMaxInputTokens`` in flowly-app's
-    ``app/api/v1/chat/completions/route.ts`` — keep the two in step. The
-    ceiling IS the model's window (family table above); an unknown family
-    gets the backend's conservative 128K fallback. Budgeting against a
-    window the wire would 413 is how mid-turn failures happen, so the bot
-    must never assume more than the proxy accepts.
+    ``app/api/v1/chat/completions/route.ts`` — keep the two in step.
+    Budgeting against a window the wire would 413 is how mid-turn failures
+    happen, so the bot must never assume more than the proxy accepts.
+
+    Both sides resolve the model's REAL context length first and fall back to
+    the family table only when the catalogue cannot place it. Reading that
+    table as the primary answer is what capped most of the catalogue at 128K:
+    it knows four families, so a 1M deepseek or a 262K gemma was budgeted —
+    and compacted — as though it had 128K.
+
+    The lookup is cache-only on both sides, so a cold process answers from the
+    family table exactly as before. That is also what keeps the two safely in
+    step when their caches disagree: a cold bot's number is lower than the
+    proxy's, never higher, so it budgets conservatively instead of building a
+    prompt the proxy would reject.
     """
+    try:
+        from flowly.integrations.model_catalog import get_context_window
+
+        known = get_context_window(model)
+        if known and known > 0:
+            return known
+    except Exception:  # noqa: BLE001 — catalogue is best-effort
+        pass
     return _heuristic_context_window(model) or 128_000
 
 

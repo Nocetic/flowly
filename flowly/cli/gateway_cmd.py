@@ -96,6 +96,25 @@ def _install_gateway_file_sink(level: str = "INFO") -> None:
         logger.warning(f"[gateway] daily file log sink not installed: {exc}")
 
 
+async def _warm_model_catalog(provider_key: str) -> None:
+    """Populate the active provider's model catalogue for this process.
+
+    Every context-window lookup here is synchronous and cache-only
+    (:func:`flowly.integrations.model_catalog.get_context_window`), so a cache
+    nobody fills is a cache that always misses. It used to be filled only by
+    the TUI, which is why the terminal could size its context bar from a
+    model's real window while the gateway — the process the desktop and iOS
+    actually talk to — fell through to a model-family guess for its whole
+    lifetime, reporting a flat 128K for anything that guess cannot place.
+
+    Never raises: ``warm_cache`` already swallows network failures, and the
+    callers all keep their own fallback.
+    """
+    from flowly.integrations.model_catalog import warm_cache
+
+    await warm_cache(provider_key)
+
+
 def _start_media_library_sync() -> None:
     """Reconcile the media library on a daemon thread. Never raises.
 
@@ -1910,10 +1929,29 @@ Respond to the user now:"""
 
         _watch_task: asyncio.Task | None = None
         _source_task: asyncio.Task | None = None
+        _catalog_task: asyncio.Task | None = None
         try:
             await gateway_server.start()
             await cron.start()
             await heartbeat.start(run_on_start=True)
+
+            # Warm the active provider's model catalogue.
+            #
+            # Every context-window lookup in this process is synchronous and
+            # cache-only (`get_context_window`), so with nothing warming the
+            # cache here it stayed empty for the gateway's whole life and each
+            # caller silently fell through to a model-family guess: the
+            # desktop's context ring and the compaction budget both reported a
+            # flat 128K for any model that table cannot place. Only the TUI
+            # warmed it — which is why the terminal knew a model's real window
+            # and the gateway never did.
+            #
+            # Fire-and-forget: it must not delay the gateway becoming
+            # reachable, and a failure is survivable because the guess is
+            # still there. `warm_cache` swallows its own errors.
+            _catalog_task = asyncio.create_task(
+                _warm_model_catalog(active.key),
+            )
 
             # Flowlet reactive watches — a lightweight 60s heartbeat that fires
             # schedule/stale/condition reminders LLM-free (client taps trigger an
@@ -2075,6 +2113,8 @@ Respond to the user now:"""
                 _watch_task.cancel()
             if _source_task is not None:
                 _source_task.cancel()
+            if _catalog_task is not None:
+                _catalog_task.cancel()
             await gateway_server.stop()
             heartbeat.stop()
             cron.stop()
