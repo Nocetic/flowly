@@ -86,29 +86,30 @@ def _model_budget(model: str) -> int:
          already cached (warmed at TUI startup), use the provider's own
          ``context_length`` field. Works for the entire ~262 OpenRouter
          catalog without us baking in magic numbers per family.
-      2. **Hardcoded fallback** — the catalog isn't always cached (no
-         network yet, BYOK provider w/o fetcher, custom model id). The
-         family heuristics below stay so the bar isn't blank on cold
-         start.
-      3. **Default 200k** — last resort so the bar still renders.
+      2. **Family fallback** — the catalog isn't always cached (no network
+         yet, BYOK provider w/o fetcher, custom model id), so the bar still
+         has something to draw on a cold start. Shared with the compaction
+         budget: this used to be a second, slightly different copy that did
+         not know ``gpt-4.1`` or ``gpt-3.5`` and matched only the dated
+         Claude 4 slugs, so a model could be budgeted at one size and drawn
+         at another.
+      3. **Default 200k** — last resort so the bar still renders. Stays local
+         to the bar: a wrong guess here costs a mis-drawn ring, whereas
+         compaction answers to a wire that 413s and defaults lower.
     """
     try:
-        from flowly.integrations.model_catalog import get_context_window
+        from flowly.integrations.model_catalog import (
+            family_context_window,
+            get_context_window,
+        )
         live = get_context_window(model)
         if live:
             return live
+        family = family_context_window(model)
+        if family:
+            return family
     except Exception:
         pass
-    m = (model or "").lower()
-    if "kimi" in m:
-        return 262_144
-    if "gemini" in m:
-        return 1_000_000
-    if "gpt-4o" in m or "gpt-4-turbo" in m:
-        return 128_000
-    if any(x in m for x in ("claude-haiku-4", "claude-sonnet-4",
-                            "claude-opus-4", "sonnet-4", "haiku-4", "opus-4")):
-        return 200_000
     return DEFAULT_BUDGET_TOKENS
 
 

@@ -104,6 +104,57 @@ def get_flowly_model_policy() -> FlowlyModelPolicy | None:
     return _FLOWLY_POLICY
 
 
+# Rough context window by model family, for when no catalogue can place an id.
+#
+# THE fallback table — the compaction budget and the TUI's token bar each
+# carried their own, and they had already drifted: the TUI's did not know
+# ``gpt-4.1`` or ``gpt-3.5``, matched only the dated Claude 4 slugs rather than
+# the family, and defaulted to 200K where compaction defaulted to 128K. So the
+# same model could be budgeted at one size and drawn at another.
+#
+# Deliberately conservative, and it stays that way: guessing small compacts a
+# bit early, guessing large sails past the provider's limit and 413s mid-turn.
+# This is a last resort — every caller consults the live catalogue first — so
+# it is not the place to be clever. Entries are only added with a verified
+# number behind them; a plausible guess here outlives the person who made it.
+_FAMILY_WINDOWS: dict[str, int] = {
+    "gemini": 1_000_000,
+    "kimi": 262_144,
+    "claude": 200_000,
+    "sonnet": 200_000,
+    "opus": 200_000,
+    "haiku": 200_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-4.1": 128_000,
+    "gpt-4o": 128_000,
+    "gpt-3.5": 16_385,
+}
+
+# Longest key first, so a specific entry always beats a broader one that
+# happens to be a substring of the same id. Nothing in the table needs it
+# today; it is here so that adding e.g. ``"gpt-4": 8_191`` alongside
+# ``"gpt-4o"`` cannot silently start answering for the wrong model.
+_FAMILY_WINDOWS_BY_SPECIFICITY: tuple[tuple[str, int], ...] = tuple(
+    sorted(_FAMILY_WINDOWS.items(), key=lambda kv: len(kv[0]), reverse=True)
+)
+
+
+def family_context_window(model_id: str) -> int | None:
+    """Best guess at ``model_id``'s window from its family name.
+
+    ``None`` means "no idea" — never a default. The caller owns that choice,
+    because the right default differs: compaction answers to a proxy that
+    413s, the TUI only has to draw a bar.
+    """
+    m = (model_id or "").lower()
+    if not m:
+        return None
+    for needle, window in _FAMILY_WINDOWS_BY_SPECIFICITY:
+        if needle in m:
+            return window
+    return None
+
+
 def get_context_window(model_id: str) -> int | None:
     """Look up a model's reported context_window from any cached catalog.
 

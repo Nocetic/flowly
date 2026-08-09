@@ -32,23 +32,13 @@ from flowly.providers.base import LLMProvider
 def _heuristic_context_window(model: str) -> int | None:
     """Rough context window by model family, for a cold catalog.
 
-    Deliberately conservative: guessing small compacts a bit early, while
-    guessing large sails past the provider's limit and 413s mid-turn.
+    The table itself lives in ``integrations.model_catalog`` — the TUI's token
+    bar needs the same answer, and when each kept its own copy they drifted.
+    This wrapper stays because three callers already import it by name.
     """
-    m = (model or "").lower()
-    if not m:
-        return None
-    if "gemini" in m:
-        return 1_000_000
-    if "kimi" in m:
-        return 262_144
-    if "claude" in m or "sonnet" in m or "opus" in m or "haiku" in m:
-        return 200_000
-    if "gpt-4o" in m or "gpt-4-turbo" in m or "gpt-4.1" in m:
-        return 128_000
-    if "gpt-3.5" in m:
-        return 16_385
-    return None
+    from flowly.integrations.model_catalog import family_context_window
+
+    return family_context_window(model)
 
 
 def _flowly_proxy_max_input_tokens(model: str) -> int:

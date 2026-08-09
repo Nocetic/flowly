@@ -20,12 +20,17 @@ from flowly.agent.loop import AgentLoop, context_occupancy_tokens
 from flowly.compaction.service import (
     CompactionService,
     _flowly_proxy_max_input_tokens,
+    _heuristic_context_window,
 )
 from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
 from flowly.integrations import model_catalog as mc
 from flowly.integrations.model_catalog import Model
 from flowly.tui.client import ChatFinal, GatewayClient
-from flowly.tui.panes.status import StatusBar, _model_budget, _TokenBar
+from flowly.tui.panes.status import (
+    StatusBar,
+    _model_budget,
+    _TokenBar,
+)
 
 
 class _Provider:
@@ -189,6 +194,46 @@ def test_an_unknown_model_still_reports_nothing():
         assert mc.get_context_window("someone/other-model-0731") is None
     finally:
         mc._CACHE.pop("test", None)
+
+
+# ── One family table, not one per caller ──────────────────────────────────
+
+
+def test_the_compaction_budget_and_the_token_bar_agree():
+    """They each carried their own copy and had already drifted: the bar did
+    not know `gpt-4.1` or `gpt-3.5` and matched only the dated Claude 4 slugs,
+    so the same model could be budgeted at one size and drawn at another."""
+    mc._CACHE.clear()  # force both onto the family fallback
+    for model in ("gpt-4.1-mini", "gpt-3.5-turbo", "claude-3-opus",
+                  "gemini-2.5-flash", "moonshot/kimi-k2"):
+        assert _heuristic_context_window(model) == mc.family_context_window(model)
+        assert _model_budget(model) == mc.family_context_window(model)
+
+
+def test_the_table_answers_for_families_the_bar_used_to_miss():
+    """Regression on the drift itself. `gpt-3.5-turbo` drew against the bar's
+    200K default — an order of magnitude over a 16K model."""
+    assert mc.family_context_window("gpt-3.5-turbo") == 16_385
+    assert mc.family_context_window("gpt-4.1-mini") == 128_000
+    assert mc.family_context_window("claude-3-opus") == 200_000
+
+
+def test_an_unplaceable_model_gets_no_answer_rather_than_a_guess():
+    """`None` is not a default. Each caller owns that choice, because the
+    right one differs — compaction answers to a wire that 413s."""
+    assert mc.family_context_window("some-local-llm") is None
+    assert mc.family_context_window("") is None
+    # ...and each caller still applies its own.
+    assert _model_budget("some-local-llm") == 200_000          # bar renders
+    assert _flowly_proxy_max_input_tokens("some-local-llm") == 128_000
+
+
+def test_a_more_specific_family_entry_wins():
+    """Matching is longest-key-first so a broader entry that happens to be a
+    substring cannot answer for a narrower one. Nothing in the table needs it
+    today; the invariant is what makes the table safe to extend."""
+    keys = [k for k, _ in mc._FAMILY_WINDOWS_BY_SPECIFICITY]
+    assert keys == sorted(keys, key=len, reverse=True)
 
 
 # ── The proxy ceiling the bot mirrors ─────────────────────────────────────
