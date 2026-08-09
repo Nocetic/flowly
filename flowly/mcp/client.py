@@ -35,6 +35,7 @@ or the agent boot itself. We gather server connects with
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import threading
@@ -57,7 +58,6 @@ from flowly.mcp.stderr_log import (
     write_stderr_log_header,
 )
 from flowly.mcp.stdio_resolver import resolve_stdio_command
-
 
 logger = logging.getLogger(__name__)
 
@@ -505,7 +505,7 @@ class MCPServerTask:
                         await self._serve(session)
                 return
 
-            from flowly.mcp.proc import snapshot_child_pids, reap_pids
+            from flowly.mcp.proc import reap_pids, snapshot_child_pids
 
             before = snapshot_child_pids()
             spawned: set[int] = set()
@@ -563,7 +563,7 @@ class MCPServerTask:
         # mTLS / custom CA (Faz 2c): only build a custom httpx factory
         # when the config actually sets a TLS knob, so the default path
         # keeps using the SDK's own factory.
-        from flowly.mcp.tls import needs_custom_tls, make_http_client_factory
+        from flowly.mcp.tls import make_http_client_factory, needs_custom_tls
 
         client_factory = None
         if needs_custom_tls(self._config):
@@ -757,10 +757,10 @@ def _utility_tools_for_server(
 ) -> list[Any]:
     """Build resource/prompt utility tools allowed by config + capabilities (D9)."""
     from flowly.mcp.tool import (
+        MCPGetPromptTool,
         MCPListPromptsTool,
         MCPListResourcesTool,
         MCPReadResourceTool,
-        MCPGetPromptTool,
     )
 
     tools_cfg = server_cfg.get("tools") or {}
@@ -846,16 +846,62 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
     for util_tool in _utility_tools_for_server(server_task, server_cfg):
         desired[util_tool.name] = util_tool
 
+    def _registered(name: str) -> Any | None:
+        getter = getattr(registry, "get", None)
+        if callable(getter):
+            return getter(name)
+        tools = getattr(registry, "tools", None)
+        return tools.get(name) if isinstance(tools, dict) else None
+
+    def _owned_by_server(tool: Any) -> bool:
+        return str(getattr(tool, "_server_name", "")) == server_task.name
+
     desired_names = set(desired)
 
-    # Drop tools that disappeared (only ones THIS server registered).
+    # Drop vanished tools only if the live registry entry is still ours. A
+    # plugin may have replaced a formerly-owned name after registration; an
+    # MCP refresh must never delete that newer foreign entry.
     for stale in old_names - desired_names:
-        registry.unregister(stale)
+        existing = _registered(stale)
+        if existing is not None and _owned_by_server(existing):
+            registry.unregister(stale)
 
-    # Register newcomers, respecting collisions with non-MCP tools.
+    def _schema_fingerprint(tool: Any) -> str:
+        try:
+            schema = tool.to_schema()
+            return json.dumps(
+                schema,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except Exception:
+            return ""
+
+    # Register newcomers and replace same-name tools whose description or
+    # input schema changed. Replacing the registry entry is safe for an
+    # in-flight call: execute() already holds its old object reference, while
+    # future calls and semantic indexing see the new immutable schema.
     new_names: list[str] = []
+    changed: set[str] = set()
     for name in desired_names:
         if name in old_names:
+            existing = _registered(name)
+            if existing is None:
+                registry.register(desired[name])
+                changed.add(name)
+            elif not _owned_by_server(existing):
+                logger.warning(
+                    "MCP server '%s': formerly-owned tool '%s' now belongs to "
+                    "another source; skipping refresh.",
+                    server_task.name,
+                    name,
+                )
+                continue
+            elif _schema_fingerprint(existing) != _schema_fingerprint(desired[name]):
+                registry.register(desired[name])
+                changed.add(name)
             new_names.append(name)
             continue
         if registry.has(name):
@@ -872,12 +918,13 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
 
     added = desired_names - old_names
     removed = old_names - desired_names
-    if added or removed:
+    if added or removed or changed:
         logger.info(
-            "MCP server '%s': tools changed — added %s, removed %s",
+            "MCP server '%s': tools changed — added %s, removed %s, updated %s",
             server_task.name,
             sorted(added) or "none",
             sorted(removed) or "none",
+            sorted(changed) or "none",
         )
 
 

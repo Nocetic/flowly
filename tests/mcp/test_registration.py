@@ -123,6 +123,8 @@ def test_discovery_registers_all_tools(fake_server_script: Path, isolated_home: 
     assert "mcp_fake_echo" in names
     assert "mcp_fake_add" in names
     assert "mcp_fake_echo" in reg.tools
+    assert reg.tools["mcp_fake_echo"].toolset == "mcp"
+    assert reg.tools["mcp_fake_echo"].discovery_source == "fake"
 
 
 def test_include_filter_limits_registration(fake_server_script: Path, isolated_home: Path):
