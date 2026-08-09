@@ -561,6 +561,19 @@ class WebChannel(BaseChannel):
         model_meta = msg.metadata.get("model")
         if model_meta:
             data_block["model"] = str(model_meta)
+        # ``usage`` above is the RAW provider dialect: ``prompt_tokens`` is the
+        # full input on OpenAI-compatible providers but only the uncached
+        # remainder on native Anthropic. Dividing it by a context length is
+        # therefore wrong for whichever dialect the client didn't assume. These
+        # two fields are the agent loop's already-normalized answer — occupancy
+        # and the ceiling for the provider that actually ran the turn. Omitted
+        # when unknown, so a client's own fallback still runs.
+        context_tokens_meta = msg.metadata.get("contextTokens")
+        if isinstance(context_tokens_meta, int) and context_tokens_meta > 0:
+            data_block["contextTokens"] = context_tokens_meta
+        context_window_meta = msg.metadata.get("contextWindow")
+        if isinstance(context_window_meta, int) and context_window_meta > 0:
+            data_block["contextWindow"] = context_window_meta
 
         # Attachment V2 for hosted media. The relay persists these onto the
         # assistant message and forwards them on the live event, so a clip shows

@@ -2545,6 +2545,17 @@ class GatewayServer:
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "message": final_message,
             }
+            # Context-window occupancy + ceiling, both already normalized for
+            # the active provider by the agent loop. Sent as separate fields
+            # (not inside ``usage``) because ``usage`` is the raw provider
+            # dialect and clients must not have to guess which one it is.
+            # Omitted when unknown so a client's own fallback still runs.
+            context_tokens = (metadata or {}).get("contextTokens")
+            if isinstance(context_tokens, int) and context_tokens > 0:
+                final_data["contextTokens"] = context_tokens
+            context_window = (metadata or {}).get("contextWindow")
+            if isinstance(context_window, int) and context_window > 0:
+                final_data["contextWindow"] = context_window
             if (metadata or {}).get("aborted") is True:
                 final_data["aborted"] = True
             metadata_duration = (metadata or {}).get("duration_ms")

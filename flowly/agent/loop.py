@@ -616,6 +616,48 @@ _REDACT_LOG_FIELDS = frozenset({
 })
 
 
+def context_occupancy_tokens(
+    usage: dict[str, Any] | None, provider_name: str = "",
+) -> int:
+    """How much of the context window the turn described by ``usage`` occupies.
+
+    CACHED INPUT COUNTS, ONCE. Native Anthropic reports ``input_tokens`` for
+    the uncached remainder, with the cached prefix in separate
+    ``cache_read``/``cache_write`` fields. OpenAI-compatible providers do the
+    opposite: ``prompt_tokens`` is already the full input and their cache
+    fields are a diagnostic subset. Treating both shapes like Anthropic
+    double-counted a cached OpenRouter request and could trigger compaction far
+    too early; treating both like OpenAI drew a nearly-empty context ring on a
+    cached Anthropic conversation that was in fact nearly full. Cache tokens
+    occupy the window like any other input — the provider dialect only decides
+    where they live in the usage envelope.
+
+    The reply counts too: it is history the next request carries.
+
+    One answer for the compaction trigger AND the number the clients render, so
+    the ring and "compaction is imminent" never tell the user two different
+    stories. ``0`` means "no usable reading" — never "the context is empty".
+
+    Takes the provider name rather than reading it off a loop instance: it is
+    pure arithmetic over one wire dialect, and it is the number every surface
+    (gateway, relay, TUI) needs to agree on.
+    """
+    if not isinstance(usage, dict) or not usage:
+        return 0
+    try:
+        total = int(usage.get("prompt_tokens", 0) or 0)
+        total += int(usage.get("completion_tokens", 0) or 0)
+        if provider_name == "anthropic":
+            total += int(usage.get("cache_read_tokens", 0) or 0)
+            total += int(usage.get("cache_write_tokens", 0) or 0)
+        if total <= 0:
+            # Older/custom providers sometimes expose only the aggregate.
+            total = int(usage.get("total_tokens", 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    return max(0, total)
+
+
 def _redact_log_args(args: Any) -> Any:
     """Recursively redact sensitive URL / key fields for log output.
 
@@ -6149,6 +6191,29 @@ class AgentLoop:
                 # the UI so the context-window indicator can look up
                 # the right model's context_length.
                 "model": model_override or self.model,
+                # Context-window occupancy, ANSWERED HERE rather than left to
+                # each client. Two things only this process knows:
+                #
+                #   * ``usage`` is in the active provider's dialect, and
+                #     ``prompt_tokens`` means different things in each (see
+                #     ``context_occupancy_tokens``). A client reading it raw
+                #     shows a near-empty ring on a cached Anthropic turn.
+                #   * The real ceiling comes from the live catalogue for
+                #     whatever provider is configured — a BYOK model id is not
+                #     in the Flowly proxy catalogue the desktop used to divide
+                #     by, so its indicator simply vanished on every provider
+                #     except the proxy.
+                #
+                # Additive: old clients ignore both fields, new clients fall
+                # back to their own guess when an old bot omits them.
+                "contextTokens": context_occupancy_tokens(
+                    usage,
+                    getattr(self.provider, "provider_name", "") or "",
+                ),
+                # Bound to the agent's default model. Only cron jobs set
+                # ``model_override`` (gateway_cmd), and they have no context
+                # ring to feed; a per-model window is Stage 2.
+                "contextWindow": self._effective_context_window(),
                 # Stable first-party error contract. The gateway maps this to
                 # a native state:"error" event; remote channel adapters still
                 # receive the same user-safe text in ``content``.
@@ -7367,6 +7432,26 @@ class AgentLoop:
             return 0
         return max(0, stored)
 
+    def _effective_context_window(self) -> int:
+        """The window the active model can actually use, for the clients.
+
+        The compaction service already resolves this (live catalogue → family
+        heuristic → configured value, then clamped to the Flowly proxy's input
+        ceiling). Reuse it rather than teach every client to guess: they cannot
+        see which provider is configured, and the catalogue they *can* reach
+        only covers the proxy's own models.
+
+        ``0`` means "I don't know" — the client keeps its own fallback.
+        """
+        try:
+            window = int(self.compaction.effective_context_window)
+        except Exception:  # noqa: BLE001 — a display field, like the catalogue
+            # lookup underneath it, is best-effort. It reaches out to the model
+            # catalogue, so it can fail in ways this call has no opinion about;
+            # none of them justify breaking the turn's metadata.
+            return 0
+        return window if window > 0 else 0
+
     def _note_turn_usage(
         self, session_key: str, outcome: Any, epoch: int | None = None,
     ) -> None:
@@ -7379,29 +7464,16 @@ class AgentLoop:
         already exceed the window (observed live: estimate ~72K while the
         provider counted 82K in a 79K window).
 
-        CACHED INPUT COUNTS, ONCE. Native Anthropic reports ``input_tokens``
-        for the uncached remainder, with the cached prefix in separate
-        ``cache_read``/``cache_write`` fields. OpenAI-compatible providers do
-        the opposite: ``prompt_tokens`` is already the full input and their
-        cache fields are a diagnostic subset. Treating both shapes like
-        Anthropic double-counted a cached OpenRouter request and could trigger
-        compaction far too early. Cache tokens occupy the context window like
-        any other input; the provider dialect only decides where they live in
-        the usage envelope.
+        The provider-dialect arithmetic lives in
+        :func:`context_occupancy_tokens` — the same number the clients get on
+        the wire.
         """
         try:
             usage = (getattr(outcome, "metadata", None) or {}).get("usage") or {}
             epoch = self.context_epoch(session_key) if epoch is None else epoch
-            prompt = int(usage.get("prompt_tokens", 0) or 0)
-            completion = int(usage.get("completion_tokens", 0) or 0)
-            total = prompt + completion
-            provider = getattr(self, "provider", None)
-            if getattr(provider, "provider_name", "") == "anthropic":
-                total += int(usage.get("cache_read_tokens", 0) or 0)
-                total += int(usage.get("cache_write_tokens", 0) or 0)
-            if total <= 0:
-                # Older/custom providers sometimes expose only the aggregate.
-                total = int(usage.get("total_tokens", 0) or 0)
+            total = context_occupancy_tokens(
+                usage, getattr(getattr(self, "provider", None), "provider_name", "") or "",
+            )
         except (AttributeError, TypeError, ValueError):
             return
         if total > 0:
