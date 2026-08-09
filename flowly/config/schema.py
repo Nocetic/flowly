@@ -856,8 +856,80 @@ class MediaGenerationConfig(BaseModel):
     video_timeout_seconds: int = 900
 
 
+class ToolDiscoveryConfig(BaseModel):
+    """Progressively disclose large tool schemas to the model."""
+
+    enabled: bool = True
+    deferred_toolsets: list[str] = Field(default_factory=lambda: [
+        "mcp",
+        "extensions",
+    ])
+    always_visible_tools: list[str] = Field(default_factory=list)
+    minimum_deferred_schema_tokens: int = Field(default=750, ge=0, le=100_000)
+    catalog_max_chars: int = Field(default=6_000, ge=500, le=50_000)
+    search_default_limit: int = Field(default=5, ge=1, le=50)
+    search_max_limit: int = Field(default=20, ge=1, le=100)
+    # Deterministically expose only the external schemas that match the current
+    # user request. This avoids an LLM discovery round without making the full
+    # MCP/plugin catalog eager.
+    intent_routing_enabled: bool = True
+    intent_max_promoted_tools: int = Field(default=4, ge=0, le=20)
+    intent_min_score: float = Field(default=4.0, ge=0.0, le=100.0)
+    # Local, API-key-free semantic selection for external tools. It indexes
+    # static tool metadata only and is independent from conversation memory.
+    # This is an explicit opt-in: a fresh install must neither initialize nor
+    # download the local model until the owner accepts the recommendation.
+    # Any local model/index failure falls back to the lexical catalog.
+    semantic_routing_enabled: bool = False
+    semantic_model_auto_download: bool = False
+    semantic_routing_consent: Literal["undecided", "enabled", "dismissed"] = "undecided"
+    semantic_recommendation_min_tools: int = Field(default=12, ge=1, le=10_000)
+    semantic_recommendation_min_schema_tokens: int = Field(
+        default=2_500,
+        ge=0,
+        le=1_000_000,
+    )
+    semantic_recommendation_growth_tools: int = Field(default=8, ge=1, le=10_000)
+    semantic_recommendation_growth_schema_tokens: int = Field(
+        default=2_000,
+        ge=0,
+        le=1_000_000,
+    )
+    semantic_recommendation_dismissed_tool_count: int = Field(default=0, ge=0)
+    semantic_recommendation_dismissed_schema_tokens: int = Field(default=0, ge=0)
+    semantic_source_min_score: float = Field(default=0.78, ge=-1.0, le=1.0)
+    semantic_source_min_margin: float = Field(default=0.009, ge=0.0, le=2.0)
+    semantic_tool_min_score: float = Field(default=0.76, ge=-1.0, le=1.0)
+    semantic_tool_score_window: float = Field(default=0.035, ge=0.0, le=2.0)
+    semantic_query_cache_size: int = Field(default=256, ge=1, le=10_000)
+
+
+class ToolRoutingConfig(BaseModel):
+    """Model-facing platform/toolset selection policy."""
+
+    enabled: bool = True
+    platform_toolsets: dict[str, list[str]] = Field(default_factory=dict)
+    disabled_toolsets: list[str] = Field(default_factory=list)
+    availability_cache_ttl_seconds: float = Field(default=30.0, ge=0.0, le=300.0)
+    availability_failure_grace_seconds: float = Field(default=60.0, ge=0.0, le=600.0)
+    schema_cache_ttl_seconds: float = Field(default=10.0, ge=0.0, le=300.0)
+    # Keep direct core tools visible while moving only their large operating
+    # playbooks behind a deterministic, host-side intent router.  Disabling
+    # this is the instant rollback path to the legacy eager prompt.
+    capability_guidance_enabled: bool = True
+    # A routing error or ambiguous UI action loads the legacy guides instead
+    # of attempting to save tokens.  Behaviour wins over prompt size.
+    capability_guidance_fail_open: bool = True
+    # Startup skill metadata is progressive: relevant descriptions plus a
+    # compact complete name index.  Full SKILL.md bodies remain available via
+    # skill_view and explicit capability activation.
+    skill_catalog_max_chars: int = Field(default=8_000, ge=1_000, le=50_000)
+    discovery: ToolDiscoveryConfig = Field(default_factory=ToolDiscoveryConfig)
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
+
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     artifact: ArtifactConfig = Field(default_factory=ArtifactConfig)
@@ -866,6 +938,7 @@ class ToolsConfig(BaseModel):
     codex_session: CodexSessionToolConfig = Field(default_factory=CodexSessionToolConfig)
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
     media_generation: MediaGenerationConfig = Field(default_factory=MediaGenerationConfig)
+    routing: ToolRoutingConfig = Field(default_factory=ToolRoutingConfig)
 
 
 class MediaRetentionConfig(BaseModel):

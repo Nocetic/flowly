@@ -1,9 +1,8 @@
 """Secure shell execution tool with approval system."""
 
-import asyncio
 import re
 import sys
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -11,7 +10,6 @@ from flowly.agent.tools.base import Tool
 from flowly.exec import (
     ExecConfig,
     ExecRequest,
-    ExecResult,
     ExecApprovalStore,
     ExecApprovalDecision,
     analyze_command,
@@ -89,6 +87,10 @@ class SecureExecTool(Tool):
     @property
     def name(self) -> str:
         return "exec"
+
+    def is_available(self) -> bool:
+        """Do not advertise a shell surface disabled by configuration."""
+        return bool(self.config.enabled)
 
     @property
     def description(self) -> str:

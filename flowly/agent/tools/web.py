@@ -189,12 +189,14 @@ class WebSearchTool(Tool):
         proxy_url: str | None = None,
         server_id: str | None = None,
         auth_token: str | None = None,
+        enabled: bool = True,
     ):
         self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
         self.max_results = max_results
         self._proxy_url = proxy_url
         self._server_id = server_id
         self._auth_token = auth_token
+        self._enabled = enabled
 
         # When the account relay creds are present (a logged-in bot) but no
         # explicit proxy URL was configured, fall back to the canonical Flowly
@@ -208,6 +210,9 @@ class WebSearchTool(Tool):
         if not self._proxy_url and self._server_id and self._auth_token:
             base = os.environ.get("FLOWLY_API_BASE", "https://useflowlyapp.com")
             self._proxy_url = base.rstrip("/") + "/api/v1/search"
+
+    def is_available(self) -> bool:
+        return bool(self._enabled)
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         from flowly.agent.tools.web_providers import get_active_search_provider

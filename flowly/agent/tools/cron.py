@@ -172,6 +172,10 @@ class CronTool(Tool):
         """Set the cron service instance."""
         self._cron_service = service
 
+    def is_available(self) -> bool:
+        """A cron schema without a scheduler can only fail at execution."""
+        return self._cron_service is not None
+
     def set_context(
         self,
         channel: str,

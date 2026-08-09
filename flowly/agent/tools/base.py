@@ -42,6 +42,29 @@ class Tool(ABC):
             String result of the tool execution.
         """
         pass
+
+    @property
+    def toolset(self) -> str | None:
+        """Optional routing group override.
+
+        Built-in tools are centrally classified by name. Plugins may override
+        this property to participate in a named platform toolset.
+        """
+        return None
+
+    @property
+    def supported_platforms(self) -> frozenset[str] | None:
+        """Platforms that may advertise this tool, or ``None`` for all."""
+        return None
+
+    @property
+    def discovery_source(self) -> str | None:
+        """Connected provider/plugin label used by progressive discovery."""
+        return None
+
+    def is_available(self) -> bool:
+        """Cheap runtime capability check used before schema advertisement."""
+        return True
     
     def to_schema(self) -> dict[str, Any]:
         """Convert tool to OpenAI function schema format."""

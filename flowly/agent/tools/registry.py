@@ -4,15 +4,52 @@ from __future__ import annotations
 
 import inspect
 import json
+import threading
 import time
-from typing import Any, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
 from flowly.agent.tools.base import Tool
+from flowly.agent.tools.routing import infer_toolset
 
 if TYPE_CHECKING:
     from flowly.agent.hooks import HookRegistry
+
+
+@dataclass(frozen=True)
+class ToolAvailabilityContext:
+    """Runtime facts available to a synchronous tool capability check."""
+
+    platform: str = ""
+
+
+AvailabilityCheck = Callable[[ToolAvailabilityContext], bool]
+RegistryChangeCallback = Callable[[int], None]
+
+
+@dataclass(frozen=True)
+class _ToolRegistration:
+    toolset: str
+    platforms: frozenset[str] | None
+    check_fn: AvailabilityCheck | None
+
+
+@dataclass(frozen=True)
+class ToolCatalogSnapshot:
+    """One generation-consistent snapshot of static registry metadata.
+
+    This deliberately ignores per-platform availability.  Consumers such as
+    the local semantic index may precompute metadata for every registered
+    tool, while the live route remains the authority over which names can be
+    disclosed or executed.
+    """
+
+    generation: int
+    definitions: tuple[dict[str, Any], ...]
+    toolsets: dict[str, str]
+    sources: dict[str, str]
 
 
 def _unwrap_raw_envelope(params: Any) -> Any:
@@ -218,6 +255,19 @@ def _normalize_tool_parameters_schema(parameters: Any) -> dict[str, Any]:
     return normalized
 
 
+def _normalized_tool_definition(tool: Tool) -> dict[str, Any]:
+    definition = tool.to_schema()
+    fn = definition.get("function")
+    if isinstance(fn, dict):
+        normalized_fn = dict(fn)
+        normalized_fn["parameters"] = _normalize_tool_parameters_schema(
+            normalized_fn.get("parameters")
+        )
+        definition = dict(definition)
+        definition["function"] = normalized_fn
+    return definition
+
+
 class ToolRegistry:
     """
     Registry for agent tools.
@@ -225,8 +275,26 @@ class ToolRegistry:
     Allows dynamic registration and execution of tools.
     """
     
-    def __init__(self, hooks: HookRegistry | None = None):
+    def __init__(
+        self,
+        hooks: HookRegistry | None = None,
+        *,
+        availability_cache_ttl: float = 30.0,
+        availability_failure_grace: float = 60.0,
+        schema_cache_ttl: float = 10.0,
+    ):
         self._tools: dict[str, Tool] = {}
+        self._registrations: dict[str, _ToolRegistration] = {}
+        self._availability_cache: dict[tuple[str, str], tuple[float, bool]] = {}
+        self._availability_last_good: dict[tuple[str, str], float] = {}
+        self._availability_cache_ttl = max(0.0, float(availability_cache_ttl))
+        self._availability_failure_grace = max(0.0, float(availability_failure_grace))
+        self._schema_cache_ttl = max(0.0, float(schema_cache_ttl))
+        self._schema_cache: dict[tuple[Any, ...], tuple[float, int, tuple[dict[str, Any], ...]]] = {}
+        self._catalog_snapshot_cache: ToolCatalogSnapshot | None = None
+        self._generation = 0
+        self._lock = threading.RLock()
+        self._change_listeners: list[RegistryChangeCallback] = []
         self._hooks = hooks
         # Caller (AgentLoop) sets this for the duration of a turn so
         # ToolHookContext.session_id is populated for plugin hooks that
@@ -238,39 +306,356 @@ class ToolRegistry:
         """Bind the current session id to subsequent ``execute()`` calls."""
         self._active_session_id = session_id or ""
 
-    def register(self, tool: Tool) -> None:
-        """Register a tool."""
-        self._tools[tool.name] = tool
+    def register(
+        self,
+        tool: Tool,
+        *,
+        toolset: str | None = None,
+        platforms: set[str] | frozenset[str] | None = None,
+        check_fn: AvailabilityCheck | None = None,
+    ) -> None:
+        """Register a tool and its model-facing routing metadata."""
+        declared_toolset = toolset or tool.toolset or infer_toolset(tool.name)
+        declared_platforms = platforms
+        if declared_platforms is None:
+            declared_platforms = tool.supported_platforms
+        normalized_platforms = (
+            frozenset(str(value).strip().lower() for value in declared_platforms if str(value).strip())
+            if declared_platforms is not None
+            else None
+        )
+        with self._lock:
+            self._tools[tool.name] = tool
+            self._registrations[tool.name] = _ToolRegistration(
+                toolset=(
+                    str(declared_toolset or "extensions").strip().lower()
+                    or "extensions"
+                ),
+                platforms=normalized_platforms,
+                check_fn=check_fn,
+            )
+            self._generation += 1
+            generation = self._generation
+            self._catalog_snapshot_cache = None
+        self.invalidate_availability(tool.name)
+        self._notify_change(generation)
     
     def unregister(self, name: str) -> None:
         """Unregister a tool by name."""
-        self._tools.pop(name, None)
+        with self._lock:
+            existed = name in self._tools or name in self._registrations
+            self._tools.pop(name, None)
+            self._registrations.pop(name, None)
+            if existed:
+                self._generation += 1
+                self._catalog_snapshot_cache = None
+            generation = self._generation
+        self.invalidate_availability(name)
+        if existed:
+            self._notify_change(generation)
+
+    def subscribe_changes(
+        self,
+        callback: RegistryChangeCallback,
+    ) -> Callable[[], None]:
+        """Subscribe to generation changes; return an idempotent unsubscribe."""
+        with self._lock:
+            if callback not in self._change_listeners:
+                self._change_listeners.append(callback)
+
+        def _unsubscribe() -> None:
+            with self._lock:
+                try:
+                    self._change_listeners.remove(callback)
+                except ValueError:
+                    pass
+
+        return _unsubscribe
+
+    def _notify_change(self, generation: int) -> None:
+        """Notify observers outside the registry lock."""
+        with self._lock:
+            listeners = tuple(self._change_listeners)
+        for callback in listeners:
+            try:
+                callback(generation)
+            except Exception as exc:  # noqa: BLE001 - observers are advisory
+                logger.warning(
+                    "Tool registry change observer failed at generation {}: {}",
+                    generation,
+                    type(exc).__name__,
+                )
     
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
-        return self._tools.get(name)
+        with self._lock:
+            return self._tools.get(name)
     
     def has(self, name: str) -> bool:
         """Check if a tool is registered."""
-        return name in self._tools
+        with self._lock:
+            return name in self._tools
+
+    def get_toolsets(self) -> dict[str, str]:
+        """Return the authoritative toolset recorded for each tool."""
+        with self._lock:
+            return {
+                name: registration.toolset
+                for name, registration in self._registrations.items()
+            }
+
+    def get_discovery_sources(self) -> dict[str, str]:
+        """Return provider/plugin labels for connected external tools."""
+        with self._lock:
+            tools = dict(self._tools)
+        sources: dict[str, str] = {}
+        for name, tool in tools.items():
+            try:
+                source = str(tool.discovery_source or "").strip()
+            except Exception:  # noqa: BLE001 - metadata must not break a turn
+                source = ""
+            if source:
+                sources[name] = source
+        return sources
+
+    def get_catalog_snapshot(self) -> ToolCatalogSnapshot:
+        """Return static schemas and metadata from one registry generation.
+
+        Tool schema rendering happens outside the registry lock because a
+        third-party tool may compute its schema dynamically. If registration
+        changes while rendering, retry against the newer generation. A final
+        continuously-mutating snapshot is still safe: its definitions are the
+        authority and metadata maps are filtered to those exact names.
+        """
+        last: ToolCatalogSnapshot | None = None
+        for _attempt in range(3):
+            with self._lock:
+                generation = self._generation
+                cached = self._catalog_snapshot_cache
+                if cached is not None and cached.generation == generation:
+                    return cached
+                tools = dict(self._tools)
+                registrations = dict(self._registrations)
+            definitions: list[dict[str, Any]] = []
+            toolsets: dict[str, str] = {}
+            sources: dict[str, str] = {}
+            for name, tool in tools.items():
+                try:
+                    definition = _normalized_tool_definition(tool)
+                except Exception as exc:  # noqa: BLE001 - index metadata is optional
+                    logger.warning(
+                        "Skipping tool '{}' in static catalog snapshot: {}",
+                        name,
+                        type(exc).__name__,
+                    )
+                    continue
+                definitions.append(definition)
+                registration = registrations.get(name)
+                toolsets[name] = (
+                    registration.toolset
+                    if registration is not None
+                    else infer_toolset(name)
+                )
+                try:
+                    source = str(tool.discovery_source or "").strip()
+                except Exception:  # noqa: BLE001 - optional metadata
+                    source = ""
+                if source:
+                    sources[name] = source
+            last = ToolCatalogSnapshot(
+                generation=generation,
+                definitions=tuple(definitions),
+                toolsets=toolsets,
+                sources=sources,
+            )
+            with self._lock:
+                if self._generation == generation:
+                    self._catalog_snapshot_cache = last
+                    return last
+        assert last is not None
+        return last
     
-    def get_definitions(self) -> list[dict[str, Any]]:
-        """Get all tool definitions in OpenAI format."""
+    def invalidate_availability(self, name: str | None = None) -> None:
+        """Drop cached capability checks after config/service changes."""
+        with self._lock:
+            self._schema_cache.clear()
+            if name is None:
+                self._availability_cache.clear()
+                self._availability_last_good.clear()
+                return
+            stale = [key for key in self._availability_cache if key[0] == name]
+            for key in stale:
+                self._availability_cache.pop(key, None)
+                self._availability_last_good.pop(key, None)
+
+    def set_availability_cache_ttl(self, seconds: float) -> None:
+        """Apply a hot-reloaded probe TTL and invalidate old decisions."""
+        self._availability_cache_ttl = max(0.0, float(seconds))
+        self.invalidate_availability()
+
+    def set_availability_failure_grace(self, seconds: float) -> None:
+        """Apply a hot-reloaded last-good grace window."""
+        self._availability_failure_grace = max(0.0, float(seconds))
+        self.invalidate_availability()
+
+    def set_schema_cache_ttl(self, seconds: float) -> None:
+        """Apply a hot-reloaded model schema cache TTL."""
+        with self._lock:
+            self._schema_cache_ttl = max(0.0, float(seconds))
+            self._schema_cache.clear()
+
+    def _passes_availability_check(self, name: str, platform: str) -> bool:
+        key = (name, platform)
+        now = time.monotonic()
+        with self._lock:
+            cached = self._availability_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+
+        with self._lock:
+            tool = self._tools.get(name)
+            registration = self._registrations.get(name)
+        if tool is None or registration is None:
+            return False
+        probe_failed = False
+        try:
+            available = bool(
+                registration.check_fn(ToolAvailabilityContext(platform=platform))
+                if registration.check_fn is not None
+                else tool.is_available()
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe must never break a turn
+            logger.debug("Availability check for {} failed: {}", name, exc)
+            available = False
+            probe_failed = True
+        with self._lock:
+            if available:
+                self._availability_last_good[key] = now
+            else:
+                last_good = self._availability_last_good.get(key)
+                if (
+                    probe_failed
+                    and last_good is not None
+                    and last_good + self._availability_failure_grace > now
+                ):
+                    logger.debug(
+                        "Availability probe for {} failed inside last-good grace",
+                        name,
+                    )
+                    return True
+            self._availability_cache[key] = (
+                now + self._availability_cache_ttl,
+                available,
+            )
+        return available
+
+    def is_available(
+        self,
+        name: str,
+        *,
+        platform: str | None = None,
+        enabled_toolsets: set[str] | frozenset[str] | None = None,
+        disabled_toolsets: set[str] | frozenset[str] | None = None,
+        disabled_tools: set[str] | frozenset[str] | None = None,
+    ) -> bool:
+        """Return whether a tool is callable in the supplied route."""
+        with self._lock:
+            tool = self._tools.get(name)
+            registration = self._registrations.get(name)
+        if tool is None or registration is None:
+            return False
+
+        normalized_platform = str(platform or "").strip().lower()
+        if disabled_tools and name in disabled_tools:
+            return False
+        if enabled_toolsets is not None and registration.toolset not in enabled_toolsets:
+            return False
+        if disabled_toolsets and registration.toolset in disabled_toolsets:
+            return False
+        if (
+            registration.platforms is not None
+            and normalized_platform
+            and normalized_platform not in registration.platforms
+        ):
+            return False
+        return self._passes_availability_check(name, normalized_platform)
+
+    def get_available_names(
+        self,
+        *,
+        platform: str | None = None,
+        enabled_toolsets: set[str] | frozenset[str] | None = None,
+        disabled_toolsets: set[str] | frozenset[str] | None = None,
+        disabled_tools: set[str] | frozenset[str] | None = None,
+    ) -> list[str]:
+        """Return registered tool names that survive routing and probes."""
+        with self._lock:
+            names = list(self._tools)
+        return [
+            name
+            for name in names
+            if self.is_available(
+                name,
+                platform=platform,
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                disabled_tools=disabled_tools,
+            )
+        ]
+
+    def get_definitions(
+        self,
+        *,
+        platform: str | None = None,
+        enabled_toolsets: set[str] | frozenset[str] | None = None,
+        disabled_toolsets: set[str] | frozenset[str] | None = None,
+        disabled_tools: set[str] | frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get routed and currently available tool definitions."""
+        normalized_platform = str(platform or "").strip().lower()
+        cache_key = (
+            normalized_platform,
+            None if enabled_toolsets is None else tuple(sorted(enabled_toolsets)),
+            tuple(sorted(disabled_toolsets or ())),
+            tuple(sorted(disabled_tools or ())),
+        )
+        now = time.monotonic()
+        with self._lock:
+            generation = self._generation
+            cached = self._schema_cache.get(cache_key)
+            if (
+                cached is not None
+                and cached[0] > now
+                and cached[1] == generation
+            ):
+                return [dict(definition) for definition in cached[2]]
+
         # Snapshot the values first: MCP discovery registers tools from a
         # background thread (so a slow server can't delay boot), and iterating
         # the live dict here could otherwise raise "dictionary changed size
         # during iteration". A tool simply appears in this turn's list or the
         # next one.
-        definitions = [tool.to_schema() for tool in list(self._tools.values())]
-        normalized: list[dict[str, Any]] = []
-        for definition in definitions:
-            fn = definition.get("function")
-            if isinstance(fn, dict):
-                fn = dict(fn)
-                fn["parameters"] = _normalize_tool_parameters_schema(fn.get("parameters"))
-                definition = dict(definition)
-                definition["function"] = fn
-            normalized.append(definition)
+        available_names = self.get_available_names(
+            platform=platform,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            disabled_tools=disabled_tools,
+        )
+        with self._lock:
+            available_tools = [
+                self._tools[name]
+                for name in available_names
+                if name in self._tools
+            ]
+        normalized = [_normalized_tool_definition(tool) for tool in available_tools]
+        with self._lock:
+            if self._generation == generation:
+                cache_ttl = min(self._schema_cache_ttl, self._availability_cache_ttl)
+                self._schema_cache[cache_key] = (
+                    now + cache_ttl,
+                    generation,
+                    tuple(normalized),
+                )
         return normalized
 
     def validate_tool_call(self, name: str, params: dict[str, Any]) -> str | None:
@@ -306,7 +691,16 @@ class ToolRegistry:
             return f"Error: Missing required parameter(s) for '{name}': {joined}"
         return None
     
-    async def execute(self, name: str, params: dict[str, Any]) -> str:
+    async def execute(
+        self,
+        name: str,
+        params: dict[str, Any],
+        *,
+        platform: str | None = None,
+        enabled_toolsets: set[str] | frozenset[str] | None = None,
+        disabled_toolsets: set[str] | frozenset[str] | None = None,
+        disabled_tools: set[str] | frozenset[str] | None = None,
+    ) -> str:
         """
         Execute a tool by name with given parameters.
 
@@ -323,6 +717,15 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found"
+        if not self.is_available(
+            name,
+            platform=platform,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            disabled_tools=disabled_tools,
+        ):
+            route = f" for platform '{platform}'" if platform else ""
+            return f"Error: Tool '{name}' is unavailable{route}"
 
         params = _unwrap_raw_envelope(params)
         validation_error = self.validate_tool_call(name, params)
@@ -365,10 +768,19 @@ class ToolRegistry:
     @property
     def tool_names(self) -> list[str]:
         """Get list of registered tool names."""
-        return list(self._tools.keys())
+        with self._lock:
+            return list(self._tools.keys())
+
+    @property
+    def generation(self) -> int:
+        """Monotonic registration generation used by higher-level caches."""
+        with self._lock:
+            return self._generation
     
     def __len__(self) -> int:
-        return len(self._tools)
+        with self._lock:
+            return len(self._tools)
     
     def __contains__(self, name: str) -> bool:
-        return name in self._tools
+        with self._lock:
+            return name in self._tools

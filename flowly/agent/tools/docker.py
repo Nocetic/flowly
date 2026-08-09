@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shutil
 from typing import Any
 
 from loguru import logger
@@ -18,6 +19,10 @@ class DockerTool(Tool):
 
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
+
+    def is_available(self) -> bool:
+        """Hide the schema when the Docker CLI is not installed."""
+        return shutil.which("docker") is not None
 
     @property
     def name(self) -> str:
