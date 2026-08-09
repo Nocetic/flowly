@@ -32,6 +32,13 @@ class ChatFinal:
     session_key: str
     text: str
     usage: dict[str, Any] | None = None
+    # Context occupancy + ceiling, normalized by the agent for the provider
+    # that ran the turn. ``usage`` alone answers neither: its ``prompt_tokens``
+    # is the full input on OpenAI-shaped providers but only the uncached
+    # remainder on native Anthropic, and the ceiling comes from a catalogue
+    # keyed by the active provider. ``None`` from a gateway that predates them.
+    context_tokens: int | None = None
+    context_window: int | None = None
 
 
 @dataclass
@@ -829,8 +836,20 @@ class GatewayClient:
                     if isinstance(part, dict) and part.get("type") == "text":
                         text += part.get("text", "")
                 usage = msg.get("usage") or payload.get("usage")
+                ctx_tokens = payload.get("contextTokens")
+                ctx_window = payload.get("contextWindow")
                 await self._inbox.put(
-                    ChatFinal(run_id, session_key, text, usage=usage)
+                    ChatFinal(
+                        run_id, session_key, text, usage=usage,
+                        context_tokens=(
+                            ctx_tokens if isinstance(ctx_tokens, int) and ctx_tokens > 0
+                            else None
+                        ),
+                        context_window=(
+                            ctx_window if isinstance(ctx_window, int) and ctx_window > 0
+                            else None
+                        ),
+                    )
                 )
             elif state == "aborted":
                 await self._inbox.put(ChatAborted(run_id, session_key))

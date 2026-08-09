@@ -14,9 +14,13 @@ arithmetic and the "omit when unknown" contract that keeps older clients on
 their own fallback.
 """
 
+import asyncio
+
 from flowly.agent.loop import AgentLoop, context_occupancy_tokens
 from flowly.compaction.service import CompactionService
 from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
+from flowly.tui.client import ChatFinal, GatewayClient
+from flowly.tui.panes.status import StatusBar, _model_budget, _TokenBar
 
 
 class _Provider:
@@ -136,3 +140,109 @@ def test_an_unresolvable_window_is_reported_as_unknown():
     harness.compaction = _Broken()
 
     assert harness._effective_context_window() == 0
+
+
+# ── The TUI is a client of that wire, like the desktop ────────────────────
+
+
+async def _final_event(payload: dict) -> ChatFinal:
+    """Run one gateway `chat`/`final` frame through the real parser."""
+    client = GatewayClient.__new__(GatewayClient)
+    client._inbox = asyncio.Queue()
+    await client._dispatch({"type": "event", "event": "chat", "data": payload})
+    return await client._inbox.get()
+
+
+async def test_the_tui_reads_the_wire_instead_of_guessing_the_dialect():
+    """The status bar used to derive occupancy from `prompt_tokens` and so
+    under-reported on native Anthropic exactly like the desktop did. It is a
+    client of the same event — it should take the answer, not recompute it."""
+    ev = await _final_event({
+        "state": "final",
+        "runId": "r1",
+        "sessionKey": "cli:1",
+        "message": {"content": [{"type": "text", "text": "hi"}],
+                    "usage": {"prompt_tokens": 2_000, "completion_tokens": 1_000}},
+        "contextTokens": 181_000,
+        "contextWindow": 200_000,
+    })
+
+    assert ev.context_tokens == 181_000
+    assert ev.context_window == 200_000
+
+
+async def test_an_older_gateway_leaves_the_tui_on_its_own_numbers():
+    """No fields ⇒ None, not 0: the app then falls back to `prompt_tokens`
+    and the model-family budget, which is the pre-existing behaviour."""
+    ev = await _final_event({
+        "state": "final",
+        "runId": "r1",
+        "sessionKey": "cli:1",
+        "message": {"content": [], "usage": {"prompt_tokens": 500}},
+    })
+
+    assert ev.context_tokens is None
+    assert ev.context_window is None
+
+
+async def test_a_zero_or_junk_reading_is_treated_as_absent():
+    """0 would mean "empty context" / "no room at all" rather than "unknown"."""
+    ev = await _final_event({
+        "state": "final",
+        "runId": "r1",
+        "sessionKey": "cli:1",
+        "message": {"content": []},
+        "contextTokens": 0,
+        "contextWindow": "200000",
+    })
+
+    assert ev.context_tokens is None
+    assert ev.context_window is None
+
+
+def _rendered(bar: _TokenBar, monkeypatch) -> str:
+    """What the bar would paint. `update()` needs a live app, so capture it."""
+    painted: list[str] = []
+    monkeypatch.setattr(bar, "update", painted.append)
+    bar._refresh()
+    return painted[-1] if painted else ""
+
+
+def test_the_bar_prefers_the_reported_ceiling_over_its_own_guess(monkeypatch):
+    """`_model_budget` falls back to a flat 200K for anything it cannot place,
+    which is every BYOK model whose catalogue this process has not cached. A
+    32K model drawn against 200K tells the user they have room they don't."""
+    bar = _TokenBar()
+    bar.model = "some-byok-model"
+    bar.tokens_in = 16_000
+    bar.budget_override = 32_768
+
+    text = _rendered(bar, monkeypatch)
+
+    assert "32.8K" in text and "200.0K" not in text
+    assert "49%" in text  # 16_000 / 32_768, not 16_000 / 200_000 → 8%
+
+
+def test_the_bar_keeps_guessing_when_nothing_was_reported(monkeypatch):
+    """An older gateway reports no ceiling; the bar must behave exactly as it
+    did before, not collapse to zero and hide itself."""
+    bar = _TokenBar()
+    bar.model = "anthropic/claude-opus-4.8"
+    bar.tokens_in = 20_000
+
+    assert bar.budget_override == 0
+    assert _model_budget("anthropic/claude-opus-4.8") == 200_000
+    assert "200.0K" in _rendered(bar, monkeypatch)
+
+
+def test_switching_model_drops_a_ceiling_that_no_longer_applies(monkeypatch):
+    """A reported ceiling belongs to the model that was running. Keeping a
+    200K window after switching to a 32K model overstates the room until the
+    next turn happens to land."""
+    status = StatusBar()
+    monkeypatch.setattr(status, "_sync_context_header", lambda **kwargs: None)
+    status.context_budget = 200_000
+
+    status.model = "some-small-model"
+
+    assert status.context_budget == 0

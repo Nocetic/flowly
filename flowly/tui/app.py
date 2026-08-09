@@ -966,25 +966,26 @@ class FlowlyTUI(App[None]):
             self._current_bubble = None
             self._current_run = None
             self._set_state("idle")
-            # Token usage — REPLACES, doesn't accumulate (prompt_tokens
-            # already includes the full conversation history that the
-            # LLM sees on every turn).
+            # Token usage — REPLACES, doesn't accumulate (the prompt already
+            # includes the full conversation history the LLM sees every turn).
             #
-            # Cache semantics (see ``agent/usage_pricing.py`` for
-            # the canonical normalize_usage helper):
-            #   • **OAI-compat mode** (OpenAI / OpenRouter / Groq /
-            #     xAI via OR / DeepSeek / Codex) — ``prompt_tokens``
-            #     is the FULL input incl. cached chunks. Cache details
-            #     are nested under ``prompt_tokens_details.cached_tokens``
-            #     (or top-level ``cache_read_input_tokens`` when OR
-            #     proxies Anthropic). Adding them again would triple-
-            #     count the same bytes.
-            #   • **Anthropic native** — ``input_tokens`` is NEW only,
-            #     cache fields are separate; sum is required.
-            # ``OpenRouterProvider`` is always OAI-compat, so we use
-            # ``prompt_tokens`` directly. The bare ``input_tokens``
-            # fallback covers any pure-Anthropic adapter we might
-            # introduce later.
+            # Two different questions are answered from one envelope:
+            #
+            #   * **Cost** wants the raw per-turn split, because billing is
+            #     per turn and prices input, output and cache separately.
+            #     `_accumulate_usage` therefore keeps taking the raw numbers.
+            #   * **Context occupancy** wants one figure for "how full is the
+            #     window", and the raw numbers cannot give it without knowing
+            #     the provider dialect: OpenAI-shaped `prompt_tokens` is the
+            #     full input incl. cache, while native Anthropic reports only
+            #     the uncached remainder with the prefix in separate fields.
+            #     Reading it raw drew an almost-empty bar on a cached
+            #     Anthropic conversation that was in fact nearly full.
+            #
+            # The bot answers the second one for us now (`contextTokens`), so
+            # this no longer has to know which dialect it is looking at. The
+            # bar is `tokens_in + tokens_out`, so the reported occupancy is
+            # split back across the two rather than added on top of the reply.
             if ev.usage:
                 u = ev.usage
                 tin = int(
@@ -999,10 +1000,18 @@ class FlowlyTUI(App[None]):
                     or u.get("outputTokens")
                     or 0
                 )
-                if tin:
-                    status.tokens_in = tin
                 if tout:
                     status.tokens_out = tout
+                # An older gateway sends no occupancy; `prompt_tokens` is then
+                # the best available guess, and it is the right one for every
+                # provider such a gateway could reach.
+                occupancy = ev.context_tokens
+                if occupancy:
+                    status.tokens_in = max(0, occupancy - status.tokens_out)
+                elif tin:
+                    status.tokens_in = tin
+                if ev.context_window:
+                    status.context_budget = ev.context_window
                 cread = int(u.get("cache_read_tokens") or u.get("cache_read_input_tokens") or 0)
                 cwrite = int(u.get("cache_write_tokens") or u.get("cache_creation_input_tokens") or 0)
                 self._accumulate_usage(tin, tout, cread, cwrite, status.model)
@@ -3823,7 +3832,10 @@ class FlowlyTUI(App[None]):
         s = self.query_one(StatusBar)
         provider, _src = self._active_provider_display()
         ctx_used = int(s.tokens_in) + int(s.tokens_out)
-        ctx_budget = _model_budget(s.model or "")
+        # Same precedence as the status bar: the ceiling the bot reported for
+        # the turn beats a local guess, which can only consult a catalogue
+        # this process happens to have cached.
+        ctx_budget = int(s.context_budget) or _model_budget(s.model or "")
         composer = self.query_one(Composer)
         account = self._account
         email = (
