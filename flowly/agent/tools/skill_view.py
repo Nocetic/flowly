@@ -159,8 +159,9 @@ class SkillViewTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Load a skill's full content or access its linked files. "
+            "List/search skills, load a skill's full content, or access its linked files. "
             "First call returns SKILL.md content plus available references/templates/scripts. "
+            "Use action='search' when the compact prompt index is truncated. "
             "To access linked files, call again with file_path parameter."
         )
 
@@ -169,19 +170,56 @@ class SkillViewTool(Tool):
         return {
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["get", "search", "list"],
+                    "default": "get",
+                    "description": "Get one skill, search metadata, or list names.",
+                },
                 "name": {
                     "type": "string",
-                    "description": "The skill name",
+                    "description": "Skill name for action=get.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Keyword query for action=search.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20,
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
                 },
                 "file_path": {
                     "type": "string",
                     "description": "Optional: path to a linked file (e.g. 'references/api.md')",
                 },
             },
-            "required": ["name"],
         }
 
-    async def execute(self, name: str, file_path: str | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self,
+        name: str = "",
+        file_path: str | None = None,
+        action: str = "get",
+        query: str = "",
+        limit: int = 20,
+        offset: int = 0,
+        **kwargs: Any,
+    ) -> str:
+        if action in {"list", "search"}:
+            return self._list_or_search(
+                query=query if action == "search" else "",
+                limit=limit,
+                offset=offset,
+            )
+        if not name:
+            return json.dumps({"error": "name is required for action='get'."})
         skill_dir = self._find_skill_dir(name)
         if not skill_dir:
             return json.dumps({"error": f"Skill '{name}' not found."})
@@ -189,6 +227,37 @@ class SkillViewTool(Tool):
         if file_path:
             return self._load_linked_file(skill_dir, name, file_path)
         return self._load_skill(skill_dir, name)
+
+    def _list_or_search(self, *, query: str, limit: int, offset: int) -> str:
+        """Lossless discovery fallback for catalogs too large for the prompt."""
+
+        from flowly.agent.skills import SkillsLoader
+
+        loader = SkillsLoader(self._workspace, builtin_skills_dir=self._builtin_dir)
+        query_terms = {
+            token for token in query.lower().replace("-", " ").split() if token
+        }
+        matches: list[dict[str, str]] = []
+        for item in loader.list_skills(filter_unavailable=False):
+            name = item["name"]
+            metadata = loader.get_skill_metadata(name) or {}
+            description = str(metadata.get("description") or name)
+            haystack = f"{name} {description}".lower().replace("-", " ")
+            if query_terms and not all(term in haystack for term in query_terms):
+                continue
+            matches.append({"name": name, "description": description})
+        matches.sort(key=lambda item: item["name"].lower())
+        safe_limit = max(1, min(int(limit), 100))
+        safe_offset = max(0, int(offset))
+        page = matches[safe_offset:safe_offset + safe_limit]
+        return json.dumps({
+            "query": query,
+            "total": len(matches),
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "skills": page,
+            "has_more": safe_offset + len(page) < len(matches),
+        }, ensure_ascii=False)
 
     def _load_skill(self, skill_dir: Path, name: str) -> str:
         """Tier 2: Load full SKILL.md with parsed metadata."""

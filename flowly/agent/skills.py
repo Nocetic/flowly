@@ -394,6 +394,9 @@ class SkillsLoader:
         self,
         entries: list[dict],
         available_tools: set[str] | None,
+        *,
+        max_chars: int | None = None,
+        intent_text: str = "",
     ) -> str:
         """Render the ``<skills>`` XML from snapshot entries.
 
@@ -409,28 +412,131 @@ class SkillsLoader:
                 return desc
             return desc[:max_len - 3] + "..."
 
-        lines = ["<skills>"]
+        visible_entries = []
         for entry in entries:
             skill_meta = entry.get("skill_meta") or {}
             if available_tools and not self._skill_should_show(skill_meta, available_tools):
                 continue
+            visible_entries.append(entry)
+
+        # Backward-compatible full renderer for diagnostics, tests, and callers
+        # that explicitly request the legacy catalog.  Production supplies a
+        # budget and receives the progressive form below.
+        if max_chars is None:
+            lines = ["<skills>"]
+            for entry in visible_entries:
+                available = bool(entry.get("available", True))
+                name = escape_xml(entry["name"])
+                desc = truncate_desc(escape_xml(entry.get("description") or name))
+                path = escape_xml(entry["path"])
+                lines.append(f"  <skill available=\"{str(available).lower()}\">")
+                lines.append(f"    <name>{name}</name>")
+                lines.append(f"    <description>{desc}</description>")
+                lines.append(f"    <location>{path}</location>")
+                if not available:
+                    missing = entry.get("missing") or ""
+                    if missing:
+                        lines.append(f"    <requires>{escape_xml(missing)}</requires>")
+                lines.append("  </skill>")
+            lines.append("</skills>")
+            return "\n".join(lines)
+
+        if not visible_entries:
+            return ""
+
+        # Progressive form: a complete compact name index guarantees discovery
+        # while descriptions are spent only on the most relevant entries.
+        # Full bodies remain behind skill_view.  Ranking is deterministic and
+        # lexical so this adds no model/embedding request.
+        def terms(text: str) -> set[str]:
+            return {
+                token
+                for token in re.findall(r"[a-z0-9_+.-]{2,}", text.lower())
+                if token not in {
+                    "the", "and", "for", "with", "from", "this", "that",
+                    "use", "when", "skill", "bir", "ile", "için", "olan",
+                }
+            }
+
+        query_terms = terms(intent_text)
+
+        def relevance(indexed: tuple[int, dict]) -> tuple[float, int]:
+            index, entry = indexed
+            if not query_terms:
+                return (0.0, -index)
+            name_text = str(entry.get("name") or "").lower()
+            desc_text = str(entry.get("description") or "").lower()
+            meta = entry.get("skill_meta") or {}
+            meta_text = " ".join([
+                str(meta.get("category") or ""),
+                *[str(tag) for tag in (meta.get("tags") or [])],
+            ]).lower()
+            name_terms = terms(name_text)
+            desc_terms = terms(desc_text)
+            meta_terms = terms(meta_text)
+            score = 12.0 * len(query_terms & name_terms)
+            score += 4.0 * len(query_terms & meta_terms)
+            score += 2.0 * len(query_terms & desc_terms)
+            if name_text and name_text in intent_text.lower():
+                score += 40.0
+            return (score, -index)
+
+        ranked = [entry for _, entry in sorted(
+            enumerate(visible_entries),
+            key=relevance,
+            reverse=True,
+        )]
+
+        names = [escape_xml(str(entry["name"])) for entry in visible_entries]
+        index_line = "  <skill_index>" + " | ".join(names) + "</skill_index>"
+        footer = "</skills>"
+        header = f"<skills count=\"{len(visible_entries)}\">"
+        base = "\n".join([header, index_line, footer])
+
+        # Extremely large private libraries can exceed even the whole budget
+        # with names alone.  Mark the index as truncated; skill_view(search/list)
+        # remains the lossless fallback and is advertised in its tool schema.
+        if len(base) > max_chars:
+            allowance = max(0, max_chars - len(header) - len(footer) - 80)
+            compact = " | ".join(names)
+            compact = compact[:allowance].rsplit(" | ", 1)[0]
+            return "\n".join([
+                header,
+                f"  <skill_index truncated=\"true\">{compact}</skill_index>",
+                footer,
+            ])[:max_chars]
+
+        lines = [header]
+        # Reserve the complete index and closing tag before adding details.
+        reserved = len(index_line) + len(footer) + 2
+        for entry in ranked:
             available = bool(entry.get("available", True))
             name = escape_xml(entry["name"])
             desc = truncate_desc(escape_xml(entry.get("description") or name))
-            path = escape_xml(entry["path"])
-            lines.append(f"  <skill available=\"{str(available).lower()}\">")
-            lines.append(f"    <name>{name}</name>")
-            lines.append(f"    <description>{desc}</description>")
-            lines.append(f"    <location>{path}</location>")
+            detail = [f"  <skill available=\"{str(available).lower()}\">"]
+            detail.append(f"    <name>{name}</name>")
+            detail.append(f"    <description>{desc}</description>")
             if not available:
                 missing = entry.get("missing") or ""
                 if missing:
-                    lines.append(f"    <requires>{escape_xml(missing)}</requires>")
-            lines.append("  </skill>")
+                    detail.append(f"    <requires>{escape_xml(missing)}</requires>")
+            detail.append("  </skill>")
+            detail_text = "\n".join(detail)
+            projected = len("\n".join(lines)) + len(detail_text) + reserved + 2
+            if projected > max_chars:
+                continue
+            lines.extend(detail)
+        lines.append(index_line)
         lines.append("</skills>")
         return "\n".join(lines)
 
-    def build_skills_summary(self, available_tools: set[str] | None = None) -> str:
+    def build_skills_summary(
+        self,
+        available_tools: set[str] | None = None,
+        *,
+        max_chars: int | None = None,
+        intent_text: str = "",
+    ) -> str:
         """Build XML summary of skills with caching and conditional activation.
 
         Two-tier cache (see module docstring at top of file):
@@ -452,6 +558,8 @@ class SkillsLoader:
             str(self.managed_skills),
             str(self.builtin_skills),
             tuple(sorted(available_tools)) if available_tools else (),
+            max_chars,
+            intent_text[:500].lower() if max_chars is not None else "",
         )
         if cache_key in _SKILLS_PROMPT_CACHE:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
@@ -471,7 +579,12 @@ class SkillsLoader:
         if not entries:
             return ""
 
-        result = self._render_skills_xml(entries, available_tools)
+        result = self._render_skills_xml(
+            entries,
+            available_tools,
+            max_chars=max_chars,
+            intent_text=intent_text,
+        )
 
         # Save to LRU
         _SKILLS_PROMPT_CACHE[cache_key] = result
