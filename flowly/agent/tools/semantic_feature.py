@@ -250,10 +250,21 @@ def feature_status(metrics: Mapping[str, Any] | None = None) -> dict[str, Any]:
     runtime_available = semantic_runtime_available()
     model_dir = installed_model_dir()
     model_installed = model_dir is not None
-    effective_enabled = configured_enabled and runtime_available and model_installed
+    # Semantic selection augments the deterministic intent router and is built
+    # from the disclosed catalog, so both switches are load-bearing. Without
+    # this the owner could be recommended a 245 MiB download, accept it, and
+    # get a permanently idle router — the config says enabled while nothing
+    # ever asks it to route.
+    routing_usable = bool(discovery.enabled) and bool(discovery.intent_routing_enabled)
+    effective_enabled = (
+        configured_enabled
+        and routing_usable
+        and runtime_available
+        and model_installed
+    )
     deferred_count = max(0, int(metrics.get("deferredToolCount") or 0))
     schema_tokens = max(0, int(metrics.get("deferredSchemaTokens") or 0))
-    eligible = bool(metrics.get("eligible")) and (
+    eligible = bool(metrics.get("eligible")) and routing_usable and (
         deferred_count >= int(discovery.semantic_recommendation_min_tools)
         and schema_tokens >= int(discovery.semantic_recommendation_min_schema_tokens)
     )
@@ -284,7 +295,11 @@ def feature_status(metrics: Mapping[str, Any] | None = None) -> dict[str, Any]:
     elif consent == "dismissed":
         state = "dismissed"
     elif consent == "enabled":
-        state = "needs_download" if runtime_available else "unsupported"
+        state = (
+            "needs_download"
+            if runtime_available and routing_usable
+            else "unsupported"
+        )
     elif eligible and runtime_available:
         state = "recommended"
     elif eligible:

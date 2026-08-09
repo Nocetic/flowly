@@ -260,3 +260,42 @@ def test_persisted_shape_uses_camel_case_and_preserves_siblings() -> None:
     assert discovery["semanticRoutingConsent"] == "dismissed"
     assert discovery["semanticRoutingEnabled"] is False
     assert raw["tools"]["exec"]["enabled"] is True
+
+
+def _disable_intent_routing() -> None:
+    """Write the one config shape that makes the local model dead weight."""
+    home = semantic_feature.get_flowly_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(json.dumps({
+        "tools": {"routing": {"discovery": {"intentRoutingEnabled": False}}}
+    }))
+
+
+def test_no_recommendation_when_nothing_would_ask_the_router(monkeypatch) -> None:
+    """Semantic selection only runs through the intent router. With that off
+    the model can never be consulted, so recommending its download would spend
+    245 MiB of the owner's bandwidth on a permanently idle subsystem."""
+    monkeypatch.setattr(semantic_feature, "semantic_runtime_available", lambda: True)
+    monkeypatch.setattr(semantic_feature, "installed_model_dir", lambda cache_dir=None: None)
+    _disable_intent_routing()
+
+    status = semantic_feature.feature_status(_metrics())
+
+    assert status["state"] == "idle"
+    assert status["recommended"] is False
+
+
+def test_installed_model_reports_unsupported_while_routing_is_off(monkeypatch) -> None:
+    """An owner who already accepted must not be told to 'finish setup' forever,
+    and must not read 'enabled' for a router no turn will ever call."""
+    monkeypatch.setattr(semantic_feature, "semantic_runtime_available", lambda: True)
+    monkeypatch.setattr(
+        semantic_feature, "installed_model_dir", lambda cache_dir=None: Path("/models"),
+    )
+    _disable_intent_routing()
+    semantic_feature.persist_semantic_preference(consent="enabled", enabled=True)
+
+    status = semantic_feature.feature_status(_metrics())
+
+    assert status["state"] == "unsupported"
+    assert status["enabled"] is False
