@@ -625,7 +625,17 @@ BUILTIN_SLASH_COMMANDS: list[dict[str, str]] = [
 ]
 
 
-def build_commands_catalogue() -> dict[str, list[dict[str, Any]]]:
+def _builtin_slash_commands(surface: str | None = None) -> list[dict[str, str]]:
+    """Build the built-in list for one client without mutating global state."""
+    return [
+        {"name": command.name, "description": command.description}
+        for command in _gateway_commands(surface)
+    ]
+
+
+def build_commands_catalogue(
+    *, surface: str | None = None,
+) -> dict[str, list[dict[str, Any]] | int]:
     """Return the slash command catalogue grouped by command source.
 
     Built-ins are always present. Plugins, bundles, and skills are best-effort
@@ -633,6 +643,7 @@ def build_commands_catalogue() -> dict[str, list[dict[str, Any]]]:
     doesn't exist, those categories come back empty rather than the whole call
     failing. The caller wraps this in the appropriate RPC envelope.
     """
+    builtin_cmds = _builtin_slash_commands(surface)
     plugin_cmds: list[dict[str, Any]] = []
     try:
         from flowly.plugins import get_plugin_manager
@@ -660,7 +671,7 @@ def build_commands_catalogue() -> dict[str, list[dict[str, Any]]]:
     skill_cmds: list[dict[str, Any]] = []
     reserved = {
         _slugify(entry["name"])
-        for entry in BUILTIN_SLASH_COMMANDS
+        for entry in builtin_cmds
     }
     reserved.update(_slugify(entry["name"]) for entry in plugin_cmds)
     reserved.update(_slugify(entry["name"]) for entry in bundle_cmds)
@@ -686,7 +697,7 @@ def build_commands_catalogue() -> dict[str, list[dict[str, Any]]]:
     skill_cmds = skill_cmds[:_MAX_SKILL_COMMANDS]
 
     return {
-        "builtin": list(BUILTIN_SLASH_COMMANDS),
+        "builtin": builtin_cmds,
         "plugin": plugin_cmds,
         "bundle": bundle_cmds,
         "skill": skill_cmds,

@@ -6,7 +6,7 @@ demos are real screenshots and screen recordings.
 
 | File | Used for | Replace with | Suggested size |
 |---|---|---|---|
-| `banner.png` | Top hero banner — **final** (designed in Figma, serif title + antique current-chart art) | — | 1300×300 |
+| `banner.png` | Top hero banner — **final** (designed in Figma, brand mark + `Knows your world. Answers to you.`) | — | 1300×433 |
 | `diagram.png` | Channels → core → provider stack — **final** (Figma, brand turquoise) | — | 1300×440 |
 | `architecture.png` | Detailed architecture (clients → sandboxed gateway → provider) — **final** (Figma) | — | 1300×760 |
 | `demo-tui.png` | Terminal TUI demo — **real screenshot** (token + emails redacted) | a GIF if you want motion | 1139×814 |

@@ -7,12 +7,11 @@ description: The fastest path from nothing to a working agent — install, pick 
 ## 1. Install
 
 ```bash
-curl -fsSL https://useflowlyapp.com/install.sh | bash   # recommended (macOS / Linux)
+curl -fsSL https://useflowlyapp.com/install.sh | bash   # macOS / Linux
 # Windows: irm https://useflowlyapp.com/install.ps1 | iex
-# or a packaged PyPI install: uv tool install flowly-ai
 ```
 
-The native script manages Python for you (via uv) and installs a git checkout, so `flowly update` can pull new versions between releases. The packaged `uv tool` / `pip` installs need **Python ≥ 3.11** and track PyPI. Works on macOS, Linux, and Windows. See [Installation](./installation.md) for all methods.
+The script manages Python for you (via uv) and installs Flowly as a git checkout, so `flowly update` pulls new versions between releases. Works on macOS, Linux, and Windows. See [Installation](./installation.md) for details.
 
 ## 2. Pick a provider
 
@@ -20,7 +19,9 @@ The native script manages Python for you (via uv) and installs a git checkout, s
 flowly setup
 ```
 
-`flowly setup` opens the first-run picker. Choose how to power Flowly: **sign in with a Flowly account** (managed, nothing else to configure) or **bring your own API key** (OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI, Sakana — plus Zhipu and a self-hosted vLLM endpoint via the advanced picker). Configuring one of these is the only mandatory step — everything else (channels, tools, integrations) is optional. On a fresh install this picker also opens automatically right after `curl … | bash`.
+`flowly setup` asks how to power Flowly. **Quick** signs you in with a Flowly account — no API key, no billing setup, no model to choose. **Full** opens the complete provider list if you'd rather bring your own key (OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI, Zhipu, Sakana, a ChatGPT or Grok subscription, or a self-hosted vLLM endpoint) and continues into channels and integrations. This is the only mandatory step — everything else is optional and can be added later.
+
+Setup then sends one small request to check the provider actually answers, so a mistyped key or an empty balance surfaces here rather than in your first conversation. On a fresh install it opens automatically right after `curl … | bash`.
 
 > [!TIP]
 > If you already have a key and want to skip the picker, do it in one shot:

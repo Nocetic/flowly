@@ -11,33 +11,26 @@ flowly update            # check, upgrade in place, restart the gateway
 flowly update --check    # just tell me if a newer version exists
 ```
 
-How Flowly checks for an update depends on how it's installed. A native-script
-**git checkout** fetches its branch from git and measures how many commits it's
-behind; the **packaged** installs read the latest release from PyPI. Either way,
-if there's something newer Flowly upgrades in place and restarts the gateway so
-the new code takes effect. There's **no confirmation prompt**: running the
-command is the confirmation (use `--check` for a dry look). On Windows, the
-**PyPI** upgrade paths relaunch through a small detached helper so the running
-`flowly.exe` isn't locked while pip replaces it; the git-checkout path doesn't
-need that — its launcher runs `python -m flowly`, so nothing has to overwrite a
-running executable.
+Flowly installs as a **git checkout** (that's what the install script sets up),
+so `update` fetches the branch from git, measures how many commits it's behind,
+then pulls (`git pull --ff-only`, autostashing any local changes), reinstalls,
+and restarts the gateway so the new code takes effect. There's **no
+confirmation prompt**: running the command is the confirmation (use `--check`
+for a dry look). Nothing has to overwrite a running executable — the launcher
+runs `python -m flowly`, so a pull under a live gateway is safe.
 
-## Install-mode aware
+Two places `update` deliberately does nothing:
 
-`flowly update` figures out **how** Flowly is installed and uses the matching
-upgrade path. You never pick the command:
+- **Inside Flowly Desktop** — the app owns its embedded copy of the agent and
+  updates it itself (see below).
+- **A legacy packaged install** (the old PyPI `flowly-ai` package via
+  `uv tool` / `pipx` / `pip`) — those no longer receive releases. Re-run the
+  install script and it migrates the install in place, keeping your `~/.flowly`
+  data and your background service:
 
-| How you installed | What `update` runs |
-| --- | --- |
-| Native install script (git checkout) | `git pull --ff-only` + editable reinstall |
-| `uv tool` | `uv tool upgrade flowly-ai` |
-| `pipx` | `pipx upgrade flowly-ai` |
-| `pip` | `pip install --upgrade flowly-ai` |
-| **Inside Flowly Desktop** | **nothing** — the app owns its binary (see below) |
-
-The native `curl … | bash` / `irm … | iex` installers produce the git-checkout
-(source) install, so most users land on the first row: `flowly update` pulls the
-latest commit straight from git, no PyPI release required.
+  ```bash
+  curl -fsSL https://useflowlyapp.com/install.sh | bash
+  ```
 
 ## Flowly Desktop is separate
 
@@ -57,14 +50,13 @@ touch each other, because they're physically separate installs.
 | --- | --- |
 | `--check` | Only report whether a newer version exists; don't install. |
 | `--yes`, `-y` | No-op, kept for back-compat — `update` no longer prompts, so there's nothing to confirm. |
-| `--force` | Reinstall the latest even if you're already up to date (or PyPI is unreachable). |
+| `--force` | Reinstall the latest even if you're already up to date. |
 | `--no-restart` | Upgrade but don't bounce the gateway — run `flowly restart` yourself later. |
 
 ## What happens on a successful update
 
-1. Flowly is upgraded via the matching command — a git checkout is pulled
-   (`git pull --ff-only`, autostashing any local changes) and reinstalled
-   editable; a packaged install is upgraded in place.
+1. The checkout is pulled (`git pull --ff-only`, autostashing any local
+   changes) and reinstalled editable.
 2. Stale bytecode (`__pycache__`) is cleared so a restart doesn't import a
    half-old/half-new mix.
 3. The gateway is restarted via the smart [`flowly restart`](/docs/using-flowly/service)
@@ -73,9 +65,6 @@ touch each other, because they're physically separate installs.
 
 ## Pitfalls
 
-- **PyPI unreachable.** For a packaged install, if the version check can't reach
-  PyPI, `update` stops unless you pass `--force`. A git checkout fetches from its
-  git remote instead, so this doesn't apply to it.
 - **Foreground gateway.** A gateway started with `flowly gateway` in a terminal
   can't be restarted from outside that terminal — `update` tells you, and you
   restart it where it's running.

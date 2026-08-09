@@ -4,7 +4,7 @@
 # (uv downloads and manages Python itself — no system Python required), and
 # install Flowly into it as an editable checkout. Because the install lives in a
 # real git checkout, `flowly update` fast-forwards it with `git pull` instead of
-# waiting for a PyPI release. Git is fetched as portable MinGit when missing — no
+# waiting for a packaged release. Git is fetched as portable MinGit when missing — no
 # admin rights, isolated from any system Git. Flowly Desktop ships its own
 # embedded runtime separately; this script never touches it.
 

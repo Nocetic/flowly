@@ -26,20 +26,42 @@ def test_blank_mode_skips_config_but_offers_gateway(monkeypatch):
     """
     calls = []
     monkeypatch.setattr(ob, "_setup_home_menu", lambda: "blank")
-    monkeypatch.setattr(ob, "_run_provider_step", lambda: calls.append("provider") or True)
+    monkeypatch.setattr(
+        ob, "_run_provider_step", lambda **kw: calls.append("provider") or True
+    )
+    monkeypatch.setattr(ob, "_verify_provider", lambda **kw: calls.append("verify") or True)
     monkeypatch.setattr(ob, "_configure_channels", lambda: calls.append("channels"))
     monkeypatch.setattr(ob, "_configure_tools", lambda: calls.append("tools"))
     monkeypatch.setattr(ob, "_configure_media", lambda: calls.append("media"))
     monkeypatch.setattr(ob, "_show_summary", lambda: calls.append("summary"))
     monkeypatch.setattr(ob, "_offer_start_gateway", lambda: calls.append("gateway"))
     ob._run_setup_home()
-    assert calls == ["provider", "summary", "gateway"]  # no channels/tools/media
+    assert calls == ["provider", "verify", "summary", "gateway"]  # no channels/tools/media
+
+
+def test_blank_mode_does_not_ask_for_a_model(monkeypatch):
+    """Model choice belongs to Full. A first-run user hasn't sent a message
+    yet, so "which model?" is a question they cannot answer; the provider's
+    curated default carries them, and /model is one keystroke later."""
+    seen = {}
+    monkeypatch.setattr(ob, "_setup_home_menu", lambda: "blank")
+    monkeypatch.setattr(
+        ob, "_run_provider_step", lambda **kw: seen.update(kw) or True
+    )
+    monkeypatch.setattr(ob, "_verify_provider", lambda **kw: True)
+    monkeypatch.setattr(ob, "_show_summary", lambda: None)
+    monkeypatch.setattr(ob, "_offer_start_gateway", lambda: None)
+    ob._run_setup_home()
+    assert seen == {"ask_model": False}
 
 
 def test_full_mode_configures_channels_tools_media(monkeypatch):
     calls = []
     monkeypatch.setattr(ob, "_setup_home_menu", lambda: "full")
-    monkeypatch.setattr(ob, "_run_provider_step", lambda: calls.append("provider") or True)
+    monkeypatch.setattr(
+        ob, "_run_provider_step", lambda **kw: calls.append("provider") or True
+    )
+    monkeypatch.setattr(ob, "_verify_provider", lambda **kw: True)
     monkeypatch.setattr(ob, "_configure_channels", lambda: calls.append("channels"))
     monkeypatch.setattr(ob, "_configure_tools", lambda: calls.append("tools"))
     monkeypatch.setattr(ob, "_configure_media", lambda: calls.append("media"))
@@ -49,14 +71,52 @@ def test_full_mode_configures_channels_tools_media(monkeypatch):
     assert calls == ["provider", "channels", "tools", "media", "summary", "gateway"]
 
 
-def test_quick_mode_is_provider_then_chat(monkeypatch):
+def test_quick_mode_signs_in_without_showing_the_provider_list(monkeypatch):
+    """Quick asks ONE question, and it isn't "which of these twelve?".
+
+    The account sign-in needs no key, no billing setup and no model decision,
+    so Quick commits to it; anyone who wants their own key picks Full. The
+    picker must not appear here — that was the step a first-run user had no
+    basis to answer.
+    """
     calls = []
     monkeypatch.setattr(ob, "_setup_home_menu", lambda: "quick")
-    monkeypatch.setattr(ob, "_run_provider_step", lambda: calls.append("provider") or True)
+    monkeypatch.setattr(
+        ob,
+        "_run_provider_step",
+        lambda **kw: calls.append("picker") or True,  # must NOT be reached
+    )
+    monkeypatch.setattr(ob, "_run_managed_login", lambda: calls.append("sign-in"))
+    monkeypatch.setattr(ob, "_already_configured", lambda: True)
+    monkeypatch.setattr(ob, "_verify_provider", lambda **kw: calls.append("verify") or True)
     monkeypatch.setattr(ob, "_show_summary", lambda: calls.append("summary"))
     monkeypatch.setattr(ob, "_offer_start_gateway", lambda: calls.append("gateway"))
     ob._run_setup_home()
-    assert calls == ["provider", "summary", "gateway"]
+    assert calls == ["sign-in", "verify", "summary", "gateway"]
+    assert "picker" not in calls
+
+
+def test_quick_mode_returns_home_when_sign_in_leaves_nothing_usable(monkeypatch):
+    """Sign-in can succeed while the credential behind it never arrives."""
+    calls = []
+    monkeypatch.setattr(ob, "_setup_home_menu", lambda: "quick")
+    monkeypatch.setattr(ob, "_run_managed_login", lambda: calls.append("sign-in"))
+    monkeypatch.setattr(ob, "_already_configured", lambda: False)
+    monkeypatch.setattr(ob, "_warn_signed_in_but_unusable", lambda: calls.append("warned"))
+    monkeypatch.setattr(ob, "_verify_provider", lambda **kw: calls.append("verify") or True)
+    monkeypatch.setattr(ob, "_show_summary", lambda: calls.append("summary"))
+    monkeypatch.setattr(ob, "_offer_start_gateway", lambda: calls.append("gateway"))
+
+    # The home would loop forever on a failed mode; stop after the first pass.
+    seen = {"n": 0}
+
+    def _menu():
+        seen["n"] += 1
+        return "quick" if seen["n"] == 1 else "quit"
+
+    monkeypatch.setattr(ob, "_setup_home_menu", _menu)
+    ob._run_setup_home()
+    assert calls == ["sign-in", "warned"]  # no verify/summary/gateway on failure
 
 
 def test_gateway_offer_reports_success_only_for_zero_exit(monkeypatch):
@@ -122,7 +182,7 @@ def test_backing_out_of_a_mode_returns_to_home(monkeypatch):
     calls = []
     menu = iter(["blank", "quit"])  # back out of blank → home re-shows → quit
     monkeypatch.setattr(ob, "_setup_home_menu", lambda: next(menu))
-    monkeypatch.setattr(ob, "_run_provider_step", lambda: False)  # user backed out
+    monkeypatch.setattr(ob, "_run_provider_step", lambda **kw: False)  # user backed out
     monkeypatch.setattr(ob, "_already_configured", lambda: False)
     monkeypatch.setattr(ob, "_show_summary", lambda: calls.append("summary"))
     monkeypatch.setattr(ob, "_offer_start_gateway", lambda: calls.append("gateway"))

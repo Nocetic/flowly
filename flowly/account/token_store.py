@@ -110,6 +110,24 @@ def _default_keychain_path(value: Any) -> Path | None:
     return Path(os.path.expanduser(raw))
 
 
+def _sandboxed_away_from_keychain() -> bool:
+    """True when this process runs inside Flowly's own sandbox on macOS.
+
+    The CLI re-execs itself under ``sandbox-exec`` (default-on), and that
+    profile masks ``~/Library/Keychains`` — protecting the user's credentials
+    from the agent, which is the point. The side effect is that the keychain
+    is unreachable *by our own design*, so the pre-flight below can't help:
+    it reads the same masked paths and, on a Mac that happens to have a
+    ``com.apple.security.plist`` without a ``DefaultKeychain`` key, resolves
+    to "uncertain — try it" and walks into the dialog. Measured, not assumed:
+    inside the profile even ``stat()`` on login.keychain-db raises
+    PermissionError.
+    """
+    if sys.platform != "darwin":
+        return False
+    return bool(os.environ.get("FLOWLY_SANDBOX_WRAPPED"))
+
+
 def _macos_keychain_missing() -> bool:
     """True only when we can *prove* this Mac has no default keychain.
 
@@ -214,6 +232,17 @@ def _try_keyring():
     is written, so a repaired Mac recovers on its own.
     """
     global _KEYRING_DISABLED, _MACOS_KEYCHAIN_MISSING
+    if _sandboxed_away_from_keychain():
+        # Our own sandbox denies ~/Library/Keychains (see
+        # flowly/sandbox/cli_wrap.py `_DENY_READ_PATHS_REL`), so reaching for
+        # the keychain here can only ever end one way: macOS puts up
+        # "A keychain cannot be found to store …" mid-sign-in, the user
+        # dismisses it, and we land on the file fallback anyway — having
+        # blamed their Mac for our own policy. Skip straight to the file, and
+        # deliberately do NOT write the broken-keychain marker: nothing is
+        # broken, and an unsandboxed run (or the desktop) should still use the
+        # keychain normally.
+        return None
     if _KEYRING_DISABLED is None:
         # First call this process — seed the in-process latch from disk
         # so the very first save/load doesn't hit the OS dialog if a prior

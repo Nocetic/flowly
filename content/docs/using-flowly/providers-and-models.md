@@ -111,7 +111,9 @@ The active provider is resolved in this priority order:
 
 1. `providers.active`, if that provider is currently usable (sticky; falls through if not).
 2. `flowly` hosted, if enabled and signed in.
-3. The BYOK cascade — first usable of `openrouter`, `anthropic`, `openai`, `openai_codex`, `xai`, `xai_oauth`, `gemini`, `groq`, `zhipu`, `sakana`, `vllm`.
+3. The BYOK cascade — first usable of `openrouter`, `anthropic`, `openai`, `openai_codex`, `zai_coding`, `xai`, `xai_oauth`, `gemini`, `groq`, `zhipu`, `sakana`, `vllm`.
+
+Because `openai_codex` and `zai_coding` can read a login you made in another tool (the Codex CLI, OpenCode), the cascade may find a provider you never configured in Flowly. `flowly setup` surfaces that as a choice rather than using it silently, and picking anything writes `providers.active` — after which the cascade no longer applies.
 
 Switch live from the TUI:
 
@@ -122,13 +124,25 @@ Switch live from the TUI:
 
 Both open a picker if you omit the argument. `/model`'s picker loads the live catalog for the active provider.
 
+### When Flowly changes the model for you
+
+Only in one situation: **switching providers**. If the provider you switch to
+can't serve the model you're on (Anthropic can't serve an OpenRouter-only id,
+say), Flowly moves you to that provider's curated default in the same write
+and tells you — `model → claude-haiku-4-5` — rather than letting your next
+message fail.
+
+Your choice is never rewritten in the background otherwise. A model that a
+catalogue lookup can't confirm stays exactly as you set it; if a plan really
+can't serve it, the request says so, which is information you can act on.
+
 ### Hot-reload
 
 `/provider` and `/model` write config and tell the running gateway to reload — no restart. The gateway re-reads config, re-resolves the active provider, and **builds the new provider before swapping**, so a build error (for example an empty key) leaves the old provider in place. If the gateway is offline, the TUI reports "gateway offline — restart to apply".
 
 ### Choosing the model
 
-The model is chosen during `flowly setup` and changed later via `/model` (or `/provider` to switch providers). It is stored as `agents.defaults.model` in `config.json`:
+Each provider ships with a sensible default model, so the first run never asks you to pick one — you can start chatting and change it whenever you have an opinion. Choose one with `/model` in the chat, or by taking the **Full** path in `flowly setup`. It is stored as `agents.defaults.model` in `config.json`:
 
 ```json
 {

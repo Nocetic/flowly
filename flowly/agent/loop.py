@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -40,8 +41,20 @@ from flowly.agent.subagent import SubagentManager
 from flowly.session.manager import SessionManager
 from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
-from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
-from flowly.compaction.estimator import estimate_messages_tokens
+from flowly.compaction.types import (
+    CompactionConfig,
+    CompactionError,
+    SUMMARY_METADATA_KEY,
+    build_summary_content,
+    is_summary_message,
+)
+from flowly.compaction.pruning import split_into_turn_blocks
+from flowly.compaction.service import count_conversational_messages
+from flowly.compaction.estimator import (
+    estimate_message_tokens,
+    estimate_messages_tokens,
+    estimate_tokens,
+)
 from flowly.exec.types import ExecConfig
 from flowly.config.schema import TrelloConfig, VoiceBridgeConfig, XConfig, MemorySearchConfig
 from flowly.audit.logger import get_audit_logger
@@ -394,6 +407,88 @@ def _relabel_codex_projected_pair(
 # prefixed so the provider layer strips it before the API call.
 _EPHEMERAL_NUDGE = "_ephemeral_nudge"
 
+# A memory-flush turn is one provider round trip. Bounded for the same reason
+# every other call on the compaction path is (see
+# ``summarizer.SUMMARY_CALL_TIMEOUT_SECONDS``).
+MEMORY_FLUSH_TIMEOUT_SECONDS = 120.0
+
+# How long the post-turn pass waits before doing anything, so the turn's own
+# reply is on the wire before its compaction announces itself. See
+# ``_post_turn_compaction`` — this is an ordering requirement, not a fudge.
+POST_TURN_SETTLE_SECONDS = 2.0
+
+# Backstop for one whole post-turn pass (flush + staged summarisation + commit).
+# Generous: every call inside is already individually bounded, so reaching this
+# means something unforeseen wedged — and the session's background slot must
+# free itself rather than stay taken until the process restarts.
+POST_TURN_COMPACTION_TIMEOUT_SECONDS = 900.0
+
+
+class _CompactionCycle:
+    """One compaction's UI lifecycle, with the invariants enforced here.
+
+    Use as an async context manager. Leaving the block closes the cycle if the
+    caller did not: nothing announced stays silent, anything announced always
+    gets a terminal.
+    """
+
+    def __init__(self, loop: "AgentLoop", session_key: str) -> None:
+        self._loop = loop
+        self._session_key = session_key
+        self.id: str = ""
+        self._closed = False
+        self._epoch = loop.context_epoch(session_key)
+
+    @property
+    def announced(self) -> bool:
+        return bool(self.id)
+
+    async def start(self, tokens_before: int) -> str:
+        """Announce. Callers do this only once they own the session lock."""
+        if self.announced:
+            return self.id
+        self.id = self._loop._new_compaction_id()
+        await self._loop._emit_compaction_event(
+            self._session_key, "started", tokens_before, 0, 0,
+            compaction_id=self.id,
+        )
+        return self.id
+
+    async def complete(self, before: int, after: int, removed: int) -> None:
+        await self._close("completed", before, after, removed)
+
+    async def fail(self, before: int = 0, after: int = 0) -> None:
+        await self._close("failed", before, after, 0)
+
+    async def _close(self, phase: str, before: int, after: int, removed: int) -> None:
+        # A terminal for work that never announced would show the user a
+        # result for something they were never told had begun.
+        if not self.announced or self._closed:
+            return
+        self._closed = True
+        if self._loop.context_epoch(self._session_key) != self._epoch:
+            # The conversation was reset while this ran. Its clients were
+            # already told (the reset clears the live status), and re-recording
+            # a terminal here would hand the FRESH chat an old compaction's
+            # failure through the re-entry handshake for the next minute.
+            logger.debug(
+                "[compaction] dropping terminal for a conversation that was reset"
+            )
+            return
+        await self._loop._emit_compaction_event(
+            self._session_key, phase, before, after, removed,
+            compaction_id=self.id,
+        )
+
+    async def __aenter__(self) -> "_CompactionCycle":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        # Whatever happened — a refusal to commit, a provider blowing up, a
+        # cancellation — an announced cycle does not leave a notice running.
+        await self.fail()
+        return False
+
 
 def _drop_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter internal corrective nudges out of a turn's messages before
@@ -403,6 +498,39 @@ def _drop_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any
     if not any(m.get(_EPHEMERAL_NUDGE) for m in messages):
         return messages
     return [m for m in messages if not m.get(_EPHEMERAL_NUDGE)]
+
+
+def _emergency_trim(
+    messages: list[dict[str, Any]],
+    keep_last: int = 20,
+) -> list[dict[str, Any]]:
+    """Shrink a history we failed to summarise, without breaking tool pairs.
+
+    Used only when compaction errored and the turn still has to go out. Keeps
+    every system message plus the most recent whole turn blocks that fit in
+    ``keep_last`` messages. Slicing raw messages instead would strand a
+    ``tool`` result from its ``assistant.tool_calls`` and earn a provider 400
+    on top of the failure we're already recovering from.
+
+    This affects the turn's working copy only — the session on disk keeps
+    everything.
+    """
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
+    blocks = split_into_turn_blocks(non_system)
+    if not blocks:
+        return system_msgs
+
+    kept: list[dict[str, Any]] = []
+    for block in reversed(blocks):
+        if kept and len(kept) + len(block) > keep_last:
+            break
+        kept = block + kept
+    if not kept:
+        # Newest block alone exceeds the budget — take it anyway; a whole
+        # block is the smallest thing we are allowed to send.
+        kept = blocks[-1]
+    return system_msgs + kept
 
 
 def _strip_old_tool_results(
@@ -487,6 +615,48 @@ _REDACT_LOG_FIELDS = frozenset({
     "cdnUrl", "cdn_url",
     "s3Key", "s3_key",
 })
+
+
+def context_occupancy_tokens(
+    usage: dict[str, Any] | None, provider_name: str = "",
+) -> int:
+    """How much of the context window the turn described by ``usage`` occupies.
+
+    CACHED INPUT COUNTS, ONCE. Native Anthropic reports ``input_tokens`` for
+    the uncached remainder, with the cached prefix in separate
+    ``cache_read``/``cache_write`` fields. OpenAI-compatible providers do the
+    opposite: ``prompt_tokens`` is already the full input and their cache
+    fields are a diagnostic subset. Treating both shapes like Anthropic
+    double-counted a cached OpenRouter request and could trigger compaction far
+    too early; treating both like OpenAI drew a nearly-empty context ring on a
+    cached Anthropic conversation that was in fact nearly full. Cache tokens
+    occupy the window like any other input — the provider dialect only decides
+    where they live in the usage envelope.
+
+    The reply counts too: it is history the next request carries.
+
+    One answer for the compaction trigger AND the number the clients render, so
+    the ring and "compaction is imminent" never tell the user two different
+    stories. ``0`` means "no usable reading" — never "the context is empty".
+
+    Takes the provider name rather than reading it off a loop instance: it is
+    pure arithmetic over one wire dialect, and it is the number every surface
+    (gateway, relay, TUI) needs to agree on.
+    """
+    if not isinstance(usage, dict) or not usage:
+        return 0
+    try:
+        total = int(usage.get("prompt_tokens", 0) or 0)
+        total += int(usage.get("completion_tokens", 0) or 0)
+        if provider_name == "anthropic":
+            total += int(usage.get("cache_read_tokens", 0) or 0)
+            total += int(usage.get("cache_write_tokens", 0) or 0)
+        if total <= 0:
+            # Older/custom providers sometimes expose only the aggregate.
+            total = int(usage.get("total_tokens", 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    return max(0, total)
 
 
 def _redact_log_args(args: Any) -> Any:
@@ -772,6 +942,8 @@ class AgentLoop:
             logger.warning("Session indexer init failed (search disabled): {}", e)
 
         self._running = False
+        # (route key, tokens) memo for the tool-schema share of each request.
+        self._tool_schema_token_cache: tuple[Any, int] = (None, 0)
         self._on_compaction: Callable | None = None  # set by CLI after creation
         # Fired (session_key, title) when a session is auto-titled. The CLI
         # wires this to the web channel so the relay can encrypt + persist the
@@ -808,6 +980,27 @@ class AgentLoop:
         # coroutine can be garbage-collected mid-flight and silently never
         # finish — exactly the "no title on the server" failure mode.
         self._title_tasks: set[asyncio.Task] = set()
+
+        # One in-flight post-turn compaction per session (strong refs, same
+        # GC rationale as _title_tasks). Keyed by session_key so a turn that
+        # ends while the previous turn's background pass is still summarising
+        # doesn't stack a second one behind it on the session lock.
+        self._post_turn_compaction_tasks: dict[str, asyncio.Task] = {}
+
+        # Provider-reported total (prompt + completion tokens) of each
+        # session's last turn — ground truth where the compaction trigger's
+        # other inputs are estimates. Cleared on every compaction commit so a
+        # stale reading can't re-trigger against already-summarised history.
+        self._last_turn_total_tokens: dict[str, int] = {}
+
+        # How many times each conversation has been RESET (``/clear``, ``/new``).
+        # Deliberately not in session metadata: a reset wipes metadata, so a
+        # counter living there reads the same before and after and cannot
+        # witness the very event it exists to detect. A compaction captures
+        # this alongside its history snapshot and refuses to commit if it
+        # moved — otherwise a summary of the old conversation lands on top of
+        # the empty one the user just asked for.
+        self._context_epoch: dict[str, int] = {}
 
         # One controller owns per-run cancellation for every transport.
         # Streams poll its marker; active tool awaitables are registered with
@@ -4256,15 +4449,17 @@ class AgentLoop:
             # within reserve distance of the EFFECTIVE window (model window,
             # clamped to the Flowly proxy's 80K input cap), microcompact it —
             # old tool results collapse to stubs, recent ones stay verbatim.
-            if iteration > 1:
-                _guard_tokens = estimate_messages_tokens(messages)
-                _guard_limit = (
-                    self.compaction.effective_context_window
-                    - self.compaction.config.reserve_tokens_floor
-                )
-                if _guard_tokens > _guard_limit:
-                    messages = self.compaction.microcompact(messages)
-                    _guard_after = estimate_messages_tokens(messages)
+            #
+            # This runs on the FIRST iteration too: a single oversized message
+            # (a pasted log, a large attachment) can bust the window before any
+            # tool has run, and skipping iteration 1 meant that request went out
+            # unguarded and 413'd.
+            _guard_tokens = estimate_messages_tokens(messages)
+            _guard_limit = self.compaction.compaction_threshold
+            if _guard_tokens > _guard_limit:
+                messages = self.compaction.microcompact(messages)
+                _guard_after = estimate_messages_tokens(messages)
+                if _guard_after < _guard_tokens:
                     logger.info(
                         f"Mid-turn microcompact: {_guard_tokens} → {_guard_after} tokens "
                         f"(limit {_guard_limit}, iteration {iteration})"
@@ -5663,6 +5858,7 @@ class AgentLoop:
         session: Any,
         channel: str,
         chat_id: str,
+        announce: bool = True,
     ) -> None:
         """
         Run a pre-compaction memory flush turn.
@@ -5702,12 +5898,21 @@ class AgentLoop:
         # Add system prompt for flush context
         messages[0]["content"] += f"\n\n{system_prompt}"
 
-        # Run a single turn with tools available
+        # Run a single turn with tools available.
+        #
+        # Bounded like every other provider call on this path. Unbounded, a
+        # hung flush blocks the user's message outright on the pre-turn path
+        # (it runs before the turn's own LLM call), and on the post-turn path
+        # it wedges that session's background slot for the life of the
+        # process — no further post-turn compaction until a restart.
         try:
-            response = await self.provider.chat(
-                messages=messages,
-                tools=flush_definitions,
-                model=self.model
+            response = await asyncio.wait_for(
+                self.provider.chat(
+                    messages=messages,
+                    tools=flush_definitions,
+                    model=self.model,
+                ),
+                timeout=MEMORY_FLUSH_TIMEOUT_SECONDS,
             )
 
             # Execute any tool calls (agent might want to write to memory)
@@ -5729,11 +5934,17 @@ class AgentLoop:
                         disabled_toolsets=_disabled_toolsets,
                     )
 
-            # Check if response should be silent
+            # Check if response should be silent. ``announce`` is False on the
+            # background path: there, nobody is waiting on a turn, so a message
+            # from the flush is not a reply — it is the agent messaging the user
+            # unprompted about its own housekeeping.
             content = response.content or ""
-            if not self.compaction.is_silent_reply(content):
-                # Agent wants to communicate something
-                stripped = self.compaction.strip_silent_token(content)
+            if announce and not self.compaction.is_silent_reply(content):
+                # Agent wants to communicate something. Strip before testing:
+                # a whitespace-only reply is not silent by the token rule, but
+                # it is still nothing to say — unstripped it published an empty
+                # "📝" message to the user.
+                stripped = self.compaction.strip_silent_token(content).strip()
                 if stripped:
                     logger.info(f"Memory flush response: {stripped[:100]}...")
                     # Optionally send to user
@@ -5743,14 +5954,34 @@ class AgentLoop:
                         content=f"📝 {stripped}"
                     ))
 
-            # Save flush interaction to session
-            session.add_message("user", f"[System: Memory Flush] {user_prompt}")
-            session.add_message("assistant", content)
-            self.sessions.save(session)
+            # The flush exchange is NOT written back to the session.
+            #
+            # It used to be, as a "user" turn carrying the flush instruction
+            # ("save any durable facts to disk…") plus the model's reply. Two
+            # things followed. The pair reached the display transcript, so the
+            # user's own chat history grew fake turns they never sent. Worse,
+            # the model reads that history on every later turn and treats a
+            # recent user instruction as still standing: observed live, a user
+            # who answered "thanks" got a file written to their memory folder
+            # and a report about it, because the last instruction the model
+            # could see told it to save memories.
+            #
+            # Nothing is lost by dropping it. Whatever mattered is already on
+            # disk (that is what the flush DOES), and "has this cycle flushed"
+            # is tracked by the compaction service, not by reading history.
+            logger.debug(
+                f"[memory-flush] completed for {session.key} "
+                f"({len(content)} chars, silent={self.compaction.is_silent_reply(content)})"
+            )
 
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Memory flush timed out after {MEMORY_FLUSH_TIMEOUT_SECONDS:.0f}s "
+                "— continuing without it"
+            )
         except Exception as e:
             logger.warning(f"Memory flush failed: {e}")
-    
+
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a single inbound message.
@@ -5825,14 +6056,29 @@ class AgentLoop:
             ))
 
         completed = True
+        outcome: OutboundMessage | None = None
+        # The conversation's identity when this turn began. A /clear from
+        # another device mid-turn makes everything this turn measured describe
+        # history the user has discarded.
+        turn_epoch = self.context_epoch(msg.session_key)
         try:
-            return await self._process_message_inner(msg)
+            outcome = await self._process_message_inner(msg)
+            return outcome
         except Exception:
             completed = False
             raise
         finally:
             self.subagents.mark_idle(msg.session_key)
             self.tools.set_active_session("")
+            # After the reply is on its way: if THIS turn's tool traffic
+            # pushed the session over budget, summarise now in the background
+            # instead of making the user's next message pay the wait.
+            if completed:
+                try:
+                    self._note_turn_usage(msg.session_key, outcome, turn_epoch)
+                    self._schedule_post_turn_compaction(msg)
+                except Exception as e:  # noqa: BLE001 — never fail the turn
+                    logger.debug(f"Post-turn compaction scheduling skipped: {e}")
             # Clear codex-tool turn state so a concurrent session's
             # codex_session call can't read this turn's stream callback.
             self._codex_active_session_key = ""
@@ -5910,9 +6156,8 @@ class AgentLoop:
                 command_args = parts[1] if len(parts) > 1 else ""
 
         if is_command and command in ("new", "clear"):
+            msg_count = self.reset_conversation(msg.session_key)
             session = self.sessions.get_or_create(msg.session_key)
-            msg_count = len(session.messages)
-            session.clear()
             session.metadata["persona"] = self.context.persona
             self.sessions.save(session)
             logger.info(f"Session {msg.session_key} cleared via /{command}")
@@ -5932,10 +6177,20 @@ class AgentLoop:
                     msg.session_key, command_args or None
                 )
                 if result.get("success"):
-                    # Send a compact marker — relay saves to Firestore, client renders as separator
+                    # Every channel gets the outcome in words. This reply is a
+                    # real turn terminal, so it must not be the separator
+                    # string: consumers treat that as "not a terminal" (it
+                    # normally arrives mid-turn), and the run would never
+                    # settle — the chat would sit on "replying" forever. The
+                    # transcript divider comes from the compaction event
+                    # instead; see docs/chat-wire-protocol.md §4.2.
+                    saved = result.get("tokens_before", 0) - result.get("tokens_after", 0)
                     return OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
-                        content="[context-optimized]",
+                        content=(
+                            f"✅ {result.get('message', 'Compacted')}"
+                            + (f" (~{saved:,} tokens freed)" if saved > 0 else "")
+                        ),
                     )
                 else:
                     return OutboundMessage(
@@ -6312,12 +6567,17 @@ class AgentLoop:
             )
         session.metadata["persona"] = current_persona
 
-        # Get history and check for compaction
-        history = session.get_history(max_messages=self.context_messages)
+        # Get history and check for compaction. The session-length snapshot
+        # travels with the history snapshot: if this turn ends up committing a
+        # compaction, anything appended past this point by a concurrent turn
+        # is preserved across the rewrite (see _commit_compaction).
+        history = self._history_with_summary_anchor(session)
+        session_snapshot_len = len(session.messages)
+        session_epoch = self.context_epoch(msg.session_key)
 
         # Cron isolation flags affect both the real prompt and its compaction
-        # estimate.  Resolve them before the preview so the estimator measures
-        # the exact same context policy as the provider call below.
+        # estimate. Resolve them before the preview so the estimator measures
+        # the exact context policy the provider call below will carry.
         skip_memory_flag = bool(msg.metadata.get("skip_memory", False))
         skip_context_files_flag = bool(msg.metadata.get("skip_context_files", False))
         voice_mode_flag = bool(msg.metadata.get("voice_mode", False))
@@ -6328,11 +6588,18 @@ class AgentLoop:
             else msg.content
         )
 
-        # Estimate the actual message shape, including the stable base prompt,
-        # JIT capability/skills tail, history, and current user turn.  Calling
-        # build_system_prompt directly would use its legacy-compatible eager
-        # mode and over-estimate optimized greetings by ~20K tokens, causing
-        # premature compaction even though the provider never sees that prompt.
+        # Estimate the fixed overhead the FIRST provider call will carry: the
+        # system prompt plus the incoming message, its attachments, and the
+        # tool schemas. Leaving these out let a turn pass the check at 55K and
+        # then hit the wire at 80K — the request is what has to fit, not the
+        # history alone.
+        #
+        # The prompt share is measured by building this turn's real message
+        # list and subtracting the history, which prices the routed capability
+        # and skill tail as the provider will actually receive it. Asking
+        # build_system_prompt for a bare prompt instead would price its
+        # legacy eager mode — roughly 20K tokens a routed turn never sends,
+        # enough to compact a session that never outgrew its window.
         try:
             preview_messages = self.context.build_messages(
                 history=history,
@@ -6347,119 +6614,196 @@ class AgentLoop:
                 available_tools=turn_available_tools,
                 reachable_tools=turn_reachable_tools,
             )
-            total_tokens = estimate_messages_tokens(preview_messages)
-            prompt_overhead_tokens = max(
+            prompt_overhead = max(
                 0,
-                total_tokens - estimate_messages_tokens(history),
+                estimate_messages_tokens(preview_messages)
+                - estimate_messages_tokens(history),
             )
-        except Exception:
-            prompt_overhead_tokens = 6000  # fallback
-            total_tokens = estimate_messages_tokens(history) + prompt_overhead_tokens
+        except Exception:  # noqa: BLE001
+            prompt_overhead = self._system_prompt_tokens(
+                msg.channel,
+                available_tools=turn_available_tools,
+                reachable_tools=turn_reachable_tools,
+            ) + estimate_tokens(msg.content or "")
+        fixed_overhead = (
+            prompt_overhead
+            + self._tool_schema_tokens(msg.channel)
+            + self._attachment_tokens(msg)
+        )
+        history_tokens = estimate_messages_tokens(history)
+        total_tokens = history_tokens + fixed_overhead
 
-        if self.compaction.should_memory_flush(total_tokens):
+        observed_total = self._observed_total_tokens(msg.session_key, session)
+
+        if self.compaction.should_memory_flush(
+            history_tokens, msg.session_key, overhead_tokens=fixed_overhead,
+            observed_total_tokens=observed_total,
+        ):
             logger.info("Running pre-compaction memory flush")
             await self._run_memory_flush(session, msg.channel, msg.chat_id)
-            self.compaction.mark_memory_flush_done()
+            self.compaction.mark_memory_flush_done(msg.session_key)
             # Reload history after flush
-            history = session.get_history(max_messages=self.context_messages)
-            total_tokens = estimate_messages_tokens(history) + prompt_overhead_tokens
+            history = self._history_with_summary_anchor(session)
+            session_snapshot_len = len(session.messages)
+            history_tokens = estimate_messages_tokens(history)
+            total_tokens = history_tokens + fixed_overhead
 
         # Microcompaction: truncate old tool results to delay full compaction
         history = self.compaction.microcompact(history)
 
         # Re-estimate after microcompaction
-        total_tokens = estimate_messages_tokens(history) + prompt_overhead_tokens
+        history_tokens = estimate_messages_tokens(history)
+        total_tokens = history_tokens + fixed_overhead
 
-        # Check if compaction is needed
-        if self.compaction.should_compact(total_tokens):
-            logger.info(f"Compacting context: {total_tokens} tokens exceeds threshold")
-            try:
-                result = await self.compaction.compact(history)
-            except Exception as e:
-                logger.error(f"Compaction failed: {e}")
-                self.compaction.record_compaction_failure()
-                # Fall through with uncompacted history — better than crashing
-                result = None
+        # Compaction is judged on the HISTORY against the room left for it.
+        # The overhead is what shrinks that room, but summarising cannot
+        # reduce the overhead itself — only the conversation. The provider's
+        # own count of the last turn joins as ground truth: when it says the
+        # window is full, the estimates don't get a veto.
+        if self.compaction.should_compact(
+            history_tokens, msg.session_key, overhead_tokens=fixed_overhead,
+            observed_total_tokens=observed_total,
+        ):
+            logger.info(
+                f"Compacting context: {history_tokens}-token history over its "
+                f"{self.compaction.history_budget(fixed_overhead)}-token budget "
+                f"({fixed_overhead} fixed overhead, {total_tokens} total)"
+            )
+            # Serialise against a manual /compact arriving from another client
+            # mid-turn and against the post-turn background pass: every path
+            # commits by clearing and rewriting the same session object.
+            #
+            # LOAD-BEARING: the ``/compact`` command branch earlier in this
+            # method returns before reaching here. It must keep doing so —
+            # this lock is an asyncio.Lock and is NOT reentrant, so a turn
+            # that both handled /compact and fell through to here would wait
+            # on itself forever.
+            _session_lock = self.compaction.session_lock(msg.session_key)
+            _pre_lock_generation = self._compaction_generation(session)
+            _cycle = self.compaction_cycle(msg.session_key)
+            # The UI cycle is owned by whoever HOLDS the lock — never by
+            # whoever observed it free. Announcing before acquiring looks
+            # equivalent but is not: emitting the event yields (it writes to a
+            # socket), and in that window a second pass sees an unlocked lock
+            # and announces too. Both then close their own cycle and the notice
+            # flaps between phases even though only one compaction ran.
+            _announced = False
+            async with _session_lock:
+                _generation = self._compaction_generation(session)
+                if _generation != _pre_lock_generation:
+                    # Whoever held the lock before us (manual /compact, the
+                    # post-turn background pass) already compacted this
+                    # session. Our snapshot describes history that no longer
+                    # exists — summarising it again would burn an LLM call to
+                    # produce a stale result the generation guard below would
+                    # discard anyway. Silent: their cycle told the story.
+                    result = None
+                    history = self._history_with_summary_anchor(session)
+                    session_snapshot_len = len(session.messages)
+                    _concurrent = True
+                else:
+                    # Announce now that the cycle is provably ours. Staged
+                    # summarisation is several LLM calls, and without this the
+                    # clients show a frozen agent.
+                    _compaction_id = await _cycle.start(total_tokens)
+                    _announced = True
 
-            if result is None:
-                # Compaction failed — trim to last 20 messages as emergency fallback
-                system_msgs = [m for m in history if m.get("role") == "system"]
-                non_system = [m for m in history if m.get("role") != "system"]
-                history = system_msgs + non_system[-20:]
-                logger.warning("Compaction failed — emergency trim to last 20 messages")
-            else:
-                self.compaction.record_compaction_success()
-                logger.info(
-                    f"Compaction complete: {result.tokens_before} -> {result.tokens_after} tokens, "
-                    f"removed {result.messages_removed} messages, "
-                    f"kept {len(result.kept_messages)} recent"
-                )
-                # Persist compaction: clear session, write summary + kept messages.
-                # kept_messages may carry assistant_with_tool_calls /
-                # tool_result entries the compactor decided to preserve
-                # verbatim (recent turns the protect_last_n window
-                # covers). We must persist ``tool_calls`` / ``tool_call_id``
-                # / ``name`` alongside ``content``; otherwise the
-                # post-compaction history ends with broken tool sequences
-                # and the next chat call hits a provider 400.
-                # Preserve the full pre-compaction history in the append-only
-                # display transcript before trimming the LLM context jsonl.
-                self.sessions.flush_full(session)
-                session.clear()
-                summary_msg = f"[Previous conversation summary]\n\n{result.summary}"
-                # An approved plan mid-execution must survive compaction in the
-                # model's CONTEXT, not just on disk — otherwise the model keeps
-                # working with no memory of the contract it's bound to.
-                try:
-                    from flowly.plans.manager import get_plan_manager as _get_pm
+                    # Stop must reach compaction too. Staged summarisation is
+                    # several provider round trips, so without this the user
+                    # watches a turn they already cancelled run to completion.
+                    _run_id = str(msg.metadata.get("run_id") or "")
 
-                    _plan_note = _get_pm().compaction_note(msg.session_key)
-                    if _plan_note:
-                        summary_msg += f"\n\n{_plan_note}"
-                except Exception:
-                    logger.debug("[plan] compaction note skipped (non-fatal)")
-                session.add_message("system", summary_msg)
-                for kept_msg in result.kept_messages:
-                    extras = {
-                        k: kept_msg[k]
-                        for k in ("tool_calls", "tool_call_id", "name")
-                        if k in kept_msg
-                    }
-                    session.add_message(
-                        kept_msg.get("role", "user"),
-                        kept_msg.get("content", ""),
-                        **extras,
-                    )
-                self.sessions.mark_full_synced(session)
-                session.metadata["last_compaction_summary"] = result.summary
-                session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
-                self.sessions.save(session)
-                # Compaction is a snapshot boundary: drop the frozen memory block
-                # so post-compaction turns re-inject freshly-written memory.
-                self.context.invalidate_memory_snapshot(msg.session_key)
-                history = [{"role": "system", "content": summary_msg}] + result.kept_messages
+                    def _cancelled() -> bool:
+                        return bool(_run_id) and self.is_run_aborted(_run_id)
 
-                # Send marker message so relay saves to Firestore (persistent separator)
-                try:
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="[context-optimized]",
-                    ))
-                except Exception:
-                    pass
-
-                # Notify connected clients about compaction (real-time event)
-                if self._on_compaction:
                     try:
-                        await self._on_compaction(
-                            msg.session_key,
-                            result.tokens_before,
-                            result.tokens_after,
-                            result.messages_removed,
-                            "completed",
+                        result = await self.compaction.compact(
+                            history,
+                            session_key=msg.session_key,
+                            should_cancel=_cancelled,
+                            history_budget=self.compaction.history_budget(fixed_overhead),
                         )
                     except Exception as e:
-                        logger.debug(f"Compaction notification error: {e}")
+                        logger.error(f"Compaction failed: {e}")
+                        self.compaction.record_compaction_failure(msg.session_key)
+                        # Fall through with uncompacted history — better than crashing
+                        result = None
+
+                    if result is not None and self._compaction_generation(session) != _generation:
+                        # A manual compaction landed while we summarised; its
+                        # result is already committed and ours describes history
+                        # that no longer exists.
+                        logger.info(
+                            "Discarding auto-compaction — session was compacted concurrently"
+                        )
+                        result = None
+                        history = self._history_with_summary_anchor(session)
+                        session_snapshot_len = len(session.messages)
+                        _concurrent = True
+                    else:
+                        _concurrent = False
+
+                if result is not None:
+                    # Commit INSIDE the lock: releasing it first would let a
+                    # queued waiter (manual /compact, the post-turn pass)
+                    # re-read the still-uncompacted session and start a
+                    # redundant summarisation before our commit lands.
+                    self.compaction.record_compaction_success(msg.session_key)
+                    logger.info(
+                        f"Compaction complete: {result.tokens_before} -> {result.tokens_after} tokens, "
+                        f"removed {result.messages_removed} messages "
+                        f"({len(history) - len(result.kept_messages)} context entries), "
+                        f"kept {len(result.kept_messages)} recent"
+                    )
+                    try:
+                        history = self._commit_compaction(
+                            session, result, msg.session_key,
+                            source_message_count=session_snapshot_len,
+                            compaction_id=_compaction_id,
+                            source_epoch=session_epoch,
+                        )
+                    except Exception as _commit_exc:  # noqa: BLE001
+                        # A reset landed while we summarised, or the save
+                        # failed. Either way this turn must continue: the
+                        # user asked a question, and a compaction they never
+                        # requested must not answer it with an error.
+                        logger.warning(
+                            f"Compaction not committed: {_commit_exc}"
+                        )
+                        self.compaction.record_compaction_failure(msg.session_key)
+                        result = None
+                        history = self._history_with_summary_anchor(session)
+
+            if result is None and _concurrent:
+                # Not a failure: someone else's compaction already shrank this
+                # session, and `history` was re-read from it above. Nothing to
+                # trim and — since we never announced — nothing to close. The
+                # pass that did the work owns the UI cycle.
+                pass
+            elif result is None:
+                # Compaction failed. The SESSION IS LEFT UNTOUCHED — only this
+                # turn's working copy is trimmed, so nothing is lost on disk
+                # and the next turn can try again.
+                history = _emergency_trim(history)
+                logger.warning(
+                    "Compaction failed — emergency trim for this turn "
+                    f"({len(history)} messages); session history preserved"
+                )
+                await _cycle.fail(total_tokens, total_tokens)
+            else:
+                # Already committed inside the lock — announce outside it so
+                # slow channel I/O never extends the critical section.
+                #
+                # No transcript separator is published here. The boundary row
+                # is written by whichever transport persists the conversation,
+                # keyed off this event — see docs/chat-wire-protocol.md §4.2.
+                # Publishing it as a reply meant every consumer of terminals
+                # had to recognise a magic string to avoid settling a turn that
+                # was still streaming.
+                await _cycle.complete(
+                    result.tokens_before, result.tokens_after,
+                    result.messages_removed,
+                )
 
         # Build initial messages. Cron runs pass skip_memory and
         # skip_context_files via metadata so MEMORY.md / AGENTS.md /
@@ -6704,6 +7048,29 @@ class AgentLoop:
                 # the UI so the context-window indicator can look up
                 # the right model's context_length.
                 "model": model_override or self.model,
+                # Context-window occupancy, ANSWERED HERE rather than left to
+                # each client. Two things only this process knows:
+                #
+                #   * ``usage`` is in the active provider's dialect, and
+                #     ``prompt_tokens`` means different things in each (see
+                #     ``context_occupancy_tokens``). A client reading it raw
+                #     shows a near-empty ring on a cached Anthropic turn.
+                #   * The real ceiling comes from the live catalogue for
+                #     whatever provider is configured — a BYOK model id is not
+                #     in the Flowly proxy catalogue the desktop used to divide
+                #     by, so its indicator simply vanished on every provider
+                #     except the proxy.
+                #
+                # Additive: old clients ignore both fields, new clients fall
+                # back to their own guess when an old bot omits them.
+                "contextTokens": context_occupancy_tokens(
+                    usage,
+                    getattr(self.provider, "provider_name", "") or "",
+                ),
+                # Bound to the agent's default model. Only cron jobs set
+                # ``model_override`` (gateway_cmd), and they have no context
+                # ring to feed; a per-model window is Stage 2.
+                "contextWindow": self._effective_context_window(),
                 # Stable first-party error contract. The gateway maps this to
                 # a native state:"error" event; remote channel adapters still
                 # receive the same user-safe text in ``content``.
@@ -7409,6 +7776,405 @@ class AgentLoop:
 
         return "\n".join(lines)
 
+    def _tool_schema_tokens(self, platform: str | None = None) -> int:
+        """Token cost of the tool schemas this route puts on the wire.
+
+        Routing and progressive disclosure mean the request carries the
+        platform's own tools plus a compact bridge — not the whole registry.
+        Pricing the eager surface would over-count by exactly what disclosure
+        saves and compact a session that never outgrew its window.
+
+        Memoized on the route and the registry generation: schemas are static
+        per registered tool, and re-serializing them every turn is pure waste.
+        """
+        try:
+            definitions = list(self._routed_tool_disclosure(platform).definitions)
+        except Exception:  # noqa: BLE001
+            return 0
+        key = (
+            str(platform or ""),
+            getattr(self.tools, "generation", -1),
+            len(definitions),
+        )
+        cached_key, cached_tokens = self._tool_schema_token_cache
+        if cached_key == key:
+            return cached_tokens
+        try:
+            tokens = estimate_tokens(json.dumps(definitions))
+        except Exception:  # noqa: BLE001
+            tokens = 0
+        self._tool_schema_token_cache = (key, tokens)
+        return tokens
+
+    def _system_prompt_tokens(
+        self,
+        channel: str,
+        *,
+        available_tools: set[str] | frozenset[str] | None = None,
+        reachable_tools: set[str] | frozenset[str] | None = None,
+    ) -> int:
+        """Token cost of the system prompt as the next request will carry it.
+
+        Built for real (not a fixed estimate) so model-family blocks and the
+        channel hint are counted; the 6K fallback only covers a build failure.
+        Passing the routed surface keeps guidance for tools this platform
+        cannot call out of the estimate, exactly as it stays out of the prompt.
+        """
+        try:
+            sys_prompt = self.context.build_system_prompt(
+                memory_search_enabled=self._memory_manager is not None,
+                model=self.model,
+                channel=channel,
+                available_tools=available_tools,
+                reachable_tools=reachable_tools,
+            )
+            return estimate_tokens(sys_prompt)
+        except Exception:  # noqa: BLE001
+            return 6000
+
+    def _routed_prompt_surface(
+        self,
+        platform: str | None = None,
+    ) -> tuple[set[str] | None, set[str] | None]:
+        """Advertised and reachable tool names behind one route's prompt.
+
+        The single seam an overhead estimate needs to price the prompt the way
+        the turn will actually build it.
+        """
+        disclosure = self._routed_tool_disclosure(platform)
+        advertised = {
+            str(item.get("function", {}).get("name", ""))
+            for item in disclosure.definitions
+        }
+        advertised.discard("")
+        return advertised, set(disclosure.all_names)
+
+    def _attachment_tokens(self, msg: InboundMessage) -> int:
+        """Tokens this turn's attachments add on top of its text."""
+        if not getattr(msg, "media", None):
+            return 0
+        # Images dominate a multimodal request — an unaccounted screenshot
+        # is thousands of tokens. Price them through the estimator's own
+        # per-image overhead rather than guessing here.
+        try:
+            return estimate_message_tokens(
+                {"role": "user", "content": [{"type": "image_url"} for _ in msg.media]}
+            )
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _history_with_summary_anchor(self, session: Any) -> list[dict[str, Any]]:
+        """Session history for the LLM, with the compaction summary pinned.
+
+        ``get_history`` returns a sliding window over the last N messages, and
+        a compaction summary is an ordinary message inside it. After N further
+        messages the summary slides out and the model silently loses every
+        earlier turn compaction was preserving — while the chat UI still shows
+        the whole conversation, so nobody notices. Re-inject the stored summary
+        at the head whenever the window no longer carries one.
+        """
+        history = session.get_history(max_messages=self.context_messages)
+        try:
+            summary = session.metadata.get("last_compaction_summary")
+        except AttributeError:
+            return history
+        if not summary:
+            return history
+        # Check the RAW messages, not the projection: the summary flag is
+        # stripped on the way to the LLM, so the projected history only ever
+        # carries the text marker.
+        window = getattr(session, "messages", [])[-self.context_messages:]
+        if any(is_summary_message(m) for m in window) or any(
+            is_summary_message(m) for m in history
+        ):
+            return history
+        content = build_summary_content(summary)
+        # The plan note is baked into the summary MESSAGE at compaction time
+        # but not into the stored summary text. Re-attach the CURRENT note
+        # here, or an approved plan would drop out of the model's context at
+        # the exact moment the original message slides out of the window —
+        # the same silent loss this anchor exists to prevent.
+        try:
+            from flowly.plans.manager import get_plan_manager as _get_pm
+
+            plan_note = _get_pm().compaction_note(session.key)
+            if plan_note:
+                content += f"\n\n{plan_note}"
+        except Exception:
+            logger.debug("[plan] anchor note skipped (non-fatal)")
+        anchor = {"role": "system", "content": content}
+        return [anchor] + history
+
+    # A summary of a two-line chat costs an LLM call and buys nothing.
+    _COMPACT_MIN_TURNS = 3
+    _COMPACT_MIN_TOKENS = 1000
+
+    @classmethod
+    def _compaction_ineligible_reason(cls, history: list[dict[str, Any]]) -> str | None:
+        """Why this history should not be compacted, or None if it should.
+
+        One definition, applied both before taking the session lock (to reject
+        cheaply) and again after acquiring it — because by then another
+        compaction may have already shrunk the history out from under us.
+        """
+        if not history:
+            return "No history to compact."
+        if len(history) == 1 and is_summary_message(history[0]):
+            return "Already compacted. Send more messages first."
+        # ONE definition of "a message", shared with what we report afterwards.
+        # Filtering by role alone kept assistant tool-call frames — the model
+        # asking for a tool, not speaking — so a single exchange wrapped in
+        # three tool calls counted as five and passed a threshold meant to
+        # mean "there is a conversation here worth summarising".
+        turn_count = count_conversational_messages(history)
+        if turn_count < cls._COMPACT_MIN_TURNS:
+            return (
+                f"Not enough messages to compact ({turn_count} messages). "
+                f"Need at least {cls._COMPACT_MIN_TURNS}."
+            )
+        tokens = estimate_messages_tokens(history)
+        if tokens < cls._COMPACT_MIN_TOKENS:
+            return (
+                f"History too small to compact ({tokens} tokens). "
+                f"Need at least {cls._COMPACT_MIN_TOKENS}."
+            )
+        return None
+
+    @staticmethod
+    def _compaction_generation(session: Any) -> int:
+        """How many times this session has been compacted.
+
+        Doubles as a generation counter: a caller that snapshots it before
+        summarising can tell, on the way back, whether the history it just
+        described is still the history on disk.
+        """
+        try:
+            return int(session.metadata.get("compaction_count", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    async def _emit_compaction_event(
+        self,
+        session_key: str,
+        phase: str,
+        tokens_before: int,
+        tokens_after: int,
+        messages_removed: int,
+        compaction_id: str = "",
+    ) -> None:
+        """Push one compaction lifecycle event. Never raises.
+
+        ``compaction_id`` ties a cycle's phases together. Without it a client
+        cannot tell whether the ``completed`` it just received closes the
+        ``started`` it is showing or belongs to a different pass — it has to
+        guess, and across a reconnect or a second device it guesses wrong.
+
+        Also records the phase so ``chat.inflight`` can hand it to a client
+        that arrives after the event fired — reopening a chat mid-summarisation
+        otherwise shows an idle transcript while the turn is visibly stalled.
+        """
+        try:
+            from flowly.agent import compaction_status
+
+            compaction_status.record(
+                session_key, phase, tokens_before, tokens_after,
+                messages_removed, time.time(), compaction_id=compaction_id,
+            )
+        except Exception:  # noqa: BLE001 — status is a convenience, not the event
+            logger.debug("[compaction] status record skipped (non-fatal)")
+
+        if not self._on_compaction:
+            return
+        try:
+            await self._on_compaction(
+                session_key, tokens_before, tokens_after, messages_removed, phase,
+                compaction_id,
+            )
+        except TypeError:
+            # An older notifier that predates ``compaction_id``.
+            await self._on_compaction(
+                session_key, tokens_before, tokens_after, messages_removed, phase,
+            )
+        except Exception as e:
+            logger.debug(f"Compaction notification error: {e}")
+
+    def compaction_cycle(self, session_key: str) -> "_CompactionCycle":
+        """Own one compaction's lifecycle: at most one announce, exactly one
+        terminal, both carrying the same id.
+
+        Three paths compact (pre-turn, post-turn, manual) and each used to
+        hand-roll this. They drifted, and every drift was a real bug: a
+        commit that refused outside its try left the notice spinning forever;
+        a failure before any announce published a terminal for work that
+        never started; a terminal without the id could not be matched to what
+        a client was showing.
+        """
+        return _CompactionCycle(self, session_key)
+
+    def context_epoch(self, session_key: str) -> int:
+        """How many times this conversation has been reset.
+
+        Tolerates a half-built instance: gateway test doubles are constructed
+        with ``object.__new__`` and never run ``__init__``, and a conversation
+        nobody has reset is epoch 0 either way.
+        """
+        epochs = getattr(self, "_context_epoch", None)
+        if not isinstance(epochs, dict):
+            return 0
+        return epochs.get(session_key, 0)
+
+    def reset_conversation(self, session_key: str) -> int:
+        """Start a fresh conversation under an existing key. Returns the count.
+
+        One place, because a reset is not just "empty the message list": the
+        compaction summary lives in metadata and is re-injected by the summary
+        anchor, the compaction service holds counters describing history that
+        no longer exists, the last observed request size describes a context
+        that is gone, and the memory snapshot was frozen for the old chat.
+
+        Bumping the epoch is what makes it safe against an IN-FLIGHT
+        compaction. That compaction may be parked in a provider call holding
+        history the user just discarded; when it comes back it compares the
+        epoch it captured, sees this reset, and drops its result instead of
+        committing the old conversation over the new one.
+        """
+        session = self.sessions.get_or_create(session_key)
+        removed = len(session.messages)
+        self._context_epoch[session_key] = self.context_epoch(session_key) + 1
+        session.reset_conversation_context()
+        self.compaction.reset_session(session_key)
+        self._last_turn_total_tokens.pop(session_key, None)
+        try:
+            from flowly.agent import compaction_status
+
+            compaction_status.clear(session_key)
+        except Exception:  # noqa: BLE001 — status is a convenience
+            logger.debug("[reset] compaction status clear skipped")
+        try:
+            self.context.invalidate_memory_snapshot(session_key)
+        except Exception:  # noqa: BLE001 — snapshot is a cache
+            logger.debug("[reset] memory snapshot invalidation skipped")
+        self.sessions.save(session)
+        return removed
+
+    @staticmethod
+    def _new_compaction_id() -> str:
+        """Identity for one compaction cycle, minted when it is announced."""
+        return f"cmp_{uuid.uuid4().hex[:12]}"
+
+    def _commit_compaction(
+        self,
+        session: Any,
+        result: Any,
+        session_key: str,
+        source_message_count: int | None = None,
+        compaction_id: str = "",
+        source_epoch: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Persist a successful compaction and return the new working history.
+
+        Shared by the automatic and manual paths so both produce identical
+        on-disk state. Called ONLY after the summary has been validated —
+        it clears the session's working context, which is unrecoverable
+        except from the append-only display transcript flushed just before.
+
+        ``source_message_count`` is ``len(session.messages)`` at the moment
+        the caller snapshotted the history it summarised. Summarisation takes
+        real wall-clock time (background post-turn compaction especially), and
+        anything appended to the session in that window — the user's next
+        message, a concurrent device's turn, a subagent announce — is NOT in
+        the summary. Clearing the session would silently destroy it. We carry
+        that appended tail across the rewrite instead.
+        """
+        if (
+            source_epoch is not None
+            and self.context_epoch(session_key) != source_epoch
+        ):
+            # The user reset this conversation while we were summarising. Our
+            # summary describes turns they discarded; committing it would put
+            # the old conversation back on top of the empty one they asked
+            # for — and the generation guard cannot see this, because a reset
+            # wipes the counter it compares. Raising keeps every caller's
+            # existing "compaction failed, history untouched" path.
+            raise CompactionError(
+                "conversation was reset while summarising — discarding the "
+                "summary rather than restoring what the user cleared"
+            )
+        appended_tail: list[dict[str, Any]] = []
+        if source_message_count is not None and 0 <= source_message_count < len(session.messages):
+            appended_tail = [dict(m) for m in session.messages[source_message_count:]]
+        # Preserve the full pre-compaction history in the append-only display
+        # transcript before trimming the LLM context jsonl.
+        self.sessions.flush_full(session)
+        # Mark the boundary in the display transcript, between the turns that
+        # were summarised and what follows. The relay writes the equivalent row
+        # into Firestore for its own clients; this is the copy the transports
+        # that read history from disk (direct gateway: desktop, iOS) rely on —
+        # without it a reopened chat gave no hint anything had been summarised.
+        self.sessions.append_context_boundary(session, compaction_id)
+        session.clear()
+        summary_msg = build_summary_content(result.summary)
+        # An approved plan mid-execution must survive compaction in the
+        # model's CONTEXT, not just on disk — otherwise the model keeps
+        # working with no memory of the contract it's bound to.
+        try:
+            from flowly.plans.manager import get_plan_manager as _get_pm
+
+            _plan_note = _get_pm().compaction_note(session_key)
+            if _plan_note:
+                summary_msg += f"\n\n{_plan_note}"
+        except Exception:
+            logger.debug("[plan] compaction note skipped (non-fatal)")
+        # Flag it as a summary rather than relying on the text prefix. The
+        # session store's allowlist projection strips this before the message
+        # reaches a provider, so it stays an internal fact.
+        session.add_message("system", summary_msg, **{SUMMARY_METADATA_KEY: True})
+        # kept_messages may carry assistant_with_tool_calls / tool_result
+        # entries preserved verbatim. Their ``tool_calls`` / ``tool_call_id``
+        # / ``name`` fields must persist alongside ``content`` or the next
+        # chat call hits a provider 400 on a malformed sequence.
+        for kept_msg in result.kept_messages:
+            extras = {
+                k: kept_msg[k]
+                for k in ("tool_calls", "tool_call_id", "name")
+                if k in kept_msg
+            }
+            session.add_message(
+                kept_msg.get("role", "user"),
+                kept_msg.get("content", ""),
+                **extras,
+            )
+        # Re-append messages that landed while we were summarising — raw
+        # dicts, so their timestamps and internal flags survive verbatim.
+        for late_msg in appended_tail:
+            session.messages.append(late_msg)
+        self.sessions.mark_full_synced(session)
+        session.metadata["last_compaction_summary"] = result.summary
+        session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
+        self.sessions.save(session)
+        # Compaction is a snapshot boundary: drop the frozen memory block
+        # so post-compaction turns re-inject freshly-written memory.
+        self.context.invalidate_memory_snapshot(session_key)
+        # The provider's last-turn count described the PRE-compaction context;
+        # kept, it would re-trigger compaction against the fresh summary until
+        # the next turn overwrote it.
+        self._last_turn_total_tokens.pop(session_key, None)
+        # The working history mirrors what was just persisted: summary, kept
+        # tail, and any late arrivals — projected to bare LLM-protocol shape.
+        tail_projection = [
+            {
+                k: m[k]
+                for k in ("role", "content", "tool_calls", "tool_call_id", "name")
+                if k in m
+            }
+            for m in appended_tail
+        ]
+        return (
+            [{"role": "system", "content": summary_msg}]
+            + result.kept_messages
+            + tail_projection
+        )
+
     async def compact_session(
         self,
         session_key: str,
@@ -7425,126 +8191,427 @@ class AgentLoop:
             Dict with compaction results.
         """
         session = self.sessions.get_or_create(session_key)
-        history = session.get_history(max_messages=self.context_messages)
-
-        if not history:
-            return {
-                "success": False,
-                "message": "No history to compact.",
-                "tokens_before": 0,
-                "tokens_after": 0,
-            }
-
+        history = self._history_with_summary_anchor(session)
         tokens_before = estimate_messages_tokens(history)
 
-        # Check if already compacted (first message is a compaction summary)
-        is_already_compacted = (
-            len(history) == 1
-            and history[0].get("role") == "system"
-            and "[Compacted conversation summary]" in history[0].get("content", "")
-        )
-
-        if is_already_compacted:
+        # Cheap rejection before announcing anything or taking the lock. The
+        # same checks run again inside the lock against the history we
+        # actually end up holding.
+        ineligible = self._compaction_ineligible_reason(history)
+        if ineligible:
             return {
                 "success": False,
-                "message": "Already compacted. Send more messages first.",
+                "message": ineligible,
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_before,
             }
 
-        # Check if too few messages to compact (need at least 3 messages)
-        # Filter out system messages for this count
-        user_assistant_messages = [m for m in history if m.get("role") in ("user", "assistant")]
-        if len(user_assistant_messages) < 3:
-            return {
-                "success": False,
-                "message": f"Not enough messages to compact ({len(user_assistant_messages)} messages). Need at least 3.",
-                "tokens_before": tokens_before,
-                "tokens_after": tokens_before,
-            }
+        # Serialise against the automatic path and against another device
+        # asking for the same thing. Both end in a commit that clears the
+        # session, and every caller shares one session object.
+        #
+        # The UI cycle is announced from INSIDE the lock — see the pre-turn
+        # path for why observing an unlocked lock is not the same as owning it.
+        _session_lock = self.compaction.session_lock(session_key)
+        cycle = self.compaction_cycle(session_key)
+        async with cycle, _session_lock:
+            generation = self._compaction_generation(session)
+            # Re-read inside the lock: whoever held it before us may have
+            # already compacted, in which case our snapshot is stale.
+            history = self._history_with_summary_anchor(session)
+            source_len = len(session.messages)
+            source_epoch = self.context_epoch(session_key)
+            # Re-apply the eligibility checks to what we ACTUALLY hold. Running
+            # them only on the pre-lock snapshot meant a second device could
+            # pass them, wait for the first compaction, then spend an LLM call
+            # summarising the tiny result — and report it as a failure.
+            not_worth_it = self._compaction_ineligible_reason(history)
+            if not_worth_it:
+                # Nothing announced yet, so nothing to close — the caller gets
+                # the reason as an RPC result instead.
+                tokens_now = estimate_messages_tokens(history)
+                return {
+                    "success": False,
+                    "message": not_worth_it,
+                    "tokens_before": tokens_now,
+                    "tokens_after": tokens_now,
+                }
 
-        # Check if token count is too low to bother compacting (< 1000 tokens)
-        if tokens_before < 1000:
-            return {
-                "success": False,
-                "message": f"History too small to compact ({tokens_before} tokens). Need at least 1000.",
-                "tokens_before": tokens_before,
-                "tokens_after": tokens_before,
-            }
+            # The cycle is provably ours now: we hold the lock and we know
+            # there is work to do.
+            await cycle.start(tokens_before)
 
-        # Notify clients that compaction is starting
-        if self._on_compaction:
+            # Run compaction. A failure must leave the session exactly as it
+            # was: the manual path is the one users reach for when context is
+            # already tight, so silently replacing their history with an error
+            # string is the worst possible outcome.
             try:
-                await self._on_compaction(
-                    session_key, tokens_before, 0, 0, "started",
+                result = await self.compaction.compact(
+                    history,
+                    custom_instructions=custom_instructions,
+                    session_key=session_key,
+                    history_budget=self.compaction.history_budget(),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Manual compaction failed: {e}")
+                self.compaction.record_compaction_failure(session_key)
+                await cycle.fail(tokens_before, tokens_before)
+                return {
+                    "success": False,
+                    "message": f"Compaction failed: {e}. Your history is unchanged.",
+                    "tokens_before": tokens_before,
+                    "tokens_after": tokens_before,
+                }
 
-        # Run compaction
-        result = await self.compaction.compact(
-            history,
-            custom_instructions=custom_instructions,
-        )
+            # Someone compacted this session while we were summarising. Our
+            # summary describes history that no longer exists, so committing
+            # it would overwrite their work with a stale view.
+            if self._compaction_generation(session) != generation:
+                logger.info(
+                    f"Discarding manual compaction for {session_key} — "
+                    "the session was compacted concurrently"
+                )
+                await cycle.complete(tokens_before, tokens_before, 0)
+                return {
+                    "success": False,
+                    "message": "Already compacted just now — nothing further to do.",
+                    "tokens_before": tokens_before,
+                    "tokens_after": estimate_messages_tokens(
+                        self._history_with_summary_anchor(session)
+                    ),
+                }
 
-        # Clear session and add summary + kept recent messages.
-        # Same tool-field preservation as the auto-compaction path:
-        # kept_messages from the protect_last_n window may include
-        # tool-call assistants + tool results that must keep their
-        # protocol fields (``tool_calls`` / ``tool_call_id`` / ``name``)
-        # or the next chat call rejects the malformed sequence.
-        # Preserve the FULL pre-compaction history in the append-only display
-        # transcript before we trim the context jsonl, so the chat UI keeps every
-        # early message (compaction only shrinks the LLM working context).
-        self.sessions.flush_full(session)
-        session.clear()
-        compacted_msg = f"[Compacted conversation summary]\n\n{result.summary}"
-        # Same plan re-injection as the auto-compaction path: an approved plan
-        # mid-execution must survive /compact in the model's context too.
-        try:
-            from flowly.plans.manager import get_plan_manager as _get_pm
-
-            _plan_note = _get_pm().compaction_note(session_key)
-            if _plan_note:
-                compacted_msg += f"\n\n{_plan_note}"
-        except Exception:
-            logger.debug("[plan] compaction note skipped (non-fatal)")
-        session.add_message("system", compacted_msg)
-        for kept_msg in result.kept_messages:
-            extras = {
-                k: kept_msg[k]
-                for k in ("tool_calls", "tool_call_id", "name")
-                if k in kept_msg
-            }
-            session.add_message(
-                kept_msg.get("role", "user"),
-                kept_msg.get("content", ""),
-                **extras,
-            )
-        # The summary + kept turns are already in (or excluded from) the display
-        # log; declare them synced so save() doesn't mirror the summary.
-        self.sessions.mark_full_synced(session)
-        session.metadata["last_compaction_summary"] = result.summary
-        session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
-        self.sessions.save(session)
-
-        # Notify connected clients — compaction completed
-        if self._on_compaction:
+            self.compaction.record_compaction_success(session_key)
             try:
-                await self._on_compaction(
-                    session_key,
-                    result.tokens_before,
-                    result.tokens_after,
-                    result.messages_removed,
-                    "completed",
+                self._commit_compaction(
+                    session, result, session_key, source_message_count=source_len,
+                    compaction_id=cycle.id, source_epoch=source_epoch,
                 )
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # A reset landing mid-summary, or the session save failing.
+                # Catching only CompactionError left an OSError to escape with
+                # the notice still spinning — and the in-memory session already
+                # rewritten while the canonical file still held the old one.
+                logger.info(f"Manual compaction not committed: {exc}")
+                await cycle.fail(tokens_before, tokens_before)
+                return {
+                    "success": False,
+                    "message": f"{exc}",
+                    "tokens_before": tokens_before,
+                    "tokens_after": estimate_messages_tokens(
+                        self._history_with_summary_anchor(session)
+                    ),
+                }
+
+        # No transcript separator is published: the boundary row is written by
+        # whichever transport persists the conversation, keyed off this event.
+        await cycle.complete(
+            result.tokens_before, result.tokens_after, result.messages_removed,
+        )
 
         return {
             "success": True,
             "message": f"Compacted {result.messages_removed} messages",
             "tokens_before": result.tokens_before,
             "tokens_after": result.tokens_after,
+            "messages_removed": result.messages_removed,
             "summary_preview": result.summary[:200] + "..." if len(result.summary) > 200 else result.summary,
         }
+
+    def _observed_total_tokens(self, session_key: str, session: Any = None) -> int:
+        """The provider's last reported request size for this conversation.
+
+        Prefers the in-memory reading and falls back to the one persisted on
+        the session, so a per-message CLI process — or a restarted gateway —
+        still has ground truth to check the estimate against.
+        """
+        live = self._last_turn_total_tokens.get(session_key, 0)
+        if live > 0:
+            return live
+        try:
+            stored = int((session.metadata or {}).get("last_turn_total_tokens", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        return max(0, stored)
+
+    def _effective_context_window(self) -> int:
+        """The window the active model can actually use, for the clients.
+
+        The compaction service already resolves this (live catalogue → family
+        heuristic → configured value, then clamped to the Flowly proxy's input
+        ceiling). Reuse it rather than teach every client to guess: they cannot
+        see which provider is configured, and the catalogue they *can* reach
+        only covers the proxy's own models.
+
+        ``0`` means "I don't know" — the client keeps its own fallback.
+        """
+        try:
+            window = int(self.compaction.effective_context_window)
+        except Exception:  # noqa: BLE001 — a display field, like the catalogue
+            # lookup underneath it, is best-effort. It reaches out to the model
+            # catalogue, so it can fail in ways this call has no opinion about;
+            # none of them justify breaking the turn's metadata.
+            return 0
+        return window if window > 0 else 0
+
+    def _note_turn_usage(
+        self, session_key: str, outcome: Any, epoch: int | None = None,
+    ) -> None:
+        """Record the provider's own count of the turn that just ended.
+
+        What the NEXT request will roughly weigh before its new message —
+        ground truth against which the estimate-based compaction trigger is
+        cross-checked. Local estimators drift by model and language, and a
+        session can sit under the estimated budget while its real requests
+        already exceed the window (observed live: estimate ~72K while the
+        provider counted 82K in a 79K window).
+
+        The provider-dialect arithmetic lives in
+        :func:`context_occupancy_tokens` — the same number the clients get on
+        the wire.
+        """
+        try:
+            usage = (getattr(outcome, "metadata", None) or {}).get("usage") or {}
+            epoch = self.context_epoch(session_key) if epoch is None else epoch
+            total = context_occupancy_tokens(
+                usage, getattr(getattr(self, "provider", None), "provider_name", "") or "",
+            )
+        except (AttributeError, TypeError, ValueError):
+            return
+        if total > 0:
+            if self.context_epoch(session_key) != epoch:
+                # The conversation was reset while this turn ran; its size
+                # describes history the user discarded, and using it would
+                # decide the fresh chat's first compaction.
+                return
+            self._last_turn_total_tokens[session_key] = total
+            # Also on the session, so the reading survives the process. The
+            # CLI runs one process per message, so an in-memory observation is
+            # gone before the next turn can use it — the trigger this exists
+            # for could never fire there. A gateway restart lost it the same
+            # way. It is content-derived, so a /clear drops it with everything
+            # else (see Session.CONTEXT_FREE_METADATA_KEYS).
+            try:
+                session = self.sessions.get_or_create(session_key)
+                session.metadata["last_turn_total_tokens"] = total
+                # Writing the attribute is not persisting it: the turn's own
+                # save already happened, so without this the reading lives only
+                # in this process — exactly the case it exists to cover.
+                self.sessions.save(session)
+            except Exception:  # noqa: BLE001 — the in-memory copy still works
+                logger.debug("[compaction] usage persist skipped (non-fatal)")
+            # Bounded: sessions come and go on a long-lived gateway.
+            if len(self._last_turn_total_tokens) > 512:
+                self._last_turn_total_tokens.pop(
+                    next(iter(self._last_turn_total_tokens)), None,
+                )
+
+    def _schedule_post_turn_compaction(self, msg: InboundMessage) -> None:
+        """Kick off a background compaction check once the turn's reply is out.
+
+        The pre-turn check only runs when a message ARRIVES — a session whose
+        final tool-heavy turn pushed it over budget would otherwise sit there
+        full until the user's next message, and then make THAT message pay the
+        whole summarisation wait. Running the check after delivery means the
+        user comes back to a session that is already clean.
+
+        Fire-and-forget by design: never delays the reply, never raises into
+        the turn, at most one in flight per session.
+        """
+        key = msg.session_key
+        existing = self._post_turn_compaction_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        # Bounded as a whole, not just per provider call: staged summarisation
+        # is many calls, and the "one pass per session" rule above means a
+        # single wedged pass would disable post-turn compaction for that
+        # session until the process restarts. The cap is generous — it is a
+        # backstop, not a deadline.
+        task = asyncio.create_task(asyncio.wait_for(
+            self._post_turn_compaction(msg),
+            timeout=POST_TURN_COMPACTION_TIMEOUT_SECONDS,
+        ))
+        self._post_turn_compaction_tasks[key] = task
+
+        def _reap(t: asyncio.Task, key: str = key) -> None:
+            if self._post_turn_compaction_tasks.get(key) is t:
+                self._post_turn_compaction_tasks.pop(key, None)
+            if not t.cancelled():
+                t.exception()  # retrieve, or asyncio logs "never retrieved"
+
+        task.add_done_callback(_reap)
+
+    async def await_post_turn_compaction(self, session_key: str) -> None:
+        """Block until this session's background compaction finishes.
+
+        For callers whose process ends with the turn — ``flowly agent -m`` runs
+        one process per message, and ``asyncio.run`` cancels every pending task
+        on the way out. Without this the one-shot CLI got the post-turn CHECK
+        but never the work, so the session stayed over budget and the next
+        invocation paid for it. A long-lived gateway never calls this: there,
+        not blocking is the entire point.
+        """
+        task = self._post_turn_compaction_tasks.get(session_key)
+        if task is None or task.done():
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — already logged inside the pass
+            logger.debug(f"Post-turn compaction ended with: {e}")
+
+    async def _post_turn_compaction(self, msg: InboundMessage) -> None:
+        """Background twin of the pre-turn compaction block.
+
+        Same signal, same lock, same commit path — the only differences are
+        WHEN it runs (after the reply, off the user's critical path) and that
+        there is no run to cancel it from. Every failure mode ends in "leave
+        the session untouched": the pre-turn check still guards the next turn.
+        """
+        session_key = msg.session_key
+        # Hoisted so the outermost failure path can close the cycle it opened
+        # — a terminal without the id cannot be matched to its `started`, and
+        # clients that key on the id would leave the notice running forever.
+        cycle = self.compaction_cycle(session_key)
+        # Let the turn's own reply reach the client first. This pass is
+        # scheduled from _process_message's finally, which runs BEFORE the
+        # caller publishes the reply — so without a settle the "started"
+        # notice can overtake it on the wire. Clients treat arriving content
+        # as proof a compaction finished (a stuck notice once hid a delivered
+        # answer), so an early "started" is wiped the instant the reply lands:
+        # observed live as a 15-second compaction with no visible shimmer.
+        # It also reads better — the answer, then the summarising notice.
+        if POST_TURN_SETTLE_SECONDS > 0:
+            await asyncio.sleep(POST_TURN_SETTLE_SECONDS)
+        try:
+            session = self.sessions.get_or_create(session_key)
+            history = self._history_with_summary_anchor(session)
+            history_tokens = estimate_messages_tokens(history)
+            # Overhead the NEXT turn will carry. Its inbound message size is
+            # unknowable here, so this is system prompt + tool schemas only —
+            # slightly optimistic, and the pre-turn check (which sees the real
+            # message) remains the backstop.
+            _advertised, _reachable = self._routed_prompt_surface(msg.channel)
+            overhead = self._system_prompt_tokens(
+                msg.channel,
+                available_tools=_advertised,
+                reachable_tools=_reachable,
+            ) + self._tool_schema_tokens(msg.channel)
+
+            observed_total = self._observed_total_tokens(session_key, session)
+
+            # Memory flush first, exactly like the pre-turn order: extract
+            # durable memories from the history WHILE it is still verbatim.
+            if self.compaction.should_memory_flush(
+                history_tokens, session_key, overhead_tokens=overhead,
+                observed_total_tokens=observed_total,
+            ):
+                logger.info("Running post-turn memory flush")
+                await self._run_memory_flush(
+                    session, msg.channel, msg.chat_id, announce=False,
+                )
+                self.compaction.mark_memory_flush_done(session_key)
+                history = self._history_with_summary_anchor(session)
+                history_tokens = estimate_messages_tokens(history)
+
+            if not self.compaction.should_compact(
+                history_tokens, session_key, overhead_tokens=overhead,
+                observed_total_tokens=observed_total,
+            ):
+                return
+
+            logger.info(
+                f"Post-turn compaction: {history_tokens} history tokens over "
+                "budget — summarising in the background"
+            )
+            _session_lock = self.compaction.session_lock(session_key)
+            # Same ownership rule as the pre-turn path: the cycle belongs to
+            # whoever HOLDS the lock, not to whoever saw it free. See there.
+            _announced = False
+            pre_lock_generation = self._compaction_generation(session)
+            async with _session_lock:
+                generation = self._compaction_generation(session)
+                if generation != pre_lock_generation:
+                    # Someone compacted while we queued. Their cycle already
+                    # told the user; ours would be a duplicate.
+                    return
+                # Re-read inside the lock — a manual /compact or a turn's own
+                # pre-turn pass may have already done the work while we waited.
+                history = self._history_with_summary_anchor(session)
+                source_len = len(session.messages)
+                source_epoch = self.context_epoch(session_key)
+                history_tokens = estimate_messages_tokens(history)
+                # Re-read the observation too: a commit that happened while we
+                # waited on the lock clears it, which is what makes this
+                # re-check able to say "already handled".
+                if not self.compaction.should_compact(
+                    history_tokens, session_key, overhead_tokens=overhead,
+                    observed_total_tokens=self._observed_total_tokens(
+                        session_key, session,
+                    ),
+                ):
+                    # Nothing to do and nothing announced — stay silent.
+                    return
+
+                # The cycle is provably ours: we hold the lock and the
+                # generation still matches what we measured against.
+                await cycle.start(history_tokens + overhead)
+                _announced = True
+
+                try:
+                    result = await self.compaction.compact(
+                        history,
+                        session_key=session_key,
+                        history_budget=self.compaction.history_budget(overhead),
+                    )
+                except Exception as e:
+                    logger.error(f"Post-turn compaction failed: {e}")
+                    self.compaction.record_compaction_failure(session_key)
+                    await cycle.fail(history_tokens, history_tokens)
+                    return
+
+                if self._compaction_generation(session) != generation:
+                    logger.info(
+                        "Discarding post-turn compaction — session was "
+                        "compacted concurrently"
+                    )
+                    tokens_now = estimate_messages_tokens(
+                        self._history_with_summary_anchor(session)
+                    )
+                    await cycle.complete(tokens_now, tokens_now, 0)
+                    return
+
+                self.compaction.record_compaction_success(session_key)
+                logger.info(
+                    f"Post-turn compaction complete: {result.tokens_before} -> "
+                    f"{result.tokens_after} tokens, removed "
+                    f"{result.messages_removed} messages "
+                    f"({len(history) - len(result.kept_messages)} context entries), "
+                    f"kept {len(result.kept_messages)} recent"
+                )
+                self._commit_compaction(
+                    session, result, session_key,
+                    source_message_count=source_len,
+                    compaction_id=cycle.id,
+                    source_epoch=source_epoch,
+                )
+
+            # No transcript separator here either — see the pre-turn path.
+            await cycle.complete(
+                result.tokens_before, result.tokens_after,
+                result.messages_removed,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Belt-and-braces: nothing in a background pass may take the
+            # agent down or leave the UI stuck on "started".
+            logger.error(f"Post-turn compaction pass failed: {e}")
+            try:
+                # A no-op unless this pass actually announced — publishing a
+                # failure for work that never started showed the user a result
+                # for something they were never told had begun.
+                await cycle.fail()
+            except Exception:
+                pass

@@ -20,6 +20,12 @@ from flowly.clarify.types import ClarifyRequest
 # Type for surface notification callback
 NotifyCallback = Callable[[ClarifyRequest], Awaitable[None]]
 
+# Fired once a question stops waiting — answered here, answered on another
+# surface, or timed out. Surfaces use it to retire the prompt they drew;
+# without it a tray outlives its question and the answer typed into it is
+# rejected as unknown. Args: (clarify_id, reason, session_key).
+CloseCallback = Callable[[str, str, str], Awaitable[None]]
+
 
 class ClarifyManager:
     """
@@ -36,10 +42,15 @@ class ClarifyManager:
         self._futures: dict[str, asyncio.Future[str]] = {}
         self._pending: dict[str, ClarifyRequest] = {}
         self._notify_callbacks: list[NotifyCallback] = []
+        self._close_callbacks: list[CloseCallback] = []
 
     def add_notify_callback(self, callback: NotifyCallback) -> None:
         """Register a surface callback for clarify notifications."""
         self._notify_callbacks.append(callback)
+
+    def add_close_callback(self, callback: CloseCallback) -> None:
+        """Register a surface callback for "this question is over"."""
+        self._close_callbacks.append(callback)
 
     async def request_and_wait(self, pending: ClarifyRequest) -> str | None:
         """
@@ -80,16 +91,34 @@ class ClarifyManager:
                 )
 
         timeout = max(0, pending.expires_at - time.time())
+        reason = "answered"
         try:
             answer = await asyncio.wait_for(future, timeout=timeout)
             logger.info(f"[ClarifyManager] {pending.id} answered")
             return answer
         except asyncio.TimeoutError:
             logger.info(f"[ClarifyManager] {pending.id} timed out")
+            reason = "timeout"
             return None
         finally:
             self._futures.pop(pending.id, None)
             self._pending.pop(pending.id, None)
+            await self._fire_close(pending, reason)
+
+    async def _fire_close(self, pending: ClarifyRequest, reason: str) -> None:
+        """Tell every surface the question is over so it can drop its prompt.
+
+        Never lets a surface failure escape — the agent's answer must survive
+        a broken client.
+        """
+        for cb in self._close_callbacks:
+            try:
+                await cb(pending.id, reason, pending.session_key or "")
+            except Exception as e:
+                logger.error(
+                    f"[ClarifyManager] Close callback failed: {e}",
+                    exc_info=True,
+                )
 
     @staticmethod
     def _in_cron_context() -> bool:

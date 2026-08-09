@@ -42,8 +42,13 @@ class KeepRecentConfig:
     min_tokens: int = 5_000
     # Minimum number of user/assistant text messages to preserve
     min_messages: int = 3
-    # Maximum tokens of recent messages to preserve (hard cap)
+    # Absolute ceiling on the preserved tail.
     max_tokens: int = 20_000
+    # …and the one that actually governs. The tail must be a SHARE of the room
+    # available for history, never a fixed number: preserving 20K of an 8K
+    # history keeps 93% of it verbatim, leaves almost nothing to summarise, and
+    # produces a "compaction" that grows the context instead of shrinking it.
+    max_share: float = 0.25
 
 
 @dataclass
@@ -62,8 +67,14 @@ class CompactionConfig:
     # 0.6 keeps more history context than 0.5 (less aggressive pruning).
     max_history_share: float = 0.6
 
-    # Context window size (model-specific, will be auto-detected)
+    # Fallback context window, used only when the model's real window can't
+    # be resolved from the catalog or a family heuristic.
     context_window: int = 128_000
+
+    # True when the user pinned ``contextWindow`` in config.json. An explicit
+    # operator setting overrides catalog detection — if someone caps the
+    # window deliberately, auto-detection must not quietly raise it again.
+    context_window_explicit: bool = False
 
     # Memory flush settings
     memory_flush: MemoryFlushConfig = field(default_factory=MemoryFlushConfig)
@@ -90,6 +101,15 @@ class CompactionResult:
     kept_messages: list = field(default_factory=list)
 
 
+class CompactionError(RuntimeError):
+    """A compaction attempt could not produce a usable summary.
+
+    Raised instead of returning placeholder text so the caller keeps the
+    uncompacted history. Committing a placeholder would replace the whole
+    conversation with a sentence that carries none of it.
+    """
+
+
 # Constants (matching moltbot)
 BASE_CHUNK_RATIO = 0.4
 MIN_CHUNK_RATIO = 0.15
@@ -97,6 +117,68 @@ SAFETY_MARGIN = 1.2  # 20% buffer for token estimation inaccuracy
 
 DEFAULT_SUMMARY_FALLBACK = "No prior history."
 DEFAULT_PARTS = 2
+
+# The marker prefixing a compaction summary in the working context.
+# The manual (/compact) path historically wrote a different string, so both
+# are recognised when detecting an existing summary — sessions compacted by
+# older builds must still be understood.
+SUMMARY_MARKER = "[Previous conversation summary]"
+
+#: Text of a transcript context-boundary row. Clients that predate the typed
+#: ``kind`` field match on this, so it is a compatibility shim — the bot never
+#: puts it on the wire as a reply. See ``docs/chat-wire-protocol.md`` §4.2.
+CONTEXT_BOUNDARY_CONTENT = "[context-optimized]"
+
+
+def is_context_boundary(message: dict) -> bool:
+    """Is this row the seam a compaction left, rather than a message?
+
+    Prefers the typed field; the text is the fallback for rows persisted
+    before it existed.
+    """
+    if not isinstance(message, dict):
+        return False
+    if message.get("kind") == "context_boundary":
+        return True
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+    return isinstance(content, str) and content.strip() == CONTEXT_BOUNDARY_CONTENT
+LEGACY_SUMMARY_MARKER = "[Compacted conversation summary]"
+SUMMARY_MARKERS = (SUMMARY_MARKER, LEGACY_SUMMARY_MARKER)
+
+# Recorded on the summary message when compaction commits. A stored fact beats
+# guessing from the text: a user can paste the marker into a message of their
+# own, and the anchor's de-duplication depends on telling the two apart.
+#
+# The session store projects messages through a strict allowlist before they
+# reach a provider, so this flag never travels on the wire — but that also
+# means it is absent from the PROJECTED history. Detection therefore has to
+# read the raw session messages; the content check below remains the fallback
+# for projected views and for sessions written before this flag existed.
+SUMMARY_METADATA_KEY = "_compaction_summary"
+
+
+def build_summary_content(summary: str) -> str:
+    """The exact text a compaction summary is stored and injected as.
+
+    One definition, because the stateless helper and the agent loop both write
+    it and both anchor against it — three copies of a format string is how the
+    marker and the detector drift apart.
+    """
+    return f"{SUMMARY_MARKER}\n\n{summary}"
+
+
+def is_summary_message(message: dict) -> bool:
+    """True if ``message`` is a compaction summary this system wrote."""
+    if message.get("role") != "system":
+        return False
+    if message.get(SUMMARY_METADATA_KEY):
+        return True
+    content = message.get("content", "")
+    return isinstance(content, str) and content.lstrip().startswith(SUMMARY_MARKERS)
 
 MERGE_SUMMARIES_INSTRUCTIONS = (
     "Merge these partial summaries into a single cohesive summary. "

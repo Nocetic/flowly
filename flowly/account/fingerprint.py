@@ -80,6 +80,23 @@ def _write_shared_machine_id(value: str) -> bool:
         return False
 
 
+def _home_machine_id_path() -> Path | None:
+    """Non-default homes carry their own machine identity.
+
+    ``register_machine`` is idempotent by ``machineId`` — same id, same
+    Firestore server, regardless of name. If a dev/profile instance shared
+    the desktop's machine id, logging in from it would REBIND the user's
+    real server: the dev bot would take over the relay connection and start
+    receiving the real agent's traffic. So every non-default ``FLOWLY_HOME``
+    gets its own ``.machine-id`` inside the home — a separate server
+    registration, same account. No-op at the default home.
+    """
+    from flowly.profile import get_flowly_home, is_default_home
+    if is_default_home():
+        return None
+    return get_flowly_home() / ".machine-id"
+
+
 def _hardware_fingerprint_fallback() -> str:
     """SHA-256(hardware UUID), used only when the shared path is unwritable."""
     system = platform.system()
@@ -125,13 +142,34 @@ def _hardware_fingerprint_fallback() -> str:
 def machine_id() -> str:
     """Return the machine identifier, sharing with flowly-desktop when possible.
 
-    Priority:
+    Priority (default home):
       1. Read the desktop's ``.machine-id`` file → use raw UUID
       2. Generate a fresh UUIDv4 and write to that same file
          → next desktop install picks it up
       3. If write fails (locked filesystem), fall back to a SHA-256 of
          the OS hardware UUID (deterministic, but won't match desktop)
+
+    A non-default ``FLOWLY_HOME`` never uses the shared id — see
+    ``_home_machine_id_path`` for why that would hijack the real server.
     """
+    home_path = _home_machine_id_path()
+    if home_path is not None:
+        try:
+            raw = home_path.read_text(encoding="utf-8").strip()
+            if raw and _UUID_RE.match(raw):
+                return raw
+        except OSError:
+            pass
+        fresh = str(uuid.uuid4())
+        try:
+            home_path.parent.mkdir(parents=True, exist_ok=True)
+            home_path.write_text(fresh, encoding="utf-8")
+            return fresh
+        except OSError:
+            # Deterministic per home, never equal to the shared identity.
+            base = _read_shared_machine_id() or _hardware_fingerprint_fallback()
+            return hashlib.sha256(f"{base}:{home_path.parent}".encode()).hexdigest()[:32]
+
     shared = _read_shared_machine_id()
     if shared:
         return shared
@@ -145,12 +183,19 @@ def machine_id() -> str:
 
 @lru_cache(maxsize=1)
 def machine_name() -> str:
-    """Human-friendly device name shown in picker UIs."""
+    """Human-friendly device name shown in picker UIs.
+
+    Development/profile instances (non-default ``FLOWLY_HOME``) are labeled
+    ``<name>-dev`` so the dashboard and device pickers make the separate
+    server registration impossible to mistake for the real machine.
+    """
     host = platform.node() or "computer"
     for suffix in (".local", ".lan", ".home"):
         if host.lower().endswith(suffix):
             host = host[: -len(suffix)]
             break
+    if _home_machine_id_path() is not None:
+        host = f"{host}-dev"
     system = platform.system()
     if system == "Darwin":
         return host

@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/Nocetic/flowly/main/assets/banner.png" alt="Flowly — one brain, everywhere you work" width="100%">
+  <img src="https://raw.githubusercontent.com/Nocetic/flowly/main/assets/banner.png" alt="Flowly — the personal AI agent you own, everywhere you are" width="100%">
   <p>
     <a href="https://pypi.org/project/flowly-ai/"><img src="https://img.shields.io/pypi/v/flowly-ai?style=for-the-badge&label=pypi&color=7C5CFC" alt="PyPI"></a>
     <img src="https://img.shields.io/badge/python-%E2%89%A53.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">

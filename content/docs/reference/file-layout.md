@@ -13,15 +13,24 @@ written outside it without your involvement.
 | Path | What it is |
 | --- | --- |
 | `config.json` | Main configuration (camelCase keys). The one file you edit by hand. |
+| `config.json.bak` | Copy of the previous **parseable** `config.json`, refreshed before each save. If the active file is ever corrupted, Flowly moves it aside as `config.json.broken-<timestamp>` and restores from here. |
 | `.env` | Secrets / environment overrides loaded at startup. |
 | `workspace/` | Context files, memory, skills, personas — see below. |
-| `credentials/` | OAuth tokens (e.g. `gmail.json`, mode `0600`). |
+| `credentials/` | Account and OAuth tokens (e.g. `account.json`, `gmail.json`), each `0600`. Used whenever the OS keychain isn't available — which includes every sandboxed run on macOS, since the sandbox hides `~/Library/Keychains`. |
 | `plugins/` | User-installed [plugins](/docs/features/plugins). |
 | `cron/` | Scheduled-job data. |
 | `plan-mode/` | [Plan mode](/docs/features/plan-mode) state: per-session plans (`<session>/plan_<id>.json` plus an append-only `plan_<id>.revisions.log`) and `sticky.json`, which conversations have the standing mode on (what makes the mode survive restarts). |
 | `audit/` | Command + decision [audit log](/docs/features/audit-log). |
 | `sessions/` | Session routing index and transcripts. |
 | `assistants/` | Saved assistant / multi-agent definitions. |
+| `desktop-client-id` | Stable id Flowly Desktop reconnects with. |
+
+Two more files appear only in certain states, and both are safe to delete:
+
+| Path | When it appears |
+| --- | --- |
+| `credentials/.keychain-broken` | After the OS keychain refused a write. While it exists, Flowly skips the keychain and uses the `0600` files. Clear it with `flowly keychain retry` once the keychain works again. |
+| `.machine-id` | In a **non-default** home only (a profile, or a `FLOWLY_HOME` you set). It gives that instance its own identity, so signing in from it registers a separate `<machine>-dev` server rather than taking over your main one. |
 
 ## Workspace (`~/.flowly/workspace/`)
 

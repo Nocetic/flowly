@@ -31,7 +31,9 @@ class CommandDef:
 
     ``cli_only`` — only meaningful in the TUI/CLI (e.g. ``/theme``); hidden from
     remote clients. ``gateway_only`` — only meaningful for gateway/messaging
-    clients; hidden from the TUI. Neither flag set → universal (both).
+    clients; hidden from the TUI. ``client_surfaces`` narrows a gateway command
+    to named clients (for example ``("desktop",)``). An empty tuple means every
+    gateway client. Neither flag set → universal (both).
     """
 
     name: str
@@ -42,6 +44,7 @@ class CommandDef:
     subcommands: tuple[str, ...] = ()
     cli_only: bool = False
     gateway_only: bool = False
+    client_surfaces: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +66,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # side effect runs. "/plan <task>" plans just that one task.
     CommandDef("plan", "Plan mode: propose a plan and wait for approval before acting",
                "Session", args_hint="[task | on | off | status]"),
+    # Purely local: reopens a question tray hidden with Esc. cli_only because
+    # the other surfaces keep their question on screen until it's answered —
+    # there's nothing to bring back.
+    CommandDef("clarify", "Reopen the question Flowly is waiting on", "Session",
+               cli_only=True),
     CommandDef("usage", "Token & cost this session (+ Flowly account credits)", "Info",
                cli_only=True),
     CommandDef("whoami", "Show user / server / conversation", "Info"),
@@ -74,6 +82,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[--dry-run] <source|workflow|notes>"),
     CommandDef("codex", "Codex runtime: on / off / sandbox / cwd / tools", "Tools & Skills",
                args_hint="[on|off|sandbox|cwd|tools]"),
+    # The desktop intercepts this locally and opens its singleton floating
+    # radio window. Keep it out of iOS/web discovery until those surfaces ship
+    # an equivalent native action.
+    CommandDef("radio", "Open Flowly Radio", "Media", gateway_only=True,
+               client_surfaces=("desktop",)),
 
     # ── TUI-only — terminal UI launchers / actions with no remote equivalent ──
     # (The desktop has its own buttons/pages for these, or they're terminal
@@ -132,9 +145,19 @@ COMMAND_REGISTRY: list[CommandDef] = [
 # Derived views
 # ---------------------------------------------------------------------------
 
-def gateway_commands() -> list[CommandDef]:
-    """Commands available to remote clients (desktop, iOS) — not ``cli_only``."""
-    return [c for c in COMMAND_REGISTRY if not c.cli_only]
+def gateway_commands(surface: str | None = None) -> list[CommandDef]:
+    """Commands available to a remote client surface.
+
+    Surface-scoped commands are intentionally omitted when the caller does not
+    identify itself. That keeps older iOS/web clients from advertising native
+    actions they cannot execute.
+    """
+    normalized_surface = (surface or "").strip().lower()
+    return [
+        c for c in COMMAND_REGISTRY
+        if not c.cli_only
+        and (not c.client_surfaces or normalized_surface in c.client_surfaces)
+    ]
 
 
 def cli_commands() -> list[CommandDef]:

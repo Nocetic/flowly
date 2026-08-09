@@ -218,20 +218,8 @@ def agent(
     cron = CronService(cron_store_path)
 
     # Build compaction config
-    from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
-    compaction_cfg = config.agents.defaults.compaction
-    compaction_config = CompactionConfig(
-        mode=compaction_cfg.mode,
-        reserve_tokens_floor=compaction_cfg.reserve_tokens_floor,
-        max_history_share=compaction_cfg.max_history_share,
-        context_window=compaction_cfg.context_window,
-        memory_flush=MemoryFlushConfig(
-            enabled=compaction_cfg.memory_flush.enabled,
-            soft_threshold_tokens=compaction_cfg.memory_flush.soft_threshold_tokens,
-            prompt=compaction_cfg.memory_flush.prompt,
-            system_prompt=compaction_cfg.memory_flush.system_prompt,
-        ),
-    )
+    from flowly.compaction.builder import build_compaction_config
+    compaction_config = build_compaction_config(config.agents.defaults.compaction)
 
     # Build exec config
     from flowly.exec.types import ExecConfig
@@ -267,10 +255,18 @@ def agent(
     )
     _wait_for_initial_mcp_tools(agent_loop, config)
 
+    # Set while a user-requested /compact runs, so the automatic-compaction
+    # hook below does not narrate a compaction the user is already watching.
+    _manual_compact_in_flight = {"value": False}
+
     async def handle_compact(instructions: str | None = None) -> None:
         """Handle /compact command."""
         console.print("[cyan]⚙️ Compacting conversation history...[/cyan]")
-        result = await agent_loop.compact_session(session_id, instructions)
+        _manual_compact_in_flight["value"] = True
+        try:
+            result = await agent_loop.compact_session(session_id, instructions)
+        finally:
+            _manual_compact_in_flight["value"] = False
         if result["success"]:
             console.print(
                 f"[green]✓[/green] {result['message']} "
@@ -279,6 +275,66 @@ def agent(
             console.print(f"\n[dim]Summary preview:[/dim]\n{result['summary_preview']}")
         else:
             console.print(f"[yellow]{result['message']}[/yellow]")
+
+    # Automatic compaction was invisible here: the notification hook is wired
+    # by the gateway, and the CLI runs the agent in-process. So a conversation
+    # would stall for many seconds mid-turn with nothing on screen to say why.
+    _compaction_spinner: dict[str, Any] = {"status": None, "cycle": ""}
+
+    def _stop_compaction_spinner() -> None:
+        status = _compaction_spinner.get("status")
+        if status is not None:
+            try:
+                status.stop()
+            except Exception:  # noqa: BLE001 — cosmetic
+                pass
+        _compaction_spinner["status"] = None
+
+    async def _on_cli_compaction(
+        session_key: str,
+        tokens_before: int,
+        tokens_after: int,
+        messages_removed: int,
+        phase: str = "completed",
+        compaction_id: str = "",
+    ) -> None:
+        if session_key and session_key != session_id:
+            return
+        if phase == "started":
+            # The manual /compact path prints its own progress; announcing
+            # again would double every line.
+            _compaction_spinner["cycle"] = compaction_id
+            if _manual_compact_in_flight["value"]:
+                return
+            status = console.status(
+                "[cyan]Compacting context…[/cyan]", spinner="dots"
+            )
+            status.start()
+            _compaction_spinner["status"] = status
+            return
+        # A terminal closes the cycle it belongs to — an event from another
+        # pass (a retry, a reorder) must not close the notice on screen and
+        # report its own numbers.
+        cycle = _compaction_spinner.get("cycle") or ""
+        if compaction_id and cycle and compaction_id != cycle:
+            return
+        _compaction_spinner["cycle"] = ""
+        _stop_compaction_spinner()
+        if _manual_compact_in_flight["value"]:
+            return
+        if phase == "failed":
+            console.print(
+                "[yellow]⚠ context compaction failed — history kept[/yellow]"
+            )
+            return
+        saved = max(0, tokens_before - tokens_after)
+        console.print(
+            f"[dim]⚡ context compacted · {messages_removed} messages"
+            + (f" · −{saved:,} tokens" if saved else "")
+            + "[/dim]"
+        )
+
+    agent_loop._on_compaction = _on_cli_compaction
 
     def _format_tokens(n: int) -> str:
         if n >= 1_000_000:
@@ -373,6 +429,12 @@ def agent(
                 console.print(f"\n{__logo__} {response}")
                 _display_media(meta)
                 _display_usage(meta)
+                # A one-shot run ends when this coroutine returns, and
+                # asyncio.run() then cancels whatever is still pending —
+                # including the post-turn compaction this turn just scheduled.
+                # So the CLI got the check but never the work: the session
+                # stayed over budget and the NEXT invocation paid for it.
+                await agent_loop.await_post_turn_compaction(session_id)
             _run_agent_coroutine_with_cleanup(run_once(), agent_loop)
     else:
         # Interactive mode
@@ -399,10 +461,16 @@ def agent(
                             await handle_compact(args)
                             continue
                         elif cmd == "/clear":
-                            session = agent_loop.sessions.get_or_create(session_id)
-                            session.clear()
-                            agent_loop.sessions.save(session)
-                            console.print("[green]✓[/green] Session cleared")
+                            # One entry point: it drops the compaction summary
+                            # (plain clear() leaves it in metadata and the
+                            # summary anchor re-injects it next turn) AND bumps
+                            # the context epoch, which is what stops a
+                            # compaction already in flight from committing the
+                            # old conversation over the empty one.
+                            removed = agent_loop.reset_conversation(session_id)
+                            console.print(
+                                f"[green]✓[/green] Session cleared ({removed} messages)"
+                            )
                             continue
                         elif cmd in ("/quit", "/exit", "/q"):
                             console.print("Goodbye!")
@@ -416,6 +484,14 @@ def agent(
                         elif cmd == "/model":
                             if args:
                                 agent_loop.model = args.strip()
+                                # Compaction budgets and counts tokens against
+                                # the ACTIVE model — leaving them on the old one
+                                # sizes the context window and the per-message
+                                # overheads for a model that is no longer in use.
+                                agent_loop.compaction.model = agent_loop.model
+                                from flowly.compaction.estimator import set_active_model
+
+                                set_active_model(agent_loop.model)
                                 console.print(f"[green]✓[/green] Model set to [cyan]{args.strip()}[/cyan]")
                             else:
                                 console.print(f"[cyan]Current model:[/cyan] {agent_loop.model}")

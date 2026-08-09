@@ -12,16 +12,15 @@ For what's open-source vs. cloud-only, see [Open source vs. Desktop & Cloud](des
 
 ```bash
 # One command — sets up uv, Python, git, and a Flowly git checkout that
-# `flowly update` keeps current with `git pull` (no waiting on a PyPI release)
+# `flowly update` keeps current with `git pull`
 curl -fsSL https://useflowlyapp.com/install.sh | bash
-# prefer a packaged PyPI install?  uv tool install flowly-ai
 ```
 
 The checkout and its virtualenv live under `~/.local/share/flowly/` (`repo/` + `venv/`); everything Flowly *stores* lives under `~/.flowly/` (config, workspace, plugins, skills, memory, session db). See [Installation](../getting-started/installation.md) and [File layout](../reference/file-layout.md).
 
 ## 2. Bring your own key
 
-Pick any provider — OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI/Grok, Zhipu, Kimi, or any OpenAI-compatible local model (Ollama, LM Studio, vLLM):
+Pick any provider — OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI/Grok, Zhipu, Sakana, or any OpenAI-compatible local model (Ollama, LM Studio, vLLM). Those eight slugs are what `setup byok` accepts; subscription sign-ins (ChatGPT via Codex, Grok, GLM Coding Plan) have their own commands — see [Providers and models](providers-and-models.md):
 
 ```bash
 flowly setup byok openrouter --key sk-or-...

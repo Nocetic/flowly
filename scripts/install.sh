@@ -5,7 +5,7 @@
 # uv (which downloads and manages Python itself — no system Python required), and
 # installs Flowly into it as an editable checkout. Because the install lives in a
 # real git checkout, `flowly update` can fast-forward it with `git pull` instead
-# of waiting for a PyPI release. The installed command is the console script:
+# of waiting for a packaged release. The installed command is the console script:
 # flowly.
 
 set -euo pipefail

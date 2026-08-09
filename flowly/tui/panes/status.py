@@ -86,29 +86,30 @@ def _model_budget(model: str) -> int:
          already cached (warmed at TUI startup), use the provider's own
          ``context_length`` field. Works for the entire ~262 OpenRouter
          catalog without us baking in magic numbers per family.
-      2. **Hardcoded fallback** — the catalog isn't always cached (no
-         network yet, BYOK provider w/o fetcher, custom model id). The
-         family heuristics below stay so the bar isn't blank on cold
-         start.
-      3. **Default 200k** — last resort so the bar still renders.
+      2. **Family fallback** — the catalog isn't always cached (no network
+         yet, BYOK provider w/o fetcher, custom model id), so the bar still
+         has something to draw on a cold start. Shared with the compaction
+         budget: this used to be a second, slightly different copy that did
+         not know ``gpt-4.1`` or ``gpt-3.5`` and matched only the dated
+         Claude 4 slugs, so a model could be budgeted at one size and drawn
+         at another.
+      3. **Default 200k** — last resort so the bar still renders. Stays local
+         to the bar: a wrong guess here costs a mis-drawn ring, whereas
+         compaction answers to a wire that 413s and defaults lower.
     """
     try:
-        from flowly.integrations.model_catalog import get_context_window
+        from flowly.integrations.model_catalog import (
+            family_context_window,
+            get_context_window,
+        )
         live = get_context_window(model)
         if live:
             return live
+        family = family_context_window(model)
+        if family:
+            return family
     except Exception:
         pass
-    m = (model or "").lower()
-    if "kimi" in m:
-        return 262_144
-    if "gemini" in m:
-        return 1_000_000
-    if "gpt-4o" in m or "gpt-4-turbo" in m:
-        return 128_000
-    if any(x in m for x in ("claude-haiku-4", "claude-sonnet-4",
-                            "claude-opus-4", "sonnet-4", "haiku-4", "opus-4")):
-        return 200_000
     return DEFAULT_BUDGET_TOKENS
 
 
@@ -232,6 +233,11 @@ class _TokenBar(Static):
     tokens_in:  reactive[int] = reactive(0, layout=False)
     tokens_out: reactive[int] = reactive(0, layout=False)
     model:      reactive[str] = reactive("", layout=False)
+    # The bot's own ceiling for the provider that ran the turn, when it sent
+    # one. Beats every guess below: `_model_budget` can only read a catalogue
+    # this process happens to have cached, and falls back to a flat 200K for
+    # anything it cannot place. 0 = nothing reported, keep guessing.
+    budget_override: reactive[int] = reactive(0, layout=False)
 
     def __init__(self) -> None:
         super().__init__("", markup=True)
@@ -239,6 +245,7 @@ class _TokenBar(Static):
     def watch_tokens_in(self) -> None: self._refresh()
     def watch_tokens_out(self) -> None: self._refresh()
     def watch_model(self) -> None: self._refresh()
+    def watch_budget_override(self) -> None: self._refresh()
 
     def _refresh(self) -> None:
         # Always render the bar — previously we hid it until the first
@@ -246,7 +253,7 @@ class _TokenBar(Static):
         # fresh chat. The bar now shows "0/1M ░░░░ 0%" up front so the
         # user knows how much context their current model has.
         used = self.tokens_in + self.tokens_out
-        budget = _model_budget(self.model)
+        budget = self.budget_override or _model_budget(self.model)
         if not budget:
             self.update("")
             return
@@ -282,6 +289,7 @@ class ContextHeader(Header):
     model: reactive[str] = reactive("", layout=False)
     tokens_in: reactive[int] = reactive(0, layout=False)
     tokens_out: reactive[int] = reactive(0, layout=False)
+    budget_override: reactive[int] = reactive(0, layout=False)
 
     def compose(self) -> ComposeResult:
         yield HeaderTitle()
@@ -299,6 +307,10 @@ class ContextHeader(Header):
     def watch_tokens_out(self, _old: int, new: int) -> None:
         if hasattr(self, "_tokens"):
             self._tokens.tokens_out = new
+
+    def watch_budget_override(self, _old: int, new: int) -> None:
+        if hasattr(self, "_tokens"):
+            self._tokens.budget_override = new
 
 
 class _SessionClock(Static):
@@ -539,6 +551,10 @@ class StatusBar(Horizontal):
     hint:              reactive[str] = reactive("")
     tokens_in:         reactive[int] = reactive(0)
     tokens_out:        reactive[int] = reactive(0)
+    # Ceiling reported by the bot for the turn that just ended; 0 until one
+    # arrives (or from a gateway that never sends it), which leaves the bar on
+    # its own model-family guess exactly as before.
+    context_budget:    reactive[int] = reactive(0)
     approvals_pending: reactive[int] = reactive(0)
     artifacts_count:   reactive[int] = reactive(0)
     cost_usd:          reactive[float] = reactive(0.0)
@@ -588,11 +604,18 @@ class StatusBar(Horizontal):
     def watch_model(self, _o: str, n: str) -> None:
         if hasattr(self, "_model"):
             self._model.model = n
+        # A reported ceiling belongs to the model that was running. Switching
+        # from a 200K model to a 32K one must not keep drawing the bar against
+        # 200K until the next turn happens to land — drop back to the guess,
+        # which at least follows the new model's family.
+        self.context_budget = 0
         self._sync_context_header(model=n)
     def watch_tokens_in(self, _o: int, n: int) -> None:
         self._sync_context_header(tokens_in=n)
     def watch_tokens_out(self, _o: int, n: int) -> None:
         self._sync_context_header(tokens_out=n)
+    def watch_context_budget(self, _o: int, n: int) -> None:
+        self._sync_context_header(budget=n)
     def watch_approvals_pending(self, _o: int, n: int) -> None:
         if hasattr(self, "_meta"):
             self._meta.approvals = n
@@ -638,6 +661,7 @@ class StatusBar(Horizontal):
         model: str | None = None,
         tokens_in: int | None = None,
         tokens_out: int | None = None,
+        budget: int | None = None,
     ) -> None:
         try:
             header = self.app.query_one(ContextHeader)
@@ -649,6 +673,8 @@ class StatusBar(Horizontal):
             header.tokens_in = tokens_in
         if tokens_out is not None:
             header.tokens_out = tokens_out
+        if budget is not None:
+            header.budget_override = budget
         tokens_bar = getattr(header, "_tokens", None)
         if tokens_bar is not None:
             if model is not None:
@@ -657,6 +683,8 @@ class StatusBar(Horizontal):
                 tokens_bar.tokens_in = tokens_in
             if tokens_out is not None:
                 tokens_bar.tokens_out = tokens_out
+            if budget is not None:
+                tokens_bar.budget_override = budget
             try:
                 tokens_bar._refresh()
             except Exception:

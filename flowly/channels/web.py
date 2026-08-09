@@ -566,6 +566,19 @@ class WebChannel(BaseChannel):
         model_meta = msg.metadata.get("model")
         if model_meta:
             data_block["model"] = str(model_meta)
+        # ``usage`` above is the RAW provider dialect: ``prompt_tokens`` is the
+        # full input on OpenAI-compatible providers but only the uncached
+        # remainder on native Anthropic. Dividing it by a context length is
+        # therefore wrong for whichever dialect the client didn't assume. These
+        # two fields are the agent loop's already-normalized answer — occupancy
+        # and the ceiling for the provider that actually ran the turn. Omitted
+        # when unknown, so a client's own fallback still runs.
+        context_tokens_meta = msg.metadata.get("contextTokens")
+        if isinstance(context_tokens_meta, int) and context_tokens_meta > 0:
+            data_block["contextTokens"] = context_tokens_meta
+        context_window_meta = msg.metadata.get("contextWindow")
+        if isinstance(context_window_meta, int) and context_window_meta > 0:
+            data_block["contextWindow"] = context_window_meta
 
         # Attachment V2 for hosted media. The relay persists these onto the
         # assistant message and forwards them on the live event, so a clip shows
@@ -803,8 +816,17 @@ class WebChannel(BaseChannel):
         tokens_after: int,
         messages_removed: int,
         phase: str = "completed",
+        compaction_id: str = "",
     ) -> None:
-        """Notify the browser/iOS that context is being compacted or was compacted."""
+        """Notify the browser/iOS that context is being compacted or was compacted.
+
+        On ``phase="completed"`` this event is ALSO what makes the relay write
+        the transcript's context-boundary row. The bot used to publish that row
+        itself as an ordinary reply carrying ``[context-optimized]`` — which
+        every consumer of turn terminals then had to recognise by its text to
+        avoid settling a turn that was still streaming. Keyed off a typed event
+        instead, no reply-shaped message is involved and nothing has to guess.
+        """
         if not self._ws:
             return
 
@@ -823,6 +845,16 @@ class WebChannel(BaseChannel):
                 "tokensBefore": tokens_before,
                 "tokensAfter": tokens_after,
                 "messagesRemoved": messages_removed,
+                # The relay routes conversation-scoped events by the payload's
+                # sessionKey (same as plan.*), falling back to the origin
+                # session id. Sending it means every device viewing this chat
+                # gets the event, not just the socket that happened to be the
+                # envelope's origin.
+                "sessionKey": session_key,
+                # Identity of this compaction cycle: correlates started with
+                # completed, and gives the relay a stable document id for the
+                # boundary row so a duplicate event cannot draw two dividers.
+                **({"compactionId": compaction_id} if compaction_id else {}),
             },
         }
         try:
@@ -1175,7 +1207,20 @@ class WebChannel(BaseChannel):
                             "type": "event",
                             "sessionId": session_id,
                             "event": "chat",
-                            "data": {"state": "streaming", "runId": run_id, "delta": delta},
+                            # sessionKey is how the relay routes this to the
+                            # CONVERSATION rather than to the socket the turn
+                            # started on. Without it the relay falls back to
+                            # the originating session id — and a client that
+                            # reconnected mid-turn (a long compaction is
+                            # enough) never receives the rest of its own
+                            # reply. It shows up only on re-entry, restored
+                            # from chat.inflight.
+                            "data": {
+                                "state": "streaming",
+                                "runId": run_id,
+                                "sessionKey": session_key,
+                                "delta": delta,
+                            },
                         }
                     )
                 )
@@ -1285,7 +1330,14 @@ class WebChannel(BaseChannel):
                             "type": "event",
                             "sessionId": session_id,
                             "event": "chat",
-                            "data": {"state": "aborted", "runId": run_id},
+                            # Same routing requirement as the streaming and
+                            # final events: without sessionKey the relay can
+                            # only reach the socket the turn started on.
+                            "data": {
+                                "state": "aborted",
+                                "runId": run_id,
+                                "sessionKey": self._session_key_for_relay_id(session_id),
+                            },
                         }
                     )
                 )
@@ -1348,7 +1400,13 @@ class WebChannel(BaseChannel):
                 "type": "rpc",
                 "id": rpc_id,
                 "sessionId": session_id,
-                "result": build_commands_catalogue(),
+                "result": build_commands_catalogue(
+                    surface=(
+                        params.get("surface")
+                        if isinstance(params.get("surface"), str)
+                        else None
+                    ),
+                ),
             }
             await ws.send(json.dumps(ack))
 

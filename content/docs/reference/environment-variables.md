@@ -10,7 +10,7 @@ Flowly is configured mainly through `~/.flowly/config.json`. The environment var
 
 | Variable | Default | What it does |
 |---|---|---|
-| `FLOWLY_HOME` | `~/.flowly` | The profile/home directory — where config, sessions, credentials, skills, and databases live. |
+| `FLOWLY_HOME` | `~/.flowly` | The profile/home directory — where config, sessions, credentials, skills, and databases live. A non-default home also carries its own machine identity, so signing in from it registers a separate `<machine>-dev` server instead of taking over your main one. |
 | `FLOWLY_PROFILE` | `default` | Profile name, for wrapper scripts. Resolution order: `-p` flag → `FLOWLY_PROFILE` → `~/.flowly/active_profile` → `default`. |
 
 ## Sandbox & execution
@@ -18,7 +18,7 @@ Flowly is configured mainly through `~/.flowly/config.json`. The environment var
 | Variable | Default | What it does |
 |---|---|---|
 | `FLOWLY_SANDBOX` | on | Set to `0` / `false` / `off` / `no` to disable the OS sandbox (macOS `sandbox-exec` / Linux `bwrap`). |
-| `FLOWLY_SANDBOX_WRAPPED` | — | Internal recursion guard set when re-execing under the sandbox. **Do not set this yourself.** |
+| `FLOWLY_SANDBOX_WRAPPED` | — | Internal recursion guard set when re-execing under the sandbox. Also tells Flowly the OS keychain is out of reach (the profile hides `~/Library/Keychains`), so credentials go to `0600` files instead of raising a keychain prompt. **Do not set this yourself.** |
 | `FLOWLY_CWD` | — | Override the runtime working directory for shell/exec and Codex. |
 | `FLOWLY_BASH_PATH` | — | Path to the `bash` binary used for command execution. |
 

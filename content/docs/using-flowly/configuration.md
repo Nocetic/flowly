@@ -155,11 +155,27 @@ Channels are off by default. See [Channels overview](../channels/overview.md).
 |---|---|
 | `active` | `""` — explicit default provider slug; `""` falls back to the API-key cascade |
 | `flowly` | `enabled=true`, `apiBase="https://useflowlyapp.com/api/v1"` (Flowly Cloud; uses account token when signed in) |
-| `xaiOAuth` | `enabled=true`, `clientId=""`, `apiBase="https://api.x.ai/v1"` (tokens stored in OS keychain, not config) |
+| `xaiOAuth` | `enabled=true`, `clientId=""`, `apiBase="https://api.x.ai/v1"` (tokens stored in the OS keychain, not config) |
+| `openaiCodex` | ChatGPT subscription (Codex OAuth) — tokens in the OS keychain, not config |
+| `zaiCoding` | Z.AI GLM Coding Plan — tokens in the OS keychain, not config |
 
-BYOK provider slots — each with `apiKey=""`, `apiBase=null`, `fallbackKeys=[]`: `anthropic`, `openai`, `openrouter`, `zhipu`, `vllm`, `gemini`, `groq`, `xai`.
+BYOK provider slots — each with `apiKey=""`, `apiBase=null`, `fallbackKeys=[]`: `anthropic`, `openai`, `openrouter`, `zhipu`, `sakana`, `vllm`, `gemini`, `groq`, `xai`.
 
-When `active=""`, the API-key cascade picks the first usable provider in priority order: OpenRouter → Anthropic → OpenAI → xAI → xAI OAuth → Gemini → Groq → Zhipu → Sakana → vLLM. See [Providers and models](./providers-and-models.md).
+When `active=""`, the cascade picks the first usable provider in priority order:
+
+```
+openrouter → anthropic → openai → openai_codex → zai_coding → xai
+           → xai_oauth → gemini → groq → zhipu → sakana → vllm
+```
+
+Setting a provider explicitly (`/provider`, `flowly setup`, or `active` in this file) skips the cascade entirely — worth doing if more than one credential is present, so the choice is yours rather than the order's. See [Providers and models](./providers-and-models.md).
+
+> [!NOTE]
+> Two of those slots can read a login you created elsewhere: `openai_codex`
+> falls back to the Codex CLI's `~/.codex/auth.json`, and `zai_coding` to
+> OpenCode's `auth.json`. That's why an existing subscription can work with
+> no setup — and why `flowly setup` asks before using one instead of
+> adopting it silently.
 
 ### gateway
 

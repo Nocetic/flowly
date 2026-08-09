@@ -81,6 +81,43 @@ def _format_message_time(value: object | None) -> str:
         return time.strftime("%I:%M %p").lstrip("0")
 
 
+class CompactionNotice(Static):
+    """A spinning one-liner that turns into its own result.
+
+    Lives in the transcript rather than the status bar because it marks a
+    point in the conversation: everything above it is about to be replaced by
+    a summary.
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    FRAME_MS = 90
+
+    def __init__(self, text: str) -> None:
+        super().__init__("", classes="compaction-notice", markup=False)
+        self._label = text
+        self._frame = 0
+        self._timer = None
+
+    def on_mount(self) -> None:
+        self._render_frame()
+        self._timer = self.set_interval(self.FRAME_MS / 1000, self._tick)
+
+    def _tick(self) -> None:
+        self._frame = (self._frame + 1) % len(self.FRAMES)
+        self._render_frame()
+
+    def _render_frame(self) -> None:
+        self.update(f"  {self.FRAMES[self._frame]}  {self._label}")
+
+    def finish(self, text: str) -> None:
+        """Stop spinning and become the outcome."""
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self._label = text
+        self.update(f"  ⚡  {text}")
+
+
 class Bubble(Container):
     """One message in the transcript.
 
@@ -188,6 +225,15 @@ class Bubble(Container):
 
     def on_mount(self) -> None:
         self._refresh_body()
+
+    @property
+    def is_empty(self) -> bool:
+        """Nothing written to this bubble yet.
+
+        A turn opens a placeholder the moment the user hits send, so "is there
+        a bubble" and "has the agent said anything" are different questions.
+        """
+        return not (self._text or "").strip()
 
     def mark_streaming(self, on: bool) -> None:
         """Begin/end stream batching for this bubble.
@@ -795,6 +841,13 @@ class TranscriptPane(VerticalScroll):
         background: transparent;
         text-align: center;
     }
+    TranscriptPane .compaction-notice {
+        height: 1;
+        padding: 0 2;
+        margin: 0 0 1 0;
+        color: #7bd4e6;
+        background: transparent;
+    }
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -895,6 +948,19 @@ class TranscriptPane(VerticalScroll):
 
     def add_welcome(self, renderable) -> Static:
         widget = Static(renderable, classes="welcome-bubble", markup=False)
+        self.mount(widget)
+        self.request_tail_scroll()
+        return widget
+
+    def add_compaction_notice(self, text: str) -> "CompactionNotice":
+        """One line that spins while the summary is being written.
+
+        Compaction takes seconds to minutes, and a static line gives the user
+        no way to tell "working" from "stuck". The same widget then becomes the
+        result, so the transcript keeps ONE row for one compaction instead of
+        an orphaned "compacting…" line followed by a separate outcome.
+        """
+        widget = CompactionNotice(text)
         self.mount(widget)
         self.request_tail_scroll()
         return widget

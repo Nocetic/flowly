@@ -5,17 +5,21 @@ import os
 import secrets
 from collections import OrderedDict
 from collections.abc import Iterator
-from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
+from flowly.compaction.types import CONTEXT_BOUNDARY_CONTENT
 from flowly.media.assets import assets_to_meta as _assets_to_meta
-from flowly.utils.helpers import ensure_dir, safe_filename
 from flowly.profile import get_flowly_home
+from flowly.utils.helpers import ensure_dir, safe_filename
 
+#: Re-exported so callers that write the row can reach it from here; the
+#: definition lives with the other compaction constants.
+COMPACTION_BOUNDARY_CONTENT = CONTEXT_BOUNDARY_CONTENT
 
 # Suffix of the append-only DISPLAY transcript that rides alongside each
 # canonical ``<key>.jsonl``. It shares the ``*.jsonl`` glob, so EVERY consumer
@@ -182,8 +186,12 @@ def _repair_tool_sequence(
                 result = result[: idx + 1]
                 continue
             issuing = result[idx]
+            # Same id resolution as the whole-list pass below. Two repairs
+            # reading different id fields is worse than one: they would
+            # disagree about which pairs are complete, and each would "fix"
+            # what the other considers valid.
             declared_ids = {
-                tc.get("id")
+                _tool_call_id(tc)
                 for tc in (issuing.get("tool_calls") or [])
                 if isinstance(tc, dict)
             }
@@ -202,7 +210,74 @@ def _repair_tool_sequence(
         # Anything else (user, system, plain assistant) is a clean tail.
         break
 
-    return result
+    return _drop_orphan_tool_pairs(result)
+
+
+def _tool_call_id(call: Any) -> str:
+    """The id a tool result will reference.
+
+    Some provider formats carry both an ``id`` and a ``call_id`` and they are
+    not always the same value. Read both, preferring the one results are keyed
+    by, so this never matches on the wrong field — a sanitizer keyed to the
+    wrong id is worse than no sanitizer, because it silently removes valid
+    turns while leaving the broken ones in place.
+    """
+    if isinstance(call, dict):
+        return str(call.get("call_id") or call.get("id") or "")
+    return str(getattr(call, "call_id", "") or getattr(call, "id", "") or "")
+
+
+def _drop_orphan_tool_pairs(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove tool calls and tool results that lost their partner.
+
+    ``_repair_tool_sequence`` walks only the tail, which is where a crash
+    leaves damage. This pass covers the whole list, so the invariant "what we
+    send is well-formed" is checked rather than inferred from the fact that
+    every producer happens to behave.
+
+    Both directions are handled: a result whose issuing call is gone, and a
+    call whose results are gone. Providers reject either with a 400.
+    """
+    issued: set[str] = set()
+    answered: set[str] = set()
+    for msg in messages:
+        role = msg.get("role")
+        if role == "assistant":
+            for call in msg.get("tool_calls") or []:
+                cid = _tool_call_id(call)
+                if cid:
+                    issued.add(cid)
+        elif role == "tool":
+            tcid = str(msg.get("tool_call_id") or "")
+            if tcid:
+                answered.add(tcid)
+
+    if answered <= issued and issued <= answered:
+        return messages  # already well-formed; keep the exact list
+
+    cleaned: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "tool":
+            if str(msg.get("tool_call_id") or "") in issued:
+                cleaned.append(msg)
+            continue
+        if role == "assistant" and msg.get("tool_calls"):
+            kept_calls = [
+                c for c in msg["tool_calls"] if _tool_call_id(c) in answered
+            ]
+            if len(kept_calls) == len(msg["tool_calls"]):
+                cleaned.append(msg)
+            elif kept_calls:
+                cleaned.append({**msg, "tool_calls": kept_calls})
+            elif str(msg.get("content") or "").strip():
+                # Keep the assistant's words, drop the unanswered calls.
+                cleaned.append({k: v for k, v in msg.items() if k != "tool_calls"})
+            continue
+        cleaned.append(msg)
+    return cleaned
 
 
 @dataclass
@@ -461,9 +536,47 @@ class Session:
             self.metadata["last_turn_usage"] = clean_usage
 
     def clear(self) -> None:
-        """Clear all messages in the session."""
+        """Clear all messages in the session.
+
+        Messages ONLY. Metadata that carries conversational context survives —
+        see :meth:`reset_conversation_context`, which is what ``/clear`` and
+        ``/new`` must call.
+        """
         self.messages = []
         self.updated_at = datetime.now()
+
+    #: Metadata that survives a ``/clear``. An ALLOWLIST, deliberately: these
+    #: describe the conversation's identity and settings, not its content.
+    #: Anything else is treated as content-derived and dropped, so a metadata
+    #: key added later cannot silently leak the old conversation into the new
+    #: one — the failure mode this list exists to prevent.
+    CONTEXT_FREE_METADATA_KEYS = frozenset({
+        "persona",            # the agent's configured voice, not conversation
+        "title",              # the chat's name in every client's list
+        "title_provisional",  # whether that name is still a placeholder
+        "cwd",                # the working directory pinned to this chat
+        "model_override",     # the model the user picked for this chat
+        "visibility",
+    })
+
+    def reset_conversation_context(self) -> None:
+        """Start a fresh conversation under the same session key.
+
+        Clearing the message list alone is not a fresh start. The compaction
+        summary lives in ``metadata['last_compaction_summary']`` and is
+        re-injected at the head of every subsequent turn by the summary
+        anchor — so after ``/clear`` the model kept being told everything the
+        previous conversation had established, while the user (and the
+        transcript) saw an empty chat.
+
+        Group-chat buffers, compaction bookkeeping and any other
+        content-derived state are dropped for the same reason.
+        """
+        self.clear()
+        self.metadata = {
+            k: v for k, v in self.metadata.items()
+            if k in self.CONTEXT_FREE_METADATA_KEYS
+        }
 
     def drop_last_assistant_chain(self) -> str | None:
         """Remove trailing assistant + tool messages; return last user text.
@@ -615,6 +728,38 @@ class SessionManager:
             session.metadata[self._FULL_WATERMARK_KEY] = total
         except Exception as e:  # pragma: no cover - disk best-effort
             logger.debug("Display-log flush failed for {}: {}", session.key, e)
+
+    def append_context_boundary(
+        self, session: "Session", compaction_id: str = "",
+    ) -> None:
+        """Record a compaction boundary in the display transcript.
+
+        The relay writes this row into Firestore for its own clients; this is
+        the same row for the transports that read history from disk instead —
+        the direct gateway (desktop over a local/remote WS, iOS over the same).
+        Without it those surfaces got a live notice that vanished on reload,
+        so a reopened chat gave no hint that anything had been summarised.
+
+        Carries the typed fields AND the legacy text, so a client that renders
+        the divider by matching content is unchanged while new ones can read
+        ``kind``. Best-effort: never blocks a commit.
+        """
+        row: dict[str, Any] = {
+            "role": "assistant",
+            "content": COMPACTION_BOUNDARY_CONTENT,
+            "kind": "context_boundary",
+            "boundaryKind": "compaction",
+            "timestamp": datetime.now().isoformat(),
+        }
+        if compaction_id:
+            row["compactionId"] = compaction_id
+        try:
+            path = self._get_full_path(session.key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception as e:  # pragma: no cover - disk best-effort
+            logger.debug("Context boundary append failed for {}: {}", session.key, e)
 
     def mark_full_synced(self, session: "Session") -> None:
         """Declare the current ``session.messages`` as already represented in the

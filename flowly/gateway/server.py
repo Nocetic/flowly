@@ -1550,6 +1550,30 @@ class GatewayServer:
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 
+    async def broadcast_clarify_closed(
+        self,
+        clarify_id: str,
+        reason: str,
+        session_key: str | None,
+    ) -> None:
+        """Tell clients a clarify stopped waiting (``answered`` / ``timeout``).
+
+        The counterpart of ``broadcast_clarify_request``: a surface that drew a
+        prompt needs to retire it when the question is settled elsewhere or
+        expires, or the user answers into a prompt nothing is listening to.
+        """
+        event = {
+            "type": "event",
+            "event": "agent.clarify.closed",
+            "data": {
+                "id": clarify_id,
+                "reason": reason,
+                "sessionKey": session_key or "",
+            },
+        }
+        for ws in list(self._ws_clients.values()):
+            await self._ws_send(ws, event)
+
     # exec.policy.* (standing approval policy) is served from the shared
     # flowly.channels.feature_rpc surface — dispatched at the top of
     # _ws_dispatch via ``method in feature_rpc.FEATURE_METHODS`` so it lights
@@ -1679,7 +1703,14 @@ class GatewayServer:
         """
         from flowly.agent.skill_bundles import build_commands_catalogue
 
-        await self._ws_rpc_reply(ws, rpc_id, build_commands_catalogue())
+        surface = params.get("surface")
+        await self._ws_rpc_reply(
+            ws,
+            rpc_id,
+            build_commands_catalogue(
+                surface=surface if isinstance(surface, str) else None,
+            ),
+        )
 
     # --- RPC: subagents.list ---
 
@@ -2210,6 +2241,16 @@ class GatewayServer:
                 msg["tool_call_id"] = m["tool_call_id"]
             if m.get("name"):
                 msg["name"] = m["name"]
+            # Context-boundary rows (a compaction happened here). Typed fields
+            # ride alongside the legacy text so a client can render the divider
+            # without matching a string — the relay's Firestore row carries the
+            # same pair, so both transports look identical to a client.
+            if m.get("kind"):
+                msg["kind"] = m["kind"]
+            if m.get("boundaryKind"):
+                msg["boundaryKind"] = m["boundaryKind"]
+            if m.get("compactionId"):
+                msg["compactionId"] = m["compactionId"]
             # Reconstruct attachment previews from the media paths saved on the
             # user turn. Images get a small base64 JPEG thumbnail (not the full
             # original — that could be 25 MB) so the desktop shows the same
@@ -2511,6 +2552,17 @@ class GatewayServer:
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "message": final_message,
             }
+            # Context-window occupancy + ceiling, both already normalized for
+            # the active provider by the agent loop. Sent as separate fields
+            # (not inside ``usage``) because ``usage`` is the raw provider
+            # dialect and clients must not have to guess which one it is.
+            # Omitted when unknown so a client's own fallback still runs.
+            context_tokens = (metadata or {}).get("contextTokens")
+            if isinstance(context_tokens, int) and context_tokens > 0:
+                final_data["contextTokens"] = context_tokens
+            context_window = (metadata or {}).get("contextWindow")
+            if isinstance(context_window, int) and context_window > 0:
+                final_data["contextWindow"] = context_window
             if (metadata or {}).get("aborted") is True:
                 final_data["aborted"] = True
             metadata_duration = (metadata or {}).get("duration_ms")
@@ -3437,8 +3489,23 @@ class GatewayServer:
             await self._ws_send(ws, event)
 
     async def _broadcast_compaction_event(self, data: dict) -> None:
-        """Push compaction event to all connected WS clients."""
+        """Push a compaction event to clients watching that session.
+
+        Compaction is a property of one conversation, so a blanket broadcast
+        put another chat's (or a cron run's) compaction notice into every open
+        transcript. Clients still filter defensively, but the server should not
+        be sending them the event in the first place.
+        """
         event = {"type": "event", "event": "compaction", "data": data}
+        session_key = str(data.get("sessionKey") or "")
+        target = self._session_ws.get(session_key) if session_key else None
+        if target is not None and not target.closed:
+            await self._ws_send(target, event)
+            return
+        # No live socket bound to this session (a client that connected but
+        # hasn't sent yet, or a rebind in flight). Fall back to everyone —
+        # a redundant notice beats a missing one, and clients filter on
+        # sessionKey anyway.
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 
