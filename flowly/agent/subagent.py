@@ -22,6 +22,10 @@ from flowly.artifacts.context import (
     internal_context_metadata,
 )
 from flowly.agent.tools.base import Tool
+from flowly.agent.tools.discovery import (
+    annotate_search_repetition,
+    build_tool_disclosure,
+)
 from flowly.agent.tools.registry import ToolRegistry
 from flowly.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, MemoryAppendTool
 from flowly.agent.tools.shell import ExecTool
@@ -688,6 +692,18 @@ class SubagentManager:
             system_prompt = self._build_subagent_prompt(
                 task, label=label, assistant=assistant,
             )
+            if build_tool_disclosure(
+                tools.get_definitions(),
+                toolsets=tools.get_toolsets(),
+                sources=tools.get_discovery_sources(),
+                intent_text=task,
+            ).enabled:
+                system_prompt += (
+                    "\n\nSome safe tools are represented by a compact catalog. "
+                    "They may be invoked through tool_call. tool_search is available "
+                    "when a name or compact signature is unclear; its results include "
+                    "complete schemas and valid invocation options."
+                )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -696,6 +712,7 @@ class SubagentManager:
             # Run agent loop (limited iterations)
             max_iterations = 15
             iteration = 0
+            _tool_search_result_sets: dict[tuple[str, ...], int] = {}
             final_result: str | None = None
             _model_used_artifact = False
             # P1.2 — structured tool trace, one dict per call
@@ -767,9 +784,15 @@ class SubagentManager:
                         messages, keep_last=2, max_old_chars=150,
                     )
 
+                tool_disclosure = build_tool_disclosure(
+                    tools.get_definitions(),
+                    toolsets=tools.get_toolsets(),
+                    sources=tools.get_discovery_sources(),
+                    intent_text=task,
+                )
                 response = await self.provider.chat(
                     messages=messages,
-                    tools=tools.get_definitions(),
+                    tools=list(tool_disclosure.definitions),
                     model=model,
                     max_tokens=16384,
                     timeout=_llm_call_timeout,
@@ -800,34 +823,117 @@ class SubagentManager:
 
                     # Execute tools
                     for tool_call in response.tool_calls:
-                        logger.debug(f"[SubagentManager] [{run_id[:8]}] tool: {tool_call.name}")
-                        if tool_call.name == "artifact":
+                        protocol_tool_name = tool_call.name
+                        effective_tool_name = protocol_tool_name
+                        tool_args = dict(tool_call.arguments)
+
+                        if protocol_tool_name == "tool_search":
+                            search_offset = tool_args.get("offset", 0)
+                            try:
+                                search_limit = max(
+                                    1,
+                                    min(
+                                        int(tool_args.get("limit", 5)),
+                                        tool_disclosure.search_max_limit,
+                                    ),
+                                )
+                            except (TypeError, ValueError):
+                                search_limit = 5
+                            try:
+                                search_offset = max(0, int(search_offset))
+                            except (TypeError, ValueError):
+                                search_offset = 0
+                            result = tool_disclosure.search(
+                                query=str(tool_args.get("query", "")),
+                                toolset=str(tool_args.get("toolset", "")),
+                                limit=search_limit,
+                                offset=search_offset,
+                            )
+                            result = annotate_search_repetition(
+                                result,
+                                _tool_search_result_sets,
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": protocol_tool_name,
+                                "content": result,
+                            })
+                            continue
+
+                        if protocol_tool_name == "tool_describe":
+                            result = tool_disclosure.describe(str(tool_args.get("name", "")))
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": protocol_tool_name,
+                                "content": result,
+                            })
+                            continue
+
+                        if protocol_tool_name == "tool_call":
+                            resolved = tool_disclosure.resolve_call(
+                                str(tool_args.get("name", "")),
+                                tool_args.get("arguments"),
+                            )
+                            if isinstance(resolved, str):
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "name": protocol_tool_name,
+                                    "content": resolved,
+                                })
+                                continue
+                            effective_tool_name, tool_args = resolved
+
+                        if (
+                            protocol_tool_name != "tool_call"
+                            and effective_tool_name not in tool_disclosure.direct_names
+                        ):
+                            result = f"Error: Tool '{effective_tool_name}' is unavailable."
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": protocol_tool_name,
+                                "content": result,
+                            })
+                            continue
+
+                        logger.debug(
+                            f"[SubagentManager] [{run_id[:8]}] tool: {effective_tool_name}"
+                        )
+                        if effective_tool_name == "artifact":
                             _model_used_artifact = True
                         _heartbeat(
-                            f"subagent {label}: running {tool_call.name}",
-                            tool_call.name,
+                            f"subagent {label}: running {effective_tool_name}",
+                            effective_tool_name,
                         )
                         _tool_t0 = time.monotonic()
                         _tool_status = "ok"
                         try:
-                            tool_args = dict(tool_call.arguments)
                             if (
-                                tool_call.name == "artifact"
+                                effective_tool_name == "artifact"
                                 and "session_key" not in tool_args
                             ):
                                 tool_args["session_key"] = f"{origin_channel}:{origin_chat_id}"
                             result = await asyncio.wait_for(
-                                tools.execute(tool_call.name, tool_args),
+                                tools.execute(effective_tool_name, tool_args),
                                 timeout=120,  # Per-tool timeout
                             )
                         except asyncio.TimeoutError:
-                            result = f"Error: Tool '{tool_call.name}' timed out after 120s"
+                            result = f"Error: Tool '{effective_tool_name}' timed out after 120s"
                             _tool_status = "timeout"
-                            logger.warning(f"[SubagentManager] [{run_id[:8]}] tool timeout: {tool_call.name}")
+                            logger.warning(
+                                f"[SubagentManager] [{run_id[:8]}] tool timeout: "
+                                f"{effective_tool_name}"
+                            )
                         except Exception as e:
-                            result = f"Error executing {tool_call.name}: {e}"
+                            result = f"Error executing {effective_tool_name}: {e}"
                             _tool_status = "error"
-                            logger.warning(f"[SubagentManager] [{run_id[:8]}] tool error: {tool_call.name}: {e}")
+                            logger.warning(
+                                f"[SubagentManager] [{run_id[:8]}] tool error: "
+                                f"{effective_tool_name}: {e}"
+                            )
                         _tool_duration_ms = int((time.monotonic() - _tool_t0) * 1000)
                         # Flip status to "error" if the tool returned a
                         # human-readable error string without raising
@@ -835,8 +941,8 @@ class SubagentManager:
                         if _tool_status == "ok" and result.startswith("Error"):
                             _tool_status = "error"
                         _tool_trace.append({
-                            "tool": tool_call.name,
-                            "args_bytes": len(json.dumps(tool_call.arguments or {})),
+                            "tool": effective_tool_name,
+                            "args_bytes": len(json.dumps(tool_args or {})),
                             "result_bytes": len(result),
                             "status": _tool_status,
                             "duration_ms": _tool_duration_ms,
@@ -847,7 +953,7 @@ class SubagentManager:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
+                            "name": protocol_tool_name,
                             "content": result,
                         })
                 else:

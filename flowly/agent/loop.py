@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -40,7 +41,7 @@ from flowly.session.manager import SessionManager
 from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
 from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
-from flowly.compaction.estimator import estimate_messages_tokens, estimate_tokens
+from flowly.compaction.estimator import estimate_messages_tokens
 from flowly.exec.types import ExecConfig
 from flowly.config.schema import TrelloConfig, VoiceBridgeConfig, XConfig, MemorySearchConfig
 from flowly.audit.logger import get_audit_logger
@@ -509,6 +510,31 @@ def _redact_log_args(args: Any) -> Any:
     return args
 
 
+def _merge_turn_usage(
+    total_usage: dict[str, int],
+    response_usage: dict[str, Any],
+) -> None:
+    """Merge one provider iteration into turn-level usage in place.
+
+    Provider ``prompt_tokens`` is the complete input token count, including
+    tokens served from or written to a prompt cache.  Cache counters are a
+    billing/cache-efficiency breakdown, not additional context tokens.  Adding
+    them to ``total_tokens`` double-counts the input (often making a 61K prompt
+    look like 122K on a cache hit).
+    """
+
+    for key in ("prompt_tokens", "cache_read_tokens"):
+        total_usage[key] = int(response_usage.get(key, 0) or 0)
+    for key in ("completion_tokens", "cache_write_tokens"):
+        total_usage[key] = int(total_usage.get(key, 0) or 0) + int(
+            response_usage.get(key, 0) or 0
+        )
+    total_usage["total_tokens"] = (
+        int(total_usage.get("prompt_tokens", 0) or 0)
+        + int(total_usage.get("completion_tokens", 0) or 0)
+    )
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -565,7 +591,33 @@ class AgentLoop:
         self.sessions = SessionManager(workspace)
         from flowly.agent.hooks import HookRegistry
         self.hooks = HookRegistry()
-        self.tools = ToolRegistry(hooks=self.hooks)
+        _routing_cfg = getattr(getattr(main_config, "tools", None), "routing", None)
+        _availability_ttl = getattr(
+            _routing_cfg, "availability_cache_ttl_seconds", 30.0
+        )
+        _availability_grace = getattr(
+            _routing_cfg, "availability_failure_grace_seconds", 60.0
+        )
+        _schema_cache_ttl = getattr(
+            _routing_cfg, "schema_cache_ttl_seconds", 10.0
+        )
+        self.context.set_capability_guidance(
+            enabled=bool(getattr(
+                _routing_cfg, "capability_guidance_enabled", True
+            )),
+            fail_open=bool(getattr(
+                _routing_cfg, "capability_guidance_fail_open", True
+            )),
+            skill_catalog_max_chars=int(getattr(
+                _routing_cfg, "skill_catalog_max_chars", 8_000
+            )),
+        )
+        self.tools = ToolRegistry(
+            hooks=self.hooks,
+            availability_cache_ttl=_availability_ttl,
+            availability_failure_grace=_availability_grace,
+            schema_cache_ttl=_schema_cache_ttl,
+        )
         # Gateway reference for turn-level lifecycle broadcasts. Wired by
         # set_gateway_server() once the gateway is constructed.
         self._gateway_server = None
@@ -638,6 +690,75 @@ class AgentLoop:
         self._memory_search_config = memory_search_config or MemorySearchConfig()
         self._main_config = main_config
         self._memory_manager: Any | None = None  # lazy-initialized
+
+        # Local semantic routing is a separate derived index over static tool
+        # metadata. It deliberately does not share the memory embedding
+        # provider, memory configuration, or memory databases.
+        self._semantic_tool_router: Any | None = None
+        self._semantic_registry_unsubscribe: Callable[[], None] | None = None
+        self._semantic_refresh_lock = threading.Lock()
+        self._semantic_refresh_timer: threading.Timer | None = None
+        self._semantic_snapshot_lock = threading.Lock()
+        self._semantic_snapshot_cache_key: tuple[Any, ...] | None = None
+        self._semantic_snapshot_cache: Any | None = None
+        try:
+            _discovery_cfg = getattr(_routing_cfg, "discovery", None)
+            if bool(getattr(_discovery_cfg, "semantic_routing_enabled", False)):
+                from flowly.agent.tools.semantic_feature import semantic_model_cache_dir
+                from flowly.agent.tools.semantic_routing import SemanticToolRouter
+
+                _auto_download = bool(getattr(
+                    _discovery_cfg,
+                    "semantic_model_auto_download",
+                    False,
+                ))
+                _download_env = str(
+                    os.environ.get("FLOWLY_SEMANTIC_MODEL_DOWNLOAD", "")
+                ).strip().casefold()
+                if _download_env in {"0", "false", "no", "off"}:
+                    _auto_download = False
+                elif _download_env in {"1", "true", "yes", "on"}:
+                    _auto_download = True
+                _semantic_model_cache = semantic_model_cache_dir(self._state_dir)
+                self._semantic_tool_router = SemanticToolRouter(
+                    state_dir=self._state_dir,
+                    model_cache_dir=_semantic_model_cache,
+                    auto_download=_auto_download,
+                    source_min_score=float(getattr(
+                        _discovery_cfg, "semantic_source_min_score", 0.78
+                    )),
+                    source_min_margin=float(getattr(
+                        _discovery_cfg, "semantic_source_min_margin", 0.009
+                    )),
+                    tool_min_score=float(getattr(
+                        _discovery_cfg, "semantic_tool_min_score", 0.76
+                    )),
+                    tool_score_window=float(getattr(
+                        _discovery_cfg, "semantic_tool_score_window", 0.035
+                    )),
+                    workflow_max_tools=int(getattr(
+                        _discovery_cfg, "intent_max_promoted_tools", 4
+                    )),
+                    query_cache_size=int(getattr(
+                        _discovery_cfg, "semantic_query_cache_size", 256
+                    )),
+                )
+        except Exception as exc:  # noqa: BLE001 - lexical discovery remains complete
+            logger.warning(
+                "Semantic tool router initialization failed; lexical discovery remains active: {}",
+                type(exc).__name__,
+            )
+            self._semantic_tool_router = None
+
+        # Initial MCP discovery deliberately runs off the constructor thread so
+        # a slow integration never delays gateway startup.  Direct CLI calls,
+        # however, may submit their first turn immediately after construction.
+        # Expose an explicit readiness contract so those callers can wait for a
+        # complete tool catalog instead of racing the discovery thread.
+        self._mcp_discovery_started = False
+        self._mcp_discovery_done = threading.Event()
+        self._mcp_discovery_registered = 0
+        self._mcp_discovery_error: str | None = None
 
         # Session search index (FTS5)
         self._session_indexer: Any | None = None
@@ -740,6 +861,25 @@ class AgentLoop:
         self._maybe_enable_skill_improvement()
 
         self._register_default_tools()
+
+    @property
+    def mcp_discovery_pending(self) -> bool:
+        """Whether configured MCP tools are still joining the registry."""
+
+        return self._mcp_discovery_started and not self._mcp_discovery_done.is_set()
+
+    def wait_for_mcp_discovery(self, timeout: float | None = None) -> bool:
+        """Wait for the initial MCP catalog snapshot to become stable.
+
+        Gateway construction remains non-blocking; synchronous entry points
+        such as ``flowly agent`` use this hook before their first model turn.
+        ``False`` means the caller's bounded wait elapsed while discovery keeps
+        running in the background, so later turns may still see the tools.
+        """
+
+        if not self._mcp_discovery_started:
+            return True
+        return self._mcp_discovery_done.wait(timeout=timeout)
 
     def _maybe_enable_memory_governance(self) -> None:
         """Wire memory_append/knowledge_graph writes into the governance layer.
@@ -1518,11 +1658,15 @@ class AgentLoop:
                 from flowly.agent.tools.google_drive import GoogleDriveTool
                 from flowly.agent.tools.google_contacts import GoogleContactsTool
                 from flowly.agent.tools.google_tasks import GoogleTasksTool
-                self.tools.register(EmailTool())
-                self.tools.register(GoogleCalendarTool())
-                self.tools.register(GoogleDriveTool())
-                self.tools.register(GoogleContactsTool())
-                self.tools.register(GoogleTasksTool())
+                def _google_ready(_context: Any) -> bool:
+                    from flowly.channels.gmail_auth import load_credentials
+                    return load_credentials() is not None
+
+                self.tools.register(EmailTool(), check_fn=_google_ready)
+                self.tools.register(GoogleCalendarTool(), check_fn=_google_ready)
+                self.tools.register(GoogleDriveTool(), check_fn=_google_ready)
+                self.tools.register(GoogleContactsTool(), check_fn=_google_ready)
+                self.tools.register(GoogleTasksTool(), check_fn=_google_ready)
         
         # Web tools — direct Brave key OR centralized proxy via web app
         web_proxy_url = None
@@ -1534,11 +1678,15 @@ class AgentLoop:
                 web_proxy_url = self._main_config.tools.web.search.proxy_url
                 web_server_id = web_cfg.server_id
                 web_auth_token = web_cfg.auth_token
+        web_search_enabled = True
+        if self._main_config and hasattr(self._main_config, "tools"):
+            web_search_enabled = bool(self._main_config.tools.web.search.enabled)
         self.tools.register(WebSearchTool(
             api_key=self.brave_api_key,
             proxy_url=web_proxy_url,
             server_id=web_server_id,
             auth_token=web_auth_token,
+            enabled=web_search_enabled,
         ))
         self.tools.register(WebFetchTool())
         self.tools.register(WebExtractTool())
@@ -1970,25 +2118,44 @@ class AgentLoop:
         try:
             mcp_servers = getattr(self._main_config, "mcp_servers", None)
             if mcp_servers:
-                import threading
+                self._mcp_discovery_started = True
 
                 def _discover_mcp_background() -> None:
                     try:
                         from flowly.mcp import discover_mcp_tools
-                        discover_mcp_tools(
+                        registered = discover_mcp_tools(
                             servers=mcp_servers,
                             tool_registry=self.tools,
                         )
+                        self._mcp_discovery_registered = len(registered)
                     except Exception as exc:  # pragma: no cover — defensive
-                        logger.warning("MCP discovery failed: {}", exc)
+                        from flowly.mcp.security import sanitize_error
+
+                        self._mcp_discovery_error = sanitize_error(str(exc))
+                        logger.warning(
+                            "MCP discovery failed: {}",
+                            self._mcp_discovery_error,
+                        )
+                    finally:
+                        self._mcp_discovery_done.set()
+                        self._prepare_semantic_tool_index()
 
                 threading.Thread(
                     target=_discover_mcp_background,
                     name="flowly-mcp-discovery",
                     daemon=True,
                 ).start()
+            else:
+                self._mcp_discovery_done.set()
         except Exception as exc:  # pragma: no cover — defensive
-            logger.warning("MCP discovery could not start: {}", exc)
+            from flowly.mcp.security import sanitize_error
+
+            self._mcp_discovery_error = sanitize_error(str(exc))
+            self._mcp_discovery_done.set()
+            logger.warning(
+                "MCP discovery could not start: {}",
+                self._mcp_discovery_error,
+            )
 
         # Wire the finished registry to ContextBuilder so per-tool
         # guidance blocks (trello, docker, voice_call, computer,
@@ -2014,6 +2181,15 @@ class AgentLoop:
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("plugin discovery failed: {}", exc)
             self._plugin_manager = None
+
+        # Plugin tools are registered synchronously above; MCP tools may arrive
+        # later and trigger the second warmup from their discovery thread.
+        self._prepare_semantic_tool_index()
+        subscribe_changes = getattr(self.tools, "subscribe_changes", None)
+        if self._semantic_tool_router is not None and callable(subscribe_changes):
+            self._semantic_registry_unsubscribe = subscribe_changes(
+                self._schedule_semantic_tool_index_refresh
+            )
 
     def _register_codex_session_tool(self) -> None:
         """Register the opt-in ``codex_session`` tool when configured.
@@ -2661,6 +2837,25 @@ class AgentLoop:
         except Exception:
             logger.exception("AgentLoop.stop: subagent cancel_all failed")
 
+        semantic_router = getattr(self, "_semantic_tool_router", None)
+        unsubscribe = getattr(self, "_semantic_registry_unsubscribe", None)
+        if unsubscribe is not None:
+            try:
+                unsubscribe()
+            except Exception:
+                logger.exception("AgentLoop.stop: semantic registry unsubscribe failed")
+            self._semantic_registry_unsubscribe = None
+        with self._semantic_refresh_lock:
+            refresh_timer = self._semantic_refresh_timer
+            self._semantic_refresh_timer = None
+        if refresh_timer is not None:
+            refresh_timer.cancel()
+        if semantic_router is not None:
+            try:
+                semantic_router.close()
+            except Exception:
+                logger.exception("AgentLoop.stop: semantic tool router teardown failed")
+
         # Tear down warm Codex subprocesses so a gateway shutdown doesn't
         # leak `codex app-server` processes. Fire-and-forget on the
         # running loop because stop() is synchronous; the per-session
@@ -2684,6 +2879,369 @@ class AgentLoop:
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
             cron_tool.set_cron_service(cron_service)
+            self.tools.invalidate_availability("cron")
+
+    def _resolve_toolset_route(
+        self,
+        platform: str | None,
+    ) -> tuple[frozenset[str] | None, frozenset[str]]:
+        """Resolve configured and built-in toolset filters for one surface."""
+        from flowly.agent.tools.routing import resolve_toolset_filters
+
+        main_config = getattr(self, "_main_config", None)
+        cfg = getattr(getattr(main_config, "tools", None), "routing", None)
+        return resolve_toolset_filters(
+            platform,
+            enabled=bool(getattr(cfg, "enabled", True)),
+            platform_toolsets=getattr(cfg, "platform_toolsets", None),
+            disabled_toolsets=getattr(cfg, "disabled_toolsets", None),
+        )
+
+    def _routed_tool_names(
+        self,
+        platform: str | None,
+        *,
+        disabled_tools: list[str] | set[str] | None = None,
+    ) -> set[str]:
+        enabled_toolsets, disabled_toolsets = self._resolve_toolset_route(platform)
+        get_available_names = getattr(self.tools, "get_available_names", None)
+        if callable(get_available_names):
+            return set(get_available_names(
+                platform=platform,
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                disabled_tools=frozenset(disabled_tools or ()),
+            ))
+        # Lightweight test/plugin registries predating routing may only expose
+        # mapping semantics. Preserve their former all-tools behavior.
+        try:
+            return set(self.tools)
+        except TypeError:
+            return set()
+
+    def _routed_tool_definitions(
+        self,
+        platform: str | None,
+        *,
+        disabled_tools: list[str] | set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        enabled_toolsets, disabled_toolsets = self._resolve_toolset_route(platform)
+        get_definitions = getattr(self.tools, "get_definitions", None)
+        if not callable(get_definitions):
+            return []
+        try:
+            return get_definitions(
+                platform=platform,
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                disabled_tools=frozenset(disabled_tools or ()),
+            )
+        except TypeError:
+            # Compatibility for third-party registries implementing the old
+            # zero-argument protocol. Runtime enforcement still uses the names
+            # present in the returned schemas.
+            return get_definitions()
+
+    def _build_tool_disclosure(
+        self,
+        definitions: list[dict[str, Any]],
+        *,
+        intent_text: str = "",
+        semantic_promoted_tools: tuple[str, ...] | None = None,
+    ):
+        """Compact one already-routed tool surface without losing reachability."""
+        from flowly.agent.tools.discovery import (
+            DEFAULT_ALWAYS_VISIBLE_TOOLS,
+            DEFAULT_DEFERRED_TOOLSETS,
+            build_tool_disclosure,
+        )
+
+        main_config = getattr(self, "_main_config", None)
+        routing_cfg = getattr(getattr(main_config, "tools", None), "routing", None)
+        discovery_cfg = getattr(routing_cfg, "discovery", None)
+        get_toolsets = getattr(self.tools, "get_toolsets", None)
+        toolsets = get_toolsets() if callable(get_toolsets) else None
+        get_sources = getattr(self.tools, "get_discovery_sources", None)
+        sources = get_sources() if callable(get_sources) else None
+        return build_tool_disclosure(
+            definitions,
+            toolsets=toolsets,
+            sources=sources,
+            enabled=bool(getattr(discovery_cfg, "enabled", True)),
+            deferred_toolsets=getattr(
+                discovery_cfg, "deferred_toolsets", DEFAULT_DEFERRED_TOOLSETS
+            ),
+            always_visible_tools=getattr(
+                discovery_cfg, "always_visible_tools", DEFAULT_ALWAYS_VISIBLE_TOOLS
+            ),
+            minimum_deferred_schema_tokens=int(getattr(
+                discovery_cfg, "minimum_deferred_schema_tokens", 750
+            )),
+            catalog_max_chars=int(getattr(discovery_cfg, "catalog_max_chars", 6_000)),
+            search_default_limit=int(getattr(discovery_cfg, "search_default_limit", 5)),
+            search_max_limit=int(getattr(discovery_cfg, "search_max_limit", 20)),
+            intent_text=intent_text,
+            intent_routing_enabled=bool(getattr(
+                discovery_cfg, "intent_routing_enabled", True
+            )),
+            intent_max_promoted_tools=int(getattr(
+                discovery_cfg, "intent_max_promoted_tools", 4
+            )),
+            intent_min_score=float(getattr(
+                discovery_cfg, "intent_min_score", 4.0
+            )),
+            semantic_promoted_tools=semantic_promoted_tools,
+        )
+
+    def semantic_tool_routing_metrics(self) -> dict[str, Any]:
+        """Return non-sensitive eligibility facts for the shared opt-in UI.
+
+        The recommendation is based only on the currently reachable registry
+        and deterministic schema estimates. It never sends a user message or
+        tool metadata to another model.
+        """
+
+        from flowly.agent.tools.discovery import estimate_schema_tokens
+
+        definitions = self._routed_tool_definitions(None)
+        disclosure = self._build_tool_disclosure(definitions)
+        deferred_tokens = (
+            estimate_schema_tokens(disclosure.deferred.values())
+            if disclosure.deferred
+            else 0
+        )
+        router = getattr(self, "_semantic_tool_router", None)
+        return {
+            "eligible": bool(disclosure.enabled),
+            "catalogReady": not self.mcp_discovery_pending,
+            "toolCount": len(disclosure.all_names),
+            "deferredToolCount": len(disclosure.deferred),
+            "deferredSchemaTokens": deferred_tokens,
+            "originalSchemaTokens": disclosure.original_schema_tokens,
+            "disclosedSchemaTokens": disclosure.disclosed_schema_tokens,
+            "routerState": getattr(router, "state", "disabled"),
+        }
+
+    def activate_semantic_tool_routing(self) -> bool:
+        """Activate an already-installed model without rebuilding the CLI loop.
+
+        Gateway users restart after the enable RPC so every channel receives
+        the new config atomically. The direct interactive CLI can safely turn
+        the same feature on live after its foreground consent prompt.
+        """
+
+        if self._semantic_tool_router is not None:
+            return True
+        main_config = getattr(self, "_main_config", None)
+        routing_cfg = getattr(getattr(main_config, "tools", None), "routing", None)
+        discovery_cfg = getattr(routing_cfg, "discovery", None)
+        if discovery_cfg is None:
+            return False
+        try:
+            from flowly.agent.tools.semantic_feature import semantic_model_cache_dir
+            from flowly.agent.tools.semantic_routing import SemanticToolRouter
+
+            discovery_cfg.semantic_routing_enabled = True
+            discovery_cfg.semantic_model_auto_download = False
+            discovery_cfg.semantic_routing_consent = "enabled"
+            self._semantic_tool_router = SemanticToolRouter(
+                state_dir=self._state_dir,
+                model_cache_dir=semantic_model_cache_dir(self._state_dir),
+                auto_download=False,
+                source_min_score=float(discovery_cfg.semantic_source_min_score),
+                source_min_margin=float(discovery_cfg.semantic_source_min_margin),
+                tool_min_score=float(discovery_cfg.semantic_tool_min_score),
+                tool_score_window=float(discovery_cfg.semantic_tool_score_window),
+                workflow_max_tools=int(discovery_cfg.intent_max_promoted_tools),
+                query_cache_size=int(discovery_cfg.semantic_query_cache_size),
+            )
+            subscribe_changes = getattr(self.tools, "subscribe_changes", None)
+            if callable(subscribe_changes):
+                self._semantic_registry_unsubscribe = subscribe_changes(
+                    self._schedule_semantic_tool_index_refresh
+                )
+            self._prepare_semantic_tool_index()
+            return True
+        except Exception as exc:  # noqa: BLE001 - lexical discovery remains complete
+            logger.warning(
+                "Live semantic tool routing activation failed; lexical discovery remains active: {}",
+                type(exc).__name__,
+            )
+            self._semantic_tool_router = None
+            return False
+
+    def _semantic_catalog_snapshot(self):
+        """Build one content-addressed snapshot of the routed tool universe."""
+        router = getattr(self, "_semantic_tool_router", None)
+        if router is None:
+            return None
+        main_config = getattr(self, "_main_config", None)
+        routing_cfg = getattr(getattr(main_config, "tools", None), "routing", None)
+        discovery_cfg = getattr(routing_cfg, "discovery", None)
+        if not bool(getattr(discovery_cfg, "enabled", True)):
+            return None
+        if not bool(getattr(discovery_cfg, "intent_routing_enabled", True)):
+            return None
+        if not bool(getattr(discovery_cfg, "semantic_routing_enabled", False)):
+            return None
+        if int(getattr(discovery_cfg, "intent_max_promoted_tools", 4)) <= 0:
+            return None
+        get_snapshot = getattr(self.tools, "get_catalog_snapshot", None)
+        if not callable(get_snapshot):
+            return None
+        try:
+            catalog = get_snapshot()
+            from flowly.agent.tools.discovery import (
+                DEFAULT_ALWAYS_VISIBLE_TOOLS,
+                DEFAULT_DEFERRED_TOOLSETS,
+            )
+            from flowly.agent.tools.semantic_routing import build_semantic_snapshot
+
+            deferred_toolsets = tuple(getattr(
+                discovery_cfg,
+                "deferred_toolsets",
+                DEFAULT_DEFERRED_TOOLSETS,
+            ))
+            always_visible_tools = tuple(getattr(
+                discovery_cfg,
+                "always_visible_tools",
+                DEFAULT_ALWAYS_VISIBLE_TOOLS,
+            ))
+            cache_key = (
+                catalog.generation,
+                deferred_toolsets,
+                always_visible_tools,
+            )
+            with self._semantic_snapshot_lock:
+                if self._semantic_snapshot_cache_key == cache_key:
+                    return self._semantic_snapshot_cache
+            snapshot = build_semantic_snapshot(
+                catalog.definitions,
+                toolsets=catalog.toolsets,
+                sources=catalog.sources,
+                deferred_toolsets=deferred_toolsets,
+                always_visible_tools=always_visible_tools,
+                generation=catalog.generation,
+            )
+            with self._semantic_snapshot_lock:
+                self._semantic_snapshot_cache_key = cache_key
+                self._semantic_snapshot_cache = snapshot
+            return snapshot
+        except Exception as exc:  # noqa: BLE001 - index is an optional fast path
+            logger.warning(
+                "Semantic tool catalog snapshot failed; lexical discovery remains active: {}",
+                type(exc).__name__,
+            )
+            return None
+
+    def _prepare_semantic_tool_index(self) -> None:
+        """Warm changed external metadata without delaying agent startup."""
+        router = getattr(self, "_semantic_tool_router", None)
+        snapshot = self._semantic_catalog_snapshot()
+        if (
+            router is None
+            or snapshot is None
+            or not snapshot.promotable_names
+        ):
+            return
+        try:
+            from flowly.agent.tools.discovery import estimate_schema_tokens
+
+            main_config = getattr(self, "_main_config", None)
+            routing_cfg = getattr(getattr(main_config, "tools", None), "routing", None)
+            discovery_cfg = getattr(routing_cfg, "discovery", None)
+            external_definitions = (
+                snapshot.documents[name].definition
+                for name in snapshot.promotable_names
+            )
+            if estimate_schema_tokens(external_definitions) < int(getattr(
+                discovery_cfg,
+                "minimum_deferred_schema_tokens",
+                750,
+            )):
+                return
+            router.prepare(snapshot)
+        except Exception as exc:  # noqa: BLE001 - lexical discovery remains complete
+            logger.warning(
+                "Semantic tool index warmup failed; lexical discovery remains active: {}",
+                type(exc).__name__,
+            )
+
+    def _schedule_semantic_tool_index_refresh(self, _generation: int) -> None:
+        """Debounce bursts of MCP/plugin registrations into one index delta."""
+        if getattr(self, "_semantic_tool_router", None) is None:
+            return
+        with self._semantic_refresh_lock:
+            previous = self._semantic_refresh_timer
+            if previous is not None:
+                previous.cancel()
+            timer = threading.Timer(0.10, self._prepare_semantic_tool_index)
+            timer.name = "flowly-tool-index-refresh"
+            timer.daemon = True
+            self._semantic_refresh_timer = timer
+            timer.start()
+
+    async def _semantic_tool_decision(
+        self,
+        definitions: list[dict[str, Any]],
+        *,
+        intent_text: str,
+    ):
+        """Select semantic promotions from the already-authorized route."""
+        router = getattr(self, "_semantic_tool_router", None)
+        snapshot = self._semantic_catalog_snapshot()
+        if (
+            router is None
+            or snapshot is None
+            or not snapshot.promotable_names
+        ):
+            return None
+        # The route is still the hard authority. It includes eager/core tools
+        # because they act as non-promotable semantic competitors, preventing
+        # unrelated external promotion for local work.
+        allowed_names = frozenset(
+            str(definition.get("function", {}).get("name", "")).strip()
+            for definition in definitions
+            if isinstance(definition.get("function"), dict)
+        ).intersection(snapshot.documents)
+        if not allowed_names:
+            return None
+        main_config = getattr(self, "_main_config", None)
+        routing_cfg = getattr(getattr(main_config, "tools", None), "routing", None)
+        discovery_cfg = getattr(routing_cfg, "discovery", None)
+        try:
+            return await router.select(
+                intent_text,
+                snapshot,
+                allowed_names=frozenset(allowed_names),
+                max_tools=int(getattr(
+                    discovery_cfg,
+                    "intent_max_promoted_tools",
+                    4,
+                )),
+            )
+        except Exception as exc:  # noqa: BLE001 - never break an LLM turn
+            logger.warning(
+                "Semantic tool selection failed; lexical discovery remains active: {}",
+                type(exc).__name__,
+            )
+            return None
+
+    def _routed_tool_disclosure(
+        self,
+        platform: str | None,
+        *,
+        disabled_tools: list[str] | set[str] | None = None,
+        intent_text: str = "",
+    ):
+        """Return the compact model surface and its full reachable catalog."""
+        return self._build_tool_disclosure(
+            self._routed_tool_definitions(
+                platform,
+                disabled_tools=disabled_tools,
+            ),
+            intent_text=intent_text,
+        )
 
     def _extract_action_intent_text(self, content: str) -> str:
         """
@@ -3479,22 +4037,30 @@ class AgentLoop:
         ``iteration_event`` metadata field as the legacy
         single-write-at-end path.
         """
-        role = message.get("role") or ""
+        # Project a detached copy for product surfaces.  The canonical message
+        # stays untouched in provider/session history so strict tool-call /
+        # tool-result name matching remains valid.
+        from flowly.tool_activity import project_tool_messages_for_ui
+
+        ui_message = project_tool_messages_for_ui([message])[0]
+        role = ui_message.get("role") or ""
         if role not in ("assistant", "tool"):
             return
         event_payload: dict[str, Any] = {
             "runId": outbound_run_id,
             "iterationIdx": iteration_idx,
             "role": role,
-            "content": message.get("content") or "",
+            "content": ui_message.get("content") or "",
         }
-        if role == "assistant" and message.get("tool_calls"):
-            event_payload["tool_calls"] = message["tool_calls"]
+        if role == "assistant" and ui_message.get("tool_calls"):
+            event_payload["tool_calls"] = ui_message["tool_calls"]
         if role == "tool":
-            if message.get("tool_call_id"):
-                event_payload["tool_call_id"] = message["tool_call_id"]
-            if message.get("name"):
-                event_payload["name"] = message["name"]
+            if ui_message.get("tool_call_id"):
+                event_payload["tool_call_id"] = ui_message["tool_call_id"]
+            if ui_message.get("name"):
+                event_payload["name"] = ui_message["name"]
+            if ui_message.get("tool_activity"):
+                event_payload["tool_activity"] = ui_message["tool_activity"]
 
         # Direct-callback path (the direct gateway / any ``process_direct``
         # caller): deliver the event straight to the caller's transport — e.g.
@@ -3544,6 +4110,7 @@ class AgentLoop:
         session_key: str = "",
         model_override: str | None = None,
         disabled_tools: list[str] | None = None,
+        tool_platform: str = "",
         outbound_channel: str = "",
         outbound_chat_id: str = "",
         outbound_run_id: str = "",
@@ -3571,6 +4138,8 @@ class AgentLoop:
         ``turn_start_idx`` computed against the input list stays valid.
         """
         iteration = 0
+        from flowly.agent.tools.discovery import annotate_search_repetition
+        _tool_search_result_sets: dict[tuple[str, ...], int] = {}
         # Turn-local collector for media a tool produces for THIS reply (image_
         # generate, screenshot). Callers pass their own list and read it after to
         # set ``OutboundMessage.media`` — so it's concurrency-safe (per-turn, not
@@ -3593,6 +4162,22 @@ class AgentLoop:
             "cache_read_tokens": 0,
             "cache_write_tokens": 0,
         }
+        _guidance_message = next(
+            (
+                message for message in messages
+                if isinstance(message, dict)
+                and "_capability_guidance" in message
+            ),
+            None,
+        )
+        _active_capability_guidance = (
+            list(_guidance_message.get("_capability_guidance") or [])
+            if _guidance_message else []
+        )
+        _dynamic_guidance_chars = (
+            len(str(_guidance_message.get("content") or ""))
+            if _guidance_message else 0
+        )
         tools_were_used = False
         _audit = get_audit_logger()
         _overflow_recovered = False  # allow at most one overflow recovery per turn
@@ -3751,7 +4336,10 @@ class AgentLoop:
                 messages.append({"role": "user", "content": nudge, _EPHEMERAL_NUDGE: True})
 
             tool_defs, policy_blocked_tools = self._apply_turn_tool_policy(
-                self.tools.get_definitions(),
+                self._routed_tool_definitions(
+                    tool_platform or outbound_channel,
+                    disabled_tools=disabled_tools,
+                ),
                 live_call_turn=live_call_turn,
                 builtin_agent_dispatched=_builtin_agent_dispatched,
             )
@@ -3770,6 +4358,42 @@ class AgentLoop:
                 ]
                 if len(tool_defs) < before:
                     blocked_tools.extend(disabled_set)
+            # Build the deterministic/lossless view first. Small external
+            # catalogs remain eager, so they should not initialize or download
+            # a semantic model that cannot save any schema tokens.
+            disclosure = self._build_tool_disclosure(
+                tool_defs,
+                intent_text=turn_content,
+            )
+            semantic_decision = None
+            if disclosure.enabled:
+                semantic_decision = await self._semantic_tool_decision(
+                    tool_defs,
+                    intent_text=turn_content,
+                )
+            semantic_promotions: tuple[str, ...] | None = None
+            if semantic_decision is not None:
+                if semantic_decision.mode == "semantic":
+                    semantic_promotions = semantic_decision.promotions
+            if semantic_promotions is not None:
+                disclosure = self._build_tool_disclosure(
+                    tool_defs,
+                    intent_text=turn_content,
+                    semantic_promoted_tools=semantic_promotions,
+                )
+            tool_defs = list(disclosure.definitions)
+            if disabled_tools:
+                disabled_set = set(disabled_tools)
+                tool_defs = [
+                    definition
+                    for definition in tool_defs
+                    if str(definition.get("function", {}).get("name", ""))
+                    not in disabled_set
+                ]
+            available_tool_names = {
+                str(td.get("function", {}).get("name", ""))
+                for td in tool_defs
+            }
             # Always use "auto" on the first iteration so the model can output
             # a preamble sentence ("Hemen bakıyorum.") before the tool call.
             # This is critical for voice mode — the user needs audio feedback
@@ -3794,6 +4418,18 @@ class AgentLoop:
             logger.info(
                 "LLM request telemetry: "
                 f"model={selected_model}, tool_choice={tool_choice}, tool_count={len(tool_defs)}, "
+                f"reachable_tool_count={len(disclosure.all_names)}, "
+                f"intent_promoted_tools={sorted(disclosure.promoted_names)}, "
+                f"semantic_routing={getattr(semantic_decision, 'state', 'disabled')}/"
+                f"{getattr(semantic_decision, 'mode', 'fallback')}, "
+                f"semantic_source={getattr(semantic_decision, 'source', '')!r}, "
+                f"semantic_score={getattr(semantic_decision, 'score', 0.0):.4f}, "
+                f"semantic_margin={getattr(semantic_decision, 'margin', 0.0):.4f}, "
+                f"semantic_latency_ms={getattr(semantic_decision, 'latency_ms', 0.0):.2f}, "
+                f"tool_schema_tokens={disclosure.original_schema_tokens}→"
+                f"{disclosure.disclosed_schema_tokens}, "
+                f"capability_guidance={_active_capability_guidance}, "
+                f"dynamic_guidance_chars={_dynamic_guidance_chars}, "
                 f"action_turn={action_turn}, live_call_turn={live_call_turn}, "
                 f"blocked_tools={sorted(set(blocked_tools))}, "
                 f"iteration={iteration}/{max_turn_iterations}"
@@ -4063,18 +4699,7 @@ class AgentLoop:
             # stays internally consistent for any downstream code that
             # reads it instead of summing components.
             if response.usage:
-                for k in ("prompt_tokens", "cache_read_tokens"):
-                    total_usage[k] = response.usage.get(k, 0) or 0
-                for k in ("completion_tokens", "cache_write_tokens"):
-                    total_usage[k] = (
-                        total_usage.get(k, 0) + (response.usage.get(k, 0) or 0)
-                    )
-                total_usage["total_tokens"] = (
-                    total_usage.get("prompt_tokens", 0)
-                    + total_usage.get("completion_tokens", 0)
-                    + total_usage.get("cache_read_tokens", 0)
-                    + total_usage.get("cache_write_tokens", 0)
-                )
+                _merge_turn_usage(total_usage, response.usage)
 
             if response.has_tool_calls:
                 tool_call_dicts = [
@@ -4133,34 +4758,170 @@ class AgentLoop:
                     # N+1 after the user has stopped the run.
                     if outbound_run_id and self.is_run_aborted(outbound_run_id):
                         break
-                    turn_tools.append(tool_call.name)
-                    executed_tool_names.append(tool_call.name)
-                    args_str = json.dumps(_redact_log_args(tool_call.arguments))
-                    logger.info(f"Executing tool: {tool_call.name}({args_str[:160]}...)")
+                    _protocol_tool_name = tool_call.name
+                    _effective_tool_name = _protocol_tool_name
+                    call_args = dict(tool_call.arguments)
+
+                    if _protocol_tool_name == "tool_search":
+                        _search_limit = call_args.get("limit", 5)
+                        _search_offset = call_args.get("offset", 0)
+                        try:
+                            _search_limit = max(
+                                1,
+                                min(int(_search_limit), disclosure.search_max_limit),
+                            )
+                        except (TypeError, ValueError):
+                            _search_limit = 5
+                        try:
+                            _search_offset = max(0, int(_search_offset))
+                        except (TypeError, ValueError):
+                            _search_offset = 0
+                        result = disclosure.search(
+                            query=str(call_args.get("query", "")),
+                            toolset=str(call_args.get("toolset", "")),
+                            limit=_search_limit,
+                            offset=_search_offset,
+                        )
+                        result = annotate_search_repetition(
+                            result,
+                            _tool_search_result_sets,
+                        )
+                        accumulated_tool_results.append({
+                            "tool": _protocol_tool_name,
+                            "success": True,
+                            "result": result,
+                        })
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, _protocol_tool_name, result
+                        )
+                        await self._emit_iteration_event(
+                            outbound_channel=outbound_channel,
+                            outbound_chat_id=outbound_chat_id,
+                            outbound_run_id=outbound_run_id,
+                            iteration_idx=_iteration_event_idx,
+                            message=messages[-1],
+                            on_iteration=on_iteration,
+                        )
+                        _iteration_event_idx += 1
+                        continue
+
+                    if _protocol_tool_name == "tool_describe":
+                        result = disclosure.describe(str(call_args.get("name", "")))
+                        _ok = not result.startswith("Error")
+                        accumulated_tool_results.append({
+                            "tool": _protocol_tool_name,
+                            "success": _ok,
+                            "result": result,
+                        })
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, _protocol_tool_name, result
+                        )
+                        await self._emit_iteration_event(
+                            outbound_channel=outbound_channel,
+                            outbound_chat_id=outbound_chat_id,
+                            outbound_run_id=outbound_run_id,
+                            iteration_idx=_iteration_event_idx,
+                            message=messages[-1],
+                            on_iteration=on_iteration,
+                        )
+                        _iteration_event_idx += 1
+                        continue
+
+                    if _protocol_tool_name == "tool_call":
+                        _resolved = disclosure.resolve_call(
+                            str(call_args.get("name", "")),
+                            call_args.get("arguments"),
+                        )
+                        if isinstance(_resolved, str):
+                            blocked_tools.append(_protocol_tool_name)
+                            accumulated_tool_results.append({
+                                "tool": _protocol_tool_name,
+                                "success": False,
+                                "result": _resolved,
+                            })
+                            messages = self.context.add_tool_result(
+                                messages, tool_call.id, _protocol_tool_name, _resolved
+                            )
+                            await self._emit_iteration_event(
+                                outbound_channel=outbound_channel,
+                                outbound_chat_id=outbound_chat_id,
+                                outbound_run_id=outbound_run_id,
+                                iteration_idx=_iteration_event_idx,
+                                message=messages[-1],
+                                on_iteration=on_iteration,
+                            )
+                            _iteration_event_idx += 1
+                            continue
+                        _effective_tool_name, call_args = _resolved
+
+                    turn_tools.append(_effective_tool_name)
+                    executed_tool_names.append(_effective_tool_name)
+                    args_str = json.dumps(_redact_log_args(call_args))
+                    logger.info(
+                        f"Executing tool: {_effective_tool_name}({args_str[:160]}...)"
+                    )
                     # Heartbeat for the inactivity watchdog — tool
                     # launches are the most common "agent is alive"
                     # signal, especially for long research loops.
-                    self._touch_activity(f"executing tool: {tool_call.name}", tool=tool_call.name)
+                    self._touch_activity(
+                        f"executing tool: {_effective_tool_name}",
+                        tool=_effective_tool_name,
+                    )
 
-                    if live_call_turn and not self._is_live_call_tool_allowed(
-                        tool_call.name,
-                        tool_call.arguments,
-                    ):
-                        blocked_tools.append(tool_call.name)
+                    _is_advertised_direct = _protocol_tool_name in available_tool_names
+                    _is_advertised_external = (
+                        _protocol_tool_name == "tool_call"
+                        and _effective_tool_name in disclosure.external
+                    )
+                    if not (_is_advertised_direct or _is_advertised_external):
+                        blocked_tools.append(_effective_tool_name)
                         result = (
-                            f"Error: Tool '{tool_call.name}' was blocked by the "
-                            "live-call security policy."
+                            f"Error: Tool '{_effective_tool_name}' is unavailable for "
+                            f"platform '{tool_platform or outbound_channel or 'unknown'}'."
                         )
-                        logger.error(
-                            f"Live call blocked risky tool: {tool_call.name} args={args_str[:160]}"
+                        logger.warning(
+                            "Tool routing blocked unadvertised call: {} platform={}",
+                            _effective_tool_name,
+                            tool_platform or outbound_channel or "unknown",
                         )
                         accumulated_tool_results.append({
-                            "tool": tool_call.name,
+                            "tool": _effective_tool_name,
                             "success": False,
                             "result": result,
                         })
                         messages = self.context.add_tool_result(
-                            messages, tool_call.id, tool_call.name, result
+                            messages, tool_call.id, _protocol_tool_name, result
+                        )
+                        await self._emit_iteration_event(
+                            outbound_channel=outbound_channel,
+                            outbound_chat_id=outbound_chat_id,
+                            outbound_run_id=outbound_run_id,
+                            iteration_idx=_iteration_event_idx,
+                            message=messages[-1],
+                            on_iteration=on_iteration,
+                        )
+                        _iteration_event_idx += 1
+                        continue
+
+                    if live_call_turn and not self._is_live_call_tool_allowed(
+                        _effective_tool_name,
+                        call_args,
+                    ):
+                        blocked_tools.append(_effective_tool_name)
+                        result = (
+                            f"Error: Tool '{_effective_tool_name}' was blocked by the "
+                            "live-call security policy."
+                        )
+                        logger.error(
+                            f"Live call blocked risky tool: {_effective_tool_name} args={args_str[:160]}"
+                        )
+                        accumulated_tool_results.append({
+                            "tool": _effective_tool_name,
+                            "success": False,
+                            "result": result,
+                        })
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, _protocol_tool_name, result
                         )
                         await self._emit_iteration_event(
                             outbound_channel=outbound_channel,
@@ -4181,30 +4942,30 @@ class AgentLoop:
                     # ignores the planning instruction, it physically cannot
                     # run exec / write_file / send a message / etc. until the
                     # plan is approved. Read-only tools and `plan` itself pass.
-                    if tool_call.name != "plan":
+                    if _effective_tool_name != "plan":
                         try:
                             from flowly.plans.manager import get_plan_manager
                             _pmgr = get_plan_manager()
                             if _current_session_key and _pmgr.gate_blocks(
-                                _current_session_key, tool_call.name
+                                _current_session_key, _effective_tool_name
                             ):
-                                blocked_tools.append(tool_call.name)
+                                blocked_tools.append(_effective_tool_name)
                                 result = (
-                                    f"BLOCKED: '{tool_call.name}' is a side-"
+                                    f"BLOCKED: '{_effective_tool_name}' is a side-"
                                     "effecting action. "
                                     + _pmgr.gate_reason(_current_session_key)
                                 )
                                 logger.info(
-                                    f"[plan] gate blocked {tool_call.name} "
+                                    f"[plan] gate blocked {_effective_tool_name} "
                                     f"for session={_current_session_key}"
                                 )
                                 accumulated_tool_results.append({
-                                    "tool": tool_call.name,
+                                    "tool": _effective_tool_name,
                                     "success": False,
                                     "result": result,
                                 })
                                 messages = self.context.add_tool_result(
-                                    messages, tool_call.id, tool_call.name, result
+                                    messages, tool_call.id, _protocol_tool_name, result
                                 )
                                 await self._emit_iteration_event(
                                     outbound_channel=outbound_channel,
@@ -4227,15 +4988,15 @@ class AgentLoop:
                     # _is_media_tool_call_blocked for the intent phrases
                     # and _user_wants_media_output for the matching logic.
                     if self._is_media_tool_call_blocked(
-                        tool_call.name,
-                        tool_call.arguments,
+                        _effective_tool_name,
+                        call_args,
                         messages,
                     ):
-                        blocked_tools.append(tool_call.name)
+                        blocked_tools.append(_effective_tool_name)
                         action_label = (
-                            tool_call.name
-                            if tool_call.name != "computer"
-                            else f"computer({tool_call.arguments.get('action', '?')})"
+                            _effective_tool_name
+                            if _effective_tool_name != "computer"
+                            else f"computer({call_args.get('action', '?')})"
                         )
                         result = (
                             f"BLOCKED: {action_label} produces a pixel image. "
@@ -4256,12 +5017,12 @@ class AgentLoop:
                             f"args={args_str[:160]}"
                         )
                         accumulated_tool_results.append({
-                            "tool": tool_call.name,
+                            "tool": _effective_tool_name,
                             "success": False,
                             "result": result,
                         })
                         messages = self.context.add_tool_result(
-                            messages, tool_call.id, tool_call.name, result
+                            messages, tool_call.id, _protocol_tool_name, result
                         )
                         await self._emit_iteration_event(
                             outbound_channel=outbound_channel,
@@ -4277,8 +5038,6 @@ class AgentLoop:
                     _t0 = time.monotonic()
                     _tool_result = ""
                     _tool_success = False
-                    call_args = dict(tool_call.arguments)
-                    _effective_tool_name = tool_call.name
                     # Best-effort live event for streaming clients. Failures
                     # (no callback wired, peer disconnect, slow consumer)
                     # must not affect agent execution.
@@ -4298,7 +5057,7 @@ class AgentLoop:
                         # Inject the active session for approval routing and
                         # conversation-scoped persistence.
                         if (
-                            tool_call.name
+                            _effective_tool_name
                             in (
                                 "exec",
                                 "email",
@@ -4318,7 +5077,7 @@ class AgentLoop:
 
                         # Spawn interception: redirect spawn → builtin_agent
                         # when task matches a specialist keyword (enterprise pattern)
-                        if tool_call.name == "spawn" and not _builtin_agent_dispatched:
+                        if _effective_tool_name == "spawn" and not _builtin_agent_dispatched:
                             _task_text = str(call_args.get("task", ""))
                             _detected_agent = _detect_builtin_agent_type(_task_text)
                             if _detected_agent:
@@ -4329,9 +5088,22 @@ class AgentLoop:
                                 call_args = {"agent": _detected_agent, "task": _task_text}
                                 _effective_tool_name = "builtin_agent"
 
+                        _enabled_toolsets, _disabled_toolsets = self._resolve_toolset_route(
+                            tool_platform or outbound_channel
+                        )
+                        _execute_kwargs = {
+                            "platform": tool_platform or outbound_channel,
+                            "enabled_toolsets": _enabled_toolsets,
+                            "disabled_toolsets": _disabled_toolsets,
+                            "disabled_tools": frozenset(disabled_tools or ()),
+                        }
                         _tool_result = await self._run_aborts.run_cancellable(
                             outbound_run_id,
-                            lambda: self.tools.execute(_effective_tool_name, call_args),
+                            lambda: self.tools.execute(
+                                _effective_tool_name,
+                                call_args,
+                                **_execute_kwargs,
+                            ),
                         )
                         # Reply-media envelope: a tool (image_generate, screenshot)
                         # produced file(s) for THIS turn's reply. Peel the paths onto
@@ -4368,7 +5140,7 @@ class AgentLoop:
                         ):
                             _tool_success = False
                         accumulated_tool_results.append({
-                            "tool": tool_call.name,
+                            "tool": _effective_tool_name,
                             "success": _tool_success,
                             "result": _tool_result[:500] if len(_tool_result) > 500 else _tool_result,
                         })
@@ -4378,21 +5150,21 @@ class AgentLoop:
                         _tool_result = result
                         _tool_success = False
                         logger.info(
-                            f"Tool stopped: {tool_call.name} run_id={outbound_run_id}"
+                            f"Tool stopped: {_effective_tool_name} run_id={outbound_run_id}"
                         )
                         accumulated_tool_results.append({
-                            "tool": tool_call.name,
+                            "tool": _effective_tool_name,
                             "success": False,
                             "aborted": True,
                             "result": result,
                         })
                     except Exception as e:
-                        result = f"Error executing {tool_call.name}: {str(e)}"
+                        result = f"Error executing {_effective_tool_name}: {str(e)}"
                         _tool_result = result
                         _tool_success = False
                         logger.error(result)
                         accumulated_tool_results.append({
-                            "tool": tool_call.name,
+                            "tool": _effective_tool_name,
                             "success": False,
                             "result": result,
                         })
@@ -4401,7 +5173,7 @@ class AgentLoop:
                         if _tool_success:
                             turn_success_count += 1
                             logger.info(
-                                f"Tool success: {tool_call.name} result={result[:180]}"
+                                f"Tool success: {_effective_tool_name} result={result[:180]}"
                             )
                             # Track ASYNC (background) subagent dispatch so the
                             # next iteration hides tools and the turn ends with a
@@ -4420,20 +5192,20 @@ class AgentLoop:
                                 _builtin_agent_dispatched = True
                         else:
                             logger.warning(
-                                f"Tool failed: {tool_call.name} result={result[:220]}"
+                                f"Tool failed: {_effective_tool_name} result={result[:220]}"
                             )
                         # Heartbeat — tool just finished, refresh the
                         # inactivity clock so the next iteration's LLM
                         # round trip doesn't look idle.
                         self._touch_activity(
-                            f"tool completed: {tool_call.name} ({_tool_elapsed:.1f}s)",
+                            f"tool completed: {_effective_tool_name} ({_tool_elapsed:.1f}s)",
                         )
                     finally:
                         _duration_ms = int((time.monotonic() - _t0) * 1000)
                         _audit.log_tool_call(
                             session_key=_current_session_key,
-                            tool_name=tool_call.name,
-                            args=tool_call.arguments,
+                            tool_name=_effective_tool_name,
+                            args=call_args,
                             result=_tool_result,
                             duration_ms=_duration_ms,
                             success=_tool_success,
@@ -4462,7 +5234,7 @@ class AgentLoop:
                     # with a narrower query when it needs more detail.
                     # Context persistence now exists only on the
                     # subagent boundary (Assistant.cap_to_artifact).
-                    sanitized_result = _sanitize_tool_result(result, tool_call.name)
+                    sanitized_result = _sanitize_tool_result(result, _effective_tool_name)
 
                     # If the tool flagged its result as an image-bearing
                     # screenshot, extract the data URL from the RAW
@@ -4471,7 +5243,7 @@ class AgentLoop:
                     # provider sends this through to the LLM's vision
                     # input. Without this the agent never sees the
                     # picture and stays blind on canvas apps.
-                    image_url = _maybe_extract_image_for_vision(result, tool_call.name)
+                    image_url = _maybe_extract_image_for_vision(result, _effective_tool_name)
                     if image_url:
                         tool_content: str | list[dict[str, Any]] = [
                             {"type": "text", "text": sanitized_result},
@@ -4481,7 +5253,7 @@ class AgentLoop:
                         tool_content = sanitized_result
 
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, tool_content
+                        messages, tool_call.id, _protocol_tool_name, tool_content
                     )
                     # Live tool-result event for the UI panel — same
                     # path as the two earlier early-out branches.
@@ -4506,7 +5278,7 @@ class AgentLoop:
                     # rides in the codex_session result envelope, and
                     # injecting a trailing assistant message would risk
                     # two consecutive assistant turns for strict providers.
-                    if tool_call.name == "codex_session":
+                    if _effective_tool_name == "codex_session":
                         codex_pairs = self._drain_codex_projected_pairs()
                         for _cm in codex_pairs:
                             messages.append(_cm)
@@ -4524,13 +5296,13 @@ class AgentLoop:
 
                     # In strict action turns, stop as soon as a terminal action succeeds.
                     if _tool_success:
-                        if tool_call.name == "cron":
-                            cron_action = str(tool_call.arguments.get("action", "")).lower()
-                            target_tool = str(tool_call.arguments.get("tool_name", "")).lower()
+                        if _effective_tool_name == "cron":
+                            cron_action = str(call_args.get("action", "")).lower()
+                            target_tool = str(call_args.get("tool_name", "")).lower()
                             if cron_action == "add" and target_tool == "voice_call":
                                 terminal_action_executed = True
-                        elif enforce_action_tools and tool_call.name == "voice_call":
-                            voice_action = str(tool_call.arguments.get("action", "")).lower()
+                        elif enforce_action_tools and _effective_tool_name == "voice_call":
+                            voice_action = str(call_args.get("action", "")).lower()
                             if voice_action in {"call", "end_call", "speak"}:
                                 terminal_action_executed = True
 
@@ -4899,6 +5671,18 @@ class AgentLoop:
         to disk before context gets compacted.
         """
         user_prompt, system_prompt = self.compaction.get_memory_flush_prompt()
+        flush_tool_names = {"memory_append", "knowledge_graph"}
+        routed_definitions = self._routed_tool_definitions(channel)
+        flush_definitions = [
+            definition
+            for definition in routed_definitions
+            if str(definition.get("function", {}).get("name", ""))
+            in flush_tool_names
+        ]
+        available_tools = {
+            str(definition.get("function", {}).get("name", ""))
+            for definition in flush_definitions
+        }
 
         # Build messages with flush prompt. Pass self.model so the
         # family-aware guidance block matches the model the flush
@@ -4912,6 +5696,7 @@ class AgentLoop:
             current_message=user_prompt,
             model=self.model,
             channel=channel,
+            available_tools=available_tools,
         )
 
         # Add system prompt for flush context
@@ -4921,7 +5706,7 @@ class AgentLoop:
         try:
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=flush_definitions,
                 model=self.model
             )
 
@@ -4929,7 +5714,20 @@ class AgentLoop:
             if response.has_tool_calls:
                 for tool_call in response.tool_calls:
                     logger.debug(f"Memory flush tool: {tool_call.name}")
-                    await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if tool_call.name not in available_tools:
+                        logger.warning(
+                            "Memory flush routing blocked unadvertised tool: {}",
+                            tool_call.name,
+                        )
+                        continue
+                    _enabled_toolsets, _disabled_toolsets = self._resolve_toolset_route(channel)
+                    await self.tools.execute(
+                        tool_call.name,
+                        tool_call.arguments,
+                        platform=channel,
+                        enabled_toolsets=_enabled_toolsets,
+                        disabled_toolsets=_disabled_toolsets,
+                    )
 
             # Check if response should be silent
             content = response.content or ""
@@ -5451,6 +6249,19 @@ class AgentLoop:
             tool_channel = (msg.metadata.get("origin_channel") or "").strip() or ""
             tool_chat_id = (msg.metadata.get("origin_chat_id") or "").strip() or msg.chat_id
 
+        disabled_tools = msg.metadata.get("disabled_tools")
+        turn_disclosure = self._routed_tool_disclosure(
+            msg.channel,
+            disabled_tools=disabled_tools,
+            intent_text=msg.content,
+        )
+        turn_available_tools = {
+            str(item.get("function", {}).get("name", ""))
+            for item in turn_disclosure.definitions
+            if str(item.get("function", {}).get("name", ""))
+        }
+        turn_reachable_tools = set(turn_disclosure.all_names)
+
         # Update tool contexts
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
@@ -5504,22 +6315,46 @@ class AgentLoop:
         # Get history and check for compaction
         history = session.get_history(max_messages=self.context_messages)
 
-        # Estimate total context: history + system prompt overhead.
-        # Build actual system prompt to get accurate token count (avoids fixed 6K estimate drift).
-        # Pass self.model AND msg.channel so the family-aware block
-        # and the channel hint are both counted toward the estimate;
-        # otherwise GPT/Gemini/Chinese + non-cli channels would
-        # under-estimate by ~1-3K tokens and trip compaction late.
+        # Cron isolation flags affect both the real prompt and its compaction
+        # estimate.  Resolve them before the preview so the estimator measures
+        # the exact same context policy as the provider call below.
+        skip_memory_flag = bool(msg.metadata.get("skip_memory", False))
+        skip_context_files_flag = bool(msg.metadata.get("skip_context_files", False))
+        voice_mode_flag = bool(msg.metadata.get("voice_mode", False))
+        effective_model = msg.metadata.get("model_override") or self.model
+        llm_current_message = (
+            f"{group_context_block}\n---\n{msg.content}"
+            if group_context_block
+            else msg.content
+        )
+
+        # Estimate the actual message shape, including the stable base prompt,
+        # JIT capability/skills tail, history, and current user turn.  Calling
+        # build_system_prompt directly would use its legacy-compatible eager
+        # mode and over-estimate optimized greetings by ~20K tokens, causing
+        # premature compaction even though the provider never sees that prompt.
         try:
-            sys_prompt = self.context.build_system_prompt(
+            preview_messages = self.context.build_messages(
+                history=history,
+                current_message=llm_current_message,
                 memory_search_enabled=self._memory_manager is not None,
-                model=self.model,
+                skip_memory=skip_memory_flag,
+                skip_context_files=skip_context_files_flag,
+                voice_mode=voice_mode_flag,
+                model=effective_model,
                 channel=msg.channel,
+                session_key=msg.session_key,
+                available_tools=turn_available_tools,
+                reachable_tools=turn_reachable_tools,
             )
-            system_prompt_tokens = estimate_tokens(sys_prompt)
+            total_tokens = estimate_messages_tokens(preview_messages)
+            prompt_overhead_tokens = max(
+                0,
+                total_tokens - estimate_messages_tokens(history),
+            )
         except Exception:
-            system_prompt_tokens = 6000  # fallback
-        total_tokens = estimate_messages_tokens(history) + system_prompt_tokens
+            prompt_overhead_tokens = 6000  # fallback
+            total_tokens = estimate_messages_tokens(history) + prompt_overhead_tokens
 
         if self.compaction.should_memory_flush(total_tokens):
             logger.info("Running pre-compaction memory flush")
@@ -5527,13 +6362,13 @@ class AgentLoop:
             self.compaction.mark_memory_flush_done()
             # Reload history after flush
             history = session.get_history(max_messages=self.context_messages)
-            total_tokens = estimate_messages_tokens(history) + system_prompt_tokens
+            total_tokens = estimate_messages_tokens(history) + prompt_overhead_tokens
 
         # Microcompaction: truncate old tool results to delay full compaction
         history = self.compaction.microcompact(history)
 
         # Re-estimate after microcompaction
-        total_tokens = estimate_messages_tokens(history) + system_prompt_tokens
+        total_tokens = estimate_messages_tokens(history) + prompt_overhead_tokens
 
         # Check if compaction is needed
         if self.compaction.should_compact(total_tokens):
@@ -5630,25 +6465,12 @@ class AgentLoop:
         # skip_context_files via metadata so MEMORY.md / AGENTS.md /
         # SOUL.md / USER.md don't leak into scheduled runs. Keeps
         # user's mental-model cues out of cron.
-        skip_memory_flag = bool(msg.metadata.get("skip_memory", False))
-        skip_context_files_flag = bool(msg.metadata.get("skip_context_files", False))
-        voice_mode_flag = bool(msg.metadata.get("voice_mode", False))
-
         # Resolve effective model BEFORE building messages: cron
         # ``model_override`` lets a scheduled job target a different
         # model than the gateway default (e.g. a research job on
         # Gemini while chat runs on Claude), and the family-aware
         # guidance block must match the model the request actually
         # lands on, not the gateway default.
-        effective_model = msg.metadata.get("model_override") or self.model
-
-        # Prepend observed channel context to the LLM's view of this turn only.
-        llm_current_message = (
-            f"{group_context_block}\n---\n{msg.content}"
-            if group_context_block
-            else msg.content
-        )
-
         messages = self.context.build_messages(
             history=history,
             current_message=llm_current_message,
@@ -5660,6 +6482,8 @@ class AgentLoop:
             model=effective_model,
             channel=msg.channel,
             session_key=msg.session_key,
+            available_tools=turn_available_tools,
+            reachable_tools=turn_reachable_tools,
         )
         self._inject_recent_artifacts_hint(
             messages, session_key=msg.session_key,
@@ -5688,10 +6512,13 @@ class AgentLoop:
         # tools and feeds an attacker-supplied photo whose prompt may contain
         # action words ("card statement screenshot" hit the \bscreenshot\b
         # pattern). If every tool is disabled, drop the action-turn flag.
-        if action_turn and self._all_tools_disabled(disabled_tools):
+        if action_turn and (
+            not turn_available_tools
+            or self._all_tools_disabled(disabled_tools)
+        ):
             action_turn = False
             logger.info(
-                "Action-turn flag cleared: all tools disabled this turn "
+                "Action-turn flag cleared: no tools available for this turn "
                 "(nothing to enforce)."
             )
 
@@ -5720,6 +6547,7 @@ class AgentLoop:
             session_key=msg.session_key,
             model_override=model_override,
             disabled_tools=disabled_tools,
+            tool_platform=msg.channel,
             outbound_channel=msg.channel,
             outbound_chat_id=msg.chat_id,
             outbound_run_id=msg.metadata.get("run_id") or "",
@@ -5848,6 +6676,13 @@ class AgentLoop:
                              "tool_call_id", "name")
                 })
 
+        # Relay/Firestore must receive the same presentation contract as live
+        # iteration events and direct-gateway history.  Projection happens
+        # only after the provider-facing loop messages have been persisted.
+        from flowly.tool_activity import project_tool_messages_for_ui
+
+        tool_messages_for_ui = project_tool_messages_for_ui(tool_messages_for_ui)
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -5960,12 +6795,23 @@ class AgentLoop:
         # announce turn is delivered on the parent's origin channel,
         # so the channel hint must match origin_channel rather than
         # the announce message's transport channel.
+        system_disclosure = self._routed_tool_disclosure(
+            origin_channel,
+            intent_text=msg.content,
+        )
+        system_available_tools = {
+            str(item.get("function", {}).get("name", ""))
+            for item in system_disclosure.definitions
+            if str(item.get("function", {}).get("name", ""))
+        }
         messages = self.context.build_messages(
             history=session.get_history(max_messages=self.context_messages),
             current_message=msg.content,
             memory_search_enabled=self._memory_manager is not None,
             model=self.model,
             channel=origin_channel,
+            available_tools=system_available_tools,
+            reachable_tools=set(system_disclosure.all_names),
         )
         self._inject_recent_artifacts_hint(
             messages, session_key=f"{origin_channel}:{origin_chat_id}",
@@ -6002,6 +6848,7 @@ class AgentLoop:
             live_call_turn=live_call_turn,
             turn_content=msg.content,
             session_key=f"{origin_channel}:{origin_chat_id}",
+            tool_platform=origin_channel,
             outbound_channel=origin_channel,
             outbound_chat_id=origin_chat_id,
             outbound_run_id=msg.metadata.get("run_id") or "",
