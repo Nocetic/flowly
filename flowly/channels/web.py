@@ -457,6 +457,11 @@ class WebChannel(BaseChannel):
                         else {}
                     ),
                     **({"name": iter_event["name"]} if iter_event.get("name") else {}),
+                    **(
+                        {"tool_activity": iter_event["tool_activity"]}
+                        if iter_event.get("tool_activity")
+                        else {}
+                    ),
                 },
             }
             await self._send_or_queue(json.dumps(event_msg))

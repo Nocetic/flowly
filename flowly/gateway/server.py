@@ -2245,6 +2245,13 @@ class GatewayServer:
                 msg["durationMs"] = max(0, int(duration_ms))
             messages.append(msg)
 
+        # ``messages`` is a transport DTO, not provider history. Flatten any
+        # deferred-call wrappers here so a reopened Desktop/iOS conversation
+        # renders the same effective tool identity it showed while streaming.
+        from flowly.tool_activity import project_tool_messages_for_ui
+
+        messages = project_tool_messages_for_ui(messages)
+
         await self._ws_rpc_reply(
             ws,
             rpc_id,
