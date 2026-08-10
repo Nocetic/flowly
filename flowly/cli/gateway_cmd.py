@@ -2015,16 +2015,10 @@ Respond to the user now:"""
                 if web and hasattr(web, "send_approval_event"):
                     session_key = pending.session_key or ""
                     if session_key.startswith("web:"):
-                        await web.send_approval_event(
-                            session_key, pending.id, pending.request.command, pending.expires_at,
-                            getattr(pending, "supports_always", True),
-                        )
+                        await web.send_approval_event(session_key, pending)
 
                 # Gateway: push event to all desktop clients (local WS)
-                await gateway_server.broadcast_approval_request(
-                    pending.id, pending.request.command, pending.session_key, pending.expires_at,
-                    getattr(pending, "supports_always", True),
-                )
+                await gateway_server.broadcast_approval_request(pending)
 
                 # Closed-app push: wake the phone with an APNs/FCM notification
                 # so the request reaches the user even when the app is shut.
@@ -2034,6 +2028,27 @@ Respond to the user now:"""
                 await notify_approval_requested(pending)
 
             _approval_mgr.add_notify_callback(_notify_approval)
+
+            async def _close_approval(
+                approval_id: str, reason: str, session_key: str
+            ) -> None:
+                """The approval is settled — retire the card everywhere.
+
+                Same need clarify already had: without this a command decided on
+                one device keeps its card on every other surface, and that stale
+                card's countdown eventually fires a decision against an id the
+                manager has already dropped.
+                """
+                web = channels.get_channel("web")
+                if web and hasattr(web, "send_approval_closed"):
+                    if session_key.startswith("web:"):
+                        await web.send_approval_closed(session_key, approval_id, reason)
+
+                await gateway_server.broadcast_approval_closed(
+                    approval_id, reason, session_key
+                )
+
+            _approval_mgr.add_close_callback(_close_approval)
 
             # Connect clarify manager to the gateway so agent-initiated
             # questions reach desktop/web clients. Same fan-out shape as
@@ -2049,19 +2064,10 @@ Respond to the user now:"""
                 if web and hasattr(web, "send_clarify_event"):
                     session_key = pending.session_key or ""
                     if session_key.startswith("web:"):
-                        await web.send_clarify_event(
-                            session_key, pending.id, pending.question,
-                            pending.choices, pending.expires_at,
-                        )
+                        await web.send_clarify_event(session_key, pending)
 
                 # Gateway: push event to all desktop clients (local WS).
-                await gateway_server.broadcast_clarify_request(
-                    pending.id,
-                    pending.question,
-                    pending.choices,
-                    pending.session_key,
-                    pending.expires_at,
-                )
+                await gateway_server.broadcast_clarify_request(pending)
 
             _clarify_mgr.add_notify_callback(_notify_clarify)
 
@@ -2074,6 +2080,11 @@ Respond to the user now:"""
                 on another device, or timed out after five minutes, with the
                 agent long since moved on.
                 """
+                web = channels.get_channel("web")
+                if web and hasattr(web, "send_clarify_closed"):
+                    if session_key.startswith("web:"):
+                        await web.send_clarify_closed(session_key, clarify_id, reason)
+
                 await gateway_server.broadcast_clarify_closed(
                     clarify_id, reason, session_key
                 )

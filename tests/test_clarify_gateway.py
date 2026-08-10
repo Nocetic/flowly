@@ -43,8 +43,12 @@ async def test_broadcast_reaches_clients():
     ws = _fake_ws()
     server._ws_clients["c1"] = ws
 
+    now = time.time()
     await server.broadcast_clarify_request(
-        "id1", "Which?", ["A", "B"], "web:1", time.time() + 60,
+        ClarifyRequest(
+            id="id1", question="Which?", choices=["A", "B"],
+            session_key="web:1", created_at=now, expires_at=now + 60,
+        )
     )
 
     ws.send_json.assert_awaited_once()

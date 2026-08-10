@@ -290,6 +290,7 @@ class ExecApprovalStore:
             # (see resolve_pending). Pipelines / builtins resolve to no path,
             # so remembering them is impossible — don't offer it.
             supports_always=analysis.resolved_path is not None,
+            kind="exec",
         )
 
         self._pending[approval_id] = pending
