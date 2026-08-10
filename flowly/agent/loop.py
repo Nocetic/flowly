@@ -1990,7 +1990,9 @@ class AgentLoop:
         except Exception:  # noqa: BLE001 — never block agent startup
             logger.exception("[loop] PlanTool registration failed (non-fatal)")
 
-        # Browser tab tool (if enabled — requires Chrome extension)
+        # Browser tab tool (if enabled — served by whichever browser provider
+        # is registered on the gateway: embedded Flowly Browser or the Chrome
+        # extension)
         browser_tab_enabled = False
         if self._main_config and hasattr(self._main_config, "tools"):
             browser_tab_enabled = self._main_config.tools.browser_tab.enabled
