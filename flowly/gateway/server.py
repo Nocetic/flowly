@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from urllib.parse import quote
 
 import aiohttp
@@ -34,6 +34,10 @@ from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
+
+if TYPE_CHECKING:  # annotations only — keeps the runtime import graph unchanged
+    from flowly.clarify.types import ClarifyRequest
+    from flowly.exec.types import PendingApproval
 
 # Maximum allowed request body size (1MB)
 _MAX_BODY_SIZE = 1024 * 1024
@@ -1472,19 +1476,14 @@ class GatewayServer:
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
         from flowly.exec.approval_manager import get_approval_manager
+        from flowly.exec.wire import approval_to_wire
 
         manager = get_approval_manager()
         pending = manager.list_pending()
-        items = [
-            {
-                "id": p.id,
-                "command": p.request.command,
-                "sessionKey": p.session_key,
-                "expiresAt": p.expires_at,
-                "supportsAlways": getattr(p, "supports_always", True),
-            }
-            for p in pending
-        ]
+        # Same serializer as the broadcast: a surface that reconnects and
+        # catches up must see byte-identical objects to the ones it would have
+        # received live, or its dedupe-by-id turns into two different cards.
+        items = [approval_to_wire(p) for p in pending]
         await self._ws_rpc_reply(ws, rpc_id, {"approvals": items})
 
     # --- RPC: agent.clarify ---
@@ -1514,38 +1513,21 @@ class GatewayServer:
     ) -> None:
         from flowly.clarify.manager import get_clarify_manager
 
+        from flowly.clarify.wire import clarify_to_wire
+
         manager = get_clarify_manager()
-        items = [
-            {
-                "id": p.id,
-                "question": p.question,
-                "choices": p.choices,
-                "sessionKey": p.session_key,
-                "expiresAt": p.expires_at,
-            }
-            for p in manager.list_pending()
-        ]
+        # Same serializer as the broadcast — see the approval list for why.
+        items = [clarify_to_wire(p) for p in manager.list_pending()]
         await self._ws_rpc_reply(ws, rpc_id, {"clarifies": items})
 
-    async def broadcast_clarify_request(
-        self,
-        clarify_id: str,
-        question: str,
-        choices: list[str] | None,
-        session_key: str | None,
-        expires_at: float,
-    ) -> None:
+    async def broadcast_clarify_request(self, pending: "ClarifyRequest") -> None:
         """Push an agent clarify request to all connected desktop/web clients."""
+        from flowly.clarify.wire import clarify_to_wire
+
         event = {
             "type": "event",
             "event": "agent.clarify.requested",
-            "data": {
-                "id": clarify_id,
-                "question": question,
-                "choices": choices,
-                "sessionKey": session_key,
-                "expiresAt": expires_at,
-            },
+            "data": clarify_to_wire(pending),
         }
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
@@ -1562,14 +1544,12 @@ class GatewayServer:
         prompt needs to retire it when the question is settled elsewhere or
         expires, or the user answers into a prompt nothing is listening to.
         """
+        from flowly.clarify.wire import clarify_closed_to_wire
+
         event = {
             "type": "event",
             "event": "agent.clarify.closed",
-            "data": {
-                "id": clarify_id,
-                "reason": reason,
-                "sessionKey": session_key or "",
-            },
+            "data": clarify_closed_to_wire(clarify_id, reason, session_key),
         }
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
@@ -1653,25 +1633,38 @@ class GatewayServer:
         result = clear_audit_logs(self._audit_dir())
         await self._ws_rpc_reply(ws, rpc_id, result)
 
-    async def broadcast_approval_request(
-        self,
-        approval_id: str,
-        command: str,
-        session_key: str | None,
-        expires_at: float,
-        supports_always: bool = True,
-    ) -> None:
+    async def broadcast_approval_request(self, pending: "PendingApproval") -> None:
         """Push an exec approval request to all connected desktop/web clients."""
+        from flowly.exec.wire import approval_to_wire
+
         event = {
             "type": "event",
             "event": "exec.approval.requested",
-            "data": {
-                "id": approval_id,
-                "command": command,
-                "sessionKey": session_key,
-                "expiresAt": expires_at,
-                "supportsAlways": supports_always,
-            },
+            "data": approval_to_wire(pending),
+        }
+        for ws in list(self._ws_clients.values()):
+            await self._ws_send(ws, event)
+
+    async def broadcast_approval_closed(
+        self,
+        approval_id: str,
+        reason: str,
+        session_key: str | None,
+    ) -> None:
+        """Tell clients an approval stopped waiting (decision or ``timeout``).
+
+        The counterpart of ``broadcast_approval_request``, and the exact
+        sibling of ``broadcast_clarify_closed``: a surface that drew a card
+        needs to retire it when the request is settled elsewhere or expires.
+        Without it the stale card's own countdown eventually fires a decision
+        against an id the approval manager has already dropped.
+        """
+        from flowly.exec.wire import approval_closed_to_wire
+
+        event = {
+            "type": "event",
+            "event": "exec.approval.closed",
+            "data": approval_closed_to_wire(approval_id, reason, session_key),
         }
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)

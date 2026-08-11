@@ -707,75 +707,112 @@ class WebChannel(BaseChannel):
                     self._enqueue_payload(remaining)
                 return
 
-    async def send_approval_event(
-        self,
-        session_key: str,
-        approval_id: str,
-        command: str,
-        expires_at: float,
-        supports_always: bool = True,
-    ) -> None:
-        """Push exec approval request to the browser/iOS via relay."""
-        if not self._ws:
-            return
-
-        # Resolve to relay session_id (browser UUID) from session_key
+    def _relay_id_for(self, session_key: str) -> str | None:
+        """Map a bot session key to the relay session id (browser UUID)."""
         relay_id = self._session_key_to_relay_id.get(session_key)
         if not relay_id:
             # Try with web: prefix
             relay_id = self._session_key_to_relay_id.get(f"web:{session_key}")
+        return relay_id
+
+    async def send_approval_event(self, session_key: str, pending) -> None:
+        """Push exec approval request to the browser/iOS via relay."""
+        if not self._ws:
+            return
+
+        relay_id = self._relay_id_for(session_key)
         if not relay_id:
             logger.warning(f"[WebChannel] No relay session found for {session_key}")
             return
+
+        from flowly.exec.wire import approval_to_wire
 
         event_msg = {
             "type": "event",
             "sessionId": relay_id,
             "event": "exec.approval.requested",
-            "data": {
-                "id": approval_id,
-                "command": command,
-                "expiresAt": expires_at,
-                "supportsAlways": supports_always,
-            },
+            "data": approval_to_wire(pending),
         }
         # Approval requests are user-blocking — must survive a flapping WS.
         await self._send_or_queue(json.dumps(event_msg))
-        logger.info(f"[WebChannel] Sent approval event {approval_id} to relay session {relay_id}")
+        logger.info(f"[WebChannel] Sent approval event {pending.id} to relay session {relay_id}")
 
-    async def send_clarify_event(
-        self,
-        session_key: str,
-        clarify_id: str,
-        question: str,
-        choices: list[str] | None,
-        expires_at: float,
+    async def send_approval_closed(
+        self, session_key: str, approval_id: str, reason: str,
     ) -> None:
+        """Tell relay clients an approval stopped waiting.
+
+        Relay-connected surfaces (iOS, a cloud-connected desktop) previously
+        never learned that a request died: only the local gateway broadcast a
+        close. A card decided on one device therefore stayed on screen on every
+        other one.
+        """
+        if not self._ws:
+            return
+
+        relay_id = self._relay_id_for(session_key)
+        if not relay_id:
+            return
+
+        from flowly.exec.wire import approval_closed_to_wire
+
+        event_msg = {
+            "type": "event",
+            "sessionId": relay_id,
+            "event": "exec.approval.closed",
+            "data": approval_closed_to_wire(approval_id, reason, session_key),
+        }
+        # Retiring a prompt matters as much as raising it — queue on a flap.
+        await self._send_or_queue(json.dumps(event_msg))
+
+    async def send_clarify_event(self, session_key: str, pending) -> None:
         """Push an agent clarify question to the browser/iOS via relay."""
         if not self._ws:
             return
 
-        relay_id = self._session_key_to_relay_id.get(session_key)
-        if not relay_id:
-            relay_id = self._session_key_to_relay_id.get(f"web:{session_key}")
+        relay_id = self._relay_id_for(session_key)
         if not relay_id:
             logger.warning(f"[WebChannel] No relay session found for {session_key}")
             return
+
+        from flowly.clarify.wire import clarify_to_wire
 
         event_msg = {
             "type": "event",
             "sessionId": relay_id,
             "event": "agent.clarify.requested",
-            "data": {
-                "id": clarify_id,
-                "question": question,
-                "choices": choices,
-                "expiresAt": expires_at,
-            },
+            "data": clarify_to_wire(pending),
         }
         # Clarify questions are user-blocking — must survive a flapping WS.
         await self._send_or_queue(json.dumps(event_msg))
-        logger.info(f"[WebChannel] Sent clarify event {clarify_id} to relay session {relay_id}")
+        logger.info(f"[WebChannel] Sent clarify event {pending.id} to relay session {relay_id}")
+
+    async def send_clarify_closed(
+        self, session_key: str, clarify_id: str, reason: str,
+    ) -> None:
+        """Tell relay clients a question stopped waiting (``answered`` / ``timeout``).
+
+        The gateway has broadcast this for a while; the relay path never did, so
+        a question answered on the phone left a dead prompt on every other
+        relay-connected surface.
+        """
+        if not self._ws:
+            return
+
+        relay_id = self._relay_id_for(session_key)
+        if not relay_id:
+            return
+
+        from flowly.clarify.wire import clarify_closed_to_wire
+
+        event_msg = {
+            "type": "event",
+            "sessionId": relay_id,
+            "event": "agent.clarify.closed",
+            "data": clarify_closed_to_wire(clarify_id, reason, session_key),
+        }
+        # Retiring a prompt matters as much as raising it — queue on a flap.
+        await self._send_or_queue(json.dumps(event_msg))
 
     async def send_plan_event(
         self,

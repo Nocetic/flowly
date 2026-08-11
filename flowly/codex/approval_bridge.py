@@ -113,6 +113,7 @@ def _build_pending_for_command(
         session_key=session_key or None,
         resolved_path=None,
         risk_reasons=[reason] if reason else [],
+        kind="codex",
     )
     return pending
 
@@ -166,6 +167,7 @@ def _build_pending_for_file_change(
         session_key=session_key or None,
         resolved_path=grant_root,
         risk_reasons=risk,
+        kind="codex",
     )
 
 

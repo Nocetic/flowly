@@ -760,7 +760,11 @@ class ArtifactConfig(BaseModel):
 
 
 class BrowserTabConfig(BaseModel):
-    """Browser tab tool configuration (requires Flowly Chrome extension)."""
+    """Browser tab tool configuration.
+
+    Requires a connected browser provider: the desktop app's embedded
+    Flowly Browser or the Flowly Chrome extension.
+    """
     enabled: bool = False
 
 

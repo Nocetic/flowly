@@ -15,6 +15,10 @@ ExecHost = Literal["local", "sandbox"]
 # Approval decisions
 ExecApprovalDecision = Literal["allow-once", "allow-always", "deny"]
 
+# What a pending approval is asking permission for. Drives how surfaces frame
+# the prompt — see ``PendingApproval.kind``.
+ExecApprovalKind = Literal["exec", "action", "codex"]
+
 
 @dataclass
 class ExecConfig:
@@ -86,6 +90,14 @@ class PendingApproval:
     session_key: str | None = None
     resolved_path: str | None = None
     risk_reasons: list[str] = field(default_factory=list)
+    # What the user is being asked to permit. Surfaces frame the prompt on it:
+    # ``exec``/``codex`` carry a shell command and belong in a monospace block,
+    # ``action`` carries a human sentence ("Send email to a@b.com") that a code
+    # block would misrepresent. Defaults to ``action`` so the seven tool
+    # integrations that build a PendingApproval directly (email, github,
+    # linear, drive, calendar, tasks, sentry) get the right framing without
+    # each having to say so.
+    kind: ExecApprovalKind = "action"
     # Whether an "allow-always" decision actually has a lasting effect. True
     # for exec commands we can allowlist (resolved_path known) and for codex
     # (acceptForSession). False for tool actions that can never be remembered

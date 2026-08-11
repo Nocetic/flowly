@@ -121,7 +121,14 @@ async def test_the_gateway_payload_is_the_one_the_tui_reads(monkeypatch, tmp_pat
     ws.send_json = AsyncMock()
     server._ws_clients["c1"] = ws
 
-    await server.broadcast_clarify_request("cl_1", "Which?", ["A", "B"], "cli:1", 9e12)
+    from flowly.clarify.types import ClarifyRequest as _Pending
+
+    await server.broadcast_clarify_request(
+        _Pending(
+            id="cl_1", question="Which?", choices=["A", "B"],
+            session_key="cli:1", created_at=0.0, expires_at=9e12,
+        )
+    )
     client = _bare_client()
     await client._dispatch(ws.send_json.await_args.args[0])
     ev = client._inbox.get_nowait()

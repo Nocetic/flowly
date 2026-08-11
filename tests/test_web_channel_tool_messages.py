@@ -258,6 +258,32 @@ async def test_legacy_abort_keeps_terminal_event_for_old_embedders(channel) -> N
     assert terminal["data"]["sessionKey"] == "web:sess-1"
 
 
+def _pending_approval(
+    approval_id: str,
+    command: str,
+    expires_at: float,
+    *,
+    supports_always: bool = True,
+    kind: str = "exec",
+    cwd: str | None = None,
+    resolved_path: str | None = None,
+    risk_reasons: list[str] | None = None,
+):
+    from flowly.exec.types import ExecRequest, PendingApproval
+
+    return PendingApproval(
+        id=approval_id,
+        request=ExecRequest(command=command, cwd=cwd),
+        created_at=0.0,
+        expires_at=expires_at,
+        session_key="web:session-1",
+        resolved_path=resolved_path,
+        risk_reasons=list(risk_reasons or []),
+        supports_always=supports_always,
+        kind=kind,
+    )
+
+
 @pytest.mark.asyncio
 async def test_approval_event_payload_shape_unchanged(channel) -> None:
     """iOS/browser approval events keep their existing wire contract."""
@@ -266,13 +292,18 @@ async def test_approval_event_payload_shape_unchanged(channel) -> None:
 
     await channel.send_approval_event(
         "session-1",
-        "approval-1",
-        "echo hello",
-        123.0,
+        _pending_approval(
+            "approval-1", "echo hello", 123.0,
+            cwd="/tmp", resolved_path="/bin/echo",
+            risk_reasons=["Uses shell redirection"],
+        ),
     )
 
-    # Additive field `supportsAlways` (default True) — old relays ignore
-    # unknown keys; clients use it to hide a no-op "Always allow".
+    # Additive fields only — old relays and older clients ignore unknown keys.
+    # `supportsAlways` lets a client hide a no-op "Always allow"; `kind` says
+    # whether `command` is a shell line (monospace) or a human sentence;
+    # `riskReasons`/`cwd`/`resolvedPath` let the card explain *why* it fired
+    # instead of asking the client to re-derive the danger heuristics.
     assert channel._capture == [
         {
             "type": "event",
@@ -281,8 +312,14 @@ async def test_approval_event_payload_shape_unchanged(channel) -> None:
             "data": {
                 "id": "approval-1",
                 "command": "echo hello",
+                "kind": "exec",
+                "sessionKey": "web:session-1",
+                "createdAt": 0.0,
                 "expiresAt": 123.0,
                 "supportsAlways": True,
+                "riskReasons": ["Uses shell redirection"],
+                "cwd": "/tmp",
+                "resolvedPath": "/bin/echo",
             },
         }
     ]
@@ -294,7 +331,36 @@ async def test_approval_event_marks_non_persistable(channel) -> None:
     channel._session_key_to_relay_id["web:session-1"] = "relay-1"
 
     await channel.send_approval_event(
-        "session-1", "approval-1", "📧 Send email", 123.0, supports_always=False
+        "session-1",
+        _pending_approval(
+            "approval-1", "📧 Send email", 123.0,
+            supports_always=False, kind="action",
+        ),
     )
 
     assert channel._capture[0]["data"]["supportsAlways"] is False
+    # A sent email is not a shell command — the card must not frame it as one.
+    assert channel._capture[0]["data"]["kind"] == "action"
+
+
+@pytest.mark.asyncio
+async def test_approval_closed_reaches_relay(channel) -> None:
+    """Relay-connected surfaces previously never learned a request had died, so
+    a command decided on one device kept its card everywhere else."""
+    channel._ws = object()
+    channel._session_key_to_relay_id["web:session-1"] = "relay-1"
+
+    await channel.send_approval_closed("web:session-1", "approval-1", "allow-once")
+
+    assert channel._capture == [
+        {
+            "type": "event",
+            "sessionId": "relay-1",
+            "event": "exec.approval.closed",
+            "data": {
+                "id": "approval-1",
+                "reason": "allow-once",
+                "sessionKey": "web:session-1",
+            },
+        }
+    ]
