@@ -52,4 +52,3 @@ def test_later_prompt_replaces_input_while_completion_accumulates() -> None:
         "cache_read_tokens": 1_000,
         "cache_write_tokens": 850,
     }
-
