@@ -425,6 +425,33 @@ class WebChannel(BaseChannel):
         """
         session_id = msg.chat_id  # chat_id = sessionId for web channel
 
+        # Autonomous goal delta.  It travels over the existing relay `chat`
+        # event contract, so no relay protocol/version change is required.
+        stream_event = msg.metadata.get("stream_event")
+        if isinstance(stream_event, dict) and stream_event:
+            session_key = self._session_key_for_relay_id(session_id)
+            stream_data = {
+                "state": "streaming",
+                "runId": stream_event.get("runId") or "",
+                "sessionKey": session_key,
+                "source": "relay",
+                "delta": stream_event.get("delta") or "",
+                **(
+                    {"goalRun": True}
+                    if stream_event.get("goalRun") is True
+                    else {}
+                ),
+            }
+            event_msg = {
+                "type": "event",
+                "sessionId": session_id,
+                "event": "chat",
+                "data": stream_data,
+            }
+            await self._send_or_queue(json.dumps(event_msg))
+            asyncio.create_task(self._emit_local_event("chat", stream_data))
+            return
+
         # Live per-iteration tool-turn event from the loop. The loop
         # emits one of these after every assistant_with_tool_calls or
         # tool_result it adds to the in-flight turn; we forward it
@@ -464,6 +491,11 @@ class WebChannel(BaseChannel):
                     **(
                         {"tool_activity": iter_event["tool_activity"]}
                         if iter_event.get("tool_activity")
+                        else {}
+                    ),
+                    **(
+                        {"goalRun": True}
+                        if iter_event.get("goalRun") is True
                         else {}
                     ),
                 },
@@ -561,6 +593,8 @@ class WebChannel(BaseChannel):
             # streaming state. They must remain distinct: chat.send's
             # idempotency key also identifies the durable USER document.
             data_block["streamRunId"] = str(stream_run_id)
+        if msg.metadata.get("goal_run") is True:
+            data_block["goalRun"] = True
         usage_meta = msg.metadata.get("usage")
         if isinstance(usage_meta, dict) and usage_meta:
             data_block["usage"] = {

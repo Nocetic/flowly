@@ -6,12 +6,13 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from flowly.agent import inflight
 from flowly.agent.loop import (
     _GOAL_BASE_USER_EPOCH,
     _GOAL_CONTINUATION_ID,
     _GOAL_KICKOFF,
-    _AgentGoalDelivery,
     AgentLoop,
+    _AgentGoalDelivery,
 )
 from flowly.bus.events import InboundMessage, OutboundMessage
 from flowly.goals.commands import GoalCommandResult
@@ -71,12 +72,90 @@ async def test_goal_continuation_preserves_relay_stable_session_key() -> None:
     submitted = loop._process_message.await_args.args[0]
     assert submitted.session_key == "web:stable-chat"
     assert submitted.chat_id == "relay-1"
+    assert submitted.metadata["goal_run"] is True
+    assert submitted.metadata["run_id"].startswith("goal-")
     assert result == "turn"
     loop._goal_turn_from_outbound.assert_called_once_with(
         "web:stable-chat",
         response,
         user_epoch=3,
     )
+    inflight.finish("web:stable-chat", submitted.metadata["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_goal_continuation_streams_and_restores_as_one_relay_chat_run() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.bus = Mock()
+    loop.bus.publish_outbound = AsyncMock()
+    loop._deliver_goal_outbound = AsyncMock()
+
+    async def process(message: InboundMessage) -> OutboundMessage:
+        await message.metadata["stream_callback"]("working")
+        await message.metadata["on_iteration"]({
+            "iterationIdx": 0,
+            "role": "assistant",
+            "content": "working",
+            "tool_calls": [{"id": "call-1"}],
+        })
+        return OutboundMessage(
+            channel="web",
+            chat_id="relay-1",
+            content="done",
+            metadata={
+                "stream_run_id": message.metadata["run_id"],
+                "goal_run": True,
+            },
+        )
+
+    loop._process_message = AsyncMock(side_effect=process)
+    delivery = _AgentGoalDelivery(
+        loop,
+        session_key="web:stable-chat",
+        channel="web",
+        chat_id="relay-1",
+        direct=False,
+    )
+
+    turn = await delivery.run_continuation(
+        session_key="web:stable-chat",
+        goal_id="goal-1",
+        user_epoch=3,
+        kickoff=False,
+    )
+
+    assert turn is not None
+    streamed, iterated = [call.args[0] for call in loop.bus.publish_outbound.await_args_list]
+    run_id = streamed.metadata["stream_event"]["runId"]
+    assert run_id.startswith("goal-")
+    assert streamed.metadata["stream_event"] == {
+        "state": "streaming",
+        "runId": run_id,
+        "delta": "working",
+        "goalRun": True,
+    }
+    assert iterated.metadata["iteration_event"]["runId"] == run_id
+    assert iterated.metadata["iteration_event"]["goalRun"] is True
+    assert inflight.get("web:stable-chat") == {
+        "runId": run_id,
+        "text": "",
+        "user": "",
+        "iterations": [{
+            "iterationIdx": 0,
+            "role": "assistant",
+            "content": "working",
+            "tool_calls": [{"id": "call-1"}],
+            "runId": run_id,
+            "goalRun": True,
+            "state": "iteration_step",
+        }],
+    }
+
+    await delivery.deliver_turn(turn)
+
+    delivered = loop._deliver_goal_outbound.await_args.args[0]
+    assert delivered.metadata["stream_run_id"] == run_id
+    assert inflight.get("web:stable-chat") is None
 
 
 @pytest.mark.asyncio

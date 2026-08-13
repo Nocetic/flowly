@@ -3368,7 +3368,8 @@ class GatewayServer:
             return
         import uuid as _uuid
 
-        run_id = "proactive-" + _uuid.uuid4().hex[:8]
+        stream_run_id = str(metadata.get("stream_run_id") or "")
+        run_id = stream_run_id or ("proactive-" + _uuid.uuid4().hex[:8])
         provider_error = metadata.get("error")
         if isinstance(provider_error, dict):
             data: dict[str, Any] = {
@@ -3387,12 +3388,17 @@ class GatewayServer:
             }
             if metadata.get("model"):
                 data["model"] = str(metadata["model"])
+            if metadata.get("goal_run") is True:
+                data["goalRun"] = True
             payload = {"type": "event", "event": "chat", "data": data}
-            for ws in list(self._ws_clients.values()):
-                try:
-                    await self._ws_send(ws, payload)
-                except Exception:
-                    pass
+            if metadata.get("goal_run") is True:
+                await self._push_session_chat_event(session_key, data)
+            else:
+                for ws in list(self._ws_clients.values()):
+                    try:
+                        await self._ws_send(ws, payload)
+                    except Exception:
+                        pass
             if isinstance(goal_snapshot, dict):
                 await self.broadcast_goal_updated(session_key, goal_snapshot)
             return
@@ -3417,6 +3423,8 @@ class GatewayServer:
         }
         if isinstance(goal_snapshot, dict):
             data["goal"] = goal_snapshot
+        if metadata.get("goal_run") is True:
+            data["goalRun"] = True
         if isinstance(metadata.get("usage"), dict) and metadata["usage"]:
             final_message["usage"] = metadata["usage"]
         if metadata.get("model"):
@@ -3431,13 +3439,70 @@ class GatewayServer:
             "event": "chat",
             "data": data,
         }
+        if metadata.get("goal_run") is True:
+            await self._push_session_chat_event(session_key, data)
+        else:
+            for ws in list(self._ws_clients.values()):
+                try:
+                    await self._ws_send(ws, payload)
+                except Exception:
+                    pass  # closed socket — best effort
+        if isinstance(goal_snapshot, dict):
+            await self.broadcast_goal_updated(session_key, goal_snapshot)
+
+    async def push_session_stream(
+        self,
+        session_key: str,
+        run_id: str,
+        delta: str,
+    ) -> None:
+        """Push one autonomous continuation delta to its conversation."""
+        if not delta:
+            return
+        await self._push_session_chat_event(
+            session_key,
+            {
+                "state": "streaming",
+                "runId": run_id,
+                "sessionKey": session_key,
+                "delta": delta,
+                "goalRun": True,
+            },
+        )
+
+    async def push_session_iteration(
+        self,
+        session_key: str,
+        run_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        """Push one autonomous continuation tool-loop boundary."""
+        await self._push_session_chat_event(
+            session_key,
+            {
+                **event,
+                "state": "iteration_step",
+                "runId": run_id,
+                "sessionKey": session_key,
+                "goalRun": True,
+            },
+        )
+
+    async def _push_session_chat_event(
+        self,
+        session_key: str,
+        data: dict[str, Any],
+    ) -> None:
+        payload = {"type": "event", "event": "chat", "data": data}
+        target = self._session_ws.get(session_key)
+        if target is not None and not target.closed:
+            await self._ws_send(target, payload)
+            return
         for ws in list(self._ws_clients.values()):
             try:
                 await self._ws_send(ws, payload)
             except Exception:
-                pass  # closed socket — best effort
-        if isinstance(goal_snapshot, dict):
-            await self.broadcast_goal_updated(session_key, goal_snapshot)
+                pass
 
     async def broadcast_agent_state(self, state: str) -> None:
         """Push the agent's turn-level state to every registered extension.

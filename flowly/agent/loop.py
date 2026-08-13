@@ -185,6 +185,58 @@ class _AgentGoalDelivery(GoalDelivery):
         user_epoch: int,
         kickoff: bool,
     ) -> DeliveredGoalTurn | None:
+        run_id = f"goal-{uuid.uuid4().hex}"
+        from flowly.agent import inflight
+
+        # Autonomous turns are first-class chat runs.  They do not create a
+        # synthetic user bubble, but otherwise share the normal stream,
+        # iteration, abort, and reconnect lifecycle.
+        inflight.begin(session_key, run_id, "")
+
+        async def stream_callback(delta: str) -> None:
+            inflight.append(session_key, run_id, delta)
+            if self.direct:
+                gateway = getattr(self.agent, "_gateway_server", None)
+                if gateway is not None and hasattr(gateway, "push_session_stream"):
+                    await gateway.push_session_stream(session_key, run_id, delta)
+                return
+            await self.agent.bus.publish_outbound(OutboundMessage(
+                channel=self.channel,
+                chat_id=self.chat_id,
+                content="",
+                metadata={
+                    "stream_event": {
+                        "state": "streaming",
+                        "runId": run_id,
+                        "delta": delta,
+                        "goalRun": True,
+                    }
+                },
+            ))
+
+        async def iteration_callback(event: dict[str, Any]) -> None:
+            wrapped = {**event, "runId": run_id, "goalRun": True}
+            inflight.append_iteration(
+                session_key,
+                run_id,
+                {**wrapped, "state": "iteration_step"},
+            )
+            if self.direct:
+                gateway = getattr(self.agent, "_gateway_server", None)
+                if gateway is not None and hasattr(gateway, "push_session_iteration"):
+                    await gateway.push_session_iteration(
+                        session_key,
+                        run_id,
+                        wrapped,
+                    )
+                return
+            await self.agent.bus.publish_outbound(OutboundMessage(
+                channel=self.channel,
+                chat_id=self.chat_id,
+                content="",
+                metadata={"iteration_event": wrapped},
+            ))
+
         message = _GoalInboundMessage(
             channel=self.channel,
             sender_id="goal",
@@ -194,11 +246,20 @@ class _AgentGoalDelivery(GoalDelivery):
                 _GOAL_CONTINUATION_ID: goal_id,
                 _GOAL_BASE_USER_EPOCH: user_epoch,
                 _GOAL_KICKOFF: kickoff,
+                "run_id": run_id,
+                "stream_callback": stream_callback,
+                "on_iteration": iteration_callback,
+                "goal_run": True,
             },
             _stable_session_key=session_key,
         )
-        response = await self.agent._process_message(message)
+        try:
+            response = await self.agent._process_message(message)
+        except BaseException:
+            inflight.finish(session_key, run_id)
+            raise
         if response is None:
+            inflight.finish(session_key, run_id)
             return None
         return self.agent._goal_turn_from_outbound(
             session_key,
@@ -209,7 +270,14 @@ class _AgentGoalDelivery(GoalDelivery):
     async def deliver_turn(self, turn: DeliveredGoalTurn) -> None:
         outbound = turn.metadata.get("outbound")
         if isinstance(outbound, OutboundMessage):
-            await self.agent._deliver_goal_outbound(outbound, direct=self.direct)
+            try:
+                await self.agent._deliver_goal_outbound(outbound, direct=self.direct)
+            finally:
+                run_id = str(outbound.metadata.get("stream_run_id") or "")
+                if run_id:
+                    from flowly.agent import inflight
+
+                    inflight.finish(turn.session_key, run_id)
 
     async def deliver_notice(self, decision: GoalDecision) -> None:
         state = self.agent.goal_manager.get(self.session_key)
@@ -8180,6 +8248,10 @@ class AgentLoop:
                 # additive field so clients settle the right live stream
                 # without changing the durable assistant message id.
                 "stream_run_id": outbound_run_id or None,
+                # Autonomous goal continuations use the same chat lifecycle as
+                # user-started runs but have no chat.send ACK. Clients use this
+                # additive marker to adopt the unsolicited stream safely.
+                "goal_run": bool(msg.metadata.get("goal_run")),
                 # Internal delivery marker consumed only after the assistant
                 # response reaches its surface. Slash-command acknowledgments
                 # and other early returns never carry it and are never judged.

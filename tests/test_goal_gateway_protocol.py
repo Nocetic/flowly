@@ -144,6 +144,33 @@ async def test_proactive_goal_provider_failure_uses_native_error_contract() -> N
 
 
 @pytest.mark.asyncio
+async def test_direct_goal_run_stream_iteration_and_final_share_one_identity() -> None:
+    server = GatewayServer(host="127.0.0.1", port=0, on_chat_message=AsyncMock())
+    ws = _FakeWS()
+    server._session_ws["desktop:chat"] = ws
+
+    await server.push_session_stream("desktop:chat", "goal-run-1", "working")
+    await server.push_session_iteration(
+        "desktop:chat",
+        "goal-run-1",
+        {"iterationIdx": 0, "role": "assistant", "content": "working"},
+    )
+    await server.push_session_message(
+        "desktop:chat",
+        "done",
+        metadata={"stream_run_id": "goal-run-1", "goal_run": True},
+    )
+
+    assert [event["data"]["state"] for event in ws.sent] == [
+        "streaming",
+        "iteration_step",
+        "final",
+    ]
+    assert {event["data"]["runId"] for event in ws.sent} == {"goal-run-1"}
+    assert all(event["data"]["goalRun"] is True for event in ws.sent)
+
+
+@pytest.mark.asyncio
 async def test_relay_final_is_followed_by_conversation_scoped_goal_event() -> None:
     channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
     payloads: list[dict[str, Any]] = []
@@ -167,3 +194,42 @@ async def test_relay_final_is_followed_by_conversation_scoped_goal_event() -> No
     assert [payload["event"] for payload in payloads] == ["chat", "goal.updated"]
     assert payloads[1]["data"]["sessionKey"] == "web:stable-chat"
     assert payloads[1]["data"]["goal"]["goalId"] == state.goal_id
+
+
+@pytest.mark.asyncio
+async def test_relay_goal_stream_uses_existing_chat_event_contract() -> None:
+    channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
+    payloads: list[dict[str, Any]] = []
+
+    async def capture(payload: str) -> None:
+        payloads.append(json.loads(payload))
+
+    channel._send_or_queue = capture  # type: ignore[method-assign]
+    channel._session_key_to_relay_id["web:stable-chat"] = "relay-1"
+
+    await channel.send(OutboundMessage(
+        channel="web",
+        chat_id="relay-1",
+        content="",
+        metadata={
+            "stream_event": {
+                "runId": "goal-run-1",
+                "delta": "working",
+                "goalRun": True,
+            }
+        },
+    ))
+
+    assert payloads == [{
+        "type": "event",
+        "sessionId": "relay-1",
+        "event": "chat",
+        "data": {
+            "state": "streaming",
+            "runId": "goal-run-1",
+            "sessionKey": "web:stable-chat",
+            "source": "relay",
+            "delta": "working",
+            "goalRun": True,
+        },
+    }]
