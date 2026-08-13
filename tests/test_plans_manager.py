@@ -101,6 +101,31 @@ async def test_gate_active_while_awaiting_approval(tmp_path: Path):
     assert not mgr.gate_blocks("web:1", "exec")
 
 
+@pytest.mark.asyncio
+async def test_auto_plan_starts_without_approval_event(tmp_path: Path):
+    """A policy-approved tracking plan starts atomically, without flashing an
+    approval prompt on any client."""
+    mgr = _mgr(tmp_path)
+    events: list[tuple[str, dict]] = []
+
+    async def broadcast(name, data):
+        events.append((name, data))
+
+    mgr.set_on_change(broadcast)
+    plan, decision = await mgr.propose(
+        "web:1", "g", _steps(mgr, "A", "B"), mode="auto", timeout_s=5
+    )
+
+    assert decision.approved
+    assert decision.via == "policy"
+    assert plan.mode == "auto"
+    assert plan.status == "executing"
+    assert plan.approval is None
+    assert [name for name, _data in events] == ["plan.updated"]
+    assert events[0][1]["status"] == "executing"
+    assert events[0][1]["approval"] is None
+
+
 def test_side_effect_set_covers_the_dangerous_tools():
     for t in ("exec", "write_file", "edit_file", "email", "message", "spawn"):
         assert t in SIDE_EFFECT_TOOLS

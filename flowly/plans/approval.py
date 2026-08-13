@@ -43,7 +43,7 @@ class PlanDecision:
     decision: Decision
     feedback: Optional[str] = None
     decision_id: Optional[str] = None
-    via: str = "surface"  # surface | timeout | cron
+    via: str = "surface"  # surface | policy | timeout | cron
 
     @property
     def approved(self) -> bool:
