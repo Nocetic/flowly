@@ -3492,6 +3492,35 @@ class AgentLoop:
             return False
         return not (all_names - set(disabled_tools))
 
+    @staticmethod
+    def _turn_tools_allowed(
+        metadata: dict[str, Any] | None,
+        content: str,
+    ) -> bool:
+        """Resolve the backend-enforced tool policy for one user turn.
+
+        Structured transport metadata is preferred, while a deliberately
+        narrow multilingual grammar supports ordinary chat instructions. The
+        result is carried to schema disclosure *and* the executor gate; hiding
+        schemas alone is not a security boundary because a model can still
+        hallucinate a structured call.
+        """
+        metadata = metadata or {}
+        if metadata.get("tools_allowed") is False:
+            return False
+        policy = str(metadata.get("tool_policy") or "").strip().casefold()
+        if policy in {"none", "disabled", "deny", "no_tools", "no-tools"}:
+            return False
+        text = str(content or "").casefold()
+        patterns = (
+            r"\b(?:do\s+not|don't|dont|never)\s+(?:use|call|invoke)\s+(?:any\s+)?tools?\b",
+            r"\bwithout\s+(?:using|calling|invoking)\s+(?:any\s+)?tools?\b",
+            r"^\s*(?:please[,:]?\s*)?no[\s-]?tools?(?:\s+(?:please|for\s+this\s+turn))?[.!]?\s*$",
+            r"\b(?:hiçbir\s+)?(?:tool|araç)\s+kullanma(?:dan)?\b",
+            r"\b(?:tool|araç)\s+(?:çağırma|çalıştırma)\b",
+        )
+        return not any(re.search(pattern, text) for pattern in patterns)
+
     def _is_action_turn(self, channel: str, content: str) -> bool:
         """Detect whether this turn is an action request that should execute tools strictly."""
         lowered = content.lower()
@@ -4502,6 +4531,7 @@ class AgentLoop:
         session_key: str = "",
         model_override: str | None = None,
         disabled_tools: list[str] | None = None,
+        tools_allowed: bool = True,
         tool_platform: str = "",
         outbound_channel: str = "",
         outbound_chat_id: str = "",
@@ -4579,7 +4609,11 @@ class AgentLoop:
         no_tool_retry_count = 0
         forced_tool_retry = False
         strict_live_call_action = live_call_turn and self._is_strict_live_call_action_intent(turn_content)
-        enforce_action_tools = action_turn and (not live_call_turn or strict_live_call_action)
+        enforce_action_tools = (
+            tools_allowed
+            and action_turn
+            and (not live_call_turn or strict_live_call_action)
+        )
 
         # Counter for per-iteration WS events the channel layer
         # forwards to clients so the desktop / iOS tool-turn panel
@@ -4740,6 +4774,12 @@ class AgentLoop:
             if policy_blocked_tools:
                 blocked_tools.extend(policy_blocked_tools)
 
+            # A no-tools turn advertises no schema at all. This reduces model
+            # confusion and request size, but it is only the first layer: the
+            # executor gate below still rejects hallucinated structured calls.
+            if not tools_allowed:
+                tool_defs = []
+
             # Caller-supplied hard block list — used by cron jobs to hide
             # the `cron` and `message` tools so a scheduled run can't
             # recursively schedule more jobs or DM users directly.
@@ -4794,7 +4834,9 @@ class AgentLoop:
             # while the tool executes. On subsequent iterations (iteration > 1),
             # if the model hasn't called any tools yet, escalate to "required"
             # to force tool use and prevent infinite text-only loops.
-            if iteration == 1:
+            if not tools_allowed:
+                tool_choice = "none"
+            elif iteration == 1:
                 tool_choice = "auto"
             else:
                 tool_choice = (
@@ -4825,6 +4867,7 @@ class AgentLoop:
                 f"capability_guidance={_active_capability_guidance}, "
                 f"dynamic_guidance_chars={_dynamic_guidance_chars}, "
                 f"action_turn={action_turn}, live_call_turn={live_call_turn}, "
+                f"tools_allowed={tools_allowed}, "
                 f"blocked_tools={sorted(set(blocked_tools))}, "
                 f"iteration={iteration}/{max_turn_iterations}"
             )
@@ -5155,6 +5198,43 @@ class AgentLoop:
                     _protocol_tool_name = tool_call.name
                     _effective_tool_name = _protocol_tool_name
                     call_args = dict(tool_call.arguments)
+
+                    # Authoritative turn-level prohibition. This runs before
+                    # discovery bridges, routing resolution, callbacks, plan
+                    # gates, argument injection, and ToolRegistry.execute, so
+                    # every tool class (including read-only virtual tools) is
+                    # physically unreachable under policy=none.
+                    if not tools_allowed:
+                        blocked_tools.append(_protocol_tool_name)
+                        result = (
+                            f"BLOCKED: Tool '{_protocol_tool_name}' cannot run "
+                            "because this turn has a backend-enforced no-tools policy. "
+                            "Answer from the supplied context without tools."
+                        )
+                        logger.warning(
+                            "No-tools policy blocked structured call: {} session={}",
+                            _protocol_tool_name,
+                            _current_session_key,
+                        )
+                        accumulated_tool_results.append({
+                            "tool": _protocol_tool_name,
+                            "success": False,
+                            "policy": "no_tools",
+                            "result": result,
+                        })
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, _protocol_tool_name, result
+                        )
+                        await self._emit_iteration_event(
+                            outbound_channel=outbound_channel,
+                            outbound_chat_id=outbound_chat_id,
+                            outbound_run_id=outbound_run_id,
+                            iteration_idx=_iteration_event_idx,
+                            message=messages[-1],
+                            on_iteration=on_iteration,
+                        )
+                        _iteration_event_idx += 1
+                        continue
 
                     if _protocol_tool_name == "tool_search":
                         _search_limit = call_args.get("limit", 5)
@@ -6351,6 +6431,13 @@ class AgentLoop:
                 is_command = True
                 command = parsed_cmd
                 command_args = ""
+            elif parsed_cmd in ("notools", "no-tools", "no_tools"):
+                # A normal agent turn whose tool prohibition is enforced by
+                # schema removal and an executor gate. Accept an argument so
+                # every raw-text client can use it without protocol changes.
+                is_command = True
+                command = "notools"
+                command_args = parts[1] if len(parts) > 1 else ""
             elif parsed_cmd == "plan":
                 # ``/plan [task | off | status]`` — force plan mode. With a task
                 # it rewrites into a planning turn (like /learn); bare it arms
@@ -6456,6 +6543,23 @@ class AgentLoop:
                 content=f"↩️ Removed your last turn. Re-send to edit:\n\n{undo_text}",
             )
 
+        if is_command and command == "notools":
+            if not command_args.strip():
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: `/notools <prompt>`",
+                )
+            original_content = msg.content
+            msg.content = command_args.strip()
+            msg.metadata["_display_content"] = original_content
+            msg.metadata["tools_allowed"] = False
+            msg.metadata["tool_policy"] = "none"
+            msg.metadata["task_objective"] = msg.content
+            is_command = False
+            command = ""
+            command_args = ""
+
         if is_command and command == "help":
             help_text = (
                 "**Available commands:**\n"
@@ -6464,6 +6568,7 @@ class AgentLoop:
                 "• `/new` — Start new conversation\n"
                 "• `/retry` — Re-run your last message for a fresh reply\n"
                 "• `/undo` — Remove the last turn (returns your prompt to edit)\n"
+                "• `/notools <prompt>` — Answer with tool execution disabled\n"
                 "• `/skills [filter]` — List available skills\n"
                 "• `/learn [--dry-run] [source]` — Create or update a reusable skill from sources you describe\n"
                 "• `/whoami` — Show user / server / conversation\n"
@@ -6678,6 +6783,10 @@ class AgentLoop:
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
         display_content = str(msg.metadata.get("_display_content") or msg.content)
+        tools_allowed = self._turn_tools_allowed(msg.metadata, display_content)
+        # Carry the resolved policy through background post-turn work. This is
+        # private turn metadata, not a persisted client protocol requirement.
+        msg.metadata["_effective_tools_allowed"] = tools_allowed
 
         # Record the raw user-facing instruction before plan/skill prompt
         # rewrites or lossy compaction can obscure it.  Existing installations
@@ -6738,10 +6847,14 @@ class AgentLoop:
             tool_chat_id = (msg.metadata.get("origin_chat_id") or "").strip() or msg.chat_id
 
         disabled_tools = msg.metadata.get("disabled_tools")
-        turn_disclosure = self._routed_tool_disclosure(
-            msg.channel,
-            disabled_tools=disabled_tools,
-            intent_text=msg.content,
+        turn_disclosure = (
+            self._routed_tool_disclosure(
+                msg.channel,
+                disabled_tools=disabled_tools,
+                intent_text=msg.content,
+            )
+            if tools_allowed
+            else self._build_tool_disclosure([], intent_text=msg.content)
         )
         turn_available_tools = {
             str(item.get("function", {}).get("name", ""))
@@ -6815,6 +6928,14 @@ class AgentLoop:
         task_contract_sidecar = self._task_contract_sidecar(
             msg.session_key, history
         )
+        tool_policy_sidecar = ""
+        if not tools_allowed:
+            tool_policy_sidecar = (
+                "<tool_execution_policy mode=\"none\" enforcement=\"backend\" />\n"
+                "Answer using only the supplied conversation and your internal "
+                "knowledge. Tool schemas are hidden and every attempted tool "
+                "call is rejected by the executor."
+            )
 
         # Cron isolation flags affect both the real prompt and its compaction
         # estimate. Resolve them before the preview so the estimator measures
@@ -6824,7 +6945,13 @@ class AgentLoop:
         voice_mode_flag = bool(msg.metadata.get("voice_mode", False))
         effective_model = msg.metadata.get("model_override") or self.model
         request_sidecars = [
-            block for block in (coverage_sidecar, task_contract_sidecar) if block
+            block
+            for block in (
+                coverage_sidecar,
+                task_contract_sidecar,
+                tool_policy_sidecar,
+            )
+            if block
         ]
         covered_current_message = "\n\n".join(
             [*request_sidecars, msg.content]
@@ -6872,9 +6999,17 @@ class AgentLoop:
                 available_tools=turn_available_tools,
                 reachable_tools=turn_reachable_tools,
             ) + estimate_tokens(covered_current_message or "")
+        try:
+            turn_tool_schema_tokens = estimate_tokens(
+                json.dumps(turn_disclosure.definitions)
+            )
+        except Exception:  # noqa: BLE001 - conservative fallback
+            turn_tool_schema_tokens = (
+                self._tool_schema_tokens(msg.channel) if tools_allowed else 0
+            )
         fixed_overhead = (
             prompt_overhead
-            + self._tool_schema_tokens(msg.channel)
+            + turn_tool_schema_tokens
             + self._attachment_tokens(msg)
         )
         history_tokens = estimate_messages_tokens(history)
@@ -6882,7 +7017,7 @@ class AgentLoop:
 
         observed_total = self._observed_total_tokens(msg.session_key, session)
 
-        if self.compaction.should_memory_flush(
+        if tools_allowed and self.compaction.should_memory_flush(
             history_tokens, msg.session_key, overhead_tokens=fixed_overhead,
             observed_total_tokens=observed_total,
         ):
@@ -7088,7 +7223,11 @@ class AgentLoop:
         action_turn = self._is_action_turn(msg.channel, msg.content)
         if not action_turn and self._should_promote_retry_to_action(msg.content, history):
             action_turn = True
-        if not action_turn and self._consume_pending_action_lock(session, msg.content):
+        if (
+            not action_turn
+            and tools_allowed
+            and self._consume_pending_action_lock(session, msg.content)
+        ):
             action_turn = True
             logger.info("Pending action lock promoted this turn to action_turn=True")
         live_call_turn = self._is_live_call_turn(msg.content)
@@ -7104,7 +7243,8 @@ class AgentLoop:
         # action words ("card statement screenshot" hit the \bscreenshot\b
         # pattern). If every tool is disabled, drop the action-turn flag.
         if action_turn and (
-            not turn_available_tools
+            not tools_allowed
+            or not turn_available_tools
             or self._all_tools_disabled(disabled_tools)
         ):
             action_turn = False
@@ -7138,6 +7278,7 @@ class AgentLoop:
             session_key=msg.session_key,
             model_override=model_override,
             disabled_tools=disabled_tools,
+            tools_allowed=tools_allowed,
             tool_platform=msg.channel,
             outbound_channel=msg.channel,
             outbound_chat_id=msg.chat_id,
@@ -7302,6 +7443,7 @@ class AgentLoop:
                    if reply_media_assets else {}),
                 "tool_results": tool_results,
                 "executed_tools": _executed_tools,
+                "toolPolicy": "auto" if tools_allowed else "none",
                 "usage": usage,
                 # Effective model for this turn — ``model_override``
                 # wins when set (per-session model switches), else the
@@ -7771,6 +7913,7 @@ class AgentLoop:
         render_capabilities: list[str] | tuple[str, ...] | None = None,
         on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         run_id: str | None = None,
+        tools_allowed: bool | None = None,
     ) -> str | tuple[str, dict[str, Any]]:
         """
         Process a message directly (for CLI, voice calls, or desktop WebSocket).
@@ -7785,6 +7928,9 @@ class AgentLoop:
                             default. Intended for cron jobs with a per-job model
                             pinned at creation time. Scoped to this call; does
                             not leak to other in-flight requests.
+            tools_allowed: Set ``False`` for an executor-enforced tool-free
+                           turn. ``None`` preserves content-based policy
+                           detection and existing caller behaviour.
             render_capabilities: Rich-rendering features advertised by the
                                  current client for this response.
             run_id: Transport-owned run identifier. When present, Stop requests
@@ -7812,6 +7958,10 @@ class AgentLoop:
             metadata["model_override"] = model_override
         if disabled_tools:
             metadata["disabled_tools"] = list(disabled_tools)
+        if tools_allowed is not None:
+            metadata["tools_allowed"] = bool(tools_allowed)
+            if not tools_allowed:
+                metadata["tool_policy"] = "none"
         if skip_memory:
             metadata["skip_memory"] = True
         if skip_context_files:
@@ -8898,9 +9048,14 @@ class AgentLoop:
 
             # Memory flush first, exactly like the pre-turn order: extract
             # durable memories from the history WHILE it is still verbatim.
-            if self.compaction.should_memory_flush(
-                history_tokens, session_key, overhead_tokens=overhead,
-                observed_total_tokens=observed_total,
+            if (
+                msg.metadata.get("_effective_tools_allowed", True)
+                and self.compaction.should_memory_flush(
+                    history_tokens,
+                    session_key,
+                    overhead_tokens=overhead,
+                    observed_total_tokens=observed_total,
+                )
             ):
                 logger.info("Running post-turn memory flush")
                 await self._run_memory_flush(

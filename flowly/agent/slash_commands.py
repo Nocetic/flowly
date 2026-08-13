@@ -60,6 +60,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("new", "Start a new conversation", "Session", aliases=("reset",)),
     CommandDef("retry", "Re-submit the last user message (drops the stale reply)", "Session"),
     CommandDef("undo", "Pop the last turn (pre-fills the removed prompt)", "Session"),
+    CommandDef(
+        "notools",
+        "Answer this prompt with tool execution disabled",
+        "Session",
+        aliases=("no-tools", "no_tools"),
+        args_hint="<prompt>",
+    ),
     CommandDef("status", "Session health summary", "Info"),
     # Plan mode — universal (works on every surface). Bare "/plan" (or on/off)
     # toggles the STANDING mode: every task is planned + approved before any

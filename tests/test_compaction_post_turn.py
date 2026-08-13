@@ -213,6 +213,22 @@ async def test_post_turn_pass_compacts_an_over_budget_session():
     assert len(ids) == 1 and ids != {""}, harness.cycles
 
 
+async def test_no_tools_turn_skips_memory_flush_but_keeps_safe_compaction():
+    session = _big_session()
+    harness = _Harness(session)
+    harness.compaction.config.memory_flush.enabled = True
+    # Guarantee that the flush predicate would fire if the turn policy did
+    # not suppress it. _Harness._run_memory_flush raises on any call.
+    harness.compaction.config.memory_flush.soft_threshold_tokens = 1_000_000
+    message = _msg()
+    message.metadata["_effective_tools_allowed"] = False
+
+    await harness._post_turn_compaction(message)
+
+    assert is_summary_message(session.messages[0])
+    assert harness.events[-1] == "completed"
+
+
 async def test_post_turn_pass_is_a_noop_under_budget():
     session = Session(key="web:conv-1")
     session.add_message("user", "hello")
