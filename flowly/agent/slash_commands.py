@@ -68,6 +68,18 @@ COMMAND_REGISTRY: list[CommandDef] = [
         args_hint="<prompt>",
     ),
     CommandDef("status", "Session health summary", "Info"),
+    CommandDef(
+        "goal",
+        "Set or manage an autonomous standing goal",
+        "Session",
+        args_hint="[text|status|show|pause|resume|clear|wait|gate]",
+    ),
+    CommandDef(
+        "subgoal",
+        "Manage extra completion criteria for the standing goal",
+        "Session",
+        args_hint="[text|remove <n>|clear]",
+    ),
     # Plan mode — universal (works on every surface). Bare "/plan" (or on/off)
     # toggles the STANDING mode: every task is planned + approved before any
     # side effect runs. "/plan <task>" plans just that one task.

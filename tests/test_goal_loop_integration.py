@@ -10,6 +10,7 @@ from flowly.agent.loop import (
     _GOAL_BASE_USER_EPOCH,
     _GOAL_CONTINUATION_ID,
     _GOAL_KICKOFF,
+    _AgentGoalDelivery,
     AgentLoop,
 )
 from flowly.bus.events import InboundMessage, OutboundMessage
@@ -44,6 +45,63 @@ def _bare_loop() -> AgentLoop:
         return_value=OutboundMessage(channel="web", chat_id="chat", content="ok")
     )
     return loop
+
+
+@pytest.mark.asyncio
+async def test_goal_continuation_preserves_relay_stable_session_key() -> None:
+    loop = object.__new__(AgentLoop)
+    response = OutboundMessage(channel="web", chat_id="relay-1", content="ok")
+    loop._process_message = AsyncMock(return_value=response)
+    loop._goal_turn_from_outbound = Mock(return_value="turn")
+    delivery = _AgentGoalDelivery(
+        loop,
+        session_key="web:stable-chat",
+        channel="web",
+        chat_id="relay-1",
+        direct=False,
+    )
+
+    result = await delivery.run_continuation(
+        session_key="web:stable-chat",
+        goal_id="goal-1",
+        user_epoch=3,
+        kickoff=False,
+    )
+
+    submitted = loop._process_message.await_args.args[0]
+    assert submitted.session_key == "web:stable-chat"
+    assert submitted.chat_id == "relay-1"
+    assert result == "turn"
+    loop._goal_turn_from_outbound.assert_called_once_with(
+        "web:stable-chat",
+        response,
+        user_epoch=3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal_notice_reads_state_from_relay_stable_session_key() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.goal_manager = Mock()
+    state = Mock()
+    state.to_public_dict.return_value = {"goalId": "goal-1"}
+    loop.goal_manager.get.return_value = state
+    loop._deliver_goal_outbound = AsyncMock()
+    delivery = _AgentGoalDelivery(
+        loop,
+        session_key="web:stable-chat",
+        channel="web",
+        chat_id="relay-1",
+        direct=False,
+    )
+
+    decision = Mock(message="completed")
+    await delivery.deliver_notice(decision)
+
+    loop.goal_manager.get.assert_called_once_with("web:stable-chat")
+    outbound = loop._deliver_goal_outbound.await_args.args[0]
+    assert outbound.chat_id == "relay-1"
+    assert outbound.metadata["goal"] == {"goalId": "goal-1"}
 
 
 @pytest.mark.asyncio

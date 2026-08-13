@@ -551,6 +551,9 @@ class WebChannel(BaseChannel):
                 "content": content_blocks,
             },
         }
+        goal_snapshot = msg.metadata.get("goal")
+        if isinstance(goal_snapshot, dict):
+            data_block["goal"] = goal_snapshot
         if stream_run_id:
             # ``runId`` is the durable assistant-message identity used by the
             # relay's Firestore document. ``streamRunId`` is the chat.send
@@ -653,6 +656,18 @@ class WebChannel(BaseChannel):
         payload = json.dumps(event_msg)
         await self._send_or_queue(payload)
         asyncio.create_task(self._emit_local_event("chat", data_block))
+        if isinstance(goal_snapshot, dict):
+            goal_event = {
+                "type": "event",
+                "sessionId": session_id,
+                "event": "goal.updated",
+                "data": {
+                    "sessionKey": data_block["sessionKey"],
+                    "goal": goal_snapshot,
+                },
+            }
+            await self._send_or_queue(json.dumps(goal_event))
+            asyncio.create_task(self._emit_local_event("goal.updated", goal_event["data"]))
 
     async def send_cron_register(self, job: dict) -> None:
         """Push a bot-created cron job to Firestore via relay.

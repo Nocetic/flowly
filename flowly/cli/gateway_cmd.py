@@ -1340,6 +1340,7 @@ Respond to the user now:"""
             return_metadata=True,
             on_iteration=iteration_callback,
             run_id=run_id,
+            defer_goal_delivery=True,
         )
         return text, (metadata or {})
 
@@ -1476,6 +1477,13 @@ Respond to the user now:"""
         _feature_rpc.set_semantic_tool_metrics_provider(
             agent.semantic_tool_routing_metrics
         )
+        _feature_rpc.set_goal_state_provider(
+            lambda session_key: (
+                agent.goal_manager.get(session_key)
+                if agent.goal_manager is not None
+                else None
+            )
+        )
         # Subagent manager — for subagents.spawn (manual background subagent).
         _feature_rpc.set_subagent_manager_provider(
             lambda: getattr(agent, "subagents", None)
@@ -1496,6 +1504,7 @@ Respond to the user now:"""
         on_cron_health=cron.health_report,
         on_chat_message=on_chat_message,
         on_chat_abort=agent.mark_aborted,
+        on_chat_delivered=agent.goal_after_direct_delivery,
         sessions=agent.sessions,
         subagent_registry=agent._subagent_registry,
         artifact_store=artifact_store,

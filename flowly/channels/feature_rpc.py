@@ -703,7 +703,45 @@ def chat_inflight(params: dict) -> dict:
         )
     except Exception:
         result["compaction"] = None
+    # Standing goals are durable and independent from the transient stream.
+    # Returning the same snapshot as goal.get lets a reconnect restore the
+    # objective, budget and wait state in this one existing handshake.
+    try:
+        result["goal"] = goal_get({"sessionKey": session_key})["goal"]
+    except Exception:
+        result["goal"] = None
     return result
+
+
+# Host-supplied live goal lookup. The disk fallback keeps the shared relay RPC
+# useful in read-only processes, while the gateway binding guarantees the
+# active profile's already-initialized manager remains canonical.
+_goal_state_provider = None
+
+
+def set_goal_state_provider(provider) -> None:
+    global _goal_state_provider
+    _goal_state_provider = provider
+
+
+def goal_get(params: dict) -> dict:
+    """Return a conversation's durable standing-goal snapshot."""
+    session_key = str(params.get("sessionKey") or "").strip()
+    if not session_key:
+        raise FeatureRpcError("INVALID_PARAMS", "sessionKey is required")
+    if len(session_key) > 2_000:
+        raise FeatureRpcError("INVALID_PARAMS", "sessionKey is too long")
+
+    if _goal_state_provider is not None:
+        state = _goal_state_provider(session_key)
+    else:
+        from flowly.goals.store import GoalStore
+
+        state = GoalStore(get_flowly_home()).get(session_key)
+    return {
+        "sessionKey": session_key,
+        "goal": state.to_public_dict() if state is not None else None,
+    }
 
 
 # ── Compaction ──────────────────────────────────────────────────────────────
@@ -3857,6 +3895,7 @@ _DISPATCH: dict[str, tuple] = {
     "push.register": (push_register, True, False),
     "push.unregister": (push_unregister, True, False),
     "chat.inflight": (chat_inflight, True, False),
+    "goal.get": (goal_get, True, False),
     "chat.compact": (chat_compact, True, False),
     "plan.get": (plan_get, True, False),
     "plan.list": (plan_list, True, False),

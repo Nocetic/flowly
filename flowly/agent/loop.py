@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -147,6 +148,17 @@ def _is_goal_control_message(message: InboundMessage) -> bool:
     return bool(parts and parts[0].casefold() in {"/goal", "/subgoal"})
 
 
+@dataclass
+class _GoalInboundMessage(InboundMessage):
+    """Synthetic turn that preserves a relay's stable conversation key."""
+
+    _stable_session_key: str = ""
+
+    @property
+    def session_key(self) -> str:  # type: ignore[override]
+        return self._stable_session_key or super().session_key
+
+
 class _AgentGoalDelivery(GoalDelivery):
     """Route autonomous goal turns back through their originating surface."""
 
@@ -154,11 +166,13 @@ class _AgentGoalDelivery(GoalDelivery):
         self,
         agent: "AgentLoop",
         *,
+        session_key: str,
         channel: str,
         chat_id: str,
         direct: bool,
     ) -> None:
         self.agent = agent
+        self.session_key = session_key
         self.channel = channel
         self.chat_id = chat_id
         self.direct = direct
@@ -171,7 +185,7 @@ class _AgentGoalDelivery(GoalDelivery):
         user_epoch: int,
         kickoff: bool,
     ) -> DeliveredGoalTurn | None:
-        message = InboundMessage(
+        message = _GoalInboundMessage(
             channel=self.channel,
             sender_id="goal",
             chat_id=self.chat_id,
@@ -181,6 +195,7 @@ class _AgentGoalDelivery(GoalDelivery):
                 _GOAL_BASE_USER_EPOCH: user_epoch,
                 _GOAL_KICKOFF: kickoff,
             },
+            _stable_session_key=session_key,
         )
         response = await self.agent._process_message(message)
         if response is None:
@@ -197,7 +212,7 @@ class _AgentGoalDelivery(GoalDelivery):
             await self.agent._deliver_goal_outbound(outbound, direct=self.direct)
 
     async def deliver_notice(self, decision: GoalDecision) -> None:
-        state = self.agent.goal_manager.get(f"{self.channel}:{self.chat_id}")
+        state = self.agent.goal_manager.get(self.session_key)
         metadata: dict[str, Any] = {"goalStatus": True}
         if state is not None:
             metadata["goal"] = state.to_public_dict()
@@ -3242,6 +3257,7 @@ class AgentLoop:
         metadata = outbound.metadata or {}
         delivery = _AgentGoalDelivery(
             self,
+            session_key=msg.session_key,
             channel=msg.channel,
             chat_id=msg.chat_id,
             direct=direct,

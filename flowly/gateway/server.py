@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import inspect
 import json
 import mimetypes
 import uuid
@@ -107,6 +108,7 @@ ChatCallback = Callable[
     Awaitable[tuple[str, dict]],
 ]
 AbortCallback = Callable[[str], bool]
+ChatDeliveredCallback = Callable[[str, str, dict[str, Any]], Any]
 
 
 # Per-file attachment cap for the direct gateway's base64-over-WS upload path.
@@ -402,6 +404,7 @@ class GatewayServer:
         on_cron_health: Callable[[], dict] | None = None,
         on_chat_message: ChatCallback | None = None,
         on_chat_abort: AbortCallback | None = None,
+        on_chat_delivered: ChatDeliveredCallback | None = None,
         sessions: SessionManager | None = None,
         subagent_registry: SubagentRegistry | None = None,
         artifact_store: Any | None = None,
@@ -463,6 +466,7 @@ class GatewayServer:
         self.on_provider_reload = on_provider_reload
         self.on_chat_message = on_chat_message
         self.on_chat_abort = on_chat_abort
+        self.on_chat_delivered = on_chat_delivered
         self.sessions = sessions
         self.subagent_registry = subagent_registry
         self._delegate_tool: Any | None = None
@@ -2531,6 +2535,7 @@ class GatewayServer:
                         },
                     },
                 )
+                await self._notify_chat_delivered(session_key, response, metadata or {})
                 return
 
             # Send final chat event. ``usage`` rides inside ``message`` so
@@ -2568,6 +2573,9 @@ class GatewayServer:
                 "message": final_message,
                 **context_wire,
             }
+            goal_snapshot = (metadata or {}).get("goal")
+            if isinstance(goal_snapshot, dict):
+                final_data["goal"] = goal_snapshot
             # Context-window occupancy + ceiling, both already normalized for
             # the active provider by the agent loop. Sent as separate fields
             # (not inside ``usage``) because ``usage`` is the raw provider
@@ -2595,6 +2603,13 @@ class GatewayServer:
                     "data": final_data,
                 },
             )
+            if isinstance(goal_snapshot, dict):
+                await self.broadcast_goal_updated(
+                    session_key,
+                    goal_snapshot,
+                    fallback_ws=ws,
+                )
+            await self._notify_chat_delivered(session_key, response, metadata or {})
             if not final_data.get("aborted"):
                 self._schedule_offline_chat_push(
                     session_key,
@@ -3294,7 +3309,50 @@ class GatewayServer:
         if future and not future.done():
             future.set_result(result)
 
-    async def push_session_message(self, session_key: str, text: str) -> None:
+    async def _notify_chat_delivered(
+        self,
+        session_key: str,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        callback = getattr(self, "on_chat_delivered", None)
+        if callback is None:
+            return
+        try:
+            result = callback(session_key, text, metadata)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("[GatewayWS] post-delivery callback failed")
+
+    async def broadcast_goal_updated(
+        self,
+        session_key: str,
+        goal: dict[str, Any],
+        *,
+        fallback_ws: web.WebSocketResponse | None = None,
+    ) -> None:
+        """Push one conversation-scoped durable goal snapshot."""
+        payload = {
+            "type": "event",
+            "event": "goal.updated",
+            "data": {"sessionKey": session_key, "goal": goal},
+        }
+        target = self._session_ws.get(session_key) or fallback_ws
+        if target is not None and not target.closed:
+            await self._ws_send(target, payload)
+            return
+        for ws in list(self._ws_clients.values()):
+            await self._ws_send(ws, payload)
+
+    async def push_session_message(
+        self,
+        session_key: str,
+        text: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        media: list[str] | None = None,
+    ) -> None:
         """Push a proactive assistant message to connected WS clients.
 
         Local clients (TUI / desktop) have no channel adapter, so out-of-band
@@ -3303,29 +3361,54 @@ class GatewayServer:
         WhatsApp. It's sent as a normal chat ``final`` event, so the client
         renders it exactly like any assistant reply (no client change needed).
         """
-        if not text:
+        metadata = metadata or {}
+        goal_snapshot = metadata.get("goal")
+        media = list(media or [])
+        if not text and not media and not isinstance(goal_snapshot, dict):
             return
         import uuid as _uuid
 
+        final_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+        }
+        if media:
+            attachments = _reply_media_attachments(
+                media,
+                _assets_index(metadata.get(ASSETS_META_KEY)),
+            )
+            if attachments:
+                final_message["attachments"] = attachments
+        data: dict[str, Any] = {
+            "state": "final",
+            "proactive": True,
+            "runId": "proactive-" + _uuid.uuid4().hex[:8],
+            "sessionKey": session_key,
+            "message": final_message,
+        }
+        if isinstance(goal_snapshot, dict):
+            data["goal"] = goal_snapshot
+        if isinstance(metadata.get("usage"), dict) and metadata["usage"]:
+            final_message["usage"] = metadata["usage"]
+        if metadata.get("model"):
+            data["model"] = str(metadata["model"])
+        if metadata.get("aborted") is True:
+            data["aborted"] = True
+        duration_ms = metadata.get("duration_ms")
+        if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
+            data["durationMs"] = max(0, int(duration_ms))
         payload = {
             "type": "event",
             "event": "chat",
-            "data": {
-                "state": "final",
-                "proactive": True,
-                "runId": "proactive-" + _uuid.uuid4().hex[:8],
-                "sessionKey": session_key,
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": text}],
-                },
-            },
+            "data": data,
         }
         for ws in list(self._ws_clients.values()):
             try:
                 await self._ws_send(ws, payload)
             except Exception:
                 pass  # closed socket — best effort
+        if isinstance(goal_snapshot, dict):
+            await self.broadcast_goal_updated(session_key, goal_snapshot)
 
     async def broadcast_agent_state(self, state: str) -> None:
         """Push the agent's turn-level state to every registered extension.
