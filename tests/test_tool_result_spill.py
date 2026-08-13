@@ -237,16 +237,13 @@ def test_codex_projected_non_string_content_untouched():
 # ── Layer 6: late-turn messages survive mid-turn list rebinding ───────────
 #
 # Field bug (2026-06-10): _strip_old_tool_results (iteration > 5) and the
-# mid-turn microcompact guard REBIND the loop's local ``messages`` to a new
-# list. Persistence sliced the CALLER's original list, so anything appended
-# after the rebinding — a codex_session call landing on iteration 6+ and all
-# its projected pairs — was silently dropped from the session. Next turn the
-# model truthfully claimed it never ran codex. The fix returns the loop's
-# final list and persists from THAT.
+# Mid-turn context transforms can REBIND the loop's local ``messages`` to a
+# new list. Persistence therefore uses a separate append-only turn journal;
+# it cannot depend on either the caller's original list or the final working
+# list retaining a stable positional boundary.
 
 def test_strip_old_tool_results_rebinding_loses_late_appends():
-    """Documents WHY the loop must return its final list: the transform
-    copies, so late appends never reach the original."""
+    """Documents why durable turn events need an independent journal."""
     from flowly.agent.loop import _strip_old_tool_results
 
     original = [{"role": "tool", "content": f"r{i}" * 200} for i in range(5)]
@@ -257,14 +254,13 @@ def test_strip_old_tool_results_rebinding_loses_late_appends():
     assert original[-1]["role"] == "tool"  # original never saw the append
 
 
-def test_turn_persistence_uses_loop_final_list():
-    """End-to-end recipe: persisting from the loop's RETURNED list keeps
-    messages appended after a mid-turn rebinding."""
+def test_turn_persistence_uses_independent_journal():
+    """A journal retains turn events even when the prompt list is rebound."""
     from flowly.agent.loop import _strip_old_tool_results
     from flowly.session.manager import Session
 
     caller_messages = [{"role": "user", "content": "incele codex ile"}]
-    turn_start_idx = len(caller_messages)
+    turn_messages = []
 
     # Loop simulation: early exec pairs append in place…
     messages = caller_messages
@@ -276,21 +272,24 @@ def test_turn_persistence_uses_loop_final_list():
                          "name": "exec", "content": "x" * 400})
     # …iteration 6: strip rebinds, then codex lands on the NEW list.
     messages = _strip_old_tool_results(messages, keep_last=3, max_old_chars=50)
-    messages.append({"role": "assistant", "content": "", "tool_calls": [
+    assistant_message = {"role": "assistant", "content": "", "tool_calls": [
         {"id": "cx", "type": "function",
-         "function": {"name": "codex_session", "arguments": "{}"}}]})
-    messages.append({"role": "tool", "tool_call_id": "cx",
-                     "name": "codex_session", "content": '{"status": "ok"}'})
+         "function": {"name": "codex_session", "arguments": "{}"}}]}
+    tool_message = {"role": "tool", "tool_call_id": "cx",
+                    "name": "codex_session", "content": '{"status": "ok"}'}
+    messages.append(assistant_message)
+    messages.append(tool_message)
+    turn_messages.extend([assistant_message, tool_message])
 
     s = Session(key="t")
     s.extend_with_turn_messages(
         user_content="incele codex ile",
-        new_messages=messages[turn_start_idx:],  # the loop's FINAL list
+        new_messages=turn_messages,
         final_content="done",
     )
     persisted_tools = [m.get("name") for m in s.messages if m.get("role") == "tool"]
     assert "codex_session" in persisted_tools  # the regression
-    assert persisted_tools.count("exec") == 4
+    assert persisted_tools.count("exec") == 0
 
 
 # ── Layer 7: codex projected pairs are attributed via codex_ prefix ───────

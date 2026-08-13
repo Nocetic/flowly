@@ -448,9 +448,9 @@ class Session:
 
         Every code path that drives a turn through ``AgentLoop._run_llm_tool_loop``
         (main user message, system / subagent announce, cron jobs, …)
-        ends with the same persistence pattern: snapshot the messages
-        the loop appended, save the user prompt, then save each loop
-        message preserving its tool-protocol fields. Centralising that
+        ends with the same persistence pattern: collect the loop's append-only
+        turn journal, save the user prompt, then save each journal entry
+        preserving its tool-protocol fields. Centralising that
         here means the four-step recipe only has to be right once;
         future call sites get the correct ChatGPT-style full-structure
         persistence for free.
@@ -463,9 +463,9 @@ class Session:
             ``[System: announcer]`` markers in the system-message
             path).
         new_messages:
-            The slice of the loop's ``messages`` list that was added
-            during this turn — typically ``messages[turn_start_idx:]``
-            where ``turn_start_idx`` was captured before the loop ran.
+            The append-only journal of durable messages produced during this
+            turn. It must be independent of the provider-facing working list,
+            which recovery or compaction may replace, reorder, or shrink.
             Each entry's ``tool_calls``, ``tool_call_id``, and
             ``name`` fields are carried through so cross-turn tool
             reasoning works.

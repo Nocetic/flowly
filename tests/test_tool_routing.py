@@ -705,6 +705,91 @@ async def test_main_loop_executes_deferred_mcp_tool_through_bridge(
 
 
 @pytest.mark.asyncio
+async def test_turn_journal_survives_working_context_shrink(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Overflow recovery may make the final list shorter than its input.
+
+    Durable assistant/tool events must come from the append-only turn journal,
+    never from a positional slice of that mutable working list.
+    """
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+
+    class Provider(LLMProvider):
+        def __init__(self) -> None:
+            super().__init__(api_key="test")
+            self.index = 0
+
+        def get_default_model(self) -> str:
+            return "test/model"
+
+        async def chat(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            self.index += 1
+            if self.index == 1:
+                return LLMResponse(
+                    content=None,
+                    tool_calls=[ToolCallRequest(
+                        id="search-1",
+                        name="tool_search",
+                        arguments={"query": "context integrity"},
+                    )],
+                )
+            if self.index == 2:
+                return LLMResponse(
+                    content="Error calling LLM: maximum context length exceeded"
+                )
+            return LLMResponse(content="done")
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=Provider(),
+        workspace=tmp_path,
+        main_config=Config(),
+        max_iterations=4,
+        soft_warn_at_iteration=0,
+    )
+    input_messages = [{"role": "system", "content": "test"}]
+    input_messages.extend(
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"old-{index}"}
+        for index in range(30)
+    )
+    turn_messages: list[dict[str, Any]] = []
+
+    final, _results, _executed, _usage, working_messages = await loop._run_llm_tool_loop(
+        messages=input_messages,
+        action_turn=False,
+        turn_content="search context integrity",
+        session_key="web:test",
+        tool_platform="web",
+        turn_messages_out=turn_messages,
+    )
+
+    assert final == "done"
+    assert len(working_messages) < len(input_messages)
+    assert [message.get("role") for message in turn_messages] == ["assistant", "tool"]
+    assert turn_messages[0]["tool_calls"][0]["id"] == "search-1"
+    assert turn_messages[1]["tool_call_id"] == "search-1"
+
+    # A later prompt-only mutation cannot corrupt the durable delta.
+    working_tool = next(message for message in working_messages if message.get("role") == "tool")
+    working_tool["content"] = "mutated prompt projection"
+    assert turn_messages[1]["content"] != "mutated prompt projection"
+
+    from flowly.session.manager import Session
+
+    session = Session(key="web:test")
+    session.extend_with_turn_messages(
+        user_content="search context integrity",
+        new_messages=turn_messages,
+        final_content=final,
+    )
+    persisted = session.get_history()
+    assert any(message.get("tool_calls") for message in persisted)
+    assert any(message.get("tool_call_id") == "search-1" for message in persisted)
+
+
+@pytest.mark.asyncio
 async def test_main_loop_promotes_matching_mcp_tool_before_first_llm_call(
     tmp_path,
     monkeypatch,

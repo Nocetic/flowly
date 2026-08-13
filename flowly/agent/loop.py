@@ -4356,6 +4356,7 @@ class AgentLoop:
         reply_media: list[str] | None = None,
         reply_media_assets: list | None = None,
         error_out: dict[str, Any] | None = None,
+        turn_messages_out: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[dict[str, Any]], list[str], dict[str, Any], list[dict[str, Any]]]:
         """
         Run iterative LLM + tool execution loop until final response.
@@ -4364,16 +4365,13 @@ class AgentLoop:
             (final_content, accumulated_tool_results, executed_tool_names,
              total_usage, messages)
 
-        The returned ``messages`` is the loop's FINAL working list — callers
-        must slice THIS list (not the one they passed in) when persisting the
-        turn. Mid-turn transforms (``_strip_old_tool_results`` after
-        iteration 5, the microcompact guard) REBIND the local ``messages`` to
-        a new list; everything appended afterwards (e.g. a codex_session
-        result landing on iteration 6+) only exists on the rebound list.
-        Slicing the caller's original list silently dropped those messages
-        from the session — the next turn's model had no record that the tool
-        ever ran. All transforms preserve message count and order, so
-        ``turn_start_idx`` computed against the input list stays valid.
+        ``turn_messages_out`` is an append-only journal of the durable
+        assistant/tool protocol messages produced by this turn. Callers must
+        persist this journal instead of slicing the final working list: context
+        recovery and compaction may replace, reorder, or shrink that list.
+        Journal entries are deep copies so later prompt-only transforms cannot
+        mutate the durable turn delta. Ephemeral model nudges are intentionally
+        excluded.
         """
         iteration = 0
         from flowly.agent.tools.discovery import annotate_search_repetition
@@ -4384,6 +4382,41 @@ class AgentLoop:
         # on ``self``). Default to a local list when not threaded.
         if reply_media is None:
             reply_media = []
+
+        def _record_turn_message(message: dict[str, Any]) -> None:
+            if turn_messages_out is not None:
+                turn_messages_out.append(copy.deepcopy(message))
+
+        def _add_assistant_turn_message(
+            working_messages: list[dict[str, Any]],
+            content: Any,
+            tool_calls: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            updated = self.context.add_assistant_message(
+                working_messages, content, tool_calls
+            )
+            _record_turn_message(updated[-1])
+            return updated
+
+        def _add_tool_turn_message(
+            working_messages: list[dict[str, Any]],
+            tool_call_id: str,
+            tool_name: str,
+            content: Any,
+        ) -> list[dict[str, Any]]:
+            updated = self.context.add_tool_result(
+                working_messages, tool_call_id, tool_name, content
+            )
+            _record_turn_message(updated[-1])
+            return updated
+
+        def _append_turn_message(
+            working_messages: list[dict[str, Any]],
+            message: dict[str, Any],
+        ) -> None:
+            working_messages.append(message)
+            _record_turn_message(message)
+
         final_content: str | None = None
         accumulated_tool_results: list[dict[str, Any]] = []
         executed_tool_names: list[str] = []
@@ -4982,7 +5015,7 @@ class AgentLoop:
                     if not any(phrase in content_lower for phrase in hallucination_phrases):
                         assistant_content = response.content
 
-                messages = self.context.add_assistant_message(
+                messages = _add_assistant_turn_message(
                     messages, assistant_content, tool_call_dicts
                 )
 
@@ -5038,7 +5071,7 @@ class AgentLoop:
                             "policy": "no_tools",
                             "result": result,
                         })
-                        messages = self.context.add_tool_result(
+                        messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
                         await self._emit_iteration_event(
@@ -5081,7 +5114,7 @@ class AgentLoop:
                             "success": True,
                             "result": result,
                         })
-                        messages = self.context.add_tool_result(
+                        messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
                         await self._emit_iteration_event(
@@ -5103,7 +5136,7 @@ class AgentLoop:
                             "success": _ok,
                             "result": result,
                         })
-                        messages = self.context.add_tool_result(
+                        messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
                         await self._emit_iteration_event(
@@ -5129,7 +5162,7 @@ class AgentLoop:
                                 "success": False,
                                 "result": _resolved,
                             })
-                            messages = self.context.add_tool_result(
+                            messages = _add_tool_turn_message(
                                 messages, tool_call.id, _protocol_tool_name, _resolved
                             )
                             await self._emit_iteration_event(
@@ -5179,7 +5212,7 @@ class AgentLoop:
                             "success": False,
                             "result": result,
                         })
-                        messages = self.context.add_tool_result(
+                        messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
                         await self._emit_iteration_event(
@@ -5210,7 +5243,7 @@ class AgentLoop:
                             "success": False,
                             "result": result,
                         })
-                        messages = self.context.add_tool_result(
+                        messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
                         await self._emit_iteration_event(
@@ -5254,7 +5287,7 @@ class AgentLoop:
                                     "success": False,
                                     "result": result,
                                 })
-                                messages = self.context.add_tool_result(
+                                messages = _add_tool_turn_message(
                                     messages, tool_call.id, _protocol_tool_name, result
                                 )
                                 await self._emit_iteration_event(
@@ -5311,7 +5344,7 @@ class AgentLoop:
                             "success": False,
                             "result": result,
                         })
-                        messages = self.context.add_tool_result(
+                        messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
                         await self._emit_iteration_event(
@@ -5543,7 +5576,7 @@ class AgentLoop:
                     else:
                         tool_content = sanitized_result
 
-                    messages = self.context.add_tool_result(
+                    messages = _add_tool_turn_message(
                         messages, tool_call.id, _protocol_tool_name, tool_content
                     )
                     # Live tool-result event for the UI panel — same
@@ -5572,7 +5605,7 @@ class AgentLoop:
                     if _effective_tool_name == "codex_session":
                         codex_pairs = self._drain_codex_projected_pairs()
                         for _cm in codex_pairs:
-                            messages.append(_cm)
+                            _append_turn_message(messages, _cm)
                         if codex_pairs:
                             for _cm in codex_pairs:
                                 await self._emit_iteration_event(
@@ -7034,14 +7067,10 @@ class AgentLoop:
                 "(nothing to enforce)."
             )
 
-        # Mark the boundary between prior history and this turn's
-        # additions. ``_run_llm_tool_loop`` mutates ``messages`` in
-        # place — appending every assistant_with_tool_calls and
-        # tool_result the LLM produces. Snapshotting the length now
-        # lets us persist exactly those new entries (and only those)
-        # to the session after the loop returns. Prior history is
-        # already in session.messages; we don't want to double-save.
-        turn_start_idx = len(messages)
+        # Append-only durable delta for this turn. The provider-facing working
+        # list can be rebound or shrunk by recovery/compaction without changing
+        # what is committed to the session archive.
+        turn_messages: list[dict[str, Any]] = []
 
         # Files a tool produces for this reply (image_generate, screenshot) land
         # here and ride the OutboundMessage below — no separate ``message`` send.
@@ -7050,7 +7079,7 @@ class AgentLoop:
         # them (video duration/dimensions/poster). Same per-turn lifetime.
         reply_media_assets: list = []
         provider_error: dict[str, Any] = {}
-        final_content, tool_results, _executed_tools, usage, loop_messages = await self._run_llm_tool_loop(
+        final_content, tool_results, _executed_tools, usage, _loop_messages = await self._run_llm_tool_loop(
             messages=messages,
             action_turn=action_turn,
             live_call_turn=live_call_turn,
@@ -7068,6 +7097,7 @@ class AgentLoop:
             reply_media=reply_media,
             reply_media_assets=reply_media_assets,
             error_out=provider_error,
+            turn_messages_out=turn_messages,
         )
         outbound_run_id = msg.metadata.get("run_id") or ""
         turn_aborted = bool(
@@ -7103,12 +7133,9 @@ class AgentLoop:
         # turn's LLM sees its prior tool calls + results, not just
         # the final summary text. See ``Session.extend_with_turn_messages``
         # for the full recipe (user + each loop message + capstone).
-        # Slice the RETURNED list, not the input one: mid-turn transforms
-        # rebind the loop's local list, so late appends (codex_session on
-        # iteration 6+) never reach the input list.
         session.extend_with_turn_messages(
             user_content=display_content,
-            new_messages=_drop_ephemeral_nudges(loop_messages[turn_start_idx:]),
+            new_messages=turn_messages,
             final_content=final_content,
             usage=usage,
             media=msg.media or None,
@@ -7177,7 +7204,7 @@ class AgentLoop:
         # relay sees no ``toolMessages`` and uses its old path.
         # Backward compat is preserved on every layer.
         tool_messages_for_ui: list[dict[str, Any]] = []
-        for m in loop_messages[turn_start_idx:]:
+        for m in turn_messages:
             if m.get("tool_calls") or m.get("role") == "tool":
                 # Project to JSON-safe shape: content can be a list
                 # of multimodal blocks; serialise via json.dumps once
@@ -7376,15 +7403,12 @@ class AgentLoop:
         # non-enforced message turn rather than an action request.
         action_turn = False
         live_call_turn = self._is_live_call_turn(msg.content)
-        # Snapshot the loop-input boundary — same rationale as the
-        # main path. Everything appended past this index is what the
-        # turn produced and what we need to persist.
-        turn_start_idx = len(messages)
+        turn_messages: list[dict[str, Any]] = []
         reply_media: list[str] = []
         # Descriptors for the files above, when the producing tool measured
         # them (video duration/dimensions/poster). Same per-turn lifetime.
         reply_media_assets: list = []
-        final_content, tool_results, _executed_tools, system_usage, loop_messages = await self._run_llm_tool_loop(
+        final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
             messages=messages,
             action_turn=action_turn,
             live_call_turn=live_call_turn,
@@ -7396,6 +7420,7 @@ class AgentLoop:
             outbound_run_id=msg.metadata.get("run_id") or "",
             reply_media=reply_media,
             reply_media_assets=reply_media_assets,
+            turn_messages_out=turn_messages,
         )
 
         # No pending-action-lock bookkeeping here: a system/announce turn is a
@@ -7408,7 +7433,7 @@ class AgentLoop:
         # visible to the parent agent on the next turn.
         session.extend_with_turn_messages(
             user_content=f"[System: {msg.sender_id}] {msg.content}",
-            new_messages=_drop_ephemeral_nudges(loop_messages[turn_start_idx:]),
+            new_messages=turn_messages,
             final_content=final_content,
             usage=system_usage,
             reply_media=reply_media or None,
