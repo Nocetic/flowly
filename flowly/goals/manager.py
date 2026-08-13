@@ -37,6 +37,10 @@ MAX_COMPACTION_FAILURES = 2
 GOAL_CONTINUATION_MARKER = "[Continuing toward the explicitly set standing goal]"
 
 
+class _ContractSupersededError(RuntimeError):
+    """The goal changed while its contract was being drafted."""
+
+
 class GoalManager:
     def __init__(
         self,
@@ -181,6 +185,40 @@ class GoalManager:
             "discarding the standing goal."
         )
         return "\n\n".join(parts)
+
+    def attach_contract(
+        self,
+        session_key: str,
+        goal_id: str,
+        contract: GoalContract,
+    ) -> GoalState | None:
+        """Fill in a completion contract that was drafted after the goal began.
+
+        Settling a plain objective costs an auxiliary model call, and making
+        the user wait for it before the first turn is what kept ``/goal`` from
+        behaving like an ordinary message. Drafting therefore runs alongside
+        that turn and lands here — but only while the SAME goal generation is
+        still live, and only when nothing has since supplied a contract of its
+        own. A goal cleared, replaced or hand-written in the meantime wins.
+        """
+        if contract is None or contract.is_empty:
+            return None
+
+        def mutate(state: GoalState | None) -> GoalState:
+            state = _require_live_goal(state)
+            if state.goal_id != goal_id:
+                raise _ContractSupersededError()
+            if not state.contract.is_empty:
+                raise _ContractSupersededError()
+            state.contract = contract
+            return state
+
+        try:
+            return self.store.update(session_key, mutate)
+        except (_ContractSupersededError, RuntimeError, ValueError):
+            # Superseded or no live goal: the drafted contract is stale and
+            # must never resurrect a goal the user moved on from.
+            return None
 
     def add_subgoal(self, session_key: str, criterion: str) -> GoalState:
         def mutate(state: GoalState | None) -> GoalState:

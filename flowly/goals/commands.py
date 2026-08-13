@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
+
+from loguru import logger
 
 from flowly.goals.manager import GoalManager
 from flowly.goals.models import GoalContract, GoalState, GoalStatus, parse_contract
@@ -16,6 +19,10 @@ class GoalCommandResult:
     state: GoalState | None = None
     kickoff_goal_id: str | None = None
     wake_after_delivery: bool = False
+    #: Setting a goal does not reply — it starts working. When present, the
+    #: caller runs THIS turn with this prompt instead of returning ``content``,
+    #: so ``/goal <text>`` streams exactly like sending ``<text>`` would.
+    start_turn: str | None = None
 
     def metadata(self, *, user_epoch: int) -> dict[str, Any]:
         metadata: dict[str, Any] = {"_goal_user_epoch": user_epoch}
@@ -41,6 +48,10 @@ class GoalCommandHandler:
         self.runtime = runtime
         self.gate_timeout_seconds = max(1, min(3_600, int(gate_timeout_seconds)))
         self.gate_max_retries = max(0, min(100, int(gate_max_retries)))
+        # Strong refs to in-flight settling tasks; the event loop only holds
+        # weak ones, so without this a contract draft can be garbage collected
+        # mid-flight.
+        self._settling: set[asyncio.Task[None]] = set()
 
     async def goal(
         self,
@@ -111,16 +122,16 @@ class GoalCommandHandler:
             except Exception:
                 contract = GoalContract()
             goal_text = objective
+            settle_in_background = False
         else:
             goal_text, contract = _split_goal_contract(arguments)
-            # A plain objective is settled into a concrete completion contract
-            # before the autonomous loop starts. Explicit inline fields remain
-            # authoritative and avoid an unnecessary auxiliary model call.
-            if contract.is_empty:
-                try:
-                    contract = await self.manager.judge.draft_contract(goal_text)
-                except Exception:
-                    contract = GoalContract()
+            # A plain objective is still settled into a concrete completion
+            # contract — but NEVER before the first turn. Drafting is an
+            # auxiliary model call, and awaiting it here is what made
+            # ``/goal <text>`` sit silent for seconds instead of answering
+            # like any other message. Explicit inline fields stay
+            # authoritative and skip the call entirely.
+            settle_in_background = contract.is_empty
 
         self.runtime.cancel_session(session_key)
         try:
@@ -133,17 +144,46 @@ class GoalCommandHandler:
         except ValueError as exc:
             return GoalCommandResult(f"Invalid goal: {exc}")
 
-        lines = [f"⊙ Goal settled ({state.max_turns}-turn budget): {state.goal}"]
+        if settle_in_background:
+            self._settle_in_background(session_key, state.goal_id, state.goal)
+
+        lines = [f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}"]
         if not state.contract.is_empty:
             label = "Drafted completion contract" if drafted else "Completion contract"
             lines.extend((f"{label}:", state.contract.render()))
         elif drafted:
             lines.append("Couldn't draft a completion contract; running as a free-form goal.")
+        # ``content`` is what surfaces WITHOUT a goal chip (plain chat
+        # channels) show; chip surfaces render the snapshot instead. Either
+        # way the goal's first turn is this turn — see ``start_turn``.
         return GoalCommandResult(
             "\n".join(lines),
             state,
-            kickoff_goal_id=state.goal_id,
+            start_turn=state.goal,
         )
+
+    def _settle_in_background(self, session_key: str, goal_id: str, objective: str) -> None:
+        """Draft the completion contract alongside the goal's first turn.
+
+        Fire-and-forget by design: the contract is only consulted from the
+        first judge onwards, which is a whole turn away, and a drafter that
+        is slow or unavailable must never delay or block the work itself.
+        """
+
+        async def settle() -> None:
+            try:
+                contract = await self.manager.judge.draft_contract(objective)
+            except Exception as exc:  # noqa: BLE001 — optional refinement
+                logger.debug("[goal] contract drafting skipped: {}", exc)
+                return
+            try:
+                self.manager.attach_contract(session_key, goal_id, contract)
+            except Exception:  # noqa: BLE001 — never surfaces to the turn
+                logger.debug("[goal] contract attach skipped", exc_info=True)
+
+        task = asyncio.create_task(settle(), name=f"goal-settle:{session_key}")
+        self._settling.add(task)
+        task.add_done_callback(self._settling.discard)
 
     def subgoal(self, session_key: str, arguments: str) -> GoalCommandResult:
         arguments = str(arguments or "").strip()

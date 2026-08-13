@@ -1324,6 +1324,7 @@ Respond to the user now:"""
         voice_mode: bool = False,
         iteration_callback=None,
         render_capabilities: tuple[str, ...] = (),
+        extra_metadata: dict | None = None,
     ) -> tuple[str, dict]:
         # Return ``(text, metadata)`` so the gateway can forward usage
         # tokens (prompt/completion/cache) to the TUI's context-window
@@ -1341,6 +1342,7 @@ Respond to the user now:"""
             on_iteration=iteration_callback,
             run_id=run_id,
             defer_goal_delivery=True,
+            extra_metadata=extra_metadata,
         )
         return text, (metadata or {})
 
@@ -1535,6 +1537,16 @@ Respond to the user now:"""
 
     # Wire browser_tab tool to gateway server
     agent.set_gateway_server(gateway_server)
+
+    # A standing goal's turns re-enter through each surface's OWN chat entry,
+    # so an autonomous turn is indistinguishable from a typed one: the direct
+    # gateway reuses its chat runner, the relay reuses chat.send's machinery.
+    # Anything unregistered falls back to the bus, which every channel adapter
+    # already serves.
+    agent.register_goal_turn_submitter("direct", gateway_server.run_autonomous_turn)
+    _web_channel = channels.get_channel("web")
+    if _web_channel is not None and hasattr(_web_channel, "run_autonomous_turn"):
+        agent.register_goal_turn_submitter("web", _web_channel.run_autonomous_turn)
 
     # Mirror relay/web chat liveness to local desktop gateway clients. This
     # lets the desktop UI react when another client (iOS/web) talks to this

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from unittest.mock import AsyncMock
@@ -144,30 +145,51 @@ async def test_proactive_goal_provider_failure_uses_native_error_contract() -> N
 
 
 @pytest.mark.asyncio
-async def test_direct_goal_run_stream_iteration_and_final_share_one_identity() -> None:
-    server = GatewayServer(host="127.0.0.1", port=0, on_chat_message=AsyncMock())
+async def test_direct_autonomous_turn_reuses_the_client_chat_runner() -> None:
+    """An agent-authored turn must run through _run_chat, not a second path."""
+    seen: dict[str, Any] = {}
+
+    async def on_chat_message(session_key, message, run_id, stream_cb, *args):
+        seen["session_key"] = session_key
+        seen["run_id"] = run_id
+        seen["extra"] = args[-1]
+        # The agent announces the resolved prompt from inside its guards.
+        await args[-1]["on_user_message"]("keep going")
+        await stream_cb("wor")
+        await stream_cb("king")
+        return "done", {}
+
+    server = GatewayServer(host="127.0.0.1", port=0, on_chat_message=on_chat_message)
     ws = _FakeWS()
     server._session_ws["desktop:chat"] = ws
 
-    await server.push_session_stream("desktop:chat", "goal-run-1", "working")
-    await server.push_session_iteration(
-        "desktop:chat",
-        "goal-run-1",
-        {"iterationIdx": 0, "role": "assistant", "content": "working"},
-    )
-    await server.push_session_message(
-        "desktop:chat",
-        "done",
-        metadata={"stream_run_id": "goal-run-1", "goal_run": True},
+    await server.run_autonomous_turn(
+        "desktop:chat", {"_goal_continuation_goal_id": "g1", "goal_run": True},
     )
 
-    assert [event["data"]["state"] for event in ws.sent] == [
-        "streaming",
-        "iteration_step",
-        "final",
-    ]
-    assert {event["data"]["runId"] for event in ws.sent} == {"goal-run-1"}
-    assert all(event["data"]["goalRun"] is True for event in ws.sent)
+    # One run identity for the user row, the deltas and the terminal.
+    assert not seen["run_id"].startswith("goal-"), "autonomous runs use normal ids"
+    assert seen["extra"]["_goal_continuation_goal_id"] == "g1"
+    kinds = [(e.get("event"), e["data"].get("state") or e["data"].get("stream")) for e in ws.sent]
+    assert ("chat", "user") in kinds, "the agent-authored prompt is announced"
+    assert ("agent", "assistant") in kinds, "deltas stream on the normal path"
+    assert ("chat", "final") in kinds, "the turn settles with a normal final"
+    run_ids = {
+        e["data"].get("runId")
+        for e in ws.sent
+        if e["data"].get("runId")
+    }
+    assert run_ids == {seen["run_id"]}
+
+
+@pytest.mark.asyncio
+async def test_direct_autonomous_turn_without_a_bound_socket_is_a_no_op() -> None:
+    called = AsyncMock()
+    server = GatewayServer(host="127.0.0.1", port=0, on_chat_message=called)
+
+    await server.run_autonomous_turn("desktop:gone", {"goal_run": True})
+
+    called.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -197,28 +219,25 @@ async def test_relay_final_is_followed_by_conversation_scoped_goal_event() -> No
 
 
 @pytest.mark.asyncio
-async def test_relay_goal_stream_uses_existing_chat_event_contract() -> None:
+async def test_relay_autonomous_turn_streams_through_the_shared_callback() -> None:
+    """The relay's goal turn uses chat.send's own streaming implementation."""
     channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
     payloads: list[dict[str, Any]] = []
+    local: list[tuple[str, dict[str, Any]]] = []
 
     async def capture(payload: str) -> None:
         payloads.append(json.loads(payload))
 
+    async def capture_local(name: str, data: dict[str, Any]) -> None:
+        local.append((name, data))
+
     channel._send_or_queue = capture  # type: ignore[method-assign]
+    channel._emit_local_event = capture_local  # type: ignore[method-assign]
     channel._session_key_to_relay_id["web:stable-chat"] = "relay-1"
 
-    await channel.send(OutboundMessage(
-        channel="web",
-        chat_id="relay-1",
-        content="",
-        metadata={
-            "stream_event": {
-                "runId": "goal-run-1",
-                "delta": "working",
-                "goalRun": True,
-            }
-        },
-    ))
+    callback = channel._make_stream_callback("relay-1", "web:stable-chat", "run-1")
+    await callback("working")
+    await asyncio.sleep(0)
 
     assert payloads == [{
         "type": "event",
@@ -226,10 +245,43 @@ async def test_relay_goal_stream_uses_existing_chat_event_contract() -> None:
         "event": "chat",
         "data": {
             "state": "streaming",
-            "runId": "goal-run-1",
+            "runId": "run-1",
             "sessionKey": "web:stable-chat",
-            "source": "relay",
             "delta": "working",
-            "goalRun": True,
         },
     }]
+    # The embedded desktop bot listens on the local ``agent`` event; a goal
+    # turn that skipped it showed no live text at all.
+    assert [name for name, _ in local] == ["chat", "agent"]
+
+
+@pytest.mark.asyncio
+async def test_relay_autonomous_turn_announces_the_agent_authored_prompt() -> None:
+    channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
+    payloads: list[dict[str, Any]] = []
+    published: list[Any] = []
+
+    async def capture(payload: str) -> None:
+        payloads.append(json.loads(payload))
+
+    channel._send_or_queue = capture  # type: ignore[method-assign]
+    channel._emit_local_event = AsyncMock()  # type: ignore[method-assign]
+    channel.bus.publish_inbound = lambda msg: published.append(msg)  # type: ignore[assignment]
+    channel._session_key_to_relay_id["web:stable-chat"] = "relay-1"
+
+    await channel.run_autonomous_turn(
+        "web:stable-chat", {"_goal_continuation_goal_id": "g1", "goal_run": True},
+    )
+    await asyncio.sleep(0)
+
+    # The turn is published as an ordinary inbound with the goal markers…
+    assert len(published) == 1
+    inbound = published[0]
+    assert inbound.session_key == "web:stable-chat"
+    assert inbound.metadata["_goal_continuation_goal_id"] == "g1"
+    # …and the announce hook publishes the user row when the agent resolves it.
+    await inbound.metadata["on_user_message"]("keep going")
+    user_events = [p for p in payloads if p["data"].get("state") == "user"]
+    assert len(user_events) == 1
+    assert user_events[0]["data"]["message"]["content"][0]["text"] == "keep going"
+    assert user_events[0]["data"]["sessionKey"] == "web:stable-chat"

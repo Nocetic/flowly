@@ -49,11 +49,16 @@ def _bare_loop() -> AgentLoop:
 
 
 @pytest.mark.asyncio
-async def test_goal_continuation_preserves_relay_stable_session_key() -> None:
+async def test_goal_continuation_uses_the_surfaces_own_turn_entry() -> None:
+    """A registered surface runs the turn; the delivery never runs its own."""
     loop = object.__new__(AgentLoop)
-    response = OutboundMessage(channel="web", chat_id="relay-1", content="ok")
-    loop._process_message = AsyncMock(return_value=response)
-    loop._goal_turn_from_outbound = Mock(return_value="turn")
+    loop._process_message = AsyncMock()
+    submitted: list[tuple[str, dict]] = []
+
+    async def submitter(session_key: str, metadata: dict) -> None:
+        submitted.append((session_key, metadata))
+
+    loop.register_goal_turn_submitter("web", submitter)
     delivery = _AgentGoalDelivery(
         loop,
         session_key="web:stable-chat",
@@ -69,93 +74,87 @@ async def test_goal_continuation_preserves_relay_stable_session_key() -> None:
         kickoff=False,
     )
 
-    submitted = loop._process_message.await_args.args[0]
-    assert submitted.session_key == "web:stable-chat"
-    assert submitted.chat_id == "relay-1"
-    assert submitted.metadata["goal_run"] is True
-    assert submitted.metadata["run_id"].startswith("goal-")
-    assert result == "turn"
-    loop._goal_turn_from_outbound.assert_called_once_with(
-        "web:stable-chat",
-        response,
-        user_epoch=3,
-    )
-    inflight.finish("web:stable-chat", submitted.metadata["run_id"])
+    # Nothing is executed here: the surface's normal runner owns the turn and
+    # the judge picks it up through the ordinary delivered-turn hook.
+    assert result is None
+    loop._process_message.assert_not_awaited()
+    assert len(submitted) == 1
+    session_key, metadata = submitted[0]
+    assert session_key == "web:stable-chat"
+    assert {k: v for k, v in metadata.items() if k != "on_run_started"} == {
+        "_goal_continuation_goal_id": "goal-1",
+        "_goal_base_user_epoch": 3,
+        "_goal_kickoff": False,
+        "goal_run": True,
+    }
+    # The surface reports its run id back so a goal control can stop it.
+    assert callable(metadata["on_run_started"])
 
 
 @pytest.mark.asyncio
-async def test_goal_continuation_streams_and_restores_as_one_relay_chat_run() -> None:
+async def test_goal_continuation_falls_back_to_the_bus_for_plain_channels() -> None:
+    """Unregistered surfaces still get an ordinary inbound user turn."""
     loop = object.__new__(AgentLoop)
     loop.bus = Mock()
-    loop.bus.publish_outbound = AsyncMock()
-    loop._deliver_goal_outbound = AsyncMock()
+    loop.bus.publish_inbound = AsyncMock()
+    delivery = _AgentGoalDelivery(
+        loop,
+        session_key="web:stable-chat",
+        channel="telegram",
+        chat_id="42",
+        direct=False,
+    )
 
-    async def process(message: InboundMessage) -> OutboundMessage:
-        await message.metadata["stream_callback"]("working")
-        await message.metadata["on_iteration"]({
-            "iterationIdx": 0,
-            "role": "assistant",
-            "content": "working",
-            "tool_calls": [{"id": "call-1"}],
-        })
-        return OutboundMessage(
-            channel="web",
-            chat_id="relay-1",
-            content="done",
-            metadata={
-                "stream_run_id": message.metadata["run_id"],
-                "goal_run": True,
-            },
-        )
+    result = await delivery.run_continuation(
+        session_key="web:stable-chat",
+        goal_id="goal-1",
+        user_epoch=3,
+        kickoff=True,
+    )
 
-    loop._process_message = AsyncMock(side_effect=process)
+    assert result is None
+    published = loop.bus.publish_inbound.await_args.args[0]
+    # The stable relay session key survives the channel/chat_id split.
+    assert published.session_key == "web:stable-chat"
+    assert published.chat_id == "42"
+    assert published.metadata["_goal_kickoff"] is True
+    assert published.metadata["goal_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_direct_surface_prefers_the_gateway_runner() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.bus = Mock()
+    loop.bus.publish_inbound = AsyncMock()
+    direct_calls: list[str] = []
+    web_calls: list[str] = []
+
+    async def direct(session_key: str, metadata: dict) -> None:
+        direct_calls.append(session_key)
+
+    async def web(session_key: str, metadata: dict) -> None:
+        web_calls.append(session_key)
+
+    loop.register_goal_turn_submitter("direct", direct)
+    loop.register_goal_turn_submitter("web", web)
     delivery = _AgentGoalDelivery(
         loop,
         session_key="web:stable-chat",
         channel="web",
         chat_id="relay-1",
-        direct=False,
+        direct=True,
     )
 
-    turn = await delivery.run_continuation(
+    await delivery.run_continuation(
         session_key="web:stable-chat",
         goal_id="goal-1",
-        user_epoch=3,
+        user_epoch=0,
         kickoff=False,
     )
 
-    assert turn is not None
-    streamed, iterated = [call.args[0] for call in loop.bus.publish_outbound.await_args_list]
-    run_id = streamed.metadata["stream_event"]["runId"]
-    assert run_id.startswith("goal-")
-    assert streamed.metadata["stream_event"] == {
-        "state": "streaming",
-        "runId": run_id,
-        "delta": "working",
-        "goalRun": True,
-    }
-    assert iterated.metadata["iteration_event"]["runId"] == run_id
-    assert iterated.metadata["iteration_event"]["goalRun"] is True
-    assert inflight.get("web:stable-chat") == {
-        "runId": run_id,
-        "text": "",
-        "user": "",
-        "iterations": [{
-            "iterationIdx": 0,
-            "role": "assistant",
-            "content": "working",
-            "tool_calls": [{"id": "call-1"}],
-            "runId": run_id,
-            "goalRun": True,
-            "state": "iteration_step",
-        }],
-    }
-
-    await delivery.deliver_turn(turn)
-
-    delivered = loop._deliver_goal_outbound.await_args.args[0]
-    assert delivered.metadata["stream_run_id"] == run_id
-    assert inflight.get("web:stable-chat") is None
+    assert direct_calls == ["web:stable-chat"]
+    assert web_calls == []
+    loop.bus.publish_inbound.assert_not_awaited()
 
 
 @pytest.mark.asyncio

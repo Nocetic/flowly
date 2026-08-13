@@ -444,33 +444,6 @@ class WebChannel(BaseChannel):
                 )
             return
 
-        # Autonomous goal delta.  It travels over the existing relay `chat`
-        # event contract, so no relay protocol/version change is required.
-        stream_event = msg.metadata.get("stream_event")
-        if isinstance(stream_event, dict) and stream_event:
-            session_key = self._session_key_for_relay_id(session_id)
-            stream_data = {
-                "state": "streaming",
-                "runId": stream_event.get("runId") or "",
-                "sessionKey": session_key,
-                "source": "relay",
-                "delta": stream_event.get("delta") or "",
-                **(
-                    {"goalRun": True}
-                    if stream_event.get("goalRun") is True
-                    else {}
-                ),
-            }
-            event_msg = {
-                "type": "event",
-                "sessionId": session_id,
-                "event": "chat",
-                "data": stream_data,
-            }
-            await self._send_or_queue(json.dumps(event_msg))
-            asyncio.create_task(self._emit_local_event("chat", stream_data))
-            return
-
         # Live per-iteration tool-turn event from the loop. The loop
         # emits one of these after every assistant_with_tool_calls or
         # tool_result it adds to the in-flight turn; we forward it
@@ -1314,53 +1287,13 @@ class WebChannel(BaseChannel):
 
             inflight.begin(session_key, run_id, message_text)
 
-            # Build streaming callback — sends delta events to this browser session.
-            # Captures ws and session_id at call time (safe even if self._ws reconnects).
-            async def stream_callback(delta: str) -> None:
-                inflight.append(session_key, run_id, delta)
-                local_stream_data = {
-                    "state": "streaming",
-                    "runId": run_id,
-                    "sessionKey": session_key,
-                    "source": "relay",
-                    "delta": delta,
-                }
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "event",
-                            "sessionId": session_id,
-                            "event": "chat",
-                            # sessionKey is how the relay routes this to the
-                            # CONVERSATION rather than to the socket the turn
-                            # started on. Without it the relay falls back to
-                            # the originating session id — and a client that
-                            # reconnected mid-turn (a long compaction is
-                            # enough) never receives the rest of its own
-                            # reply. It shows up only on re-entry, restored
-                            # from chat.inflight.
-                            "data": {
-                                "state": "streaming",
-                                "runId": run_id,
-                                "sessionKey": session_key,
-                                "delta": delta,
-                            },
-                        }
-                    )
-                )
-                asyncio.create_task(self._emit_local_event("chat", local_stream_data))
-                asyncio.create_task(
-                    self._emit_local_event(
-                        "agent",
-                        {
-                            "stream": "assistant",
-                            "runId": run_id,
-                            "sessionKey": session_key,
-                            "source": "relay",
-                            "data": {"text": delta},
-                        },
-                    )
-                )
+            # ONE streaming implementation, shared with autonomous goal turns
+            # (see ``_make_stream_callback``). Two copies drifted before: the
+            # goal path forgot the local ``agent`` event and the embedded
+            # desktop bot showed no live text for goal turns at all.
+            stream_callback = self._make_stream_callback(
+                session_id, session_key, run_id,
+            )
 
             # Process message asynchronously (don't block the recv loop).
             # Tracking the Task by run_id is what makes chat.abort
@@ -1612,6 +1545,106 @@ class WebChannel(BaseChannel):
 
         asyncio.create_task(_run())
 
+    def _make_stream_callback(self, session_id: str, session_key: str, run_id: str):
+        """The per-delta fan-out every relay turn uses.
+
+        ``sessionKey`` is what makes the relay route a delta to the
+        CONVERSATION rather than to the socket that started the turn — so a
+        client that reconnected mid-turn (or never started one, as with an
+        autonomous goal turn) still receives the live reply.
+        """
+
+        async def stream_callback(delta: str) -> None:
+            from flowly.agent import inflight
+
+            inflight.append(session_key, run_id, delta)
+            data = {
+                "state": "streaming",
+                "runId": run_id,
+                "sessionKey": session_key,
+                "delta": delta,
+            }
+            await self._send_or_queue(json.dumps({
+                "type": "event",
+                "sessionId": session_id,
+                "event": "chat",
+                "data": data,
+            }))
+            local_data = {**data, "source": "relay"}
+            asyncio.create_task(self._emit_local_event("chat", local_data))
+            asyncio.create_task(self._emit_local_event(
+                "agent",
+                {
+                    "stream": "assistant",
+                    "runId": run_id,
+                    "sessionKey": session_key,
+                    "source": "relay",
+                    "data": {"text": delta},
+                },
+            ))
+
+        return stream_callback
+
+    async def run_autonomous_turn(
+        self,
+        session_key: str,
+        goal_metadata: dict[str, Any],
+    ) -> None:
+        """Run an agent-authored turn exactly like a client's ``chat.send``.
+
+        Same run identity, streaming callback, in-flight registration and
+        final delivery — the only difference is that the prompt is resolved
+        inside the agent (from the standing goal) and announced through
+        ``on_user_message`` once the goal guards have passed.
+        """
+        session_id = self._session_key_to_relay_id.get(session_key) or ""
+        if not session_id and session_key.startswith("web:"):
+            session_id = session_key.split(":", 1)[1]
+        if not session_id:
+            logger.debug("[WebChannel] no relay session for {}", session_key)
+            return
+        run_id = str(uuid.uuid4())
+
+        from flowly.agent import inflight
+
+        inflight.begin(session_key, run_id, "")
+
+        async def announce_user(text: str) -> None:
+            """Publish the agent-authored prompt as this run's user turn."""
+            inflight.begin(session_key, run_id, text)
+            data = {
+                "state": "user",
+                "runId": run_id,
+                "sessionKey": session_key,
+                "goalRun": True,
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}],
+                },
+            }
+            await self._send_or_queue(json.dumps({
+                "type": "event",
+                "sessionId": session_id,
+                "event": "chat",
+                "data": data,
+            }))
+            asyncio.create_task(self._emit_local_event("chat", {**data, "source": "relay"}))
+
+        started = goal_metadata.pop("on_run_started", None)
+        if started is not None:
+            started(run_id)
+        metadata = {**goal_metadata, "on_user_message": announce_user}
+        task = asyncio.create_task(self._process_message(
+            session_id,
+            session_key,
+            "",
+            run_id,
+            self._make_stream_callback(session_id, session_key, run_id),
+            extra_metadata=metadata,
+        ))
+        self._active_tasks[run_id] = task
+        task.add_done_callback(lambda _t, _rid=run_id: self._active_tasks.pop(_rid, None))
+
     async def _process_message(
         self,
         session_id: str,
@@ -1622,6 +1655,7 @@ class WebChannel(BaseChannel):
         media: list[str] | None = None,
         voice_mode: bool = False,
         render_capabilities: tuple[str, ...] = (),
+        extra_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Push message to bus and wait for agent response."""
         metadata: dict[str, Any] = {
@@ -1629,6 +1663,8 @@ class WebChannel(BaseChannel):
             "run_id": run_id,
             "stream_callback": stream_callback,
         }
+        if extra_metadata:
+            metadata.update(extra_metadata)
         if voice_mode:
             metadata["voice_mode"] = True
         if render_capabilities:

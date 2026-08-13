@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from collections import OrderedDict
 from loguru import logger
 
 from flowly.bus.events import InboundMessage, OutboundMessage
@@ -160,7 +161,20 @@ class _GoalInboundMessage(InboundMessage):
 
 
 class _AgentGoalDelivery(GoalDelivery):
-    """Route autonomous goal turns back through their originating surface."""
+    """Route autonomous goal turns through a surface's NORMAL chat entry.
+
+    A standing goal does not get its own execution path. Its turns are ordinary
+    turns whose prompt the agent authored, so they are submitted through the
+    same entry point a typed message uses — the direct gateway's chat runner,
+    the web channel's chat.send machinery, or the bus for plain channels. That
+    is what makes streaming, tool events, Stop, chat.inflight resume, history
+    and persistence identical to a user-started turn, with no client aware that
+    nobody typed it.
+
+    Judging is NOT awaited here: the completed turn reaches the judge through
+    the same ``_goal_after_delivery`` hook every delivered turn already uses.
+    Awaiting the result here would evaluate it twice.
+    """
 
     def __init__(
         self,
@@ -185,99 +199,40 @@ class _AgentGoalDelivery(GoalDelivery):
         user_epoch: int,
         kickoff: bool,
     ) -> DeliveredGoalTurn | None:
-        run_id = f"goal-{uuid.uuid4().hex}"
-        from flowly.agent import inflight
+        metadata = self.agent.goal_turn_metadata(
+            goal_id, user_epoch=user_epoch, kickoff=kickoff,
+        )
+        submitter = self.agent.goal_turn_submitter(self.channel, direct=self.direct)
+        if submitter is not None:
+            # The surface reports the run identity it minted so a later goal
+            # control can stop that turn — and only that turn.
+            metadata["on_run_started"] = lambda run_id: self.agent.note_autonomous_run(run_id)
+            await submitter(session_key, metadata)
+            return None
 
-        # Autonomous turns are first-class chat runs.  They do not create a
-        # synthetic user bubble, but otherwise share the normal stream,
-        # iteration, abort, and reconnect lifecycle.
-        inflight.begin(session_key, run_id, "")
-
-        async def stream_callback(delta: str) -> None:
-            inflight.append(session_key, run_id, delta)
-            if self.direct:
-                gateway = getattr(self.agent, "_gateway_server", None)
-                if gateway is not None and hasattr(gateway, "push_session_stream"):
-                    await gateway.push_session_stream(session_key, run_id, delta)
-                return
-            await self.agent.bus.publish_outbound(OutboundMessage(
-                channel=self.channel,
-                chat_id=self.chat_id,
-                content="",
-                metadata={
-                    "stream_event": {
-                        "state": "streaming",
-                        "runId": run_id,
-                        "delta": delta,
-                        "goalRun": True,
-                    }
-                },
-            ))
-
-        async def iteration_callback(event: dict[str, Any]) -> None:
-            wrapped = {**event, "runId": run_id, "goalRun": True}
-            inflight.append_iteration(
-                session_key,
-                run_id,
-                {**wrapped, "state": "iteration_step"},
-            )
-            if self.direct:
-                gateway = getattr(self.agent, "_gateway_server", None)
-                if gateway is not None and hasattr(gateway, "push_session_iteration"):
-                    await gateway.push_session_iteration(
-                        session_key,
-                        run_id,
-                        wrapped,
-                    )
-                return
-            await self.agent.bus.publish_outbound(OutboundMessage(
-                channel=self.channel,
-                chat_id=self.chat_id,
-                content="",
-                metadata={"iteration_event": wrapped},
-            ))
-
-        message = _GoalInboundMessage(
+        # No transport-native entry (plain channels, one-shot CLI, tests): the
+        # bus IS the generic user-turn entry point, and channel adapters give
+        # these turns the same delivery a typed message gets.
+        await self.agent.bus.publish_inbound(_GoalInboundMessage(
             channel=self.channel,
             sender_id="goal",
             chat_id=self.chat_id,
             content="",
-            metadata={
-                _GOAL_CONTINUATION_ID: goal_id,
-                _GOAL_BASE_USER_EPOCH: user_epoch,
-                _GOAL_KICKOFF: kickoff,
-                "run_id": run_id,
-                "stream_callback": stream_callback,
-                "on_iteration": iteration_callback,
-                "goal_run": True,
-            },
+            metadata=metadata,
             _stable_session_key=session_key,
-        )
-        try:
-            response = await self.agent._process_message(message)
-        except BaseException:
-            inflight.finish(session_key, run_id)
-            raise
-        if response is None:
-            inflight.finish(session_key, run_id)
-            return None
-        return self.agent._goal_turn_from_outbound(
-            session_key,
-            response,
-            user_epoch=user_epoch,
-        )
+        ))
+        return None
 
     async def deliver_turn(self, turn: DeliveredGoalTurn) -> None:
+        """Deliver a turn a caller executed itself.
+
+        Unused by the submit path above (which never returns a turn) and kept
+        for delivery implementations — tests, embedders — that still run a
+        continuation inline and hand back its result.
+        """
         outbound = turn.metadata.get("outbound")
         if isinstance(outbound, OutboundMessage):
-            try:
-                await self.agent._deliver_goal_outbound(outbound, direct=self.direct)
-            finally:
-                run_id = str(outbound.metadata.get("stream_run_id") or "")
-                if run_id:
-                    from flowly.agent import inflight
-
-                    inflight.finish(turn.session_key, run_id)
+            await self.agent._deliver_goal_outbound(outbound, direct=self.direct)
 
     async def deliver_notice(self, decision: GoalDecision) -> None:
         state = self.agent.goal_manager.get(self.session_key)
@@ -3408,6 +3363,75 @@ class AgentLoop:
             metadata={"outbound": outbound},
         )
 
+    async def _deliver_goal_status(
+        self,
+        msg: InboundMessage,
+        text: str,
+        state: Any,
+    ) -> None:
+        """Publish goal state to the surface in the shape that surface wants.
+
+        Chip surfaces (desktop, iOS, TUI, relay) receive the snapshot as a
+        ``goal.updated`` event and never a chat row; chat-only channels get
+        ``text`` so they are not left without any confirmation at all. The
+        split lives in the transports — see ``_deliver_goal_outbound``.
+        """
+        try:
+            await self._deliver_goal_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=text,
+                    metadata={"goalStatus": True, "goal": state.to_public_dict()},
+                ),
+                direct=bool(msg.metadata.get("stream_callback")) or bool(
+                    getattr(self, "_goal_output_callback", None)
+                ),
+            )
+        except Exception:  # noqa: BLE001 — never block the turn on a notice
+            logger.debug("[goal] status delivery skipped", exc_info=True)
+
+    def register_goal_turn_submitter(self, key: str, submitter: Any) -> None:
+        """Register a surface's normal user-turn entry point for goal turns.
+
+        ``key`` is ``"direct"`` for the gateway's own chat runner, otherwise a
+        channel name (``"web"``). A goal turn submitted through one of these
+        is indistinguishable from a typed turn on that surface — same run id,
+        streaming, tool events, Stop and resume. Without a registration the
+        delivery falls back to the bus, which is the generic entry every
+        channel adapter already serves.
+        """
+        if not hasattr(self, "_goal_turn_submitters"):
+            self._goal_turn_submitters: dict[str, Any] = {}
+        self._goal_turn_submitters[key] = submitter
+
+    def goal_turn_submitter(self, channel: str, *, direct: bool) -> Any:
+        """The registered entry point for this surface, or ``None``."""
+        registry = getattr(self, "_goal_turn_submitters", None) or {}
+        if direct:
+            return registry.get("direct")
+        return registry.get(channel)
+
+    def goal_turn_metadata(
+        self,
+        goal_id: str,
+        *,
+        user_epoch: int,
+        kickoff: bool,
+    ) -> dict[str, Any]:
+        """Metadata that marks one inbound turn as this goal's next step.
+
+        The prompt itself is resolved inside the turn lock (see
+        ``_process_message``) so a goal cleared or superseded while the turn
+        was queued can still be dropped before anything is shown or sent.
+        """
+        return {
+            _GOAL_CONTINUATION_ID: goal_id,
+            _GOAL_BASE_USER_EPOCH: user_epoch,
+            _GOAL_KICKOFF: kickoff,
+            "goal_run": True,
+        }
+
     async def goal_control(self, session_key: str, action: str) -> dict[str, Any]:
         """Pause/resume a standing goal from a client control (the chip button).
 
@@ -3422,11 +3446,26 @@ class AgentLoop:
             raise ValueError("goals are not available on this agent")
         if action == "pause":
             state = manager.pause(session_key, reason="paused by user")
-            if state is not None and runtime is not None:
-                # A queued continuation must not outlive the pause.
-                runtime.cancel_session(session_key)
+            if state is not None:
+                # Stopping a goal stops its work: the queued continuation goes,
+                # and so does the turn currently streaming. Leaving that turn
+                # running is what made pause look like it had done nothing.
+                if runtime is not None:
+                    runtime.cancel_session(session_key)
+                self.abort_autonomous_run(session_key)
         elif action == "resume":
             state = manager.resume(session_key)
+        elif action == "stop":
+            # Finish for good: drop queued work and the in-flight turn first so
+            # no continuation can slip through between cancel and the cleared
+            # write.
+            if runtime is not None:
+                runtime.cancel_session(session_key)
+            self.abort_autonomous_run(session_key)
+            state = manager.clear(
+                session_key,
+                conversation_epoch=self.context_epoch(session_key),
+            )
         else:
             raise ValueError(f"unsupported goal action: {action}")
         if state is None:
@@ -3564,6 +3603,41 @@ class AgentLoop:
             media=list((metadata or {}).get("media") or []),
         )
         self._goal_after_delivery(msg, outbound, direct=True)
+
+    def abort_autonomous_run(self, session_key: str) -> bool:
+        """Stop an agent-authored turn that is streaming right now.
+
+        Only autonomous turns are touched: a user's own in-flight message is
+        theirs to stop, and a goal control must never cancel it. The turn ends
+        the same cooperative way the Stop button ends one, so its partial text
+        and tool history are preserved and one authoritative aborted terminal
+        still reaches every client.
+        """
+        from flowly.agent import inflight
+
+        current = inflight.get(session_key)
+        if not isinstance(current, dict):
+            return False
+        run_id = str(current.get("runId") or "")
+        if not run_id or not self.is_autonomous_run(run_id):
+            return False
+        return self.mark_aborted(run_id)
+
+    def note_autonomous_run(self, run_id: str) -> None:
+        """Record that this run belongs to a standing goal, not to a person."""
+        if not run_id:
+            return
+        runs = getattr(self, "_autonomous_runs", None)
+        if runs is None:
+            runs = self._autonomous_runs = OrderedDict()
+        runs[run_id] = True
+        # Bounded: a long-lived gateway would otherwise accumulate one entry
+        # per autonomous turn for the life of the process.
+        while len(runs) > 512:
+            runs.popitem(last=False)
+
+    def is_autonomous_run(self, run_id: str) -> bool:
+        return bool(run_id) and run_id in (getattr(self, "_autonomous_runs", None) or {})
 
     def mark_aborted(self, run_id: str) -> bool:
         """Stop one run without cancelling its transcript-finalization task.
@@ -7036,6 +7110,15 @@ class AgentLoop:
                     else self.goal_manager.continuation_prompt(state)
                 )
                 msg.metadata[_GOAL_USER_EPOCH] = base_epoch
+                # Announce the prompt ONLY here — after every guard above has
+                # passed. Emitting it at submit time would show a user row for
+                # a turn a cleared or superseded goal then refuses to run.
+                announce = msg.metadata.get("on_user_message")
+                if announce is not None:
+                    try:
+                        await announce(msg.content)
+                    except Exception:  # noqa: BLE001 — display, never the turn
+                        logger.debug("[goal] user-message announce failed", exc_info=True)
             return await self._process_message_unlocked(msg)
 
     async def _process_message_unlocked(
@@ -7258,14 +7341,43 @@ class AgentLoop:
                 )
             else:
                 result = handler.subgoal(msg.session_key, command_args)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=result.content,
-                metadata=result.metadata(
-                    user_epoch=self.goal_user_epoch(msg.session_key)
-                ),
-            )
+
+            if result.start_turn:
+                # Setting a goal does not reply — it starts working. THIS turn
+                # becomes the goal's first turn: the prompt is rewritten, the
+                # command text stays as the visible user row, and control falls
+                # through to the ordinary agent run below. That is what makes
+                # `/goal <text>` stream exactly like sending `<text>` would,
+                # instead of answering with an acknowledgement and only then
+                # starting a second turn. Same mechanism `/notools` and `/plan`
+                # already use.
+                state = result.state
+                if state is not None:
+                    # The chip must appear at once — before the first token —
+                    # so the user sees the goal took hold. Chip surfaces render
+                    # the snapshot and suppress the text; chat-only channels
+                    # (Telegram, Slack…) get the one-line confirmation instead.
+                    await self._deliver_goal_status(msg, result.content, state)
+                    msg.metadata.update(self.goal_turn_metadata(
+                        state.goal_id,
+                        user_epoch=self.goal_user_epoch(msg.session_key),
+                        kickoff=True,
+                    ))
+                msg.metadata.setdefault("_display_content", msg.content)
+                msg.content = result.start_turn
+                is_command = False
+                command = ""
+                command_args = ""
+                # Do NOT return — continues to the normal agent run below.
+            else:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=result.content,
+                    metadata=result.metadata(
+                        user_epoch=self.goal_user_epoch(msg.session_key)
+                    ),
+                )
 
         if is_command and command == "compact":
             session = self.sessions.get_or_create(msg.session_key)
@@ -8133,7 +8245,12 @@ class AgentLoop:
             reply_media_assets=reply_media_assets or None,
             aborted=turn_aborted,
             duration_ms=turn_duration_ms,
-            user_display_hidden=bool(msg.metadata.get(_GOAL_CONTINUATION_ID)),
+            # A goal turn is an ordinary turn whose prompt the agent authored
+            # on the user's behalf. It stays VISIBLE: the transcript must read
+            # like the conversation it is, and every client already renders a
+            # user row it did not send (chat.inflight restores one the same
+            # way). Hiding it produced replies with no visible cause.
+            user_display_hidden=False,
             # Provider failures are terminal, but they are not successful
             # assistant completions. Keep their visible error text in history
             # without advancing the cross-client unread identity.
@@ -8741,6 +8858,7 @@ class AgentLoop:
         run_id: str | None = None,
         tools_allowed: bool | None = None,
         defer_goal_delivery: bool = False,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> str | tuple[str, dict[str, Any]]:
         """
         Process a message directly (for CLI, voice calls, or desktop WebSocket).
@@ -8813,6 +8931,12 @@ class AgentLoop:
             metadata["origin_channel"] = origin_channel
         if origin_chat_id:
             metadata["origin_chat_id"] = origin_chat_id
+
+        # Turn markers the transport does not interpret (a standing goal's
+        # continuation identity, the agent-authored-prompt announce hook).
+        # Merged last so a caller cannot be silently overridden by defaults.
+        if extra_metadata:
+            metadata.update(extra_metadata)
 
         msg = InboundMessage(
             channel=channel,

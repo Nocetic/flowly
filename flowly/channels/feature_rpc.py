@@ -759,6 +759,11 @@ async def goal_resume(params: dict) -> dict:
     return await _goal_control(params, "resume")
 
 
+async def goal_stop(params: dict) -> dict:
+    """Finish a standing goal for good; clients drop the goal surface."""
+    return await _goal_control(params, "stop")
+
+
 def goal_get(params: dict) -> dict:
     """Return a conversation's durable standing-goal snapshot."""
     session_key = str(params.get("sessionKey") or "").strip()
@@ -3933,6 +3938,7 @@ _DISPATCH: dict[str, tuple] = {
     "goal.get": (goal_get, True, False),
     "goal.pause": (goal_pause, True, False),
     "goal.resume": (goal_resume, True, False),
+    "goal.stop": (goal_stop, True, False),
     "chat.compact": (chat_compact, True, False),
     "plan.get": (plan_get, True, False),
     "plan.list": (plan_list, True, False),

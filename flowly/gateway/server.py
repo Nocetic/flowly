@@ -2416,6 +2416,77 @@ class GatewayServer:
         self._active_tasks[run_id] = task
         task.add_done_callback(lambda _: self._active_tasks.pop(run_id, None))
 
+    async def run_autonomous_turn(
+        self,
+        session_key: str,
+        goal_metadata: dict[str, Any],
+    ) -> None:
+        """Run an agent-authored turn exactly like a client's ``chat.send``.
+
+        Reuses :meth:`_run_chat` verbatim, so the turn is indistinguishable
+        from a typed one on the wire: normal run id, live deltas, tool-turn
+        events, chat.inflight resume, Stop, and one authoritative final event.
+        The prompt is resolved inside the agent (from the standing goal) and
+        announced through ``on_user_message`` after its guards pass.
+        """
+        ws = self._session_ws.get(session_key)
+        if ws is None or ws.closed:
+            logger.debug("[GatewayWS] no bound socket for autonomous turn on %s", session_key)
+            return
+        run_id = str(uuid.uuid4())
+
+        async def stream_callback(delta: str) -> None:
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "agent",
+                    "data": {
+                        "runId": run_id,
+                        "stream": "assistant",
+                        "data": {"text": delta},
+                    },
+                },
+            )
+
+        async def announce_user(text: str) -> None:
+            """Publish the agent-authored prompt as this run's user turn."""
+            from flowly.agent import inflight
+
+            inflight.begin(session_key, run_id, text)
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "chat",
+                    "data": {
+                        "state": "user",
+                        "runId": run_id,
+                        "sessionKey": session_key,
+                        "goalRun": True,
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": text}],
+                        },
+                    },
+                },
+            )
+
+        started = goal_metadata.pop("on_run_started", None)
+        if started is not None:
+            started(run_id)
+        await self._run_chat(
+            ws,
+            "",
+            session_key,
+            "",
+            run_id,
+            stream_callback,
+            extra_metadata={**goal_metadata, "on_user_message": announce_user},
+        )
+
     async def _run_chat(
         self,
         ws: web.WebSocketResponse,
@@ -2428,8 +2499,16 @@ class GatewayServer:
         voice_mode: bool = False,
         browser_binding: _BrowserRunBinding | None = None,
         render_capabilities: tuple[str, ...] = (),
+        extra_metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Execute the chat and send final/error events."""
+        """Execute the chat and send final/error events.
+
+        ``extra_metadata`` carries turn markers the transport itself does not
+        interpret (a standing goal's continuation identity, the callback that
+        announces an agent-authored prompt). Passing them here is what lets an
+        autonomous turn reuse this exact runner — same run identity, streaming,
+        tool events, in-flight registration, abort and final delivery — instead
+        of growing a second delivery path that drifts from this one."""
         run_started_at = asyncio.get_running_loop().time()
         accumulated_text = ""
 
@@ -2467,7 +2546,7 @@ class GatewayServer:
         binding_token = _BROWSER_RUN_BINDING.set(browser_binding)
         try:
             assert self.on_chat_message is not None
-            result = await self.on_chat_message(
+            call_args = (
                 session_key,
                 message,
                 run_id,
@@ -2477,6 +2556,24 @@ class GatewayServer:
                 iteration_callback,
                 render_capabilities,
             )
+            # The extra-metadata parameter is additive: only an autonomous
+            # turn supplies it, and a host wired with the older signature
+            # still serves every client turn. Binding is attempted before the
+            # await so this can only ever catch an arity mismatch, never a
+            # TypeError raised inside the callback itself.
+            if extra_metadata:
+                try:
+                    pending = self.on_chat_message(*call_args, extra_metadata)
+                except TypeError:
+                    logger.debug(
+                        "[GatewayWS] chat host predates autonomous turns; "
+                        "running %s without turn markers",
+                        session_key,
+                    )
+                    pending = self.on_chat_message(*call_args)
+            else:
+                pending = self.on_chat_message(*call_args)
+            result = await pending
             # Back-compat: older callbacks returned bare text. Detect the
             # tuple form and fall back to ``{}`` metadata otherwise so
             # any third-party gateway wiring keeps working.
@@ -3457,44 +3554,6 @@ class GatewayServer:
                     pass  # closed socket — best effort
         if isinstance(goal_snapshot, dict):
             await self.broadcast_goal_updated(session_key, goal_snapshot)
-
-    async def push_session_stream(
-        self,
-        session_key: str,
-        run_id: str,
-        delta: str,
-    ) -> None:
-        """Push one autonomous continuation delta to its conversation."""
-        if not delta:
-            return
-        await self._push_session_chat_event(
-            session_key,
-            {
-                "state": "streaming",
-                "runId": run_id,
-                "sessionKey": session_key,
-                "delta": delta,
-                "goalRun": True,
-            },
-        )
-
-    async def push_session_iteration(
-        self,
-        session_key: str,
-        run_id: str,
-        event: dict[str, Any],
-    ) -> None:
-        """Push one autonomous continuation tool-loop boundary."""
-        await self._push_session_chat_event(
-            session_key,
-            {
-                **event,
-                "state": "iteration_step",
-                "runId": run_id,
-                "sessionKey": session_key,
-                "goalRun": True,
-            },
-        )
 
     async def _push_session_chat_event(
         self,

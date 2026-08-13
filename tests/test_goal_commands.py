@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,7 @@ def _handler(tmp_path: Path) -> tuple[GoalManager, Runtime, GoalCommandHandler]:
 
 
 @pytest.mark.asyncio
-async def test_goal_set_parses_contract_and_requests_post_delivery_kickoff(
+async def test_goal_set_parses_inline_contract_and_runs_this_turn(
     tmp_path: Path,
 ) -> None:
     manager, runtime, handler = _handler(tmp_path)
@@ -57,13 +58,18 @@ async def test_goal_set_parses_contract_and_requests_post_delivery_kickoff(
     assert state.contract.verification == "auth tests pass"
     assert state.contract.constraints == "keep /login stable"
     assert state.conversation_epoch == 7
-    assert result.kickoff_goal_id == state.goal_id
+    # Setting a goal starts working: the caller runs THIS turn with the goal
+    # text rather than replying with an acknowledgement.
+    assert result.start_turn == state.goal
+    assert result.kickoff_goal_id is None
     assert runtime.cancelled == ["web:chat"]
-    assert result.metadata(user_epoch=3)["_goal_kickoff_goal_id"] == state.goal_id
+    assert result.metadata(user_epoch=3).get("_goal_kickoff_goal_id") is None
 
 
 @pytest.mark.asyncio
-async def test_plain_goal_is_settled_into_a_contract_before_kickoff(tmp_path: Path) -> None:
+async def test_plain_goal_starts_immediately_and_settles_in_the_background(
+    tmp_path: Path,
+) -> None:
     manager, _runtime, handler = _handler(tmp_path)
 
     result = await handler.goal(
@@ -74,10 +80,18 @@ async def test_plain_goal_is_settled_into_a_contract_before_kickoff(tmp_path: Pa
 
     state = manager.get("web:chat")
     assert state is not None
-    assert state.contract.outcome == "Test the system end to end"
-    assert state.contract.verification == "all tests pass"
-    assert result.content.startswith("⊙ Goal settled")
-    assert result.kickoff_goal_id == state.goal_id
+    # The turn is not held back by the drafter…
+    assert result.start_turn == "Test the system end to end"
+    assert state.contract.is_empty
+    assert result.content.startswith("⊙ Goal set")
+
+    # …and the contract lands on the same goal once drafting finishes.
+    await asyncio.gather(*handler._settling)
+    settled = manager.get("web:chat")
+    assert settled is not None
+    assert settled.contract.outcome == "Test the system end to end"
+    assert settled.contract.verification == "all tests pass"
+    assert settled.goal_id == state.goal_id
 
 
 @pytest.mark.asyncio
@@ -94,7 +108,9 @@ async def test_goal_draft_sets_structured_contract_and_kicks_off(tmp_path: Path)
     assert state is not None
     assert state.contract.verification == "all tests pass"
     assert "Drafted completion contract" in result.content
-    assert result.kickoff_goal_id == state.goal_id
+    # An explicit draft is authoritative, so it is ready before the turn runs.
+    assert result.start_turn == state.goal
+    assert result.kickoff_goal_id is None
 
 
 @pytest.mark.asyncio
