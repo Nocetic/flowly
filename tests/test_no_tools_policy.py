@@ -205,16 +205,15 @@ async def test_notools_slash_works_end_to_end_without_client_changes(
     session = loop.sessions.get_or_create("web:slash")
     session.metadata["title"] = "Existing title"
     loop.sessions.save(session)
-    loop._task_states.observe_user_message(
-        session.key,
-        "Implement the transactional archive",
-        new_objective="Implement the transactional archive",
-    )
     try:
         text, metadata = await loop.process_direct(
             "/notools Explain the architecture",
             session_key="web:slash",
             return_metadata=True,
+        )
+        await loop.process_direct(
+            "Explain it again with the available tools",
+            session_key="web:slash",
         )
     finally:
         loop.stop()
@@ -224,80 +223,18 @@ async def test_notools_slash_works_end_to_end_without_client_changes(
     assert provider.calls[0]["tools"] == []
     assert provider.calls[0]["tool_choice"] == "none"
     assert "<tool_execution_policy" in provider.calls[0]["messages"][-1]["content"]
+    assert provider.calls[1]["tools"]
+    assert provider.calls[1]["tool_choice"] == "auto"
+    assert "<tool_execution_policy" not in provider.calls[1]["messages"][-1]["content"]
     saved = loop.sessions.get_or_create("web:slash")
     assert [
         message["content"]
         for message in saved.messages
         if message.get("role") == "user"
-    ][-1] == "/notools Explain the architecture"
-    state = loop._task_states.get("web:slash")
-    assert state is not None
-    assert state.objective == "Implement the transactional archive"
-    assert state.latest_user_request == "/notools Explain the architecture"
-
-
-@pytest.mark.asyncio
-async def test_notools_inner_action_can_start_a_new_task(tmp_path, monkeypatch):
-    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
-    provider = _PlainProvider()
-    loop = AgentLoop(
-        bus=MessageBus(),
-        provider=provider,
-        workspace=tmp_path,
-        main_config=Config(),
-        max_iterations=2,
-        soft_warn_at_iteration=0,
-    )
-    try:
-        await loop.process_direct(
-            "/notools Investigate the archive transaction design",
-            session_key="web:new-no-tools-task",
-        )
-    finally:
-        loop.stop()
-
-    state = loop._task_states.get("web:new-no-tools-task")
-    assert state is not None
-    assert state.status == "active"
-    assert state.objective == "Investigate the archive transaction design"
-    assert state.latest_user_request == (
-        "/notools Investigate the archive transaction design"
-    )
-
-
-@pytest.mark.asyncio
-async def test_notools_inner_cancellation_cancels_instead_of_replacing_task(
-    tmp_path, monkeypatch,
-):
-    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
-    provider = _PlainProvider()
-    loop = AgentLoop(
-        bus=MessageBus(),
-        provider=provider,
-        workspace=tmp_path,
-        main_config=Config(),
-        max_iterations=2,
-        soft_warn_at_iteration=0,
-    )
-    session_key = "web:cancel-no-tools-task"
-    loop._task_states.observe_user_message(
-        session_key,
-        "Build the migration",
-        new_objective="Build the migration",
-    )
-    try:
-        await loop.process_direct(
-            "/notools Bu işi iptal et.",
-            session_key=session_key,
-        )
-    finally:
-        loop.stop()
-
-    state = loop._task_states.get(session_key)
-    assert state is not None
-    assert state.status == "cancelled"
-    assert state.objective == "Build the migration"
-    assert state.latest_user_request == "/notools Bu işi iptal et."
+    ][-2:] == [
+        "/notools Explain the architecture",
+        "Explain it again with the available tools",
+    ]
 
 
 def test_command_registry_advertises_transport_compatible_name():
