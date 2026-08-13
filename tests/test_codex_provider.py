@@ -8,16 +8,19 @@ importantly, output items arriving in ``response.output_item.done`` while
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 import flowly.providers.codex_responses_provider as codex
+from flowly.integrations.active_provider import ActiveProvider
 from flowly.providers.codex_responses_provider import (
     CodexResponsesProvider,
     _messages_to_codex_input,
     _normalize_codex_model,
     _resolve_effort,
 )
+from flowly.providers.factory import build_provider
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +96,114 @@ def test_payload_shape_is_codex_backend_compatible():
     assert isinstance(sid, str) and len(sid) == 32
 
 
+def test_native_compaction_is_scoped_gated_and_below_local_threshold():
+    prov = CodexResponsesProvider(api_key="tok", account_id="acct-1")
+    state = {}
+
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=100_000,
+    ):
+        payload, _ = prov._build_payload(
+            [{"role": "user", "content": "hi"}],
+            None,
+            "gpt-5.6-sol",
+            "auto",
+            stream=True,
+        )
+        old_payload, _ = prov._build_payload(
+            [{"role": "user", "content": "hi"}],
+            None,
+            "gpt-5.5",
+            "auto",
+            stream=True,
+        )
+
+    assert payload["context_management"] == [{
+        "type": "compaction",
+        "compact_threshold": 100_000 - 8_192,
+    }]
+    assert "context_management" not in old_payload
+    # Out-of-band calls (including the local summarizer) have no durable
+    # session scope and must remain byte-compatible with the old path.
+    unscoped, _ = prov._build_payload(
+        [{"role": "user", "content": "hi"}],
+        None,
+        "gpt-5.6-sol",
+        "auto",
+        stream=True,
+    )
+    assert "context_management" not in unscoped
+
+
+def test_factory_threads_native_compaction_configuration():
+    config = SimpleNamespace(
+        agents=SimpleNamespace(
+            defaults=SimpleNamespace(llm_timeout_seconds=123),
+        ),
+        providers=SimpleNamespace(
+            openai_codex=SimpleNamespace(
+                native_compaction=False,
+                native_compaction_threshold=77_000,
+            ),
+        ),
+    )
+    active = ActiveProvider(
+        key="openai_codex",
+        api_key="tok",
+        api_base=None,
+        source="test",
+        account_id="acct-1",
+    )
+
+    provider = build_provider(
+        active,
+        default_model="gpt-5.6-sol",
+        config=config,
+    )
+
+    assert isinstance(provider, CodexResponsesProvider)
+    assert provider.native_compaction is False
+    assert provider.native_compaction_threshold == 77_000
+    assert provider.request_timeout_seconds == 123
+
+
+def test_concurrent_session_scopes_do_not_share_native_state():
+    prov = CodexResponsesProvider(api_key="tok", account_id="acct-1")
+    disabled = {}
+    prov._stamp_state(disabled, "gpt-5.6-sol")
+    disabled["native_disabled"] = True
+    enabled = {}
+
+    async def build(session_key, state):
+        with prov.request_scope(
+            session_key=session_key,
+            provider_state=state,
+            local_compaction_threshold=250_000,
+        ):
+            await asyncio.sleep(0)
+            payload, _ = prov._build_payload(
+                [{"role": "user", "content": session_key}],
+                None,
+                "gpt-5.6-sol",
+                "auto",
+                stream=True,
+            )
+            return payload
+
+    async def run():
+        return await asyncio.gather(
+            build("web:disabled", disabled),
+            build("web:enabled", enabled),
+        )
+
+    disabled_payload, enabled_payload = asyncio.run(run())
+
+    assert "context_management" not in disabled_payload
+    assert "context_management" in enabled_payload
+
+
 def test_headers_carry_account_id_and_beta():
     prov = CodexResponsesProvider(api_key="tok", account_id="acct-9")
     h = prov._headers("sess-1", accept="text/event-stream")
@@ -106,9 +217,10 @@ def test_headers_carry_account_id_and_beta():
 
 
 class _FakeStream:
-    def __init__(self, status_code, lines):
+    def __init__(self, status_code, lines, body=b""):
         self.status_code = status_code
         self._lines = lines
+        self._body = body
 
     async def __aenter__(self):
         return self
@@ -121,7 +233,7 @@ class _FakeStream:
             yield ln
 
     async def aread(self):
-        return b""
+        return self._body
 
 
 class _FakeClient:
@@ -163,6 +275,16 @@ _TOOL_FRAMES = [
     '"name":"get_weather","arguments":"{\\"city\\":\\"Istanbul\\"}","call_id":"call_abc"}}',
     'data: {"type":"response.completed","response":{"status":"completed","output":[],'
     '"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}',
+    "",
+]
+
+_COMPACTION_FRAMES = [
+    'data: {"type":"response.output_item.done","item":{"type":"compaction",'
+    '"encrypted_content":"opaque-checkpoint"}}',
+    'data: {"type":"response.output_item.done","item":{"type":"message",'
+    '"role":"assistant","content":[{"type":"output_text","text":"Continued"}]}}',
+    'data: {"type":"response.completed","response":{"status":"completed",'
+    '"output":[],"usage":{"input_tokens":20,"output_tokens":2,"total_tokens":22}}}',
     "",
 ]
 
@@ -218,6 +340,268 @@ def test_stream_tool_call_in_final():
     final = chunks[-1]
     assert final.finish_reason == "tool_calls"
     assert final.tool_calls[0].name == "get_weather"
+
+
+def test_compaction_checkpoint_is_captured_and_replayed_in_sequence():
+    prov = CodexResponsesProvider(
+        api_key="k",
+        account_id="acct-1",
+        default_model="gpt-5.6-sol",
+    )
+    state = {}
+    _install(_COMPACTION_FRAMES)
+
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        response = asyncio.run(prov.chat(
+            messages=[{"role": "user", "content": "long turn"}],
+            model="gpt-5.6-sol",
+        ))
+
+    assert response.content == "Continued"
+    assert response.provider_state["_checkpoint_emitted"] is True
+    assert state["checkpoint"] == {
+        "type": "compaction",
+        "encrypted_content": "opaque-checkpoint",
+    }
+
+    marker = prov.continuity_marker(state, "gpt-5.6-sol")
+    assert marker is not None
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        payload, _ = prov._build_payload(
+            [
+                {"role": "user", "content": "covered"},
+                marker,
+                {"role": "assistant", "content": "Continued"},
+                {"role": "user", "content": "next"},
+            ],
+            None,
+            "gpt-5.6-sol",
+            "auto",
+            stream=True,
+        )
+
+    assert [item.get("type") for item in payload["input"]] == [
+        None,
+        "compaction",
+        None,
+        None,
+    ]
+    assert payload["input"][1]["encrypted_content"] == "opaque-checkpoint"
+
+
+def test_checkpoint_keeps_cache_key_stable_and_drops_on_issuer_change():
+    prov = CodexResponsesProvider(
+        api_key="k",
+        account_id="acct-1",
+        default_model="gpt-5.6-sol",
+    )
+    state = {}
+    prov._stamp_state(state, "gpt-5.6-sol")
+    state["checkpoint"] = {
+        "type": "compaction",
+        "encrypted_content": "opaque-checkpoint",
+    }
+    marker = prov.continuity_marker(state, "gpt-5.6-sol")
+    assert marker is not None
+    messages = [
+        {"role": "system", "content": "stable instructions"},
+        {"role": "user", "content": "first request"},
+        marker,
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "next request"},
+    ]
+
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        checkpoint_payload, checkpoint_cache_key = prov._build_payload(
+            messages,
+            None,
+            "gpt-5.6-sol",
+            "auto",
+            stream=True,
+        )
+        _, raw_cache_key = prov._build_payload(
+            [message for message in messages if message is not marker],
+            None,
+            "gpt-5.6-sol",
+            "auto",
+            stream=True,
+        )
+
+    assert checkpoint_cache_key == raw_cache_key
+    assert any(
+        item.get("type") == "compaction"
+        for item in checkpoint_payload["input"]
+    )
+
+    # OAuth account rotation changes the encryption issuer. The raw transcript
+    # remains in the request, while the now-ineligible opaque item is removed.
+    prov.account_id = "acct-2"
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        rotated_payload, _ = prov._build_payload(
+            messages,
+            None,
+            "gpt-5.6-sol",
+            "auto",
+            stream=True,
+        )
+
+    assert not any(
+        item.get("type") == "compaction"
+        for item in rotated_payload["input"]
+    )
+    assert [
+        item.get("content")
+        for item in rotated_payload["input"]
+        if item.get("role") in {"user", "assistant"}
+    ] == ["first request", "first answer", "next request"]
+
+
+def test_checkpoint_coverage_survives_later_non_checkpoint_response():
+    prov = CodexResponsesProvider(
+        api_key="k",
+        account_id="acct-1",
+        default_model="gpt-5.6-sol",
+    )
+    state = {}
+    prov._stamp_state(state, "gpt-5.6-sol")
+    state.update({
+        "checkpoint": {
+            "type": "compaction",
+            "encrypted_content": "opaque-checkpoint",
+        },
+        "_covered_turn_message_count": 2,
+    })
+
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        response = prov._merge_response_state(
+            codex.LLMResponse(content="final"),
+            "gpt-5.6-sol",
+        )
+
+    assert response.provider_state["_covered_turn_message_count"] == 2
+    assert response.provider_state["checkpoint"]["encrypted_content"] == (
+        "opaque-checkpoint"
+    )
+
+
+def test_native_field_rejection_retries_once_and_disables_only_that_session():
+    prov = CodexResponsesProvider(
+        api_key="k",
+        account_id="acct-1",
+        default_model="gpt-5.6-sol",
+    )
+    state = {}
+    captures = []
+    replies = [
+        _FakeStream(400, [], b"Unknown parameter: context_management"),
+        _FakeStream(200, _TEXT_FRAMES),
+    ]
+
+    class SequenceClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, **kwargs):
+            captures.append(kwargs["json"])
+            return replies.pop(0)
+
+    codex.httpx.AsyncClient = lambda **kwargs: SequenceClient()  # type: ignore
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        response = asyncio.run(prov.chat(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.6-sol",
+        ))
+
+    assert response.content == "Hello"
+    assert "context_management" in captures[0]
+    assert "context_management" not in captures[1]
+    assert state["native_disabled"] is True
+
+
+def test_bad_encrypted_checkpoint_retries_with_complete_raw_transcript():
+    prov = CodexResponsesProvider(
+        api_key="k",
+        account_id="acct-1",
+        default_model="gpt-5.6-sol",
+    )
+    state = {}
+    prov._stamp_state(state, "gpt-5.6-sol")
+    state["checkpoint"] = {
+        "type": "compaction",
+        "encrypted_content": "bad-checkpoint",
+    }
+    marker = prov.continuity_marker(state, "gpt-5.6-sol")
+    assert marker is not None
+    captures = []
+    replies = [
+        _FakeStream(400, [], b'{"error":{"code":"invalid_encrypted_content"}}'),
+        _FakeStream(200, _TEXT_FRAMES),
+    ]
+
+    class SequenceClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, **kwargs):
+            captures.append(kwargs["json"])
+            return replies.pop(0)
+
+    codex.httpx.AsyncClient = lambda **kwargs: SequenceClient()  # type: ignore
+    messages = [
+        {"role": "user", "content": "old raw turn"},
+        marker,
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new raw turn"},
+    ]
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        response = asyncio.run(prov.chat(
+            messages=messages,
+            model="gpt-5.6-sol",
+        ))
+
+    assert response.content == "Hello"
+    assert any(item.get("type") == "compaction" for item in captures[0]["input"])
+    assert not any(item.get("type") == "compaction" for item in captures[1]["input"])
+    assert [item.get("content") for item in captures[1]["input"]] == [
+        "old raw turn",
+        "old answer",
+        "new raw turn",
+    ]
+    assert "checkpoint" not in state
 
 
 def test_http_error_returns_error_response_not_raise():

@@ -28,6 +28,9 @@ import copy
 import hashlib
 import json
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 import httpx
@@ -41,6 +44,7 @@ from flowly.auth.openai_codex import (
     resolve_runtime_credentials,
 )
 from flowly.providers.base import (
+    PROVIDER_COMPACTION_CHECKPOINT_KEY,
     LLMProvider,
     LLMResponse,
     ProviderHTTPError,
@@ -56,6 +60,63 @@ DEFAULT_CODEX_MODEL = os.getenv("FLOWLY_CODEX_MODEL", "gpt-5.6-sol")
 # accepted here (unlike the metered API) — it is folded down to "low".
 _VALID_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 _DEFAULT_EFFORT = "medium"
+
+_NATIVE_MODEL_MARKER = "gpt-5.6"
+_NATIVE_THRESHOLD_DEFAULT = 200_000
+_LOCAL_THRESHOLD_MARGIN = 8_192
+
+
+@dataclass
+class _RequestScope:
+    session_key: str
+    provider_state: dict[str, Any]
+    local_compaction_threshold: int | None
+
+
+_REQUEST_SCOPE: ContextVar[_RequestScope | None] = ContextVar(
+    "flowly_codex_request_scope",
+    default=None,
+)
+
+
+def _resolve_native_threshold(configured: Any, local_threshold: Any) -> int:
+    """Keep the server checkpoint trigger safely below local compaction."""
+    try:
+        native = int(configured)
+    except (TypeError, ValueError):
+        native = _NATIVE_THRESHOLD_DEFAULT
+    if isinstance(configured, bool) or native <= 0:
+        native = _NATIVE_THRESHOLD_DEFAULT
+
+    try:
+        local = (
+            int(local_threshold)
+            if local_threshold is not None and not isinstance(local_threshold, bool)
+            else 0
+        )
+    except (TypeError, ValueError):
+        local = 0
+    if local <= 0:
+        return max(1_024, native)
+    upper = (
+        local - _LOCAL_THRESHOLD_MARGIN
+        if local > _LOCAL_THRESHOLD_MARGIN
+        else max(1_024, int(local * 0.8))
+    )
+    return max(1_024, min(native, upper))
+
+
+def _is_native_rejection(value: Any) -> bool:
+    text = str(value or "").lower()
+    return "context_management" in text or "compact_threshold" in text
+
+
+def _is_encrypted_checkpoint_rejection(value: Any) -> bool:
+    text = str(value or "").lower()
+    return (
+        "invalid_encrypted_content" in text
+        or "could not decrypt" in text and "encrypted_content" in text
+    )
 
 
 def _strip_known_prefixes(model: str) -> str:
@@ -164,6 +225,26 @@ def _messages_to_codex_input(
 
     for msg in messages:
         if not isinstance(msg, dict):
+            continue
+        if PROVIDER_COMPACTION_CHECKPOINT_KEY in msg:
+            scope = _REQUEST_SCOPE.get()
+            checkpoint = msg.get(PROVIDER_COMPACTION_CHECKPOINT_KEY)
+            active = (
+                scope.provider_state.get("checkpoint")
+                if scope is not None
+                else None
+            )
+            if (
+                isinstance(checkpoint, dict)
+                and isinstance(active, dict)
+                and checkpoint.get("encrypted_content")
+                and checkpoint.get("encrypted_content")
+                == active.get("encrypted_content")
+            ):
+                items.append({
+                    "type": "compaction",
+                    "encrypted_content": checkpoint["encrypted_content"],
+                })
             continue
         role = msg.get("role")
 
@@ -327,11 +408,18 @@ class CodexResponsesProvider(LLMProvider):
         default_model: str = DEFAULT_CODEX_MODEL,
         provider_name: str = "openai_codex",
         request_timeout_seconds: float | None = None,
+        native_compaction: bool = True,
+        native_compaction_threshold: int = _NATIVE_THRESHOLD_DEFAULT,
     ):
         super().__init__(api_key, api_base or CODEX_RESPONSES_URL)
         self.account_id = account_id
         self.default_model = _normalize_codex_model(default_model)
         self.provider_name = provider_name
+        self.native_compaction = bool(native_compaction)
+        self.native_compaction_threshold = max(
+            1_024,
+            int(native_compaction_threshold),
+        )
         # Precedence: env var > config (llmTimeoutSeconds) > 180s default.
         # Reasoning models can run long, hence the higher default.
         _env = os.getenv("FLOWLY_LLM_TIMEOUT_SECONDS")
@@ -340,6 +428,93 @@ class CodexResponsesProvider(LLMProvider):
             else float(request_timeout_seconds) if request_timeout_seconds
             else 180.0
         )
+
+    def _issuer_key(self) -> str:
+        account = hashlib.sha256(
+            self.account_id.encode("utf-8", "ignore")
+        ).hexdigest()[:16]
+        return f"{CODEX_RESPONSES_URL}#{account}"
+
+    def _state_matches(
+        self,
+        state: dict[str, Any],
+        model: str | None,
+    ) -> bool:
+        return (
+            state.get("provider") == self.provider_name
+            and state.get("model") == _normalize_codex_model(model or self.default_model)
+            and state.get("issuer") == self._issuer_key()
+        )
+
+    def _stamp_state(
+        self,
+        state: dict[str, Any],
+        model: str | None,
+    ) -> None:
+        state.update({
+            "provider": self.provider_name,
+            "model": _normalize_codex_model(model or self.default_model),
+            "issuer": self._issuer_key(),
+        })
+
+    @contextmanager
+    def request_scope(
+        self,
+        *,
+        session_key: str,
+        provider_state: dict[str, Any],
+        local_compaction_threshold: int | None = None,
+    ):
+        scope = _RequestScope(
+            session_key=session_key,
+            provider_state=provider_state,
+            local_compaction_threshold=local_compaction_threshold,
+        )
+        token = _REQUEST_SCOPE.set(scope)
+        try:
+            yield
+        finally:
+            _REQUEST_SCOPE.reset(token)
+
+    def continuity_marker(
+        self,
+        provider_state: dict[str, Any],
+        model: str | None,
+    ) -> dict[str, Any] | None:
+        if not self._state_matches(provider_state, model):
+            return None
+        checkpoint = provider_state.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            return None
+        encrypted = checkpoint.get("encrypted_content")
+        if not isinstance(encrypted, str) or not encrypted:
+            return None
+        return {
+            PROVIDER_COMPACTION_CHECKPOINT_KEY: {
+                "type": "compaction",
+                "encrypted_content": encrypted,
+            },
+        }
+
+    def _native_context_management(
+        self,
+        resolved_model: str,
+    ) -> list[dict[str, Any]] | None:
+        scope = _REQUEST_SCOPE.get()
+        if (
+            scope is None
+            or not self.native_compaction
+            or _NATIVE_MODEL_MARKER not in resolved_model.lower()
+        ):
+            return None
+        state = scope.provider_state
+        if self._state_matches(state, resolved_model) and state.get("native_disabled"):
+            return None
+        threshold = _resolve_native_threshold(
+            self.native_compaction_threshold,
+            scope.local_compaction_threshold,
+        )
+        return [{"type": "compaction", "compact_threshold": threshold}]
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -384,6 +559,17 @@ class CodexResponsesProvider(LLMProvider):
     ) -> tuple[dict[str, Any], str]:
         resolved_model = _normalize_codex_model(model or self.default_model)
         instructions_text, input_items = _messages_to_codex_input(messages)
+        scope = _REQUEST_SCOPE.get()
+        if scope is not None and not self._state_matches(
+            scope.provider_state,
+            resolved_model,
+        ):
+            # An encrypted item is issuer/model scoped. The complete raw
+            # transcript is still present around the prompt-only marker, so
+            # dropping an ineligible blob loses no conversational context.
+            input_items = [
+                item for item in input_items if item.get("type") != "compaction"
+            ]
         session_id = _session_id_for(instructions_text, input_items)
         payload: dict[str, Any] = {
             "model": resolved_model,
@@ -395,6 +581,9 @@ class CodexResponsesProvider(LLMProvider):
             "reasoning": {"effort": _resolve_effort(model or self.default_model), "summary": "auto"},
             "include": ["reasoning.encrypted_content"],
         }
+        context_management = self._native_context_management(resolved_model)
+        if context_management:
+            payload["context_management"] = context_management
         response_tools = _codex_tools(tools)
         if response_tools:
             payload["tools"] = response_tools
@@ -403,6 +592,68 @@ class CodexResponsesProvider(LLMProvider):
             )
             payload["parallel_tool_calls"] = False
         return payload, session_id
+
+    def _merge_response_state(
+        self,
+        response: LLMResponse,
+        model: str | None,
+    ) -> LLMResponse:
+        """Merge newly emitted checkpoint state into the request scope."""
+        scope = _REQUEST_SCOPE.get()
+        if scope is None:
+            return response
+        state = scope.provider_state
+        if not self._state_matches(state, model):
+            state.clear()
+            self._stamp_state(state, model)
+        checkpoint = response.provider_state.get("checkpoint")
+        checkpoint_emitted = bool(
+            isinstance(checkpoint, dict) and checkpoint.get("encrypted_content")
+        )
+        if isinstance(checkpoint, dict) and checkpoint.get("encrypted_content"):
+            state["checkpoint"] = {
+                "type": "compaction",
+                "encrypted_content": checkpoint["encrypted_content"],
+            }
+        response.provider_state = copy.deepcopy(state)
+        if checkpoint_emitted:
+            response.provider_state["_checkpoint_emitted"] = True
+        return response
+
+    def _recover_rejected_payload(
+        self,
+        detail: Any,
+        *,
+        model: str | None,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Mutate session-local state for one safe provider downgrade."""
+        scope = _REQUEST_SCOPE.get()
+        if scope is None:
+            return False
+        state = scope.provider_state
+        if _is_native_rejection(detail) and "context_management" in payload:
+            if not self._state_matches(state, model):
+                state.clear()
+                self._stamp_state(state, model)
+            state["native_disabled"] = True
+            logger.warning(
+                "Native provider compaction was rejected for session {}; "
+                "using local compaction for the rest of this session",
+                scope.session_key or "<default>",
+            )
+            return True
+        if _is_encrypted_checkpoint_rejection(detail) and state.get("checkpoint"):
+            state.pop("checkpoint", None)
+            state.pop("covered_event_id", None)
+            state.pop("covered_event_seq", None)
+            logger.warning(
+                "Encrypted provider checkpoint was rejected for session {}; "
+                "retrying from the complete local transcript",
+                scope.session_key or "<default>",
+            )
+            return True
+        return False
 
     def _headers(self, session_id: str, *, accept: str) -> dict[str, str]:
         return {
@@ -432,12 +683,15 @@ class CodexResponsesProvider(LLMProvider):
         # This backend rejects max_output_tokens / temperature — accepted for
         # interface parity, deliberately not forwarded.
         del max_tokens, temperature, purpose
-        payload, session_id = self._build_payload(
-            messages, tools, model, tool_choice, stream=True
-        )
+        resolved_model = _normalize_codex_model(model or self.default_model)
         request_timeout = timeout or self.request_timeout_seconds
+        auth_refreshed = False
+        recovery_attempts = 0
         try:
-            for attempt in range(2):
+            for _attempt in range(4):
+                payload, session_id = self._build_payload(
+                    messages, tools, model, tool_choice, stream=True
+                )
                 async with httpx.AsyncClient(timeout=request_timeout) as client:
                     async with client.stream(
                         "POST",
@@ -445,9 +699,10 @@ class CodexResponsesProvider(LLMProvider):
                         json=payload,
                         headers=self._headers(session_id, accept="text/event-stream"),
                     ) as response:
-                        if response.status_code == 401 and attempt == 0:
+                        if response.status_code == 401 and not auth_refreshed:
                             await response.aread()
                             await self._refresh_api_key()
+                            auth_refreshed = True
                             continue
                         if response.status_code == 403:
                             await response.aread()
@@ -457,17 +712,44 @@ class CodexResponsesProvider(LLMProvider):
                             )
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "replace")
+                            if (
+                                recovery_attempts < 2
+                                and self._recover_rejected_payload(
+                                    body,
+                                    model=resolved_model,
+                                    payload=payload,
+                                )
+                            ):
+                                recovery_attempts += 1
+                                continue
                             raise ProviderHTTPError(
                                 "Codex Responses",
                                 response.status_code,
                                 self._redact(body[:500]),
                             )
-                        return await self._aggregate_stream(response)
+                        try:
+                            final = await self._aggregate_stream(response)
+                        except Exception as stream_exc:
+                            if (
+                                recovery_attempts < 2
+                                and self._recover_rejected_payload(
+                                    stream_exc,
+                                    model=resolved_model,
+                                    payload=payload,
+                                )
+                            ):
+                                recovery_attempts += 1
+                                continue
+                            raise
+                        return self._merge_response_state(final, resolved_model)
         except Exception as exc:
-            return self._error_response(exc)
-        return LLMResponse(
+            return self._merge_response_state(
+                self._error_response(exc),
+                resolved_model,
+            )
+        return self._merge_response_state(LLMResponse(
             content="Error calling LLM: Codex OAuth refresh failed", finish_reason="error"
-        )
+        ), resolved_model)
 
     async def _aggregate_stream(self, response: httpx.Response) -> LLMResponse:
         """Collect an SSE stream into one final LLMResponse (blocking path).
@@ -540,6 +822,7 @@ class CodexResponsesProvider(LLMProvider):
 
         content_parts: list[str] = []
         tool_calls: list[ToolCallRequest] = []
+        checkpoint: dict[str, str] | None = None
         output = data.get("output")
         if isinstance(output, list):
             for item in output:
@@ -565,6 +848,13 @@ class CodexResponsesProvider(LLMProvider):
                             args = {"raw": str(raw_args or "")}
                     call_id = str(item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}")
                     tool_calls.append(ToolCallRequest(id=call_id, name=name, arguments=args))
+                elif item_type == "compaction":
+                    encrypted = item.get("encrypted_content")
+                    if isinstance(encrypted, str) and encrypted:
+                        checkpoint = {
+                            "type": "compaction",
+                            "encrypted_content": encrypted,
+                        }
 
         final_text = "\n".join(p for p in content_parts if p).strip()
         if not final_text and isinstance(data.get("output_text"), str):
@@ -575,6 +865,11 @@ class CodexResponsesProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason="tool_calls" if tool_calls else ("length" if status == "incomplete" else "stop"),
             usage=_usage_from_response(data),
+            provider_state=(
+                {"checkpoint": checkpoint}
+                if checkpoint is not None
+                else {}
+            ),
         )
 
     # ── streaming chat ───────────────────────────────────────────────
@@ -596,12 +891,15 @@ class CodexResponsesProvider(LLMProvider):
         blocking :meth:`chat` so a turn is never left empty.
         """
         del max_tokens, temperature
-        payload, session_id = self._build_payload(
-            messages, tools, model, tool_choice, stream=True
-        )
+        resolved_model = _normalize_codex_model(model or self.default_model)
         request_timeout = self.request_timeout_seconds
+        auth_refreshed = False
+        recovery_attempts = 0
         try:
-            for attempt in range(2):
+            for _attempt in range(4):
+                payload, session_id = self._build_payload(
+                    messages, tools, model, tool_choice, stream=True
+                )
                 streamed_text = False
                 async with httpx.AsyncClient(timeout=request_timeout) as client:
                     async with client.stream(
@@ -610,9 +908,10 @@ class CodexResponsesProvider(LLMProvider):
                         json=payload,
                         headers=self._headers(session_id, accept="text/event-stream"),
                     ) as response:
-                        if response.status_code == 401 and attempt == 0:
+                        if response.status_code == 401 and not auth_refreshed:
                             await response.aread()
                             await self._refresh_api_key()
+                            auth_refreshed = True
                             continue
                         if response.status_code == 403:
                             await response.aread()
@@ -622,6 +921,16 @@ class CodexResponsesProvider(LLMProvider):
                             )
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "replace")
+                            if (
+                                recovery_attempts < 2
+                                and self._recover_rejected_payload(
+                                    body,
+                                    model=resolved_model,
+                                    payload=payload,
+                                )
+                            ):
+                                recovery_attempts += 1
+                                continue
                             raise ProviderHTTPError(
                                 "Codex Responses",
                                 response.status_code,
@@ -661,6 +970,10 @@ class CodexResponsesProvider(LLMProvider):
                                 parsed = self._parse_response(
                                     {"output": collected_items, "usage": usage, "status": status}
                                 )
+                                parsed = self._merge_response_state(
+                                    parsed,
+                                    resolved_model,
+                                )
                                 if not streamed_text and parsed.content:
                                     yield LLMResponse(content=parsed.content, finish_reason="")
                                 yield LLMResponse(
@@ -668,6 +981,7 @@ class CodexResponsesProvider(LLMProvider):
                                     tool_calls=parsed.tool_calls,
                                     finish_reason=parsed.finish_reason,
                                     usage=parsed.usage,
+                                    provider_state=parsed.provider_state,
                                 )
                                 return
                             elif etype in {"response.failed", "error"}:
@@ -682,11 +996,16 @@ class CodexResponsesProvider(LLMProvider):
                             parsed = self._parse_response(
                                 {"output": collected_items, "usage": {}, "status": "completed"}
                             )
+                            parsed = self._merge_response_state(
+                                parsed,
+                                resolved_model,
+                            )
                             yield LLMResponse(
                                 content=None,
                                 tool_calls=parsed.tool_calls,
                                 finish_reason=parsed.finish_reason,
                                 usage=parsed.usage,
+                                provider_state=parsed.provider_state,
                             )
                             return
                         raise CodexAuthError("Codex stream closed without recognizable output")

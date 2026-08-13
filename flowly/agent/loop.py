@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -4172,12 +4173,18 @@ class AgentLoop:
         # calls safe.
         final_usage = dict(final_response.usage) if final_response and final_response.usage else {}
         final_error_info = final_response.error_info if final_response else None
+        final_provider_state = (
+            dict(final_response.provider_state)
+            if final_response and final_response.provider_state
+            else {}
+        )
         if final_response is None:
             final_response = LLMResponse(
                 content=accumulated_text or None,
                 finish_reason="stop",
                 usage=final_usage,
                 partial_content_delivered=bool(accumulated_text),
+                provider_state=final_provider_state,
             )
         elif final_response.tool_calls:
             # Final chunk had tool calls — content came in earlier deltas
@@ -4188,6 +4195,7 @@ class AgentLoop:
                 usage=final_usage,
                 error_info=final_error_info,
                 partial_content_delivered=bool(accumulated_text),
+                provider_state=final_provider_state,
             )
         else:
             # Pure text — use accumulated content
@@ -4197,6 +4205,7 @@ class AgentLoop:
                 usage=final_usage,
                 error_info=final_error_info,
                 partial_content_delivered=bool(accumulated_text),
+                provider_state=final_provider_state,
             )
 
         return final_response
@@ -4272,6 +4281,8 @@ class AgentLoop:
         run_id: str = "",
         iteration: int = 0,
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
+        provider_state: dict[str, Any] | None = None,
+        provider_state_out: dict[str, Any] | None = None,
     ) -> tuple[LLMResponse, list[dict[str, Any]]]:
         """Budget, dispatch, and recover one main-agent provider request.
 
@@ -4282,6 +4293,7 @@ class AgentLoop:
         limits and other failures never enter this recovery path.
         """
         coordinator = self._request_coordinator()
+        continuity_state = provider_state if provider_state is not None else {}
 
         def cancelled() -> bool:
             return bool(run_id) and self.is_run_aborted(run_id)
@@ -4324,24 +4336,55 @@ class AgentLoop:
             self._touch_activity(
                 f"starting LLM call #{self._api_call_count} (iter {iteration})"
             )
-            if stream_callback is not None:
-                return await self._chat_with_stream(
-                    messages=payload,
-                    tools=tools,
-                    model=model,
-                    temperature=temperature,
-                    tool_choice=tool_choice,
-                    stream_callback=stream_callback,
-                    run_id=run_id,
+            request_scope = getattr(self.provider, "request_scope", None)
+            scope = (
+                request_scope(
+                    session_key=session_key,
+                    provider_state=continuity_state,
+                    local_compaction_threshold=(
+                        self.compaction.compaction_threshold_for(model)
+                    ),
                 )
-            return await self._chat_without_stream(
-                messages=payload,
-                tools=tools,
-                model=model,
-                temperature=temperature,
-                tool_choice=tool_choice,
-                run_id=run_id,
+                if callable(request_scope)
+                else nullcontext()
             )
+            with scope:
+                if stream_callback is not None:
+                    response = await self._chat_with_stream(
+                        messages=payload,
+                        tools=tools,
+                        model=model,
+                        temperature=temperature,
+                        tool_choice=tool_choice,
+                        stream_callback=stream_callback,
+                        run_id=run_id,
+                    )
+                else:
+                    response = await self._chat_without_stream(
+                        messages=payload,
+                        tools=tools,
+                        model=model,
+                        temperature=temperature,
+                        tool_choice=tool_choice,
+                        run_id=run_id,
+                    )
+            if response.provider_state:
+                checkpoint_emitted = bool(
+                    response.provider_state.get("_checkpoint_emitted")
+                )
+                durable_state = {
+                    key: value
+                    for key, value in response.provider_state.items()
+                    if key != "_checkpoint_emitted"
+                }
+                continuity_state.clear()
+                continuity_state.update(copy.deepcopy(durable_state))
+                if checkpoint_emitted:
+                    response.provider_state["_checkpoint_emitted"] = True
+            if provider_state_out is not None:
+                provider_state_out.clear()
+                provider_state_out.update(copy.deepcopy(continuity_state))
+            return response
 
         response = await dispatch(working)
         if response.finish_reason != "error":
@@ -4514,6 +4557,8 @@ class AgentLoop:
         reply_media_assets: list | None = None,
         error_out: dict[str, Any] | None = None,
         turn_messages_out: list[dict[str, Any]] | None = None,
+        provider_state: dict[str, Any] | None = None,
+        provider_state_out: dict[str, Any] | None = None,
     ) -> tuple[str, list[dict[str, Any]], list[str], dict[str, Any], list[dict[str, Any]]]:
         """
         Run iterative LLM + tool execution loop until final response.
@@ -4539,8 +4584,12 @@ class AgentLoop:
         # on ``self``). Default to a local list when not threaded.
         if reply_media is None:
             reply_media = []
+        continuity_state = provider_state if provider_state is not None else {}
+        durable_turn_message_count = 0
 
         def _record_turn_message(message: dict[str, Any]) -> None:
+            nonlocal durable_turn_message_count
+            durable_turn_message_count += 1
             if turn_messages_out is not None:
                 turn_messages_out.append(copy.deepcopy(message))
 
@@ -4956,6 +5005,8 @@ class AgentLoop:
                     run_id=outbound_run_id,
                     iteration=iteration,
                     stream_callback=stream_callback if use_stream else None,
+                    provider_state=continuity_state,
+                    provider_state_out=provider_state_out,
                 )
 
             # Cooperative abort — short-circuit the tool loop. Two
@@ -4997,6 +5048,8 @@ class AgentLoop:
                     session_key=session_key,
                     run_id=outbound_run_id,
                     iteration=iteration,
+                    provider_state=continuity_state,
+                    provider_state_out=provider_state_out,
                 )
 
             if (
@@ -5019,7 +5072,27 @@ class AgentLoop:
                     session_key=session_key,
                     run_id=outbound_run_id,
                     iteration=iteration,
+                    provider_state=continuity_state,
+                    provider_state_out=provider_state_out,
                 )
+
+            if response.provider_state.get("_checkpoint_emitted"):
+                marker = self.provider.continuity_marker(
+                    continuity_state,
+                    selected_model,
+                )
+                if marker is not None:
+                    # The checkpoint belongs exactly after the input that
+                    # produced it and before this response's message/tool item.
+                    # Keep it in the transient working chain for immediate
+                    # tool-loop replay; only its encrypted state is persisted.
+                    messages = [*messages, marker]
+                    continuity_state["_covered_turn_message_count"] = (
+                        durable_turn_message_count
+                    )
+                    if provider_state_out is not None:
+                        provider_state_out.clear()
+                        provider_state_out.update(copy.deepcopy(continuity_state))
 
             # Audit the LLM call after the retry chain settles. We log
             # one row per iteration (not per individual attempt) — the
@@ -6863,11 +6936,13 @@ class AgentLoop:
             )
         session.metadata["persona"] = current_persona
 
+        effective_model = msg.metadata.get("model_override") or self.model
+
         # Get history and check for compaction. The session-length snapshot
         # travels with the history snapshot: if this turn ends up committing a
         # compaction, anything appended past this point by a concurrent turn
         # is preserved across the rewrite (see _commit_compaction).
-        history = self._history_with_summary_anchor(session)
+        history = self._history_with_summary_anchor(session, effective_model)
         session_snapshot_len = len(session.messages)
         session_epoch = self.context_epoch(msg.session_key)
 
@@ -6888,7 +6963,6 @@ class AgentLoop:
         skip_memory_flag = bool(msg.metadata.get("skip_memory", False))
         skip_context_files_flag = bool(msg.metadata.get("skip_context_files", False))
         voice_mode_flag = bool(msg.metadata.get("voice_mode", False))
-        effective_model = msg.metadata.get("model_override") or self.model
         request_sidecars = [
             block
             for block in (
@@ -6969,7 +7043,7 @@ class AgentLoop:
             await self._run_memory_flush(session, msg.channel, msg.chat_id)
             self.compaction.mark_memory_flush_done(msg.session_key)
             # Reload history after flush
-            history = self._history_with_summary_anchor(session)
+            history = self._history_with_summary_anchor(session, effective_model)
             session_snapshot_len = len(session.messages)
             history_tokens = estimate_messages_tokens(history)
             total_tokens = history_tokens + fixed_overhead
@@ -7034,11 +7108,11 @@ class AgentLoop:
                     # produce a stale result the generation guard below would
                     # discard anyway. Silent: their cycle told the story.
                     result = None
-                    history = self._history_with_summary_anchor(session)
+                    history = self._history_with_summary_anchor(session, effective_model)
                     session_snapshot_len = len(session.messages)
                     _concurrent = True
                 else:
-                    history = self._history_with_summary_anchor(session)
+                    history = self._history_with_summary_anchor(session, effective_model)
                     session_snapshot_len = len(session.messages)
                     _source_fingerprint = self.sessions.source_fingerprint(
                         session.messages, session_snapshot_len
@@ -7078,7 +7152,7 @@ class AgentLoop:
                             "Discarding auto-compaction — session was compacted concurrently"
                         )
                         result = None
-                        history = self._history_with_summary_anchor(session)
+                        history = self._history_with_summary_anchor(session, effective_model)
                         session_snapshot_len = len(session.messages)
                         _concurrent = True
                     else:
@@ -7115,7 +7189,7 @@ class AgentLoop:
                         )
                         self.compaction.record_compaction_failure(msg.session_key)
                         result = None
-                        history = self._history_with_summary_anchor(session)
+                        history = self._history_with_summary_anchor(session, effective_model)
 
             if result is None and _concurrent:
                 # Not a failure: someone else's compaction already shrank this
@@ -7231,6 +7305,8 @@ class AgentLoop:
         # them (video duration/dimensions/poster). Same per-turn lifetime.
         reply_media_assets: list = []
         provider_error: dict[str, Any] = {}
+        provider_state = self._provider_continuity_state(session)
+        provider_state_out: dict[str, Any] = {}
         final_content, tool_results, _executed_tools, usage, _loop_messages = await self._run_llm_tool_loop(
             messages=messages,
             action_turn=action_turn,
@@ -7250,6 +7326,8 @@ class AgentLoop:
             reply_media_assets=reply_media_assets,
             error_out=provider_error,
             turn_messages_out=turn_messages,
+            provider_state=provider_state,
+            provider_state_out=provider_state_out,
         )
         outbound_run_id = msg.metadata.get("run_id") or ""
         turn_aborted = bool(
@@ -7285,6 +7363,7 @@ class AgentLoop:
         # turn's LLM sees its prior tool calls + results, not just
         # the final summary text. See ``Session.extend_with_turn_messages``
         # for the full recipe (user + each loop message + capstone).
+        turn_start_index = len(session.messages)
         session.extend_with_turn_messages(
             user_content=display_content,
             new_messages=turn_messages,
@@ -7300,6 +7379,11 @@ class AgentLoop:
             # assistant completions. Keep their visible error text in history
             # without advancing the cross-client unread identity.
             run_id=(outbound_run_id or None) if not provider_error else None,
+        )
+        self._commit_provider_continuity(
+            session,
+            provider_state_out,
+            turn_start_index=turn_start_index,
         )
         self.sessions.save(session)
         await self._index_turn_media(
@@ -7575,6 +7659,8 @@ class AgentLoop:
         # Descriptors for the files above, when the producing tool measured
         # them (video duration/dimensions/poster). Same per-turn lifetime.
         reply_media_assets: list = []
+        provider_state = self._provider_continuity_state(session)
+        provider_state_out: dict[str, Any] = {}
         final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
             messages=messages,
             action_turn=action_turn,
@@ -7588,6 +7674,8 @@ class AgentLoop:
             reply_media=reply_media,
             reply_media_assets=reply_media_assets,
             turn_messages_out=turn_messages,
+            provider_state=provider_state,
+            provider_state_out=provider_state_out,
         )
 
         # No pending-action-lock bookkeeping here: a system/announce turn is a
@@ -7598,6 +7686,7 @@ class AgentLoop:
         # tool-protocol structure is preserved by
         # ``extend_with_turn_messages`` so a subagent's tool work is
         # visible to the parent agent on the next turn.
+        turn_start_index = len(session.messages)
         session.extend_with_turn_messages(
             user_content=f"[System: {msg.sender_id}] {msg.content}",
             new_messages=turn_messages,
@@ -7610,6 +7699,11 @@ class AgentLoop:
             # user message — only the assistant's summary is user-facing.
             user_display_hidden=True,
             run_id=(msg.metadata.get("run_id") or None),
+        )
+        self._commit_provider_continuity(
+            session,
+            provider_state_out,
+            turn_start_index=turn_start_index,
         )
         self.sessions.save(session)
         # A system/announce turn has no inbound attachment — it is triggered by
@@ -8238,7 +8332,11 @@ class AgentLoop:
         except Exception:  # noqa: BLE001
             return 0
 
-    def _history_with_summary_anchor(self, session: Any) -> list[dict[str, Any]]:
+    def _history_with_summary_anchor(
+        self,
+        session: Any,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Complete working history with the durable summary normalised.
 
         A fixed record-count slice here used to run *before* request token
@@ -8252,7 +8350,35 @@ class AgentLoop:
         refresh its attached plan note in the request copy only, so a durable
         plan can advance without rewriting the stored transcript.
         """
-        history = session.get_history()
+        selected_model = model or getattr(self, "model", "")
+        state = (
+            session.metadata.get("provider_continuity")
+            if isinstance(getattr(session, "metadata", None), dict)
+            else None
+        )
+        provider = getattr(self, "provider", None)
+        marker_factory = getattr(provider, "continuity_marker", None)
+        marker = (
+            marker_factory(state, selected_model)
+            if isinstance(state, dict) and callable(marker_factory)
+            else None
+        )
+        history = None
+        if marker is not None:
+            covered_event_id = str(state.get("covered_event_id") or "")
+            history = session.get_history_with_checkpoint(
+                covered_event_id=covered_event_id,
+                marker=marker,
+            )
+            if history is None:
+                logger.warning(
+                    "Provider checkpoint boundary {} is absent from session {}; "
+                    "using complete local history",
+                    covered_event_id or "<missing>",
+                    getattr(session, "key", "<unknown>"),
+                )
+        if history is None:
+            history = session.get_history()
         try:
             summary = session.metadata.get("last_compaction_summary")
         except AttributeError:
@@ -8281,6 +8407,54 @@ class AgentLoop:
                 return history[:index] + [refreshed] + history[index + 1:]
         anchor = {"role": "system", "content": content}
         return [anchor] + history
+
+    @staticmethod
+    def _provider_continuity_state(session: Any) -> dict[str, Any]:
+        state = getattr(session, "metadata", {}).get("provider_continuity")
+        return copy.deepcopy(state) if isinstance(state, dict) else {}
+
+    @staticmethod
+    def _commit_provider_continuity(
+        session: Any,
+        state: dict[str, Any],
+        *,
+        turn_start_index: int,
+    ) -> None:
+        """Attach a new encrypted checkpoint to its durable event boundary."""
+        if not isinstance(state, dict) or not state:
+            return
+        durable = {
+            key: copy.deepcopy(state[key])
+            for key in (
+                "provider",
+                "model",
+                "issuer",
+                "native_disabled",
+                "checkpoint",
+                "covered_event_id",
+                "covered_event_seq",
+            )
+            if key in state
+        }
+        covered_turn_count = state.get("_covered_turn_message_count")
+        if isinstance(durable.get("checkpoint"), dict):
+            if isinstance(covered_turn_count, int) and covered_turn_count >= 0:
+                boundary_index = turn_start_index + covered_turn_count
+                if 0 <= boundary_index < len(session.messages):
+                    boundary = session.messages[boundary_index]
+                    durable["covered_event_id"] = str(
+                        boundary.get(EVENT_ID_KEY) or ""
+                    )
+                    durable["covered_event_seq"] = int(
+                        boundary.get(EVENT_SEQ_KEY) or 0
+                    )
+        else:
+            durable.pop("covered_event_id", None)
+            durable.pop("covered_event_seq", None)
+        if durable:
+            session.metadata["provider_continuity"] = durable
+        else:
+            session.metadata.pop("provider_continuity", None)
 
     def _context_coverage_sidecar(self, session: Any) -> str:
         """Return a deterministic request-only archive coverage manifest."""
@@ -8642,6 +8816,10 @@ class AgentLoop:
         session.metadata["last_compaction_summary"] = result.summary
         session.metadata["last_compaction_coverage"] = summary_covers
         session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
+        # Local summary compaction has established a new custody boundary.
+        # Any opaque provider checkpoint described the pre-rewrite working
+        # sequence and must not be replayed on top of the new local summary.
+        session.metadata.pop("provider_continuity", None)
         session.metadata["_pending_archive_transaction"] = archive_transaction
         # The display seam is phase two of the canonical swap. Persisting its
         # intent first means a crash after the swap can finish it on reload;

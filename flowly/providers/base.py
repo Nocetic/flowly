@@ -5,8 +5,14 @@ from __future__ import annotations
 import json
 import re
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
+
+# Prompt-only control row. It is never persisted as a conversation message;
+# eligible Responses providers translate it into an opaque input item while
+# every other provider sees no row at all.
+PROVIDER_COMPACTION_CHECKPOINT_KEY = "_provider_compaction_checkpoint"
 
 
 @dataclass
@@ -133,6 +139,10 @@ class LLMResponse:
     # Retrying an error after that point would duplicate or contradict visible
     # output, so context recovery must fail closed and preserve the partial.
     partial_content_delivered: bool = False
+    # Opaque continuity state produced by a provider. AgentLoop persists this
+    # under session metadata, never in the visible transcript, and gives it
+    # back only to the same provider/model/issuer on later requests.
+    provider_state: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_tool_calls(self) -> bool:
@@ -151,6 +161,32 @@ class LLMProvider(ABC):
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
         self.api_base = api_base
+
+    @contextmanager
+    def request_scope(
+        self,
+        *,
+        session_key: str,
+        provider_state: dict[str, Any],
+        local_compaction_threshold: int | None = None,
+    ) -> Iterator[None]:
+        """Bind per-session provider state for one request.
+
+        Most providers are stateless and inherit this no-op. Responses-style
+        providers can override it with a ContextVar-backed scope so concurrent
+        sessions never leak encrypted replay state into one another.
+        """
+        del session_key, provider_state, local_compaction_threshold
+        yield
+
+    def continuity_marker(
+        self,
+        provider_state: dict[str, Any],
+        model: str | None,
+    ) -> dict[str, Any] | None:
+        """Return a prompt-only checkpoint row when this state is reusable."""
+        del provider_state, model
+        return None
 
     @abstractmethod
     async def chat(

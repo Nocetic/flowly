@@ -9,6 +9,8 @@ from typing import Any
 
 import tiktoken
 
+from flowly.providers.base import PROVIDER_COMPACTION_CHECKPOINT_KEY
+
 # Cache the encoder
 _encoder: tiktoken.Encoding | None = None
 
@@ -106,4 +108,30 @@ def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
     Returns:
         Total estimated token count.
     """
-    return sum(estimate_message_tokens(msg) for msg in messages)
+    checkpoint_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if isinstance(messages[index], dict)
+            and messages[index].get(PROVIDER_COMPACTION_CHECKPOINT_KEY)
+        ),
+        None,
+    )
+    if checkpoint_index is None:
+        return sum(estimate_message_tokens(msg) for msg in messages)
+
+    # The latest encrypted checkpoint replaces earlier conversational input,
+    # but the Responses ``instructions`` field is rebuilt from system rows on
+    # every call. Price those instructions plus only the post-checkpoint tail.
+    # Opaque encrypted bytes are not text tokens and deliberately contribute
+    # just one protocol-row overhead through estimate_message_tokens(marker).
+    instruction_tokens = sum(
+        estimate_message_tokens(message)
+        for message in messages[:checkpoint_index]
+        if message.get("role") in {"system", "developer"}
+    )
+    tail_tokens = sum(
+        estimate_message_tokens(message)
+        for message in messages[checkpoint_index:]
+    )
+    return instruction_tokens + tail_tokens

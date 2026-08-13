@@ -451,6 +451,37 @@ class Session:
         projected = [_project_for_llm(m) for m in recent]
         return _repair_tool_sequence(projected)
 
+    def get_history_with_checkpoint(
+        self,
+        *,
+        covered_event_id: str,
+        marker: dict[str, Any],
+    ) -> list[dict[str, Any]] | None:
+        """Project complete history with a prompt-only row after one event.
+
+        The raw transcript stays authoritative and untouched. Responses
+        providers use the inserted row to place an encrypted server checkpoint
+        at its original sequence position; other providers never call this
+        method. ``None`` means the covered event no longer exists in the
+        working session (for example, local compaction replaced it).
+        """
+        if not covered_event_id or not isinstance(marker, dict):
+            return None
+        projected: list[dict[str, Any]] = []
+        found = False
+        for message in self.messages:
+            projected.append(_project_for_llm(message))
+            if str(message.get(EVENT_ID_KEY) or "") == covered_event_id:
+                projected.append(dict(marker))
+                found = True
+        if not found:
+            return None
+        repaired = _repair_tool_sequence(projected)
+        marker_keys = set(marker)
+        if not any(marker_keys <= set(item) for item in repaired):
+            return None
+        return repaired
+
     def extend_with_turn_messages(
         self,
         *,

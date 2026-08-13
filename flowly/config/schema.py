@@ -385,6 +385,10 @@ class OpenAICodexConfig(BaseModel):
     against the user's ChatGPT plan.
     """
     enabled: bool = True
+    # Let eligible Responses models emit encrypted server-side checkpoints.
+    # Local summary compaction stays enabled as the independent fallback.
+    native_compaction: bool = True
+    native_compaction_threshold: int = Field(default=200_000, ge=1_024)
 
 
 class ZaiCodingConfig(BaseModel):

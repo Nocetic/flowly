@@ -36,7 +36,10 @@ from flowly.compaction.types import (
     is_context_boundary,
     is_summary_message,
 )
-from flowly.providers.base import LLMProvider
+from flowly.providers.base import (
+    PROVIDER_COMPACTION_CHECKPOINT_KEY,
+    LLMProvider,
+)
 
 
 def _heuristic_context_window(model: str) -> int | None:
@@ -788,6 +791,14 @@ class CompactionService:
             List of recent messages to keep (in original order).
         """
         cfg = self.config.keep_recent
+        # Prompt-only provider checkpoints are opaque transport controls, not
+        # conversation content. If local compaction takes ownership, summarize
+        # the complete raw transcript around them and emit a normal checkpoint.
+        messages = [
+            message
+            for message in messages
+            if not message.get(PROVIDER_COMPACTION_CHECKPOINT_KEY)
+        ]
         if not messages:
             return []
 

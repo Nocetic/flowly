@@ -40,6 +40,12 @@ def build_provider(
             request_timeout_seconds=timeout_seconds,
         )
     if active.key == "openai_codex":
+        providers = getattr(config, "providers", None) if config is not None else None
+        codex_cfg = (
+            getattr(providers, "openai_codex", None)
+            if providers is not None
+            else None
+        )
         return CodexResponsesProvider(
             api_key=active.api_key,
             account_id=active.account_id,
@@ -47,6 +53,12 @@ def build_provider(
             default_model=default_model,
             provider_name=active.key,
             request_timeout_seconds=timeout_seconds,
+            native_compaction=bool(
+                getattr(codex_cfg, "native_compaction", True)
+            ),
+            native_compaction_threshold=int(
+                getattr(codex_cfg, "native_compaction_threshold", 200_000)
+            ),
         )
     if active.key == "anthropic":
         return AnthropicProvider(
