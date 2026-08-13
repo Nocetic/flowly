@@ -78,6 +78,7 @@ from flowly.compaction.estimator import (
 from flowly.exec.types import ExecConfig
 from flowly.config.schema import TrelloConfig, VoiceBridgeConfig, XConfig, MemorySearchConfig
 from flowly.goals.models import GoalDecision
+from flowly.goals.commands import GoalCommandHandler
 from flowly.goals.runtime import DeliveredGoalTurn, GoalDelivery, GoalRuntime
 from flowly.audit.logger import get_audit_logger
 from flowly.agent.prompt_blocks import (
@@ -136,6 +137,14 @@ _GOAL_USER_EPOCH = "_goal_user_epoch"
 def _is_user_activity_channel(channel: str) -> bool:
     """True when ``channel`` is real user conversation (not a background run)."""
     return (channel or "") not in _NON_USER_CHANNELS
+
+
+def _is_goal_control_message(message: InboundMessage) -> bool:
+    command = str(message.metadata.get("command") or "").casefold()
+    if command in {"goal", "subgoal"}:
+        return True
+    parts = str(message.content or "").strip().split(None, 1)
+    return bool(parts and parts[0].casefold() in {"/goal", "/subgoal"})
 
 
 class _AgentGoalDelivery(GoalDelivery):
@@ -856,6 +865,7 @@ class AgentLoop:
         self._goal_output_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None
         self.goal_manager: Any | None = None
         self.goal_runtime: GoalRuntime | None = None
+        self.goal_commands: GoalCommandHandler | None = None
         self._goal_process_unsubscribe: Callable[[], None] | None = None
         self._session_turn_locks: dict[str, asyncio.Lock] = {}
         self._goal_user_epochs: dict[str, int] = {}
@@ -1229,6 +1239,16 @@ class AgentLoop:
             )
             self.goal_manager = manager
             self.goal_runtime = runtime
+            self.goal_commands = GoalCommandHandler(
+                manager,
+                runtime,
+                gate_timeout_seconds=int(
+                    getattr(goals_config, "gate_timeout_seconds", 300)
+                ),
+                gate_max_retries=int(
+                    getattr(goals_config, "gate_max_retries", 3)
+                ),
+            )
 
             def process_trigger(
                 _process_id: str,
@@ -1245,6 +1265,7 @@ class AgentLoop:
             logger.exception("Standing goal initialization failed; /goal is unavailable")
             self.goal_manager = None
             self.goal_runtime = None
+            self.goal_commands = None
 
     def goal_user_epoch(self, session_key: str) -> int:
         epochs = getattr(self, "_goal_user_epochs", None)
@@ -3237,6 +3258,9 @@ class AgentLoop:
                     user_epoch,
                     delivery,
                 )
+            return
+        if metadata.get("_goal_wake_after_delivery"):
+            runtime.wake(msg.session_key, delivery)
             return
         if not metadata.get("_goal_eligible"):
             return
@@ -6722,6 +6746,7 @@ class AgentLoop:
         synthetic_goal_id = str(msg.metadata.get(_GOAL_CONTINUATION_ID) or "")
         is_real_arrival = (
             not synthetic_goal_id
+            and not _is_goal_control_message(msg)
             and _is_user_activity_channel(msg.channel)
             and msg.sender_id not in {"goal", "process", "system", "subagent"}
         )
@@ -6906,6 +6931,10 @@ class AgentLoop:
                 is_command = True
                 command = parsed_cmd
                 command_args = parts[1] if len(parts) > 1 else ""
+            elif parsed_cmd in ("goal", "subgoal"):
+                is_command = True
+                command = parsed_cmd
+                command_args = parts[1] if len(parts) > 1 else ""
             elif parsed_cmd == "learn":
                 # ``/learn [--dry-run] [source]`` is intentionally a normal agent turn:
                 # convert the short command into a Flowly-native skill-authoring
@@ -6959,6 +6988,31 @@ class AgentLoop:
                     channel=msg.channel, chat_id=msg.chat_id, content=f"✅ {action}",
                 )
             return None  # Telegram handler already sent confirmation
+
+        if is_command and command in {"goal", "subgoal"}:
+            handler = getattr(self, "goal_commands", None)
+            if handler is None:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Standing goals are unavailable in this configuration.",
+                )
+            if command == "goal":
+                result = await handler.goal(
+                    msg.session_key,
+                    command_args,
+                    conversation_epoch=self.context_epoch(msg.session_key),
+                )
+            else:
+                result = handler.subgoal(msg.session_key, command_args)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=result.content,
+                metadata=result.metadata(
+                    user_epoch=self.goal_user_epoch(msg.session_key)
+                ),
+            )
 
         if is_command and command == "compact":
             session = self.sessions.get_or_create(msg.session_key)
@@ -7054,6 +7108,8 @@ class AgentLoop:
                 "• `/retry` — Re-run your last message for a fresh reply\n"
                 "• `/undo` — Remove the last turn (returns your prompt to edit)\n"
                 "• `/notools <prompt>` — Answer with tool execution disabled\n"
+                "• `/goal [text|status|show|pause|resume|clear]` — Set or manage an autonomous standing goal\n"
+                "• `/subgoal [text|remove <n>|clear]` — Manage extra goal completion criteria\n"
                 "• `/skills [filter]` — List available skills\n"
                 "• `/learn [--dry-run] [source]` — Create or update a reusable skill from sources you describe\n"
                 "• `/whoami` — Show user / server / conversation\n"

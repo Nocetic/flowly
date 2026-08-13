@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -13,6 +13,7 @@ from flowly.agent.loop import (
     AgentLoop,
 )
 from flowly.bus.events import InboundMessage, OutboundMessage
+from flowly.goals.commands import GoalCommandResult
 
 
 @dataclass
@@ -116,3 +117,39 @@ async def test_same_session_turns_are_serialized_but_arrivals_get_distinct_epoch
     assert peak == 1
     assert first.metadata["_goal_user_epoch"] == 1
     assert second.metadata["_goal_user_epoch"] == 2
+
+
+@pytest.mark.asyncio
+async def test_goal_control_commands_do_not_preempt_the_continuation_epoch() -> None:
+    loop = _bare_loop()
+    loop._goal_user_epochs["web:chat"] = 6
+
+    await loop._process_message(InboundMessage("web", "person", "chat", "/subgoal preserve relay"))
+
+    assert loop.goal_user_epoch("web:chat") == 6
+
+
+@pytest.mark.asyncio
+async def test_goal_slash_command_surfaces_snapshot_and_kickoff_metadata() -> None:
+    loop = object.__new__(AgentLoop)
+    loop._context_epoch = {"web:chat": 2}
+    loop._goal_user_epochs = {"web:chat": 5}
+    state = _State()
+    state.to_public_dict = Mock(return_value={"goalId": "goal-1"})  # type: ignore[attr-defined]
+    result = GoalCommandResult(
+        "goal accepted",
+        state=state,  # type: ignore[arg-type]
+        kickoff_goal_id="goal-1",
+    )
+    loop.goal_commands = Mock()
+    loop.goal_commands.goal = AsyncMock(return_value=result)
+
+    response = await loop._process_message_inner(
+        InboundMessage("web", "person", "chat", "/goal ship")
+    )
+
+    assert response is not None
+    assert response.content == "goal accepted"
+    assert response.metadata["goal"] == {"goalId": "goal-1"}
+    assert response.metadata["_goal_kickoff_goal_id"] == "goal-1"
+    loop.goal_commands.goal.assert_awaited_once_with("web:chat", "ship", conversation_epoch=2)
