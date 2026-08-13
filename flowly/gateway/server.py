@@ -3364,6 +3364,14 @@ class GatewayServer:
         metadata = metadata or {}
         goal_snapshot = metadata.get("goal")
         media = list(media or [])
+        # Goal status is CHIP state, not conversation. Surfaces with a goal
+        # chip (desktop / iOS / TUI — everything on this push path) render the
+        # snapshot; the explanatory text would only duplicate it as a fake
+        # assistant bubble. Event-only, no transcript row.
+        if metadata.get("goalStatus") is True:
+            if isinstance(goal_snapshot, dict):
+                await self.broadcast_goal_updated(session_key, goal_snapshot)
+            return
         if not text and not media and not isinstance(goal_snapshot, dict):
             return
         import uuid as _uuid

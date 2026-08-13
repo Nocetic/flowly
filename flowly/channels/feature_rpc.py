@@ -724,6 +724,41 @@ def set_goal_state_provider(provider) -> None:
     _goal_state_provider = provider
 
 
+_goal_control_cb = None
+
+
+def set_goal_control_callback(cb) -> None:
+    """Register ``async (session_key, action) -> dict`` for goal.pause/resume.
+
+    The chip's pause/play button drives these; they must run through the
+    agent (state mutation + runtime cancel/wake + snapshot broadcast), not a
+    bare store write that no runtime would notice.
+    """
+    global _goal_control_cb
+    _goal_control_cb = cb
+
+
+async def _goal_control(params: dict, action: str) -> dict:
+    if _goal_control_cb is None:
+        raise FeatureRpcError("UNAVAILABLE", "goal control is not available")
+    session_key = str(params.get("sessionKey") or "").strip()
+    if not session_key:
+        raise FeatureRpcError("INVALID_PARAMS", "sessionKey is required")
+    if len(session_key) > 2_000:
+        raise FeatureRpcError("INVALID_PARAMS", "sessionKey is too long")
+    return await _goal_control_cb(session_key, action)
+
+
+async def goal_pause(params: dict) -> dict:
+    """Pause a standing goal (chip button / client control)."""
+    return await _goal_control(params, "pause")
+
+
+async def goal_resume(params: dict) -> dict:
+    """Resume a paused standing goal and wake the autonomous loop."""
+    return await _goal_control(params, "resume")
+
+
 def goal_get(params: dict) -> dict:
     """Return a conversation's durable standing-goal snapshot."""
     session_key = str(params.get("sessionKey") or "").strip()
@@ -3896,6 +3931,8 @@ _DISPATCH: dict[str, tuple] = {
     "push.unregister": (push_unregister, True, False),
     "chat.inflight": (chat_inflight, True, False),
     "goal.get": (goal_get, True, False),
+    "goal.pause": (goal_pause, True, False),
+    "goal.resume": (goal_resume, True, False),
     "chat.compact": (chat_compact, True, False),
     "plan.get": (plan_get, True, False),
     "plan.list": (plan_list, True, False),

@@ -3408,6 +3408,71 @@ class AgentLoop:
             metadata={"outbound": outbound},
         )
 
+    async def goal_control(self, session_key: str, action: str) -> dict[str, Any]:
+        """Pause/resume a standing goal from a client control (the chip button).
+
+        Chat surfaces drive this over feature RPC, so it must do everything the
+        slash command's delivery hook does — mutate state, drop or restart the
+        autonomous loop — and then push the fresh snapshot as a ``goal.updated``
+        event so every connected chip updates WITHOUT a chat message.
+        """
+        manager = getattr(self, "goal_manager", None)
+        runtime = getattr(self, "goal_runtime", None)
+        if manager is None:
+            raise ValueError("goals are not available on this agent")
+        if action == "pause":
+            state = manager.pause(session_key, reason="paused by user")
+            if state is not None and runtime is not None:
+                # A queued continuation must not outlive the pause.
+                runtime.cancel_session(session_key)
+        elif action == "resume":
+            state = manager.resume(session_key)
+        else:
+            raise ValueError(f"unsupported goal action: {action}")
+        if state is None:
+            return {"sessionKey": session_key, "goal": None}
+        snapshot = state.to_public_dict()
+
+        # The live stream (and the wake's turns) follow whichever surface owns
+        # the session right now: a bound gateway socket means direct push,
+        # anything else rides the channel adapter through the bus.
+        gateway = getattr(self, "_gateway_server", None)
+        session_ws = getattr(gateway, "_session_ws", {}).get(session_key) if gateway else None
+        direct = session_ws is not None and not getattr(session_ws, "closed", True)
+
+        if ":" in session_key:
+            channel, chat_id = session_key.split(":", 1)
+        else:
+            channel, chat_id = "cli", session_key
+
+        # Snapshot to every surface — duplicates are harmless (clients guard
+        # by revision), a missing surface is not.
+        if gateway is not None and hasattr(gateway, "broadcast_goal_updated"):
+            try:
+                await gateway.broadcast_goal_updated(session_key, snapshot)
+            except Exception:
+                logger.debug("[goal] gateway snapshot push failed", exc_info=True)
+        try:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="",
+                metadata={"goalStatus": True, "goal": snapshot},
+            ))
+        except Exception:
+            logger.debug("[goal] channel snapshot push failed", exc_info=True)
+
+        if action == "resume" and runtime is not None:
+            delivery = _AgentGoalDelivery(
+                self,
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                direct=direct,
+            )
+            runtime.wake(session_key, delivery)
+        return {"sessionKey": session_key, "goal": snapshot}
+
     def _goal_after_delivery(
         self,
         msg: InboundMessage,

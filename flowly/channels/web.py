@@ -425,6 +425,25 @@ class WebChannel(BaseChannel):
         """
         session_id = msg.chat_id  # chat_id = sessionId for web channel
 
+        # Goal status is CHIP state, not conversation: emit the snapshot as a
+        # `goal.updated` event only. Sending the explanatory text as a chat
+        # final would persist a fake assistant bubble in every client.
+        if msg.metadata.get("goalStatus") is True:
+            goal_snapshot = msg.metadata.get("goal")
+            if isinstance(goal_snapshot, dict):
+                session_key = self._session_key_for_relay_id(session_id)
+                goal_event = {
+                    "type": "event",
+                    "sessionId": session_id,
+                    "event": "goal.updated",
+                    "data": {"sessionKey": session_key, "goal": goal_snapshot},
+                }
+                await self._send_or_queue(json.dumps(goal_event))
+                asyncio.create_task(
+                    self._emit_local_event("goal.updated", goal_event["data"])
+                )
+            return
+
         # Autonomous goal delta.  It travels over the existing relay `chat`
         # event contract, so no relay protocol/version change is required.
         stream_event = msg.metadata.get("stream_event")
