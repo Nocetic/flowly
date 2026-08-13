@@ -216,6 +216,14 @@ def resolve_active_provider(config: Config) -> ActiveProvider | None:
     return None
 
 
+def resolve_named_provider(config: Config, name: str) -> ActiveProvider | None:
+    """Resolve one explicitly named provider without applying the cascade."""
+    key = str(name or "").strip()
+    if not key:
+        return None
+    return _build_for(config, key)
+
+
 def _build_for(config: Config, name: str) -> ActiveProvider | None:
     """Construct an ``ActiveProvider`` for ``name``, or ``None`` if not usable.
 

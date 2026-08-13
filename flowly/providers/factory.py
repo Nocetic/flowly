@@ -77,3 +77,25 @@ def build_provider(
         provider_name=active.key,
         request_timeout_seconds=timeout_seconds,
     )
+
+
+def build_named_provider(
+    config: object,
+    provider_name: str,
+    *,
+    default_model: str,
+) -> LLMProvider | None:
+    """Build one configured provider by name, or ``None`` when unavailable."""
+    from flowly.integrations.active_provider import resolve_named_provider
+
+    active = resolve_named_provider(config, provider_name)  # type: ignore[arg-type]
+    if active is None:
+        return None
+    provider_cfg = getattr(getattr(config, "providers", None), active.key, None)
+    fallback_keys = list(getattr(provider_cfg, "fallback_keys", []) or [])
+    return build_provider(
+        active,
+        default_model=default_model,
+        fallback_keys=fallback_keys,
+        config=config,
+    )

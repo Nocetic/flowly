@@ -19,8 +19,7 @@ import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
@@ -65,6 +64,9 @@ class ProcessSession:
     output_buffer: str = ""
     notify_on_complete: bool = True
     watch_patterns: list[str] = field(default_factory=list)
+    watch_hit: bool = False
+    watch_hit_at: float = 0.0
+    watch_hit_pattern: str = ""
     _watch_last_emit_at: float = 0.0
     _watch_consecutive_strikes: int = 0
     _watch_disabled: bool = False
@@ -86,6 +88,7 @@ class ProcessSession:
     def to_summary(self) -> dict:
         return {
             "id": self.id,
+            "session_id": self.id,
             "command": self.command,
             "status": self.status(),
             "pid": self.pid,
@@ -93,6 +96,16 @@ class ProcessSession:
             "started_at": self.started_at,
             "uptime_seconds": round(self.uptime_seconds(), 2),
             "session_key": self.session_key,
+            "cwd": self.cwd,
+            "watch_patterns": list(self.watch_patterns),
+            "watch_hit": self.watch_hit,
+            "watch_hit_at": self.watch_hit_at or None,
+            "watch_hit_pattern": self.watch_hit_pattern or None,
+            "notify_on_complete": self.notify_on_complete,
+            "output_preview": _strip_ansi(
+                self.output_buffer
+            )[-POLL_OUTPUT_PREVIEW_CHARS:],
+            "detached": self.detached,
         }
 
 
@@ -111,6 +124,9 @@ class ProcessRegistry:
         self._global_watch_emits: list[float] = []
         self._global_watch_cooldown_until: float = 0.0
         self._checkpoint: "ProcessCheckpoint | None" = None
+        self._trigger_callbacks: list[
+            Callable[[str, str | None, str], Awaitable[None] | None]
+        ] = []
 
     def bind_bus(self, bus: "MessageBus") -> None:
         self._bus = bus
@@ -119,6 +135,26 @@ class ProcessRegistry:
         """Enable disk-backed restart-survive. Recovery is the caller's job
         (use ``recover_detached()`` after binding)."""
         self._checkpoint = checkpoint
+
+    def subscribe_trigger(
+        self,
+        callback: Callable[[str, str | None, str], Awaitable[None] | None],
+    ) -> Callable[[], None]:
+        """Observe exits and first watch matches; return an unsubscribe hook."""
+        self._trigger_callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            try:
+                self._trigger_callbacks.remove(callback)
+            except ValueError:
+                pass
+
+        return unsubscribe
+
+    def wait_barrier_active(self, session_id: str) -> bool:
+        """Whether a goal waiting on this process session remains parked."""
+        session = self._running.get(session_id) or self._finished.get(session_id)
+        return bool(session and not session.exited and not session.watch_hit)
 
     async def recover_detached(self) -> int:
         """Load checkpoint, probe PIDs, register survivors as detached sessions.
@@ -232,6 +268,7 @@ class ProcessRegistry:
                 session._finished_at = time.time()
                 session._exit_event.set()
                 await self._move_to_finished(session)
+                await self._notify_trigger(session, "exit")
         preview = session.output_buffer[-POLL_OUTPUT_PREVIEW_CHARS:]
         if session.exited:
             session._completion_consumed = True
@@ -320,6 +357,7 @@ class ProcessRegistry:
                 session._finished_at = time.time()
                 session._exit_event.set()
                 await self._move_to_finished(session)
+                await self._notify_trigger(session, "exit")
                 return {"status": "killed", "session_id": session.id, "exit_code": session.exit_code}
             return {"status": "error", "session_id": session.id, "error": "no process handle"}
         try:
@@ -394,6 +432,7 @@ class ProcessRegistry:
             session._finished_at = time.time()
             session._exit_event.set()
             await self._move_to_finished(session)
+            await self._notify_trigger(session, "exit")
             if session.notify_on_complete:
                 await self._emit_completion(session)
 
@@ -427,6 +466,13 @@ class ProcessRegistry:
                 break
         if matched is None:
             return
+
+        if not session.watch_hit:
+            session.watch_hit = True
+            session.watch_hit_at = time.time()
+            session.watch_hit_pattern = matched
+            self._persist()
+            await self._notify_trigger(session, "watch_match")
 
         now = time.time()
         if now < self._global_watch_cooldown_until:
@@ -516,6 +562,19 @@ class ProcessRegistry:
             await self._bus.publish_inbound(msg)
         except Exception as e:
             logger.warning(f"[ProcessRegistry] completion emit failed for {session.id}: {e}")
+
+    async def _notify_trigger(self, session: ProcessSession, trigger: str) -> None:
+        """Notify observers without allowing them to break process bookkeeping."""
+        for callback in tuple(self._trigger_callbacks):
+            try:
+                result = callback(session.id, session.session_key, trigger)
+                if result is not None:
+                    await result
+            except Exception as exc:
+                logger.debug(
+                    f"[ProcessRegistry] trigger observer failed for "
+                    f"{session.id}: {exc}"
+                )
 
 
 def _split_session_key(session_key: str) -> tuple[str, str]:

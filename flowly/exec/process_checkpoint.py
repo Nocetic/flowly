@@ -24,7 +24,6 @@ from loguru import logger
 
 from flowly.exec.process_registry import ProcessSession
 
-
 CHECKPOINT_VERSION = 1
 
 
@@ -59,6 +58,9 @@ class ProcessCheckpoint:
                     "cwd": s.cwd,
                     "startedAt": s.started_at,
                     "watchPatterns": list(s.watch_patterns),
+                    "watchHit": s.watch_hit,
+                    "watchHitAt": s.watch_hit_at,
+                    "watchHitPattern": s.watch_hit_pattern,
                     "notifyOnComplete": s.notify_on_complete,
                 }
                 for s in running
@@ -114,6 +116,9 @@ class ProcessCheckpoint:
                 exited=False,
                 notify_on_complete=bool(entry.get("notifyOnComplete", False)),
                 watch_patterns=list(entry.get("watchPatterns") or []),
+                watch_hit=bool(entry.get("watchHit", False)),
+                watch_hit_at=float(entry.get("watchHitAt", 0.0) or 0.0),
+                watch_hit_pattern=str(entry.get("watchHitPattern") or ""),
             )
             recovered.append(session)
         if recovered:

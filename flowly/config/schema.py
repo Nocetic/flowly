@@ -282,6 +282,24 @@ class SkillImprovementConfig(BaseModel):
     snapshot_keep: int = 10              # rollback snapshots to retain
 
 
+class GoalsConfig(BaseModel):
+    """Configuration for explicitly activated standing goals.
+
+    Ordinary conversation never creates a goal; these settings apply only
+    after the user invokes ``/goal``.
+    """
+    enabled: bool = True
+    max_turns: int = Field(default=20, ge=1, le=10_000)
+    # Empty values inherit the main conversation provider/model. A named
+    # provider must already have usable credentials under ``providers``.
+    judge_provider: str = ""
+    judge_model: str = ""
+    judge_timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
+    judge_max_tokens: int = Field(default=4_096, ge=64, le=16_384)
+    gate_timeout_seconds: int = Field(default=300, ge=1, le=3_600)
+    gate_max_retries: int = Field(default=3, ge=0, le=100)
+
+
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.flowly/workspace"
@@ -325,6 +343,7 @@ class AgentDefaults(BaseModel):
     memory_search: MemorySearchConfig = Field(default_factory=MemorySearchConfig)
     memory_dreaming: MemoryDreamingConfig = Field(default_factory=MemoryDreamingConfig)
     skill_improvement: SkillImprovementConfig = Field(default_factory=SkillImprovementConfig)
+    goals: GoalsConfig = Field(default_factory=GoalsConfig)
 
 
 class MultiAgentConfig(BaseModel):
