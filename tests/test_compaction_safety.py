@@ -27,6 +27,7 @@ from flowly.compaction.types import (
     CompactionConfig,
     CompactionError,
     KeepRecentConfig,
+    build_summary_content,
     is_summary_message,
 )
 from flowly.providers.base import LLMResponse
@@ -123,6 +124,29 @@ async def test_successful_compaction_commits_summary():
     )
     assert result.tokens_after < result.tokens_before
     assert service.compaction_count_for("s1") == 1
+
+
+async def test_recompaction_updates_prior_summary_without_summarizing_its_wrapper():
+    provider = _Provider(LLMResponse(
+        content="## Decisions\nKeep the current database.",
+        finish_reason="stop",
+    ))
+    service = _service(provider)
+    prior_body = "## Decisions\nSQLite was selected in the first phase."
+    messages = [
+        {"role": "system", "content": build_summary_content(prior_body)},
+        *_conversation(8, filler="detail " * 100),
+    ]
+
+    result = await service.compact(messages)
+    committed = build_summary_content(result.summary)
+
+    assert provider.saw(prior_body)
+    assert not provider.saw(SUMMARY_REFERENCE_PREAMBLE)
+    assert not provider.saw(SUMMARY_MARKER)
+    assert committed.count(SUMMARY_MARKER) == 1
+    assert committed.count(SUMMARY_REFERENCE_PREAMBLE) == 1
+    assert "question 7" in result.summary
 
 
 async def test_compaction_that_does_not_shrink_is_refused():

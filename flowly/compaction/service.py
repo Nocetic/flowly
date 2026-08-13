@@ -21,6 +21,7 @@ from flowly.compaction.pruning import (
     split_into_turn_blocks,
 )
 from flowly.compaction.summarizer import (
+    ground_historical_request,
     reject_invented_user_attribution,
     summarize_in_stages,
 )
@@ -31,6 +32,7 @@ from flowly.compaction.types import (
     CompactionError,
     CompactionResult,
     build_summary_content,
+    extract_summary_text,
     is_context_boundary,
     is_summary_message,
 )
@@ -909,6 +911,24 @@ class CompactionService:
             )
 
         tokens_before = estimate_messages_tokens(messages)
+
+        # A committed checkpoint is state, not another transcript turn. Feed
+        # its body through ``previous_summary`` and summarize only the new raw
+        # delta. Otherwise each cycle recursively summarizes our own safety
+        # preamble and marker, which steadily distorts facts and wastes room.
+        inherited_summaries: list[str] = []
+        source_messages: list[dict[str, Any]] = []
+        for message in messages:
+            inherited = extract_summary_text(message)
+            if inherited is None:
+                source_messages.append(message)
+            elif inherited.strip():
+                inherited_summaries.append(inherited.strip())
+        if previous_summary and previous_summary.strip():
+            inherited_summaries.append(previous_summary.strip())
+        if inherited_summaries:
+            previous_summary = "\n\n".join(dict.fromkeys(inherited_summaries))
+
         # Size every summarisation call against the window we can actually
         # use — the model's real window, clamped by the active provider's
         # input cap. Budgeting chunks against a configured 128K while the
@@ -916,7 +936,7 @@ class CompactionService:
         window = self.effective_context_window
 
         # Determine which recent messages to preserve verbatim
-        kept_messages = self._calculate_keep_recent(messages, history_budget)
+        kept_messages = self._calculate_keep_recent(source_messages, history_budget)
         kept_count = len(kept_messages)
 
         # Only summarize messages NOT in the kept set — valid only when the
@@ -927,25 +947,25 @@ class CompactionService:
         # extracted tail therefore summarizes everything; its verbatim copy
         # rides on top, at the cost of a little duplication.
         is_suffix = (
-            0 < kept_count < len(messages)
-            and kept_messages == messages[-kept_count:]
+            0 < kept_count < len(source_messages)
+            and kept_messages == source_messages[-kept_count:]
         )
         if is_suffix:
-            messages_to_summarize = messages[:-kept_count]
+            messages_to_summarize = source_messages[:-kept_count]
             logger.info(
                 f"Keeping {kept_count} recent messages "
                 f"(~{estimate_messages_tokens(kept_messages)} tokens), "
                 f"summarizing {len(messages_to_summarize)}"
             )
-        elif kept_count > 0 and kept_count < len(messages):
-            messages_to_summarize = messages
+        elif kept_count > 0 and kept_count < len(source_messages):
+            messages_to_summarize = source_messages
             logger.info(
                 f"Keeping the essential tail ({kept_count} messages, "
                 f"~{estimate_messages_tokens(kept_messages)} tokens) verbatim; "
-                f"summarizing all {len(messages)}"
+                f"summarizing all {len(source_messages)}"
             )
-        elif kept_count == len(messages):
-            newest_block = split_into_turn_blocks(messages)[-1]
+        elif kept_count == len(source_messages) and source_messages:
+            newest_block = split_into_turn_blocks(source_messages)[-1]
             protected_tail = _essential_turn_tail(newest_block)
             if protected_tail:
                 # The preference-based tail happened to include the whole
@@ -954,7 +974,7 @@ class CompactionService:
                 # newest raw question + final plain-text answer. Summarize all
                 # source messages so tool actions still reach the reference.
                 kept_messages = protected_tail
-                messages_to_summarize = messages
+                messages_to_summarize = source_messages
                 logger.info(
                     "Recent-tail preference covered the whole history; "
                     "preserving the newest essential turn and summarizing all"
@@ -962,11 +982,12 @@ class CompactionService:
             else:
                 # A genuinely userless/system-driven history has no active
                 # request to protect.
-                messages_to_summarize = messages
+                messages_to_summarize = source_messages
                 kept_messages = []
         else:
-            messages_to_summarize = messages
+            messages_to_summarize = source_messages
             kept_messages = []  # Nothing to keep (all summarized)
+        grounding_messages = list(messages_to_summarize)
         dropped_summary: str | None = None
         dropped_chunks = 0
         dropped_messages = 0
@@ -1048,10 +1069,17 @@ class CompactionService:
             should_cancel=should_cancel,
         )
 
+        # The model supplies the rich checkpoint, but the current-task anchor
+        # comes directly from the newest real user turn in the compacted
+        # region. This prevents a plausible-looking summary from reviving an
+        # older request or missing a cancellation/reversal.
+        summary = ground_historical_request(summary, grounding_messages)
+
         # Applied once, against the WHOLE conversation rather than a chunk: a
         # chunk can legitimately have no user turn even when the conversation
         # does, and rejecting on that would fail real compactions.
-        reject_invented_user_attribution(summary, messages)
+        if not inherited_summaries:
+            reject_invented_user_attribution(summary, source_messages)
 
         # Measure the exact prompt shape that will be committed, including the
         # reference-only wrapper. Omitting the wrapper here could approve a

@@ -207,6 +207,32 @@ def is_summary_message(message: dict) -> bool:
     content = message.get("content", "")
     return isinstance(content, str) and content.lstrip().startswith(SUMMARY_MARKERS)
 
+
+def extract_summary_text(message: dict) -> str | None:
+    """Return the reusable body of a persisted compaction summary.
+
+    Re-compaction must update the previous summary as structured state, not
+    feed its marker and reference-only safety envelope back as ordinary
+    conversation text. The metadata flag handles current sessions; marker
+    parsing keeps summaries written by older releases resumable.
+    """
+    if not is_summary_message(message):
+        return None
+    content = message.get("content", "")
+    if not isinstance(content, str):
+        return ""
+    text = content.strip()
+    start = text.find(SUMMARY_REFERENCE_START)
+    if start >= 0:
+        body_start = start + len(SUMMARY_REFERENCE_START)
+        end = text.find(SUMMARY_REFERENCE_END, body_start)
+        if end >= 0:
+            return text[body_start:end].strip()
+    for marker in SUMMARY_MARKERS:
+        if text.startswith(marker):
+            return text[len(marker):].strip()
+    return text
+
 MERGE_SUMMARIES_INSTRUCTIONS = (
     "Merge these partial summaries into a single cohesive summary. "
     "Preserve decisions, TODOs, open questions, and any constraints."

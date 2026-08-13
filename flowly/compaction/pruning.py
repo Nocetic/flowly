@@ -112,7 +112,11 @@ def chunk_messages_by_max_tokens(
     current_chunk: list[dict[str, Any]] = []
     current_tokens = 0
 
+    expanded: list[dict[str, Any]] = []
     for message in messages:
+        expanded.extend(_split_oversized_text_message(message, max_tokens))
+
+    for message in expanded:
         message_tokens = estimate_message_tokens(message)
 
         if current_chunk and current_tokens + message_tokens > max_tokens:
@@ -123,7 +127,9 @@ def chunk_messages_by_max_tokens(
         current_chunk.append(message)
         current_tokens += message_tokens
 
-        # Split oversized messages to avoid unbounded chunk growth
+        # Non-text payloads can still be indivisible (for example one image or
+        # a large structured tool call). Keep those atomic; string content was
+        # already split above without dropping a byte.
         if message_tokens > max_tokens:
             chunks.append(current_chunk)
             current_chunk = []
@@ -133,6 +139,71 @@ def chunk_messages_by_max_tokens(
         chunks.append(current_chunk)
 
     return chunks
+
+
+def _split_oversized_text_message(
+    message: dict[str, Any],
+    max_tokens: int,
+) -> list[dict[str, Any]]:
+    """Split one huge text message into lossless summary-only fragments.
+
+    Message-count chunking alone cannot bound a single pasted log or document.
+    A provider then rejects the *summarizer* request before compaction can save
+    the main turn. Character boundaries are selected with the real estimator
+    and never persisted, so every source character remains represented while
+    each fragment fits the summarizer budget.
+    """
+    if max_tokens <= 0 or estimate_message_tokens(message) <= max_tokens:
+        return [message]
+    content = message.get("content")
+    if not isinstance(content, str) or not content:
+        return [message]
+
+    fragments: list[dict[str, Any]] = []
+    start = 0
+    while start < len(content):
+        low = start + 1
+        high = len(content)
+        best = start
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = dict(message)
+            candidate["content"] = content[start:mid]
+            if fragments:
+                # Tool calls describe the assistant message once; duplicating
+                # them on every text fragment would fabricate repeated actions.
+                candidate.pop("tool_calls", None)
+            if estimate_message_tokens(candidate) <= max_tokens:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        if best <= start:
+            # The text is not the oversized component (for example enormous
+            # tool-call arguments). The transcript renderer bounds those
+            # separately, so retain this atomic message rather than lose it.
+            return [message]
+
+        end = best
+        if end < len(content):
+            search_floor = start + max(1, int((end - start) * 0.8))
+            newline = content.rfind("\n", search_floor, end)
+            space = content.rfind(" ", search_floor, end)
+            boundary = max(newline, space)
+            if boundary > start:
+                # Keep the separator in one fragment so joining fragment
+                # contents reconstructs the original byte-for-byte.
+                end = boundary + 1
+
+        fragment = dict(message)
+        fragment["content"] = content[start:end]
+        if fragments:
+            fragment.pop("tool_calls", None)
+        fragments.append(fragment)
+        start = end
+
+    return fragments
 
 
 def compute_adaptive_chunk_ratio(

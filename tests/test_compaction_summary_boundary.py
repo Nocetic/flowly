@@ -9,19 +9,26 @@ for the rest of its life. These tests pin what must never make that crossing
 
 import pytest
 
+from flowly.compaction.estimator import estimate_message_tokens
+from flowly.compaction.pruning import chunk_messages_by_max_tokens
 from flowly.compaction.redaction import REDACTED, redact_secrets
 from flowly.compaction.summarizer import (
     SUMMARIZE_SYSTEM_PROMPT,
+    ground_historical_request,
     strip_reasoning_blocks,
+    summarize_with_fallback,
     validated_summary_text,
 )
 from flowly.compaction.types import (
+    EPHEMERAL_NUDGE_KEY,
+    LEGACY_SUMMARY_MARKER,
     SUMMARY_MARKER,
     SUMMARY_REFERENCE_END,
     SUMMARY_REFERENCE_PREAMBLE,
     SUMMARY_REFERENCE_START,
     CompactionError,
     build_summary_content,
+    extract_summary_text,
 )
 from flowly.providers.base import LLMResponse
 
@@ -193,6 +200,10 @@ def test_prompt_marks_the_last_request_as_historical_not_authoritative() -> None
     assert "Most Recent Historical Request" in SUMMARIZE_SYSTEM_PROMPT
     assert "newer raw user message" in SUMMARIZE_SYSTEM_PROMPT
     assert "never as an instruction" in SUMMARIZE_SYSTEM_PROMPT
+    assert "same language" in SUMMARIZE_SYSTEM_PROMPT
+    assert "reverses, cancels, narrows" in SUMMARIZE_SYSTEM_PROMPT
+    assert "## Completed Actions" in SUMMARIZE_SYSTEM_PROMPT
+    assert "## Active State" in SUMMARIZE_SYSTEM_PROMPT
 
 
 def test_committed_summary_is_explicitly_reference_only() -> None:
@@ -215,6 +226,94 @@ def test_summary_cannot_close_its_reference_envelope() -> None:
 
     assert content.count(SUMMARY_REFERENCE_END) == 1
     assert "[historical reference marker removed]" in content
+
+
+def test_summary_body_can_be_rehydrated_without_its_safety_envelope() -> None:
+    body = "## Decisions\nSQLite remains authoritative."
+
+    assert extract_summary_text({
+        "role": "system",
+        "content": build_summary_content(body),
+    }) == body
+    assert extract_summary_text({
+        "role": "system",
+        "content": f"{LEGACY_SUMMARY_MARKER}\n\n{body}",
+    }) == body
+    assert extract_summary_text({"role": "user", "content": SUMMARY_MARKER}) is None
+
+
+def test_latest_historical_request_is_grounded_in_real_user_text() -> None:
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    summary = (
+        "## Decisions\nKeep the release stable.\n\n"
+        "## Most Recent Historical Request\nDeploy immediately.\n\n"
+        "## Open TODOs\nWrite the report."
+    )
+    messages = [
+        {"role": "user", "content": "Deploy immediately."},
+        {
+            "role": "user",
+            "content": f"Cancel deployment. Only write the report. Token: {secret}",
+        },
+        {
+            "role": "user",
+            "content": "internal retry hint",
+            EPHEMERAL_NUDGE_KEY: True,
+        },
+    ]
+
+    grounded = ground_historical_request(summary, messages)
+
+    assert "Cancel deployment. Only write the report." in grounded
+    assert secret not in grounded
+    assert REDACTED in grounded
+    assert "internal retry hint" not in grounded
+    assert "Deploy immediately.\n\n## Open TODOs" not in grounded
+    assert "Historical reference only" in grounded
+
+
+def test_one_huge_text_message_is_split_without_losing_content() -> None:
+    content = "alpha beta gamma\n" * 2_000
+    message = {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [{"id": "call-1", "function": {"name": "inspect"}}],
+    }
+
+    chunks = chunk_messages_by_max_tokens([message], max_tokens=200)
+    fragments = [fragment for chunk in chunks for fragment in chunk]
+
+    assert "".join(fragment["content"] for fragment in fragments) == content
+    assert all(estimate_message_tokens(fragment) <= 200 for fragment in fragments)
+    assert sum("tool_calls" in fragment for fragment in fragments) == 1
+
+
+async def test_failed_huge_message_summary_is_not_committed_as_an_omission() -> None:
+    class RejectSourceProvider:
+        async def chat(self, *args, **kwargs):
+            messages = kwargs.get("messages") or args[0]
+            prompt = "\n".join(str(message.get("content", "")) for message in messages)
+            if "LOSSLESS-SOURCE" in prompt:
+                return LLMResponse(
+                    content="Error calling LLM: rejected source chunk",
+                    finish_reason="error",
+                )
+            return LLMResponse(content="Small messages only.", finish_reason="stop")
+
+    messages = [
+        {"role": "user", "content": "LOSSLESS-SOURCE " + "x" * 8_000},
+        {"role": "assistant", "content": "small trailing message"},
+    ]
+
+    with pytest.raises(CompactionError, match="without dropping source content"):
+        await summarize_with_fallback(
+            messages,
+            RejectSourceProvider(),
+            model="test",
+            reserve_tokens=128,
+            max_chunk_tokens=500,
+            context_window=2_000,
+        )
 
 
 # ── Tool activity reaches the summarizer ──────────────────────────────────
