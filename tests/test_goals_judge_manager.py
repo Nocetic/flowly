@@ -58,6 +58,10 @@ def _manager(tmp_path: Path, provider: ScriptedProvider, **kwargs) -> GoalManage
             'prefix ```json\n{"verdict":"continue","reason":"missing test"}\n```',
             GoalVerdict.CONTINUE,
         ),
+        (
+            '{"verdict":"needs_input","reason":"choose the deployment target"}',
+            GoalVerdict.NEEDS_INPUT,
+        ),
         ('{"done":true,"reason":"legacy"}', GoalVerdict.DONE),
     ],
 )
@@ -155,6 +159,33 @@ async def test_continue_then_done_lifecycle_and_resume_reset(tmp_path: Path) -> 
     resumed = manager.resume("web:1")
     assert resumed.status is GoalStatus.ACTIVE
     assert resumed.turns_used == 0
+    assert resumed.goal_id == initial.goal_id
+
+
+@pytest.mark.asyncio
+async def test_needs_input_parks_without_spinning_and_user_reply_resumes_budget(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedProvider(
+        '{"verdict":"needs_input","reason":"choose staging or production"}'
+    )
+    manager = _manager(tmp_path, provider)
+    initial = manager.set("web:1", "deploy safely", max_turns=4)
+
+    decision = await manager.evaluate_after_turn(
+        "web:1", "Which environment should I deploy to?"
+    )
+
+    parked = manager.get("web:1")
+    assert decision.verdict is GoalVerdict.NEEDS_INPUT
+    assert decision.should_continue is False
+    assert parked is not None and parked.status is GoalStatus.PAUSED
+    assert parked.turns_used == 1
+    assert parked.goal_id == initial.goal_id
+
+    resumed = manager.resume_for_user_input("web:1")
+    assert resumed is not None and resumed.status is GoalStatus.ACTIVE
+    assert resumed.turns_used == 1
     assert resumed.goal_id == initial.goal_id
 
 

@@ -186,6 +186,18 @@ async def test_real_user_arrival_invalidates_a_stale_goal_continuation() -> None
 
 
 @pytest.mark.asyncio
+async def test_real_user_reply_resumes_a_goal_waiting_for_input() -> None:
+    loop = _bare_loop()
+    loop.goal_manager.resume_for_user_input = Mock()
+
+    await loop._process_message(
+        InboundMessage("web", "person", "chat", "Use the staging environment")
+    )
+
+    loop.goal_manager.resume_for_user_input.assert_called_once_with("web:chat")
+
+
+@pytest.mark.asyncio
 async def test_same_session_turns_are_serialized_but_arrivals_get_distinct_epochs() -> None:
     loop = _bare_loop()
     active = 0

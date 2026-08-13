@@ -39,6 +39,7 @@ class GoalStatus(StrEnum):
 class GoalVerdict(StrEnum):
     DONE = "done"
     CONTINUE = "continue"
+    NEEDS_INPUT = "needs_input"
     WAIT = "wait"
     INACTIVE = "inactive"
     SKIPPED = "skipped"

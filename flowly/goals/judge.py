@@ -52,16 +52,22 @@ latest response, and process evidence. Return exactly one JSON object.
 Verdicts:
 - done: every completion requirement is satisfied by concrete evidence.
 - continue: work remains and the agent can take a concrete step now.
+- needs_input: the latest response asks the user for an essential decision,
+  credential, clarification, or approval and there is no safe bounded step the
+  agent can take without it. Do not use this for optional preferences; use a
+  reasonable assumption and continue instead.
 - wait: work remains but progress is genuinely blocked on a listed background
   process or a fixed cooldown. Waiting is not completion.
 
 Needing user input, being blocked, reporting an error, or merely claiming success
-does not by itself make the goal done. Use continue unless the completion evidence
+does not by itself make the goal done. Use needs_input only when the latest response
+actually requests that input; otherwise use continue unless the completion evidence
 is sufficient or a real asynchronous wait target exists.
 
 Accepted shapes:
 {"verdict":"done","reason":"one sentence"}
 {"verdict":"continue","reason":"one sentence"}
+{"verdict":"needs_input","reason":"what the user must provide"}
 {"verdict":"wait","wait_on_session":"id","reason":"one sentence"}
 {"verdict":"wait","wait_on_pid":123,"reason":"one sentence"}
 {"verdict":"wait","wait_for_seconds":30,"reason":"one sentence"}
@@ -106,9 +112,18 @@ def parse_judge_result(text: str) -> GoalJudgeResult:
     try:
         verdict = GoalVerdict(str(raw_verdict or "").strip().casefold())
     except ValueError as exc:
-        raise GoalJudgeParseError("judge verdict must be done, continue, or wait") from exc
-    if verdict not in {GoalVerdict.DONE, GoalVerdict.CONTINUE, GoalVerdict.WAIT}:
-        raise GoalJudgeParseError("judge verdict must be done, continue, or wait")
+        raise GoalJudgeParseError(
+            "judge verdict must be done, continue, needs_input, or wait"
+        ) from exc
+    if verdict not in {
+        GoalVerdict.DONE,
+        GoalVerdict.CONTINUE,
+        GoalVerdict.NEEDS_INPUT,
+        GoalVerdict.WAIT,
+    }:
+        raise GoalJudgeParseError(
+            "judge verdict must be done, continue, needs_input, or wait"
+        )
 
     reason = str(data.get("reason") or "").strip()[:MAX_REASON_CHARS]
     if not reason:

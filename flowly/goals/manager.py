@@ -106,6 +106,36 @@ class GoalManager:
 
         return self.store.update(session_key, mutate)
 
+    def resume_for_user_input(self, session_key: str) -> GoalState | None:
+        """Resume a goal parked by the judge when the user replies.
+
+        Unlike the explicit ``/goal resume`` command, this preserves the turn
+        budget and failure counters.  The reply is part of the same goal run,
+        not a fresh attempt.
+        """
+        snapshot = self.store.get(session_key)
+        if (
+            snapshot is None
+            or snapshot.status is not GoalStatus.PAUSED
+            or snapshot.last_verdict != GoalVerdict.NEEDS_INPUT.value
+        ):
+            return snapshot
+
+        def mutate(state: GoalState) -> GoalState:
+            if (
+                state.status is not GoalStatus.PAUSED
+                or state.last_verdict != GoalVerdict.NEEDS_INPUT.value
+            ):
+                raise GoalStoreConflictError("goal is no longer waiting for user input")
+            state.status = GoalStatus.ACTIVE
+            state.paused_reason = None
+            return state
+
+        try:
+            return self.store.compare_and_update(snapshot, mutate)
+        except GoalStoreConflictError:
+            return self.store.get(session_key)
+
     def clear(self, session_key: str, *, conversation_epoch: int | None = None) -> GoalState | None:
         current = self.store.get(session_key)
         if current is None:
@@ -428,6 +458,13 @@ class GoalManager:
                 reason=result.reason,
                 message=f"✓ Goal achieved: {result.reason}",
             )
+        if result.verdict is GoalVerdict.NEEDS_INPUT:
+            return _decision(
+                committed,
+                GoalVerdict.NEEDS_INPUT,
+                reason=result.reason,
+                message=f"◌ Goal is waiting for your input: {result.reason}",
+            )
         if committed.status is GoalStatus.PAUSED:
             return _decision(
                 committed,
@@ -613,6 +650,8 @@ def _apply_judge_result(
         else:
             state.set_wait(result.wait_kind, result.wait_target, reason=result.reason)
         return state
+    if result.verdict is GoalVerdict.NEEDS_INPUT:
+        return _pause(state, f"waiting for user input: {result.reason}")
     if state.consecutive_transport_failures >= MAX_TRANSPORT_FAILURES:
         return _pause(state, "goal judge was unreachable for five consecutive turns")
     if state.consecutive_parse_failures >= MAX_PARSE_FAILURES:

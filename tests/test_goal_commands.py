@@ -63,6 +63,24 @@ async def test_goal_set_parses_contract_and_requests_post_delivery_kickoff(
 
 
 @pytest.mark.asyncio
+async def test_plain_goal_is_settled_into_a_contract_before_kickoff(tmp_path: Path) -> None:
+    manager, _runtime, handler = _handler(tmp_path)
+
+    result = await handler.goal(
+        "web:chat",
+        "Test the system end to end",
+        conversation_epoch=0,
+    )
+
+    state = manager.get("web:chat")
+    assert state is not None
+    assert state.contract.outcome == "Test the system end to end"
+    assert state.contract.verification == "all tests pass"
+    assert result.content.startswith("⊙ Goal settled")
+    assert result.kickoff_goal_id == state.goal_id
+
+
+@pytest.mark.asyncio
 async def test_goal_draft_sets_structured_contract_and_kicks_off(tmp_path: Path) -> None:
     manager, _runtime, handler = _handler(tmp_path)
 

@@ -6870,6 +6870,12 @@ class AgentLoop:
                 self._goal_user_epochs = {}
             self._goal_user_epochs[msg.session_key] = next_epoch
             msg.metadata[_GOAL_USER_EPOCH] = next_epoch
+            manager = getattr(self, "goal_manager", None)
+            if manager is not None:
+                try:
+                    manager.resume_for_user_input(msg.session_key)
+                except Exception:
+                    logger.exception("goal user-input resume failed for {}", msg.session_key)
 
         if not hasattr(self, "_session_turn_locks"):
             self._session_turn_locks = {}

@@ -113,6 +113,14 @@ class GoalCommandHandler:
             goal_text = objective
         else:
             goal_text, contract = _split_goal_contract(arguments)
+            # A plain objective is settled into a concrete completion contract
+            # before the autonomous loop starts. Explicit inline fields remain
+            # authoritative and avoid an unnecessary auxiliary model call.
+            if contract.is_empty:
+                try:
+                    contract = await self.manager.judge.draft_contract(goal_text)
+                except Exception:
+                    contract = GoalContract()
 
         self.runtime.cancel_session(session_key)
         try:
@@ -125,7 +133,7 @@ class GoalCommandHandler:
         except ValueError as exc:
             return GoalCommandResult(f"Invalid goal: {exc}")
 
-        lines = [f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}"]
+        lines = [f"⊙ Goal settled ({state.max_turns}-turn budget): {state.goal}"]
         if not state.contract.is_empty:
             label = "Drafted completion contract" if drafted else "Completion contract"
             lines.extend((f"{label}:", state.contract.render()))
