@@ -119,6 +119,43 @@ async def test_tool_schema_budget_can_fail_before_any_conversation_is_sent():
     assert provider.calls == [], "preflight itself must not dispatch the rejected request"
 
 
+async def test_failed_preflight_summary_fails_closed_without_partial_history_dispatch():
+    class _FailingSummaryProvider(_SummaryProvider):
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return LLMResponse(
+                content="opaque summarizer outage",
+                finish_reason="error",
+                error_info=LLMErrorInfo(status_code=503),
+            )
+
+    provider = _FailingSummaryProvider()
+    harness = _CallHarness(provider, _service(provider, window=4_000))
+    messages = _history()
+    original_fingerprint = request_fingerprint(messages)
+
+    response, returned = await harness._call_provider_with_context_recovery(
+        messages=messages,
+        tools=[],
+        model="test/model",
+        temperature=0.7,
+        tool_choice="auto",
+        session_key="web:summary-outage",
+    )
+
+    assert response.finish_reason == "error"
+    assert response.error_info == LLMErrorInfo(
+        status_code=413,
+        code="input_too_large",
+        type="request_too_large",
+    )
+    assert request_fingerprint(returned) == original_fingerprint
+    assert provider.calls, "preflight should attempt a summary before failing"
+    assert all("tool_choice" not in call for call in provider.calls), (
+        "the main model must not receive a silently truncated history"
+    )
+
+
 async def test_force_reduction_materially_changes_a_locally_fitting_payload():
     provider = _SummaryProvider()
     coordinator = ProviderRequestCoordinator(_service(provider, window=8_000))

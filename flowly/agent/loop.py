@@ -62,7 +62,6 @@ from flowly.compaction.types import (
     build_summary_content,
     is_summary_message,
 )
-from flowly.compaction.pruning import split_into_turn_blocks
 from flowly.compaction.service import count_conversational_messages
 from flowly.compaction.estimator import (
     estimate_message_tokens,
@@ -511,39 +510,6 @@ def _drop_ephemeral_nudges(messages: list[dict[str, Any]]) -> list[dict[str, Any
     if not any(m.get(_EPHEMERAL_NUDGE) for m in messages):
         return messages
     return [m for m in messages if not m.get(_EPHEMERAL_NUDGE)]
-
-
-def _emergency_trim(
-    messages: list[dict[str, Any]],
-    keep_last: int = 20,
-) -> list[dict[str, Any]]:
-    """Shrink a history we failed to summarise, without breaking tool pairs.
-
-    Used only when compaction errored and the turn still has to go out. Keeps
-    every system message plus the most recent whole turn blocks that fit in
-    ``keep_last`` messages. Slicing raw messages instead would strand a
-    ``tool`` result from its ``assistant.tool_calls`` and earn a provider 400
-    on top of the failure we're already recovering from.
-
-    This affects the turn's working copy only — the session on disk keeps
-    everything.
-    """
-    system_msgs = [m for m in messages if m.get("role") == "system"]
-    non_system = [m for m in messages if m.get("role") != "system"]
-    blocks = split_into_turn_blocks(non_system)
-    if not blocks:
-        return system_msgs
-
-    kept: list[dict[str, Any]] = []
-    for block in reversed(blocks):
-        if kept and len(kept) + len(block) > keep_last:
-            break
-        kept = block + kept
-    if not kept:
-        # Newest block alone exceeds the budget — take it anyway; a whole
-        # block is the smallest thing we are allowed to send.
-        kept = blocks[-1]
-    return system_msgs + kept
 
 
 def _strip_old_tool_results(
@@ -7158,13 +7124,18 @@ class AgentLoop:
                 # pass that did the work owns the UI cycle.
                 pass
             elif result is None:
-                # Compaction failed. The SESSION IS LEFT UNTOUCHED — only this
-                # turn's working copy is trimmed, so nothing is lost on disk
-                # and the next turn can try again.
-                history = _emergency_trim(history)
+                # Compaction failed. Keep the COMPLETE working history here.
+                # The final provider-request coordinator will either produce
+                # a bounded transient summary or fail closed before dispatch.
+                # A legacy fallback silently kept only the last 20 records;
+                # that made the model answer from partial context while the UI
+                # still showed a complete conversation. Preserving the full
+                # list is the integrity boundary: no request may shed turns
+                # unless they are represented by a successful summary.
                 logger.warning(
-                    "Compaction failed — emergency trim for this turn "
-                    f"({len(history)} messages); session history preserved"
+                    "Compaction failed — full history preserved for guarded "
+                    "request fitting ({} messages)",
+                    len(history),
                 )
                 await _cycle.fail(total_tokens, total_tokens)
             else:

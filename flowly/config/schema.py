@@ -311,7 +311,11 @@ class AgentDefaults(BaseModel):
     # while — keep going if making progress, otherwise tell the user what's
     # blocking you". Helps the model self-evaluate without hard-stopping it.
     soft_warn_at_iteration: int = 30
-    context_messages: int = 100  # Max messages to include in context
+    # Legacy compatibility knob. Agent requests deliberately do not use this
+    # as a hard history ceiling: the complete working history must reach token
+    # budgeting so older turns are either retained or represented by a
+    # successful compaction summary, never silently sliced away.
+    context_messages: int = 100
     persona: str = "default"  # Bot persona (default, jarvis, pirate, etc.)
     save_trajectories: bool = False  # Save conversation turns as ShareGPT JSONL
     memory_nudge_interval: int = 10   # Background memory review every N user turns (0=disabled)
