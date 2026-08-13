@@ -832,6 +832,13 @@ class AgentLoop:
         # State dir (must be set before SubagentManager)
         self._state_dir = state_dir or (workspace / ".flowly_state")
 
+        # Summary-independent task continuity.  This is deliberately separate
+        # from Session metadata: compaction rewrites the working conversation,
+        # while the active objective and latest instruction must survive it.
+        from flowly.agent.task_state import TaskStateStore
+
+        self._task_states = TaskStateStore()
+
         from flowly.agent.subagent_registry import SubagentRegistry
         self._subagent_registry = SubagentRegistry()
         self.subagents = SubagentManager(
@@ -3572,6 +3579,183 @@ class AgentLoop:
         )
         return any(re.search(pattern, intent_text) for pattern in cancel_patterns)
 
+    @staticmethod
+    def _is_task_state_reversal(content: str) -> bool:
+        """Recognise only explicit whole-message reversals.
+
+        A broad ``"stop" in text`` test is unsafe: instructions such as
+        "do not stop" or "don't merge" would cancel the task they are trying
+        to constrain.  Keeping this grammar narrow makes cancellation a
+        deterministic state transition rather than a sentiment guess.
+        """
+        text = re.sub(r"[.!?…]+$", "", str(content or "").strip().casefold())
+        patterns = (
+            r"(?:please\s+)?(?:stop|cancel|abort)(?:\s+(?:it|this|the task))?",
+            r"(?:never\s*mind|forget\s+it)",
+            r"(?:(?:bunu|bu işi|bu görevi)\s+)?(?:iptal\s+et|durdur|bırak|boşver|vazgeç)",
+            r"(?:devam\s+etme|artık\s+yapma)",
+        )
+        return any(re.fullmatch(pattern, text) for pattern in patterns)
+
+    def _task_objective_candidate(self, channel: str, content: str) -> str | None:
+        """Return a deterministic new objective, or ``None`` for a follow-up.
+
+        The classifier is intentionally conservative.  A false negative keeps
+        the previous objective and still records the latest request; a false
+        positive would silently replace the user's contract.
+        """
+        if not _is_user_activity_channel(channel):
+            return None
+        raw = str(content or "").strip()
+        if not raw or self._is_task_state_reversal(raw):
+            return None
+        lowered = raw.casefold()
+        if lowered.startswith("/plan "):
+            task = raw.split(None, 1)[1].strip()
+            if task.casefold() not in {"on", "off", "status", "stop", "cancel"}:
+                return task
+            return None
+        if lowered.startswith("/"):
+            return None
+        # Negative imperatives constrain an existing objective. They must not
+        # become a replacement objective merely because they contain an action
+        # verb (for example "do not deploy" or "gönderme").
+        if re.search(r"\b(?:do\s+not|don't|never)\b", lowered) or re.search(
+            r"\b(?:yap|et|gönder|paylaş|sil|kaldır|değiştir|başlat|çalıştır|ara)(?:ma|me)\b",
+            lowered,
+        ):
+            return None
+        # Short continuations, approvals, status checks and courtesies refine
+        # an existing task; they must never replace it.
+        followups = (
+            r"(?:ok(?:ay)?|tamam|evet|yes|go ahead|onaylıyorum|approved?)",
+            r"(?:continue|devam(?:\s+et)?|başla|hadi|proceed)",
+            r"(?:durum\s+ne|ne\s+durumda|status|how(?:'s| is) it going)",
+            r"(?:teşekkür(?:ler)?|sağ ol|thanks?|thank you)",
+        )
+        plain = re.sub(r"[.!?…]+$", "", lowered).strip()
+        if any(re.fullmatch(pattern, plain) for pattern in followups):
+            return None
+        if self._is_action_turn(channel, raw):
+            return raw
+        work_verbs = (
+            # English
+            r"\b(?:implement|build|create|fix|investigate|research|analy[sz]e|compare|review|"
+            r"update|change|add|remove|write|prepare|design|refactor|test|deploy|configure|"
+            r"integrate|migrate|audit|inspect|verify|start)\b",
+            # Turkish, including common imperative suffixes.
+            r"\b(?:uygula|yap|oluştur|ekle|düzelt|araştır|incele|karşılaştır|değiştir|"
+            r"güncelle|kaldır|sil|yaz|hazırla|tasarla|test\s+et|kur|entegre\s+et|taşı|"
+            r"doğrula|denetle|başlat)\b",
+        )
+        if any(re.search(pattern, lowered) for pattern in work_verbs):
+            return raw
+        return None
+
+    def _bootstrap_task_state(
+        self,
+        session: Any,
+        channel: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Migrate an existing session's objective from its complete archive."""
+        store = getattr(self, "_task_states", None)
+        if store is None or (not force and store.get(session.key) is not None):
+            return
+        try:
+            archived = self.sessions.get_full_messages(session.key)
+        except Exception as exc:  # noqa: BLE001 - continuity aid, never a blocker
+            logger.warning("[task-state] archive bootstrap failed: {}", exc)
+            return
+        for message in reversed(archived):
+            if message.get("role") != "user":
+                continue
+            content = str(message.get("content") or "")
+            candidate = self._task_objective_candidate(channel, content)
+            if not candidate:
+                continue
+            store.observe_user_message(
+                session.key,
+                content,
+                new_objective=candidate,
+                event_id=str(message.get(EVENT_ID_KEY) or ""),
+            )
+            logger.info("[task-state] bootstrapped objective for {}", session.key)
+            return
+
+    def _observe_task_state(
+        self,
+        session: Any,
+        msg: InboundMessage,
+        display_content: str,
+    ) -> None:
+        """Persist the current user's deterministic task-state transition."""
+        store = getattr(self, "_task_states", None)
+        if store is None or not _is_user_activity_channel(msg.channel):
+            return
+        objective = msg.metadata.get("task_objective")
+        if not isinstance(objective, str) or not objective.strip():
+            objective = self._task_objective_candidate(msg.channel, display_content)
+        cancel = bool(msg.metadata.get("cancel_task_state", False)) or (
+            self._is_task_state_reversal(display_content)
+        )
+        if store.get(session.key) is None and objective is None:
+            self._bootstrap_task_state(session, msg.channel)
+        store.observe_user_message(
+            session.key,
+            display_content,
+            new_objective=objective,
+            cancel=cancel,
+        )
+
+    def _task_contract_sidecar(
+        self,
+        session_key: str,
+        history: list[dict[str, Any]],
+    ) -> str:
+        """Return the request-only contract, with PlanStore taking priority."""
+        try:
+            from flowly.plans.manager import get_plan_manager
+
+            plan_manager = get_plan_manager()
+            plan = plan_manager.get_current(session_key)
+            if plan is not None:
+                plan_note = plan_manager.compaction_note(session_key)
+                if plan_note and any(
+                    plan_note in str(message.get("content") or "")
+                    for message in history
+                ):
+                    # The refreshed summary anchor already carries the exact
+                    # plan.  Add only the authority marker, not a duplicate.
+                    return (
+                        "<durable_task_state source=\"plan_store\" "
+                        "authority=\"authoritative\" />\n"
+                        "The active PlanStore plan is the task contract. Do not "
+                        "replace it with a conversation-summary inference."
+                    )
+                if plan_note:
+                    return (
+                        "<durable_task_state source=\"plan_store\" "
+                        "authority=\"authoritative\">\n"
+                        f"{plan_note}\n</durable_task_state>"
+                    )
+                # Awaiting/draft plans deliberately have no compaction note,
+                # but they still outrank generic TaskState and remain gated.
+                return (
+                    "<durable_task_state source=\"plan_store\" "
+                    "authority=\"authoritative\">\n"
+                    f"Plan: {plan.title}\nStatus: {plan.status}\nGoal: {plan.goal}\n"
+                    "Do not execute gated work until this plan is approved.\n"
+                    "</durable_task_state>"
+                )
+        except Exception as exc:  # noqa: BLE001 - fall back to TaskState
+            logger.debug("[task-state] plan priority lookup skipped: {}", exc)
+        store = getattr(self, "_task_states", None)
+        if store is None:
+            return ""
+        return store.prompt_sidecar(session_key)
+
     def _consume_pending_action_lock(self, session: Any, content: str) -> bool:
         """
         Consume a pending-action lock set by a previous failed action turn.
@@ -6255,6 +6439,18 @@ class AgentLoop:
                     content="↩️ Nothing to undo yet.",
                 )
             self.sessions.save(session)
+            # The withdrawn turn may have supplied the active objective or the
+            # latest constraint. Rebuild from the now-visible append-only
+            # archive instead of leaving TaskState pointing at withdrawn data.
+            try:
+                task_store = getattr(self, "_task_states", None)
+                if task_store is not None:
+                    task_store.reset(msg.session_key)
+                    self._bootstrap_task_state(
+                        session, msg.channel, force=True
+                    )
+            except Exception as exc:  # noqa: BLE001 - undo itself already succeeded
+                logger.warning("[task-state] undo rebuild failed: {}", exc)
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=f"↩️ Removed your last turn. Re-send to edit:\n\n{undo_text}",
@@ -6325,6 +6521,17 @@ class AgentLoop:
             if _low in ("off", "stop", "cancel"):
                 _pmgr.set_sticky(msg.session_key, False)
                 await _pmgr.abort_active_for_session(msg.session_key, "user turned off plan mode")
+                if _low in ("stop", "cancel"):
+                    try:
+                        task_store = getattr(self, "_task_states", None)
+                        if task_store is not None:
+                            task_store.observe_user_message(
+                                msg.session_key,
+                                msg.content,
+                                cancel=True,
+                            )
+                    except Exception as exc:  # noqa: BLE001 - plan cancel succeeded
+                        logger.warning("[task-state] plan cancellation sync failed: {}", exc)
                 return OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="✅ Plan mode off.",
@@ -6472,6 +6679,11 @@ class AgentLoop:
         session = self.sessions.get_or_create(msg.session_key)
         display_content = str(msg.metadata.get("_display_content") or msg.content)
 
+        # Record the raw user-facing instruction before plan/skill prompt
+        # rewrites or lossy compaction can obscure it.  Existing installations
+        # without TaskState are bootstrapped from the append-only archive.
+        self._observe_task_state(session, msg, display_content)
+
         # Passive channel context (Slack/Discord "listen" mode): render any
         # messages observed since the last reply into a block we prepend ONLY to
         # the LLM's current-message below. ``msg.content``/``display_content``
@@ -6588,11 +6800,6 @@ class AgentLoop:
             )
         session.metadata["persona"] = current_persona
 
-        # Prove the persisted archive and working context still form one
-        # complete lineage. The sidecar is added only to this request copy;
-        # the user's stored message remains byte-for-byte clean.
-        coverage_sidecar = self._context_coverage_sidecar(session)
-
         # Get history and check for compaction. The session-length snapshot
         # travels with the history snapshot: if this turn ends up committing a
         # compaction, anything appended past this point by a concurrent turn
@@ -6601,6 +6808,14 @@ class AgentLoop:
         session_snapshot_len = len(session.messages)
         session_epoch = self.context_epoch(msg.session_key)
 
+        # Both blocks are request-only: neither becomes a user transcript row.
+        # Coverage proves completeness; TaskState preserves intent.  A live
+        # PlanStore contract takes priority inside _task_contract_sidecar.
+        coverage_sidecar = self._context_coverage_sidecar(session)
+        task_contract_sidecar = self._task_contract_sidecar(
+            msg.session_key, history
+        )
+
         # Cron isolation flags affect both the real prompt and its compaction
         # estimate. Resolve them before the preview so the estimator measures
         # the exact context policy the provider call below will carry.
@@ -6608,10 +6823,11 @@ class AgentLoop:
         skip_context_files_flag = bool(msg.metadata.get("skip_context_files", False))
         voice_mode_flag = bool(msg.metadata.get("voice_mode", False))
         effective_model = msg.metadata.get("model_override") or self.model
-        covered_current_message = (
-            f"{coverage_sidecar}\n\n{msg.content}"
-            if coverage_sidecar
-            else msg.content
+        request_sidecars = [
+            block for block in (coverage_sidecar, task_contract_sidecar) if block
+        ]
+        covered_current_message = "\n\n".join(
+            [*request_sidecars, msg.content]
         )
         llm_current_message = (
             f"{group_context_block}\n---\n{covered_current_message}"
@@ -6968,6 +7184,7 @@ class AgentLoop:
         # Slice the RETURNED list, not the input one: mid-turn transforms
         # rebind the loop's local list, so late appends (codex_session on
         # iteration 6+) never reach the input list.
+        turn_session_start = len(session.messages)
         session.extend_with_turn_messages(
             user_content=display_content,
             new_messages=_drop_ephemeral_nudges(loop_messages[turn_start_idx:]),
@@ -6984,6 +7201,19 @@ class AgentLoop:
             run_id=(outbound_run_id or None) if not provider_error else None,
         )
         self.sessions.save(session)
+        # The archive identity exists only after the canonical user row is
+        # appended. Bind it back into TaskState so exact retrieval can resolve
+        # the latest instruction even after it is compacted out of history.
+        try:
+            persisted_user = session.messages[turn_session_start]
+            task_store = getattr(self, "_task_states", None)
+            if task_store is not None and persisted_user.get("role") == "user":
+                task_store.bind_event(
+                    msg.session_key,
+                    str(persisted_user.get(EVENT_ID_KEY) or ""),
+                )
+        except (IndexError, AttributeError, TypeError) as exc:
+            logger.debug("[task-state] event binding skipped: {}", exc)
         await self._index_turn_media(
             session, reply_media_assets, msg.media, msg.channel
         )
@@ -8125,6 +8355,12 @@ class AgentLoop:
             self.context.invalidate_memory_snapshot(session_key)
         except Exception:  # noqa: BLE001 — snapshot is a cache
             logger.debug("[reset] memory snapshot invalidation skipped")
+        try:
+            task_store = getattr(self, "_task_states", None)
+            if task_store is not None:
+                task_store.reset(session_key)
+        except Exception:  # noqa: BLE001 — reset must still clear the session
+            logger.exception("[reset] durable task-state reset failed")
         self.sessions.save(session)
         return removed
 
