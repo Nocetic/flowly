@@ -7,7 +7,8 @@ relay channel and the direct gateway. Contract pinned here:
 * the FAL image-generation card (category ``media``) is exposed alongside
   channels/tools/voice, so it appears in BOTH clients with no client change;
 * ``connections.set`` persists its values and ``connections.list`` masks the
-  PASSWORD field back, never echoing the key in clear.
+  PASSWORD field back, exposing only a non-reusable suffix preview;
+* a full secret requires an explicit, field-scoped ``connections.secret.get``.
 """
 
 from __future__ import annotations
@@ -112,6 +113,38 @@ def test_connections_set_round_trips_media(isolated_home):
     # Key persisted but masked on the way out — never echoed in clear.
     assert card["values"]["api_key"] == "••••••••"
     assert card["values"]["api_key"] != "fal-secret"
+    assert card["secretPreviews"]["api_key"] == "••••••••…cret"
+    assert "fal-secret" not in repr(card)
+
+
+def test_connection_secret_requires_explicit_password_field(isolated_home):
+    _dispatch("connections.set", {
+        "key": "fal_image",
+        "values": {"enabled": True, "api_key": "fal-secret"},
+    })
+
+    result, restart = _dispatch("connections.secret.get", {
+        "key": "fal_image",
+        "field": "api_key",
+    })
+    assert result == {"value": "fal-secret"}
+    assert restart is False
+
+    with pytest.raises(feature_rpc.FeatureRpcError, match="only password fields"):
+        _dispatch("connections.secret.get", {
+            "key": "fal_image",
+            "field": "enabled",
+        })
+
+
+def test_short_connection_secret_never_leaks_in_preview(isolated_home):
+    _dispatch("connections.set", {
+        "key": "fal_image",
+        "values": {"enabled": True, "api_key": "tiny"},
+    })
+    card = _list_by_key(isolated_home)["fal_image"]
+    assert card["secretPreviews"]["api_key"] == "••••••••"
+    assert "tiny" not in repr(card)
 
 
 def test_connections_set_clear_disables_media(isolated_home):

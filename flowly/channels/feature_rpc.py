@@ -86,6 +86,15 @@ def state_db(filename: str) -> Path:
 # ── Connections (integration cards: channels / tools / voice / media) ───────
 
 
+def _secret_preview(value: Any) -> str:
+    """Return a non-reusable PASSWORD preview with at most four suffix chars."""
+    text = str(value or "")
+    if not text:
+        return ""
+    suffix = text[-4:] if len(text) > 4 else ""
+    return f"••••••••…{suffix}" if suffix else "••••••••"
+
+
 async def connections_list() -> dict:
     """List integration cards with masked PASSWORD fields + live probe status."""
     from flowly.integrations.registry import list_cards
@@ -102,6 +111,11 @@ async def connections_list() -> dict:
                 else values.get(f.key)
             )
             for f in card.fields
+        }
+        secret_previews = {
+            f.key: _secret_preview(values.get(f.key))
+            for f in card.fields
+            if f.type == FieldType.PASSWORD and values.get(f.key)
         }
         probe_status: str | None = None
         probe_detail = ""
@@ -122,6 +136,10 @@ async def connections_list() -> dict:
                 "probeStatus": probe_status or "unknown",
                 "probeDetail": probe_detail,
                 "values": masked,
+                # Additive, display-only metadata. Keep ``values`` at the exact
+                # legacy mask so older Desktop/iOS clients never mistake a
+                # suffix preview for a replacement credential on save.
+                "secretPreviews": secret_previews,
                 "fields": [
                     {
                         "key": f.key,
@@ -141,6 +159,35 @@ async def connections_list() -> dict:
             }
         )
     return {"connections": out}
+
+
+def connections_secret_get(params: dict) -> dict:
+    """Return exactly one PASSWORD value after an explicit authenticated RPC.
+
+    Full credentials deliberately never ride along with ``connections.list``;
+    callers must name both the card and field they intend to reveal.
+    """
+    from flowly.integrations.cards import FieldType
+    from flowly.integrations.config_io import read_card_values
+    from flowly.integrations.registry import get_card
+
+    key = str(params.get("key") or "").strip()
+    field_key = str(params.get("field") or "").strip()
+    if not key or not field_key:
+        raise FeatureRpcError("INVALID_PARAMS", "key and field are required")
+
+    card = get_card(key)
+    if not card or card.category not in CONNECTION_CATEGORIES:
+        raise FeatureRpcError("NOT_FOUND", f"unknown connection: {key}")
+
+    field = next((candidate for candidate in card.fields if candidate.key == field_key), None)
+    if field is None:
+        raise FeatureRpcError("NOT_FOUND", f"unknown connection field: {field_key}")
+    if field.type != FieldType.PASSWORD:
+        raise FeatureRpcError("INVALID", "only password fields can be revealed")
+
+    value = read_card_values(card).get(field_key)
+    return {"value": str(value or "")}
 
 
 def connections_set(params: dict) -> dict:
@@ -3791,6 +3838,7 @@ async def media_models_refresh(_params: dict) -> dict:
 _DISPATCH: dict[str, tuple] = {
     "system.capabilities": (system_capabilities, False, False),
     "connections.list": (connections_list, False, False),
+    "connections.secret.get": (connections_secret_get, True, False),
     "connections.set": (connections_set, True, True),
     "gmail.set_credentials": (gmail_set_credentials, True, True),
     "board.snapshot": (board_snapshot, False, False),

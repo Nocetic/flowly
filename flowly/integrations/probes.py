@@ -635,7 +635,23 @@ async def probe_elevenlabs(values: dict[str, Any]) -> ProbeResult:
         return ProbeResult("down", "could not reach ElevenLabs")
 
     if response.status_code in (401, 403):
-        return ProbeResult("auth_failed", "key rejected")
+        # Restricted ElevenLabs keys authenticate successfully but `/v1/user`
+        # answers 401 with `missing_permissions` when `user_read` is absent.
+        # Treat that specific provider signal as a valid, limited key; voice
+        # generation and other explicitly granted endpoints can still work.
+        try:
+            detail = response.json().get("detail") or {}
+            provider_status = detail.get("status") if isinstance(detail, dict) else ""
+        except (AttributeError, TypeError, ValueError):
+            provider_status = ""
+        if provider_status == "missing_permissions":
+            return ProbeResult("ok", "key valid · limited API permissions")
+        if response.status_code == 401:
+            return ProbeResult("auth_failed", "API key rejected")
+        return ProbeResult(
+            "auth_failed",
+            "access denied · check API permissions or IP allowlist",
+        )
     if response.status_code != 200:
         return ProbeResult("down", f"HTTP {response.status_code}")
 
