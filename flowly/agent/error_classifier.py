@@ -22,6 +22,7 @@ fallback for providers that expose no structured failure metadata.
 from __future__ import annotations
 
 import random
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -121,6 +122,41 @@ def is_image_input_unsupported(error_msg: str) -> bool:
     """True only for an explicit provider statement rejecting image input."""
     lowered = error_msg.lower()
     return any(p in lowered for p in _IMAGE_INPUT_UNSUPPORTED_PHRASES)
+
+
+# The token ceiling a too-large rejection advertises, when it advertises one.
+# OpenAI-style TPM rejections spell it out ("Limit 30000, Requested 34712");
+# other providers phrase the same fact as "maximum ... 30000 tokens". Thousands
+# separators appear in some SDK renderings, so digits may carry , . or _.
+_INPUT_LIMIT_TOKEN_PATTERNS = (
+    re.compile(r"\blimit[:\s]+([0-9][0-9,._]*)", re.IGNORECASE),
+    re.compile(r"\bmaximum[^.:;]*?\b([0-9][0-9,._]*)\s+tokens", re.IGNORECASE),
+)
+
+
+def extract_input_limit_tokens(response: "LLMResponse") -> int | None:
+    """The provider-advertised input token ceiling in a too-large rejection.
+
+    Only meaningful for a response already classified INPUT_TOO_LARGE — on
+    arbitrary error text the word "limit" is too ambiguous to trust. Returns
+    ``None`` when no plausible number is present; the caller falls back to
+    its own estimate of the rejected payload.
+    """
+    text = str(response.content or "")
+    if not text:
+        return None
+    for pattern in _INPUT_LIMIT_TOKEN_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        digits = re.sub(r"[,._]", "", match.group(1))
+        try:
+            value = int(digits)
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+    return None
 
 
 def classify_response(response: "LLMResponse") -> ErrorCategory:

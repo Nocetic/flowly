@@ -177,6 +177,11 @@ class CompactionService:
     # the request is over the threshold on fixed overhead the summariser
     # cannot shrink, and compacting just churns the session.
     MIN_OBSERVED_TRIGGER_HISTORY_TOKENS = 4_000
+    # Sanity floor for a provider-observed input ceiling. Below this a
+    # "learned" limit is more likely a mis-parsed number or a degenerate
+    # estimate than a real request cap, and clamping the window to it would
+    # leave no room to hold a conversation at all.
+    MIN_OBSERVED_INPUT_LIMIT = 4_096
 
     def __init__(
         self,
@@ -217,6 +222,11 @@ class CompactionService:
         # conversation's memory-flush cycle cancel another's, and one
         # conversation's outage suppress compaction for all of them.
         self._sessions: dict[str, _SessionState] = {}
+        # Provider-observed request input ceilings, keyed by model id.
+        # Deliberately in-memory: a tier upgrade or key change is picked up
+        # after a restart at the cost of exactly one relearning 413, whereas a
+        # persisted clamp could silently cap a healthy account forever.
+        self._observed_input_limits: dict[str, int] = {}
 
     def session_lock(self, session_key: str = "") -> asyncio.Lock:
         """The lock serialising compaction for one conversation.
@@ -415,12 +425,69 @@ class CompactionService:
         return self.effective_context_window_for(self.model)
 
     def effective_context_window_for(self, model: str | None = None) -> int:
-        """Usable request window for a per-turn model override."""
+        """Usable request window for a per-turn model override.
+
+        Clamped by any provider-observed input ceiling for this model (see
+        :meth:`note_observed_input_limit`): a 413 the provider actually sent
+        outranks whatever the catalog believes the model could accept.
+        """
         selected_model = model or self.model
         window = self.model_context_window_for(selected_model)
+        observed = self._observed_input_limits.get(selected_model)
+        if observed and observed < window:
+            window = observed
         if getattr(self.provider, "provider_name", "") == "flowly":
             return min(window, _flowly_proxy_max_input_tokens(selected_model))
         return window
+
+    def note_observed_input_limit(
+        self, model: str | None, limit_tokens: int, *, reason: str = "",
+    ) -> int | None:
+        """Learn a provider-enforced request input ceiling for ``model``.
+
+        Called when a provider rejected a request as too large (413 /
+        ``request_too_large``) even though the request fit the catalog
+        window — a TPM tier, per-request cap, or proxy guard the catalog
+        cannot see. Recording it makes every later budget (durable pre-turn
+        compaction AND pre-dispatch request fitting) shrink to fit, so the
+        session stops paying a transient recovery on every turn.
+
+        Lower-only within the process: repeated observations can tighten the
+        ceiling but a looser reading never widens it — convergence, not
+        oscillation. Readings below :attr:`MIN_OBSERVED_INPUT_LIMIT` or at/
+        above the model's raw window are discarded as noise.
+
+        Returns the ceiling now in effect, or ``None`` when the reading was
+        unusable and nothing is clamped.
+        """
+        selected_model = (model or self.model or "").strip()
+        if not selected_model:
+            return None
+        try:
+            limit = int(limit_tokens)
+        except (TypeError, ValueError):
+            return None
+        raw_window = self.model_context_window_for(selected_model)
+        if limit < self.MIN_OBSERVED_INPUT_LIMIT or limit >= raw_window:
+            return self._observed_input_limits.get(selected_model)
+        current = self._observed_input_limits.get(selected_model)
+        if current is not None and current <= limit:
+            return current
+        self._observed_input_limits[selected_model] = limit
+        logger.warning(
+            "Learned provider input ceiling for {}: {} tokens (catalog window "
+            "{}){} — future requests budget against it",
+            selected_model,
+            limit,
+            raw_window,
+            f" [{reason}]" if reason else "",
+        )
+        return limit
+
+    def observed_input_limit_for(self, model: str | None = None) -> int | None:
+        """The provider-observed input ceiling for ``model``, if one is known."""
+        selected_model = (model or self.model or "").strip()
+        return self._observed_input_limits.get(selected_model)
 
     @property
     def effective_reserve_tokens(self) -> int:

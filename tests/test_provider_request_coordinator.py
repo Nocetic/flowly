@@ -308,3 +308,137 @@ async def test_overflow_after_streamed_text_is_never_retried():
     assert delivered == ["Visible partial text"]
     assert provider.stream_calls == 1
     assert provider.calls == [], "partial delivery must suppress summary/retry work"
+
+
+# ── Learned provider input ceilings ─────────────────────────────────────────
+#
+# A provider that rejects a request as too large has revealed a real ceiling
+# the model catalog cannot see (TPM tier, per-request byte cap, proxy guard).
+# The service learns it once, in-process, and every later budget — durable
+# compaction and pre-dispatch fitting alike — shrinks to fit, so the session
+# stops paying a transient recovery on every single turn.
+
+
+def test_observed_input_limit_clamps_window_and_threshold():
+    svc = _service(_SummaryProvider(), window=128_000)
+    assert svc.effective_context_window_for("test/model") == 128_000
+
+    assert svc.note_observed_input_limit("test/model", 30_000) == 30_000
+    assert svc.observed_input_limit_for("test/model") == 30_000
+    assert svc.effective_context_window_for("test/model") == 30_000
+    assert svc.compaction_threshold_for("test/model") < 30_000
+
+    # Lower-only: a later, looser reading never widens the clamp…
+    assert svc.note_observed_input_limit("test/model", 60_000) == 30_000
+    assert svc.effective_context_window_for("test/model") == 30_000
+    # …while a stricter observation tightens it.
+    assert svc.note_observed_input_limit("test/model", 20_000) == 20_000
+    assert svc.effective_context_window_for("test/model") == 20_000
+
+
+def test_observed_input_limit_rejects_unusable_readings():
+    svc = _service(_SummaryProvider(), window=128_000)
+
+    assert svc.note_observed_input_limit("test/model", 100) is None
+    assert svc.note_observed_input_limit("test/model", 128_000) is None
+    assert svc.note_observed_input_limit("test/model", 300_000) is None
+    assert svc.observed_input_limit_for("test/model") is None
+    assert svc.effective_context_window_for("test/model") == 128_000
+    # A blank model resolves to the service default, like every other
+    # ``*_for`` accessor — it must not create a phantom "" entry.
+    assert svc.note_observed_input_limit(None, 30_000) == 30_000
+    assert svc.observed_input_limit_for("test/model") == 30_000
+
+
+def test_observed_limit_makes_durable_compaction_fire_next_turn():
+    svc = _service(_SummaryProvider(), window=128_000)
+    # A 40K history sits comfortably inside a 128K window…
+    assert not svc.should_compact(40_000, "web:ceiling")
+    svc.note_observed_input_limit("test/model", 30_000)
+    # …but exceeds the provider's real ceiling, so the next pre-turn check
+    # compacts durably instead of leaving every turn to transient recovery.
+    assert svc.should_compact(40_000, "web:ceiling")
+
+
+def test_extract_input_limit_tokens_reads_the_advertised_limit():
+    from flowly.agent.error_classifier import extract_input_limit_tokens
+
+    response = LLMResponse(
+        content=(
+            "Error calling LLM: Request too large for gpt-x in organization "
+            "org-1 on tokens per min (TPM): Limit 30000, Requested 34712."
+        ),
+        finish_reason="error",
+        error_info=LLMErrorInfo(status_code=413),
+    )
+    assert extract_input_limit_tokens(response) == 30_000
+
+
+def test_extract_input_limit_tokens_handles_separators_and_absence():
+    from flowly.agent.error_classifier import extract_input_limit_tokens
+
+    assert extract_input_limit_tokens(
+        LLMResponse(content="input too large: Limit 30,000 tokens", finish_reason="error")
+    ) == 30_000
+    assert extract_input_limit_tokens(
+        LLMResponse(content="request too large", finish_reason="error")
+    ) is None
+    assert extract_input_limit_tokens(
+        LLMResponse(content="", finish_reason="error")
+    ) is None
+
+
+async def test_structured_413_teaches_the_provider_ceiling():
+    harness, provider = _harness(
+        LLMResponse(
+            content=(
+                "Error calling LLM: input too large on tokens per min (TPM): "
+                "Limit 6000, Requested 9000"
+            ),
+            finish_reason="error",
+            error_info=LLMErrorInfo(status_code=413),
+        ),
+        window=128_000,
+    )
+    messages = _history(turns=8, words=15)
+
+    response, _recovered = await harness._call_provider_with_context_recovery(
+        messages=messages,
+        tools=[],
+        model="test/model",
+        temperature=0.7,
+        tool_choice="auto",
+        session_key="web:learn",
+    )
+
+    assert response.content == "Recovered answer."
+    assert harness.compaction.observed_input_limit_for("test/model") == 6_000
+    # The learned ceiling governs the whole service, not just this call.
+    assert harness.compaction.effective_context_window_for("test/model") == 6_000
+
+
+async def test_unparseable_413_still_learns_a_conservative_ceiling():
+    harness, provider = _harness(
+        LLMResponse(
+            content="opaque provider failure",
+            finish_reason="error",
+            error_info=LLMErrorInfo(status_code=413),
+        ),
+        window=128_000,
+    )
+    # Big enough that 90% of the rejected estimate clears the sanity floor.
+    messages = _history(turns=30, words=100)
+
+    await harness._call_provider_with_context_recovery(
+        messages=messages,
+        tools=[],
+        model="test/model",
+        temperature=0.7,
+        tool_choice="auto",
+        session_key="web:fallback",
+    )
+
+    learned = harness.compaction.observed_input_limit_for("test/model")
+    assert learned is not None
+    assert learned >= 4_096
+    assert learned < 128_000

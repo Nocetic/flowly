@@ -27,6 +27,7 @@ from flowly.agent.error_classifier import (
     ErrorCategory,
     backoff_for,
     classify_response,
+    extract_input_limit_tokens,
     present_provider_error,
 )
 from flowly.agent.context import ContextBuilder
@@ -4415,6 +4416,23 @@ class AgentLoop:
                 session_key or "<default>",
             )
             return response, working
+
+        if category is ErrorCategory.INPUT_TOO_LARGE:
+            # The provider just revealed a request ceiling the catalog cannot
+            # see (TPM tier, per-request cap, proxy guard). Learn it BEFORE
+            # fitting so this retry — and every later durable budget — targets
+            # the real limit instead of paying transient recovery every turn.
+            ceiling = extract_input_limit_tokens(response)
+            if ceiling is None:
+                # The rejected payload itself bounds the ceiling from above;
+                # 90% of its estimate is a safe, converging first guess.
+                ceiling = int(
+                    coordinator.budget(working, tools, model).estimated_input_tokens
+                    * 0.9
+                )
+            self.compaction.note_observed_input_limit(
+                model, ceiling, reason="provider input_too_large rejection",
+            )
 
         rejected_fingerprint = request_fingerprint(working)
         try:
