@@ -63,6 +63,7 @@ def test_state_round_trip_preserves_all_behavioral_fields() -> None:
         goal="Deliver a verified change",
         turns_used=4,
         max_turns=9,
+        consecutive_compaction_failures=1,
         contract=GoalContract(outcome="ship", verification="tests pass"),
         subgoals=["No regressions"],
         gates=[GoalGate("pytest -q", timeout_seconds=12, max_retries=2)],
@@ -78,6 +79,7 @@ def test_state_round_trip_preserves_all_behavioral_fields() -> None:
         "reason": "tests are running",
     }
     assert restored.to_public_dict()["contract"]["verification"] == "tests pass"
+    assert restored.to_public_dict()["consecutiveCompactionFailures"] == 1
 
 
 def test_state_rejects_multiple_wait_targets() -> None:

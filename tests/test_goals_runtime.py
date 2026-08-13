@@ -169,6 +169,60 @@ async def test_kickoff_runs_goal_text_as_first_turn_without_a_prior_judge(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_compaction_exhaustion_gets_one_runtime_retry_then_pauses(tmp_path: Path) -> None:
+    provider = Provider('{"verdict":"done","reason":"must not judge"}')
+    epochs = {"s": 1}
+    manager, runtime = _runtime(tmp_path, provider, epochs)
+    state = manager.set("s", "ship")
+
+    class ExhaustedDelivery(Delivery):
+        async def run_continuation(
+            self,
+            *,
+            session_key: str,
+            goal_id: str,
+            user_epoch: int,
+            kickoff: bool,
+        ) -> DeliveredGoalTurn:
+            self.events.append(("run", {"goal_id": goal_id, "kickoff": kickoff}))
+            return DeliveredGoalTurn(
+                session_key=session_key,
+                response="request too large",
+                user_epoch=user_epoch,
+                succeeded=False,
+                provider_error=True,
+                compaction_failed=True,
+            )
+
+    delivery = ExhaustedDelivery()
+    runtime.delivered(
+        DeliveredGoalTurn(
+            "s",
+            "request too large",
+            user_epoch=1,
+            succeeded=False,
+            provider_error=True,
+            compaction_failed=True,
+        ),
+        delivery,
+    )
+
+    await asyncio.wait_for(delivery.finished.wait(), timeout=1)
+
+    assert delivery.events == [
+        ("notice", "skipped"),
+        ("run", {"goal_id": state.goal_id, "kickoff": False}),
+        ("assistant", "request too large"),
+        ("notice", "skipped"),
+    ]
+    final = manager.get("s")
+    assert final is not None and final.status.value == "paused"
+    assert final.turns_used == 0
+    assert provider.responses == ['{"verdict":"done","reason":"must not judge"}']
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_pending_plan_parks_without_consuming_turn_and_wakes_on_resolution(
     tmp_path: Path,
 ) -> None:

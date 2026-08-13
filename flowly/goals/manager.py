@@ -32,6 +32,7 @@ from flowly.goals.store import GoalStore, GoalStoreConflictError
 
 MAX_PARSE_FAILURES = 3
 MAX_TRANSPORT_FAILURES = 5
+MAX_COMPACTION_FAILURES = 2
 
 GOAL_CONTINUATION_MARKER = "[Continuing toward the explicitly set standing goal]"
 
@@ -99,6 +100,7 @@ class GoalManager:
             state.paused_reason = None
             state.consecutive_parse_failures = 0
             state.consecutive_transport_failures = 0
+            state.consecutive_compaction_failures = 0
             state.clear_wait()
             return state
 
@@ -119,6 +121,9 @@ class GoalManager:
             state.last_verdict = GoalVerdict.INACTIVE.value
             state.last_reason = "goal cleared"
             state.paused_reason = None
+            state.consecutive_parse_failures = 0
+            state.consecutive_transport_failures = 0
+            state.consecutive_compaction_failures = 0
             state.clear_wait()
             if conversation_epoch is not None:
                 state.conversation_epoch = max(0, int(conversation_epoch))
@@ -317,10 +322,41 @@ class GoalManager:
                 reason="turn interrupted",
                 message="⏸ Goal paused because the turn was interrupted.",
             )
+        if compaction_failed:
+            try:
+                failed = self.store.compare_and_update(
+                    state,
+                    _record_compaction_failure,
+                )
+            except GoalStoreConflictError:
+                return _decision(
+                    self.store.get(session_key), GoalVerdict.SKIPPED, reason="goal changed"
+                )
+            if failed.status is GoalStatus.PAUSED:
+                return _decision(
+                    failed,
+                    GoalVerdict.SKIPPED,
+                    reason="context recovery failed twice",
+                    message=(
+                        "⏸ Goal paused after context recovery failed twice. "
+                        "Conversation history was preserved; compact the chat or "
+                        "choose a larger-context model, then resume the goal."
+                    ),
+                )
+            return _decision(
+                failed,
+                GoalVerdict.SKIPPED,
+                should_continue=True,
+                continuation_prompt=self.continuation_prompt(failed),
+                reason="context recovery failed; retrying once",
+                message=(
+                    "⚠ Goal context recovery failed. Retrying once without "
+                    "resetting or truncating the conversation."
+                ),
+            )
         if (
             not turn_succeeded
             or provider_error
-            or compaction_failed
             or not str(latest_response or "").strip()
         ):
             return _decision(
@@ -531,6 +567,18 @@ def _consume_turn(state: GoalState) -> GoalState:
         raise GoalStoreConflictError("goal is no longer active")
     state.turns_used += 1
     state.last_turn_at = time.time()
+    state.consecutive_compaction_failures = 0
+    return state
+
+
+def _record_compaction_failure(state: GoalState) -> GoalState:
+    if not state.is_active:
+        raise GoalStoreConflictError("goal is no longer active")
+    state.consecutive_compaction_failures += 1
+    state.last_verdict = GoalVerdict.SKIPPED.value
+    state.last_reason = "context recovery failed"
+    if state.consecutive_compaction_failures >= MAX_COMPACTION_FAILURES:
+        _pause(state, "context recovery failed twice; conversation history preserved")
     return state
 
 

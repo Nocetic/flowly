@@ -278,6 +278,7 @@ class GoalState:
     paused_reason: str | None = None
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
+    consecutive_compaction_failures: int = 0
     subgoals: list[str] = field(default_factory=list)
     waiting_on_pid: int | None = None
     waiting_on_session: str | None = None
@@ -316,6 +317,12 @@ class GoalState:
         )
         self.consecutive_transport_failures = _bounded_int(
             self.consecutive_transport_failures, default=0, minimum=0, maximum=1_000_000
+        )
+        self.consecutive_compaction_failures = _bounded_int(
+            self.consecutive_compaction_failures,
+            default=0,
+            minimum=0,
+            maximum=1_000_000,
         )
         self.subgoals = _clean_unique_strings(
             self.subgoals, limit=MAX_SUBGOAL_CHARS, max_items=MAX_SUBGOALS, field_name="subgoal"
@@ -409,6 +416,7 @@ class GoalState:
             "paused_reason": self.paused_reason,
             "consecutive_parse_failures": self.consecutive_parse_failures,
             "consecutive_transport_failures": self.consecutive_transport_failures,
+            "consecutive_compaction_failures": self.consecutive_compaction_failures,
             "subgoals": list(self.subgoals),
             "waiting_on_pid": self.waiting_on_pid,
             "waiting_on_session": self.waiting_on_session,
@@ -435,6 +443,7 @@ class GoalState:
             "lastVerdict": self.last_verdict,
             "lastReason": self.last_reason,
             "pausedReason": self.paused_reason,
+            "consecutiveCompactionFailures": self.consecutive_compaction_failures,
             "subgoals": list(self.subgoals),
             "wait": self.wait_public_dict(),
             "contract": self.contract.to_dict() if not self.contract.is_empty else None,
@@ -500,6 +509,10 @@ class GoalState:
             ),
             consecutive_transport_failures=value.get(
                 "consecutive_transport_failures", value.get("consecutiveTransportFailures", 0)
+            ),
+            consecutive_compaction_failures=value.get(
+                "consecutive_compaction_failures",
+                value.get("consecutiveCompactionFailures", 0),
             ),
             subgoals=raw_subgoals
             if isinstance(raw_subgoals, Iterable) and not isinstance(raw_subgoals, (str, bytes))

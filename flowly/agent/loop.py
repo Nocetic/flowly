@@ -3227,9 +3227,18 @@ class AgentLoop:
         user_epoch: int,
     ) -> DeliveredGoalTurn:
         metadata = outbound.metadata or {}
-        provider_error = bool(metadata.get("error"))
+        error = metadata.get("error")
+        provider_error = bool(error)
         aborted = bool(metadata.get("aborted"))
-        compaction_failed = bool(metadata.get("_goal_compaction_failed"))
+        error_category = (
+            str(error.get("category") or "").casefold()
+            if isinstance(error, dict)
+            else ""
+        )
+        compaction_failed = bool(metadata.get("_goal_compaction_failed")) or (
+            error_category in {"context_overflow", "input_too_large"}
+            and not bool(error.get("partial_content_delivered"))
+        )
         return DeliveredGoalTurn(
             session_key=session_key,
             response=outbound.content,
@@ -5576,6 +5585,8 @@ class AgentLoop:
                     final_content = f"{presentation.title}\n\n{presentation.message}"
                     if error_out is not None:
                         error_out.update(presentation.as_dict())
+                        if response.partial_content_delivered:
+                            error_out["partial_content_delivered"] = True
                 break
 
             logger.info(

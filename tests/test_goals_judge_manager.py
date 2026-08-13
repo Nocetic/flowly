@@ -230,6 +230,65 @@ async def test_aborted_failed_and_provider_error_turn_guards(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_compaction_exhaustion_retries_once_then_pauses_without_spending_turn(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedProvider('{"verdict":"continue","reason":"unused"}')
+    manager = _manager(tmp_path, provider)
+    manager.set("s", "g")
+
+    first = await manager.evaluate_after_turn(
+        "s",
+        "request too large",
+        turn_succeeded=False,
+        provider_error=True,
+        compaction_failed=True,
+    )
+    after_first = manager.get("s")
+    assert first.should_continue is True
+    assert "Retrying once" in first.message
+    assert after_first is not None and after_first.is_active
+    assert after_first.turns_used == 0
+    assert after_first.consecutive_compaction_failures == 1
+
+    second = await manager.evaluate_after_turn(
+        "s",
+        "request too large",
+        turn_succeeded=False,
+        provider_error=True,
+        compaction_failed=True,
+    )
+    after_second = manager.get("s")
+    assert second.status is GoalStatus.PAUSED
+    assert second.should_continue is False
+    assert "history was preserved" in second.message
+    assert after_second is not None and after_second.turns_used == 0
+    assert after_second.consecutive_compaction_failures == 2
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_successful_goal_turn_resets_compaction_failure_streak(tmp_path: Path) -> None:
+    provider = ScriptedProvider('{"verdict":"continue","reason":"progress"}')
+    manager = _manager(tmp_path, provider)
+    manager.set("s", "g")
+    await manager.evaluate_after_turn(
+        "s",
+        "request too large",
+        turn_succeeded=False,
+        provider_error=True,
+        compaction_failed=True,
+    )
+
+    decision = await manager.evaluate_after_turn("s", "progress evidence")
+
+    state = manager.get("s")
+    assert decision.should_continue is True
+    assert state is not None and state.turns_used == 1
+    assert state.consecutive_compaction_failures == 0
+
+
+@pytest.mark.asyncio
 async def test_parse_and_transport_failure_circuit_breakers(tmp_path: Path) -> None:
     parse_provider = ScriptedProvider("bad", "bad", "bad")
     parse_manager = _manager(tmp_path / "parse", parse_provider)

@@ -116,6 +116,34 @@ async def test_proactive_goal_status_keeps_old_final_and_adds_scoped_event() -> 
 
 
 @pytest.mark.asyncio
+async def test_proactive_goal_provider_failure_uses_native_error_contract() -> None:
+    server = GatewayServer(host="127.0.0.1", port=0, on_chat_message=AsyncMock())
+    ws = _FakeWS()
+    server._ws_clients = {"client": ws}
+
+    await server.push_session_message(
+        "desktop:chat",
+        "request too large",
+        metadata={
+            "model": "test/model",
+            "error": {
+                "code": "MODEL_INPUT_LIMIT_EXCEEDED",
+                "title": "This request is too large",
+                "message": "Compact the conversation, then try again.",
+                "retryable": False,
+            },
+        },
+    )
+
+    assert len(ws.sent) == 1
+    assert ws.sent[0]["event"] == "chat"
+    assert ws.sent[0]["data"]["state"] == "error"
+    assert ws.sent[0]["data"]["proactive"] is True
+    assert ws.sent[0]["data"]["errorCode"] == "MODEL_INPUT_LIMIT_EXCEEDED"
+    assert "message" not in ws.sent[0]["data"]
+
+
+@pytest.mark.asyncio
 async def test_relay_final_is_followed_by_conversation_scoped_goal_event() -> None:
     channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
     payloads: list[dict[str, Any]] = []

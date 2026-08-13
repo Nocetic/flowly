@@ -3368,6 +3368,35 @@ class GatewayServer:
             return
         import uuid as _uuid
 
+        run_id = "proactive-" + _uuid.uuid4().hex[:8]
+        provider_error = metadata.get("error")
+        if isinstance(provider_error, dict):
+            data: dict[str, Any] = {
+                "state": "error",
+                "proactive": True,
+                "runId": run_id,
+                "sessionKey": session_key,
+                "errorCode": str(
+                    provider_error.get("code") or "MODEL_PROVIDER_UNAVAILABLE"
+                ),
+                "errorTitle": str(
+                    provider_error.get("title") or "The model couldn't respond"
+                ),
+                "errorMessage": str(provider_error.get("message") or text),
+                "retryable": bool(provider_error.get("retryable", False)),
+            }
+            if metadata.get("model"):
+                data["model"] = str(metadata["model"])
+            payload = {"type": "event", "event": "chat", "data": data}
+            for ws in list(self._ws_clients.values()):
+                try:
+                    await self._ws_send(ws, payload)
+                except Exception:
+                    pass
+            if isinstance(goal_snapshot, dict):
+                await self.broadcast_goal_updated(session_key, goal_snapshot)
+            return
+
         final_message: dict[str, Any] = {
             "role": "assistant",
             "content": [{"type": "text", "text": text}],
@@ -3382,7 +3411,7 @@ class GatewayServer:
         data: dict[str, Any] = {
             "state": "final",
             "proactive": True,
-            "runId": "proactive-" + _uuid.uuid4().hex[:8],
+            "runId": run_id,
             "sessionKey": session_key,
             "message": final_message,
         }

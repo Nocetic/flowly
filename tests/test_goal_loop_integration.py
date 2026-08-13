@@ -104,6 +104,39 @@ async def test_goal_notice_reads_state_from_relay_stable_session_key() -> None:
     assert outbound.metadata["goal"] == {"goalId": "goal-1"}
 
 
+def test_goal_turn_recognizes_safe_context_recovery_exhaustion() -> None:
+    loop = object.__new__(AgentLoop)
+    exhausted = loop._goal_turn_from_outbound(
+        "web:chat",
+        OutboundMessage(
+            "web",
+            "chat",
+            "too large",
+            metadata={"error": {"category": "input_too_large"}},
+        ),
+        user_epoch=2,
+    )
+    partial = loop._goal_turn_from_outbound(
+        "web:chat",
+        OutboundMessage(
+            "web",
+            "chat",
+            "partial",
+            metadata={
+                "error": {
+                    "category": "context_overflow",
+                    "partial_content_delivered": True,
+                }
+            },
+        ),
+        user_epoch=2,
+    )
+
+    assert exhausted.compaction_failed is True
+    assert partial.compaction_failed is False
+    assert partial.provider_error is True
+
+
 @pytest.mark.asyncio
 async def test_goal_continuation_rebuilds_fresh_content_without_tool_policy() -> None:
     loop = _bare_loop()
