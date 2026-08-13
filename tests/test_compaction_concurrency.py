@@ -238,6 +238,16 @@ def test_breaker_disk_failure_degrades_to_in_memory_backoff(tmp_path, monkeypatc
     assert service._sessions["chat-1"].consecutive_failures == 1
 
 
+def test_read_only_coordination_root_does_not_break_agent_startup(tmp_path):
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("occupied", encoding="utf-8")
+
+    service = _service(_SlowProvider(), state_dir=blocked)
+
+    assert service._coordinator is None
+    assert service.session_lock("chat-1") is not None
+
+
 # ── Generation guard ──────────────────────────────────────────────────────
 
 

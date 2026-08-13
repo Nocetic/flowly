@@ -20,6 +20,8 @@ from __future__ import annotations
 import pytest
 
 from flowly.agent.loop import AgentLoop
+from flowly.agent.run_abort import RunAbortController
+from flowly.compaction.request_guard import ProviderRequestCoordinator
 from flowly.compaction.service import CompactionService
 from flowly.compaction.types import CompactionConfig
 from flowly.providers.base import LLMResponse
@@ -75,6 +77,11 @@ class _Harness:
     # so the harness borrows that resolution rather than stubbing a policy.
     _resolve_toolset_route = AgentLoop._resolve_toolset_route
     _routed_tool_definitions = AgentLoop._routed_tool_definitions
+    _chat_without_stream = AgentLoop._chat_without_stream
+    _request_coordinator = AgentLoop._request_coordinator
+    _request_too_large_response = staticmethod(AgentLoop._request_too_large_response)
+    _call_provider_with_context_recovery = AgentLoop._call_provider_with_context_recovery
+    is_run_aborted = AgentLoop.is_run_aborted
 
     def __init__(self, reply: str):
         self.provider = _Provider(reply)
@@ -87,6 +94,12 @@ class _Harness:
         self.compaction = CompactionService(
             provider=self.provider, model="m", config=CompactionConfig(),
         )
+        self._provider_requests = ProviderRequestCoordinator(self.compaction)
+        self._run_aborts = RunAbortController()
+        self._api_call_count = 0
+
+    def _touch_activity(self, _detail: str) -> None:
+        pass
 
 
 def _session() -> Session:

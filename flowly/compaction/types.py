@@ -171,6 +171,11 @@ SUMMARY_MARKERS = (SUMMARY_MARKER, LEGACY_SUMMARY_MARKER)
 # for projected views and for sessions written before this flag existed.
 SUMMARY_METADATA_KEY = "_compaction_summary"
 
+# Prompt-only user-role nudges inserted by the agent loop. They may need to
+# survive a mid-turn request rebuild, but they are not the human's current raw
+# request and therefore must never displace it as the protected user message.
+EPHEMERAL_NUDGE_KEY = "_ephemeral_nudge"
+
 
 def build_summary_content(summary: str) -> str:
     """The exact text a compaction summary is stored and injected as.

@@ -16,8 +16,9 @@ from loguru import logger
 
 from flowly.bus.events import InboundMessage, OutboundMessage
 from flowly.bus.queue import MessageBus
-from flowly.providers.base import LLMProvider, LLMResponse
+from flowly.providers.base import LLMErrorInfo, LLMProvider, LLMResponse
 from flowly.agent.error_classifier import (
+    ErrorCategory,
     backoff_for,
     classify_response,
     present_provider_error,
@@ -49,9 +50,14 @@ from flowly.session.archive import (
 )
 from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
+from flowly.compaction.request_guard import (
+    ProviderRequestCoordinator,
+    request_fingerprint,
+)
 from flowly.compaction.types import (
     CompactionConfig,
     CompactionError,
+    EPHEMERAL_NUDGE_KEY,
     SUMMARY_METADATA_KEY,
     build_summary_content,
     is_summary_message,
@@ -412,7 +418,7 @@ def _relabel_codex_projected_pair(
 # steer the model during the turn but must never be persisted — otherwise
 # they surface in the transcript as if the user typed them. Underscore-
 # prefixed so the provider layer strips it before the API call.
-_EPHEMERAL_NUDGE = "_ephemeral_nudge"
+_EPHEMERAL_NUDGE = EPHEMERAL_NUDGE_KEY
 
 # A memory-flush turn is one provider round trip. Bounded for the same reason
 # every other call on the compaction path is (see
@@ -855,6 +861,7 @@ class AgentLoop:
             # both believe they owned the same conversation.
             state_dir=self.sessions.sessions_dir,
         )
+        self._provider_requests = ProviderRequestCoordinator(self.compaction)
 
         # Trello config
         self.trello_config = trello_config
@@ -3725,7 +3732,10 @@ class AgentLoop:
         return False
 
     async def _request_summary_turn(
-        self, messages: list[dict], tool_results: list[dict]
+        self,
+        messages: list[dict],
+        tool_results: list[dict],
+        session_key: str = "",
     ) -> str | None:
         """Ask the model to summarize what happened in natural language.
 
@@ -3748,13 +3758,19 @@ class AgentLoop:
         messages_copy.append({"role": "user", "content": summary_prompt})
 
         try:
-            response = await self.provider.chat(
+            response, _fitted_messages = await self._call_provider_with_context_recovery(
                 messages=messages_copy,
                 tools=[],
                 model=self.model,
                 temperature=0.7,
+                tool_choice="none",
+                session_key=session_key,
             )
-            if response.content and response.content.strip():
+            if (
+                response.finish_reason != "error"
+                and response.content
+                and response.content.strip()
+            ):
                 return response.content.strip()
         except Exception as e:
             logger.warning(f"Summary turn failed, keeping fallback: {e}")
@@ -4175,6 +4191,7 @@ class AgentLoop:
                 content=accumulated_text or None,
                 finish_reason="aborted",
                 usage={},
+                partial_content_delivered=bool(accumulated_text),
             )
 
         # Preserve usage across the final-response rebuild. The earlier
@@ -4194,6 +4211,7 @@ class AgentLoop:
                 content=accumulated_text or None,
                 finish_reason="stop",
                 usage=final_usage,
+                partial_content_delivered=bool(accumulated_text),
             )
         elif final_response.tool_calls:
             # Final chunk had tool calls — content came in earlier deltas
@@ -4203,6 +4221,7 @@ class AgentLoop:
                 finish_reason=final_response.finish_reason,
                 usage=final_usage,
                 error_info=final_error_info,
+                partial_content_delivered=bool(accumulated_text),
             )
         else:
             # Pure text — use accumulated content
@@ -4211,6 +4230,7 @@ class AgentLoop:
                 finish_reason=final_response.finish_reason,
                 usage=final_usage,
                 error_info=final_error_info,
+                partial_content_delivered=bool(accumulated_text),
             )
 
         return final_response
@@ -4251,6 +4271,167 @@ class AgentLoop:
                 finish_reason="aborted",
                 usage={},
             )
+
+    def _request_coordinator(self) -> ProviderRequestCoordinator:
+        """Lazy compatibility for lightweight test/embedding harnesses."""
+        coordinator = getattr(self, "_provider_requests", None)
+        if coordinator is None:
+            coordinator = ProviderRequestCoordinator(self.compaction)
+            self._provider_requests = coordinator
+        return coordinator
+
+    @staticmethod
+    def _request_too_large_response(reason: str) -> LLMResponse:
+        """Fail closed with machine-routable metadata and user-safe prose."""
+        logger.warning("Provider request blocked before dispatch: {}", reason)
+        return LLMResponse(
+            content="Error calling LLM: request input is too large after compaction",
+            finish_reason="error",
+            error_info=LLMErrorInfo(
+                status_code=413,
+                code="input_too_large",
+                type="request_too_large",
+            ),
+        )
+
+    async def _call_provider_with_context_recovery(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str,
+        temperature: float,
+        tool_choice: str,
+        session_key: str = "",
+        run_id: str = "",
+        iteration: int = 0,
+        stream_callback: Callable[[str], Awaitable[None]] | None = None,
+    ) -> tuple[LLMResponse, list[dict[str, Any]]]:
+        """Budget, dispatch, and recover one main-agent provider request.
+
+        Every main conversation call enters here — initial, tool iteration,
+        streaming fallback, required→auto fallback, memory flush, and natural
+        fallback summary.  A structured 413/context overflow gets exactly one
+        retry and only after the working payload has materially changed.  Rate
+        limits and other failures never enter this recovery path.
+        """
+        coordinator = self._request_coordinator()
+
+        def cancelled() -> bool:
+            return bool(run_id) and self.is_run_aborted(run_id)
+
+        try:
+            fitted = await coordinator.fit(
+                messages,
+                tools,
+                model,
+                session_key=session_key,
+                should_cancel=cancelled,
+            )
+        except Exception as exc:  # noqa: BLE001 — preflight must fail closed
+            logger.error("Provider request fitting failed: {}", exc)
+            return self._request_too_large_response(str(exc)), messages
+        if cancelled():
+            return LLMResponse(
+                content=None,
+                finish_reason="aborted",
+                usage={},
+            ), messages
+        if not fitted.fits:
+            return (
+                self._request_too_large_response(fitted.failure or "request does not fit"),
+                messages,
+            )
+        working = fitted.messages
+        if fitted.changed:
+            logger.info(
+                "Provider request compacted before dispatch: {} → {} estimated "
+                "input tokens (limit {}, iteration {})",
+                fitted.before.estimated_input_tokens,
+                fitted.after.estimated_input_tokens,
+                fitted.after.input_limit,
+                iteration,
+            )
+
+        async def dispatch(payload: list[dict[str, Any]]) -> LLMResponse:
+            self._api_call_count = getattr(self, "_api_call_count", 0) + 1
+            self._touch_activity(
+                f"starting LLM call #{self._api_call_count} (iter {iteration})"
+            )
+            if stream_callback is not None:
+                return await self._chat_with_stream(
+                    messages=payload,
+                    tools=tools,
+                    model=model,
+                    temperature=temperature,
+                    tool_choice=tool_choice,
+                    stream_callback=stream_callback,
+                    run_id=run_id,
+                )
+            return await self._chat_without_stream(
+                messages=payload,
+                tools=tools,
+                model=model,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                run_id=run_id,
+            )
+
+        response = await dispatch(working)
+        if response.finish_reason != "error":
+            return response, working
+        category = classify_response(response)
+        if category not in {
+            ErrorCategory.CONTEXT_OVERFLOW,
+            ErrorCategory.INPUT_TOO_LARGE,
+        }:
+            return response, working
+        if response.partial_content_delivered:
+            logger.warning(
+                "Context overflow arrived after streamed content; refusing a "
+                "duplicate retry for session {}",
+                session_key or "<default>",
+            )
+            return response, working
+
+        rejected_fingerprint = request_fingerprint(working)
+        try:
+            recovered = await coordinator.fit(
+                working,
+                tools,
+                model,
+                session_key=session_key,
+                force_reduction=True,
+                should_cancel=cancelled,
+            )
+        except Exception as exc:  # noqa: BLE001 — preserve original provider error
+            logger.warning("Overflow recovery compaction failed: {}", exc)
+            return response, working
+        if cancelled():
+            return LLMResponse(
+                content=None,
+                finish_reason="aborted",
+                usage={},
+            ), working
+        if (
+            not recovered.fits
+            or not recovered.changed
+            or request_fingerprint(recovered.messages) == rejected_fingerprint
+        ):
+            logger.warning(
+                "Overflow recovery could not produce a safely smaller payload: {}",
+                recovered.failure or "payload unchanged",
+            )
+            return response, working
+
+        logger.warning(
+            "Retrying {} once after material context reduction: {} → {} "
+            "estimated input tokens",
+            category.value,
+            recovered.before.estimated_input_tokens,
+            recovered.after.estimated_input_tokens,
+        )
+        return await dispatch(recovered.messages), recovered.messages
 
     async def _emit_iteration_event(
         self,
@@ -4798,28 +4979,17 @@ class AgentLoop:
             use_stream = stream_callback is not None and preflight_response is None
             if preflight_response is not None:
                 response = preflight_response
-            elif use_stream:
-                self._api_call_count += 1
-                self._touch_activity(f"starting LLM call #{self._api_call_count} (iter {iteration})")
-                response = await self._chat_with_stream(
-                    messages=messages,
-                    tools=tool_defs,
-                    model=selected_model,
-                    temperature=selected_temperature,
-                    tool_choice=tool_choice,
-                    stream_callback=stream_callback,
-                    run_id=outbound_run_id,
-                )
             else:
-                self._api_call_count += 1
-                self._touch_activity(f"starting LLM call #{self._api_call_count} (iter {iteration})")
-                response = await self._chat_without_stream(
+                response, messages = await self._call_provider_with_context_recovery(
                     messages=messages,
                     tools=tool_defs,
                     model=selected_model,
                     temperature=selected_temperature,
                     tool_choice=tool_choice,
+                    session_key=session_key,
                     run_id=outbound_run_id,
+                    iteration=iteration,
+                    stream_callback=stream_callback if use_stream else None,
                 )
 
             # Cooperative abort — short-circuit the tool loop. Two
@@ -4847,37 +5017,42 @@ class AgentLoop:
             # If streaming failed, fall back to blocking chat()
             if (
                 use_stream
-                and response.content
-                and response.content.startswith("Error calling LLM:")
+                and response.finish_reason == "error"
+                and not response.partial_content_delivered
                 and backoff_for(classify_response(response), 1) is not None
             ):
                 logger.warning("Streaming failed, falling back to blocking chat()")
-                response = await self._chat_without_stream(
+                response, messages = await self._call_provider_with_context_recovery(
                     messages=messages,
                     tools=tool_defs,
                     model=selected_model,
                     temperature=selected_temperature,
                     tool_choice=tool_choice,
+                    session_key=session_key,
                     run_id=outbound_run_id,
+                    iteration=iteration,
                 )
 
             if (
-                response.content
-                and response.content.startswith("Error")
+                response.finish_reason == "error"
                 and tool_choice == "required"
                 and (
-                    not response.content.startswith("Error calling LLM:")
-                    or backoff_for(classify_response(response), 1) is not None
+                    backoff_for(classify_response(response), 1) is not None
                 )
             ):
-                logger.warning(f"tool_choice=required failed, retrying with auto: {response.content[:120]}")
-                response = await self._chat_without_stream(
+                logger.warning(
+                    "tool_choice=required failed, retrying with auto: {}",
+                    (response.content or "")[:120],
+                )
+                response, messages = await self._call_provider_with_context_recovery(
                     messages=messages,
                     tools=tool_defs,
                     model=selected_model,
                     temperature=selected_temperature,
                     tool_choice="auto",
+                    session_key=session_key,
                     run_id=outbound_run_id,
+                    iteration=iteration,
                 )
 
             # Audit the LLM call after the retry chain settles. We log
@@ -4909,8 +5084,8 @@ class AgentLoop:
                 # alone is loud enough for diagnostics.
                 logger.debug("audit log_llm_call failed", exc_info=True)
 
-            if response.content and response.content.startswith("Error calling LLM:"):
-                lowered_error = response.content.lower()
+            if response.finish_reason == "error":
+                lowered_error = (response.content or "").lower()
                 schema_rejected = (
                     "input_schema does not support oneof" in lowered_error
                     or "input_schema does not support allof" in lowered_error
@@ -5958,7 +6133,11 @@ class AgentLoop:
             and self._is_hardcoded_fallback(final_content)
         ):
             logger.info("Requesting model summary turn to replace hardcoded fallback")
-            summary = await self._request_summary_turn(messages, accumulated_tool_results)
+            summary = await self._request_summary_turn(
+                messages,
+                accumulated_tool_results,
+                session_key=session_key,
+            )
             if summary:
                 final_content = summary
 
@@ -6022,11 +6201,14 @@ class AgentLoop:
         # it wedges that session's background slot for the life of the
         # process — no further post-turn compaction until a restart.
         try:
-            response = await asyncio.wait_for(
-                self.provider.chat(
+            response, messages = await asyncio.wait_for(
+                self._call_provider_with_context_recovery(
                     messages=messages,
                     tools=flush_definitions,
                     model=self.model,
+                    temperature=0.7,
+                    tool_choice="auto",
+                    session_key=session.key,
                 ),
                 timeout=MEMORY_FLUSH_TIMEOUT_SECONDS,
             )

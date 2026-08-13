@@ -25,6 +25,7 @@ from flowly.compaction.summarizer import (
     summarize_in_stages,
 )
 from flowly.compaction.types import (
+    EPHEMERAL_NUDGE_KEY,
     SILENT_REPLY_TOKEN,
     CompactionConfig,
     CompactionError,
@@ -192,9 +193,20 @@ class CompactionService:
         self.provider = provider
         self.model = model
         self.config = config or CompactionConfig()
-        self._coordinator = (
-            CompactionCoordinator(Path(state_dir)) if state_dir is not None else None
-        )
+        self._coordinator: CompactionCoordinator | None = None
+        if state_dir is not None:
+            try:
+                self._coordinator = CompactionCoordinator(Path(state_dir))
+            except OSError as exc:
+                # Read-only/test profiles must still boot. Compaction remains
+                # protected by its in-process lock and fails safe at canonical
+                # revision checks; production profiles log the missing durable
+                # coordination layer prominently.
+                logger.warning(
+                    "Cross-process compaction coordination unavailable at {}: {}",
+                    state_dir,
+                    exc,
+                )
         # Compaction bookkeeping is PER SESSION. A single service instance
         # serves every chat on the gateway, so a global counter let one
         # conversation's memory-flush cycle cancel another's, and one
@@ -366,19 +378,24 @@ class CompactionService:
         A user who pinned ``compaction.contextWindow`` themselves always
         wins: an operator override must not be second-guessed by a catalog.
         """
+        return self.model_context_window_for(self.model)
+
+    def model_context_window_for(self, model: str | None = None) -> int:
+        """Resolve a model window without mutating the service's default model."""
+        selected_model = model or self.model
         if self.config.context_window_explicit:
             return self.config.context_window
 
         try:
             from flowly.integrations.model_catalog import get_context_window
 
-            live = get_context_window(self.model)
+            live = get_context_window(selected_model)
             if live and live > 0:
                 return live
         except Exception:  # noqa: BLE001 - catalog is best-effort
             pass
 
-        heuristic = _heuristic_context_window(self.model)
+        heuristic = _heuristic_context_window(selected_model)
         if heuristic:
             return heuristic
         return self.config.context_window
@@ -390,9 +407,14 @@ class CompactionService:
         provider (it rejects bigger prompts with 413). The ceiling follows
         the model family, so a 200K Claude gets its 200K — the old flat 80K
         cap choked every large model to a fraction of its window."""
-        window = self.model_context_window
+        return self.effective_context_window_for(self.model)
+
+    def effective_context_window_for(self, model: str | None = None) -> int:
+        """Usable request window for a per-turn model override."""
+        selected_model = model or self.model
+        window = self.model_context_window_for(selected_model)
         if getattr(self.provider, "provider_name", "") == "flowly":
-            return min(window, _flowly_proxy_max_input_tokens(self.model))
+            return min(window, _flowly_proxy_max_input_tokens(selected_model))
         return window
 
     @property
@@ -410,8 +432,12 @@ class CompactionService:
         the share; large ones keep the configured value, which is smaller than
         the share and therefore wins.
         """
+        return self.effective_reserve_tokens_for(self.model)
+
+    def effective_reserve_tokens_for(self, model: str | None = None) -> int:
+        """Reply reserve sized against the model actually being called."""
         configured = max(0, self.config.reserve_tokens_floor)
-        window = max(1, self.effective_context_window)
+        window = max(1, self.effective_context_window_for(model))
         return max(
             self.MIN_RESERVE_TOKENS,
             min(configured, int(window * self.MAX_RESERVE_SHARE)),
@@ -420,7 +446,15 @@ class CompactionService:
     @property
     def compaction_threshold(self) -> int:
         """Token count at which this session starts compacting."""
-        return max(1, self.effective_context_window - self.effective_reserve_tokens)
+        return self.compaction_threshold_for(self.model)
+
+    def compaction_threshold_for(self, model: str | None = None) -> int:
+        """Maximum estimated request input while preserving reply headroom."""
+        return max(
+            1,
+            self.effective_context_window_for(model)
+            - self.effective_reserve_tokens_for(model),
+        )
 
     def history_budget(self, overhead_tokens: int = 0) -> int:
         """Tokens the conversation itself may occupy.
@@ -761,7 +795,12 @@ class CompactionService:
         # provider cannot accept that request verbatim, the compaction is
         # refused later instead of pretending a lossy paraphrase is equivalent.
         newest_user = next(
-            (message for message in reversed(messages) if message.get("role") == "user"),
+            (
+                message
+                for message in reversed(messages)
+                if message.get("role") == "user"
+                and not message.get(EPHEMERAL_NUDGE_KEY)
+            ),
             None,
         )
 
@@ -836,6 +875,7 @@ class CompactionService:
         session_key: str = "",
         should_cancel: "Callable[[], bool] | None" = None,
         history_budget: int = 0,
+        track_cycle: bool = True,
     ) -> CompactionResult:
         """
         Compact messages by generating a summary.
@@ -850,6 +890,8 @@ class CompactionService:
             history_budget: Room the conversation may occupy after this runs.
                 Sizes the preserved tail — without it the tail is capped by an
                 absolute number that can exceed the whole history.
+            track_cycle: Whether this is a durable session compaction cycle.
+                Mid-turn request fitting is transient and sets this false.
 
         Returns:
             CompactionResult with summary and statistics.
@@ -1027,7 +1069,8 @@ class CompactionService:
                 f"({tokens_before} → {tokens_after} tokens); refusing to commit"
             )
 
-        self._state(session_key).compaction_count += 1
+        if track_cycle:
+            self._state(session_key).compaction_count += 1
 
         return CompactionResult(
             summary=summary,

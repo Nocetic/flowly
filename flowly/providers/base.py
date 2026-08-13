@@ -129,6 +129,10 @@ class LLMResponse:
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     error_info: LLMErrorInfo | None = None
+    # True when text from this attempt already reached a live stream callback.
+    # Retrying an error after that point would duplicate or contradict visible
+    # output, so context recovery must fail closed and preserve the partial.
+    partial_content_delivered: bool = False
 
     @property
     def has_tool_calls(self) -> bool:
@@ -139,7 +143,7 @@ class LLMResponse:
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-    
+
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
