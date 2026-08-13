@@ -3723,11 +3723,20 @@ class AgentLoop:
         store = getattr(self, "_task_states", None)
         if store is None or not _is_user_activity_channel(msg.channel):
             return
+        # Transport wrappers such as ``/notools <prompt>`` must not become the
+        # task contract themselves.  Classify the wrapped user intent while
+        # retaining ``display_content`` verbatim for history and audit.  This
+        # keeps the tool policy orthogonal to TaskState: a question preserves
+        # the current objective, a genuine action may replace it, and an exact
+        # cancellation still cancels it.
+        intent_content = msg.metadata.get("_task_state_intent_content")
+        if not isinstance(intent_content, str) or not intent_content.strip():
+            intent_content = display_content
         objective = msg.metadata.get("task_objective")
         if not isinstance(objective, str) or not objective.strip():
-            objective = self._task_objective_candidate(msg.channel, display_content)
+            objective = self._task_objective_candidate(msg.channel, intent_content)
         cancel = bool(msg.metadata.get("cancel_task_state", False)) or (
-            self._is_task_state_reversal(display_content)
+            self._is_task_state_reversal(intent_content)
         )
         if store.get(session.key) is None and objective is None:
             self._bootstrap_task_state(session, msg.channel)
@@ -6553,9 +6562,9 @@ class AgentLoop:
             original_content = msg.content
             msg.content = command_args.strip()
             msg.metadata["_display_content"] = original_content
+            msg.metadata["_task_state_intent_content"] = msg.content
             msg.metadata["tools_allowed"] = False
             msg.metadata["tool_policy"] = "none"
-            msg.metadata["task_objective"] = msg.content
             is_command = False
             command = ""
             command_args = ""
