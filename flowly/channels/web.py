@@ -430,6 +430,7 @@ class WebChannel(BaseChannel):
         # final would persist a fake assistant bubble in every client.
         if msg.metadata.get("goalStatus") is True:
             goal_snapshot = msg.metadata.get("goal")
+            terminal = bool(msg.metadata.get("goalTerminal")) and bool(msg.content.strip())
             if isinstance(goal_snapshot, dict):
                 session_key = self._session_key_for_relay_id(session_id)
                 goal_event = {
@@ -442,7 +443,13 @@ class WebChannel(BaseChannel):
                 asyncio.create_task(
                     self._emit_local_event("goal.updated", goal_event["data"])
                 )
-            return
+            # A goal that ENDED still reports in words; routine progress stops
+            # here as chip state.
+            if not terminal:
+                return
+            # The snapshot already went out; keep the message path from
+            # appending the same revision again.
+            msg.metadata.pop("goal", None)
 
         # Live per-iteration tool-turn event from the loop. The loop
         # emits one of these after every assistant_with_tool_calls or

@@ -3468,7 +3468,14 @@ class GatewayServer:
         if metadata.get("goalStatus") is True:
             if isinstance(goal_snapshot, dict):
                 await self.broadcast_goal_updated(session_key, goal_snapshot)
-            return
+            # A goal that ENDED still reports in words — something has to say
+            # the work finished. Routine progress stops here as chip state.
+            if not (metadata.get("goalTerminal") and text.strip()):
+                return
+            # The snapshot has already gone out; drop it so the message path
+            # below does not broadcast the same revision a second time.
+            metadata = {k: v for k, v in metadata.items() if k != "goal"}
+            goal_snapshot = None
         if not text and not media and not isinstance(goal_snapshot, dict):
             return
         import uuid as _uuid

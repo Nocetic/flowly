@@ -79,7 +79,7 @@ from flowly.compaction.estimator import (
 )
 from flowly.exec.types import ExecConfig
 from flowly.config.schema import TrelloConfig, VoiceBridgeConfig, XConfig, MemorySearchConfig
-from flowly.goals.models import GoalDecision
+from flowly.goals.models import GoalDecision, GoalStatus
 from flowly.goals.commands import GoalCommandHandler
 from flowly.goals.runtime import DeliveredGoalTurn, GoalDelivery, GoalRuntime
 from flowly.audit.logger import get_audit_logger
@@ -236,16 +236,21 @@ class _AgentGoalDelivery(GoalDelivery):
 
     async def deliver_notice(self, decision: GoalDecision) -> None:
         state = self.agent.goal_manager.get(self.session_key)
-        metadata: dict[str, Any] = {"goalStatus": True}
-        if state is not None:
-            metadata["goal"] = state.to_public_dict()
-        outbound = OutboundMessage(
-            channel=self.channel,
-            chat_id=self.chat_id,
-            content=decision.message,
-            metadata=metadata,
+        if state is None:
+            return
+        # A goal that ENDED has to say so: the chip alone cannot be the only
+        # report that the work finished (or stopped needing the user). Routine
+        # progress stays chip state — that chatter is what polluted the
+        # transcript before.
+        terminal = decision.status in {GoalStatus.DONE, GoalStatus.PAUSED}
+        await self.agent.publish_goal_snapshot(
+            self.session_key,
+            self.channel,
+            self.chat_id,
+            decision.message,
+            state,
+            terminal=terminal,
         )
-        await self.agent._deliver_goal_outbound(outbound, direct=self.direct)
 
 
 # ── Built-in agent keyword routing ──────────────────────────────────────────
@@ -3363,33 +3368,54 @@ class AgentLoop:
             metadata={"outbound": outbound},
         )
 
-    async def _deliver_goal_status(
+    async def publish_goal_snapshot(
         self,
-        msg: InboundMessage,
+        session_key: str,
+        channel: str,
+        chat_id: str,
         text: str,
         state: Any,
+        *,
+        terminal: bool = False,
     ) -> None:
-        """Publish goal state to the surface in the shape that surface wants.
+        """Publish goal state to every surface this conversation may be on.
 
-        Chip surfaces (desktop, iOS, TUI, relay) receive the snapshot as a
-        ``goal.updated`` event and never a chat row; chat-only channels get
-        ``text`` so they are not left without any confirmation at all. The
-        split lives in the transports — see ``_deliver_goal_outbound``.
+        Deliberately not "pick the live transport": a conversation can be open
+        on a gateway socket and a relay chat at once, and inferring the surface
+        from turn metadata got it wrong — a relay chat carries a stream
+        callback too, so the snapshot went to the gateway socket and the chip
+        only caught up on its next refetch. Both are addressed; clients drop
+        duplicates by revision.
+
+        ``terminal`` marks the end of a goal (achieved, or stopped needing the
+        user). Those notices stay VISIBLE — something has to say the work
+        finished — while routine progress remains chip state only.
         """
+        snapshot = state.to_public_dict()
+        metadata: dict[str, Any] = {"goalStatus": True, "goal": snapshot}
+        if terminal:
+            metadata["goalTerminal"] = True
+
+        gateway = getattr(self, "_gateway_server", None)
+        if gateway is not None and hasattr(gateway, "broadcast_goal_updated"):
+            try:
+                await gateway.broadcast_goal_updated(session_key, snapshot)
+            except Exception:  # noqa: BLE001
+                logger.debug("[goal] gateway snapshot push skipped", exc_info=True)
+        callback = getattr(self, "_goal_output_callback", None)
+        if callback is not None:
+            try:
+                await callback(OutboundMessage(
+                    channel=channel, chat_id=chat_id, content=text, metadata=metadata,
+                ))
+            except Exception:  # noqa: BLE001
+                logger.debug("[goal] direct snapshot push skipped", exc_info=True)
         try:
-            await self._deliver_goal_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=text,
-                    metadata={"goalStatus": True, "goal": state.to_public_dict()},
-                ),
-                direct=bool(msg.metadata.get("stream_callback")) or bool(
-                    getattr(self, "_goal_output_callback", None)
-                ),
-            )
-        except Exception:  # noqa: BLE001 — never block the turn on a notice
-            logger.debug("[goal] status delivery skipped", exc_info=True)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=channel, chat_id=chat_id, content=text, metadata=metadata,
+            ))
+        except Exception:  # noqa: BLE001 — never block a turn on a notice
+            logger.debug("[goal] channel snapshot push skipped", exc_info=True)
 
     def register_goal_turn_submitter(self, key: str, submitter: Any) -> None:
         """Register a surface's normal user-turn entry point for goal turns.
@@ -3484,22 +3510,9 @@ class AgentLoop:
         else:
             channel, chat_id = "cli", session_key
 
-        # Snapshot to every surface — duplicates are harmless (clients guard
-        # by revision), a missing surface is not.
-        if gateway is not None and hasattr(gateway, "broadcast_goal_updated"):
-            try:
-                await gateway.broadcast_goal_updated(session_key, snapshot)
-            except Exception:
-                logger.debug("[goal] gateway snapshot push failed", exc_info=True)
-        try:
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content="",
-                metadata={"goalStatus": True, "goal": snapshot},
-            ))
-        except Exception:
-            logger.debug("[goal] channel snapshot push failed", exc_info=True)
+        await self.publish_goal_snapshot(
+            session_key, channel, chat_id, "", state,
+        )
 
         if action == "resume" and runtime is not None:
             delivery = _AgentGoalDelivery(
@@ -7357,7 +7370,10 @@ class AgentLoop:
                     # so the user sees the goal took hold. Chip surfaces render
                     # the snapshot and suppress the text; chat-only channels
                     # (Telegram, Slack…) get the one-line confirmation instead.
-                    await self._deliver_goal_status(msg, result.content, state)
+                    await self.publish_goal_snapshot(
+                        msg.session_key, msg.channel, msg.chat_id,
+                        result.content, state,
+                    )
                     msg.metadata.update(self.goal_turn_metadata(
                         state.goal_id,
                         user_epoch=self.goal_user_epoch(msg.session_key),

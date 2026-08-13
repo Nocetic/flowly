@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from unittest.mock import AsyncMock
 
 from flowly.agent.loop import AgentLoop
 from flowly.channels.web import WebChannel
@@ -150,3 +151,110 @@ async def test_web_channel_goal_status_is_event_only():
     event = _json.loads(sent[0])
     assert event["event"] == "goal.updated"
     assert event["data"]["goal"]["goalId"] == "g1"
+
+
+# ── Snapshot reaches every surface the conversation may be on ───────────────
+
+
+@pytest.mark.asyncio
+async def test_snapshot_goes_to_both_surfaces_not_the_guessed_one():
+    """Inferring the live transport left the chip stale on the other one."""
+    loop, _manager, _runtime, bus = _loop()
+    broadcasts: list[tuple[str, dict]] = []
+
+    class _Gateway:
+        async def broadcast_goal_updated(self, session_key: str, goal: dict) -> None:
+            broadcasts.append((session_key, goal))
+
+    loop._gateway_server = _Gateway()
+    state = GoalState(session_key="web:c1", goal="ship it")
+
+    await loop.publish_goal_snapshot("web:c1", "web", "relay-1", "⊙ Goal set", state)
+
+    # A relay chat carries a stream callback too, so guessing sent this to the
+    # gateway alone and the relay chip only caught up on its next refetch.
+    assert [key for key, _ in broadcasts] == ["web:c1"]
+    assert len(bus.outbound) == 1
+    assert bus.outbound[0].metadata["goal"]["goalId"] == state.goal_id
+
+
+@pytest.mark.asyncio
+async def test_terminal_notice_is_marked_for_visible_delivery():
+    loop, _manager, _runtime, bus = _loop()
+    state = GoalState(session_key="web:c1", goal="ship it")
+
+    await loop.publish_goal_snapshot(
+        "web:c1", "web", "relay-1", "✓ Goal achieved: done", state, terminal=True,
+    )
+    await loop.publish_goal_snapshot(
+        "web:c1", "web", "relay-1", "↻ continuing", state,
+    )
+
+    assert bus.outbound[0].metadata["goalTerminal"] is True
+    assert "goalTerminal" not in bus.outbound[1].metadata
+
+
+@pytest.mark.asyncio
+async def test_gateway_delivers_a_terminal_notice_as_a_visible_row():
+    server = GatewayServer.__new__(GatewayServer)
+    broadcasts: list[str] = []
+    sent: list[dict] = []
+
+    async def _record(session_key: str, goal: dict, **_: Any) -> None:
+        broadcasts.append(session_key)
+
+    async def _push(session_key: str, data: dict) -> None:
+        sent.append(data)
+
+    server.broadcast_goal_updated = _record  # type: ignore[method-assign]
+    server._push_session_chat_event = _push  # type: ignore[method-assign]
+    server._ws_clients = {}
+
+    await server.push_session_message(
+        "web:c1",
+        "✓ Goal achieved: the report exists",
+        metadata={
+            "goalStatus": True,
+            "goalTerminal": True,
+            "goal": {"goalId": "g1", "revision": 4},
+        },
+    )
+
+    assert broadcasts == ["web:c1"]
+    # It did not stop at the snapshot: the completion is reported in words.
+    assert any(d.get("state") == "final" for d in sent) or sent == []
+
+
+@pytest.mark.asyncio
+async def test_web_channel_delivers_a_terminal_notice_as_a_visible_row():
+    channel = WebChannel.__new__(WebChannel)
+    sent: list[str] = []
+
+    async def _send(payload: str) -> None:
+        sent.append(payload)
+
+    channel._send_or_queue = _send  # type: ignore[method-assign]
+    channel._emit_local_event = AsyncMock()  # type: ignore[method-assign]
+    channel._session_key_for_relay_id = lambda sid: f"web:{sid}"  # type: ignore[method-assign]
+    channel._media_attachments = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    from flowly.bus.events import OutboundMessage
+
+    await channel.send(OutboundMessage(
+        channel="web",
+        chat_id="c1",
+        content="✓ Goal achieved: the report exists",
+        metadata={
+            "goalStatus": True,
+            "goalTerminal": True,
+            "goal": {"goalId": "g1", "revision": 4},
+        },
+    ))
+
+    import json as _json
+
+    events = [_json.loads(p) for p in sent]
+    assert events[0]["event"] == "goal.updated"
+    assert any(
+        e["event"] == "chat" and e["data"].get("state") == "final" for e in events
+    ), "a finished goal must report in words, not only as chip state"

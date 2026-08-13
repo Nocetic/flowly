@@ -16,6 +16,7 @@ from flowly.agent.loop import (
 )
 from flowly.bus.events import InboundMessage, OutboundMessage
 from flowly.goals.commands import GoalCommandResult
+from flowly.goals.models import GoalStatus
 
 
 @dataclass
@@ -164,7 +165,7 @@ async def test_goal_notice_reads_state_from_relay_stable_session_key() -> None:
     state = Mock()
     state.to_public_dict.return_value = {"goalId": "goal-1"}
     loop.goal_manager.get.return_value = state
-    loop._deliver_goal_outbound = AsyncMock()
+    loop.publish_goal_snapshot = AsyncMock()
     delivery = _AgentGoalDelivery(
         loop,
         session_key="web:stable-chat",
@@ -173,13 +174,35 @@ async def test_goal_notice_reads_state_from_relay_stable_session_key() -> None:
         direct=False,
     )
 
-    decision = Mock(message="completed")
+    decision = Mock(message="completed", status=GoalStatus.DONE)
     await delivery.deliver_notice(decision)
 
     loop.goal_manager.get.assert_called_once_with("web:stable-chat")
-    outbound = loop._deliver_goal_outbound.await_args.args[0]
-    assert outbound.chat_id == "relay-1"
-    assert outbound.metadata["goal"] == {"goalId": "goal-1"}
+    kwargs = loop.publish_goal_snapshot.await_args
+    assert kwargs.args[:4] == ("web:stable-chat", "web", "relay-1", "completed")
+    # A goal that ENDED reports in words, not only as chip state.
+    assert kwargs.kwargs["terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_routine_goal_progress_stays_chip_state() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.goal_manager = Mock()
+    state = Mock()
+    state.to_public_dict.return_value = {"goalId": "goal-1"}
+    loop.goal_manager.get.return_value = state
+    loop.publish_goal_snapshot = AsyncMock()
+    delivery = _AgentGoalDelivery(
+        loop,
+        session_key="web:stable-chat",
+        channel="web",
+        chat_id="relay-1",
+        direct=False,
+    )
+
+    await delivery.deliver_notice(Mock(message="↻ continuing", status=GoalStatus.ACTIVE))
+
+    assert loop.publish_goal_snapshot.await_args.kwargs["terminal"] is False
 
 
 def test_goal_turn_recognizes_safe_context_recovery_exhaustion() -> None:
