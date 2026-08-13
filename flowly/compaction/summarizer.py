@@ -296,7 +296,11 @@ def latest_historical_request_snapshot(
 ) -> str | None:
     """Ground task continuity in the newest real user-authored source turn."""
     for message in reversed(messages):
-        if message.get("role") != "user" or message.get(EPHEMERAL_NUDGE_KEY):
+        if (
+            message.get("role") != "user"
+            or message.get(EPHEMERAL_NUDGE_KEY)
+            or message.get("_display_hidden")
+        ):
             continue
         text = redact_secrets(_message_text(message)).strip()
         if not text:

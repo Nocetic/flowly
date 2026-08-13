@@ -272,6 +272,22 @@ def test_latest_historical_request_is_grounded_in_real_user_text() -> None:
     assert "Historical reference only" in grounded
 
 
+def test_latest_historical_request_ignores_hidden_goal_continuations() -> None:
+    messages = [
+        {"role": "user", "content": "the real user request"},
+        {
+            "role": "user",
+            "content": "[Continuing toward an internal goal]",
+            "_display_hidden": True,
+        },
+    ]
+
+    grounded = ground_historical_request("summary", messages)
+
+    assert "the real user request" in grounded
+    assert "internal goal" not in grounded
+
+
 def test_one_huge_text_message_is_split_without_losing_content() -> None:
     content = "alpha beta gamma\n" * 2_000
     message = {

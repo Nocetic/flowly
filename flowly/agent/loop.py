@@ -11,7 +11,7 @@ import uuid
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -77,6 +77,8 @@ from flowly.compaction.estimator import (
 )
 from flowly.exec.types import ExecConfig
 from flowly.config.schema import TrelloConfig, VoiceBridgeConfig, XConfig, MemorySearchConfig
+from flowly.goals.models import GoalDecision
+from flowly.goals.runtime import DeliveredGoalTurn, GoalDelivery, GoalRuntime
 from flowly.audit.logger import get_audit_logger
 from flowly.agent.prompt_blocks import (
     build_render_capability_hint,
@@ -125,10 +127,78 @@ _NON_USER_CHANNELS = ("system", "heartbeat", "cron")
 _GROUP_BUFFER_MAX_MSGS = 50
 _GROUP_BUFFER_MAX_CHARS = 6000
 
+_GOAL_CONTINUATION_ID = "_goal_continuation_goal_id"
+_GOAL_BASE_USER_EPOCH = "_goal_base_user_epoch"
+_GOAL_KICKOFF = "_goal_kickoff"
+_GOAL_USER_EPOCH = "_goal_user_epoch"
+
 
 def _is_user_activity_channel(channel: str) -> bool:
     """True when ``channel`` is real user conversation (not a background run)."""
     return (channel or "") not in _NON_USER_CHANNELS
+
+
+class _AgentGoalDelivery(GoalDelivery):
+    """Route autonomous goal turns back through their originating surface."""
+
+    def __init__(
+        self,
+        agent: "AgentLoop",
+        *,
+        channel: str,
+        chat_id: str,
+        direct: bool,
+    ) -> None:
+        self.agent = agent
+        self.channel = channel
+        self.chat_id = chat_id
+        self.direct = direct
+
+    async def run_continuation(
+        self,
+        *,
+        session_key: str,
+        goal_id: str,
+        user_epoch: int,
+        kickoff: bool,
+    ) -> DeliveredGoalTurn | None:
+        message = InboundMessage(
+            channel=self.channel,
+            sender_id="goal",
+            chat_id=self.chat_id,
+            content="",
+            metadata={
+                _GOAL_CONTINUATION_ID: goal_id,
+                _GOAL_BASE_USER_EPOCH: user_epoch,
+                _GOAL_KICKOFF: kickoff,
+            },
+        )
+        response = await self.agent._process_message(message)
+        if response is None:
+            return None
+        return self.agent._goal_turn_from_outbound(
+            session_key,
+            response,
+            user_epoch=user_epoch,
+        )
+
+    async def deliver_turn(self, turn: DeliveredGoalTurn) -> None:
+        outbound = turn.metadata.get("outbound")
+        if isinstance(outbound, OutboundMessage):
+            await self.agent._deliver_goal_outbound(outbound, direct=self.direct)
+
+    async def deliver_notice(self, decision: GoalDecision) -> None:
+        state = self.agent.goal_manager.get(f"{self.channel}:{self.chat_id}")
+        metadata: dict[str, Any] = {"goalStatus": True}
+        if state is not None:
+            metadata["goal"] = state.to_public_dict()
+        outbound = OutboundMessage(
+            channel=self.channel,
+            chat_id=self.chat_id,
+            content=decision.message,
+            metadata=metadata,
+        )
+        await self.agent._deliver_goal_outbound(outbound, direct=self.direct)
 
 
 # ── Built-in agent keyword routing ──────────────────────────────────────────
@@ -725,6 +795,7 @@ class AgentLoop:
         memory_search_config: MemorySearchConfig | None = None,
         state_dir: Path | None = None,
         main_config: Any | None = None,
+        goal_provider: LLMProvider | None = None,
     ):
         self.bus = bus
         self.provider = provider
@@ -782,6 +853,12 @@ class AgentLoop:
         # Gateway reference for turn-level lifecycle broadcasts. Wired by
         # set_gateway_server() once the gateway is constructed.
         self._gateway_server = None
+        self._goal_output_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None
+        self.goal_manager: Any | None = None
+        self.goal_runtime: GoalRuntime | None = None
+        self._goal_process_unsubscribe: Callable[[], None] | None = None
+        self._session_turn_locks: dict[str, asyncio.Lock] = {}
+        self._goal_user_epochs: dict[str, int] = {}
 
         # Live tool activity callback for streaming UIs (TUI / desktop).
         # Signature: (event_name, payload_dict) -> Awaitable[None] | None.
@@ -1051,6 +1128,7 @@ class AgentLoop:
         self._maybe_enable_skill_improvement()
 
         self._register_default_tools()
+        self._init_goals(goal_provider)
 
     @property
     def mcp_discovery_pending(self) -> bool:
@@ -1070,6 +1148,114 @@ class AgentLoop:
         if not self._mcp_discovery_started:
             return True
         return self._mcp_discovery_done.wait(timeout=timeout)
+
+    def _init_goals(self, explicit_provider: LLMProvider | None) -> None:
+        """Build the opt-in standing-goal services without affecting normal chat."""
+        goals_config = getattr(
+            getattr(getattr(self._main_config, "agents", None), "defaults", None),
+            "goals",
+            None,
+        )
+        if goals_config is None and explicit_provider is None:
+            return
+        if goals_config is not None and not bool(getattr(goals_config, "enabled", True)):
+            return
+
+        try:
+            from flowly.goals.judge import GoalJudge
+            from flowly.goals.manager import GoalManager
+            from flowly.goals.store import GoalStore
+            from flowly.plans.manager import get_plan_manager
+            from flowly.runtime_cwd import resolve_runtime_cwd
+
+            judge_provider = explicit_provider
+            judge_model = str(getattr(goals_config, "judge_model", "") or "").strip()
+            provider_name = str(
+                getattr(goals_config, "judge_provider", "") or ""
+            ).strip()
+            if judge_provider is None and provider_name and self._main_config is not None:
+                from flowly.providers.factory import build_named_provider
+
+                judge_provider = build_named_provider(
+                    self._main_config,
+                    provider_name,
+                    default_model=judge_model or self.model,
+                )
+                if judge_provider is None:
+                    logger.warning(
+                        "Goal judge provider {!r} is unavailable; using the main provider",
+                        provider_name,
+                    )
+            judge_provider = judge_provider or self.provider
+            process_registry = _get_process_registry()
+            plan_manager = get_plan_manager()
+
+            def session_is_waiting(target: str) -> bool:
+                if target.startswith("plan:"):
+                    plan = plan_manager.get_plan(target.removeprefix("plan:"))
+                    return bool(plan and plan.status in {"draft", "awaiting_approval"})
+                return process_registry.wait_barrier_active(target)
+
+            def pending_plan(session_key: str) -> str | None:
+                plan = plan_manager.get_current(session_key)
+                if plan and plan.status in {"draft", "awaiting_approval"}:
+                    return plan.id
+                return None
+
+            judge = GoalJudge(
+                judge_provider,
+                model=judge_model or None,
+                timeout_seconds=float(
+                    getattr(goals_config, "judge_timeout_seconds", 30.0)
+                ),
+                max_tokens=int(getattr(goals_config, "judge_max_tokens", 4_096)),
+            )
+            manager = GoalManager(
+                GoalStore(self.sessions.sessions_dir.parent),
+                judge,
+                default_max_turns=int(getattr(goals_config, "max_turns", 20)),
+                session_is_waiting=session_is_waiting,
+            )
+            runtime = GoalRuntime(
+                manager,
+                current_user_epoch=self.goal_user_epoch,
+                background_processes=process_registry.list_sessions,
+                session_cwd=lambda session_key: resolve_runtime_cwd(
+                    session_key=session_key,
+                    config=self._main_config,
+                    workspace=self.workspace,
+                ),
+                pending_plan=pending_plan,
+            )
+            self.goal_manager = manager
+            self.goal_runtime = runtime
+
+            def process_trigger(
+                _process_id: str,
+                owner_session_key: str | None,
+                _trigger: str,
+            ) -> None:
+                if owner_session_key:
+                    runtime.wake(owner_session_key)
+
+            self._goal_process_unsubscribe = process_registry.subscribe_trigger(
+                process_trigger
+            )
+        except Exception:
+            logger.exception("Standing goal initialization failed; /goal is unavailable")
+            self.goal_manager = None
+            self.goal_runtime = None
+
+    def goal_user_epoch(self, session_key: str) -> int:
+        epochs = getattr(self, "_goal_user_epochs", None)
+        return epochs.get(session_key, 0) if isinstance(epochs, dict) else 0
+
+    def set_goal_output_callback(
+        self,
+        callback: Callable[[OutboundMessage], Awaitable[None]] | None,
+    ) -> None:
+        """Set the delivery sink for autonomous turns in direct CLI mode."""
+        self._goal_output_callback = callback
 
     def _maybe_enable_memory_governance(self) -> None:
         """Wire memory_append/knowledge_graph writes into the governance layer.
@@ -1668,6 +1854,8 @@ class AgentLoop:
         not create or patch skills; that remains a main-agent path initiated by
         the user or by the active task context.
         """
+        if getattr(msg, "metadata", {}).get(_GOAL_CONTINUATION_ID):
+            return
         # Turn-based autonomous consolidation: every N turns, if memory has new
         # writes, kick off a background cleanup pass (independent of the
         # memory-review cadence above).
@@ -2967,6 +3155,7 @@ class AgentLoop:
             response = await self._process_message(msg)
             if response:
                 await self.bus.publish_outbound(response)
+                self._goal_after_delivery(msg, response, direct=False)
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             # Send error response
@@ -2993,6 +3182,119 @@ class AgentLoop:
                         inflight.finish(msg.session_key, run_id)
                     except Exception:
                         logger.debug("[loop] inflight.finish failed", exc_info=True)
+
+    def _goal_turn_from_outbound(
+        self,
+        session_key: str,
+        outbound: OutboundMessage,
+        *,
+        user_epoch: int,
+    ) -> DeliveredGoalTurn:
+        metadata = outbound.metadata or {}
+        provider_error = bool(metadata.get("error"))
+        aborted = bool(metadata.get("aborted"))
+        compaction_failed = bool(metadata.get("_goal_compaction_failed"))
+        return DeliveredGoalTurn(
+            session_key=session_key,
+            response=outbound.content,
+            user_epoch=user_epoch,
+            succeeded=bool(outbound.content)
+            and not provider_error
+            and not aborted
+            and not compaction_failed,
+            aborted=aborted,
+            provider_error=provider_error,
+            compaction_failed=compaction_failed,
+            metadata={"outbound": outbound},
+        )
+
+    def _goal_after_delivery(
+        self,
+        msg: InboundMessage,
+        outbound: OutboundMessage,
+        direct: bool,
+    ) -> None:
+        runtime = getattr(self, "goal_runtime", None)
+        manager = getattr(self, "goal_manager", None)
+        if runtime is None or manager is None:
+            return
+        metadata = outbound.metadata or {}
+        delivery = _AgentGoalDelivery(
+            self,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            direct=direct,
+        )
+        kickoff_goal_id = str(metadata.get("_goal_kickoff_goal_id") or "")
+        user_epoch = int(
+            metadata.get(_GOAL_USER_EPOCH, self.goal_user_epoch(msg.session_key))
+        )
+        if kickoff_goal_id:
+            if manager.is_generation_active(msg.session_key, kickoff_goal_id):
+                runtime.kickoff(
+                    msg.session_key,
+                    kickoff_goal_id,
+                    user_epoch,
+                    delivery,
+                )
+            return
+        if not metadata.get("_goal_eligible"):
+            return
+        runtime.delivered(
+            self._goal_turn_from_outbound(
+                msg.session_key,
+                outbound,
+                user_epoch=user_epoch,
+            ),
+            delivery,
+        )
+
+    async def _deliver_goal_outbound(
+        self,
+        outbound: OutboundMessage,
+        *,
+        direct: bool,
+    ) -> None:
+        if direct:
+            if self._goal_output_callback is not None:
+                await self._goal_output_callback(outbound)
+                return
+            gateway = getattr(self, "_gateway_server", None)
+            if gateway is not None and hasattr(gateway, "push_session_message"):
+                await gateway.push_session_message(
+                    f"{outbound.channel}:{outbound.chat_id}",
+                    outbound.content,
+                    metadata=outbound.metadata,
+                    media=outbound.media,
+                )
+                return
+        await self.bus.publish_outbound(outbound)
+
+    def goal_after_direct_delivery(
+        self,
+        session_key: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Notify the runtime after a direct gateway final event was sent."""
+        if ":" in session_key:
+            channel, chat_id = session_key.split(":", 1)
+        else:
+            channel, chat_id = "cli", session_key
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content="",
+        )
+        outbound = OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=content,
+            metadata=dict(metadata or {}),
+            media=list((metadata or {}).get("media") or []),
+        )
+        self._goal_after_delivery(msg, outbound, direct=True)
 
     def mark_aborted(self, run_id: str) -> bool:
         """Stop one run without cancelling its transcript-finalization task.
@@ -3022,6 +3324,16 @@ class AgentLoop:
         "interrupted" outcome gracefully — see ``_run_subagent``.
         """
         self._running = False
+        goal_runtime = getattr(self, "goal_runtime", None)
+        if goal_runtime is not None:
+            goal_runtime.cancel()
+        goal_unsubscribe = getattr(self, "_goal_process_unsubscribe", None)
+        if goal_unsubscribe is not None:
+            try:
+                goal_unsubscribe()
+            except Exception:
+                logger.exception("AgentLoop.stop: goal process unsubscribe failed")
+            self._goal_process_unsubscribe = None
         try:
             cancelled = self.subagents.cancel_all()
             if cancelled:
@@ -6406,6 +6718,51 @@ class AgentLoop:
             logger.warning(f"Memory flush failed: {e}")
 
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
+        """Serialize a conversation's turns and reject stale continuations."""
+        synthetic_goal_id = str(msg.metadata.get(_GOAL_CONTINUATION_ID) or "")
+        is_real_arrival = (
+            not synthetic_goal_id
+            and _is_user_activity_channel(msg.channel)
+            and msg.sender_id not in {"goal", "process", "system", "subagent"}
+        )
+        if is_real_arrival:
+            next_epoch = self.goal_user_epoch(msg.session_key) + 1
+            if not hasattr(self, "_goal_user_epochs"):
+                self._goal_user_epochs = {}
+            self._goal_user_epochs[msg.session_key] = next_epoch
+            msg.metadata[_GOAL_USER_EPOCH] = next_epoch
+
+        if not hasattr(self, "_session_turn_locks"):
+            self._session_turn_locks = {}
+        lock = self._session_turn_locks.setdefault(msg.session_key, asyncio.Lock())
+        async with lock:
+            if synthetic_goal_id:
+                if (
+                    getattr(self, "goal_runtime", None) is None
+                    or getattr(self, "goal_manager", None) is None
+                ):
+                    return None
+                base_epoch = int(msg.metadata.get(_GOAL_BASE_USER_EPOCH, -1))
+                if self.goal_user_epoch(msg.session_key) != base_epoch:
+                    return None
+                state = self.goal_manager.get(msg.session_key)
+                if (
+                    state is None
+                    or not state.is_active
+                    or state.goal_id != synthetic_goal_id
+                ):
+                    return None
+                msg.content = (
+                    state.goal
+                    if msg.metadata.get(_GOAL_KICKOFF)
+                    else self.goal_manager.continuation_prompt(state)
+                )
+                msg.metadata[_GOAL_USER_EPOCH] = base_epoch
+            return await self._process_message_unlocked(msg)
+
+    async def _process_message_unlocked(
+        self, msg: InboundMessage
+    ) -> OutboundMessage | None:
         """
         Process a single inbound message.
         
@@ -6449,7 +6806,10 @@ class AgentLoop:
         # NOT shared with _last_activity_ts, which background heartbeat/cron turns
         # also touch (a 30-min heartbeat would otherwise keep resetting a 30-min
         # idle clock, so the idle pass would never fire).
-        if _is_user_activity_channel(msg.channel):
+        if (
+            _is_user_activity_channel(msg.channel)
+            and not msg.metadata.get(_GOAL_CONTINUATION_ID)
+        ):
             self._dreamer_last_user_ts = time.time()
 
         # Mark parent session busy so subagent announces are queued, not injected mid-processing
@@ -6816,6 +7176,7 @@ class AgentLoop:
             not is_command
             and "_display_content" not in msg.metadata
             and not msg.content.strip().startswith("/")
+            and not msg.metadata.get(_GOAL_CONTINUATION_ID)
         ):
             try:
                 from flowly.plans.manager import get_plan_manager as _get_pm_sticky
@@ -6935,6 +7296,8 @@ class AgentLoop:
             _pending_user: dict[str, Any] = {"role": "user", "content": display_content}
             if msg.media:
                 _pending_user["media"] = list(msg.media)
+            if msg.metadata.get(_GOAL_CONTINUATION_ID):
+                _pending_user["_display_hidden"] = True
             self.sessions.save(session, extra_messages=[_pending_user])
         except Exception as exc:  # noqa: BLE001
             logger.debug("early session save skipped: {}", exc)
@@ -7461,6 +7824,7 @@ class AgentLoop:
             reply_media_assets=reply_media_assets or None,
             aborted=turn_aborted,
             duration_ms=turn_duration_ms,
+            user_display_hidden=bool(msg.metadata.get(_GOAL_CONTINUATION_ID)),
             # Provider failures are terminal, but they are not successful
             # assistant completions. Keep their visible error text in history
             # without advancing the cross-client unread identity.
@@ -7640,6 +8004,16 @@ class AgentLoop:
                 # additive field so clients settle the right live stream
                 # without changing the durable assistant message id.
                 "stream_run_id": outbound_run_id or None,
+                # Internal delivery marker consumed only after the assistant
+                # response reaches its surface. Slash-command acknowledgments
+                # and other early returns never carry it and are never judged.
+                "_goal_eligible": True,
+                _GOAL_USER_EPOCH: int(
+                    msg.metadata.get(_GOAL_USER_EPOCH, self.goal_user_epoch(msg.session_key))
+                ),
+                "_goal_compaction_failed": bool(
+                    msg.metadata.get("_compaction_failed", False)
+                ),
             },
         )
 
@@ -8053,6 +8427,7 @@ class AgentLoop:
         on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         run_id: str | None = None,
         tools_allowed: bool | None = None,
+        defer_goal_delivery: bool = False,
     ) -> str | tuple[str, dict[str, Any]]:
         """
         Process a message directly (for CLI, voice calls, or desktop WebSocket).
@@ -8136,6 +8511,13 @@ class AgentLoop:
         )
 
         response = await self._process_message(msg)
+        if response is not None and not defer_goal_delivery:
+            asyncio.get_running_loop().call_soon(
+                self._goal_after_delivery,
+                msg,
+                response,
+                True,
+            )
         text = response.content if response else ""
         if return_metadata:
             meta = dict(response.metadata) if response and response.metadata else {}
@@ -8714,6 +9096,18 @@ class AgentLoop:
         self.sessions.refresh(session)
         removed = len(session.messages)
         self._context_epoch[session_key] = self.context_epoch(session_key) + 1
+        goal_runtime = getattr(self, "goal_runtime", None)
+        if goal_runtime is not None:
+            goal_runtime.cancel_session(session_key)
+        goal_manager = getattr(self, "goal_manager", None)
+        if goal_manager is not None:
+            try:
+                goal_manager.clear(
+                    session_key,
+                    conversation_epoch=self._context_epoch[session_key],
+                )
+            except Exception:
+                logger.exception("[reset] goal clear failed")
         session.reset_conversation_context()
         self.compaction.reset_session(session_key)
         self._last_turn_total_tokens.pop(session_key, None)
