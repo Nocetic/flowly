@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -288,4 +289,104 @@ def test_archive_index_preserves_row_ids_when_compaction_changes_state(archive_h
     assert [row["state"] for row in after] == [
         "compacted", "compacted", "compacted", "compacted", "active", "active",
     ]
+    indexer.close()
+
+
+def test_legacy_index_migrates_in_place_without_losing_fts_or_row_ids(
+    archive_home,
+):
+    """An upgrade must enrich an old search DB, never rebuild its rows."""
+    db_path = archive_home / "legacy_session_index.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE sessions (
+            key TEXT PRIMARY KEY,
+            created_at REAL,
+            updated_at REAL,
+            msg_count INTEGER DEFAULT 0
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp REAL NOT NULL
+        );
+        CREATE INDEX idx_messages_session
+            ON messages(session_key, timestamp);
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+            content,
+            content=messages,
+            content_rowid=id
+        );
+        CREATE TRIGGER fts_insert AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+        CREATE TRIGGER fts_delete AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, content)
+                VALUES('delete', old.id, old.content);
+        END;
+        """
+    )
+    connection.execute(
+        "INSERT INTO sessions (key, created_at, updated_at, msg_count) "
+        "VALUES (?, ?, ?, ?)",
+        ("web:migrated", 1.0, 1.0, 1),
+    )
+    connection.execute(
+        "INSERT INTO messages (session_key, role, content, timestamp) "
+        "VALUES (?, ?, ?, ?)",
+        ("web:migrated", "user", "legacy migration needle", 1.0),
+    )
+    legacy_row_id = connection.execute(
+        "SELECT id FROM messages WHERE session_key = ?",
+        ("web:migrated",),
+    ).fetchone()[0]
+    connection.commit()
+    connection.close()
+
+    indexer = SessionIndexer(db_path)
+    columns = {
+        row[1]
+        for row in indexer._conn.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    assert {"event_id", "event_seq", "state"} <= columns
+
+    archive_rows = [
+        {
+            "role": "user",
+            "content": "legacy migration needle",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            EVENT_ID_KEY: "evt_migrated_1",
+            EVENT_SEQ_KEY: 1,
+            ARCHIVE_STATE_KEY: "compacted",
+        },
+        {
+            "role": "assistant",
+            "content": "new archive tail",
+            "timestamp": "2026-01-01T00:00:01+00:00",
+            EVENT_ID_KEY: "evt_migrated_2",
+            EVENT_SEQ_KEY: 2,
+            ARCHIVE_STATE_KEY: "active",
+        },
+    ]
+    indexer.index_archive("web:migrated", archive_rows)
+
+    stored = indexer._conn.execute(
+        "SELECT id, event_id, event_seq, state, content FROM messages "
+        "WHERE session_key = ? ORDER BY event_seq",
+        ("web:migrated",),
+    ).fetchall()
+    assert [row["content"] for row in stored] == [
+        "legacy migration needle",
+        "new archive tail",
+    ]
+    assert stored[0]["id"] == legacy_row_id
+    assert stored[0]["event_id"] == "evt_migrated_1"
+    assert stored[0]["state"] == "compacted"
+    assert stored[1]["event_id"] == "evt_migrated_2"
+    assert stored[1]["state"] == "active"
+    assert indexer.search("needle", include_bookends=False)[0]["anchor_id"] == legacy_row_id
+    assert indexer.search("archive tail", include_bookends=False)
     indexer.close()

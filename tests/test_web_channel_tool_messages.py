@@ -144,6 +144,28 @@ async def test_tool_messages_absent_when_metadata_key_missing(channel) -> None:
 
 
 @pytest.mark.asyncio
+async def test_internal_turn_policy_does_not_change_relay_wire_shape(channel) -> None:
+    """Execution policy is backend state, not a new mixed-version wire field."""
+    msg = OutboundMessage(
+        channel="web",
+        chat_id="sess-1",
+        content="Tool-free answer.",
+        metadata={
+            "run_id": "run-no-tools",
+            "toolPolicy": "none",
+            "tool_messages": [],
+        },
+    )
+
+    await channel.send(msg)
+
+    data = channel._capture[0]["data"]
+    assert "toolPolicy" not in data
+    assert "toolMessages" not in data
+    assert data["state"] == "final"
+
+
+@pytest.mark.asyncio
 async def test_aborted_final_includes_partial_marker_and_duration(channel) -> None:
     msg = OutboundMessage(
         channel="web",

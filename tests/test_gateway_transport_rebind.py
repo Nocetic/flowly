@@ -153,6 +153,62 @@ async def test_chat_history_projects_deferred_tool_identity_for_clients() -> Non
 
 
 @pytest.mark.asyncio
+async def test_chat_history_exposes_full_display_rows_without_archive_internals() -> None:
+    """Internal lineage can evolve without changing released client DTOs."""
+    srv = _bare_server()
+    srv.sessions = SimpleNamespace(
+        get_or_create=lambda _key: SimpleNamespace(metadata={}),
+        get_full_messages=lambda _key: [
+            {
+                "role": "user",
+                "content": "early question",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "_event_id": "evt_1",
+                "_event_seq": 1,
+                "_archive_state": "compacted",
+            },
+            {
+                "role": "assistant",
+                "content": "[context-optimized]",
+                "kind": "context_boundary",
+                "boundaryKind": "compaction",
+                "compactionId": "cmp_1",
+                "_event_id": "evt_boundary",
+                "_event_seq": 2,
+                "_archive_state": "active",
+            },
+            {
+                "role": "assistant",
+                "content": "recent answer",
+                "timestamp": "2026-01-01T00:00:02+00:00",
+                "_event_id": "evt_3",
+                "_event_seq": 3,
+                "_archive_state": "active",
+            },
+        ],
+    )
+    srv._ws_rpc_reply = AsyncMock()
+
+    await srv._ws_rpc_chat_history(
+        _FakeWS(),
+        "rpc-history",
+        {"sessionKey": "desktop:full-history"},
+    )
+
+    payload = srv._ws_rpc_reply.await_args.args[2]
+    messages = payload["messages"]
+    assert [
+        "".join(block.get("text", "") for block in row["content"])
+        for row in messages
+    ] == ["early question", "[context-optimized]", "recent answer"]
+    assert set(messages[0]) == {"role", "content", "timestamp"}
+    assert set(messages[1]) == {
+        "role", "content", "kind", "boundaryKind", "compactionId",
+    }
+    assert set(messages[2]) == {"role", "content", "timestamp"}
+
+
+@pytest.mark.asyncio
 async def test_offline_chat_final_schedules_push(monkeypatch) -> None:
     srv = _bare_server()
     calls: list[dict] = []
