@@ -2483,6 +2483,26 @@ class GatewayServer:
             usage = (metadata or {}).get("usage") or {}
             model = (metadata or {}).get("model") or ""
             provider_error = (metadata or {}).get("error") or None
+            context_wire: dict[str, Any] = {}
+            context_tokens = (metadata or {}).get("contextTokens")
+            if isinstance(context_tokens, int) and context_tokens > 0:
+                context_wire["contextTokens"] = context_tokens
+            context_window = (metadata or {}).get("contextWindow")
+            if isinstance(context_window, int) and context_window > 0:
+                context_wire["contextWindow"] = context_window
+            context_stale = (metadata or {}).get("contextTokensStale")
+            if isinstance(context_stale, bool):
+                context_wire["contextTokensStale"] = context_stale
+            context_source = (metadata or {}).get("contextTokensSource")
+            if context_source in {
+                "provider_usage",
+                "last_provider_usage",
+                "unavailable",
+            }:
+                context_wire["contextTokensSource"] = context_source
+            context_measured_at = (metadata or {}).get("contextTokensMeasuredAt")
+            if isinstance(context_measured_at, str) and context_measured_at:
+                context_wire["contextTokensMeasuredAt"] = context_measured_at
 
             # Agent/provider failures are expected product states, not gateway
             # crashes. Emit the native error event with stable machine fields
@@ -2507,6 +2527,7 @@ class GatewayServer:
                             ),
                             "errorMessage": str(provider_error.get("message") or response),
                             "retryable": bool(provider_error.get("retryable", False)),
+                            **context_wire,
                         },
                     },
                 )
@@ -2545,18 +2566,13 @@ class GatewayServer:
                 "model": model,
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "message": final_message,
+                **context_wire,
             }
             # Context-window occupancy + ceiling, both already normalized for
             # the active provider by the agent loop. Sent as separate fields
             # (not inside ``usage``) because ``usage`` is the raw provider
             # dialect and clients must not have to guess which one it is.
             # Omitted when unknown so a client's own fallback still runs.
-            context_tokens = (metadata or {}).get("contextTokens")
-            if isinstance(context_tokens, int) and context_tokens > 0:
-                final_data["contextTokens"] = context_tokens
-            context_window = (metadata or {}).get("contextWindow")
-            if isinstance(context_window, int) and context_window > 0:
-                final_data["contextWindow"] = context_window
             if (metadata or {}).get("aborted") is True:
                 final_data["aborted"] = True
             metadata_duration = (metadata or {}).get("duration_ms")

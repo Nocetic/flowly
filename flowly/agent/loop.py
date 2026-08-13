@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -7114,7 +7114,8 @@ class AgentLoop:
             user_content=display_content,
             new_messages=turn_messages,
             final_content=final_content,
-            usage=usage,
+            usage=usage if not provider_error and not turn_aborted else None,
+            accounting_usage=(usage if provider_error or turn_aborted else None),
             media=msg.media or None,
             reply_media=reply_media or None,
             reply_media_assets=reply_media_assets or None,
@@ -7200,6 +7201,14 @@ class AgentLoop:
 
         tool_messages_for_ui = project_tool_messages_for_ui(tool_messages_for_ui)
 
+        context_telemetry = self._context_usage_telemetry(
+            msg.session_key,
+            session,
+            usage,
+            provider_error=bool(provider_error),
+            aborted=turn_aborted,
+        )
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -7215,7 +7224,11 @@ class AgentLoop:
                 "tool_results": tool_results,
                 "executed_tools": _executed_tools,
                 "toolPolicy": "auto" if tools_allowed else "none",
-                "usage": usage,
+                # Failed/aborted turns may contain usage from an earlier
+                # successful iteration, not the terminal request. Keep that
+                # for accounting in the session store, but never let old
+                # clients hydrate context occupancy from it.
+                "usage": usage if not provider_error and not turn_aborted else {},
                 # Effective model for this turn — ``model_override``
                 # wins when set (per-session model switches), else the
                 # agent's default. The channel layer forwards this to
@@ -7237,10 +7250,12 @@ class AgentLoop:
                 #
                 # Additive: old clients ignore both fields, new clients fall
                 # back to their own guess when an old bot omits them.
-                "contextTokens": context_occupancy_tokens(
-                    usage,
-                    getattr(self.provider, "provider_name", "") or "",
-                ),
+                "contextTokens": context_telemetry["tokens"],
+                "contextTokensStale": context_telemetry["stale"],
+                "contextTokensSource": context_telemetry["source"],
+                **({
+                    "contextTokensMeasuredAt": context_telemetry["measured_at"],
+                } if context_telemetry.get("measured_at") else {}),
                 # Bound to the agent's default model. Only cron jobs set
                 # ``model_override`` (gateway_cmd), and they have no context
                 # ring to feed; a per-model window is Stage 2.
@@ -8642,6 +8657,61 @@ class AgentLoop:
             return 0
         return max(0, stored)
 
+    def _context_usage_telemetry(
+        self,
+        session_key: str,
+        session: Any,
+        usage: dict[str, Any] | None,
+        *,
+        provider_error: bool,
+        aborted: bool,
+    ) -> dict[str, Any]:
+        """Build an explicit freshness contract for context occupancy.
+
+        A provider error can arrive after earlier successful tool iterations,
+        leaving ``usage`` non-zero but describing an older request in the same
+        turn. Publishing that as current is misleading. Error/aborted turns
+        therefore fall back to the last successfully completed provider
+        observation and mark it stale. If no trustworthy observation exists,
+        zero means unknown and the source says so explicitly.
+        """
+        current = context_occupancy_tokens(
+            usage or {},
+            getattr(getattr(self, "provider", None), "provider_name", "") or "",
+        )
+        if current > 0 and not provider_error and not aborted:
+            return {
+                "tokens": current,
+                "stale": False,
+                "source": "provider_usage",
+                "measured_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        previous = self._observed_total_tokens(session_key, session)
+        if previous > 0:
+            observation = (getattr(session, "metadata", None) or {}).get(
+                "last_context_observation"
+            )
+            measured_at = (
+                observation.get("measured_at")
+                if isinstance(observation, dict)
+                and isinstance(observation.get("measured_at"), str)
+                else None
+            )
+            return {
+                "tokens": previous,
+                "stale": True,
+                "source": "last_provider_usage",
+                "measured_at": measured_at,
+            }
+
+        return {
+            "tokens": 0,
+            "stale": True,
+            "source": "unavailable",
+            "measured_at": None,
+        }
+
     def _effective_context_window(self) -> int:
         """The window the active model can actually use, for the clients.
 
@@ -8679,11 +8749,33 @@ class AgentLoop:
         the wire.
         """
         try:
-            usage = (getattr(outcome, "metadata", None) or {}).get("usage") or {}
+            metadata = getattr(outcome, "metadata", None) or {}
+            # Only a completed provider response is a new ground-truth context
+            # observation. Error/aborted turns may carry zero usage or usage
+            # from an earlier successful iteration in the same turn.
+            source = metadata.get("contextTokensSource")
+            if source is None:
+                # Compatibility for internal/third-party callers that still
+                # return only raw usage. Explicit failure flags remain a hard
+                # stop; successful legacy outcomes are normalized here.
+                if metadata.get("error") or metadata.get("aborted"):
+                    return
+                total = context_occupancy_tokens(
+                    metadata.get("usage") or {},
+                    getattr(
+                        getattr(self, "provider", None), "provider_name", ""
+                    ) or "",
+                )
+                measured_at = datetime.now(timezone.utc).isoformat()
+            else:
+                if (
+                    source != "provider_usage"
+                    or metadata.get("contextTokensStale") is not False
+                ):
+                    return
+                total = int(metadata.get("contextTokens", 0) or 0)
+                measured_at = metadata.get("contextTokensMeasuredAt")
             epoch = self.context_epoch(session_key) if epoch is None else epoch
-            total = context_occupancy_tokens(
-                usage, getattr(getattr(self, "provider", None), "provider_name", "") or "",
-            )
         except (AttributeError, TypeError, ValueError):
             return
         if total > 0:
@@ -8702,6 +8794,16 @@ class AgentLoop:
             try:
                 session = self.sessions.get_or_create(session_key)
                 session.metadata["last_turn_total_tokens"] = total
+                session.metadata["last_context_observation"] = {
+                    "tokens": total,
+                    "source": "provider_usage",
+                    "measured_at": measured_at,
+                    "model": metadata.get("model") or self.model,
+                    "provider": (
+                        getattr(getattr(self, "provider", None), "provider_name", "")
+                        or ""
+                    ),
+                }
                 # Writing the attribute is not persisting it: the turn's own
                 # save already happened, so without this the reading lives only
                 # in this process — exactly the case it exists to cover.

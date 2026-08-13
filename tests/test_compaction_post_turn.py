@@ -122,6 +122,7 @@ class _Harness:
     compaction_cycle = AgentLoop.compaction_cycle
     context_epoch = AgentLoop.context_epoch
     _observed_total_tokens = AgentLoop._observed_total_tokens
+    _context_usage_telemetry = AgentLoop._context_usage_telemetry
     reset_conversation = AgentLoop.reset_conversation
     _post_turn_compaction = AgentLoop._post_turn_compaction
     _schedule_post_turn_compaction = AgentLoop._schedule_post_turn_compaction
@@ -746,6 +747,73 @@ def test_openai_shaped_cached_input_is_not_counted_twice():
     harness._note_turn_usage(session.key, _Outcome())
 
     assert harness._last_turn_total_tokens[session.key] == 78_000
+
+
+def test_error_turn_reports_last_good_context_as_stale() -> None:
+    session = _big_session(turns=1)
+    session.metadata["last_turn_total_tokens"] = 81_000
+    session.metadata["last_context_observation"] = {
+        "tokens": 81_000,
+        "source": "provider_usage",
+        "measured_at": "2026-08-13T12:00:00+00:00",
+    }
+    harness = _Harness(session, context_window=100_000)
+
+    telemetry = harness._context_usage_telemetry(
+        session.key,
+        session,
+        {"prompt_tokens": 12_000, "completion_tokens": 200},
+        provider_error=True,
+        aborted=False,
+    )
+
+    assert telemetry == {
+        "tokens": 81_000,
+        "stale": True,
+        "source": "last_provider_usage",
+        "measured_at": "2026-08-13T12:00:00+00:00",
+    }
+
+
+def test_first_error_turn_reports_context_as_unavailable() -> None:
+    session = _big_session(turns=1)
+    harness = _Harness(session, context_window=100_000)
+
+    telemetry = harness._context_usage_telemetry(
+        session.key,
+        session,
+        {},
+        provider_error=True,
+        aborted=False,
+    )
+
+    assert telemetry == {
+        "tokens": 0,
+        "stale": True,
+        "source": "unavailable",
+        "measured_at": None,
+    }
+
+
+def test_error_turn_never_overwrites_last_good_observation() -> None:
+    session = _big_session(turns=1)
+    session.metadata["last_turn_total_tokens"] = 81_000
+    harness = _Harness(session, context_window=100_000)
+
+    class _Outcome:
+        metadata = {
+            "usage": {"prompt_tokens": 12_000, "completion_tokens": 200},
+            "contextTokens": 81_000,
+            "contextTokensStale": True,
+            "contextTokensSource": "last_provider_usage",
+            "error": {"code": "MODEL_RATE_LIMITED"},
+        }
+
+    harness._note_turn_usage = AgentLoop._note_turn_usage.__get__(harness)
+    harness._note_turn_usage(session.key, _Outcome())
+
+    assert harness._last_turn_total_tokens == {}
+    assert session.metadata["last_turn_total_tokens"] == 81_000
 
 
 async def test_the_observed_size_survives_the_process():

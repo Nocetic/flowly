@@ -127,6 +127,23 @@ async def test_a_provider_error_is_marked_and_not_a_success(channel):
     )
 
 
+async def test_context_freshness_fields_reach_the_relay_additively(channel):
+    await channel.send(_final(
+        contextTokens=81_000,
+        contextWindow=128_000,
+        contextTokensStale=True,
+        contextTokensSource="last_provider_usage",
+        contextTokensMeasuredAt="2026-08-13T12:00:00+00:00",
+    ))
+
+    data = channel._capture[0]["data"]
+    assert data["contextTokens"] == 81_000
+    assert data["contextWindow"] == 128_000
+    assert data["contextTokensStale"] is True
+    assert data["contextTokensSource"] == "last_provider_usage"
+    assert data["contextTokensMeasuredAt"] == "2026-08-13T12:00:00+00:00"
+
+
 # ── §4.2: the compaction separator is not a turn terminal ─────────────────
 
 

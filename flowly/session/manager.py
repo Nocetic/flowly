@@ -432,6 +432,7 @@ class Session:
         new_messages: list[dict[str, Any]],
         final_content: str | None,
         usage: dict[str, Any] | None = None,
+        accounting_usage: dict[str, Any] | None = None,
         media: list[str] | None = None,
         reply_media: list[str] | None = None,
         reply_media_assets: list | None = None,
@@ -483,6 +484,11 @@ class Session:
             context-window indicator without re-running the LLM. Also
             accumulated into ``session.metadata['token_totals']`` for
             cheap session-wide queries. ``None`` skips persistence.
+        accounting_usage:
+            Billable usage from an unsuccessful/aborted attempt. Accumulated
+            into session totals but never attached to the closing assistant
+            message, so resume hydration cannot mistake a partial iteration's
+            prompt count for current context occupancy.
         aborted:
             Marks the closing assistant record as user-stopped. An aborted
             turn gets a closing record even when no text was produced so
@@ -527,6 +533,7 @@ class Session:
                 break
 
         clean_usage = _filter_usage(usage)
+        clean_accounting_usage = _filter_usage(accounting_usage)
 
         clean_run_id = run_id.strip() if isinstance(run_id, str) else ""
         persisted_closing: dict[str, Any] | None = None
@@ -605,18 +612,22 @@ class Session:
         # every message line. Stored under metadata so it survives
         # save/load via the existing metadata serialisation — no schema
         # bump, no compatibility break for older readers.
-        if clean_usage:
+        usage_for_totals = clean_usage or clean_accounting_usage
+        if usage_for_totals:
             totals = self.metadata.setdefault("token_totals", {})
             for k in (
                 "prompt_tokens", "completion_tokens",
                 "cache_read_tokens", "cache_write_tokens",
                 "reasoning_tokens", "total_tokens",
             ):
-                v = clean_usage.get(k)
+                v = usage_for_totals.get(k)
                 if isinstance(v, (int, float)) and v:
                     totals[k] = totals.get(k, 0) + int(v)
             totals["turn_count"] = totals.get("turn_count", 0) + 1
-            self.metadata["last_turn_usage"] = clean_usage
+            if clean_usage:
+                self.metadata["last_turn_usage"] = clean_usage
+            else:
+                self.metadata["last_attempt_usage"] = clean_accounting_usage
 
     def clear(self) -> None:
         """Clear all messages in the session.

@@ -25,7 +25,7 @@ from flowly.compaction.service import (
 from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
 from flowly.integrations import model_catalog as mc
 from flowly.integrations.model_catalog import Model
-from flowly.tui.client import ChatFinal, GatewayClient
+from flowly.tui.client import ChatError, ChatFinal, GatewayClient
 from flowly.tui.panes.status import (
     StatusBar,
     _model_budget,
@@ -284,10 +284,42 @@ async def test_the_tui_reads_the_wire_instead_of_guessing_the_dialect():
                     "usage": {"prompt_tokens": 2_000, "completion_tokens": 1_000}},
         "contextTokens": 181_000,
         "contextWindow": 200_000,
+        "contextTokensStale": False,
+        "contextTokensSource": "provider_usage",
+        "contextTokensMeasuredAt": "2026-08-13T12:00:00+00:00",
     })
 
     assert ev.context_tokens == 181_000
     assert ev.context_window == 200_000
+    assert ev.context_tokens_stale is False
+    assert ev.context_tokens_source == "provider_usage"
+    assert ev.context_tokens_measured_at == "2026-08-13T12:00:00+00:00"
+
+
+async def test_the_tui_preserves_last_good_context_on_error_event():
+    client = GatewayClient.__new__(GatewayClient)
+    client._inbox = asyncio.Queue()
+    await client._dispatch({
+        "type": "event",
+        "event": "chat",
+        "data": {
+            "state": "error",
+            "runId": "r1",
+            "sessionKey": "cli:1",
+            "errorMessage": "rate limited",
+            "contextTokens": 81_000,
+            "contextWindow": 128_000,
+            "contextTokensStale": True,
+            "contextTokensSource": "last_provider_usage",
+        },
+    })
+
+    ev = await client._inbox.get()
+    assert isinstance(ev, ChatError)
+    assert ev.context_tokens == 81_000
+    assert ev.context_window == 128_000
+    assert ev.context_tokens_stale is True
+    assert ev.context_tokens_source == "last_provider_usage"
 
 
 async def test_an_older_gateway_leaves_the_tui_on_its_own_numbers():

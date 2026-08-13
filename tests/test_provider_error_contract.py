@@ -318,6 +318,11 @@ async def test_gateway_emits_native_error_event_without_raw_response() -> None:
     async def on_chat_message(*args: Any) -> tuple[str, dict[str, Any]]:
         return "raw response must not be sent", {
             "model": "text/model",
+            "contextTokens": 81_000,
+            "contextWindow": 128_000,
+            "contextTokensStale": True,
+            "contextTokensSource": "last_provider_usage",
+            "contextTokensMeasuredAt": "2026-08-13T12:00:00+00:00",
             "error": {
                 "code": "MODEL_IMAGE_INPUT_UNSUPPORTED",
                 "title": "This model can't read images",
@@ -346,6 +351,11 @@ async def test_gateway_emits_native_error_event_without_raw_response() -> None:
         "errorTitle": "This model can't read images",
         "errorMessage": "Choose a vision-capable model or remove the image, then try again.",
         "retryable": False,
+        "contextTokens": 81_000,
+        "contextWindow": 128_000,
+        "contextTokensStale": True,
+        "contextTokensSource": "last_provider_usage",
+        "contextTokensMeasuredAt": "2026-08-13T12:00:00+00:00",
     }
     assert "raw response" not in str(ws.sent)
 

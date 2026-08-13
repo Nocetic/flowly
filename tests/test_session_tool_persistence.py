@@ -518,6 +518,27 @@ class TestExtendWithTurnMessages:
             "assistant",
         ]
 
+    def test_failed_attempt_usage_is_accounted_but_not_hydrated(self) -> None:
+        s = Session(key="t")
+        usage = {
+            "prompt_tokens": 12_000,
+            "completion_tokens": 200,
+            "total_tokens": 12_200,
+        }
+
+        s.extend_with_turn_messages(
+            user_content="continue",
+            new_messages=[],
+            final_content="The provider is rate limited.",
+            usage=None,
+            accounting_usage=usage,
+        )
+
+        assert "usage" not in s.messages[-1]
+        assert s.metadata["token_totals"]["total_tokens"] == 12_200
+        assert s.metadata["last_attempt_usage"] == usage
+        assert "last_turn_usage" not in s.metadata
+
     def test_next_turn_sees_prior_tool_history(self) -> None:
         """The whole point of this work: a tool turn in conversation
         step 1 must be visible to the LLM in conversation step 2.

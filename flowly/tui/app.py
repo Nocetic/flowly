@@ -1010,11 +1010,15 @@ class FlowlyTUI(App[None]):
                     status.tokens_in = max(0, occupancy - status.tokens_out)
                 elif tin:
                     status.tokens_in = tin
-                if ev.context_window:
-                    status.context_budget = ev.context_window
                 cread = int(u.get("cache_read_tokens") or u.get("cache_read_input_tokens") or 0)
                 cwrite = int(u.get("cache_write_tokens") or u.get("cache_creation_input_tokens") or 0)
                 self._accumulate_usage(tin, tout, cread, cwrite, status.model)
+            elif ev.context_tokens:
+                # A failed/aborted turn intentionally omits raw usage while
+                # carrying the last trustworthy occupancy as stale telemetry.
+                status.tokens_in = max(0, ev.context_tokens - status.tokens_out)
+            if ev.context_window:
+                status.context_budget = ev.context_window
             asyncio.create_task(self._drain_queue())
             # First-touch hint: brand-new user just saw their first
             # turn finish — point at /retry and /undo, which they have
@@ -1037,6 +1041,13 @@ class FlowlyTUI(App[None]):
         if isinstance(ev, ChatError):
             if self._current_bubble:
                 self._current_bubble.mark_streaming(False)
+            # Error turns carry the last trustworthy occupancy explicitly.
+            # Keep the existing bar stable instead of interpreting absent/zero
+            # usage as an empty conversation.
+            if ev.context_tokens:
+                status.tokens_in = max(0, ev.context_tokens - status.tokens_out)
+            if ev.context_window:
+                status.context_budget = ev.context_window
             transcript.add_error(f"error: {ev.message}")
             self._discard_skill_notice(ev.run_id)
             self._drop_pending_clarify()

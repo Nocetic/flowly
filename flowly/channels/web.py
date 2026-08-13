@@ -583,6 +583,19 @@ class WebChannel(BaseChannel):
         context_window_meta = msg.metadata.get("contextWindow")
         if isinstance(context_window_meta, int) and context_window_meta > 0:
             data_block["contextWindow"] = context_window_meta
+        context_stale_meta = msg.metadata.get("contextTokensStale")
+        if isinstance(context_stale_meta, bool):
+            data_block["contextTokensStale"] = context_stale_meta
+        context_source_meta = msg.metadata.get("contextTokensSource")
+        if context_source_meta in {
+            "provider_usage",
+            "last_provider_usage",
+            "unavailable",
+        }:
+            data_block["contextTokensSource"] = context_source_meta
+        context_measured_at_meta = msg.metadata.get("contextTokensMeasuredAt")
+        if isinstance(context_measured_at_meta, str) and context_measured_at_meta:
+            data_block["contextTokensMeasuredAt"] = context_measured_at_meta
 
         # Attachment V2 for hosted media. The relay persists these onto the
         # assistant message and forwards them on the live event, so a clip shows

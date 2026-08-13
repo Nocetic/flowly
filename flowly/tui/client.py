@@ -39,6 +39,9 @@ class ChatFinal:
     # keyed by the active provider. ``None`` from a gateway that predates them.
     context_tokens: int | None = None
     context_window: int | None = None
+    context_tokens_stale: bool | None = None
+    context_tokens_source: str | None = None
+    context_tokens_measured_at: str | None = None
 
 
 @dataclass
@@ -52,6 +55,10 @@ class ChatError:
     run_id: str
     session_key: str
     message: str
+    context_tokens: int | None = None
+    context_window: int | None = None
+    context_tokens_stale: bool | None = None
+    context_tokens_source: str | None = None
 
 
 @dataclass
@@ -838,6 +845,9 @@ class GatewayClient:
                 usage = msg.get("usage") or payload.get("usage")
                 ctx_tokens = payload.get("contextTokens")
                 ctx_window = payload.get("contextWindow")
+                ctx_stale = payload.get("contextTokensStale")
+                ctx_source = payload.get("contextTokensSource")
+                ctx_measured_at = payload.get("contextTokensMeasuredAt")
                 await self._inbox.put(
                     ChatFinal(
                         run_id, session_key, text, usage=usage,
@@ -849,13 +859,46 @@ class GatewayClient:
                             ctx_window if isinstance(ctx_window, int) and ctx_window > 0
                             else None
                         ),
+                        context_tokens_stale=(
+                            ctx_stale if isinstance(ctx_stale, bool) else None
+                        ),
+                        context_tokens_source=(
+                            ctx_source if isinstance(ctx_source, str) else None
+                        ),
+                        context_tokens_measured_at=(
+                            ctx_measured_at
+                            if isinstance(ctx_measured_at, str) and ctx_measured_at
+                            else None
+                        ),
                     )
                 )
             elif state == "aborted":
                 await self._inbox.put(ChatAborted(run_id, session_key))
             elif state == "error":
+                ctx_tokens = payload.get("contextTokens")
+                ctx_window = payload.get("contextWindow")
+                ctx_stale = payload.get("contextTokensStale")
+                ctx_source = payload.get("contextTokensSource")
                 await self._inbox.put(
-                    ChatError(run_id, session_key, payload.get("errorMessage", ""))
+                    ChatError(
+                        run_id,
+                        session_key,
+                        payload.get("errorMessage", ""),
+                        context_tokens=(
+                            ctx_tokens if isinstance(ctx_tokens, int) and ctx_tokens > 0
+                            else None
+                        ),
+                        context_window=(
+                            ctx_window if isinstance(ctx_window, int) and ctx_window > 0
+                            else None
+                        ),
+                        context_tokens_stale=(
+                            ctx_stale if isinstance(ctx_stale, bool) else None
+                        ),
+                        context_tokens_source=(
+                            ctx_source if isinstance(ctx_source, str) else None
+                        ),
+                    )
                 )
             return
 
