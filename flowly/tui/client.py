@@ -161,6 +161,12 @@ class PlanUpdated:
 
 
 @dataclass
+class GoalUpdated:
+    """Full standing-goal snapshot (revision-guarded) — drives the goal strip."""
+    goal: dict[str, Any]
+
+
+@dataclass
 class PlanApprovalRequested:
     """A plan revision is awaiting the user's decision — opens the plan tray."""
     plan: dict[str, Any]
@@ -616,6 +622,14 @@ class GatewayClient:
         plan = reply.get("plan")
         return plan if isinstance(plan, dict) else None
 
+    async def goal_get(self, session_key: str) -> dict[str, Any] | None:
+        """Current standing-goal snapshot (canonical resume source). Older
+        bots without ``goal.*`` reject the RPC; callers treat that as no goal."""
+        rid = await self._rpc("goal.get", {"sessionKey": session_key})
+        reply = await self._await_reply(rid, timeout=5.0)
+        goal = reply.get("goal")
+        return goal if isinstance(goal, dict) else None
+
     async def plan_resolve(
         self,
         plan_id: str,
@@ -981,6 +995,16 @@ class GatewayClient:
 
         if ev_name == "plan.updated":
             await self._inbox.put(PlanUpdated(plan=dict(payload)))
+            return
+
+        if ev_name == "goal.updated":
+            # Wire shape: {sessionKey, goal: {…}} — flatten the key into the
+            # snapshot so the app's session filter has one dict to look at.
+            goal = payload.get("goal")
+            if isinstance(goal, dict) and goal.get("goalId"):
+                snapshot = dict(goal)
+                snapshot["sessionKey"] = str(payload.get("sessionKey") or "")
+                await self._inbox.put(GoalUpdated(goal=snapshot))
             return
 
         if ev_name == "plan.approval.requested":

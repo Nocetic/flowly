@@ -36,6 +36,7 @@ from flowly.tui.client import (
     GatewayClient,
     GatewayUnavailable,
     PlanApprovalRequested,
+    GoalUpdated,
     PlanUpdated,
     Reconnected,
     Reconnecting,
@@ -807,6 +808,7 @@ class FlowlyTUI(App[None]):
         finally:
             await self._restore_inflight()
             await self._restore_plan_state()
+            await self._restore_goal_state()
             await self._restore_clarify_state()
 
     async def _preload_history_inner(self) -> None:
@@ -1073,6 +1075,10 @@ class FlowlyTUI(App[None]):
             self._on_plan_updated(ev.plan)
             return
 
+        if isinstance(ev, GoalUpdated):
+            self._on_goal_updated(ev.goal)
+            return
+
         if isinstance(ev, ClarifyRequested):
             self._on_clarify_requested(ev)
             return
@@ -1243,6 +1249,7 @@ class FlowlyTUI(App[None]):
             # rebind + repaint the partial, and refresh the plan strip/tray.
             asyncio.create_task(self._restore_inflight())
             asyncio.create_task(self._restore_plan_state())
+            asyncio.create_task(self._restore_goal_state())
             # A question asked while the socket was down never reached us —
             # the requested event is fire-and-forget.
             asyncio.create_task(self._restore_clarify_state())
@@ -1586,6 +1593,40 @@ class FlowlyTUI(App[None]):
                 expires_at=float(mine.get("expiresAt") or 0.0),
             )
         )
+
+    def _on_goal_updated(self, goal: dict) -> None:
+        """Apply one standing-goal snapshot to the strip.
+
+        Session filter here; the revision guard lives in the GoalPanel so a
+        stale push and a stale goal.get race resolve identically. Terminal
+        transitions leave a one-line note in the transcript, mirroring plans.
+        """
+        if str(goal.get("sessionKey") or "") != self._session_key:
+            return
+        composer = self.query_one(Composer)
+        status = str(goal.get("status") or "")
+        if status == "cleared":
+            composer.set_goal(None)
+            return
+        composer.set_goal(goal)
+        if status == "done":
+            self._add_notice("✓ goal complete")
+
+    async def _restore_goal_state(self) -> None:
+        """Fetch this session's standing goal (canonical resume source).
+        Silent on any error — an older bot without goal.* just leaves the
+        strip hidden. A successful None is authoritative."""
+        try:
+            goal = await self._client.goal_get(self._session_key)
+        except Exception:
+            return
+        composer = self.query_one(Composer)
+        if not goal:
+            composer.set_goal(None)
+            return
+        snapshot = dict(goal)
+        snapshot.setdefault("sessionKey", self._session_key)
+        self._on_goal_updated(snapshot)
 
     async def _restore_plan_state(self) -> None:
         """Fetch this session's plan (canonical resume source) and rebuild the

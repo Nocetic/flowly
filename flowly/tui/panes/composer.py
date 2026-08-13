@@ -1264,6 +1264,61 @@ class PlanPanel(Static):
         self.set_class(True, "has-plan")
 
 
+class GoalPanel(Static):
+    """Persistent standing-goal strip above the input.
+
+    Mirrors ``PlanPanel``'s discipline: one revision-guarded Static, content
+    rendered with ``markup=False``, visibility via the ``has-goal`` class.
+    A ``cleared`` snapshot (or ``None``) hides it.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("markup", False)
+        super().__init__("", *args, **kwargs)
+        self._revision = -1
+        self._goal_id = ""
+
+    def set_goal(self, goal: dict | None) -> None:
+        if goal is None or str(goal.get("status") or "") == "cleared":
+            self._goal_id = ""
+            self._revision = -1
+            self.update("")
+            self.set_class(False, "has-goal")
+            return
+        # Revision guard — a stale snapshot must never regress the strip.
+        rev = int(goal.get("revision") or 0)
+        if goal.get("goalId") == self._goal_id and rev <= self._revision:
+            return
+        self._goal_id = str(goal.get("goalId") or "")
+        self._revision = rev
+        status = str(goal.get("status") or "")
+        text = str(goal.get("goal") or "goal")[:80]
+        turns_used = int(goal.get("turnsUsed") or 0)
+        max_turns = int(goal.get("maxTurns") or 0)
+        header = Text()
+        if status == "done":
+            header.append("✓ ", style="bold #27ae60")
+        elif status == "paused":
+            header.append("⏸ ", style="bold #f2c94c")
+        else:
+            header.append("◎ ", style="bold #00a6c8")
+        header.append(text, style="bold")
+        if max_turns:
+            header.append(f"  {turns_used}/{max_turns}", style="dim")
+        wait = goal.get("wait") or {}
+        note = None
+        if status == "done":
+            note = "goal complete"
+        elif status == "paused":
+            note = str(goal.get("pausedReason") or "paused")[:60]
+        elif isinstance(wait, dict) and wait.get("reason"):
+            note = f"waiting: {str(wait.get('reason'))[:50]}"
+        if note:
+            header.append(f"  · {note}", style="#f2c94c")
+        self.update(header)
+        self.set_class(True, "has-goal")
+
+
 class InlineSecretPrompt(Vertical):
     """Compact one-field setup prompt rendered above the composer."""
 
@@ -1998,6 +2053,18 @@ class Composer(Vertical):
     Composer > #composer-plan-panel.has-plan {
         display: block;
     }
+    Composer > #composer-goal-panel {
+        display: none;
+        height: auto;
+        max-height: 3;
+        padding: 0 2;
+        margin: 0;
+        background: #000000;
+        color: #83b8c2;
+    }
+    Composer > #composer-goal-panel.has-goal {
+        display: block;
+    }
     Composer > #composer-plan-approval {
         display: none;
         height: auto;
@@ -2349,6 +2416,7 @@ class Composer(Vertical):
         yield _Rule(classes="composer-rule", id="composer-rule-top")
         yield Static("", id="composer-attachments", markup=False)
         yield PlanPanel(id="composer-plan-panel")
+        yield GoalPanel(id="composer-goal-panel")
         yield ApprovalPrompt(id="composer-approval")
         yield PlanApprovalPrompt(id="composer-plan-approval")
         yield ClarifyPrompt(id="composer-clarify")
@@ -2763,6 +2831,13 @@ class Composer(Vertical):
         """Update (or hide, with ``None``) the persistent plan strip."""
         try:
             self.query_one("#composer-plan-panel", PlanPanel).set_plan(plan)
+        except Exception:
+            pass
+
+    def set_goal(self, goal: dict | None) -> None:
+        """Update (or hide, with ``None``) the standing-goal strip."""
+        try:
+            self.query_one("#composer-goal-panel", GoalPanel).set_goal(goal)
         except Exception:
             pass
 
