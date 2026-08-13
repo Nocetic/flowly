@@ -21,6 +21,7 @@ from flowly.compaction.types import (
 )
 from flowly.media.assets import assets_to_meta as _assets_to_meta
 from flowly.profile import get_flowly_home
+from flowly.providers.base import PROVIDER_REPLAY_KEY
 from flowly.session.archive import (
     ARCHIVE_COMMIT_TYPE,
     ARCHIVE_STATE_KEY,
@@ -106,7 +107,7 @@ _MAX_CACHED_SESSIONS = 200
 # reject the payload for unrecognised fields.
 _LLM_BASE_FIELDS: tuple[str, ...] = ("role", "content")
 _LLM_ROLE_FIELDS: dict[str, tuple[str, ...]] = {
-    "assistant": ("tool_calls",),
+    "assistant": ("tool_calls", PROVIDER_REPLAY_KEY),
     "tool": ("tool_call_id", "name"),
 }
 
@@ -598,7 +599,12 @@ class Session:
         for i, new_msg in enumerate(new_messages):
             extras = {
                 k: new_msg[k]
-                for k in ("tool_calls", "tool_call_id", "name")
+                for k in (
+                    "tool_calls",
+                    "tool_call_id",
+                    "name",
+                    PROVIDER_REPLAY_KEY,
+                )
                 if k in new_msg
             }
             # Attach the turn-level usage to the closing plain-text

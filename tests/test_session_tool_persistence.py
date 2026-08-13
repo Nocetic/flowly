@@ -17,12 +17,12 @@ into Flowly's previously text-only session store.
 
 from __future__ import annotations
 
+from flowly.providers.base import PROVIDER_REPLAY_KEY
 from flowly.session.manager import (
     Session,
     _project_for_llm,
     _repair_tool_sequence,
 )
-
 
 # ---------------------------------------------------------------------------
 # get_history field preservation
@@ -98,6 +98,31 @@ class TestGetHistoryFieldPreservation:
         s.add_message("tool", content_blocks, tool_call_id="c1", name="browser_tab")
         h = s.get_history()
         assert h[1]["content"] == content_blocks
+
+    def test_provider_replay_sidecar_is_hidden_but_projected_for_provider(self) -> None:
+        replay = {
+            "provider": "openai_codex",
+            "model": "gpt-5.6-sol",
+            "issuer": "issuer",
+            "continuity_id": "epoch",
+            "items": [{
+                "type": "reasoning",
+                "encrypted_content": "opaque",
+            }],
+        }
+        s = Session(key="t1")
+        s.extend_with_turn_messages(
+            user_content="question",
+            new_messages=[{
+                "role": "assistant",
+                "content": "answer",
+                PROVIDER_REPLAY_KEY: replay,
+            }],
+            final_content="answer",
+        )
+
+        assert s.messages[-1][PROVIDER_REPLAY_KEY] == replay
+        assert s.get_history()[-1][PROVIDER_REPLAY_KEY] == replay
 
 
 # ---------------------------------------------------------------------------

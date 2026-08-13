@@ -17,7 +17,12 @@ from loguru import logger
 
 from flowly.bus.events import InboundMessage, OutboundMessage
 from flowly.bus.queue import MessageBus
-from flowly.providers.base import LLMErrorInfo, LLMProvider, LLMResponse
+from flowly.providers.base import (
+    PROVIDER_REPLAY_KEY,
+    LLMErrorInfo,
+    LLMProvider,
+    LLMResponse,
+)
 from flowly.agent.error_classifier import (
     ErrorCategory,
     backoff_for,
@@ -4178,6 +4183,11 @@ class AgentLoop:
             if final_response and final_response.provider_state
             else {}
         )
+        final_provider_replay = (
+            copy.deepcopy(final_response.provider_replay)
+            if final_response and final_response.provider_replay
+            else {}
+        )
         if final_response is None:
             final_response = LLMResponse(
                 content=accumulated_text or None,
@@ -4185,6 +4195,7 @@ class AgentLoop:
                 usage=final_usage,
                 partial_content_delivered=bool(accumulated_text),
                 provider_state=final_provider_state,
+                provider_replay=final_provider_replay,
             )
         elif final_response.tool_calls:
             # Final chunk had tool calls — content came in earlier deltas
@@ -4196,6 +4207,7 @@ class AgentLoop:
                 error_info=final_error_info,
                 partial_content_delivered=bool(accumulated_text),
                 provider_state=final_provider_state,
+                provider_replay=final_provider_replay,
             )
         else:
             # Pure text — use accumulated content
@@ -4206,6 +4218,7 @@ class AgentLoop:
                 error_info=final_error_info,
                 partial_content_delivered=bool(accumulated_text),
                 provider_state=final_provider_state,
+                provider_replay=final_provider_replay,
             )
 
         return final_response
@@ -4597,12 +4610,51 @@ class AgentLoop:
             working_messages: list[dict[str, Any]],
             content: Any,
             tool_calls: list[dict[str, Any]],
+            provider_replay: dict[str, Any] | None = None,
         ) -> list[dict[str, Any]]:
             updated = self.context.add_assistant_message(
                 working_messages, content, tool_calls
             )
+            if provider_replay:
+                updated[-1][PROVIDER_REPLAY_KEY] = copy.deepcopy(provider_replay)
             _record_turn_message(updated[-1])
             return updated
+
+        def _response_replay(
+            response: LLMResponse,
+            *,
+            include_message_items: bool,
+        ) -> dict[str, Any]:
+            envelope = copy.deepcopy(response.provider_replay)
+            items = envelope.get("items") if isinstance(envelope, dict) else None
+            if not isinstance(items, list):
+                return {}
+            if not include_message_items:
+                envelope["items"] = [
+                    item
+                    for item in items
+                    if isinstance(item, dict) and item.get("type") != "message"
+                ]
+            return envelope if envelope.get("items") else {}
+
+        def _record_final_response(
+            response: LLMResponse,
+            content: str | None,
+            *,
+            exact_message: bool,
+        ) -> None:
+            replay = _response_replay(
+                response,
+                include_message_items=exact_message,
+            )
+            if not replay:
+                return
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": content or "",
+                PROVIDER_REPLAY_KEY: replay,
+            }
+            _record_turn_message(message)
 
         def _add_tool_turn_message(
             working_messages: list[dict[str, Any]],
@@ -5212,7 +5264,13 @@ class AgentLoop:
                         assistant_content = response.content
 
                 messages = _add_assistant_turn_message(
-                    messages, assistant_content, tool_call_dicts
+                    messages,
+                    assistant_content,
+                    tool_call_dicts,
+                    _response_replay(
+                        response,
+                        include_message_items=assistant_content is not None,
+                    ),
                 )
 
                 # Emit live UI event for the assistant_with_tool_calls
@@ -6105,9 +6163,19 @@ class AgentLoop:
                     })
                     continue
                 final_content = stripped
+                _record_final_response(
+                    response,
+                    final_content,
+                    exact_message=False,
+                )
                 break
 
             final_content = response.content
+            _record_final_response(
+                response,
+                final_content,
+                exact_message=True,
+            )
             break
 
         run_was_aborted = bool(
@@ -8429,7 +8497,9 @@ class AgentLoop:
                 "provider",
                 "model",
                 "issuer",
+                "continuity_id",
                 "native_disabled",
+                "replay_disabled",
                 "checkpoint",
                 "covered_event_id",
                 "covered_event_seq",
@@ -8811,7 +8881,12 @@ class AgentLoop:
         # Re-append messages that landed while we were summarising — raw
         # dicts, so their timestamps and internal flags survive verbatim.
         for late_msg in appended_tail:
-            session.messages.append(late_msg)
+            # The local summary is a new provider-continuity epoch. Keep the
+            # late message itself, but drop encrypted output items minted
+            # against the pre-summary request chain.
+            late_copy = dict(late_msg)
+            late_copy.pop(PROVIDER_REPLAY_KEY, None)
+            session.messages.append(late_copy)
         self.sessions.mark_full_synced(session)
         session.metadata["last_compaction_summary"] = result.summary
         session.metadata["last_compaction_coverage"] = summary_covers

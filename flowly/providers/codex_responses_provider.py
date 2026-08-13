@@ -28,6 +28,7 @@ import copy
 import hashlib
 import json
 import os
+import secrets
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ from flowly.auth.openai_codex import (
 )
 from flowly.providers.base import (
     PROVIDER_COMPACTION_CHECKPOINT_KEY,
+    PROVIDER_REPLAY_KEY,
     LLMProvider,
     LLMResponse,
     ProviderHTTPError,
@@ -211,6 +213,8 @@ def _split_tool_id(raw_id: Any) -> str:
 
 def _messages_to_codex_input(
     messages: list[dict[str, Any]],
+    *,
+    replay_state: dict[str, Any] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Convert flat chat messages to Codex Responses ``input`` items.
 
@@ -227,15 +231,16 @@ def _messages_to_codex_input(
         if not isinstance(msg, dict):
             continue
         if PROVIDER_COMPACTION_CHECKPOINT_KEY in msg:
-            scope = _REQUEST_SCOPE.get()
             checkpoint = msg.get(PROVIDER_COMPACTION_CHECKPOINT_KEY)
             active = (
-                scope.provider_state.get("checkpoint")
-                if scope is not None
+                replay_state.get("checkpoint")
+                if replay_state is not None
                 else None
             )
             if (
-                isinstance(checkpoint, dict)
+                replay_state is not None
+                and not replay_state.get("replay_disabled", False)
+                and isinstance(checkpoint, dict)
                 and isinstance(active, dict)
                 and checkpoint.get("encrypted_content")
                 and checkpoint.get("encrypted_content")
@@ -259,14 +264,54 @@ def _messages_to_codex_input(
             continue
 
         if role in {"user", "assistant"}:
+            replayed_message = False
+            replayed_reasoning = False
+            if role == "assistant" and replay_state is not None:
+                envelope = msg.get(PROVIDER_REPLAY_KEY)
+                identity_keys = (
+                    "provider",
+                    "model",
+                    "issuer",
+                    "continuity_id",
+                )
+                if (
+                    isinstance(envelope, dict)
+                    and not replay_state.get("replay_disabled", False)
+                    and all(
+                        envelope.get(key) == replay_state.get(key)
+                        and envelope.get(key) is not None
+                        for key in identity_keys
+                    )
+                ):
+                    raw_items = envelope.get("items")
+                    if isinstance(raw_items, list):
+                        for raw_item in raw_items:
+                            normalized = _normalize_replay_input_item(raw_item)
+                            if normalized is None:
+                                continue
+                            items.append(normalized)
+                            replayed_message = (
+                                replayed_message
+                                or normalized.get("type") == "message"
+                            )
+                            replayed_reasoning = (
+                                replayed_reasoning
+                                or normalized.get("type") == "reasoning"
+                            )
+
             content = msg.get("content", "")
-            if isinstance(content, list):
-                parts = _content_parts(content, role=role)
-                items.append({"role": role, "content": parts if parts else ""})
-            else:
-                text = "" if content is None else str(content)
-                if text or role == "user":
-                    items.append({"role": role, "content": text})
+            if role != "assistant" or not replayed_message:
+                if isinstance(content, list):
+                    parts = _content_parts(content, role=role)
+                    items.append({"role": role, "content": parts if parts else ""})
+                else:
+                    text = "" if content is None else str(content)
+                    if text or role == "user":
+                        items.append({"role": role, "content": text})
+                    elif role == "assistant" and replayed_reasoning:
+                        # A reasoning item must be followed by an output item.
+                        # Preserve that invariant for reasoning-only responses.
+                        items.append({"role": "assistant", "content": ""})
 
             if role == "assistant":
                 for idx, tc in enumerate(msg.get("tool_calls") or []):
@@ -312,6 +357,51 @@ def _messages_to_codex_input(
 
     instructions_text = "\n\n".join(c for c in instruction_chunks if c)
     return instructions_text, items
+
+
+def _normalize_replay_input_item(value: Any) -> dict[str, Any] | None:
+    """Return the safe Responses input subset for one persisted output item."""
+    if not isinstance(value, dict):
+        return None
+    item_type = value.get("type")
+    if item_type == "reasoning":
+        encrypted = value.get("encrypted_content")
+        if not isinstance(encrypted, str) or not encrypted:
+            return None
+        item: dict[str, Any] = {
+            "type": "reasoning",
+            "encrypted_content": encrypted,
+        }
+        summary = value.get("summary")
+        if isinstance(summary, list):
+            item["summary"] = copy.deepcopy(summary)
+        return item
+    if item_type != "message" or value.get("role") != "assistant":
+        return None
+    content = value.get("content")
+    if not isinstance(content, list):
+        return None
+    parts: list[dict[str, str]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") not in {"output_text", "text"}:
+            continue
+        text = part.get("text")
+        if isinstance(text, str):
+            parts.append({"type": "output_text", "text": text})
+    if not parts:
+        return None
+    item = {
+        "type": "message",
+        "role": "assistant",
+        "content": parts,
+    }
+    for key in ("id", "status", "phase"):
+        value_part = value.get(key)
+        if isinstance(value_part, str) and value_part:
+            item[key] = value_part
+    return item
 
 
 def _strip_schema_keywords(value: Any) -> Any:
@@ -451,10 +541,23 @@ class CodexResponsesProvider(LLMProvider):
         state: dict[str, Any],
         model: str | None,
     ) -> None:
+        normalized_model = _normalize_codex_model(model or self.default_model)
+        issuer = self._issuer_key()
+        same_identity = (
+            state.get("provider") == self.provider_name
+            and state.get("model") == normalized_model
+            and state.get("issuer") == issuer
+        )
+        continuity_id = state.get("continuity_id") if same_identity else None
         state.update({
             "provider": self.provider_name,
-            "model": _normalize_codex_model(model or self.default_model),
-            "issuer": self._issuer_key(),
+            "model": normalized_model,
+            "issuer": issuer,
+            "continuity_id": (
+                continuity_id
+                if isinstance(continuity_id, str) and continuity_id
+                else secrets.token_hex(16)
+            ),
         })
 
     @contextmanager
@@ -481,7 +584,10 @@ class CodexResponsesProvider(LLMProvider):
         provider_state: dict[str, Any],
         model: str | None,
     ) -> dict[str, Any] | None:
-        if not self._state_matches(provider_state, model):
+        if (
+            not self._state_matches(provider_state, model)
+            or provider_state.get("replay_disabled")
+        ):
             return None
         checkpoint = provider_state.get("checkpoint")
         if not isinstance(checkpoint, dict):
@@ -558,18 +664,17 @@ class CodexResponsesProvider(LLMProvider):
         stream: bool,
     ) -> tuple[dict[str, Any], str]:
         resolved_model = _normalize_codex_model(model or self.default_model)
-        instructions_text, input_items = _messages_to_codex_input(messages)
         scope = _REQUEST_SCOPE.get()
-        if scope is not None and not self._state_matches(
-            scope.provider_state,
-            resolved_model,
-        ):
-            # An encrypted item is issuer/model scoped. The complete raw
-            # transcript is still present around the prompt-only marker, so
-            # dropping an ineligible blob loses no conversational context.
-            input_items = [
-                item for item in input_items if item.get("type") != "compaction"
-            ]
+        replay_state = (
+            scope.provider_state
+            if scope is not None
+            and self._state_matches(scope.provider_state, resolved_model)
+            else None
+        )
+        instructions_text, input_items = _messages_to_codex_input(
+            messages,
+            replay_state=replay_state,
+        )
         session_id = _session_id_for(instructions_text, input_items)
         payload: dict[str, Any] = {
             "model": resolved_model,
@@ -605,12 +710,18 @@ class CodexResponsesProvider(LLMProvider):
         state = scope.provider_state
         if not self._state_matches(state, model):
             state.clear()
-            self._stamp_state(state, model)
+        self._stamp_state(state, model)
         checkpoint = response.provider_state.get("checkpoint")
         checkpoint_emitted = bool(
-            isinstance(checkpoint, dict) and checkpoint.get("encrypted_content")
+            not state.get("replay_disabled")
+            and isinstance(checkpoint, dict)
+            and checkpoint.get("encrypted_content")
         )
-        if isinstance(checkpoint, dict) and checkpoint.get("encrypted_content"):
+        if (
+            not state.get("replay_disabled")
+            and isinstance(checkpoint, dict)
+            and checkpoint.get("encrypted_content")
+        ):
             state["checkpoint"] = {
                 "type": "compaction",
                 "encrypted_content": checkpoint["encrypted_content"],
@@ -618,6 +729,24 @@ class CodexResponsesProvider(LLMProvider):
         response.provider_state = copy.deepcopy(state)
         if checkpoint_emitted:
             response.provider_state["_checkpoint_emitted"] = True
+        replay_items = response.provider_replay.get("items")
+        if (
+            not state.get("replay_disabled")
+            and isinstance(replay_items, list)
+            and replay_items
+        ):
+            response.provider_replay = {
+                key: copy.deepcopy(state[key])
+                for key in (
+                    "provider",
+                    "model",
+                    "issuer",
+                    "continuity_id",
+                )
+            }
+            response.provider_replay["items"] = copy.deepcopy(replay_items)
+        else:
+            response.provider_replay = {}
         return response
 
     def _recover_rejected_payload(
@@ -643,12 +772,17 @@ class CodexResponsesProvider(LLMProvider):
                 scope.session_key or "<default>",
             )
             return True
-        if _is_encrypted_checkpoint_rejection(detail) and state.get("checkpoint"):
+        if _is_encrypted_checkpoint_rejection(detail):
+            if not self._state_matches(state, model):
+                state.clear()
+                self._stamp_state(state, model)
             state.pop("checkpoint", None)
             state.pop("covered_event_id", None)
             state.pop("covered_event_seq", None)
+            state["replay_disabled"] = True
+            state["native_disabled"] = True
             logger.warning(
-                "Encrypted provider checkpoint was rejected for session {}; "
+                "Encrypted provider replay was rejected for session {}; "
                 "retrying from the complete local transcript",
                 scope.session_key or "<default>",
             )
@@ -823,6 +957,7 @@ class CodexResponsesProvider(LLMProvider):
         content_parts: list[str] = []
         tool_calls: list[ToolCallRequest] = []
         checkpoint: dict[str, str] | None = None
+        replay_items: list[dict[str, Any]] = []
         output = data.get("output")
         if isinstance(output, list):
             for item in output:
@@ -830,9 +965,16 @@ class CodexResponsesProvider(LLMProvider):
                     continue
                 item_type = item.get("type")
                 if item_type == "message":
+                    replay_item = _normalize_replay_input_item(item)
+                    if replay_item is not None:
+                        replay_items.append(replay_item)
                     text = _extract_message_text(item)
                     if text:
                         content_parts.append(text)
+                elif item_type == "reasoning":
+                    replay_item = _normalize_replay_input_item(item)
+                    if replay_item is not None:
+                        replay_items.append(replay_item)
                 elif item_type in {"function_call", "custom_tool_call"}:
                     name = str(item.get("name") or "")
                     raw_args = (
@@ -868,6 +1010,11 @@ class CodexResponsesProvider(LLMProvider):
             provider_state=(
                 {"checkpoint": checkpoint}
                 if checkpoint is not None
+                else {}
+            ),
+            provider_replay=(
+                {"items": replay_items}
+                if replay_items
                 else {}
             ),
         )
@@ -982,6 +1129,7 @@ class CodexResponsesProvider(LLMProvider):
                                     finish_reason=parsed.finish_reason,
                                     usage=parsed.usage,
                                     provider_state=parsed.provider_state,
+                                    provider_replay=parsed.provider_replay,
                                 )
                                 return
                             elif etype in {"response.failed", "error"}:
@@ -1006,6 +1154,7 @@ class CodexResponsesProvider(LLMProvider):
                                 finish_reason=parsed.finish_reason,
                                 usage=parsed.usage,
                                 provider_state=parsed.provider_state,
+                                provider_replay=parsed.provider_replay,
                             )
                             return
                         raise CodexAuthError("Codex stream closed without recognizable output")

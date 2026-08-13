@@ -181,6 +181,12 @@ async def test_chat_history_exposes_full_display_rows_without_archive_internals(
                 "role": "assistant",
                 "content": "recent answer",
                 "timestamp": "2026-01-01T00:00:02+00:00",
+                "_provider_replay": {
+                    "items": [{
+                        "type": "reasoning",
+                        "encrypted_content": "must-not-leak",
+                    }],
+                },
                 "_event_id": "evt_3",
                 "_event_seq": 3,
                 "_archive_state": "active",

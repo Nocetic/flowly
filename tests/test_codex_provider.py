@@ -14,6 +14,7 @@ import pytest
 
 import flowly.providers.codex_responses_provider as codex
 from flowly.integrations.active_provider import ActiveProvider
+from flowly.providers.base import PROVIDER_REPLAY_KEY
 from flowly.providers.codex_responses_provider import (
     CodexResponsesProvider,
     _messages_to_codex_input,
@@ -288,6 +289,18 @@ _COMPACTION_FRAMES = [
     "",
 ]
 
+_REASONING_FRAMES = [
+    'data: {"type":"response.output_item.done","item":{"type":"reasoning",'
+    '"id":"rs_123","encrypted_content":"opaque-reasoning",'
+    '"summary":[{"type":"summary_text","text":"checked constraints"}]}}',
+    'data: {"type":"response.output_item.done","item":{"type":"message",'
+    '"id":"msg_123","role":"assistant","status":"completed",'
+    '"phase":"final_answer","content":[{"type":"output_text","text":"Answer"}]}}',
+    'data: {"type":"response.completed","response":{"status":"completed",'
+    '"output":[],"usage":{"input_tokens":20,"output_tokens":3,"total_tokens":23}}}',
+    "",
+]
+
 
 def test_blocking_chat_collects_message_from_output_item_done():
     prov = _provider()
@@ -340,6 +353,113 @@ def test_stream_tool_call_in_final():
     final = chunks[-1]
     assert final.finish_reason == "tool_calls"
     assert final.tool_calls[0].name == "get_weather"
+
+
+def test_reasoning_and_exact_message_items_round_trip_in_order():
+    prov = CodexResponsesProvider(
+        api_key="k",
+        account_id="acct-1",
+        default_model="gpt-5.6-sol",
+    )
+    state = {}
+    _install(_REASONING_FRAMES)
+
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        response = asyncio.run(prov.chat(
+            messages=[{"role": "user", "content": "question"}],
+            model="gpt-5.6-sol",
+        ))
+
+    assert response.content == "Answer"
+    assert response.provider_replay["continuity_id"] == state["continuity_id"]
+    assert [
+        item["type"] for item in response.provider_replay["items"]
+    ] == ["reasoning", "message"]
+    # Stateless reasoning ids are deliberately omitted; exact assistant output
+    # metadata survives for cache/phase fidelity.
+    assert "id" not in response.provider_replay["items"][0]
+    assert response.provider_replay["items"][1]["id"] == "msg_123"
+    assert response.provider_replay["items"][1]["phase"] == "final_answer"
+
+    assistant = {
+        "role": "assistant",
+        "content": "Answer",
+        PROVIDER_REPLAY_KEY: response.provider_replay,
+    }
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        payload, _ = prov._build_payload(
+            [
+                {"role": "user", "content": "question"},
+                assistant,
+                {"role": "user", "content": "follow-up"},
+            ],
+            None,
+            "gpt-5.6-sol",
+            "auto",
+            stream=True,
+        )
+
+    assert [item.get("type") for item in payload["input"]] == [
+        None,
+        "reasoning",
+        "message",
+        None,
+    ]
+    assert payload["input"][1]["encrypted_content"] == "opaque-reasoning"
+    assert payload["input"][2]["id"] == "msg_123"
+    assert payload["input"][2]["phase"] == "final_answer"
+
+
+def test_foreign_replay_sidecar_falls_back_to_plain_assistant_message():
+    prov = CodexResponsesProvider(
+        api_key="k",
+        account_id="acct-1",
+        default_model="gpt-5.6-sol",
+    )
+    old_state = {}
+    prov._stamp_state(old_state, "gpt-5.6-sol")
+    envelope = {
+        **{
+            key: old_state[key]
+            for key in ("provider", "model", "issuer", "continuity_id")
+        },
+        "items": [{
+            "type": "reasoning",
+            "encrypted_content": "foreign",
+            "summary": [],
+        }],
+    }
+    prov.account_id = "acct-2"
+
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=old_state,
+        local_compaction_threshold=250_000,
+    ):
+        payload, _ = prov._build_payload(
+            [{
+                "role": "assistant",
+                "content": "durable plain answer",
+                PROVIDER_REPLAY_KEY: envelope,
+            }],
+            None,
+            "gpt-5.6-sol",
+            "auto",
+            stream=True,
+        )
+
+    assert payload["input"] == [{
+        "role": "assistant",
+        "content": "durable plain answer",
+    }]
 
 
 def test_compaction_checkpoint_is_captured_and_replayed_in_sequence():
@@ -602,6 +722,74 @@ def test_bad_encrypted_checkpoint_retries_with_complete_raw_transcript():
         "new raw turn",
     ]
     assert "checkpoint" not in state
+
+
+def test_bad_reasoning_replay_disables_opaque_items_and_retries_plain_text():
+    prov = CodexResponsesProvider(
+        api_key="k",
+        account_id="acct-1",
+        default_model="gpt-5.6-sol",
+    )
+    state = {}
+    prov._stamp_state(state, "gpt-5.6-sol")
+    envelope = {
+        **{
+            key: state[key]
+            for key in ("provider", "model", "issuer", "continuity_id")
+        },
+        "items": [{
+            "type": "reasoning",
+            "encrypted_content": "bad-reasoning",
+            "summary": [],
+        }],
+    }
+    captures = []
+    replies = [
+        _FakeStream(400, [], b'{"error":{"code":"invalid_encrypted_content"}}'),
+        _FakeStream(200, _TEXT_FRAMES),
+    ]
+
+    class SequenceClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, **kwargs):
+            captures.append(kwargs["json"])
+            return replies.pop(0)
+
+    codex.httpx.AsyncClient = lambda **kwargs: SequenceClient()  # type: ignore
+    messages = [
+        {"role": "user", "content": "old question"},
+        {
+            "role": "assistant",
+            "content": "old answer",
+            PROVIDER_REPLAY_KEY: envelope,
+        },
+        {"role": "user", "content": "new question"},
+    ]
+    with prov.request_scope(
+        session_key="web:one",
+        provider_state=state,
+        local_compaction_threshold=250_000,
+    ):
+        response = asyncio.run(prov.chat(
+            messages=messages,
+            model="gpt-5.6-sol",
+        ))
+
+    assert response.content == "Hello"
+    assert any(item.get("type") == "reasoning" for item in captures[0]["input"])
+    assert not any(item.get("type") == "reasoning" for item in captures[1]["input"])
+    assert [item.get("content") for item in captures[1]["input"]] == [
+        "old question",
+        "old answer",
+        "new question",
+    ]
+    assert state["replay_disabled"] is True
+    assert state["native_disabled"] is True
 
 
 def test_http_error_returns_error_response_not_raise():

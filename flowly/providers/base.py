@@ -13,6 +13,10 @@ from typing import Any, AsyncIterator, Iterator
 # eligible Responses providers translate it into an opaque input item while
 # every other provider sees no row at all.
 PROVIDER_COMPACTION_CHECKPOINT_KEY = "_provider_compaction_checkpoint"
+# Per-assistant-message Responses output sidecar. The visible transcript keeps
+# normal role/content/tool fields; eligible providers replay this envelope to
+# preserve opaque reasoning continuity and exact output-item metadata.
+PROVIDER_REPLAY_KEY = "_provider_replay"
 
 
 @dataclass
@@ -143,6 +147,10 @@ class LLMResponse:
     # under session metadata, never in the visible transcript, and gives it
     # back only to the same provider/model/issuer on later requests.
     provider_state: dict[str, Any] = field(default_factory=dict)
+    # Provider output items that must be replayed at this assistant message's
+    # exact position. AgentLoop persists the opaque envelope under
+    # ``PROVIDER_REPLAY_KEY``; product surfaces never expose it.
+    provider_replay: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_tool_calls(self) -> bool:

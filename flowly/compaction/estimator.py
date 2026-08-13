@@ -9,7 +9,10 @@ from typing import Any
 
 import tiktoken
 
-from flowly.providers.base import PROVIDER_COMPACTION_CHECKPOINT_KEY
+from flowly.providers.base import (
+    PROVIDER_COMPACTION_CHECKPOINT_KEY,
+    PROVIDER_REPLAY_KEY,
+)
 
 # Cache the encoder
 _encoder: tiktoken.Encoding | None = None
@@ -94,6 +97,26 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
                 tokens += estimate_tokens(func.get("name", ""))
                 tokens += estimate_tokens(func.get("arguments", ""))
                 tokens += oh["tool_call"]
+
+    # Stateless Responses requests replay encrypted reasoning/output items.
+    # Count their actual wire strings conservatively so a long reasoning chain
+    # cannot make the request materially larger than the local budget reports.
+    replay = message.get(PROVIDER_REPLAY_KEY)
+    replay_items = replay.get("items") if isinstance(replay, dict) else None
+    if isinstance(replay_items, list):
+        for item in replay_items:
+            if not isinstance(item, dict):
+                continue
+            encrypted = item.get("encrypted_content")
+            if isinstance(encrypted, str):
+                tokens += estimate_tokens(encrypted)
+            summary = item.get("summary")
+            if isinstance(summary, list):
+                for part in summary:
+                    if isinstance(part, dict):
+                        text = part.get("text")
+                        if isinstance(text, str):
+                            tokens += estimate_tokens(text)
 
     return tokens
 

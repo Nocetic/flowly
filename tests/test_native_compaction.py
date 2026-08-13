@@ -1,8 +1,19 @@
 """Encrypted provider checkpoint placement, accounting, and persistence."""
 
+from typing import Any
+
+import pytest
+
 from flowly.agent.loop import AgentLoop
+from flowly.bus.queue import MessageBus
 from flowly.compaction.estimator import estimate_messages_tokens
-from flowly.providers.base import PROVIDER_COMPACTION_CHECKPOINT_KEY
+from flowly.config.schema import Config
+from flowly.providers.base import (
+    PROVIDER_COMPACTION_CHECKPOINT_KEY,
+    PROVIDER_REPLAY_KEY,
+    LLMProvider,
+    LLMResponse,
+)
 from flowly.session.archive import EVENT_ID_KEY
 from flowly.session.manager import Session
 
@@ -53,6 +64,31 @@ def test_checkpoint_budget_replaces_only_earlier_conversation_tokens() -> None:
     assert with_checkpoint >= estimate_messages_tokens([instructions, tail])
 
 
+def test_post_checkpoint_reasoning_replay_is_budgeted_but_prior_replay_is_not() -> None:
+    def replay_message(blob: str) -> dict:
+        return {
+            "role": "assistant",
+            "content": "answer",
+            PROVIDER_REPLAY_KEY: {
+                "items": [{
+                    "type": "reasoning",
+                    "encrypted_content": blob,
+                }],
+            },
+        }
+
+    prior = replay_message("a" * 20_000)
+    tail = replay_message("b" * 20_000)
+    baseline = estimate_messages_tokens([_marker(), tail])
+    total = estimate_messages_tokens([prior, _marker(), tail])
+
+    assert total == baseline
+    assert baseline > estimate_messages_tokens([_marker(), {
+        "role": "assistant",
+        "content": "answer",
+    }])
+
+
 def test_new_checkpoint_persists_against_the_input_event_not_the_output() -> None:
     session = Session(key="web:one")
     session.add_message("user", "older")
@@ -96,3 +132,69 @@ def test_reset_drops_encrypted_conversation_state() -> None:
     session.reset_conversation_context()
 
     assert "provider_continuity" not in session.metadata
+
+
+@pytest.mark.asyncio
+async def test_final_provider_replay_is_journaled_and_persisted(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    replay = {
+        "provider": "openai_codex",
+        "model": "gpt-5.6-sol",
+        "issuer": "issuer",
+        "continuity_id": "epoch",
+        "items": [{
+            "type": "reasoning",
+            "encrypted_content": "opaque-reasoning",
+            "summary": [],
+        }],
+    }
+
+    class Provider(LLMProvider):
+        def get_default_model(self) -> str:
+            return "gpt-5.6-sol"
+
+        async def chat(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            return LLMResponse(
+                content="answer",
+                provider_replay=replay,
+            )
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=Provider(api_key="test"),
+        workspace=tmp_path,
+        main_config=Config(),
+        max_iterations=2,
+        soft_warn_at_iteration=0,
+    )
+    turn_messages: list[dict] = []
+    try:
+        final, *_ = await loop._run_llm_tool_loop(
+            messages=[
+                {"role": "system", "content": "test"},
+                {"role": "user", "content": "question"},
+            ],
+            action_turn=False,
+            turn_content="question",
+            session_key="web:one",
+            turn_messages_out=turn_messages,
+        )
+    finally:
+        loop.stop()
+
+    assert final == "answer"
+    assert turn_messages == [{
+        "role": "assistant",
+        "content": "answer",
+        PROVIDER_REPLAY_KEY: replay,
+    }]
+    session = Session(key="web:one")
+    session.extend_with_turn_messages(
+        user_content="question",
+        new_messages=turn_messages,
+        final_content=final,
+    )
+    assert session.messages[-1][PROVIDER_REPLAY_KEY] == replay
