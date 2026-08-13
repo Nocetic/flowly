@@ -36,6 +36,7 @@ from flowly.tui.client import (
     GatewayClient,
     GatewayUnavailable,
     PlanApprovalRequested,
+    AgentAuthoredUser,
     GoalUpdated,
     PlanUpdated,
     Reconnected,
@@ -1077,6 +1078,14 @@ class FlowlyTUI(App[None]):
 
         if isinstance(ev, GoalUpdated):
             self._on_goal_updated(ev.goal)
+            return
+
+        if isinstance(ev, AgentAuthoredUser):
+            # The agent wrote this prompt on the user's behalf; render it like
+            # any user row so the reply that follows has a visible cause.
+            if ev.session_key and ev.session_key != self._session_key:
+                return
+            transcript.add_user(ev.text)
             return
 
         if isinstance(ev, ClarifyRequested):

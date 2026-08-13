@@ -27,6 +27,18 @@ class StreamDelta:
 
 
 @dataclass
+class AgentAuthoredUser:
+    """A user-role turn the agent authored (a standing goal's next step).
+
+    Nobody typed it, so the TUI never echoed it locally — without this the
+    reply would stream in with nothing above it explaining why.
+    """
+    run_id: str
+    session_key: str
+    text: str
+
+
+@dataclass
 class ChatFinal:
     run_id: str
     session_key: str
@@ -849,6 +861,18 @@ class GatewayClient:
             state = payload.get("state")
             run_id = payload.get("runId", "")
             session_key = payload.get("sessionKey", "")
+            if state == "user":
+                blocks = (payload.get("message") or {}).get("content") or []
+                text = "".join(
+                    str(part.get("text", ""))
+                    for part in blocks
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+                if text:
+                    await self._inbox.put(
+                        AgentAuthoredUser(run_id, session_key, text)
+                    )
+                return
             if state == "final":
                 msg = payload.get("message") or {}
                 content = msg.get("content") or []

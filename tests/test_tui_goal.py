@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from textual.app import App, ComposeResult
 
-from flowly.tui.client import GatewayClient, GoalUpdated
+from flowly.tui.client import AgentAuthoredUser, GatewayClient, GoalUpdated
 from flowly.tui.panes.composer import GoalPanel
 
 HOSTILE = "[/dim] kötü [b]içerik [unknown]tag [i]x"
@@ -104,3 +104,34 @@ async def test_goal_panel_revision_guard_drops_stale():
         panel.set_goal(stale)
         await pilot.pause()
         assert panel._revision == held
+
+
+@pytest.mark.asyncio
+async def test_dispatch_agent_authored_user_turn():
+    """A goal's prompt reaches the transcript as the user row it is."""
+    client = _make()
+    await client._dispatch({
+        "type": "event",
+        "event": "chat",
+        "data": {
+            "state": "user",
+            "runId": "run-1",
+            "sessionKey": "tui:default",
+            "goalRun": True,
+            "message": {"role": "user", "content": [{"type": "text", "text": "keep going"}]},
+        },
+    })
+    ev = client._inbox.get_nowait()
+    assert isinstance(ev, AgentAuthoredUser)
+    assert (ev.run_id, ev.session_key, ev.text) == ("run-1", "tui:default", "keep going")
+
+
+@pytest.mark.asyncio
+async def test_agent_authored_user_turn_without_text_is_dropped():
+    client = _make()
+    await client._dispatch({
+        "type": "event",
+        "event": "chat",
+        "data": {"state": "user", "runId": "run-1", "message": {"content": []}},
+    })
+    assert client._inbox.empty()
