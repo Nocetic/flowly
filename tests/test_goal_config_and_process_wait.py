@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from flowly.agent.loop import AgentLoop
+from flowly.cli import gateway_cmd
 from flowly.config.loader import load_config
 from flowly.config.schema import Config
 from flowly.exec.process_checkpoint import ProcessCheckpoint
@@ -66,6 +71,125 @@ def test_named_goal_judge_provider_does_not_apply_active_provider_cascade() -> N
     assert judge.key == "anthropic"
     assert judge.api_key == "judge-key"
     assert resolve_named_provider(config, "missing") is None
+
+
+def _reload_harness() -> AgentLoop:
+    loop = object.__new__(AgentLoop)
+    loop._explicit_goal_provider = None
+    loop.goal_manager = SimpleNamespace(
+        judge=SimpleNamespace(
+            provider=None,
+            model="old",
+            timeout_seconds=1,
+            max_tokens=64,
+        ),
+        default_max_turns=1,
+    )
+    loop.goal_commands = SimpleNamespace(
+        gate_timeout_seconds=1,
+        gate_max_retries=0,
+    )
+    return loop
+
+
+def test_goal_judge_hot_reload_tracks_inherited_main_provider() -> None:
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "goals": {
+                        "max_turns": 44,
+                        "judge_timeout_seconds": 18,
+                        "judge_max_tokens": 2048,
+                        "gate_timeout_seconds": 90,
+                        "gate_max_retries": 5,
+                    }
+                }
+            }
+        }
+    )
+    loop = _reload_harness()
+    provider = object()
+
+    result = loop.reload_goal_configuration(
+        config,
+        main_provider=provider,  # type: ignore[arg-type]
+        main_model="new-main-model",
+    )
+
+    assert loop.goal_manager.judge.provider is provider
+    assert loop.goal_manager.judge.model is None
+    assert loop.goal_manager.judge.timeout_seconds == 18
+    assert loop.goal_manager.judge.max_tokens == 2048
+    assert loop.goal_manager.default_max_turns == 44
+    assert loop.goal_commands.gate_timeout_seconds == 90
+    assert loop.goal_commands.gate_max_retries == 5
+    assert result["inheritsMainProvider"] is True
+
+
+def test_goal_judge_hot_reload_rebuilds_named_provider(monkeypatch) -> None:
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "goals": {
+                        "judge_provider": "anthropic",
+                        "judge_model": "judge-model",
+                    }
+                }
+            }
+        }
+    )
+    loop = _reload_harness()
+    main_provider = object()
+    named_provider = object()
+    build = Mock(return_value=named_provider)
+    monkeypatch.setattr("flowly.providers.factory.build_named_provider", build)
+
+    result = loop.reload_goal_configuration(
+        config,
+        main_provider=main_provider,  # type: ignore[arg-type]
+        main_model="main-model",
+    )
+
+    build.assert_called_once_with(
+        config,
+        "anthropic",
+        default_model="judge-model",
+    )
+    assert loop.goal_manager.judge.provider is named_provider
+    assert loop.goal_manager.judge.model == "judge-model"
+    assert result["inheritsMainProvider"] is False
+
+
+def test_goal_judge_hot_reload_preserves_explicit_injected_provider(monkeypatch) -> None:
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "goals": {"judge_provider": "anthropic"},
+                }
+            }
+        }
+    )
+    loop = _reload_harness()
+    explicit_provider = object()
+    loop._explicit_goal_provider = explicit_provider
+    build = Mock()
+    monkeypatch.setattr("flowly.providers.factory.build_named_provider", build)
+
+    loop.reload_goal_configuration(
+        config,
+        main_provider=object(),  # type: ignore[arg-type]
+        main_model="main-model",
+    )
+
+    assert loop.goal_manager.judge.provider is explicit_provider
+    build.assert_not_called()
+
+
+def test_gateway_provider_reload_refreshes_goal_judge() -> None:
+    assert "agent.reload_goal_configuration(" in inspect.getsource(gateway_cmd)
 
 
 def test_process_summary_contains_goal_wait_evidence() -> None:

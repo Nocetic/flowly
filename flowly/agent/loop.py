@@ -882,6 +882,7 @@ class AgentLoop:
         self.goal_runtime: GoalRuntime | None = None
         self.goal_commands: GoalCommandHandler | None = None
         self._goal_process_unsubscribe: Callable[[], None] | None = None
+        self._explicit_goal_provider = goal_provider
         self._session_turn_locks: dict[str, asyncio.Lock] = {}
         self._goal_user_epochs: dict[str, int] = {}
 
@@ -1193,25 +1194,13 @@ class AgentLoop:
             from flowly.plans.manager import get_plan_manager
             from flowly.runtime_cwd import resolve_runtime_cwd
 
-            judge_provider = explicit_provider
-            judge_model = str(getattr(goals_config, "judge_model", "") or "").strip()
-            provider_name = str(
-                getattr(goals_config, "judge_provider", "") or ""
-            ).strip()
-            if judge_provider is None and provider_name and self._main_config is not None:
-                from flowly.providers.factory import build_named_provider
-
-                judge_provider = build_named_provider(
-                    self._main_config,
-                    provider_name,
-                    default_model=judge_model or self.model,
-                )
-                if judge_provider is None:
-                    logger.warning(
-                        "Goal judge provider {!r} is unavailable; using the main provider",
-                        provider_name,
-                    )
-            judge_provider = judge_provider or self.provider
+            judge_provider, judge_model = self._resolve_goal_judge_provider(
+                goals_config,
+                config=self._main_config,
+                main_provider=self.provider,
+                main_model=self.model,
+                explicit_provider=explicit_provider,
+            )
             process_registry = _get_process_registry()
             plan_manager = get_plan_manager()
 
@@ -1281,6 +1270,104 @@ class AgentLoop:
             self.goal_manager = None
             self.goal_runtime = None
             self.goal_commands = None
+
+    @staticmethod
+    def _resolve_goal_judge_provider(
+        goals_config: Any,
+        *,
+        config: Any | None,
+        main_provider: LLMProvider,
+        main_model: str,
+        explicit_provider: LLMProvider | None = None,
+    ) -> tuple[LLMProvider, str]:
+        """Resolve the isolated judge route, falling back safely to main chat."""
+        judge_model = str(getattr(goals_config, "judge_model", "") or "").strip()
+        if explicit_provider is not None:
+            return explicit_provider, judge_model
+        provider_name = str(
+            getattr(goals_config, "judge_provider", "") or ""
+        ).strip()
+        if provider_name and config is not None:
+            try:
+                from flowly.providers.factory import build_named_provider
+
+                provider = build_named_provider(
+                    config,
+                    provider_name,
+                    default_model=judge_model or main_model,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Goal judge provider {!r} could not be rebuilt: {}",
+                    provider_name,
+                    type(exc).__name__,
+                )
+            else:
+                if provider is not None:
+                    return provider, judge_model
+            logger.warning(
+                "Goal judge provider {!r} is unavailable; using the main provider",
+                provider_name,
+            )
+        return main_provider, judge_model
+
+    def reload_goal_configuration(
+        self,
+        config: Any,
+        *,
+        main_provider: LLMProvider,
+        main_model: str,
+    ) -> dict[str, Any]:
+        """Refresh the live judge route and future-goal defaults after provider reload."""
+        manager = getattr(self, "goal_manager", None)
+        commands = getattr(self, "goal_commands", None)
+        if manager is None:
+            return {"enabled": False}
+        goals_config = getattr(
+            getattr(getattr(config, "agents", None), "defaults", None),
+            "goals",
+            None,
+        )
+        if goals_config is None:
+            return {"enabled": True, "updated": False}
+
+        provider, judge_model = self._resolve_goal_judge_provider(
+            goals_config,
+            config=config,
+            main_provider=main_provider,
+            main_model=main_model,
+            explicit_provider=getattr(self, "_explicit_goal_provider", None),
+        )
+        judge = manager.judge
+        judge.provider = provider
+        judge.model = judge_model or None
+        judge.timeout_seconds = max(
+            1.0,
+            min(300.0, float(getattr(goals_config, "judge_timeout_seconds", 30.0))),
+        )
+        judge.max_tokens = max(
+            64,
+            min(16_384, int(getattr(goals_config, "judge_max_tokens", 4_096))),
+        )
+        manager.default_max_turns = max(
+            1,
+            min(10_000, int(getattr(goals_config, "max_turns", 20))),
+        )
+        if commands is not None:
+            commands.gate_timeout_seconds = max(
+                1,
+                min(3_600, int(getattr(goals_config, "gate_timeout_seconds", 300))),
+            )
+            commands.gate_max_retries = max(
+                0,
+                min(100, int(getattr(goals_config, "gate_max_retries", 3))),
+            )
+        return {
+            "enabled": True,
+            "updated": True,
+            "judgeModel": judge.model,
+            "inheritsMainProvider": provider is main_provider,
+        }
 
     def goal_user_epoch(self, session_key: str) -> int:
         epochs = getattr(self, "_goal_user_epochs", None)

@@ -1429,6 +1429,17 @@ Respond to the user now:"""
             )
         except Exception:  # noqa: BLE001
             pass
+        try:
+            agent.reload_goal_configuration(
+                fresh_cfg,
+                main_provider=new_provider,
+                main_model=new_model,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[provider] standing-goal judge reload skipped: {}",
+                type(exc).__name__,
+            )
         # This reload is how the TUI/CLI applies an xAI Grok login — so
         # (de)register x_search to match the new credential state, otherwise
         # it wouldn't surface until a full gateway restart.
