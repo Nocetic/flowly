@@ -65,6 +65,8 @@ CREATE TRIGGER IF NOT EXISTS fts_delete AFTER DELETE ON messages BEGIN
 END;
 """
 
+_RECALLABLE_STATES_SQL = "('active', 'compacted')"
+
 
 def _sanitize_fts5_query(query: str) -> str:
     """Sanitize user input for safe FTS5 MATCH queries.
@@ -361,6 +363,9 @@ class SessionIndexer:
         sql = f"""
             SELECT
                 m.id,
+                m.event_id,
+                m.event_seq,
+                m.state,
                 m.session_key,
                 m.role,
                 snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
@@ -371,6 +376,7 @@ class SessionIndexer:
             JOIN messages m ON m.id = messages_fts.rowid
             JOIN sessions s ON s.key = m.session_key
             WHERE messages_fts MATCH ?
+            AND m.state IN {_RECALLABLE_STATES_SQL}
             {exclude_clause}
             ORDER BY rank
             LIMIT ?
@@ -394,14 +400,17 @@ class SessionIndexer:
             # relevance without a follow-up scroll.
             anchor_id = r["id"]
             try:
-                ctx = self._conn.execute(
-                    "SELECT id, role, content FROM messages "
-                    "WHERE session_key = ? AND id BETWEEN ? AND ? "
-                    "ORDER BY id",
-                    (sk, anchor_id - context_window, anchor_id + context_window),
-                ).fetchall()
+                ctx = self.messages_around(
+                    sk, anchor_id, window=context_window,
+                ).get("window", [])
                 r["context"] = [
-                    {"role": c["role"], "content": (c["content"] or "")[:300]}
+                    {
+                        "id": c["id"],
+                        "event_id": c.get("event_id"),
+                        "role": c["role"],
+                        "content": (c["content"] or "")[:300],
+                        "state": c.get("state", "active"),
+                    }
                     for c in ctx
                 ]
             except Exception:
@@ -452,6 +461,7 @@ class SessionIndexer:
                 (SELECT SUBSTR(m.content, 1, 80)
                  FROM messages m
                  WHERE m.session_key = s.key AND m.role = 'user'
+                 AND m.state IN {_RECALLABLE_STATES_SQL}
                  ORDER BY m.timestamp LIMIT 1) AS preview
             FROM sessions s
             {exclude}
@@ -485,14 +495,16 @@ class SessionIndexer:
             window = 1
         try:
             rows_before = self._conn.execute(
-                "SELECT id, role, content, timestamp FROM messages "
-                "WHERE session_key = ? AND id <= ? "
+                "SELECT id, event_id, event_seq, state, role, content, timestamp "
+                "FROM messages WHERE session_key = ? AND id <= ? "
+                f"AND state IN {_RECALLABLE_STATES_SQL} "
                 "ORDER BY id DESC LIMIT ?",
                 (session_key, anchor_id, window + 1),
             ).fetchall()
             rows_after = self._conn.execute(
-                "SELECT id, role, content, timestamp FROM messages "
-                "WHERE session_key = ? AND id > ? "
+                "SELECT id, event_id, event_seq, state, role, content, timestamp "
+                "FROM messages WHERE session_key = ? AND id > ? "
+                f"AND state IN {_RECALLABLE_STATES_SQL} "
                 "ORDER BY id ASC LIMIT ?",
                 (session_key, anchor_id, window),
             ).fetchall()
@@ -512,11 +524,13 @@ class SessionIndexer:
             first_id = slice_[0]["id"]
             last_id = slice_[-1]["id"]
             messages_before = self._conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE session_key = ? AND id < ?",
+                "SELECT COUNT(*) FROM messages WHERE session_key = ? AND id < ? "
+                f"AND state IN {_RECALLABLE_STATES_SQL}",
                 (session_key, first_id),
             ).fetchone()[0]
             messages_after = self._conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE session_key = ? AND id > ?",
+                "SELECT COUNT(*) FROM messages WHERE session_key = ? AND id > ? "
+                f"AND state IN {_RECALLABLE_STATES_SQL}",
                 (session_key, last_id),
             ).fetchone()[0]
         except sqlite3.OperationalError:
@@ -544,14 +558,16 @@ class SessionIndexer:
             count = 1
         try:
             start = self._conn.execute(
-                "SELECT id, role, content, timestamp FROM messages "
-                "WHERE session_key = ? "
+                "SELECT id, event_id, event_seq, state, role, content, timestamp "
+                "FROM messages WHERE session_key = ? "
+                f"AND state IN {_RECALLABLE_STATES_SQL} "
                 "ORDER BY id ASC LIMIT ?",
                 (session_key, count),
             ).fetchall()
             end = self._conn.execute(
-                "SELECT id, role, content, timestamp FROM messages "
-                "WHERE session_key = ? "
+                "SELECT id, event_id, event_seq, state, role, content, timestamp "
+                "FROM messages WHERE session_key = ? "
+                f"AND state IN {_RECALLABLE_STATES_SQL} "
                 "ORDER BY id DESC LIMIT ?",
                 (session_key, count),
             ).fetchall()
@@ -561,6 +577,69 @@ class SessionIndexer:
             "start": [dict(r) for r in start],
             "end": [dict(r) for r in list(reversed(end))],
         }
+
+    # ── Exact retrieval -------------------------------------------------
+
+    def first_user_message(self, session_key: str) -> dict[str, Any] | None:
+        """Return the exact first recallable user event in one session."""
+        try:
+            row = self._conn.execute(
+                "SELECT id, event_id, event_seq, state, role, content, timestamp "
+                "FROM messages WHERE session_key = ? AND role = 'user' "
+                f"AND state IN {_RECALLABLE_STATES_SQL} "
+                "ORDER BY COALESCE(event_seq, id), id LIMIT 1",
+                (session_key,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return dict(row) if row else None
+
+    def message_by_event_id(
+        self, session_key: str, event_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one immutable archive event by stable identity."""
+        try:
+            row = self._conn.execute(
+                "SELECT id, event_id, event_seq, state, role, content, timestamp "
+                "FROM messages WHERE session_key = ? AND event_id = ? "
+                f"AND state IN {_RECALLABLE_STATES_SQL} LIMIT 1",
+                (session_key, event_id),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return dict(row) if row else None
+
+    def messages_by_event_range(
+        self,
+        session_key: str,
+        start_event_id: str,
+        end_event_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return an inclusive stable-event range in archive order."""
+        try:
+            bounds = self._conn.execute(
+                "SELECT event_id, event_seq FROM messages "
+                "WHERE session_key = ? AND event_id IN (?, ?)",
+                (session_key, start_event_id, end_event_id),
+            ).fetchall()
+            by_id = {str(row["event_id"]): row["event_seq"] for row in bounds}
+            if start_event_id not in by_id or end_event_id not in by_id:
+                return []
+            low = min(int(by_id[start_event_id]), int(by_id[end_event_id]))
+            high = max(int(by_id[start_event_id]), int(by_id[end_event_id]))
+            rows = self._conn.execute(
+                "SELECT id, event_id, event_seq, state, role, content, timestamp "
+                "FROM messages WHERE session_key = ? "
+                "AND event_seq BETWEEN ? AND ? "
+                f"AND state IN {_RECALLABLE_STATES_SQL} "
+                "ORDER BY event_seq, id LIMIT ?",
+                (session_key, low, high, max(1, min(int(limit), 500))),
+            ).fetchall()
+        except (sqlite3.OperationalError, TypeError, ValueError):
+            return []
+        return [dict(row) for row in rows]
 
     def get_session_meta(self, session_key: str) -> dict[str, Any] | None:
         """Single-session metadata. Returns None when the key is unknown."""

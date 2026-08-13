@@ -15,7 +15,12 @@ from pathlib import Path
 
 import pytest
 
+from flowly.agent.loop import AgentLoop
+from flowly.agent.tools.base import Tool
 from flowly.agent.tools.session_search import SessionSearchTool
+from flowly.bus.queue import MessageBus
+from flowly.config.schema import Config
+from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from flowly.session.indexer import SessionIndexer
 
 
@@ -24,17 +29,17 @@ def indexer():
     """Seeded indexer with two distinct sessions for cross-session search."""
     with tempfile.TemporaryDirectory() as tmp:
         idx = SessionIndexer(db_path=Path(tmp) / "search.db")
-        idx.index_session("docker-session", [
-            {"role": "user", "content": "How do I deploy with docker?", "timestamp": "2026-05-01T10:00:00"},
-            {"role": "assistant", "content": "Use docker compose up -d.", "timestamp": "2026-05-01T10:00:01"},
-            {"role": "user", "content": "What about kubernetes?", "timestamp": "2026-05-01T10:01:00"},
-            {"role": "assistant", "content": "For k8s use kubectl apply.", "timestamp": "2026-05-01T10:01:01"},
-            {"role": "user", "content": "Got it, thanks.", "timestamp": "2026-05-01T10:02:00"},
-            {"role": "assistant", "content": "Anytime.", "timestamp": "2026-05-01T10:02:01"},
+        idx.index_archive("docker-session", [
+            {"role": "user", "content": "How do I deploy with docker?", "timestamp": "2026-05-01T10:00:00", "_event_id": "docker-1", "_event_seq": 1, "_archive_state": "compacted"},
+            {"role": "assistant", "content": "Use docker compose up -d.", "timestamp": "2026-05-01T10:00:01", "_event_id": "docker-2", "_event_seq": 2, "_archive_state": "compacted"},
+            {"role": "user", "content": "What about kubernetes?", "timestamp": "2026-05-01T10:01:00", "_event_id": "docker-3", "_event_seq": 3, "_archive_state": "active"},
+            {"role": "assistant", "content": "For k8s use kubectl apply.", "timestamp": "2026-05-01T10:01:01", "_event_id": "docker-4", "_event_seq": 4, "_archive_state": "active"},
+            {"role": "user", "content": "Got it, thanks.", "timestamp": "2026-05-01T10:02:00", "_event_id": "docker-5", "_event_seq": 5, "_archive_state": "active"},
+            {"role": "assistant", "content": "Anytime.", "timestamp": "2026-05-01T10:02:01", "_event_id": "docker-6", "_event_seq": 6, "_archive_state": "active"},
         ])
-        idx.index_session("react-session", [
-            {"role": "user", "content": "My react component is not re-rendering.", "timestamp": "2026-05-02T10:00:00"},
-            {"role": "assistant", "content": "Check the useEffect dependency array.", "timestamp": "2026-05-02T10:00:01"},
+        idx.index_archive("react-session", [
+            {"role": "user", "content": "My react component is not re-rendering.", "timestamp": "2026-05-02T10:00:00", "_event_id": "react-1", "_event_seq": 1, "_archive_state": "active"},
+            {"role": "assistant", "content": "Check the useEffect dependency array.", "timestamp": "2026-05-02T10:00:01", "_event_id": "react-2", "_event_seq": 2, "_archive_state": "active"},
         ])
         yield idx
 
@@ -126,8 +131,8 @@ def test_scroll_exposes_remaining_message_counts(tool):
     assert payload["messages_after"] == 2
 
 
-def test_scroll_rejects_current_session(tool):
-    """Scrolling inside the active session is a no-op — those messages are already in context."""
+def test_scroll_allows_current_session_archive(tool):
+    """Compacted current-session events are no longer guaranteed in context."""
     disc = json.loads(asyncio.run(tool.execute(query="docker")))
     anchor_id = disc["results"][0]["anchor_id"]
     payload = json.loads(
@@ -139,8 +144,9 @@ def test_scroll_rejects_current_session(tool):
             )
         )
     )
-    assert "error" in payload
-    assert "current session" in payload["error"]
+    assert payload["mode"] == "scroll"
+    assert payload["current_session"] is True
+    assert any(message["state"] == "compacted" for message in payload["messages"])
 
 
 def test_scroll_window_clamped_to_max_20(tool):
@@ -197,3 +203,156 @@ def test_browse_includes_preview_text(tool):
     payload = json.loads(asyncio.run(tool.execute()))
     react = next(r for r in payload["results"] if r["session_key"] == "react-session")
     assert "react" in react["preview"].lower()
+
+
+# ── CURRENT SESSION + EXACT modes ──────────────────────────────────
+
+
+def test_discover_includes_compacted_current_session(tool):
+    payload = json.loads(asyncio.run(
+        tool.execute(query="docker", session_key="docker-session")
+    ))
+
+    hit = next(result for result in payload["results"] if result["session_key"] == "docker-session")
+    assert hit["current_session"] is True
+    assert hit["state"] == "compacted"
+    assert hit["event_id"] in {"docker-1", "docker-2"}
+
+
+def test_exact_first_user_message_defaults_to_current_session(tool):
+    payload = json.loads(asyncio.run(tool.execute(
+        exact_mode="first_user_message",
+        session_key="docker-session",
+    )))
+
+    assert payload["mode"] == "exact"
+    assert payload["current_session"] is True
+    assert payload["messages"][0]["event_id"] == "docker-1"
+    assert payload["messages"][0]["content"] == "How do I deploy with docker?"
+
+
+def test_exact_by_stable_event_id(tool):
+    payload = json.loads(asyncio.run(tool.execute(
+        exact_mode="by_id",
+        target_session="docker-session",
+        event_id="docker-3",
+    )))
+
+    assert payload["messages"] == [{
+        "id": payload["messages"][0]["id"],
+        "event_id": "docker-3",
+        "role": "user",
+        "content": "What about kubernetes?",
+        "state": "active",
+        "timestamp": "2026-05-01 10:01",
+    }]
+
+
+def test_exact_event_range_is_inclusive_and_ordered(tool):
+    payload = json.loads(asyncio.run(tool.execute(
+        exact_mode="range",
+        target_session="docker-session",
+        start_event_id="docker-2",
+        end_event_id="docker-4",
+        limit=10,
+    )))
+
+    assert [message["event_id"] for message in payload["messages"]] == [
+        "docker-2", "docker-3", "docker-4",
+    ]
+
+
+def test_withdrawn_events_are_not_recalled(indexer, tool):
+    indexer._conn.execute(
+        "UPDATE messages SET state = 'withdrawn' WHERE event_id = 'docker-1'"
+    )
+    indexer._conn.commit()
+
+    discover = json.loads(asyncio.run(tool.execute(query="docker")))
+    exact = json.loads(asyncio.run(tool.execute(
+        exact_mode="by_id",
+        target_session="docker-session",
+        event_id="docker-1",
+    )))
+
+    assert not any(
+        result.get("event_id") == "docker-1"
+        for result in discover["results"]
+    )
+    assert exact["messages"] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_runtime_injects_current_session_into_search_tool(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    calls: list[dict] = []
+
+    class CaptureSearch(Tool):
+        @property
+        def name(self) -> str:
+            return "session_search"
+
+        @property
+        def description(self) -> str:
+            return "Search sessions."
+
+        @property
+        def parameters(self) -> dict:
+            return {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            }
+
+        async def execute(self, **kwargs) -> str:
+            calls.append(kwargs)
+            return json.dumps({"results": []})
+
+    class Provider(LLMProvider):
+        def __init__(self):
+            super().__init__(api_key="test")
+            self.calls = 0
+
+        def get_default_model(self) -> str:
+            return "test/model"
+
+        async def chat(self, *args, **kwargs) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(
+                    content=None,
+                    tool_calls=[ToolCallRequest(
+                        id="search-1",
+                        name="session_search",
+                        arguments={"query": "docker"},
+                    )],
+                )
+            return LLMResponse(content="done")
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=Provider(),
+        workspace=tmp_path,
+        main_config=Config(),
+        max_iterations=2,
+        soft_warn_at_iteration=0,
+    )
+    loop.tools.register(CaptureSearch(), toolset="sessions")
+    try:
+        final, *_ = await loop._run_llm_tool_loop(
+            messages=[
+                {"role": "system", "content": "test"},
+                {"role": "user", "content": "find docker"},
+            ],
+            action_turn=False,
+            turn_content="find docker",
+            session_key="web:active-conversation",
+            tool_platform="web",
+        )
+    finally:
+        loop.stop()
+
+    assert final == "done"
+    assert calls == [{"query": "docker", "session_key": "web:active-conversation"}]
+    assert "session_key" not in CaptureSearch().parameters["properties"]

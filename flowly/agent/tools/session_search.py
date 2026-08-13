@@ -1,4 +1,4 @@
-"""Session search tool — three calling modes inferred from args.
+"""Session search tool — recall and exact retrieval over durable history.
 
 One tool, three shapes, zero LLM cost. Rather than expose three separate
 tools (and burn schema budget), the mode is inferred from which arguments
@@ -13,11 +13,15 @@ the agent supplies:
   2. SCROLL — pass ``target_session`` + ``around_message_id``. Returns a
      window of ±``window`` messages centered on the anchor. To scroll
      forward / backward, re-anchor on the last / first message id of
-     the returned window. Refuses to scroll inside the current session
-     (those messages are already in context).
+     the returned window. The current session is intentionally allowed:
+     compacted events are durable archive, not necessarily in the prompt.
 
   3. BROWSE — no args. Returns recent sessions chronologically (titles,
      previews, timestamps).
+
+  4. EXACT — pass ``exact_mode`` (``first_user_message``, ``by_id``, or
+     ``range``) and its stable event-id arguments. This bypasses fuzzy FTS so
+     questions such as "what was my first message?" are deterministic.
 
 The runtime injects the active conversation's id as ``session_key``
 kwarg — that name is reserved, which is why the scroll-mode parameter
@@ -50,8 +54,10 @@ def _shape_msg(m: dict[str, Any], anchor_id: int | None = None) -> dict[str, Any
     """Slim a message row for the JSON payload."""
     entry = {
         "id": m.get("id"),
+        "event_id": m.get("event_id"),
         "role": m.get("role"),
         "content": m.get("content"),
+        "state": m.get("state", "active"),
     }
     if m.get("timestamp"):
         entry["timestamp"] = _format_ts(m["timestamp"])
@@ -61,7 +67,7 @@ def _shape_msg(m: dict[str, Any], anchor_id: int | None = None) -> dict[str, Any
 
 
 class SessionSearchTool(Tool):
-    """Search past conversations via FTS5 — discover / scroll / browse."""
+    """Search durable conversations — discover / scroll / browse / exact."""
 
     def __init__(self, indexer: Any):  # SessionIndexer
         self._indexer = indexer
@@ -74,13 +80,16 @@ class SessionSearchTool(Tool):
     def description(self) -> str:
         return (
             "Search past conversations and drill into them without any LLM cost. "
-            "Three modes, inferred from args: "
+            "Four modes, inferred from args: "
             "(1) pass `query` to keyword-search across all sessions — returns "
             "snippets, context, and the session's opening/closing messages so "
             "you can judge relevance instantly; "
             "(2) pass `session_key` + `around_message_id` to scroll into a hit "
             "and read the surrounding window — re-anchor to scroll further; "
-            "(3) pass nothing to browse recent sessions chronologically. "
+            "(3) pass nothing to browse recent sessions chronologically; "
+            "(4) pass `exact_mode` for deterministic first-message, stable-id, "
+            "or event-range retrieval. The active conversation is searchable "
+            "because compacted events may no longer be in the prompt. "
             "Use PROACTIVELY when the user references past work ('we did this "
             "before', 'remember when', 'last time', a name/topic/file from a "
             "previous session)."
@@ -129,6 +138,28 @@ class SessionSearchTool(Tool):
                     "description": "Discover / browse mode: max results (default 5, max 10).",
                     "default": 5,
                 },
+                "exact_mode": {
+                    "type": "string",
+                    "enum": ["first_user_message", "by_id", "range"],
+                    "description": (
+                        "Deterministic archive lookup. `first_user_message` "
+                        "needs only target_session (or uses the current one); "
+                        "`by_id` needs event_id; `range` needs start_event_id "
+                        "and end_event_id."
+                    ),
+                },
+                "event_id": {
+                    "type": "string",
+                    "description": "Exact by_id mode: stable event identity.",
+                },
+                "start_event_id": {
+                    "type": "string",
+                    "description": "Exact range mode: inclusive first event.",
+                },
+                "end_event_id": {
+                    "type": "string",
+                    "description": "Exact range mode: inclusive last event.",
+                },
             },
             "required": [],
         }
@@ -140,6 +171,10 @@ class SessionSearchTool(Tool):
         around_message_id: int | None = None,
         window: int = 5,
         limit: int = 5,
+        exact_mode: str = "",
+        event_id: str = "",
+        start_event_id: str = "",
+        end_event_id: str = "",
         **kwargs: Any,
     ) -> str:
         # ``session_key`` is injected by the agent runtime as the active
@@ -155,6 +190,16 @@ class SessionSearchTool(Tool):
         )
 
         try:
+            if exact_mode:
+                return self._exact(
+                    exact_mode.strip(),
+                    target_session.strip() or current_session,
+                    event_id.strip(),
+                    start_event_id.strip(),
+                    end_event_id.strip(),
+                    limit=max(1, min(int(limit), 100)),
+                    current_session=current_session,
+                )
             if scroll_intent:
                 return self._scroll(
                     target_session.strip(),
@@ -170,11 +215,11 @@ class SessionSearchTool(Tool):
 
     # ── DISCOVER ─────────────────────────────────────────────────────
 
-    def _discover(self, query: str, limit: int, exclude: str) -> str:
+    def _discover(self, query: str, limit: int, current_session: str) -> str:
         results = self._indexer.search(
             query=query,
             limit=limit,
-            exclude_session=exclude or None,
+            exclude_session=None,
         )
         if not results:
             return json.dumps({
@@ -195,6 +240,11 @@ class SessionSearchTool(Tool):
                 "snippet": r["snippet"],
                 "context": r.get("context", []),
                 "messages_in_session": r.get("msg_count", 0),
+                "current_session": bool(
+                    current_session and r["session_key"] == current_session
+                ),
+                "state": r.get("state", "active"),
+                "event_id": r.get("event_id"),
             }
             # Bookends — session's opening + closing turns. Saves the
             # agent a second tool call to fetch context.
@@ -209,7 +259,7 @@ class SessionSearchTool(Tool):
             "results": items,
             "count": len(items),
             "next_action": (
-                "Scroll into a hit by calling with `session_key` + "
+                "Scroll into a hit by calling with `target_session` + "
                 "`around_message_id` (use the `anchor_id` from a result)."
             ),
         }, ensure_ascii=False)
@@ -223,14 +273,6 @@ class SessionSearchTool(Tool):
         window: int,
         current_session: str,
     ) -> str:
-        # Reject scrolling inside the active session — those messages are
-        # already in the agent's context.
-        if current_session and session_key == current_session:
-            return json.dumps({
-                "error": "scroll rejected: anchor is in the current session — already in context",
-                "mode": "scroll",
-            })
-
         window = max(1, min(int(window), 20))
 
         meta = self._indexer.get_session_meta(session_key)
@@ -251,6 +293,7 @@ class SessionSearchTool(Tool):
         return json.dumps({
             "mode": "scroll",
             "session_key": session_key,
+            "current_session": bool(current_session and session_key == current_session),
             "around_message_id": anchor_id,
             "window": window,
             "session_meta": {
@@ -269,10 +312,10 @@ class SessionSearchTool(Tool):
 
     # ── BROWSE ───────────────────────────────────────────────────────
 
-    def _browse(self, limit: int, exclude: str) -> str:
+    def _browse(self, limit: int, current_session: str) -> str:
         results = self._indexer.list_recent(
             limit=limit,
-            exclude_session=exclude or None,
+            exclude_session=None,
         )
         items = []
         for r in results:
@@ -282,10 +325,69 @@ class SessionSearchTool(Tool):
                 "last_active": _format_ts(r.get("updated_at")),
                 "messages": r.get("msg_count", 0),
                 "preview": r.get("preview", ""),
+                "current_session": bool(
+                    current_session and r["key"] == current_session
+                ),
             })
         return json.dumps({
             "mode": "browse",
             "results": items,
             "count": len(items),
-            "next_action": "Pass a `query` to search, or `session_key` + `around_message_id` to scroll into one.",
+            "next_action": "Pass a `query` to search, or `target_session` + `around_message_id` to scroll into one.",
+        }, ensure_ascii=False)
+
+    # ── EXACT ───────────────────────────────────────────────────────
+
+    def _exact(
+        self,
+        mode: str,
+        session_key: str,
+        event_id: str,
+        start_event_id: str,
+        end_event_id: str,
+        *,
+        limit: int,
+        current_session: str,
+    ) -> str:
+        if mode not in {"first_user_message", "by_id", "range"}:
+            return json.dumps({"mode": "exact", "error": "unknown exact_mode"})
+        if not session_key:
+            return json.dumps({
+                "mode": "exact",
+                "error": "target_session is required when there is no current session",
+            })
+
+        if mode == "first_user_message":
+            message = self._indexer.first_user_message(session_key)
+            messages = [message] if message else []
+        elif mode == "by_id":
+            if not event_id:
+                return json.dumps({
+                    "mode": "exact", "exact_mode": mode,
+                    "error": "event_id is required",
+                })
+            message = self._indexer.message_by_event_id(session_key, event_id)
+            messages = [message] if message else []
+        else:
+            if not start_event_id or not end_event_id:
+                return json.dumps({
+                    "mode": "exact", "exact_mode": mode,
+                    "error": "start_event_id and end_event_id are required",
+                })
+            messages = self._indexer.messages_by_event_range(
+                session_key,
+                start_event_id,
+                end_event_id,
+                limit=limit,
+            )
+
+        return json.dumps({
+            "mode": "exact",
+            "exact_mode": mode,
+            "session_key": session_key,
+            "current_session": bool(
+                current_session and session_key == current_session
+            ),
+            "messages": [_shape_msg(message) for message in messages],
+            "count": len(messages),
         }, ensure_ascii=False)

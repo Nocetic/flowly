@@ -5280,6 +5280,7 @@ class AgentLoop:
                                 "process",
                                 "clarify",
                                 "artifact",
+                                "session_search",
                             )
                             and "session_key" not in call_args
                         ):
