@@ -27,7 +27,13 @@ from flowly.config.schema import WebChannelConfig
 # The conversation-scoped names the relay fans out to every device viewing a
 # chat (CONVERSATION_EVENT_NAMES in stream-routing.ts). Anything NOT in this
 # set is request-scoped and must stay on the originating socket.
-CONVERSATION_SCOPED_EVENTS = {"chat", "plan.updated", "plan.approval.requested", "compaction"}
+CONVERSATION_SCOPED_EVENTS = {
+    "chat",
+    "plan.updated",
+    "plan.approval.requested",
+    "compaction",
+    "goal.updated",
+}
 
 # States that END a turn. A consumer of these settles live state, so anything
 # that is not a turn terminal must never wear one (§4.2).
@@ -142,6 +148,28 @@ async def test_context_freshness_fields_reach_the_relay_additively(channel):
     assert data["contextTokensStale"] is True
     assert data["contextTokensSource"] == "last_provider_usage"
     assert data["contextTokensMeasuredAt"] == "2026-08-13T12:00:00+00:00"
+
+
+async def test_goal_snapshot_follows_final_as_non_terminal_conversation_state(channel):
+    goal = {
+        "goalId": "goal_1",
+        "revision": 7,
+        "status": "active",
+        "goal": "ship",
+    }
+
+    await channel.send(_final(goal=goal))
+
+    assert [event["event"] for event in channel._capture] == ["chat", "goal.updated"]
+    assert channel._capture[0]["data"]["state"] == "final"
+    update = channel._capture[1]
+    assert update["event"] in CONVERSATION_SCOPED_EVENTS
+    assert update["data"] == {
+        "sessionKey": "web:relay-sess-1",
+        "goal": goal,
+    }
+    assert "state" not in update["data"]
+    assert "runId" not in update["data"]
 
 
 # ── §4.2: the compaction separator is not a turn terminal ─────────────────

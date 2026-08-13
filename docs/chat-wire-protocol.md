@@ -82,14 +82,29 @@ transcript boundary row, which makes writing that row idempotent.
 On `phase:"completed"` this event is what draws the transcript's context
 boundary — see §4.2. Lifecycle rules in §5.
 
+### `goal.updated` — durable standing-goal state
+
+`data`: `sessionKey` and the complete `goal` snapshot, including its stable
+`goalId`, monotonic `revision`, lifecycle `status`, budget, wait barrier,
+completion contract, subgoals and gates.
+
+This is additive state, not a chat turn: it never carries `state:"final"` and
+never settles a `runId`. The bot emits it after the related visible `chat`
+terminal so a goal cannot begin auxiliary evaluation before the user sees the
+reply. The relay fans it out through the same owner-scoped conversation topic
+as chat and plan events. `goal.get` is the canonical reconnect source; a client
+may ignore this event entirely and still recover the current snapshot later.
+
 ### Others
 
 `exec.approval.requested`, `agent.clarify.requested`, `plan.updated`,
-`plan.approval.requested`, `tool.*`, `cron.*`, `agent_state`, `tick`.
+`plan.approval.requested`, `goal.updated`, `tool.*`, `cron.*`, `agent_state`,
+`tick`.
 
-Only `chat`, `plan.updated`, `plan.approval.requested` and `compaction` are
-**conversation-scoped** — the relay fans those out to every socket viewing the
-conversation. Everything else is request-scoped and goes to one socket.
+Only `chat`, `plan.updated`, `plan.approval.requested`, `goal.updated` and
+`compaction` are **conversation-scoped** — the relay fans those out to every
+socket viewing the conversation. Everything else is request-scoped and goes
+to one socket.
 Adding a name to that set (`CONVERSATION_EVENT_NAMES` in the relay's
 `stream-routing.ts`) means it will reach other devices: only do it for events
 that describe the conversation, never for control traffic.
@@ -143,12 +158,12 @@ still delivers `final` with `aborted: true` — that is the authoritative
 terminal. Clients keep the partial text and tool cards until it lands.
 
 **4.4 — Re-entry is served by `chat.inflight`.** A client that reconnects
-mid-turn calls it and receives `{runId, text, user, iterations[], compaction}`
-— enough to rebuild the user bubble, the partial reply, the live tool panel
-and the compaction notice. Streaming is otherwise fire-and-forget: deltas that
-arrived while disconnected are gone. This RPC is served identically over both
-transports; if you add live state to a turn, add it here too or re-entry loses
-it.
+mid-turn calls it and receives the in-flight run plus current `plan`,
+`compaction` and `goal` snapshots — enough to rebuild the user bubble, partial
+reply, live tool panel and durable auxiliary state. Streaming is otherwise
+fire-and-forget: deltas that arrived while disconnected are gone. This RPC is
+served identically over both transports; `goal.get` remains the dedicated
+canonical lookup when only standing-goal state is needed.
 
 ---
 
