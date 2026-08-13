@@ -627,8 +627,30 @@ class CompactionService:
             List of recent messages to keep (in original order).
         """
         cfg = self.config.keep_recent
-        if not cfg.enabled or not messages:
+        if not messages:
             return []
+
+        # A generated summary is reference data; it must never become the only
+        # representation of the most recent user request. Preserve that raw
+        # message even when it alone exceeds the preferred tail cap. If the
+        # provider cannot accept that request verbatim, the compaction is
+        # refused later instead of pretending a lossy paraphrase is equivalent.
+        newest_user = next(
+            (message for message in reversed(messages) if message.get("role") == "user"),
+            None,
+        )
+
+        def _with_newest_user(
+            selected: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            if newest_user is None or any(item is newest_user for item in selected):
+                return selected
+            selected_ids = {id(item) for item in selected}
+            selected_ids.add(id(newest_user))
+            return [item for item in messages if id(item) in selected_ids]
+
+        if not cfg.enabled:
+            return _with_newest_user([])
 
         cap = self._keep_recent_cap(history_budget)
         blocks = split_into_turn_blocks(messages)
@@ -654,14 +676,14 @@ class CompactionService:
                     max(cap, history_budget // 2) if history_budget > 0 else cap
                 )
                 if block_tokens <= hard_limit:
-                    return list(block)
+                    return _with_newest_user(list(block))
                 essential = _essential_turn_tail(block)
                 if (
                     essential
                     and estimate_messages_tokens(essential) <= hard_limit
                 ):
-                    return essential
-                return []
+                    return _with_newest_user(essential)
+                return _with_newest_user([])
 
             kept_blocks.append(block)
             tokens_acc += block_tokens
@@ -677,7 +699,9 @@ class CompactionService:
                 break
 
         kept_blocks.reverse()
-        return [msg for block in kept_blocks for msg in block]
+        return _with_newest_user([
+            msg for block in kept_blocks for msg in block
+        ])
 
     async def compact(
         self,
@@ -753,6 +777,26 @@ class CompactionService:
                 f"~{estimate_messages_tokens(kept_messages)} tokens) verbatim; "
                 f"summarizing all {len(messages)}"
             )
+        elif kept_count == len(messages):
+            newest_block = split_into_turn_blocks(messages)[-1]
+            protected_tail = _essential_turn_tail(newest_block)
+            if protected_tail:
+                # The preference-based tail happened to include the whole
+                # history (common when compact() is called directly without a
+                # history budget). Reduce it to the invariant we actually need:
+                # newest raw question + final plain-text answer. Summarize all
+                # source messages so tool actions still reach the reference.
+                kept_messages = protected_tail
+                messages_to_summarize = messages
+                logger.info(
+                    "Recent-tail preference covered the whole history; "
+                    "preserving the newest essential turn and summarizing all"
+                )
+            else:
+                # A genuinely userless/system-driven history has no active
+                # request to protect.
+                messages_to_summarize = messages
+                kept_messages = []
         else:
             messages_to_summarize = messages
             kept_messages = []  # Nothing to keep (all summarized)
@@ -842,9 +886,13 @@ class CompactionService:
         # does, and rejecting on that would fail real compactions.
         reject_invented_user_attribution(summary, messages)
 
-        # Estimate tokens after (summary + kept messages)
-        from flowly.compaction.estimator import estimate_tokens
-        tokens_after = estimate_tokens(summary) + estimate_messages_tokens(kept_messages)
+        # Measure the exact prompt shape that will be committed, including the
+        # reference-only wrapper. Omitting the wrapper here could approve a
+        # compaction that actually grows the provider-facing context.
+        tokens_after = estimate_messages_tokens([
+            {"role": "system", "content": build_summary_content(summary)},
+            *kept_messages,
+        ])
 
         # A "compaction" that doesn't shrink anything is not worth the
         # history it destroys. Refuse it and let the caller carry on.

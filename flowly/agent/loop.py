@@ -8798,7 +8798,7 @@ class AgentLoop:
                     "tokens": total,
                     "source": "provider_usage",
                     "measured_at": measured_at,
-                    "model": metadata.get("model") or self.model,
+                    "model": metadata.get("model") or getattr(self, "model", ""),
                     "provider": (
                         getattr(getattr(self, "provider", None), "provider_name", "")
                         or ""

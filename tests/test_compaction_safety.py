@@ -23,6 +23,7 @@ import pytest
 from flowly.compaction.service import CompactionService
 from flowly.compaction.types import (
     SUMMARY_MARKER,
+    SUMMARY_REFERENCE_PREAMBLE,
     CompactionConfig,
     CompactionError,
     KeepRecentConfig,
@@ -115,6 +116,11 @@ async def test_successful_compaction_commits_summary():
     assert result is not None
     assert is_summary_message(messages[0])
     assert "A real summary." in messages[0]["content"]
+    assert SUMMARY_REFERENCE_PREAMBLE in messages[0]["content"]
+    assert any(
+        message.get("role") == "user" and "question 39" in message.get("content", "")
+        for message in messages[1:]
+    )
     assert result.tokens_after < result.tokens_before
     assert service.compaction_count_for("s1") == 1
 
@@ -557,6 +563,31 @@ def test_a_block_too_big_for_the_budget_degrades_to_question_and_answer():
     assert all(r != "tool" for r in roles), "tool traffic belongs to the summary"
     assert all(not m.get("tool_calls") for m in kept), "no dangling tool calls"
     assert "deploy failed on shard nine" in kept[-1]["content"]
+
+
+def test_newest_user_request_is_never_replaced_only_by_a_summary() -> None:
+    service = _service(_Provider(LLMResponse(content="s", finish_reason="stop")))
+    newest = {
+        "role": "user",
+        "content": "ACTIVE-REQUEST " + ("critical detail " * 20_000),
+    }
+    messages = _conversation(10) + [newest]
+
+    kept = service._calculate_keep_recent(messages, history_budget=2_000)
+
+    assert any(message is newest for message in kept)
+    assert kept[-1]["content"] == newest["content"]
+
+
+def test_newest_user_protection_is_not_disabled_with_tail_optimization() -> None:
+    service = _service(_Provider(LLMResponse(content="s", finish_reason="stop")))
+    service.config.keep_recent = KeepRecentConfig(enabled=False)
+    messages = _conversation(6)
+    newest = messages[-2]
+
+    kept = service._calculate_keep_recent(messages, history_budget=2_000)
+
+    assert kept == [newest]
 
 
 async def test_an_extracted_tail_still_summarizes_the_whole_block():

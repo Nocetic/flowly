@@ -12,7 +12,12 @@ Two separate regressions live here:
 
 import pytest
 
-from flowly.compaction.types import SUMMARY_MARKER, is_summary_message
+from flowly.compaction.types import (
+    SUMMARY_MARKER,
+    SUMMARY_REFERENCE_END,
+    SUMMARY_REFERENCE_PREAMBLE,
+    is_summary_message,
+)
 from flowly.session.manager import Session
 from flowly.tui.client import CompactionEvent, GatewayClient
 
@@ -58,6 +63,24 @@ def test_summary_present_right_after_compaction():
     assert is_summary_message(history[0])
     # Not duplicated: the real message is already there.
     assert sum(1 for m in history if is_summary_message(m)) == 1
+
+
+def test_anchor_is_reference_only_and_newest_raw_user_follows_it():
+    session = _session_with_summary(2)
+    newest_user = next(
+        message for message in reversed(session.messages)
+        if message.get("role") == "user"
+    )
+
+    history = _Loop()._history_with_summary_anchor(session)
+
+    assert SUMMARY_REFERENCE_PREAMBLE in history[0]["content"]
+    assert SUMMARY_REFERENCE_END in history[0]["content"]
+    assert history.index(next(
+        message for message in history
+        if message.get("role") == "user"
+        and message.get("content") == newest_user["content"]
+    )) > 0
 
 
 def test_summary_survives_far_past_the_history_window():
