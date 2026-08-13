@@ -96,6 +96,60 @@ def _install_gateway_file_sink(level: str = "INFO") -> None:
         logger.warning(f"[gateway] daily file log sink not installed: {exc}")
 
 
+async def _warm_model_catalog(provider_key: str) -> None:
+    """Populate the active provider's model catalogue for this process.
+
+    Every context-window lookup here is synchronous and cache-only
+    (:func:`flowly.integrations.model_catalog.get_context_window`), so a cache
+    nobody fills is a cache that always misses. It used to be filled only by
+    the TUI, which is why the terminal could size its context bar from a
+    model's real window while the gateway — the process the desktop and iOS
+    actually talk to — fell through to a model-family guess for its whole
+    lifetime, reporting a flat 128K for anything that guess cannot place.
+
+    Never raises: ``warm_cache`` already swallows network failures, and the
+    callers all keep their own fallback.
+    """
+    from flowly.integrations.model_catalog import warm_cache
+
+    await warm_cache(provider_key)
+
+
+def _start_media_library_sync() -> None:
+    """Reconcile the media library on a daemon thread. Never raises.
+
+    ``gateway()`` is still synchronous here — the event loop does not exist
+    yet — so this cannot be a task. A daemon thread is the right shape anyway:
+    the work is pure disk I/O, it is worthless to wait for, and if the process
+    exits mid-scan the next start simply picks up where this one left off.
+    """
+    import threading
+
+    def _run() -> None:
+        try:
+            from flowly.media.library import get_library
+            from flowly.profile import get_flowly_home
+
+            library = get_library()
+            reconciled = library.reconcile()
+            backfilled = library.backfill_from_sessions(get_flowly_home() / "sessions")
+            if reconciled["added"] or reconciled["expired"] or backfilled["enriched"]:
+                logger.debug(
+                    "[Gateway] Media library: +{} new, {} expired, {} recovered "
+                    "from {} transcripts",
+                    reconciled["added"],
+                    reconciled["expired"],
+                    backfilled["enriched"],
+                    backfilled["sessions"],
+                )
+        except Exception as e:  # noqa: BLE001 - indexing never blocks a gateway
+            logger.debug(f"[Gateway] Media library sync skipped: {e}")
+
+    threading.Thread(
+        target=_run, name="flowly-media-library-sync", daemon=True
+    ).start()
+
+
 def _should_drop_stderr_sink(stream) -> bool:
     """True when stderr is redirected (a service manager) rather than a terminal.
 
@@ -116,8 +170,111 @@ def _should_drop_stderr_sink(stream) -> bool:
 # ============================================================================
 
 
+def resolve_gateway_port(cli_port: int, config) -> int:
+    """Effective gateway port: explicit ``--port`` wins, else config.
+
+    ``cli_port`` is 0 when the flag wasn't given (typer default). The
+    configured ``gateway.port`` is the same value the desktop's local-bot
+    health probe reads, so honouring it here keeps an externally-started
+    gateway visible on the dashboard even when the configured port has
+    drifted from the historical 18790 default.
+    """
+    return cli_port or config.gateway.port
+
+
+def _installed_service_unit():
+    """The machine's gateway-service unit file, if one is installed."""
+    from flowly.cli.service_cmd import DEFAULT_SERVICE_LABEL, _service_paths
+
+    mac_plist, linux_unit, win_xml = _service_paths(DEFAULT_SERVICE_LABEL)
+    for unit in (mac_plist, linux_unit, win_xml):
+        if unit is not None and unit.exists():
+            return unit
+    return None
+
+
+def _port_in_use(port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _run_cli(*args: str) -> int:
+    """Run a flowly CLI command in a child process.
+
+    The service commands are typer entry points; running them as a child
+    keeps this caller decoupled from their signatures and streams their
+    output unchanged. The child inherits FLOWLY_HOME.
+    """
+    return subprocess.run([sys.executable, "-m", "flowly", *args]).returncode
+
+
+def take_over_port(port: int) -> bool:
+    """Offer to stop the installed gateway service that holds *port*.
+
+    Developing on Flowly means serving the port everything already talks to
+    — Desktop, the TUI, iOS via the relay — and on an installed machine the
+    background service is what's holding it. Stopping that by hand is a
+    two-command dance people get wrong in both directions: ``kill`` doesn't
+    stick (launchd's KeepAlive and systemd's Restart=always bring it right
+    back), and the service is easy to forget to restore afterwards, leaving
+    the machine with no agent for channels or cron. So the gateway command
+    handles the handover itself and puts the service back on exit.
+
+    Only the machine's own service is ever touched: a busy port with no
+    installed unit (another app, a gateway started by hand) is left alone
+    and surfaces as the normal bind error.
+
+    Returns True when the service was stopped and must be restored on exit.
+    """
+    if not _port_in_use(port):
+        return False
+    if _installed_service_unit() is None:
+        return False
+
+    console.print(
+        f"[yellow]Port {port} is held by your installed Flowly gateway service.[/]"
+    )
+    if not sys.stdin.isatty():
+        console.print(
+            "  Stop it first:  [bold]flowly service stop[/bold]\n"
+            "  When finished:  [bold]flowly service install --start[/bold]"
+        )
+        raise typer.Exit(code=1)
+
+    from rich.prompt import Confirm
+
+    if not Confirm.ask("  Stop it and serve this port from this checkout?", default=True):
+        console.print("  Left it running — nothing changed.")
+        raise typer.Exit(code=0)
+
+    if _run_cli("service", "stop") != 0:
+        console.print(
+            "[red]✗[/red] Couldn't stop the service — run "
+            "[bold]flowly service stop[/bold] yourself, then retry."
+        )
+        raise typer.Exit(code=1)
+    console.print(
+        "[green]✓[/green] Service stopped — it will be restored when this gateway exits."
+    )
+    return True
+
+
+def restore_service(port: int) -> None:
+    """Reinstall + restart the service ``take_over_port`` stopped."""
+    console.print("\nRestoring the background service…")
+    if _run_cli("service", "install", "--port", str(port), "--start") == 0:
+        console.print(f"[green]✓[/green] Background service is back on port {port}.")
+    else:
+        console.print(
+            "[yellow]Couldn't restore it — run: flowly service install --start[/yellow]"
+        )
+
+
 def gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    port: int = typer.Option(0, "--port", "-p", help="Gateway port. Overrides config.gateway.port (default 18790)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     persona: str = typer.Option("", "--persona", help="Bot persona (default, jarvis, pirate, samurai, casual, professor, butler, friday)"),
     host: str = typer.Option("", "--host", help="Bind address. Use 0.0.0.0 (or the VPS IP) to accept remote desktop clients. Overrides config.gateway.host (default 127.0.0.1)."),
@@ -203,7 +360,6 @@ def gateway(
 
     from flowly import __banner__
     console.print(f"[cyan]{__banner__.format(version=__version__)}[/cyan]")
-    console.print(f"Starting gateway on port {port}...")
 
     # Load .env from data dir (contains MOLTBOT_PROXY_JWT_SECRET, API keys, etc.)
     data_dir = get_data_dir()
@@ -219,6 +375,21 @@ def gateway(
                 os.environ[key] = value
 
     config = load_config()
+
+    # Port resolution: an explicit --port wins; otherwise the configured
+    # gateway.port. The CLI used to hardcode 18790 here while the desktop's
+    # local-bot health probe reads gateway.port from config — the moment the
+    # configured port drifted from the default, an externally-started
+    # `flowly gateway` became invisible to the desktop dashboard even though
+    # it was perfectly healthy. One source of truth ends that split.
+    port = resolve_gateway_port(port, config)
+
+    # If the installed background service holds this port, offer to take it
+    # over for this session (and restore it on exit). This is the entire
+    # "develop from a checkout" story: no separate script, no second config.
+    service_taken_over = take_over_port(port)
+
+    console.print(f"Starting gateway on port {port}...")
 
     # ── Remote access: bind host + auth token resolution ──────────────────
     # --host overrides the configured bind address. Loopback (127.0.0.1) needs
@@ -306,31 +477,48 @@ def gateway(
         except Exception as e:
             logger.debug(f"[Gateway] Audit retention skipped: {e}")
 
-    # Prune generated media (~/.flowly/media) so image generation can't fill the
-    # disk over time — the disk-cleanup plugin deliberately protects this folder,
-    # so nothing else reclaims it. Best-effort; never blocks startup. Tunable via
-    # FLOWLY_MEDIA_RETENTION_DAYS / FLOWLY_MEDIA_MAX_SIZE_MB (age -1 / size 0 = off).
-    try:
-        from flowly.media.retention import (
-            DEFAULT_MAX_SIZE_MB,
-            DEFAULT_RETENTION_DAYS,
-            prune_media,
-        )
-        from flowly.profile import get_flowly_home
+    # Prune generated media (~/.flowly/media) so generation can't fill the disk
+    # over time — the disk-cleanup plugin deliberately protects this folder, so
+    # nothing else reclaims it. Best-effort; never blocks startup. Settings live
+    # in config (media.retention); the FLOWLY_MEDIA_* env vars still override
+    # them for a one-off run.
+    if config.media.retention.enabled:
+        try:
+            from flowly.media.retention import prune_media
+            from flowly.profile import get_flowly_home
 
-        def _media_env_int(name: str, default: int) -> int:
-            try:
-                return int(os.environ[name])
-            except (KeyError, ValueError):
-                return default
+            def _media_env_int(name: str, default: int) -> int:
+                try:
+                    return int(os.environ[name])
+                except (KeyError, ValueError):
+                    return default
 
-        prune_media(
-            get_flowly_home() / "media",
-            retention_days=_media_env_int("FLOWLY_MEDIA_RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
-            max_size_mb=_media_env_int("FLOWLY_MEDIA_MAX_SIZE_MB", DEFAULT_MAX_SIZE_MB),
-        )
-    except Exception as e:
-        logger.debug(f"[Gateway] Media retention skipped: {e}")
+            retention = config.media.retention
+            prune_media(
+                get_flowly_home() / "media",
+                retention_days=_media_env_int(
+                    "FLOWLY_MEDIA_RETENTION_DAYS", retention.retention_days
+                ),
+                image_max_size_mb=_media_env_int(
+                    "FLOWLY_MEDIA_MAX_SIZE_MB", retention.image_max_size_mb
+                ),
+                video_max_size_mb=_media_env_int(
+                    "FLOWLY_MEDIA_VIDEO_MAX_SIZE_MB", retention.video_max_size_mb
+                ),
+                audio_max_size_mb=_media_env_int(
+                    "FLOWLY_MEDIA_AUDIO_MAX_SIZE_MB", retention.audio_max_size_mb
+                ),
+            )
+        except Exception as e:
+            logger.debug(f"[Gateway] Media retention skipped: {e}")
+
+    # Bring the media library index in step with the directory we just pruned,
+    # and — once, on the first run that has this feature — recover provenance
+    # for everything generated before the index existed. Both are I/O in a
+    # worker thread and neither may delay the gateway coming up, so this is
+    # fire-and-forget: a library that is a few seconds stale is invisible; a
+    # gateway that takes a few seconds longer to accept connections is not.
+    _start_media_library_sync()
 
     # Resolve persona: CLI flag overrides config
     active_persona = persona if persona else config.agents.defaults.persona
@@ -383,20 +571,8 @@ def gateway(
     cron = CronService(cron_store_path)
 
     # Build compaction config from settings
-    from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
-    compaction_cfg = config.agents.defaults.compaction
-    compaction_config = CompactionConfig(
-        mode=compaction_cfg.mode,
-        reserve_tokens_floor=compaction_cfg.reserve_tokens_floor,
-        max_history_share=compaction_cfg.max_history_share,
-        context_window=compaction_cfg.context_window,
-        memory_flush=MemoryFlushConfig(
-            enabled=compaction_cfg.memory_flush.enabled,
-            soft_threshold_tokens=compaction_cfg.memory_flush.soft_threshold_tokens,
-            prompt=compaction_cfg.memory_flush.prompt,
-            system_prompt=compaction_cfg.memory_flush.system_prompt,
-        ),
-    )
+    from flowly.compaction.builder import build_compaction_config
+    compaction_config = build_compaction_config(config.agents.defaults.compaction)
 
     # Build exec config
     from flowly.exec.types import ExecConfig
@@ -577,7 +753,14 @@ def gateway(
                         context_tool.set_context(delivery_channel, delivery_to)
 
             try:
-                result = await agent.tools.execute(tool_name, job.payload.tool_args or {})
+                enabled_toolsets, disabled_toolsets = agent._resolve_toolset_route("cron")
+                result = await agent.tools.execute(
+                    tool_name,
+                    job.payload.tool_args or {},
+                    platform="cron",
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                )
             except Exception as e:
                 err = f"Tool '{tool_name}' raised an exception: {e}"
                 logger.error(f"Cron job '{job.name}' tool_call failed: {e}")
@@ -1140,6 +1323,7 @@ Respond to the user now:"""
         media: list[str] | None = None,
         voice_mode: bool = False,
         iteration_callback=None,
+        render_capabilities: tuple[str, ...] = (),
     ) -> tuple[str, dict]:
         # Return ``(text, metadata)`` so the gateway can forward usage
         # tokens (prompt/completion/cache) to the TUI's context-window
@@ -1152,6 +1336,7 @@ Respond to the user now:"""
             stream_callback=stream_callback,
             media=media,
             voice_mode=voice_mode,
+            render_capabilities=render_capabilities,
             return_metadata=True,
             on_iteration=iteration_callback,
             run_id=run_id,
@@ -1226,11 +1411,21 @@ Respond to the user now:"""
         agent.provider = new_provider
         agent.model = new_model
         # Keep the compaction service in lockstep: it holds its own
-        # provider/model refs (summarization + the flowly-proxy window
-        # clamp both read them) — a hot-swap must not leave them stale.
+        # provider/model refs (summarization, the flowly-proxy window clamp
+        # and the model's real context window all read them) — a hot-swap
+        # must not leave them stale. The token estimator is global and
+        # model-family aware, so it has to move too, or a Claude→GPT switch
+        # keeps counting with the wrong per-message overheads.
         try:
             agent.compaction.provider = new_provider
             agent.compaction.model = new_model
+            from flowly.compaction.estimator import set_active_model
+
+            set_active_model(new_model)
+            logger.info(
+                f"[provider] compaction window now "
+                f"{agent.compaction.effective_context_window} tokens for {new_model}"
+            )
         except Exception:  # noqa: BLE001
             pass
         # This reload is how the TUI/CLI applies an xAI Grok login — so
@@ -1263,6 +1458,9 @@ Respond to the user now:"""
 
     try:
         from flowly.channels import feature_rpc as _feature_rpc
+        # chat.compact over the shared surface: relay clients (iOS, Desktop)
+        # and the direct gateway now compact through one implementation.
+        _feature_rpc.set_compact_callback(on_compact)
         _feature_rpc.set_provider_reload_callback(on_provider_reload)
         # Codex policy (codex.policy.set) applied live — drop warm sessions +
         # re-register the tool so the next turn spawns with the new config.
@@ -1274,6 +1472,9 @@ Respond to the user now:"""
         # Subagent registry — read-only, for board.card's run/tool-trace audit.
         _feature_rpc.set_registry_provider(
             lambda: getattr(getattr(agent, "subagents", None), "registry", None)
+        )
+        _feature_rpc.set_semantic_tool_metrics_provider(
+            agent.semantic_tool_routing_metrics
         )
         # Subagent manager — for subagents.spawn (manual background subagent).
         _feature_rpc.set_subagent_manager_provider(
@@ -1341,6 +1542,27 @@ Respond to the user now:"""
             artifact_tool.set_on_change(_broadcast_artifact)
             # Share with SubagentManager so subagent artifacts also sync to S3
             agent.subagents._artifact_on_change = _broadcast_artifact
+
+    # Wire media-library broadcast — the same desktop(gateway)+relay fan-out.
+    # Without it a Library grid would only learn about a new image by polling,
+    # which is exactly the difference between a gallery that feels live and one
+    # that feels stale. The relay leg carries no bytes: it is a "something
+    # changed" ping, and the client re-reads the page it is on.
+    from flowly.media.library import set_on_change as _set_media_on_change
+
+    async def _broadcast_media(event_name: str, data: dict) -> None:
+        await gateway_server.broadcast_event(event_name, data)
+        _web = channels.get_channel("web")
+        if _web and hasattr(_web, "_ws") and _web._ws:
+            import json as _json
+            try:
+                await _web._ws.send(_json.dumps({
+                    "type": "event", "event": event_name, "data": data,
+                }))
+            except Exception:
+                pass  # relay fan-out is best-effort
+
+    _set_media_on_change(_broadcast_media)
 
     # Wire flowlet broadcast + agent-action runner — same desktop(gateway)+relay
     # fan-out as artifacts. The broadcast callback also backs feature_rpc's
@@ -1550,7 +1772,7 @@ Respond to the user now:"""
     # Wire auto-compaction notification — push to relay (web channel) + desktop (gateway)
     async def _on_auto_compaction(
         session_key: str, tokens_before: int, tokens_after: int, messages_removed: int,
-        phase: str = "completed",
+        phase: str = "completed", compaction_id: str = "",
     ) -> None:
         data = {
             "phase": phase,
@@ -1558,11 +1780,18 @@ Respond to the user now:"""
             "tokensAfter": tokens_after,
             "messagesRemoved": messages_removed,
             "sessionKey": session_key,
+            # Ties this phase to its cycle. Also what the relay keys the
+            # transcript boundary row off, so a retried event cannot write
+            # the divider twice.
+            **({"compactionId": compaction_id} if compaction_id else {}),
         }
         # Relay (web channel)
         web = channels.get_channel("web")
         if web and hasattr(web, "send_compaction_event"):
-            await web.send_compaction_event(session_key, tokens_before, tokens_after, messages_removed, phase)
+            await web.send_compaction_event(
+                session_key, tokens_before, tokens_after, messages_removed, phase,
+                compaction_id=compaction_id,
+            )
         # Desktop clients (direct WS)
         await gateway_server._broadcast_compaction_event(data)
 
@@ -1654,7 +1883,17 @@ Respond to the user now:"""
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
-        console.print("[yellow]Warning: No channels enabled[/yellow]")
+        # Not a warning: a gateway with no messaging channel is the normal
+        # state for anyone using the terminal or the desktop app, which is
+        # every developer running this from a checkout. Phrased as one it
+        # reads like the setup failed — the first thing a new contributor
+        # sees after `uv run flowly gateway`, with nothing telling them
+        # whether to act. Say what it means and what the two options are.
+        console.print(
+            "[dim]Channels: none — chat with [cyan]flowly[/cyan] in another "
+            "terminal, or add Telegram/Discord/Slack with "
+            "[cyan]flowly setup channels[/cyan][/dim]"
+        )
 
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
@@ -1700,10 +1939,29 @@ Respond to the user now:"""
 
         _watch_task: asyncio.Task | None = None
         _source_task: asyncio.Task | None = None
+        _catalog_task: asyncio.Task | None = None
         try:
             await gateway_server.start()
             await cron.start()
             await heartbeat.start(run_on_start=True)
+
+            # Warm the active provider's model catalogue.
+            #
+            # Every context-window lookup in this process is synchronous and
+            # cache-only (`get_context_window`), so with nothing warming the
+            # cache here it stayed empty for the gateway's whole life and each
+            # caller silently fell through to a model-family guess: the
+            # desktop's context ring and the compaction budget both reported a
+            # flat 128K for any model that table cannot place. Only the TUI
+            # warmed it — which is why the terminal knew a model's real window
+            # and the gateway never did.
+            #
+            # Fire-and-forget: it must not delay the gateway becoming
+            # reachable, and a failure is survivable because the guess is
+            # still there. `warm_cache` swallows its own errors.
+            _catalog_task = asyncio.create_task(
+                _warm_model_catalog(active.key),
+            )
 
             # Flowlet reactive watches — a lightweight 60s heartbeat that fires
             # schedule/stale/condition reminders LLM-free (client taps trigger an
@@ -1767,16 +2025,10 @@ Respond to the user now:"""
                 if web and hasattr(web, "send_approval_event"):
                     session_key = pending.session_key or ""
                     if session_key.startswith("web:"):
-                        await web.send_approval_event(
-                            session_key, pending.id, pending.request.command, pending.expires_at,
-                            getattr(pending, "supports_always", True),
-                        )
+                        await web.send_approval_event(session_key, pending)
 
                 # Gateway: push event to all desktop clients (local WS)
-                await gateway_server.broadcast_approval_request(
-                    pending.id, pending.request.command, pending.session_key, pending.expires_at,
-                    getattr(pending, "supports_always", True),
-                )
+                await gateway_server.broadcast_approval_request(pending)
 
                 # Closed-app push: wake the phone with an APNs/FCM notification
                 # so the request reaches the user even when the app is shut.
@@ -1786,6 +2038,27 @@ Respond to the user now:"""
                 await notify_approval_requested(pending)
 
             _approval_mgr.add_notify_callback(_notify_approval)
+
+            async def _close_approval(
+                approval_id: str, reason: str, session_key: str
+            ) -> None:
+                """The approval is settled — retire the card everywhere.
+
+                Same need clarify already had: without this a command decided on
+                one device keeps its card on every other surface, and that stale
+                card's countdown eventually fires a decision against an id the
+                manager has already dropped.
+                """
+                web = channels.get_channel("web")
+                if web and hasattr(web, "send_approval_closed"):
+                    if session_key.startswith("web:"):
+                        await web.send_approval_closed(session_key, approval_id, reason)
+
+                await gateway_server.broadcast_approval_closed(
+                    approval_id, reason, session_key
+                )
+
+            _approval_mgr.add_close_callback(_close_approval)
 
             # Connect clarify manager to the gateway so agent-initiated
             # questions reach desktop/web clients. Same fan-out shape as
@@ -1801,21 +2074,32 @@ Respond to the user now:"""
                 if web and hasattr(web, "send_clarify_event"):
                     session_key = pending.session_key or ""
                     if session_key.startswith("web:"):
-                        await web.send_clarify_event(
-                            session_key, pending.id, pending.question,
-                            pending.choices, pending.expires_at,
-                        )
+                        await web.send_clarify_event(session_key, pending)
 
                 # Gateway: push event to all desktop clients (local WS).
-                await gateway_server.broadcast_clarify_request(
-                    pending.id,
-                    pending.question,
-                    pending.choices,
-                    pending.session_key,
-                    pending.expires_at,
-                )
+                await gateway_server.broadcast_clarify_request(pending)
 
             _clarify_mgr.add_notify_callback(_notify_clarify)
+
+            async def _close_clarify(
+                clarify_id: str, reason: str, session_key: str
+            ) -> None:
+                """The question stopped waiting — retire the prompt everywhere.
+
+                Without this a surface keeps a dead question on screen: answered
+                on another device, or timed out after five minutes, with the
+                agent long since moved on.
+                """
+                web = channels.get_channel("web")
+                if web and hasattr(web, "send_clarify_closed"):
+                    if session_key.startswith("web:"):
+                        await web.send_clarify_closed(session_key, clarify_id, reason)
+
+                await gateway_server.broadcast_clarify_closed(
+                    clarify_id, reason, session_key
+                )
+
+            _clarify_mgr.add_close_callback(_close_clarify)
 
             # Run until shutdown signal
             async def run_until_shutdown():
@@ -1850,6 +2134,8 @@ Respond to the user now:"""
                 _watch_task.cancel()
             if _source_task is not None:
                 _source_task.cancel()
+            if _catalog_task is not None:
+                _catalog_task.cancel()
             await gateway_server.stop()
             heartbeat.stop()
             cron.stop()
@@ -1857,4 +2143,8 @@ Respond to the user now:"""
             await channels.stop_all()
             console.print("[green]✓[/green] Shutdown complete")
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    finally:
+        if service_taken_over:
+            restore_service(port)

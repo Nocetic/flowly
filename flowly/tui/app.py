@@ -13,6 +13,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 
 from flowly.integrations import Field, FieldType, IntegrationCard
+from flowly.compaction.service import count_conversational_messages
+from flowly.session.manager import COMPACTION_BOUNDARY_CONTENT
 from flowly.tui.artifact_open import (
     is_external_artifact_type,
     open_artifact_external,
@@ -27,6 +29,8 @@ from flowly.tui.client import (
     ChatAborted,
     ChatError,
     ChatFinal,
+    ClarifyClosed,
+    ClarifyRequested,
     CompactionEvent,
     ConnectionLost,
     GatewayClient,
@@ -65,6 +69,8 @@ from flowly.tui.panes.browser_modal import BrowserPanel
 from flowly.tui.panes.composer import (
     ApprovalPrompt,
     ApprovalPromptRequest,
+    ClarifyPrompt,
+    ClarifyPromptRequest,
     Composer,
     InlineSecretPrompt,
     InlineSecretPromptRequest,
@@ -289,6 +295,15 @@ class FlowlyTUI(App[None]):
         self._client = client if client is not None else GatewayClient(host=host, port=port)
         self._session_key = session_key
         self._model_hint = model_hint
+        # True while a user-initiated /compact owns the progress reporting, so
+        # the gateway's broadcast for the same run isn't printed twice.
+        self._compact_in_flight = False
+        # The compaction cycle whose notice is currently on screen. A terminal
+        # for any other cycle is stale and must not close this one.
+        self._compaction_cycle = ""
+        #: The live notice widget, so its terminal can turn it into the result
+        #: rather than printing a second line underneath.
+        self._compaction_notice = None
         self._restored_draft: str = str(state.get("last_draft") or "")
         # Optional modal to auto-open after launch (e.g. `flowly setup`
         # passes "integrations" so the catalogue surfaces immediately).
@@ -310,6 +325,11 @@ class FlowlyTUI(App[None]):
         # can re-surface it), plus a guard against double-submitting.
         self._pending_plan_approval: dict | None = None
         self._plan_resolve_busy = False
+        # Clarify: the question this session's agent is BLOCKED on, kept for
+        # the same reasons as the plan snapshot above (re-surface after an
+        # approval, or after the tray was hidden with Esc).
+        self._pending_clarify: ClarifyPromptRequest | None = None
+        self._clarify_resolve_busy = False
         self._inline_secret_future: asyncio.Future[str | None] | None = None
         self._inline_setup_future: asyncio.Future[dict[str, object] | None] | None = None
         self._composer_picker_future: asyncio.Future[Any] | None = None
@@ -787,6 +807,7 @@ class FlowlyTUI(App[None]):
         finally:
             await self._restore_inflight()
             await self._restore_plan_state()
+            await self._restore_clarify_state()
 
     async def _preload_history_inner(self) -> None:
         # A preload can render an empty session or a history without usage
@@ -882,14 +903,26 @@ class FlowlyTUI(App[None]):
             text = _flatten_content(msg.get("content"))
             if not text:
                 continue
+            # A context boundary is a seam in the transcript, not something the
+            # agent said. Rendered as an ordinary assistant bubble it read as
+            # the agent replying "[context-optimized]" — which is exactly what
+            # a reopened session showed. Prefer the typed field; the text is
+            # the fallback for rows written before it existed.
+            if msg.get("kind") == "context_boundary" or text.strip() == COMPACTION_BOUNDARY_CONTENT:
+                transcript.add_marker("· context compacted ·")
+                continue
             if role == "user":
                 transcript.add_user(text, timestamp=msg.get("timestamp"))
             elif role == "assistant":
                 transcript.add_assistant(text)
             elif role == "system":
                 transcript.add_system(text)
+        # Counted the way the reader counts: `messages` is the wire history,
+        # which also carries tool-call frames, tool results and compaction
+        # boundaries. Reporting its length told a user with three exchanges
+        # that seventeen messages had been resumed.
         transcript.add_marker(
-            f"· resumed {len(messages)} messages ·"
+            f"· resumed {count_conversational_messages(messages)} messages ·"
         )
 
     # --- event pump ------------------------------------------------
@@ -933,25 +966,26 @@ class FlowlyTUI(App[None]):
             self._current_bubble = None
             self._current_run = None
             self._set_state("idle")
-            # Token usage — REPLACES, doesn't accumulate (prompt_tokens
-            # already includes the full conversation history that the
-            # LLM sees on every turn).
+            # Token usage — REPLACES, doesn't accumulate (the prompt already
+            # includes the full conversation history the LLM sees every turn).
             #
-            # Cache semantics (see ``agent/usage_pricing.py`` for
-            # the canonical normalize_usage helper):
-            #   • **OAI-compat mode** (OpenAI / OpenRouter / Groq /
-            #     xAI via OR / DeepSeek / Codex) — ``prompt_tokens``
-            #     is the FULL input incl. cached chunks. Cache details
-            #     are nested under ``prompt_tokens_details.cached_tokens``
-            #     (or top-level ``cache_read_input_tokens`` when OR
-            #     proxies Anthropic). Adding them again would triple-
-            #     count the same bytes.
-            #   • **Anthropic native** — ``input_tokens`` is NEW only,
-            #     cache fields are separate; sum is required.
-            # ``OpenRouterProvider`` is always OAI-compat, so we use
-            # ``prompt_tokens`` directly. The bare ``input_tokens``
-            # fallback covers any pure-Anthropic adapter we might
-            # introduce later.
+            # Two different questions are answered from one envelope:
+            #
+            #   * **Cost** wants the raw per-turn split, because billing is
+            #     per turn and prices input, output and cache separately.
+            #     `_accumulate_usage` therefore keeps taking the raw numbers.
+            #   * **Context occupancy** wants one figure for "how full is the
+            #     window", and the raw numbers cannot give it without knowing
+            #     the provider dialect: OpenAI-shaped `prompt_tokens` is the
+            #     full input incl. cache, while native Anthropic reports only
+            #     the uncached remainder with the prefix in separate fields.
+            #     Reading it raw drew an almost-empty bar on a cached
+            #     Anthropic conversation that was in fact nearly full.
+            #
+            # The bot answers the second one for us now (`contextTokens`), so
+            # this no longer has to know which dialect it is looking at. The
+            # bar is `tokens_in + tokens_out`, so the reported occupancy is
+            # split back across the two rather than added on top of the reply.
             if ev.usage:
                 u = ev.usage
                 tin = int(
@@ -966,10 +1000,18 @@ class FlowlyTUI(App[None]):
                     or u.get("outputTokens")
                     or 0
                 )
-                if tin:
-                    status.tokens_in = tin
                 if tout:
                     status.tokens_out = tout
+                # An older gateway sends no occupancy; `prompt_tokens` is then
+                # the best available guess, and it is the right one for every
+                # provider such a gateway could reach.
+                occupancy = ev.context_tokens
+                if occupancy:
+                    status.tokens_in = max(0, occupancy - status.tokens_out)
+                elif tin:
+                    status.tokens_in = tin
+                if ev.context_window:
+                    status.context_budget = ev.context_window
                 cread = int(u.get("cache_read_tokens") or u.get("cache_read_input_tokens") or 0)
                 cwrite = int(u.get("cache_write_tokens") or u.get("cache_creation_input_tokens") or 0)
                 self._accumulate_usage(tin, tout, cread, cwrite, status.model)
@@ -985,6 +1027,7 @@ class FlowlyTUI(App[None]):
                 self._current_bubble.mark_streaming(False)
             transcript.add_system("⊘ aborted")
             self._discard_skill_notice(ev.run_id)
+            self._drop_pending_clarify()
             self._current_bubble = None
             self._current_run = None
             self._set_state("idle")
@@ -996,6 +1039,7 @@ class FlowlyTUI(App[None]):
                 self._current_bubble.mark_streaming(False)
             transcript.add_error(f"error: {ev.message}")
             self._discard_skill_notice(ev.run_id)
+            self._drop_pending_clarify()
             self._current_bubble = None
             self._current_run = None
             self._set_state("error")
@@ -1016,6 +1060,14 @@ class FlowlyTUI(App[None]):
 
         if isinstance(ev, PlanUpdated):
             self._on_plan_updated(ev.plan)
+            return
+
+        if isinstance(ev, ClarifyRequested):
+            self._on_clarify_requested(ev)
+            return
+
+        if isinstance(ev, ClarifyClosed):
+            self._on_clarify_closed(ev)
             return
 
         if isinstance(ev, ArtifactEvent):
@@ -1076,15 +1128,80 @@ class FlowlyTUI(App[None]):
             return
 
         if isinstance(ev, CompactionEvent):
-            transcript.add_system(
-                f"⚡ context compacted · {ev.before_messages}→{ev.after_messages} msgs"
+            # The gateway broadcasts to every connected client, so an event
+            # for a different chat (another device, a cron session) must not
+            # land in this transcript.
+            if ev.session_key and ev.session_key != self._session_key:
+                return
+            if ev.phase == "started":
+                # The manual path prints its own progress line; only announce
+                # the automatic one, which the user did not ask for.
+                self._compaction_cycle = ev.compaction_id
+                if not self._compact_in_flight:
+                    # A turn opens an empty assistant bubble the moment the
+                    # user hits send, so a notice mounted now lands BELOW a
+                    # reply that has not been written yet — and once it fills
+                    # in, the transcript claims the compaction happened after
+                    # the answer it preceded.
+                    #
+                    # The placeholder comes down and stays down: while the
+                    # summary is being written there is no reply being written,
+                    # so an empty box below the notice says nothing the status
+                    # bar ("thinking · 13s") is not already saying. The delta
+                    # handler opens a fresh bubble the moment real content
+                    # arrives.
+                    placeholder = self._current_bubble
+                    if placeholder is not None and placeholder.is_empty:
+                        placeholder.remove()
+                        self._current_bubble = None
+                    self._compaction_notice = transcript.add_compaction_notice(
+                        "compacting context…"
+                    )
+                return
+            # A terminal closes the cycle it belongs to. Without the id an
+            # event from an earlier pass (a retry, a second device, a reorder
+            # after reconnect) closed whatever notice happened to be on
+            # screen and reported ITS numbers.
+            if (
+                ev.compaction_id
+                and self._compaction_cycle
+                and ev.compaction_id != self._compaction_cycle
+            ):
+                return
+            self._compaction_cycle = ""
+            if ev.phase == "failed":
+                if self._compaction_notice is not None:
+                    self._compaction_notice.finish(
+                        "context compaction failed — history kept"
+                    )
+                    self._compaction_notice = None
+                else:
+                    transcript.add_error(
+                        "context compaction failed — history kept, will retry"
+                    )
+                return
+            saved = max(0, ev.before_tokens - ev.after_tokens)
+            summary_line = (
+                f"context compacted · {ev.messages_removed} msgs summarized"
                 + (
-                    f" · {ev.before_tokens:,}→{ev.after_tokens:,} tokens"
+                    f" · {ev.before_tokens:,}→{ev.after_tokens:,} tokens "
+                    f"(−{saved:,})"
                     if ev.before_tokens
                     else ""
                 )
             )
+            # The running notice BECOMES the result — one row per compaction,
+            # instead of an orphaned "compacting…" line above its own outcome.
+            if self._compaction_notice is not None:
+                self._compaction_notice.finish(summary_line)
+                self._compaction_notice = None
+            else:
+                transcript.add_system(f"⚡ {summary_line}")
             status.cmp_count += 1
+            # Compaction shrinks the prompt — reset the running tally so the
+            # context bar reflects the new, smaller context immediately.
+            status.tokens_in = 0
+            status.tokens_out = 0
             return
 
         if isinstance(ev, Reconnecting):
@@ -1115,6 +1232,9 @@ class FlowlyTUI(App[None]):
             # rebind + repaint the partial, and refresh the plan strip/tray.
             asyncio.create_task(self._restore_inflight())
             asyncio.create_task(self._restore_plan_state())
+            # A question asked while the socket was down never reached us —
+            # the requested event is fire-and-forget.
+            asyncio.create_task(self._restore_clarify_state())
             return
 
         if isinstance(ev, ConnectionLost):
@@ -1155,6 +1275,12 @@ class FlowlyTUI(App[None]):
                     self.query_one(Composer).show_plan_approval(
                         self._pending_plan_approval
                     )
+                except Exception:
+                    pass
+            elif self._pending_clarify is not None:
+                # Same deferral for a question the agent is blocked on.
+                try:
+                    self.query_one(Composer).show_clarify(self._pending_clarify)
                 except Exception:
                     pass
 
@@ -1314,6 +1440,141 @@ class FlowlyTUI(App[None]):
             self.query_one(TranscriptPane).add_system(
                 "plan approval hidden — type /plan to reopen it"
             )
+
+    # --- clarify --------------------------------------------------------
+
+    def _on_clarify_requested(self, ev: ClarifyRequested) -> None:
+        """The agent asked something and its turn is parked on the answer.
+
+        Exec approvals outrank it (they expire far sooner); when one is on
+        screen the tray is deferred and re-surfaced by the drain loop's tail,
+        exactly like a plan approval.
+        """
+        if ev.session_key and ev.session_key != self._session_key:
+            return
+        if not ev.clarify_id:
+            return
+        request = ClarifyPromptRequest(
+            id=ev.clarify_id,
+            question=ev.question,
+            choices=ev.choices,
+            session_key=ev.session_key,
+            expires_at=ev.expires_at,
+        )
+        self._pending_clarify = request
+        if self._approval_active:
+            return  # deferred — re-shown when the exec approval queue drains
+        self.query_one(Composer).show_clarify(request)
+
+    def _drop_pending_clarify(self) -> None:
+        """Retire the tray because the turn behind it ended.
+
+        The ``closed`` broadcast rides the agent coroutine's exit path, which a
+        cancelled turn can skip — so an aborted or errored run would otherwise
+        leave the question on screen with nothing left to answer.
+        """
+        if self._pending_clarify is None:
+            return
+        self._pending_clarify = None
+        try:
+            self.query_one(Composer).clear_clarify()
+        except Exception:
+            pass
+
+    def _on_clarify_closed(self, ev: ClarifyClosed) -> None:
+        """Answered on another device, or expired — retire the tray.
+
+        Without this the prompt would sit there collecting an answer the
+        manager has already forgotten about.
+        """
+        if self._pending_clarify is None or self._pending_clarify.id != ev.clarify_id:
+            return
+        self._pending_clarify = None
+        self.query_one(Composer).clear_clarify()
+        if ev.reason == "timeout":
+            self._add_notice("question timed out — the agent moved on")
+        elif ev.reason == "answered":
+            self._add_notice("question answered on another device")
+
+    @on(ClarifyPrompt.Answered)
+    async def _on_clarify_answered(self, event: ClarifyPrompt.Answered) -> None:
+        event.stop()
+        if self._clarify_resolve_busy:
+            return
+        self._clarify_resolve_busy = True
+        composer = self.query_one(Composer)
+        transcript = self.query_one(TranscriptPane)
+        # Retire the tray BEFORE the round-trip. The gateway's ``closed``
+        # broadcast races the RPC reply, and a question still marked pending
+        # when it lands reports our own answer as somebody else's.
+        pending = self._pending_clarify
+        self._pending_clarify = None
+        composer.clear_clarify()
+        try:
+            ok = await self._client.clarify_resolve(event.clarify_id, event.answer)
+        except Exception as exc:
+            transcript.add_error(f"answer not delivered: {exc}")
+            # Nothing was delivered — the agent is still parked on it.
+            self._pending_clarify = pending
+            return
+        finally:
+            self._clarify_resolve_busy = False
+        if ok:
+            self._add_notice(f"↩ {event.answer}")
+        else:
+            # The question expired or someone else answered it first.
+            self._add_notice("that question is no longer waiting for an answer")
+
+    @on(ClarifyPrompt.Dismissed)
+    def _on_clarify_dismissed(self, event: ClarifyPrompt.Dismissed) -> None:
+        event.stop()
+        self.query_one(Composer).clear_clarify()
+        if self._pending_clarify is not None:
+            self.query_one(TranscriptPane).add_system(
+                "question hidden — type /clarify to answer it"
+            )
+
+    async def _restore_clarify_state(self) -> None:
+        """Re-open a question this session is still blocked on.
+
+        The event that opened it fired while the TUI was elsewhere (another
+        session, a restart, a dropped socket), so the pending list is the only
+        way back to it. It is also the authority the other way round: switching
+        sessions must not leave the previous one's question on screen.
+
+        Silent on any error — a failed list leaves the tray exactly as it is
+        rather than tearing down a question that is still waiting.
+        """
+        try:
+            items = await self._client.clarify_list()
+        except Exception:
+            return
+        mine = next(
+            (
+                item
+                for item in items
+                if not str(item.get("sessionKey") or "")
+                or str(item.get("sessionKey")) == self._session_key
+            ),
+            None,
+        )
+        if mine is None:
+            if self._pending_clarify is not None:
+                self._pending_clarify = None
+                self.query_one(Composer).clear_clarify()
+            return
+        raw_choices = mine.get("choices")
+        self._on_clarify_requested(
+            ClarifyRequested(
+                clarify_id=str(mine.get("id") or ""),
+                question=str(mine.get("question") or ""),
+                choices=tuple(
+                    str(c) for c in raw_choices if str(c).strip()
+                ) if isinstance(raw_choices, list) else (),
+                session_key=str(mine.get("sessionKey") or ""),
+                expires_at=float(mine.get("expiresAt") or 0.0),
+            )
+        )
 
     async def _restore_plan_state(self) -> None:
         """Fetch this session's plan (canonical resume source) and rebuild the
@@ -1894,6 +2155,16 @@ class FlowlyTUI(App[None]):
             await self._switch_session(new_key)
             self.query_one(TranscriptPane).add_system(f"new session · {new_key}")
             return
+        if head == "/clarify":
+            # Purely local: bring back the question tray that Esc hid. The
+            # agent is still parked on the answer until it expires.
+            if self._pending_clarify is not None:
+                self.query_one(Composer).show_clarify(self._pending_clarify)
+            else:
+                self.query_one(TranscriptPane).add_system(
+                    "no question is waiting for an answer"
+                )
+            return
         if head == "/plan":
             # Bare /plan with a decision already pending → reopen the tray
             # locally (it may have been dismissed with Esc). Anything else is
@@ -2271,6 +2542,10 @@ class FlowlyTUI(App[None]):
             f"compacting context…  {instructions!r}" if instructions
             else "compacting context…"
         )
+        # The gateway also broadcasts started/completed for this compaction.
+        # Suppress the event-driven lines while we own the progress reporting,
+        # otherwise one /compact prints the same news three times.
+        self._compact_in_flight = True
         try:
             result = await self._client.chat_compact(self._session_key, instructions)
         except Exception as exc:
@@ -2278,13 +2553,21 @@ class FlowlyTUI(App[None]):
             self._set_state("error")
             status.hint = prior_hint
             return
-        before = result.get("beforeMessages") or result.get("before_messages")
-        after = result.get("afterMessages") or result.get("after_messages")
-        before_tokens = result.get("beforeTokens") or result.get("before_tokens")
-        after_tokens = result.get("afterTokens") or result.get("after_tokens")
+        finally:
+            self._compact_in_flight = False
+        if not result.get("success", True):
+            transcript.add_error(
+                str(result.get("message") or "compaction did not run")
+            )
+            self._set_state(prior_state if prior_state != "busy" else "idle")
+            status.hint = prior_hint
+            return
+        removed = result.get("messagesRemoved") or result.get("messages_removed")
+        before_tokens = result.get("tokensBefore") or result.get("tokens_before")
+        after_tokens = result.get("tokensAfter") or result.get("tokens_after")
         bits: list[str] = []
-        if before is not None and after is not None:
-            bits.append(f"{before} → {after} messages")
+        if removed:
+            bits.append(f"{removed} messages summarized")
         if before_tokens and after_tokens:
             bits.append(f"{before_tokens:,} → {after_tokens:,} tokens")
         suffix = "  ·  " + " · ".join(bits) if bits else ""
@@ -3549,7 +3832,10 @@ class FlowlyTUI(App[None]):
         s = self.query_one(StatusBar)
         provider, _src = self._active_provider_display()
         ctx_used = int(s.tokens_in) + int(s.tokens_out)
-        ctx_budget = _model_budget(s.model or "")
+        # Same precedence as the status bar: the ceiling the bot reported for
+        # the turn beats a local guess, which can only consult a catalogue
+        # this process happens to have cached.
+        ctx_budget = int(s.context_budget) or _model_budget(s.model or "")
         composer = self.query_one(Composer)
         account = self._account
         email = (

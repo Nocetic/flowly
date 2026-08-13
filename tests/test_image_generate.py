@@ -15,27 +15,10 @@ import flowly.media.fal as fal
 from flowly.agent.tools.image_generate import ImageGenerateTool
 from flowly.integrations.probes import probe_fal_image
 from flowly.integrations.registry import get_card, list_cards
-from flowly.media.image_models import (
-    DEFAULT_IMAGE_MODEL,
-    FAL_IMAGE_MODELS,
-    get_image_model,
-    model_choices,
-)
 
-# ── catalog ──────────────────────────────────────────────────────────────
-
-def test_catalog_has_models_and_default_is_present():
-    ids = {m.id for m in FAL_IMAGE_MODELS}
-    assert DEFAULT_IMAGE_MODEL in ids
-    assert get_image_model(DEFAULT_IMAGE_MODEL) is not None
-    assert get_image_model("nope") is None
-
-
-def test_model_choices_shape():
-    choices = model_choices()
-    assert all(isinstance(c, tuple) and len(c) == 2 for c in choices)
-    assert any(cid == DEFAULT_IMAGE_MODEL for cid, _ in choices)
-
+# The hand-written model list these tests used to pin is gone — the catalog is
+# fetched now (see tests/test_media_catalog.py). What remains here is the FAL
+# client and the tool contract, neither of which changed.
 
 # ── FAL client (mocked httpx) ────────────────────────────────────────────
 
@@ -149,7 +132,10 @@ def test_media_card_registered():
     card = get_card("fal_image")
     assert card is not None
     assert card.category == "media"
-    assert card.config_path == "tools.image_generation"
+    # The card covers video as well as images now, so it edits the shared
+    # media block. The legacy image-only block is still READ at startup — see
+    # flowly.media.settings — so an existing install keeps its key and model.
+    assert card.config_path == "tools.media_generation"
     assert card in list_cards("media")
 
 

@@ -67,7 +67,7 @@ class PluginContext:
         handler: Callable[..., Any],
         check_fn: Callable[[], bool] | None = None,
         description: str = "",
-        toolset: str = "",  # accepted for upstream compat, currently unused
+        toolset: str = "",
         requires_env: list[str] | None = None,  # ditto
         is_async: bool = False,  # ditto — adapter detects awaitables
         emoji: str = "",  # ditto
@@ -84,6 +84,8 @@ class PluginContext:
             handler=handler,
             check_fn=check_fn,
             description=description,
+            discovery_source=self.manifest.name,
+            toolset=toolset,
         )
         self._manager._tool_registry.register(adapter)
         self._manager._plugin_tool_names.setdefault(self.manifest.name, set()).add(name)

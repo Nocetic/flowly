@@ -51,6 +51,12 @@ ends the mode and the work runs under whatever permission level was underneath.
 A trivial message ("hi", a quick question) doesn't force a plan — the agent
 just answers; the gate still blocks any real work until a plan is approved.
 
+The agent may also create a tracking plan for a long task while **Plan mode is
+off**. That is not an extra review gate: under **YOLO**, the plan appears and
+starts immediately. Explicit Plan mode, `/plan`, and requests such as "show me
+the plan but don't execute it" always wait for approval, even when the policy
+underneath is YOLO.
+
 ## Approving a plan
 
 When the agent proposes, the plan appears on your surface and the turn waits.

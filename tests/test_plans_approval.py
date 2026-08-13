@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from flowly.cron.context import cron_context
 from flowly.plans.approval import PlanApprovalManager
 from flowly.plans.manager import PlanManager
 from flowly.plans.store import PlanStore
@@ -85,6 +86,31 @@ async def test_revise_keeps_same_plan_id(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_revised_plan_cannot_be_auto_started(tmp_path: Path):
+    """Once the user asks for a revision, YOLO must not skip their review of
+    the revised proposal."""
+    mgr = _mgr(tmp_path)
+    asyncio.create_task(_resolve_soon(
+        mgr, "web:1", "revise", feedback="add step", decision_id="r1"
+    ))
+    first, decision = await mgr.propose(
+        "web:1", "g", _steps(mgr, "A"), timeout_s=5
+    )
+    assert decision.decision == "revise"
+
+    asyncio.create_task(_resolve_soon(
+        mgr, "web:1", "approve", decision_id="r2"
+    ))
+    revised, decision = await mgr.propose(
+        "web:1", "g", _steps(mgr, "A", "B"), mode="auto", timeout_s=5
+    )
+
+    assert revised.id == first.id
+    assert revised.mode == "forced"
+    assert decision.via == "surface"
+
+
+@pytest.mark.asyncio
 async def test_revision_conflict_and_idempotency(tmp_path: Path):
     mgr = _mgr(tmp_path)
 
@@ -144,10 +170,12 @@ async def test_broadcast_emits_full_snapshots(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_cron_context_auto_rejects(tmp_path: Path, monkeypatch):
+async def test_cron_context_auto_rejects(tmp_path: Path):
     mgr = _mgr(tmp_path)
-    monkeypatch.setattr("flowly.plans.approval._in_cron_context", lambda: True)
-    plan, decision = await mgr.propose("cron:job", "g", _steps(mgr, "A"), timeout_s=5)
+    with cron_context():
+        plan, decision = await mgr.propose(
+            "cron:job", "g", _steps(mgr, "A"), mode="auto", timeout_s=5
+        )
     assert decision.via == "cron"
     assert decision.decision == "reject"
     assert plan.status == "rejected"

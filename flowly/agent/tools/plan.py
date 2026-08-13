@@ -1,10 +1,10 @@
 """plan tool — the agent's surface for general plan mode.
 
 The agent calls ``plan(action="propose", ...)`` to decompose a task into
-steps and push it for the user's approval. That call BLOCKS until the user
-approves / rejects / requests revisions (or it times out = not approved) —
-same await-a-Future shape as ``clarify``. Once approved, the agent ticks
-steps with ``update_step`` as it works and finishes with ``complete``.
+steps. In YOLO, an ordinary agent-authored tracking plan starts immediately;
+an explicitly requested review (including standing/one-shot plan mode) blocks
+until the user decides. Once executable, the agent ticks steps with
+``update_step`` as it works and finishes with ``complete``.
 
 Distinct from ``browser_plan`` (browser-coupled, evidence + validator). This
 is the general, session-level plan that syncs to every client's composer.
@@ -50,12 +50,16 @@ class PlanTool(Tool):
     def description(self) -> str:
         return (
             "Plan mode — for any task that is long or has several distinct "
-            "steps, propose a plan and get the user's approval BEFORE doing "
-            "the work. The plan appears above the user's input on every device "
-            "with live ticks as you complete each step.\n\n"
+            "steps, propose a plan before doing the work. The plan appears "
+            "above the user's input on every device with live ticks as you "
+            "complete each step.\n\n"
             "ACTIONS:\n"
-            "- propose(goal, steps[, title, detailsMd]): decompose the task and "
-            "ask for approval. This BLOCKS until the user decides. steps = array "
+            "- propose(goal, steps[, title, detailsMd, requiresApproval]): "
+            "decompose the task. In YOLO an ordinary tracking plan auto-starts; "
+            "otherwise this blocks until the user decides. Set requiresApproval "
+            "to true when the user explicitly asked to review/approve the plan "
+            "or asked for a plan without execution. Explicit /plan or standing "
+            "Plan mode is always review-gated by the backend. steps = array "
             "of {id:int(1..N), content:str(imperative, e.g. 'Add the RPC "
             "handler'), activeForm?:str(gerund), note?:str}. title = short plan "
             "title. detailsMd = optional Markdown body shown in the plan card. "
@@ -64,8 +68,7 @@ class PlanTool(Tool):
             "  • revise  → the user's feedback is included; call propose AGAIN "
             "with updated steps (it continues the same plan).\n"
             "  • rejected → do NOT do the task; acknowledge and stop.\n"
-            "  • timeout  → not approved; do not execute — tell the user you're "
-            "waiting for approval.\n"
+            "  • timeout  → not approved; do not execute the task.\n"
             "- view(): return the current plan.\n"
             "- update_step(id, status[, note]): status = pending|in_progress|"
             "completed|blocked|skipped. Mark a step in_progress before starting "
@@ -73,9 +76,9 @@ class PlanTool(Tool):
             "- complete([summary]): declare the whole plan done.\n"
             "- block([reason]): the plan can't proceed and needs the user.\n"
             "- abort(): discard the current plan.\n\n"
-            "Until a plan is approved, side-effecting tools (running commands, "
-            "writing files, sending messages, external services) are blocked — "
-            "so propose first, then act."
+            "When review is required, side-effecting tools (running commands, "
+            "writing files, sending messages, external services) stay blocked "
+            "until approval — so propose first, then follow the decision."
         )
 
     @property
@@ -105,6 +108,13 @@ class PlanTool(Tool):
                 "detailsMd": {
                     "type": "string",
                     "description": "Optional Markdown body for the plan card (for propose).",
+                },
+                "requiresApproval": {
+                    "type": "boolean",
+                    "description": (
+                        "For propose: true when the user explicitly wants to "
+                        "review/approve the plan, or wants a plan without execution."
+                    ),
                 },
                 "steps": {
                     "type": "array",
@@ -167,6 +177,22 @@ class PlanTool(Tool):
                 return str(rid)
         return None
 
+    def _runs_unattended(self) -> bool:
+        """Read the live YOLO stance from the registered exec tool.
+
+        The exec tool owns the canonical, hot-reloaded policy store. Missing or
+        failing policy lookup must fail closed to the normal review path.
+        """
+        try:
+            exec_tool = (
+                self._registry.get("exec") if self._registry is not None else None
+            )
+            check = getattr(exec_tool, "runs_unattended", None)
+            return bool(check()) if callable(check) else False
+        except Exception as exc:
+            logger.debug(f"[plan] unattended policy lookup failed; requiring review: {exc}")
+            return False
+
     # ── execute ─────────────────────────────────────────────────────────
 
     async def execute(self, action: str = "", **kwargs: Any) -> str:
@@ -213,6 +239,14 @@ class PlanTool(Tool):
                 {"error": "propose: no valid steps (each needs a non-empty content)."}
             )
 
+        requested_review = kwargs.get("requiresApproval")
+        requires_review = (
+            requested_review not in (None, False)
+            or self._manager.is_forced_pending(session_key)
+            or self._manager.is_sticky(session_key)
+        )
+        mode = "auto" if not requires_review and self._runs_unattended() else "forced"
+
         plan, decision = await self._manager.propose(
             session_key,
             goal,
@@ -222,22 +256,33 @@ class PlanTool(Tool):
                 str(kwargs["detailsMd"]) if kwargs.get("detailsMd") else None
             ),
             run_id=self._current_run_id(),
+            mode=mode,
         )
 
         # Once a plan is approved/executing, the forced-mode gate lifts.
         if decision.approved:
             self._manager.disarm_forced(session_key)
 
-        base = {"planId": plan.id, "revision": plan.revision, "status": plan.status}
+        base = {
+            "planId": plan.id,
+            "revision": plan.revision,
+            "status": plan.status,
+            "via": decision.via,
+        }
         if decision.decision == "approve":
+            approval_note = (
+                "Plan auto-started under YOLO. Execute the steps now: mark each "
+                if decision.via == "policy"
+                else "Plan approved. Execute the steps now: mark each "
+            )
             return json.dumps(
                 {
                     **base,
                     "decision": "approved",
                     "note": (
-                        "Plan approved. Execute the steps now: mark each "
-                        "in_progress before starting and completed right after, "
-                        "then call complete() at the end."
+                        approval_note
+                        + "in_progress before starting and completed right after, "
+                        + "then call complete() at the end."
                     ),
                     "plan": plan.public_view(),
                 }
@@ -255,6 +300,8 @@ class PlanTool(Tool):
                 }
             )
         if decision.decision == "reject":
+            if not self._manager.is_sticky(session_key):
+                self._manager.disarm_forced(session_key)
             return json.dumps(
                 {
                     **base,
@@ -266,15 +313,16 @@ class PlanTool(Tool):
                 }
             )
         # timeout / cron
+        if not self._manager.is_sticky(session_key):
+            self._manager.disarm_forced(session_key)
         return json.dumps(
             {
                 **base,
                 "decision": "not_approved",
                 "via": decision.via,
                 "note": (
-                    "No approval received (timed out or no approver). Do not "
-                    "execute the task. Tell the user the plan is waiting for "
-                    "their approval."
+                    "No approval received (timed out or no approver). The task "
+                    "was not executed."
                 ),
             }
         )

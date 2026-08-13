@@ -112,3 +112,20 @@ def test_list_sessions_title_none_when_absent(tmp_path):
 
     row = next(r for r in mgr.list_sessions() if r["key"] == "desktop:xyz")
     assert row.get("title") is None
+
+
+def test_list_sessions_surfaces_latest_assistant_completion(tmp_path):
+    mgr = _mgr(tmp_path)
+    s = mgr.get_or_create("desktop:unread")
+    s.extend_with_turn_messages(
+        user_content="status?",
+        new_messages=[{"role": "assistant", "content": "Done."}],
+        final_content="Done.",
+        run_id="run-unread",
+    )
+    mgr.save(s)
+
+    row = next(r for r in mgr.list_sessions() if r["key"] == "desktop:unread")
+    assert row["last_assistant_run_id"] == "run-unread"
+    assert row["last_assistant_at"].endswith("+00:00")
+    assert row["last_assistant_at"] != s.messages[-1]["timestamp"]

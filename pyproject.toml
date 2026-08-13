@@ -52,6 +52,10 @@ dependencies = [
     "mcp>=1.20.0,<2.0.0",
     "textual>=0.80.0",
     "keyring>=24.0.0",
+    # Core, API-key-free multilingual tool routing. Model weights are pinned
+    # separately and prepared in the background; conversation memory does not
+    # use this runtime.
+    "fastembed==0.8.0",
 ]
 
 [project.optional-dependencies]

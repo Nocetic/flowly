@@ -22,6 +22,10 @@ from flowly.artifacts.context import (
     internal_context_metadata,
 )
 from flowly.agent.tools.base import Tool
+from flowly.agent.tools.discovery import (
+    annotate_search_repetition,
+    build_tool_disclosure,
+)
 from flowly.agent.tools.registry import ToolRegistry
 from flowly.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, MemoryAppendTool
 from flowly.agent.tools.shell import ExecTool
@@ -186,6 +190,104 @@ def _strip_subagent_tool_results(
                 "content": content[:max_old_chars] + "\n[compacted: old output removed to save context]",
             }
     return result
+
+
+# Headroom left for the subagent's own reply. Smaller than the main loop's
+# reserve: a subagent answers with a result, not a conversation.
+_SUBAGENT_RESERVE_TOKENS = 8_000
+# …but never more than this share of a small model's window, or the reserve
+# alone swallows the context the subagent is supposed to think with.
+_SUBAGENT_MAX_RESERVE_SHARE = 0.35
+# Cap on one reply. Also clamped to the window: asked for 16,384 output
+# tokens, a 16,385-token model has nothing left to read the request with.
+_SUBAGENT_MAX_OUTPUT_TOKENS = 16_384
+_SUBAGENT_MAX_OUTPUT_SHARE = 0.25
+# Everything a request carries besides the messages: tool schemas and the
+# system preamble. Counted so the three parts are budgeted against ONE window
+# instead of each being sized as if it were alone.
+_SUBAGENT_OVERHEAD_TOKENS = 4_000
+# Slack between the planned request and the hard limit. The message-list size
+# is an ESTIMATE (tokenisers disagree by model and language), so a plan that
+# lands exactly on the window lands over it about half the time.
+_SUBAGENT_SAFETY_MARGIN_SHARE = 0.05
+
+
+def subagent_context_window(model: str) -> int:
+    """The model's real window, or a conservative guess."""
+    from flowly.compaction.service import _heuristic_context_window
+
+    window = 0
+    try:
+        from flowly.integrations.model_catalog import get_context_window
+
+        window = get_context_window(model) or 0
+    except Exception:  # noqa: BLE001 — catalog is best-effort
+        window = 0
+    if not window:
+        window = _heuristic_context_window(model) or 128_000
+    return max(1, window)
+
+
+def subagent_output_budget(model: str) -> int:
+    """Output tokens one subagent reply may claim.
+
+    A constant 16,384 was sent to every model. On a 16,385-token model that
+    leaves one token for the entire request — the provider rejects it, and no
+    amount of trimming the message list can help, because the overflow is the
+    reply budget itself.
+    """
+    window = subagent_context_window(model)
+    return max(512, min(_SUBAGENT_MAX_OUTPUT_TOKENS,
+                        int(window * _SUBAGENT_MAX_OUTPUT_SHARE)))
+
+
+def _subagent_context_budget(model: str) -> int:
+    """Tokens a subagent may spend on its message list for ``model``.
+
+    Sized against the SAME window as the reply and the fixed overhead, so the
+    three together fit one request. Budgeting the message list alone let a
+    16,385-token model be handed 8,385 tokens of messages plus a 16,384-token
+    reply plus tool schemas — 25K+ into a 16K window, rejected every time.
+    """
+    window = subagent_context_window(model)
+    reserve = max(
+        subagent_output_budget(model),
+        min(_SUBAGENT_RESERVE_TOKENS, int(window * _SUBAGENT_MAX_RESERVE_SHARE)),
+    )
+    margin = int(window * _SUBAGENT_SAFETY_MARGIN_SHARE)
+    return max(1_000, window - reserve - _SUBAGENT_OVERHEAD_TOKENS - margin)
+
+
+def _trim_to_context_budget(
+    messages: list[dict[str, Any]],
+    model: str,
+) -> list[dict[str, Any]]:
+    """Collapse old tool results until the list fits the model's window.
+
+    Subagents deliberately do NOT summarize: their context is disposable by
+    design, and a summarization call inside one doubles its cost for work
+    that is thrown away when it returns. Progressive truncation is the cheap
+    half of what the main loop does, and it is what keeps a long subagent
+    from dying on a provider 413 instead of returning its result.
+    """
+    from flowly.compaction.estimator import estimate_messages_tokens
+
+    budget = _subagent_context_budget(model)
+    if estimate_messages_tokens(messages) <= budget:
+        return messages
+
+    for keep_last, max_chars in ((2, 200), (1, 120), (1, 60)):
+        messages = _strip_subagent_tool_results(
+            messages, keep_last=keep_last, max_old_chars=max_chars,
+        )
+        if estimate_messages_tokens(messages) <= budget:
+            return messages
+
+    logger.warning(
+        "Subagent context still over budget after truncation "
+        f"({estimate_messages_tokens(messages)} > {budget}); the provider may reject it"
+    )
+    return messages
 
 
 class SubagentManager:
@@ -688,6 +790,18 @@ class SubagentManager:
             system_prompt = self._build_subagent_prompt(
                 task, label=label, assistant=assistant,
             )
+            if build_tool_disclosure(
+                tools.get_definitions(),
+                toolsets=tools.get_toolsets(),
+                sources=tools.get_discovery_sources(),
+                intent_text=task,
+            ).enabled:
+                system_prompt += (
+                    "\n\nSome safe tools are represented by a compact catalog. "
+                    "They may be invoked through tool_call. tool_search is available "
+                    "when a name or compact signature is unclear; its results include "
+                    "complete schemas and valid invocation options."
+                )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -696,6 +810,7 @@ class SubagentManager:
             # Run agent loop (limited iterations)
             max_iterations = 15
             iteration = 0
+            _tool_search_result_sets: dict[tuple[str, ...], int] = {}
             final_result: str | None = None
             _model_used_artifact = False
             # P1.2 — structured tool trace, one dict per call
@@ -705,6 +820,9 @@ class SubagentManager:
             _tool_trace: list[dict[str, Any]] = []
             _consecutive_errors = 0  # Global error counter (not per-iteration)
             _MAX_CONSECUTIVE_ERRORS = 3
+            # Context overflow gets one rescue attempt per run. Beyond that the
+            # task genuinely does not fit and retrying only burns tokens.
+            _overflow_recovered = False
 
             # P1.1 — subagent→parent activity heartbeat. Called at each
             # iteration + tool boundary so a 10-min subagent keeps the
@@ -766,12 +884,23 @@ class SubagentManager:
                     messages = _strip_subagent_tool_results(
                         messages, keep_last=2, max_old_chars=150,
                     )
+                # Iteration count is a poor proxy for context pressure: three
+                # iterations that each read a large file overflow long before
+                # the fixed thresholds above fire, and a small-window model
+                # overflows sooner still. Measure the actual budget too.
+                messages = _trim_to_context_budget(messages, model)
 
+                tool_disclosure = build_tool_disclosure(
+                    tools.get_definitions(),
+                    toolsets=tools.get_toolsets(),
+                    sources=tools.get_discovery_sources(),
+                    intent_text=task,
+                )
                 response = await self.provider.chat(
                     messages=messages,
-                    tools=tools.get_definitions(),
+                    tools=list(tool_disclosure.definitions),
                     model=model,
-                    max_tokens=16384,
+                    max_tokens=subagent_output_budget(model),
                     timeout=_llm_call_timeout,
                 )
 
@@ -800,34 +929,117 @@ class SubagentManager:
 
                     # Execute tools
                     for tool_call in response.tool_calls:
-                        logger.debug(f"[SubagentManager] [{run_id[:8]}] tool: {tool_call.name}")
-                        if tool_call.name == "artifact":
+                        protocol_tool_name = tool_call.name
+                        effective_tool_name = protocol_tool_name
+                        tool_args = dict(tool_call.arguments)
+
+                        if protocol_tool_name == "tool_search":
+                            search_offset = tool_args.get("offset", 0)
+                            try:
+                                search_limit = max(
+                                    1,
+                                    min(
+                                        int(tool_args.get("limit", 5)),
+                                        tool_disclosure.search_max_limit,
+                                    ),
+                                )
+                            except (TypeError, ValueError):
+                                search_limit = 5
+                            try:
+                                search_offset = max(0, int(search_offset))
+                            except (TypeError, ValueError):
+                                search_offset = 0
+                            result = tool_disclosure.search(
+                                query=str(tool_args.get("query", "")),
+                                toolset=str(tool_args.get("toolset", "")),
+                                limit=search_limit,
+                                offset=search_offset,
+                            )
+                            result = annotate_search_repetition(
+                                result,
+                                _tool_search_result_sets,
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": protocol_tool_name,
+                                "content": result,
+                            })
+                            continue
+
+                        if protocol_tool_name == "tool_describe":
+                            result = tool_disclosure.describe(str(tool_args.get("name", "")))
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": protocol_tool_name,
+                                "content": result,
+                            })
+                            continue
+
+                        if protocol_tool_name == "tool_call":
+                            resolved = tool_disclosure.resolve_call(
+                                str(tool_args.get("name", "")),
+                                tool_args.get("arguments"),
+                            )
+                            if isinstance(resolved, str):
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "name": protocol_tool_name,
+                                    "content": resolved,
+                                })
+                                continue
+                            effective_tool_name, tool_args = resolved
+
+                        if (
+                            protocol_tool_name != "tool_call"
+                            and effective_tool_name not in tool_disclosure.direct_names
+                        ):
+                            result = f"Error: Tool '{effective_tool_name}' is unavailable."
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": protocol_tool_name,
+                                "content": result,
+                            })
+                            continue
+
+                        logger.debug(
+                            f"[SubagentManager] [{run_id[:8]}] tool: {effective_tool_name}"
+                        )
+                        if effective_tool_name == "artifact":
                             _model_used_artifact = True
                         _heartbeat(
-                            f"subagent {label}: running {tool_call.name}",
-                            tool_call.name,
+                            f"subagent {label}: running {effective_tool_name}",
+                            effective_tool_name,
                         )
                         _tool_t0 = time.monotonic()
                         _tool_status = "ok"
                         try:
-                            tool_args = dict(tool_call.arguments)
                             if (
-                                tool_call.name == "artifact"
+                                effective_tool_name == "artifact"
                                 and "session_key" not in tool_args
                             ):
                                 tool_args["session_key"] = f"{origin_channel}:{origin_chat_id}"
                             result = await asyncio.wait_for(
-                                tools.execute(tool_call.name, tool_args),
+                                tools.execute(effective_tool_name, tool_args),
                                 timeout=120,  # Per-tool timeout
                             )
                         except asyncio.TimeoutError:
-                            result = f"Error: Tool '{tool_call.name}' timed out after 120s"
+                            result = f"Error: Tool '{effective_tool_name}' timed out after 120s"
                             _tool_status = "timeout"
-                            logger.warning(f"[SubagentManager] [{run_id[:8]}] tool timeout: {tool_call.name}")
+                            logger.warning(
+                                f"[SubagentManager] [{run_id[:8]}] tool timeout: "
+                                f"{effective_tool_name}"
+                            )
                         except Exception as e:
-                            result = f"Error executing {tool_call.name}: {e}"
+                            result = f"Error executing {effective_tool_name}: {e}"
                             _tool_status = "error"
-                            logger.warning(f"[SubagentManager] [{run_id[:8]}] tool error: {tool_call.name}: {e}")
+                            logger.warning(
+                                f"[SubagentManager] [{run_id[:8]}] tool error: "
+                                f"{effective_tool_name}: {e}"
+                            )
                         _tool_duration_ms = int((time.monotonic() - _tool_t0) * 1000)
                         # Flip status to "error" if the tool returned a
                         # human-readable error string without raising
@@ -835,8 +1047,8 @@ class SubagentManager:
                         if _tool_status == "ok" and result.startswith("Error"):
                             _tool_status = "error"
                         _tool_trace.append({
-                            "tool": tool_call.name,
-                            "args_bytes": len(json.dumps(tool_call.arguments or {})),
+                            "tool": effective_tool_name,
+                            "args_bytes": len(json.dumps(tool_args or {})),
                             "result_bytes": len(result),
                             "status": _tool_status,
                             "duration_ms": _tool_duration_ms,
@@ -847,7 +1059,7 @@ class SubagentManager:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
+                            "name": protocol_tool_name,
                             "content": result,
                         })
                 else:
@@ -865,6 +1077,26 @@ class SubagentManager:
                         _category = classify_response(response)
                         _delay = backoff_for(_category, _consecutive_errors)
                         _err_snippet = (response.content or "")[:100]
+
+                        # One-shot overflow recovery. Giving up here throws
+                        # away everything the subagent has already done, when
+                        # the fix is usually just old tool output it no longer
+                        # needs. Trim hard and retry once; a second overflow
+                        # means the task really is too big.
+                        if (
+                            _category == ErrorCategory.CONTEXT_OVERFLOW
+                            and not _overflow_recovered
+                        ):
+                            _overflow_recovered = True
+                            _before = len(messages)
+                            messages = _strip_subagent_tool_results(
+                                messages, keep_last=1, max_old_chars=60,
+                            )
+                            logger.warning(
+                                f"[SubagentManager] [{run_id[:8]}] context overflow — "
+                                f"trimmed tool history ({_before} messages) and retrying once"
+                            )
+                            continue
 
                         if _delay is None:
                             logger.error(

@@ -181,6 +181,12 @@ FLOWLY_SANDBOX=0 flowly ...   # run this invocation without the sandbox
 ### What it enforces
 
 - **macOS (`sandbox-exec`):** allow by default, but **deny reads** of sensitive home subpaths (`.ssh`, `.aws`, `.config/gcloud`, `Library/Keychains`, browser profiles/cookies, `.mozilla`, …) and **deny writes** except under `~/.flowly`, `$HOME`, and temp dirs. Subprocesses inherit the profile.
+
+  One visible consequence: because `Library/Keychains` is hidden, Flowly's own
+  credentials can't use the OS keychain while sandboxed either. It doesn't try
+  — it writes them to `0600` files under `~/.flowly/credentials/` and says so.
+  (Trying would make macOS raise a "keychain cannot be found" panel mid-setup,
+  caused by this policy rather than by anything wrong with your Mac.)
 - **Linux (`bwrap`):** root mounted read-only, a fresh `/proc`, a tmpfs `/tmp`, read-write only for `~/.flowly`, `$HOME`, and `/tmp`, sensitive paths masked, PID/UTS/IPC namespaces unshared, dies with parent.
 
 > [!WARNING]

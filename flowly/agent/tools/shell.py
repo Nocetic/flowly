@@ -1,9 +1,8 @@
 """Secure shell execution tool with approval system."""
 
-import asyncio
 import re
 import sys
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -11,7 +10,6 @@ from flowly.agent.tools.base import Tool
 from flowly.exec import (
     ExecConfig,
     ExecRequest,
-    ExecResult,
     ExecApprovalStore,
     ExecApprovalDecision,
     analyze_command,
@@ -89,6 +87,21 @@ class SecureExecTool(Tool):
     @property
     def name(self) -> str:
         return "exec"
+
+    def is_available(self) -> bool:
+        """Do not advertise a shell surface disabled by configuration."""
+        return bool(self.config.enabled)
+
+    def runs_unattended(self) -> bool:
+        """Whether the live exec policy is the UI's YOLO/full-trust stance.
+
+        Keep this query on the exec tool so other runtime features do not need
+        to open a second approval store or guess from stale config.json data.
+        Policy lookup failures are handled by callers as non-YOLO.
+        """
+        self._store.refresh_if_changed()
+        policy = self._store.config
+        return policy.security == "full" and policy.ask == "off"
 
     @property
     def description(self) -> str:

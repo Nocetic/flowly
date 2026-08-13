@@ -47,6 +47,58 @@ def test_iterations_accumulate_and_return():
     assert [e["role"] for e in got["iterations"]] == ["assistant", "tool"]
 
 
+def test_assistant_tool_call_iteration_resets_partial_text():
+    # The streamed preamble of an iteration that ends in tool calls has,
+    # by that boundary, MOVED into the tool-turn panel (the iteration
+    # event carries it as the group's preamble). A client restoring
+    # mid-run must therefore get only the text streamed AFTER the last
+    # boundary — otherwise the restored bubble re-glues every preamble
+    # the live view had already moved out.
+    inflight.begin("web:c1", "run1", "check the logs")
+    inflight.append("web:c1", "run1", "Let me check…")
+    inflight.append_iteration("web:c1", "run1", {
+        "role": "assistant", "iterationIdx": 0,
+        "content": "Let me check…",
+        "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "exec", "arguments": "{}"}}],
+    })
+    inflight.append_iteration("web:c1", "run1", {
+        "role": "tool", "iterationIdx": 1, "tool_call_id": "c1", "content": "ok",
+    })
+    inflight.append("web:c1", "run1", "Found it — deeper now.")
+    got = inflight.get("web:c1")
+    assert got["text"] == "Found it — deeper now."
+    # The moved preamble still restores — via the iteration list.
+    assert [e["role"] for e in got["iterations"]] == ["assistant", "tool"]
+    assert got["iterations"][0]["content"] == "Let me check…"
+
+
+def test_assistant_iteration_without_tool_calls_keeps_text():
+    # Only a tool-call boundary moves text into the panel. A defensive
+    # guard: an assistant event with no tool_calls must never wipe the
+    # partial (there is no panel entry for the text to have moved into).
+    inflight.begin("web:c1", "run1")
+    inflight.append("web:c1", "run1", "partial")
+    inflight.append_iteration("web:c1", "run1", {"role": "assistant", "iterationIdx": 0})
+    assert inflight.get("web:c1")["text"] == "partial"
+
+
+def test_tool_result_iteration_keeps_text():
+    # Tool results arrive between boundaries; they must not clear text
+    # streamed after their assistant call's boundary.
+    inflight.begin("web:c1", "run1")
+    inflight.append_iteration("web:c1", "run1", {
+        "role": "assistant", "iterationIdx": 0, "content": "",
+        "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "exec", "arguments": "{}"}}],
+    })
+    inflight.append("web:c1", "run1", "streamed after boundary")
+    inflight.append_iteration("web:c1", "run1", {
+        "role": "tool", "iterationIdx": 1, "tool_call_id": "c1", "content": "ok",
+    })
+    assert inflight.get("web:c1")["text"] == "streamed after boundary"
+
+
 def test_iterations_capped_to_max():
     inflight.begin("desktop:c1", "run1")
     for i in range(inflight._MAX_ITERATIONS + 50):

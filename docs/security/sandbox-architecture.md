@@ -78,8 +78,18 @@ Deny list (everyone gets these denied, no UI to flip):
 | SSH | `~/.ssh` |
 | AWS | `~/.aws` |
 | GCP | `~/.config/gcloud`, `~/.gcp` |
-| macOS Keychain | `~/Library/Keychains` |
+| macOS Keychain | `~/Library/Keychains` |[^keychain-self]
 | Browser storage | Chrome / Firefox / Brave / Edge `Application Support` dirs, `~/Library/Cookies`, `~/.mozilla`, `~/.config/{google-chrome,BraveSoftware}` |
+
+[^keychain-self]: This applies to Flowly's *own* credentials too, since the CLI
+    runs inside the same profile: while sandboxed, the account/OAuth stores skip
+    the OS keychain entirely and write `0600` files under
+    `~/.flowly/credentials/`. That is deliberate — reaching for the keychain from
+    inside the profile only produces macOS's blocking "a keychain cannot be
+    found" panel, which reads to the user as a broken Mac rather than as our
+    policy. Detection is the sandbox recursion guard (`FLOWLY_SANDBOX_WRAPPED`),
+    and it writes no "keychain broken" marker, so an unsandboxed run
+    (`FLOWLY_SANDBOX=0`) and Flowly Desktop still use the keychain normally.
 
 Allow-write list:
 

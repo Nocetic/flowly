@@ -27,8 +27,12 @@ class _Registry:
         self.tools.pop(name, None)
 
 
-def _remote(name: str):
-    return SimpleNamespace(name=name, description=f"{name} desc", inputSchema=None)
+def _remote(name: str, *, description: str | None = None, schema=None):
+    return SimpleNamespace(
+        name=name,
+        description=description or f"{name} desc",
+        inputSchema=schema,
+    )
 
 
 def _make_server_task(registry, tools, registered_names):
@@ -83,3 +87,59 @@ def test_unchanged_tool_kept_in_place():
     # Same tool list — refresh must not churn the entry.
     client._reregister_server_tools(task)
     assert reg.tools["mcp_srv_alpha"] is original
+
+
+def test_same_name_schema_change_replaces_tool_and_advances_generation():
+    from flowly.agent.tools.registry import ToolRegistry
+
+    reg = ToolRegistry()
+    task = _make_server_task(
+        reg,
+        [_remote(
+            "alpha",
+            description="Old description",
+            schema={"type": "object", "properties": {"old": {"type": "string"}}},
+        )],
+        [],
+    )
+    client._register_tools_for_server(
+        server_task=task,
+        server_cfg=task._server_cfg,
+        tool_registry=reg,
+    )
+    original = reg.get("mcp_srv_alpha")
+    generation = reg.generation
+
+    task.tools = [_remote(
+        "alpha",
+        description="New description",
+        schema={"type": "object", "properties": {"new": {"type": "integer"}}},
+    )]
+    client._reregister_server_tools(task)
+
+    replacement = reg.get("mcp_srv_alpha")
+    assert replacement is not original
+    assert replacement is not None
+    assert replacement.description == "New description"
+    assert "new" in replacement.parameters["properties"]
+    assert reg.generation == generation + 1
+
+
+def test_refresh_never_overwrites_or_removes_a_foreign_replacement():
+    reg = _Registry()
+    task = _make_server_task(reg, [_remote("alpha")], [])
+    client._register_tools_for_server(
+        server_task=task,
+        server_cfg=task._server_cfg,
+        tool_registry=reg,
+    )
+    name = "mcp_srv_alpha"
+    foreign = object()
+    reg.tools[name] = foreign
+
+    client._reregister_server_tools(task)
+    assert reg.tools[name] is foreign
+
+    task.tools = []
+    client._reregister_server_tools(task)
+    assert reg.tools[name] is foreign

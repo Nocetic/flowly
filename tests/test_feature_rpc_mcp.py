@@ -45,15 +45,22 @@ def _config(home: Path) -> dict:
 
 # ── registration ────────────────────────────────────────────────────────────
 
+
 def test_methods_registered():
     expected = {
-        "mcp.list", "mcp.upsert", "mcp.set_enabled",
-        "mcp.remove", "mcp.install", "mcp.test", "mcp.oauth_start",
+        "mcp.list",
+        "mcp.upsert",
+        "mcp.set_enabled",
+        "mcp.remove",
+        "mcp.install",
+        "mcp.test",
+        "mcp.oauth_start",
     }
     assert expected <= feature_rpc.FEATURE_METHODS
 
 
 # ── list ─────────────────────────────────────────────────────────────────────
+
 
 def test_list_empty_returns_catalog_only(isolated_home):
     result, restart = _dispatch("mcp.list")
@@ -77,16 +84,20 @@ def test_list_shape_is_camelcase(isolated_home):
 
 # ── upsert ───────────────────────────────────────────────────────────────────
 
+
 def test_upsert_writes_verbatim_camelcase(isolated_home):
-    result, restart = _dispatch("mcp.upsert", {
-        "name": "github",
-        "config": {
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-github"],
-            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "tok"},
+    result, restart = _dispatch(
+        "mcp.upsert",
+        {
+            "name": "github",
+            "config": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "tok"},
+            },
+            "restart": True,
         },
-        "restart": True,
-    })
+    )
     assert result["ok"] is True
     assert restart is True  # restart-aware
 
@@ -98,10 +109,13 @@ def test_upsert_writes_verbatim_camelcase(isolated_home):
 
 
 def test_upsert_http_server(isolated_home):
-    result, _ = _dispatch("mcp.upsert", {
-        "name": "remote",
-        "config": {"url": "https://example.com/mcp", "headers": {"X-Key": "v"}},
-    })
+    result, _ = _dispatch(
+        "mcp.upsert",
+        {
+            "name": "remote",
+            "config": {"url": "https://example.com/mcp", "headers": {"X-Key": "v"}},
+        },
+    )
     assert result["ok"] is True
     on_disk = _config(isolated_home)["mcpServers"]["remote"]
     assert on_disk["url"] == "https://example.com/mcp"
@@ -128,6 +142,7 @@ def test_upsert_drops_unknown_field(isolated_home):
 
 # ── set_enabled / remove ─────────────────────────────────────────────────────
 
+
 def test_set_enabled_toggles(isolated_home):
     _dispatch("mcp.upsert", {"name": "demo", "config": {"command": "echo"}})
     result, restart = _dispatch("mcp.set_enabled", {"name": "demo", "enabled": False})
@@ -147,8 +162,9 @@ def test_remove_deletes(isolated_home):
     result, restart = _dispatch("mcp.remove", {"name": "demo"})
     assert result["ok"] is True
     assert restart is True
-    assert "mcpServers" not in _config(isolated_home) or \
-        "demo" not in _config(isolated_home).get("mcpServers", {})
+    assert "mcpServers" not in _config(isolated_home) or "demo" not in _config(isolated_home).get(
+        "mcpServers", {}
+    )
 
 
 def test_remove_unknown_raises(isolated_home):
@@ -158,6 +174,7 @@ def test_remove_unknown_raises(isolated_home):
 
 
 # ── test / oauth_start validation (no live connect) ──────────────────────────
+
 
 def test_mcp_test_requires_name_or_config(isolated_home):
     with pytest.raises(feature_rpc.FeatureRpcError) as exc:
@@ -172,6 +189,31 @@ def test_mcp_test_no_transport_fails_gracefully(isolated_home):
     assert restart is False
     assert result["ok"] is False
     assert result["error"]
+
+
+def test_mcp_test_rejects_invalid_connect_timeout(isolated_home):
+    result, restart = _dispatch(
+        "mcp.test",
+        {
+            "config": {"command": "echo", "connectTimeout": -1},
+        },
+    )
+    assert restart is False
+    assert result == {
+        "ok": False,
+        "tools": [],
+        "error": "invalid MCP connect_timeout: expected a positive finite number",
+    }
+
+
+def test_mcp_test_unknown_server_fails_gracefully(isolated_home):
+    result, restart = _dispatch("mcp.test", {"name": "missing"})
+    assert restart is False
+    assert result == {
+        "ok": False,
+        "tools": [],
+        "error": "unknown MCP server 'missing'",
+    }
 
 
 def test_oauth_start_requires_oauth_server(isolated_home):
@@ -192,3 +234,34 @@ def test_oauth_start_unknown_raises(isolated_home):
     with pytest.raises(feature_rpc.FeatureRpcError) as exc:
         _dispatch("mcp.oauth_start", {"name": "nope"})
     assert exc.value.code == "NOT_FOUND"
+
+
+def test_oauth_start_restores_previous_tokens_on_failure(
+    isolated_home,
+    monkeypatch,
+):
+    _dispatch(
+        "mcp.upsert",
+        {
+            "name": "remote",
+            "config": {"url": "https://x/mcp", "auth": "oauth"},
+        },
+    )
+    token_file = isolated_home / "mcp-tokens" / "remote.json"
+    token_file.parent.mkdir(parents=True)
+    original = b'{"tokens":{"access_token":"working"}}'
+    token_file.write_bytes(original)
+
+    async def fail_probe(*args, **kwargs):
+        token_file.write_bytes(b'{"tokens":{"access_token":"partial"}}')
+        return False, "authorization denied"
+
+    from flowly.mcp import probe
+
+    monkeypatch.setattr(probe, "probe_message_async", fail_probe)
+
+    with pytest.raises(feature_rpc.FeatureRpcError) as exc:
+        _dispatch("mcp.oauth_start", {"name": "remote"})
+
+    assert exc.value.code == "AUTH_FAILED"
+    assert token_file.read_bytes() == original

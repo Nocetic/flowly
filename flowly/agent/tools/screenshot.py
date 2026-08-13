@@ -1,12 +1,11 @@
 """Screenshot tool for capturing screen images."""
 
 import json
-import mimetypes
 import platform
-import subprocess
 import shutil
-import urllib.request
+import subprocess
 import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,6 +45,21 @@ class ScreenshotTool(Tool):
         self._screenshots_dir = screenshots_dir or (Path.home() / ".flowly" / "screenshots")
         self._screenshots_dir.mkdir(parents=True, exist_ok=True)
         self._platform = platform.system().lower()
+
+    def is_available(self) -> bool:
+        """Check for at least one capture backend without taking a screenshot."""
+        if _electron_api_file().exists():
+            return True
+        if self._platform == "darwin":
+            return shutil.which("screencapture") is not None
+        if self._platform == "linux":
+            return any(
+                shutil.which(command) is not None
+                for command in ("gnome-screenshot", "scrot", "import", "grim")
+            )
+        if self._platform == "windows":
+            return True
+        return False
 
     @property
     def name(self) -> str:

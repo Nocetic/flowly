@@ -105,6 +105,39 @@ def test_reconcile_preserves_valid_paid_model(tmp_path: Path, monkeypatch) -> No
     )
 
 
+def test_reconcile_never_rewrites_a_user_choice_absent_from_stale_catalog(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The Hakan bug: a freshly released model the user picked is missing from
+    yesterday's cached catalog — reconcile must NOT snap it back to the
+    backend default on every restart. Only legacy schema defaults migrate."""
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path))
+    path = _write_config(tmp_path, "deepseek/deepseek-v4-flash-0731")
+    monkeypatch.setattr(
+        catalog,
+        "_CACHE",
+        {
+            "flowly": [
+                Model(id="anthropic/claude-haiku-4.5", name="Claude Haiku 4.5"),
+                Model(id="deepseek/deepseek-chat", name="DeepSeek Chat"),
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        catalog,
+        "_FLOWLY_POLICY",
+        FlowlyModelPolicy(plan="pro", default_model="anthropic/claude-haiku-4.5"),
+    )
+
+    changed = asyncio.run(catalog.reconcile_flowly_model(force_refresh=False))
+
+    assert changed is None
+    assert (
+        json.loads(path.read_text(encoding="utf-8"))["agents"]["defaults"]["model"]
+        == "deepseek/deepseek-v4-flash-0731"
+    )
+
+
 def test_flowly_fetch_retains_plan_and_default(monkeypatch) -> None:
     cfg = Config()
     cfg.providers.active = "flowly"

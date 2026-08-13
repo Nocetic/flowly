@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -22,13 +22,44 @@ class MemoryFlushConfig(BaseModel):
     )
 
 
+class MicrocompactConfig(BaseModel):
+    """Truncation of old tool results, applied before full compaction."""
+    enabled: bool = True
+    keep_recent_full: int = Field(default=5, ge=1)
+    truncate_chars: int = Field(default=200, ge=50)
+
+
+class KeepRecentConfig(BaseModel):
+    """How much recent conversation survives compaction verbatim."""
+    enabled: bool = True
+    min_tokens: int = Field(default=5000, ge=0)
+    min_messages: int = Field(default=3, ge=0)
+    max_tokens: int = Field(default=20000, ge=1)
+
+
 class CompactionConfig(BaseModel):
     """Context compaction configuration."""
     mode: Literal["default", "safeguard"] = "safeguard"
-    reserve_tokens_floor: int = 20000
-    max_history_share: float = 0.5  # 0.1-0.9
-    context_window: int = 128000
+    # Headroom kept free for the model's reply and the next prompt. Must stay
+    # well under the context window or compaction would trigger on every turn.
+    reserve_tokens_floor: int = Field(default=20000, ge=1000)
+    max_history_share: float = Field(default=0.5, ge=0.1, le=0.9)
+    # Fallback only — the real window is detected from the model catalog
+    # unless this is set explicitly in config.json.
+    context_window: int = Field(default=128000, ge=4000)
     memory_flush: MemoryFlushConfig = Field(default_factory=MemoryFlushConfig)
+    microcompact: MicrocompactConfig = Field(default_factory=MicrocompactConfig)
+    keep_recent: KeepRecentConfig = Field(default_factory=KeepRecentConfig)
+
+    @model_validator(mode="after")
+    def _check_budget_fits(self) -> "CompactionConfig":
+        """A reserve at or above the window leaves no room to converse."""
+        if self.reserve_tokens_floor >= self.context_window:
+            raise ValueError(
+                f"compaction.reserveTokensFloor ({self.reserve_tokens_floor}) must be "
+                f"smaller than compaction.contextWindow ({self.context_window})"
+            )
+        return self
 
 
 class WhatsAppConfig(BaseModel):
@@ -681,6 +712,33 @@ class ObsidianConfig(BaseModel):
     max_note_bytes: int = 1_000_000  # skip notes larger than this in index/read
 
 
+class ElevenLabsConfig(BaseModel):
+    """ElevenLabs as a voice provider in its own right.
+
+    The key used to live inside the Twilio voice card, which made it look like
+    a telephony detail — you could only reach it by configuring phone calls you
+    might not want, and nothing suggested the same key could also read a reply
+    aloud or write a song.
+
+    Everything here is chosen from the user's OWN account: the voices are the
+    ones in their library, the models the ones their plan can run. That is the
+    whole reason a voice provider is not an entry in a shared catalog.
+
+    The old location (``integrations.voice.elevenlabs_api_key``) is still read,
+    so nobody has to re-enter anything; see
+    :func:`flowly.voice.settings.resolve_elevenlabs`.
+    """
+    enabled: bool = False
+    api_key: str = ""
+    #: Which voice speaks — a voice id from the account's own library.
+    voice_id: str = ""
+    #: Which model reads it. Empty means "not chosen yet"; Flowly will not pick
+    #: one, because a model is a price the user never saw.
+    model_id: str = ""
+    #: Which model composes. Empty means Flowly will not write music.
+    music_model_id: str = ""
+
+
 class IntegrationsConfig(BaseModel):
     """External integrations configuration."""
     trello: TrelloConfig = Field(default_factory=TrelloConfig)
@@ -692,6 +750,7 @@ class IntegrationsConfig(BaseModel):
     sentry: SentryConfig = Field(default_factory=SentryConfig)
     home_assistant: HomeAssistantConfig = Field(default_factory=HomeAssistantConfig)
     obsidian: ObsidianConfig = Field(default_factory=ObsidianConfig)
+    elevenlabs: ElevenLabsConfig = Field(default_factory=ElevenLabsConfig)
 
 
 class ArtifactConfig(BaseModel):
@@ -701,7 +760,11 @@ class ArtifactConfig(BaseModel):
 
 
 class BrowserTabConfig(BaseModel):
-    """Browser tab tool configuration (requires Flowly Chrome extension)."""
+    """Browser tab tool configuration.
+
+    Requires a connected browser provider: the desktop app's embedded
+    Flowly Browser or the Flowly Chrome extension.
+    """
     enabled: bool = False
 
 
@@ -783,11 +846,12 @@ class CodexSessionToolConfig(BaseModel):
 
 
 class ImageGenerationConfig(BaseModel):
-    """Image-generation tool configuration (provider-backed media).
+    """Legacy image-only settings, superseded by :class:`MediaGenerationConfig`.
 
-    Off by default; registers the ``image_generate`` tool only when ``enabled``
-    and an ``api_key`` are present. ``provider`` keeps the door open for non-FAL
-    backends later; ``model`` is the active model id (curated, user-selectable).
+    Kept so an existing ``tools.imageGeneration`` block on disk keeps working —
+    it is read at startup and folded into the media settings, so nobody loses
+    their key or their chosen model on upgrade. New writes go to
+    ``tools.mediaGeneration``.
     """
     enabled: bool = False
     provider: str = "fal"
@@ -795,8 +859,112 @@ class ImageGenerationConfig(BaseModel):
     api_key: str = ""
 
 
+class MediaGenerationDefaults(BaseModel):
+    """The model used for each kind of generation when the agent doesn't pick.
+
+    Every field defaults to empty, meaning "not chosen yet" — a real default
+    here would silently outrank the model an upgrading user already picked in
+    the older image-only config. The fallback chain lives in
+    :func:`flowly.media.settings.resolve_media_settings`, which is the only
+    place that can see both blocks at once.
+    """
+    text_to_image: str = ""
+    image_to_image: str = ""
+    text_to_video: str = ""
+    image_to_video: str = ""
+
+
+class MediaGenerationConfig(BaseModel):
+    """Image AND video generation (provider-backed media).
+
+    Off by default; the tools register only when ``enabled`` and an ``api_key``
+    are present. One key and one provider now cover both kinds — they are the
+    same account and the same catalog, and splitting them would mean asking for
+    the same credential twice.
+    """
+    enabled: bool = False
+    provider: str = "fal"
+    api_key: str = ""
+    defaults: MediaGenerationDefaults = Field(default_factory=MediaGenerationDefaults)
+    # Ceiling for one video generation before it is cancelled provider-side.
+    # Generous: a 1080p clip genuinely takes minutes.
+    video_timeout_seconds: int = 900
+
+
+class ToolDiscoveryConfig(BaseModel):
+    """Progressively disclose large tool schemas to the model."""
+
+    enabled: bool = True
+    deferred_toolsets: list[str] = Field(default_factory=lambda: [
+        "mcp",
+        "extensions",
+    ])
+    always_visible_tools: list[str] = Field(default_factory=list)
+    minimum_deferred_schema_tokens: int = Field(default=750, ge=0, le=100_000)
+    catalog_max_chars: int = Field(default=6_000, ge=500, le=50_000)
+    search_default_limit: int = Field(default=5, ge=1, le=50)
+    search_max_limit: int = Field(default=20, ge=1, le=100)
+    # Deterministically expose only the external schemas that match the current
+    # user request. This avoids an LLM discovery round without making the full
+    # MCP/plugin catalog eager.
+    intent_routing_enabled: bool = True
+    intent_max_promoted_tools: int = Field(default=4, ge=0, le=20)
+    intent_min_score: float = Field(default=4.0, ge=0.0, le=100.0)
+    # Local, API-key-free semantic selection for external tools. It indexes
+    # static tool metadata only and is independent from conversation memory.
+    # This is an explicit opt-in: a fresh install must neither initialize nor
+    # download the local model until the owner accepts the recommendation.
+    # Any local model/index failure falls back to the lexical catalog.
+    semantic_routing_enabled: bool = False
+    semantic_model_auto_download: bool = False
+    semantic_routing_consent: Literal["undecided", "enabled", "dismissed"] = "undecided"
+    semantic_recommendation_min_tools: int = Field(default=12, ge=1, le=10_000)
+    semantic_recommendation_min_schema_tokens: int = Field(
+        default=2_500,
+        ge=0,
+        le=1_000_000,
+    )
+    semantic_recommendation_growth_tools: int = Field(default=8, ge=1, le=10_000)
+    semantic_recommendation_growth_schema_tokens: int = Field(
+        default=2_000,
+        ge=0,
+        le=1_000_000,
+    )
+    semantic_recommendation_dismissed_tool_count: int = Field(default=0, ge=0)
+    semantic_recommendation_dismissed_schema_tokens: int = Field(default=0, ge=0)
+    semantic_source_min_score: float = Field(default=0.78, ge=-1.0, le=1.0)
+    semantic_source_min_margin: float = Field(default=0.009, ge=0.0, le=2.0)
+    semantic_tool_min_score: float = Field(default=0.76, ge=-1.0, le=1.0)
+    semantic_tool_score_window: float = Field(default=0.035, ge=0.0, le=2.0)
+    semantic_query_cache_size: int = Field(default=256, ge=1, le=10_000)
+
+
+class ToolRoutingConfig(BaseModel):
+    """Model-facing platform/toolset selection policy."""
+
+    enabled: bool = True
+    platform_toolsets: dict[str, list[str]] = Field(default_factory=dict)
+    disabled_toolsets: list[str] = Field(default_factory=list)
+    availability_cache_ttl_seconds: float = Field(default=30.0, ge=0.0, le=300.0)
+    availability_failure_grace_seconds: float = Field(default=60.0, ge=0.0, le=600.0)
+    schema_cache_ttl_seconds: float = Field(default=10.0, ge=0.0, le=300.0)
+    # Keep direct core tools visible while moving only their large operating
+    # playbooks behind a deterministic, host-side intent router.  Disabling
+    # this is the instant rollback path to the legacy eager prompt.
+    capability_guidance_enabled: bool = True
+    # A routing error or ambiguous UI action loads the legacy guides instead
+    # of attempting to save tokens.  Behaviour wins over prompt size.
+    capability_guidance_fail_open: bool = True
+    # Startup skill metadata is progressive: relevant descriptions plus a
+    # compact complete name index.  Full SKILL.md bodies remain available via
+    # skill_view and explicit capability activation.
+    skill_catalog_max_chars: int = Field(default=8_000, ge=1_000, le=50_000)
+    discovery: ToolDiscoveryConfig = Field(default_factory=ToolDiscoveryConfig)
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
+
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     artifact: ArtifactConfig = Field(default_factory=ArtifactConfig)
@@ -804,6 +972,35 @@ class ToolsConfig(BaseModel):
     computer: ComputerConfig = Field(default_factory=ComputerConfig)
     codex_session: CodexSessionToolConfig = Field(default_factory=CodexSessionToolConfig)
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
+    media_generation: MediaGenerationConfig = Field(default_factory=MediaGenerationConfig)
+    routing: ToolRoutingConfig = Field(default_factory=ToolRoutingConfig)
+
+
+class MediaRetentionConfig(BaseModel):
+    """How long generated media is kept in ``~/.flowly/media``.
+
+    Age is about relevance, so one cap covers every kind. Size is about disk,
+    and video is one to two orders of magnitude larger than an image — a shared
+    budget would mean generating video silently evicts screenshots somebody
+    still wanted, so each kind gets its own. Stray non-media files ride the
+    image budget; they are rare and small.
+
+    ``retention_days = -1`` disables the age cap; a size budget of ``0``
+    disables that budget. A clip and its poster frame are always deleted
+    together — they are one attachment, not two files.
+    """
+    enabled: bool = True
+    retention_days: int = 30
+    image_max_size_mb: int = 500
+    video_max_size_mb: int = 2000
+    # Added when the media library made audio browsable. An existing config
+    # without the key picks up this default, so nobody has to migrate.
+    audio_max_size_mb: int = 1000
+
+
+class MediaConfig(BaseModel):
+    """Settings for the media Flowly stores on this machine."""
+    retention: MediaRetentionConfig = Field(default_factory=MediaRetentionConfig)
 
 
 class AuditConfig(BaseModel):
@@ -923,6 +1120,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
+    media: MediaConfig = Field(default_factory=MediaConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)

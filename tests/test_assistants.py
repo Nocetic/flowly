@@ -296,7 +296,6 @@ class TestAssistantToolFiltering:
             t["function"]["name"] for t in tools_seen[0]
             if isinstance(t, dict) and "function" in t
         }
-        # artifact is always appended (output channel for auto_save)
         assert registered == {"web_fetch", "artifact"}
 
     @pytest.mark.asyncio
@@ -350,6 +349,8 @@ class TestAssistantToolFiltering:
         assert "cron" not in registered
         assert "web_fetch" in registered
         assert "artifact" in registered
+        bridge_names = {"tool_search", "tool_describe", "tool_call"}
+        assert not (bridge_names & registered)
 
 
 # ---------------------------------------------------------------------------

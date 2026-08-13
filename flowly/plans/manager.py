@@ -24,6 +24,7 @@ from flowly.plans.approval import (
     PlanApprovalManager,
     PlanDecision,
     ResolveResult,
+    _in_cron_context,
     get_plan_approval_manager,
 )
 from flowly.plans.models import (
@@ -181,7 +182,7 @@ class PlanManager:
         )
         return "\n".join(lines)
 
-    # ── propose (the proposing turn awaits) ─────────────────────────────
+    # ── propose ─────────────────────────────────────────────────────────
 
     async def propose(
         self,
@@ -195,7 +196,12 @@ class PlanManager:
         details_md: Optional[str] = None,
         timeout_s: int = DEFAULT_APPROVAL_TIMEOUT_S,
     ) -> tuple[GeneralPlan, PlanDecision]:
-        """Create (or revise) a plan, push it for approval, block until decided.
+        """Create (or revise) a plan and return when it is executable or denied.
+
+        ``mode="auto"`` starts a new ordinary tracking plan immediately when
+        the live turn is neither forced/sticky plan mode nor cron. Forced plans,
+        revisions already under review, and cron runs retain the explicit
+        approval path.
 
         If a non-terminal plan for this session is already ``awaiting_approval``
         or ``draft``, this call *revises it in place* (same id, revision bumped)
@@ -207,8 +213,20 @@ class PlanManager:
         if details_md is not None:
             details_md = _cap(details_md, MAX_DETAILS_CHARS)
         existing = self._store.current_for_session(session_key)
+        auto_start = (
+            mode == "auto"
+            and not self.is_forced_pending(session_key)
+            and not self.is_sticky(session_key)
+            and not _in_cron_context()
+            and not (
+                existing and existing.status in ("awaiting_approval", "draft")
+            )
+        )
         if existing and existing.status in ("awaiting_approval", "draft"):
             plan = existing
+            # A revised proposal belongs to the user's existing review cycle;
+            # switching to YOLO mid-revision must not silently approve it.
+            plan.mode = "forced"
             plan.goal = goal.strip() or plan.goal
             if title.strip():
                 plan.title = title.strip()[:200]
@@ -230,12 +248,18 @@ class PlanManager:
                 goal,
                 steps,
                 title=title,
-                mode="auto" if mode == "auto" else "forced",
+                mode="auto" if auto_start else "forced",
                 run_id=run_id,
                 details_md=details_md,
             )
-            plan.status = "awaiting_approval"
-            plan.touch("proposed")
+            plan.status = "executing" if auto_start else "awaiting_approval"
+            plan.touch("auto-started by YOLO policy" if auto_start else "proposed")
+
+        if auto_start:
+            plan.approval = None
+            self._store.save(plan)
+            await self._broadcast(plan)
+            return plan, PlanDecision("approve", via="policy")
 
         now = time.time()
         approval = PlanApproval(

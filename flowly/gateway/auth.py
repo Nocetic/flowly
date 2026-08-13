@@ -39,6 +39,12 @@ from aiohttp import web
 # short enough that a leaked ticket is near-useless (30s).
 TICKET_TTL_SECONDS = 30
 
+# Playback tickets live longer than WS tickets: the user may open a clip minutes
+# after the reply arrived, and seeking keeps re-requesting bytes for as long as
+# the player is on screen. Still short enough that a ticket found in a proxy log
+# is already dead.
+MEDIA_TICKET_TTL_SECONDS = 15 * 60
+
 # Header carrying the static token on REST requests.
 TOKEN_HEADER = "X-Flowly-Token"
 
@@ -168,6 +174,87 @@ class WsTicketStore:
         if deadline is None:
             return False
         return deadline > self._now()
+
+    @property
+    def ttl_seconds(self) -> int:
+        return self._ttl
+
+
+class MediaTicketStore:
+    """Short-lived, media-scoped tickets for byte-range playback.
+
+    A ``<video>`` element and ``AVPlayer`` both fetch by plain URL and cannot
+    attach the ``X-Flowly-Token`` header, so playback needs a credential that
+    can live in a query string. Putting the long-lived gateway token there is
+    not an option — it would be parked in proxy logs, history and referrers.
+
+    So a ticket is minted by an already-authenticated request and is:
+
+    * **bound to one media id** — it unlocks that file and nothing else, so a
+      leaked playback URL can't be walked into an arbitrary read;
+    * **short-lived** — expiry is checked on every request, not just the first;
+    * **reusable, unlike the WS ticket** — a player issues many Range requests
+      for a single clip, so burning the ticket on first use would break
+      playback the moment the user seeks.
+
+    The store is bounded: a client that mints without ever playing evicts its
+    own oldest tickets rather than growing the process forever.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: int = MEDIA_TICKET_TTL_SECONDS,
+        max_entries: int = 512,
+    ) -> None:
+        self._ttl = ttl_seconds
+        self._max_entries = max(1, max_entries)
+        # ticket -> (media_id, expiry monotonic deadline)
+        self._tickets: dict[str, tuple[str, float]] = {}
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    def _purge(self) -> None:
+        now = self._now()
+        for ticket in [t for t, (_, deadline) in self._tickets.items() if deadline <= now]:
+            self._tickets.pop(ticket, None)
+        # Insertion-ordered dict: the oldest mints go first when over cap.
+        while len(self._tickets) > self._max_entries:
+            self._tickets.pop(next(iter(self._tickets)), None)
+
+    def mint(self, media_id: str) -> str:
+        """Create a ticket that unlocks ``media_id`` only."""
+        if not media_id:
+            raise ValueError("media_id is required")
+        self._purge()
+        ticket = secrets.token_urlsafe(32)
+        self._tickets[ticket] = (media_id, self._now() + self._ttl)
+        return ticket
+
+    def resolve(self, ticket: str | None) -> str | None:
+        """Return the media id a live ticket unlocks, else ``None``."""
+        if not ticket:
+            return None
+        self._purge()
+        entry = self._tickets.get(str(ticket))
+        if entry is None:
+            return None
+        media_id, deadline = entry
+        if deadline <= self._now():
+            self._tickets.pop(str(ticket), None)
+            return None
+        return media_id
+
+    def allows(self, ticket: str | None, media_id: str) -> bool:
+        """True when ``ticket`` is live AND scoped to exactly ``media_id``."""
+        resolved = self.resolve(ticket)
+        if resolved is None or not media_id:
+            return False
+        return hmac.compare_digest(resolved, media_id)
+
+    def revoke(self, ticket: str | None) -> None:
+        if ticket:
+            self._tickets.pop(str(ticket), None)
 
     @property
     def ttl_seconds(self) -> int:

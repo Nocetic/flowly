@@ -1,20 +1,172 @@
 """CLI commands — agent_cmd."""
 
 import asyncio
-import os
-import platform
-import shutil
-import subprocess
-import sys
+import math
 from pathlib import Path
+from typing import Any, Coroutine
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
-from flowly import __version__, __logo__
+from flowly import __logo__
 
 console = Console()
+
+_MCP_DISCOVERY_GRACE_SECONDS = 5.0
+_MCP_DISCOVERY_HARD_LIMIT_SECONDS = 185.0
+
+
+def _mcp_discovery_wait_timeout(config) -> float:
+    """Return a bounded CLI wait matching configured MCP connect budgets."""
+
+    servers = getattr(config, "mcp_servers", None) or {}
+    timeouts: list[float] = []
+    for server in servers.values():
+        enabled = (
+            server.get("enabled", True)
+            if isinstance(server, dict)
+            else getattr(server, "enabled", True)
+        )
+        if not enabled:
+            continue
+        raw_timeout = (
+            server.get("connect_timeout", 60.0)
+            if isinstance(server, dict)
+            else getattr(server, "connect_timeout", 60.0)
+        )
+        try:
+            value = float(raw_timeout)
+        except (TypeError, ValueError):
+            value = 0.0
+        if math.isfinite(value) and value > 0:
+            timeouts.append(value)
+
+    if not timeouts:
+        return 0.0
+    return min(
+        _MCP_DISCOVERY_HARD_LIMIT_SECONDS,
+        max(timeouts) + _MCP_DISCOVERY_GRACE_SECONDS,
+    )
+
+
+def _wait_for_initial_mcp_tools(agent_loop, config) -> bool:
+    """Stabilize the direct CLI tool catalog before its first model turn."""
+
+    timeout = _mcp_discovery_wait_timeout(config)
+    if timeout <= 0 or not agent_loop.mcp_discovery_pending:
+        return True
+
+    with console.status("[dim]Connecting external tools…[/dim]"):
+        ready = agent_loop.wait_for_mcp_discovery(timeout=timeout)
+    if not ready:
+        console.print(
+            "[yellow]External tool discovery is still running; "
+            "this turn may not see every configured integration.[/yellow]"
+        )
+    return ready
+
+
+def _offer_semantic_tool_routing(agent_loop) -> dict[str, Any]:
+    """Offer the local routing model once in an interactive terminal.
+
+    This is deliberately never called by ``--message`` automation. A decline
+    is durable across CLI/Desktop because the decision lives in bot config.
+    """
+
+    from rich.prompt import Confirm
+
+    from flowly.agent.tools.semantic_feature import (
+        begin_install,
+        feature_status,
+        finish_install,
+        install_semantic_model,
+        persist_semantic_preference,
+    )
+
+    status = feature_status(agent_loop.semantic_tool_routing_metrics())
+    if status["state"] not in {"recommended", "needs_download", "failed"}:
+        return status
+
+    tool_count = int(status.get("deferredToolCount") or 0)
+    model_mib = int(status.get("modelBytes") or 0) / (1024 * 1024)
+    console.print(
+        "\n[bold]Use smarter local tool routing?[/bold]\n"
+        f"[dim]{tool_count} connected tool schemas are currently kept behind "
+        "the tool catalog. Flowly can choose relevant tools more directly with "
+        f"a private local model ({model_mib:.0f} MiB download). No chat data is stored.[/dim]"
+    )
+    retry = status["state"] in {"needs_download", "failed"}
+    accepted = Confirm.ask(
+        "Retry the local model setup?" if retry else "Download and enable it?",
+        default=False,
+    )
+    if not accepted:
+        metrics = agent_loop.semantic_tool_routing_metrics()
+        persist_semantic_preference(
+            consent="dismissed",
+            enabled=False,
+            dismissed_tool_count=int(metrics.get("deferredToolCount") or 0),
+            dismissed_schema_tokens=int(metrics.get("deferredSchemaTokens") or 0),
+        )
+        return feature_status(agent_loop.semantic_tool_routing_metrics())
+
+    if not begin_install():
+        console.print("[yellow]The local routing model is already downloading.[/yellow]")
+        return feature_status(agent_loop.semantic_tool_routing_metrics())
+    persist_semantic_preference(consent="enabled", enabled=False)
+    try:
+        with console.status("[dim]Downloading and verifying the local routing model…[/dim]"):
+            install_semantic_model()
+        persist_semantic_preference(consent="enabled", enabled=True)
+        finish_install()
+        if not agent_loop.activate_semantic_tool_routing():
+            raise RuntimeError("the installed local model could not be activated")
+    except Exception as exc:
+        from flowly.mcp.security import sanitize_error
+
+        detail = sanitize_error(str(exc)).strip() or type(exc).__name__
+        persist_semantic_preference(consent="enabled", enabled=False)
+        finish_install(detail)
+        console.print(
+            "[yellow]Local tool routing could not be enabled; the complete "
+            f"tool catalog remains available. {detail}[/yellow]"
+        )
+    else:
+        console.print(
+            "[green]✓[/green] Local tool routing is enabled. The complete "
+            "catalog fallback remains available."
+        )
+    return feature_status(agent_loop.semantic_tool_routing_metrics())
+
+
+def _run_agent_coroutine(coro: Coroutine[Any, Any, Any]) -> Any:
+    """Run one CLI coroutine behind a credential-safe error boundary."""
+
+    try:
+        return asyncio.run(coro)
+    except typer.Exit:
+        raise
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        raise typer.Exit(130)
+    except Exception as exc:
+        from flowly.mcp.security import sanitize_error
+
+        detail = sanitize_error(str(exc)).strip() or type(exc).__name__
+        console.print(f"[red]Agent command failed:[/red] {detail}")
+        raise typer.Exit(1)
+
+
+def _run_agent_coroutine_with_cleanup(
+    coro: Coroutine[Any, Any, Any],
+    agent_loop: Any,
+) -> Any:
+    """Run a CLI interaction and always release its background resources."""
+
+    try:
+        return _run_agent_coroutine(coro)
+    finally:
+        agent_loop.stop()
 
 # ============================================================================
 # Agent Commands
@@ -26,11 +178,11 @@ def agent(
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
 ):
     """Interact with the agent directly."""
-    from flowly.config.loader import load_config, get_data_dir
-    from flowly.bus.queue import MessageBus
-    from flowly.providers.factory import build_provider
     from flowly.agent.loop import AgentLoop
+    from flowly.bus.queue import MessageBus
+    from flowly.config.loader import get_data_dir, load_config
     from flowly.cron.service import CronService
+    from flowly.providers.factory import build_provider
 
     config = load_config()
 
@@ -66,20 +218,8 @@ def agent(
     cron = CronService(cron_store_path)
 
     # Build compaction config
-    from flowly.compaction.types import CompactionConfig, MemoryFlushConfig
-    compaction_cfg = config.agents.defaults.compaction
-    compaction_config = CompactionConfig(
-        mode=compaction_cfg.mode,
-        reserve_tokens_floor=compaction_cfg.reserve_tokens_floor,
-        max_history_share=compaction_cfg.max_history_share,
-        context_window=compaction_cfg.context_window,
-        memory_flush=MemoryFlushConfig(
-            enabled=compaction_cfg.memory_flush.enabled,
-            soft_threshold_tokens=compaction_cfg.memory_flush.soft_threshold_tokens,
-            prompt=compaction_cfg.memory_flush.prompt,
-            system_prompt=compaction_cfg.memory_flush.system_prompt,
-        ),
-    )
+    from flowly.compaction.builder import build_compaction_config
+    compaction_config = build_compaction_config(config.agents.defaults.compaction)
 
     # Build exec config
     from flowly.exec.types import ExecConfig
@@ -113,11 +253,20 @@ def agent(
         state_dir=get_data_dir(),
         main_config=config,
     )
+    _wait_for_initial_mcp_tools(agent_loop, config)
+
+    # Set while a user-requested /compact runs, so the automatic-compaction
+    # hook below does not narrate a compaction the user is already watching.
+    _manual_compact_in_flight = {"value": False}
 
     async def handle_compact(instructions: str | None = None) -> None:
         """Handle /compact command."""
         console.print("[cyan]⚙️ Compacting conversation history...[/cyan]")
-        result = await agent_loop.compact_session(session_id, instructions)
+        _manual_compact_in_flight["value"] = True
+        try:
+            result = await agent_loop.compact_session(session_id, instructions)
+        finally:
+            _manual_compact_in_flight["value"] = False
         if result["success"]:
             console.print(
                 f"[green]✓[/green] {result['message']} "
@@ -126,6 +275,66 @@ def agent(
             console.print(f"\n[dim]Summary preview:[/dim]\n{result['summary_preview']}")
         else:
             console.print(f"[yellow]{result['message']}[/yellow]")
+
+    # Automatic compaction was invisible here: the notification hook is wired
+    # by the gateway, and the CLI runs the agent in-process. So a conversation
+    # would stall for many seconds mid-turn with nothing on screen to say why.
+    _compaction_spinner: dict[str, Any] = {"status": None, "cycle": ""}
+
+    def _stop_compaction_spinner() -> None:
+        status = _compaction_spinner.get("status")
+        if status is not None:
+            try:
+                status.stop()
+            except Exception:  # noqa: BLE001 — cosmetic
+                pass
+        _compaction_spinner["status"] = None
+
+    async def _on_cli_compaction(
+        session_key: str,
+        tokens_before: int,
+        tokens_after: int,
+        messages_removed: int,
+        phase: str = "completed",
+        compaction_id: str = "",
+    ) -> None:
+        if session_key and session_key != session_id:
+            return
+        if phase == "started":
+            # The manual /compact path prints its own progress; announcing
+            # again would double every line.
+            _compaction_spinner["cycle"] = compaction_id
+            if _manual_compact_in_flight["value"]:
+                return
+            status = console.status(
+                "[cyan]Compacting context…[/cyan]", spinner="dots"
+            )
+            status.start()
+            _compaction_spinner["status"] = status
+            return
+        # A terminal closes the cycle it belongs to — an event from another
+        # pass (a retry, a reorder) must not close the notice on screen and
+        # report its own numbers.
+        cycle = _compaction_spinner.get("cycle") or ""
+        if compaction_id and cycle and compaction_id != cycle:
+            return
+        _compaction_spinner["cycle"] = ""
+        _stop_compaction_spinner()
+        if _manual_compact_in_flight["value"]:
+            return
+        if phase == "failed":
+            console.print(
+                "[yellow]⚠ context compaction failed — history kept[/yellow]"
+            )
+            return
+        saved = max(0, tokens_before - tokens_after)
+        console.print(
+            f"[dim]⚡ context compacted · {messages_removed} messages"
+            + (f" · −{saved:,} tokens" if saved else "")
+            + "[/dim]"
+        )
+
+    agent_loop._on_compaction = _on_cli_compaction
 
     def _format_tokens(n: int) -> str:
         if n >= 1_000_000:
@@ -148,6 +357,39 @@ def agent(
                 result_preview = result_preview[:120] + "..."
             result_preview = result_preview.replace("\n", " ")
             console.print(f"  {icon} [cyan]{name}[/cyan] [dim]{result_preview}[/dim]")
+
+    def _display_media(meta: dict) -> None:
+        """List the files this turn produced, by absolute path.
+
+        A terminal cannot play a clip, so the useful thing is to say exactly
+        where it landed. The paths come from the turn's metadata rather than
+        being parsed out of the reply text, and a file that is not actually on
+        disk is not listed — telling someone a video is ready when it isn't is
+        worse than saying nothing.
+        """
+        paths = [p for p in (meta.get("media") or []) if isinstance(p, str)]
+        if not paths:
+            return
+
+        from flowly.media.assets import assets_from_meta, index_by_path
+
+        assets = index_by_path(assets_from_meta(meta.get("media_assets")))
+        shown = 0
+        for raw in paths:
+            if raw.startswith(("http://", "https://")):
+                continue
+            path = Path(raw)
+            if not path.is_file():
+                continue
+            if shown == 0:
+                console.print("\n[dim]Saved:[/dim]")
+            shown += 1
+            asset = assets.get(raw)
+            kind = (asset.kind if asset else "") or "file"
+            console.print(f"  [cyan]{kind}[/cyan] {path.resolve()}")
+            poster = getattr(asset, "poster_path", None)
+            if poster and Path(poster).is_file():
+                console.print(f"  [dim]poster[/dim] {Path(poster).resolve()}")
 
     def _display_usage(meta: dict) -> None:
         """Show token usage from metadata."""
@@ -174,7 +416,10 @@ def agent(
         if message.strip().startswith("/compact"):
             parts = message.strip().split(" ", 1)
             instructions = parts[1] if len(parts) > 1 else None
-            asyncio.run(handle_compact(instructions))
+            _run_agent_coroutine_with_cleanup(
+                handle_compact(instructions),
+                agent_loop,
+            )
         else:
             async def run_once():
                 response, meta = await agent_loop.process_direct(
@@ -182,10 +427,18 @@ def agent(
                 )
                 _display_tool_results(meta)
                 console.print(f"\n{__logo__} {response}")
+                _display_media(meta)
                 _display_usage(meta)
-            asyncio.run(run_once())
+                # A one-shot run ends when this coroutine returns, and
+                # asyncio.run() then cancels whatever is still pending —
+                # including the post-turn compaction this turn just scheduled.
+                # So the CLI got the check but never the work: the session
+                # stayed over budget and the NEXT invocation paid for it.
+                await agent_loop.await_post_turn_compaction(session_id)
+            _run_agent_coroutine_with_cleanup(run_once(), agent_loop)
     else:
         # Interactive mode
+        _offer_semantic_tool_routing(agent_loop)
         console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)")
         _show_status_bar()
         console.print("[dim]Commands: /help for all commands[/dim]\n")
@@ -208,10 +461,16 @@ def agent(
                             await handle_compact(args)
                             continue
                         elif cmd == "/clear":
-                            session = agent_loop.sessions.get_or_create(session_id)
-                            session.clear()
-                            agent_loop.sessions.save(session)
-                            console.print("[green]✓[/green] Session cleared")
+                            # One entry point: it drops the compaction summary
+                            # (plain clear() leaves it in metadata and the
+                            # summary anchor re-injects it next turn) AND bumps
+                            # the context epoch, which is what stops a
+                            # compaction already in flight from committing the
+                            # old conversation over the empty one.
+                            removed = agent_loop.reset_conversation(session_id)
+                            console.print(
+                                f"[green]✓[/green] Session cleared ({removed} messages)"
+                            )
                             continue
                         elif cmd in ("/quit", "/exit", "/q"):
                             console.print("Goodbye!")
@@ -225,6 +484,14 @@ def agent(
                         elif cmd == "/model":
                             if args:
                                 agent_loop.model = args.strip()
+                                # Compaction budgets and counts tokens against
+                                # the ACTIVE model — leaving them on the old one
+                                # sizes the context window and the per-message
+                                # overheads for a model that is no longer in use.
+                                agent_loop.compaction.model = agent_loop.model
+                                from flowly.compaction.estimator import set_active_model
+
+                                set_active_model(agent_loop.model)
                                 console.print(f"[green]✓[/green] Model set to [cyan]{args.strip()}[/cyan]")
                             else:
                                 console.print(f"[cyan]Current model:[/cyan] {agent_loop.model}")
@@ -248,6 +515,8 @@ def agent(
                             continue
                         elif cmd == "/tasks":
                             from flowly.agent.subagent_registry import SubagentRegistry
+                            from flowly.cli.approvals_cmd import _render_sessions_table
+
                             registry = SubagentRegistry()
                             _render_sessions_table(registry.all())
                             continue
@@ -269,10 +538,11 @@ def agent(
                     )
                     _display_tool_results(meta)
                     console.print(f"\n{__logo__} {response}")
+                    _display_media(meta)
                     _display_usage(meta)
                     console.print()
                 except KeyboardInterrupt:
                     console.print("\nGoodbye!")
                     break
 
-        asyncio.run(run_interactive())
+        _run_agent_coroutine_with_cleanup(run_interactive(), agent_loop)

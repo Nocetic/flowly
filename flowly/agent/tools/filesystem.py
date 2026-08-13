@@ -158,6 +158,26 @@ def _is_under(resolved_path: Path, root: Path) -> bool:
         return False
 
 
+def _resolve_tool_path(path: str, workspace: Path | None) -> Path:
+    """Resolve a file-tool path without depending on the host process cwd.
+
+    Flowly's file-tool contract treats relative paths as workspace-relative.
+    The gateway process itself may run from the user's home directory, a source
+    checkout, or a service-owned directory; none of those launch details should
+    change which file ``read_file("HEARTBEAT.md")`` targets.  Absolute paths
+    remain absolute, including paths produced by ``~`` expansion.
+
+    Resolving before the allow/deny checks also collapses ``..`` components and
+    follows symlinks, so a relative write cannot escape the workspace by path
+    traversal or a symlink.
+    """
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+    base = workspace if workspace is not None else Path.cwd()
+    return (base.expanduser() / candidate).resolve()
+
+
 class ReadFileTool(Tool):
     """Tool to read file contents."""
 
@@ -173,7 +193,8 @@ class ReadFileTool(Tool):
         return (
             "Read the contents of a file at the given path. Readable area: "
             "anywhere under the user's home directory (read-only) plus the "
-            "workspace; credentials paths (~/.ssh etc.) stay blocked. For "
+            "workspace; relative paths start at the Flowly workspace and "
+            "credentials paths (~/.ssh etc.) stay blocked. For "
             "large files, pass offset (1-based start line) and limit (number "
             "of lines) to read a specific section instead of the whole file."
         )
@@ -201,7 +222,7 @@ class ReadFileTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            file_path = Path(path).expanduser().resolve()
+            file_path = _resolve_tool_path(path, self.workspace)
 
             if not _is_read_allowed(file_path, self.workspace):
                 return _read_denied_error(path, file_path)
@@ -254,8 +275,9 @@ class WriteFileTool(Tool):
         return (
             "Write content to a file at the given path. Creates parent directories "
             "if needed. Allowed locations: the active workspace and the user's own "
-            "folders (~/Downloads, ~/Desktop, ~/Documents). Use ~/Downloads when "
-            "exporting files for the user to find."
+            "folders (~/Downloads, ~/Desktop, ~/Documents). Relative paths start "
+            "at the Flowly workspace. Use ~/Downloads when exporting files for "
+            "the user to find."
         )
 
     @property
@@ -277,7 +299,7 @@ class WriteFileTool(Tool):
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
-            file_path = Path(path).expanduser().resolve()
+            file_path = _resolve_tool_path(path, self.workspace)
 
             if not _is_path_allowed(file_path, self.workspace):
                 return _write_denied_error(path, self.workspace)
@@ -320,7 +342,10 @@ class EditFileTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Edit a file by replacing old_text with new_text. The old_text must exist exactly in the file."
+        return (
+            "Edit a file by replacing old_text with new_text. The old_text must "
+            "exist exactly in the file. Relative paths start at the Flowly workspace."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -345,7 +370,7 @@ class EditFileTool(Tool):
 
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
-            file_path = Path(path).expanduser().resolve()
+            file_path = _resolve_tool_path(path, self.workspace)
 
             if not _is_path_allowed(file_path, self.workspace):
                 return _write_denied_error(path, self.workspace)
@@ -396,7 +421,8 @@ class ListDirTool(Tool):
     def description(self) -> str:
         return (
             "List the contents of a directory. Readable area: anywhere under "
-            "the user's home directory (read-only) plus the workspace."
+            "the user's home directory (read-only) plus the workspace. Relative "
+            "paths start at the Flowly workspace."
         )
 
     @property
@@ -414,7 +440,7 @@ class ListDirTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            dir_path = Path(path).expanduser().resolve()
+            dir_path = _resolve_tool_path(path, self.workspace)
 
             if not _is_read_allowed(dir_path, self.workspace):
                 return _read_denied_error(path, dir_path)

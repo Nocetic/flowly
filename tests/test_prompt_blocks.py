@@ -849,6 +849,7 @@ _EXPECTED_CHANNELS: tuple[str, ...] = (
     "slack",
     "email",
     "web",
+    "desktop",
     "cli",
     "cron",
 )
@@ -928,6 +929,11 @@ class TestPlatformHintContent:
 
     def test_web_supports_full_markdown_and_media(self) -> None:
         hint = build_platform_hint("web")
+        assert "full Markdown" in hint or "full markdown" in hint.lower()
+        assert "MEDIA:" in hint
+
+    def test_desktop_supports_full_markdown_and_media(self) -> None:
+        hint = build_platform_hint("desktop")
         assert "full Markdown" in hint or "full markdown" in hint.lower()
         assert "MEDIA:" in hint
 

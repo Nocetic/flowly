@@ -104,6 +104,57 @@ def get_flowly_model_policy() -> FlowlyModelPolicy | None:
     return _FLOWLY_POLICY
 
 
+# Rough context window by model family, for when no catalogue can place an id.
+#
+# THE fallback table — the compaction budget and the TUI's token bar each
+# carried their own, and they had already drifted: the TUI's did not know
+# ``gpt-4.1`` or ``gpt-3.5``, matched only the dated Claude 4 slugs rather than
+# the family, and defaulted to 200K where compaction defaulted to 128K. So the
+# same model could be budgeted at one size and drawn at another.
+#
+# Deliberately conservative, and it stays that way: guessing small compacts a
+# bit early, guessing large sails past the provider's limit and 413s mid-turn.
+# This is a last resort — every caller consults the live catalogue first — so
+# it is not the place to be clever. Entries are only added with a verified
+# number behind them; a plausible guess here outlives the person who made it.
+_FAMILY_WINDOWS: dict[str, int] = {
+    "gemini": 1_000_000,
+    "kimi": 262_144,
+    "claude": 200_000,
+    "sonnet": 200_000,
+    "opus": 200_000,
+    "haiku": 200_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-4.1": 128_000,
+    "gpt-4o": 128_000,
+    "gpt-3.5": 16_385,
+}
+
+# Longest key first, so a specific entry always beats a broader one that
+# happens to be a substring of the same id. Nothing in the table needs it
+# today; it is here so that adding e.g. ``"gpt-4": 8_191`` alongside
+# ``"gpt-4o"`` cannot silently start answering for the wrong model.
+_FAMILY_WINDOWS_BY_SPECIFICITY: tuple[tuple[str, int], ...] = tuple(
+    sorted(_FAMILY_WINDOWS.items(), key=lambda kv: len(kv[0]), reverse=True)
+)
+
+
+def family_context_window(model_id: str) -> int | None:
+    """Best guess at ``model_id``'s window from its family name.
+
+    ``None`` means "no idea" — never a default. The caller owns that choice,
+    because the right default differs: compaction answers to a proxy that
+    413s, the TUI only has to draw a bar.
+    """
+    m = (model_id or "").lower()
+    if not m:
+        return None
+    for needle, window in _FAMILY_WINDOWS_BY_SPECIFICITY:
+        if needle in m:
+            return window
+    return None
+
+
 def get_context_window(model_id: str) -> int | None:
     """Look up a model's reported context_window from any cached catalog.
 
@@ -112,17 +163,18 @@ def get_context_window(model_id: str) -> int | None:
     back to its own heuristics. The status bar uses this to size its
     token-budget bar without baking in per-model magic numbers.
 
-    Also normalizes between Flowly's LiteLLM dash convention
-    (``claude-sonnet-4-5``) and OpenRouter's dot convention
-    (``claude-sonnet-4.5``) — the Flowly proxy rewrites dashes to dots
-    when forwarding, so the user's config can hold either form and we
-    still find the catalog entry. Mirrors ``normalizeModelForOpenRouter``
-    in ``flowly-app/app/api/v1/chat/completions/route.ts``.
+    Matching goes through :func:`_id_candidates`, which covers the LiteLLM
+    dash convention (``claude-sonnet-4-5``) against OpenRouter's dot
+    convention (``claude-sonnet-4.5``) — the Flowly proxy rewrites dashes to
+    dots when forwarding, so a config can hold either form — and the dated
+    snapshot suffix a provider pins onto an id while its catalogue lists the
+    undated entry (``deepseek/deepseek-v4-flash-0731``). Mirrors
+    ``normalizeModelForOpenRouter`` in
+    ``flowly-app/app/api/v1/chat/completions/route.ts``.
     """
     if not model_id:
         return None
-    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
-    candidates.discard("")
+    candidates = _id_candidates(model_id)
     for models in _CACHE.values():
         for m in models:
             if m.id in candidates and m.context_window:
@@ -141,8 +193,7 @@ def get_pricing(model_id: str) -> tuple[float | None, float | None] | None:
     """
     if not model_id:
         return None
-    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
-    candidates.discard("")
+    candidates = _id_candidates(model_id)
     for models in _CACHE.values():
         for m in models:
             if m.id in candidates and (m.pricing_in is not None or m.pricing_out is not None):
@@ -160,8 +211,7 @@ def get_vision_support(model_id: str) -> bool | None:
     """
     if not model_id:
         return None
-    candidates = {model_id, _dash_to_dot_version(model_id), _dot_to_dash_version(model_id)}
-    candidates.discard("")
+    candidates = _id_candidates(model_id)
     found_false = False
     for models in _CACHE.values():
         for model in models:
@@ -198,6 +248,46 @@ def _dot_to_dash_version(mid: str) -> str:
     # Only rewrite when the preceding chunk looks like a version anchor
     # (digit). Avoids mangling names with legitimate dots.
     return _re.sub(r"(\d)\.(\d)", r"\1-\2", mid)
+
+
+# A dated snapshot pinned onto a model id: ``-0731``, ``-20250929``, ``-0613``.
+# FOUR digits minimum, deliberately. A shorter run is a version component, not
+# a date, and stripping it would silently answer for a DIFFERENT model —
+# ``claude-sonnet-4-5`` would degrade to ``claude-sonnet-4``. Dates are the
+# only suffix a catalogue reliably omits while still describing the same
+# model's window.
+_DATED_SNAPSHOT_RE = _re.compile(r"-\d{4,}$")
+
+
+def _without_dated_snapshot(mid: str) -> str:
+    """``deepseek/deepseek-v4-flash-0731`` → ``deepseek/deepseek-v4-flash``.
+
+    Providers pin a snapshot date onto an id while their catalogue lists the
+    undated family entry. The two share a context window; only the exact id
+    differs, so an exact-match lookup misses and the caller falls back to a
+    guess. Returns the input unchanged when there is no dated suffix.
+    """
+    if not mid:
+        return mid
+    return _DATED_SNAPSHOT_RE.sub("", mid)
+
+
+def _id_candidates(model_id: str) -> set[str]:
+    """Every spelling of ``model_id`` worth trying against a cached catalogue.
+
+    Covers the dash/dot version convention in both directions and the dated
+    snapshot suffix, including their combination (``claude-sonnet-4-5-20250929``
+    → ``claude-sonnet-4.5``).
+    """
+    if not model_id:
+        return set()
+    out: set[str] = set()
+    for base in (model_id, _without_dated_snapshot(model_id)):
+        if not base:
+            continue
+        out.update({base, _dash_to_dot_version(base), _dot_to_dash_version(base)})
+    out.discard("")
+    return out
 
 
 async def warm_cache(provider_key: str) -> None:
@@ -369,13 +459,34 @@ def _catalog_contains(models: list[Model], model_id: str) -> bool:
     return any("locked" not in model.tags and model.id in candidates for model in models)
 
 
-async def reconcile_flowly_model(*, force_refresh: bool = True) -> str | None:
-    """Replace a model unavailable to this Flowly account with its backend default.
+# The ONLY values reconcile may rewrite without the user asking. These are old
+# *schema defaults* a config can still carry from before the account catalog
+# existed — not choices anyone made. Everything else is a user's explicit
+# selection, and validating it against the catalog is not safe grounds to
+# replace it: the TUI runs this against a possibly-stale cached catalog at
+# boot, so a freshly released model that's absent from yesterday's cache would
+# otherwise be silently reverted to the backend default on every restart.
+_LEGACY_SCHEMA_DEFAULTS = frozenset({"moonshotai/kimi-k2.5"})
 
-    The authenticated ``/models`` response is authoritative. A valid current
-    choice — including a paid user's deliberate Kimi selection — is preserved.
-    Network/auth/catalog failures are fail-safe no-ops; they never rewrite the
-    user's config from an unverified OpenRouter fallback.
+
+def _is_legacy_schema_default(model_id: str) -> bool:
+    m = model_id.strip().lower()
+    return any(
+        cand in _LEGACY_SCHEMA_DEFAULTS
+        for cand in (m, _dash_to_dot_version(m), _dot_to_dash_version(m))
+    )
+
+
+async def reconcile_flowly_model(*, force_refresh: bool = True) -> str | None:
+    """Migrate a stale legacy default to the account catalog's default model.
+
+    Scope is deliberately narrow: only an old schema default (or an empty
+    model) is ever replaced, and only when the authenticated catalog confirms
+    it's unavailable while the backend default is. A model the user actually
+    chose is NEVER rewritten here — if their plan can't serve it, the request
+    itself will say so, which is honest; a background rewrite that keeps
+    snapping the config back to the default is not. Network/auth/catalog
+    failures are fail-safe no-ops.
     """
     models = await fetch_models("flowly", force_refresh=force_refresh)
     policy = _FLOWLY_POLICY
@@ -385,6 +496,8 @@ async def reconcile_flowly_model(*, force_refresh: bool = True) -> str | None:
     from flowly.config.loader import load_config
 
     current = (load_config().agents.defaults.model or "").strip()
+    if current and not _is_legacy_schema_default(current):
+        return None
     if current and _catalog_contains(models, current):
         return None
     if not _catalog_contains(models, policy.default_model):

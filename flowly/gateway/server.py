@@ -8,8 +8,10 @@ import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
@@ -21,6 +23,7 @@ from flowly.artifacts.summary import artifact_summary
 from flowly.browser_annotations import append_browser_annotation_context
 from flowly.channels import feature_rpc
 from flowly.gateway.auth import (
+    MediaTicketStore,
     WsTicketStore,
     extract_request_token,
     host_origin_allowed,
@@ -28,8 +31,14 @@ from flowly.gateway.auth import (
     loopback_ws_allowed,
     token_matches,
 )
+from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
+from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
+
+if TYPE_CHECKING:  # annotations only — keeps the runtime import graph unchanged
+    from flowly.clarify.types import ClarifyRequest
+    from flowly.exec.types import PendingApproval
 
 # Maximum allowed request body size (1MB)
 _MAX_BODY_SIZE = 1024 * 1024
@@ -56,7 +65,14 @@ async def _cors_middleware(request: web.Request, handler: Callable) -> web.Strea
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                # ``Range`` is here for the media streaming route — a player
+                # that preflights a byte-range request is refused without it.
+                "Access-Control-Allow-Headers": (
+                    "Content-Type, Authorization, X-Flowly-Token, Range"
+                ),
+                "Access-Control-Expose-Headers": (
+                    "Content-Range, Accept-Ranges, Content-Length, Content-Type"
+                ),
                 "Access-Control-Max-Age": "600",
             },
         )
@@ -65,8 +81,10 @@ async def _cors_middleware(request: web.Request, handler: Callable) -> web.Strea
     response.headers.setdefault("Vary", "Origin")
     return response
 
+
 # Type alias for the chat callback used by the /ws endpoint.
-# Signature: (session_key, message, run_id, stream_callback, media, voice_mode)
+# Signature: (session_key, message, run_id, stream_callback, media, voice_mode,
+#             iteration_callback, render_capabilities)
 #         -> (response_text, metadata)
 # ``metadata`` carries ``usage`` (prompt_tokens / completion_tokens /
 # cache_read_tokens / cache_write_tokens) + the effective ``model`` so
@@ -84,6 +102,7 @@ ChatCallback = Callable[
         list[str],
         bool,
         Callable[[dict], Awaitable[None]] | None,
+        tuple[str, ...],
     ],
     Awaitable[tuple[str, dict]],
 ]
@@ -105,6 +124,17 @@ _MAX_ATTACHMENT_B64_CHARS = 34 * 1024 * 1024
 _THUMB_MAX_DIMENSION = 512
 _THUMB_TARGET_BYTES = 48 * 1024
 _THUMB_INITIAL_QUALITY = 70
+
+# Ceiling for the byte-range streaming endpoint. Far above /api/media's 25 MB
+# base64 cap because streaming never buffers the file: aiohttp sends it from
+# disk in chunks, so the cost of a big clip is bandwidth, not memory. The cap
+# exists to bound what a single request can pull, not to protect the process.
+_MAX_STREAM_BYTES = 2 * 1024 * 1024 * 1024
+
+# What the streaming endpoint will serve. Generated media only — this is not a
+# general file server, and anything outside these families (archives, scripts,
+# documents) has no business being fetched by a chat client.
+_STREAMABLE_MIME_PREFIXES = ("image/", "video/", "audio/")
 
 # Browser providers share the same local WebSocket transport as desktop/chat
 # clients. Provider IDs are intentionally stricter than arbitrary display
@@ -216,6 +246,7 @@ def _thumbnail_b64(p: Path) -> tuple[str, str] | None:
         return hit
     try:
         from flowly.channels.web import _compress_image_for_transport
+
         compressed = _compress_image_for_transport(
             p,
             max_dimension=_THUMB_MAX_DIMENSION,
@@ -235,42 +266,116 @@ def _thumbnail_b64(p: Path) -> tuple[str, str] | None:
     return result
 
 
-def _reply_media_attachments(media_paths: list) -> list[dict]:
+def _inline_preview_b64(asset: Any, path: Path) -> str | None:
+    """The base64 JPEG a client shows in the bubble before fetching anything.
+
+    For an image that is the image itself, downscaled. For a video it is the
+    poster frame ffmpeg pulled at generation time — a video file cannot be fed
+    to the image compressor, so without a poster there simply is no preview and
+    the client draws its own placeholder.
+
+    Audio has none at all, and asking for one is not merely useless: it hands
+    an mp3 to an image compressor, once per file, to be told what we already
+    knew. A sound file is listened to, and every client draws it as a row.
+    """
+    if asset.kind == "audio":
+        return None
+    if asset.kind == "video":
+        poster = Path(asset.poster_path) if asset.poster_path else None
+        if poster is None or not poster.is_file():
+            return None
+        thumb = _thumbnail_b64(poster)
+        return thumb[0] if thumb else None
+    thumb = _thumbnail_b64(path)
+    return thumb[0] if thumb else None
+
+
+def _assets_index(raw: Any) -> dict:
+    """Persisted/metadata asset dicts -> ``{path: MediaAsset}``.
+
+    Returns an empty map for anything unusable, so a turn recorded before
+    assets existed simply falls back to describing the files themselves.
+    """
+    from flowly.media.assets import assets_from_meta, index_by_path
+
+    return index_by_path(assets_from_meta(raw))
+
+
+def _resolve_media_id(name: str) -> tuple[Path | None, str, int]:
+    """Resolve a media id to a file inside the media dir.
+
+    Thin wrapper over :func:`flowly.media.serving.resolve_media_id` — the relay
+    bridge answers the same question over the agent socket, and the containment
+    rules must be one implementation, not two that drift.
+    """
+    from flowly.media.serving import resolve_media_id
+
+    return resolve_media_id(name, get_flowly_home() / "media")
+
+
+def _reply_media_attachments(media_paths: list, assets: dict | None = None) -> list[dict]:
     """Attachments for media the agent produced THIS turn (image_generate /
-    screenshot), for delivery over the direct gateway WS — where there is no
-    relay/S3 to host a ``cdnUrl``.
+    video_generate / screenshot), for delivery over the direct gateway WS —
+    where there is no relay/S3 to host a ``cdnUrl``.
 
     Each local file carries a SMALL inline base64 ``thumbnail`` (~512 px / ~48 KB
-    JPEG, reusing the web channel's compressor at a thumbnail preset) so a remote
-    client (iOS / desktop) renders the bubble preview immediately with no fetch and
-    no auth. ``mediaId`` is always set so the client can pull the full-res original
-    on demand via ``GET /api/media?id=…`` (tap to zoom). Keeping the inline payload
-    small is what stops an image-heavy history reload from shipping megabytes of
-    base64. Remote URLs pass through as ``cdnUrl``. Best-effort per file —
-    unreadable entries are skipped.
+    JPEG) so a remote client (iOS / desktop) renders the bubble preview
+    immediately with no fetch and no auth. ``mediaId`` is always set so the
+    client can pull the original on demand — ``GET /api/media?id=…`` for images
+    (tap to zoom), ``GET /api/media/stream`` for video playback. Keeping the
+    inline payload small is what stops a media-heavy history reload from
+    shipping megabytes of base64. Remote URLs pass through as ``cdnUrl``.
+
+    ``assets`` maps path -> :class:`MediaAsset` for media generated this turn,
+    supplying duration/dimensions/poster that cannot be recovered from the path
+    alone. Media without an entry (screenshots, inbound user files, history
+    written before assets existed) is described from the file itself, so this
+    stays correct with no caller changes.
+
+    Best-effort per file — unreadable entries are skipped rather than handed to
+    a client as a broken bubble.
     """
+    from flowly.media.assets import attachment_v2, describe, guess_mime, kind_for_mime
+
+    by_path = assets or {}
     out: list[dict] = []
     for mp in media_paths:
         try:
             if not isinstance(mp, str) or not mp:
                 continue
             if mp.startswith(("http://", "https://")):
-                url_mime, _ = mimetypes.guess_type(mp)
-                out.append({
-                    "fileName": mp.rsplit("/", 1)[-1] or mp,
-                    "mimeType": url_mime or "",
-                    "cdnUrl": mp,
-                })
+                url_mime = guess_mime(mp)
+                file_name = mp.rsplit("/", 1)[-1] or mp
+                asset = by_path.get(mp)
+                if asset is not None:
+                    out.append(attachment_v2(asset, cdn_url=mp))
+                else:
+                    # Unknown remote file: keep the historical V1 shape rather
+                    # than inventing metadata we never measured.
+                    out.append(
+                        {
+                            "fileName": file_name,
+                            "mimeType": "" if url_mime == "application/octet-stream" else url_mime,
+                            "cdnUrl": mp,
+                        }
+                    )
                 continue
             p = Path(mp)
             if not p.is_file():
                 continue
-            mime, _ = mimetypes.guess_type(mp)
-            att: dict = {"fileName": p.name, "mimeType": mime or "image/png", "mediaId": p.name}
-            thumb = _thumbnail_b64(p)  # cached by path+mtime+size
-            if thumb is not None:
-                att["thumbnail"], att["mimeType"] = thumb
-            out.append(att)
+            asset = by_path.get(mp)
+            if asset is None:
+                # Probing here would shell out to ffprobe on every history
+                # reload; the generating tool already measured what it knows.
+                mime = guess_mime(p)
+                asset = describe(p, probe_media=kind_for_mime(mime) == "image")
+            out.append(
+                attachment_v2(
+                    asset,
+                    thumbnail=_inline_preview_b64(asset, p),
+                    media_id=p.name,
+                )
+            )
         except Exception:
             continue
     return out
@@ -342,6 +447,9 @@ class GatewayServer:
         self._auth_token = (auth_token or "").strip()
         self._require_auth = bool(self._auth_token) and not is_loopback_host(host)
         self._ticket_store = WsTicketStore()
+        # Playback tickets: short-lived, scoped to a single media id, reusable
+        # across the many Range requests one clip generates.
+        self._media_ticket_store = MediaTicketStore()
         # MCP write-plane control endpoint (Faz 3c). Additive + opt-in:
         # only active when BOTH a send callback and a token are supplied.
         # localhost-only + bearer-token authed. Lets `flowly mcp serve
@@ -427,6 +535,12 @@ class GatewayServer:
         # /api/media contract: basename-only id, media-dir containment (resolve +
         # symlink-safe), image allowlist, 25 MB cap.
         app.router.add_get("/api/media", self._handle_media)
+        # Byte-range media streaming. Video can't ride the base64 endpoint above
+        # (a player seeks, and a 200 MB JSON string is not a seek), so playback
+        # gets its own route: mint a media-scoped ticket with the static token,
+        # then stream with Range support using only that ticket.
+        app.router.add_post("/api/media/tickets", self._handle_media_ticket)
+        app.router.add_get("/api/media/stream", self._handle_media_stream)
         if self.on_provider_reload:
             app.router.add_post("/api/provider/reload", self._handle_provider_reload)
             app.router.add_get("/api/provider/active", self._handle_provider_active)
@@ -447,8 +561,11 @@ class GatewayServer:
         if self.on_send and self._control_token:
             try:
                 from flowly.mcp.server.control import register_control_routes
+
                 register_control_routes(
-                    app, token=self._control_token, on_send=self.on_send,
+                    app,
+                    token=self._control_token,
+                    on_send=self.on_send,
                 )
             except Exception as exc:  # pragma: no cover — never block boot
                 logger.warning("MCP control routes unavailable: {}", exc)
@@ -466,16 +583,19 @@ class GatewayServer:
     # ``/health`` is the public handshake clients probe to discover
     # ``auth_required``; ``/ws`` authenticates via a query-param ticket inside
     # the handler (not a header), so the header middleware skips it.
+    # ``/api/media/stream`` authenticates via a media-scoped ``?ticket=`` inside
+    # the handler for the same reason ``/ws`` does: the caller is a video
+    # element, which cannot set a header. ``/api/media/tickets`` — where that
+    # ticket is minted — is NOT listed and stays behind the static token.
     _AUTH_PUBLIC_PATHS = frozenset({"/health"})
-    _AUTH_SELF_GATED_PREFIXES = ("/ws", "/api/mcp")
+    _AUTH_SELF_GATED_PREFIXES = ("/ws", "/api/mcp", "/api/media/stream")
 
     def _make_auth_middleware(self):
         @web.middleware
         async def _auth_middleware(request: web.Request, handler):
             path = request.path
-            if (
-                path in self._AUTH_PUBLIC_PATHS
-                or any(path.startswith(p) for p in self._AUTH_SELF_GATED_PREFIXES)
+            if path in self._AUTH_PUBLIC_PATHS or any(
+                path.startswith(p) for p in self._AUTH_SELF_GATED_PREFIXES
             ):
                 return await handler(request)
             if not token_matches(extract_request_token(request), self._auth_token):
@@ -492,9 +612,7 @@ class GatewayServer:
         middleware has already verified the static token, so reaching here
         means the caller is authenticated."""
         ticket = self._ticket_store.mint()
-        return web.json_response(
-            {"ticket": ticket, "ttl_seconds": self._ticket_store.ttl_seconds}
-        )
+        return web.json_response({"ticket": ticket, "ttl_seconds": self._ticket_store.ttl_seconds})
 
     def _ws_credential_ok(self, request: web.Request) -> bool:
         """Authenticate a /ws upgrade. No-op (always True) when auth is off.
@@ -513,19 +631,21 @@ class GatewayServer:
         # Capabilities advertise what this gateway build supports so clients
         # (like the TUI) can detect a stale running process and prompt for
         # restart instead of silently degrading.
-        return web.json_response({
-            "status": "ok",
-            # The public handshake the desktop probes to decide whether to
-            # prompt for a token before connecting (the /api/status handshake).
-            "auth_required": self._require_auth,
-            "capabilities": [
-                "tool_events",      # tool.start / tool.complete WS events
-                "queue_while_busy", # client-side, but flag for future server queueing
-                "browser_provider_v2",
-                "browser_session_binding_v1",
-                "browser_provider_unregister_v1",
-            ],
-        })
+        return web.json_response(
+            {
+                "status": "ok",
+                # The public handshake the desktop probes to decide whether to
+                # prompt for a token before connecting (the /api/status handshake).
+                "auth_required": self._require_auth,
+                "capabilities": [
+                    "tool_events",  # tool.start / tool.complete WS events
+                    "queue_while_busy",  # client-side, but flag for future server queueing
+                    "browser_provider_v2",
+                    "browser_session_binding_v1",
+                    "browser_provider_unregister_v1",
+                ],
+            }
+        )
 
     async def _handle_cron_run(self, request: web.Request) -> web.Response:
         try:
@@ -540,7 +660,9 @@ class GatewayServer:
             if success:
                 return web.json_response({"ok": True})
             else:
-                return web.json_response({"error": f"Job '{job_id}' not found or disabled"}, status=404)
+                return web.json_response(
+                    {"error": f"Job '{job_id}' not found or disabled"}, status=404
+                )
         except json.JSONDecodeError:
             return web.json_response({"error": "Invalid JSON"}, status=400)
         except Exception as e:
@@ -558,9 +680,7 @@ class GatewayServer:
         """
         try:
             if not self.on_cron_health:
-                return web.json_response(
-                    {"error": "Cron health not configured"}, status=500
-                )
+                return web.json_response({"error": "Cron health not configured"}, status=500)
             snapshot = self.on_cron_health()
             return web.json_response(snapshot)
         except Exception as e:
@@ -597,7 +717,8 @@ class GatewayServer:
                 return web.json_response({"error": SKEW_MESSAGE}, status=409)
             if not self.on_provider_reload:
                 return web.json_response(
-                    {"error": "Provider reload not configured"}, status=500,
+                    {"error": "Provider reload not configured"},
+                    status=500,
                 )
             info = await self.on_provider_reload()
             if not info or not info.get("ok"):
@@ -624,24 +745,9 @@ class GatewayServer:
           * images only (allowlist), with a 25 MB ceiling.
         """
         name = (request.rel_url.query.get("id") or "").strip()
-        if (
-            not name
-            or "/" in name
-            or "\\" in name
-            or ".." in name
-            or name.startswith(".")
-        ):
-            return web.json_response({"error": "invalid id"}, status=400)
-
-        media_dir = (get_flowly_home() / "media").resolve()
-        try:
-            target = (media_dir / name).resolve()
-        except (OSError, RuntimeError):
-            return web.json_response({"error": "invalid id"}, status=400)
-        if target != media_dir and media_dir not in target.parents:
-            return web.json_response({"error": "forbidden"}, status=403)
-        if not target.is_file():
-            return web.json_response({"error": "not found"}, status=404)
+        target, error, status = _resolve_media_id(name)
+        if target is None:
+            return web.json_response({"error": error}, status=status)
 
         mime, _ = mimetypes.guess_type(str(target))
         mime = mime or ""
@@ -655,11 +761,95 @@ class GatewayServer:
         except OSError:
             return web.json_response({"error": "not found"}, status=404)
         encoded = base64.b64encode(data).decode("ascii")
-        return web.json_response({
-            "dataUrl": f"data:{mime};base64,{encoded}",
-            "fileName": name,
-            "mimeType": mime,
-        })
+        return web.json_response(
+            {
+                "dataUrl": f"data:{mime};base64,{encoded}",
+                "fileName": name,
+                "mimeType": mime,
+            }
+        )
+
+    async def _handle_media_ticket(self, request: web.Request) -> web.Response:
+        """Mint a playback ticket for one media id.
+
+        Reaching this handler means the caller already proved the static token
+        (the auth middleware does not exempt this path), so the only work left
+        is confirming the file really exists and is streamable — minting a
+        ticket for a missing or forbidden id would just move the failure to
+        playback time, where the client can only report "video won't play".
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        name = str((body or {}).get("id") or "").strip()
+        target, error, status = _resolve_media_id(name)
+        if target is None:
+            return web.json_response({"error": error}, status=status)
+
+        mime, _ = mimetypes.guess_type(str(target))
+        mime = mime or ""
+        if not mime.startswith(_STREAMABLE_MIME_PREFIXES):
+            return web.json_response({"error": "unsupported media type"}, status=415)
+
+        ticket = self._media_ticket_store.mint(name)
+        return web.json_response(
+            {
+                "ticket": ticket,
+                "ttlSeconds": self._media_ticket_store.ttl_seconds,
+                "url": f"/api/media/stream?id={quote(name)}&ticket={quote(ticket)}",
+                "mimeType": mime,
+                "size": target.stat().st_size,
+            }
+        )
+
+    async def _handle_media_stream(self, request: web.Request) -> web.StreamResponse:
+        """Stream a media file with HTTP Range support.
+
+        Unlike ``/api/media`` this never loads the file into memory: aiohttp's
+        ``FileResponse`` reads from disk and honours ``Range`` itself, which is
+        what makes seeking in a video work (and what keeps a 200 MB clip from
+        costing 270 MB of base64 in RAM).
+
+        Auth: the middleware skips this path, so the ticket check below IS the
+        credential check. On a loopback gateway with no token configured there
+        is no credential to enforce in the first place, matching every other
+        route.
+        """
+        name = (request.rel_url.query.get("id") or "").strip()
+        if self._require_auth and not self._media_ticket_store.allows(
+            request.rel_url.query.get("ticket"), name
+        ):
+            return web.json_response(
+                {"error": "unauthorized", "detail": "Missing or invalid media ticket."},
+                status=401,
+            )
+
+        target, error, status = _resolve_media_id(name)
+        if target is None:
+            return web.json_response({"error": error}, status=status)
+
+        mime, _ = mimetypes.guess_type(str(target))
+        mime = mime or ""
+        if not mime.startswith(_STREAMABLE_MIME_PREFIXES):
+            return web.json_response({"error": "unsupported media type"}, status=415)
+        if target.stat().st_size > _MAX_STREAM_BYTES:
+            return web.json_response({"error": "file too large"}, status=413)
+
+        return web.FileResponse(
+            target,
+            headers={
+                "Content-Type": mime,
+                # Generated media is immutable: the filename is unique per
+                # generation, so a player may cache it for the session.
+                "Cache-Control": "private, max-age=3600",
+                # A browser-hosted player reads these off the response to build
+                # its scrubber; without the expose list CORS hides them.
+                "Access-Control-Expose-Headers": (
+                    "Content-Range, Accept-Ranges, Content-Length, Content-Type"
+                ),
+            },
+        )
 
     async def _handle_extension_status(self, request: web.Request) -> web.Response:
         """Report whether a Chrome extension is currently connected.
@@ -670,14 +860,16 @@ class GatewayServer:
         """
         try:
             connected = self.has_browser_provider()
-            return web.json_response({
-                "ok": True,
-                "connected": connected,
-                "client_count": len(self._extension_clients),
-                "active_client": self._extension_active,
-                "active_provider": self._browser_provider_active,
-                "providers": self._list_browser_providers(),
-            })
+            return web.json_response(
+                {
+                    "ok": True,
+                    "connected": connected,
+                    "client_count": len(self._extension_clients),
+                    "active_client": self._extension_active,
+                    "active_provider": self._browser_provider_active,
+                    "providers": self._list_browser_providers(),
+                }
+            )
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
@@ -732,6 +924,7 @@ class GatewayServer:
             if action in ("clear_done", "clear"):
                 # Bulk-remove finished cards (Done by default).
                 from flowly.board.store import STATUS_DONE
+
                 target = body.get("status") or STATUS_DONE
                 removed = self.board_store.delete_by_status(target)
                 return {"ok": True, "removed": removed}, 200
@@ -752,7 +945,8 @@ class GatewayServer:
 
             if action == "note":
                 self.board_store.add_note(
-                    card_id, author=body.get("author", "user") or "user",
+                    card_id,
+                    author=body.get("author", "user") or "user",
                     text=body.get("text", "") or "",
                 )
                 card = self.board_store.get_card(card_id)
@@ -793,6 +987,7 @@ class GatewayServer:
                         except Exception as exc:
                             logger.warning(f"[board] cancel subagent failed: {exc}")
                     from flowly.board.store import STATUS_CANCELLED
+
                     self.board_store.set_status(card_id, STATUS_CANCELLED)
                 card = self.board_store.get_card(card_id)
                 return {"ok": True, "card": card.to_dict() if card else None}, 200
@@ -812,15 +1007,18 @@ class GatewayServer:
         try:
             from flowly.config.loader import load_config
             from flowly.integrations.active_provider import resolve_active_provider
+
             active = resolve_active_provider(load_config())
             if active is None:
                 return web.json_response({"ok": False, "error": "no provider"})
-            return web.json_response({
-                "ok": True,
-                "key": active.key,
-                "source": active.source,
-                "api_base": active.api_base,
-            })
+            return web.json_response(
+                {
+                    "ok": True,
+                    "key": active.key,
+                    "source": active.source,
+                    "api_base": active.api_base,
+                }
+            )
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
@@ -899,10 +1097,7 @@ class GatewayServer:
             ConnectionAbortedError,
             asyncio.CancelledError,
         ) as e:
-            logger.debug(
-                f"[WS] Client disconnected before handshake completed: "
-                f"{type(e).__name__}"
-            )
+            logger.debug(f"[WS] Client disconnected before handshake completed: {type(e).__name__}")
             return web.Response(status=400)
         except Exception as e:
             # aiohttp surfaces ClientConnectionResetError which isn't in
@@ -913,8 +1108,7 @@ class GatewayServer:
                 "ClientConnectionError",
             ):
                 logger.debug(
-                    f"[WS] Client disconnected before handshake completed: "
-                    f"{type(e).__name__}"
+                    f"[WS] Client disconnected before handshake completed: {type(e).__name__}"
                 )
                 return web.Response(status=400)
             raise
@@ -930,23 +1124,30 @@ class GatewayServer:
         # ASCII-only [a-zA-Z0-9_-]{1,64} — Python's str.isalnum is unicode-aware
         # which would let through e.g. "üñıç". Keep it strictly ASCII.
         _id_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-        if (
-            requested_id
-            and len(requested_id) <= 64
-            and all(c in _id_chars for c in requested_id)
-        ):
+        if requested_id and len(requested_id) <= 64 and all(c in _id_chars for c in requested_id):
             client_id = requested_id
             # If two connections claim the same id, keep the newest — the old
             # WS is almost certainly already broken (this is exactly the
             # reconnect case we're trying to support). Drop the stale ref.
             if client_id in self._ws_clients:
-                logger.info(
-                    f"[WS] Reattaching client_id={client_id}: replacing stale ws"
-                )
+                logger.info(f"[WS] Reattaching client_id={client_id}: replacing stale ws")
         else:
             client_id = str(uuid.uuid4())
         self._ws_clients[client_id] = ws
         logger.info(f"[WS] Desktop client connected: {client_id}")
+
+        long_rpc_tasks: set[asyncio.Task[None]] = set()
+
+        def _long_rpc_done(task: asyncio.Task[None]) -> None:
+            long_rpc_tasks.discard(task)
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(
+                    "[WS] background feature RPC failed: %s",
+                    type(exc).__name__,
+                )
 
         try:
             async for raw_msg in ws:
@@ -958,20 +1159,42 @@ class GatewayServer:
                         continue
                     msg_type = data.get("type")
                     if msg_type == "rpc":
-                        await self._handle_ws_rpc(ws, client_id, data)
+                        if data.get("method") in feature_rpc.LONG_RUNNING_METHODS:
+                            # Browser auth/probes can take minutes. Keep the
+                            # receive loop alive for WS heartbeat frames and
+                            # unrelated RPCs, while retaining ownership so a
+                            # disconnect cancels the underlying MCP future.
+                            task = asyncio.create_task(
+                                self._handle_ws_rpc(ws, client_id, data),
+                                name=f"feature-rpc-{data.get('method')}",
+                            )
+                            long_rpc_tasks.add(task)
+                            task.add_done_callback(_long_rpc_done)
+                        else:
+                            await self._handle_ws_rpc(ws, client_id, data)
                     elif msg_type == "ping":
-                        await self._ws_send(ws, {"type": "pong", "timestamp": data.get("timestamp")})
+                        await self._ws_send(
+                            ws, {"type": "pong", "timestamp": data.get("timestamp")}
+                        )
                     elif msg_type == "tool_result":
                         # Fix #10: Only accept tool_result from registered extension clients
                         if client_id in self._extension_clients:
                             self._handle_extension_tool_result(data, client_id)
                         else:
-                            logger.warning(f"[WS] tool_result from non-extension client {client_id}, ignoring")
+                            logger.warning(
+                                f"[WS] tool_result from non-extension client {client_id}, ignoring"
+                            )
                 elif raw_msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                     break
         except Exception as e:
             logger.error(f"[WS] Client {client_id} error: {e}")
         finally:
+            pending_long_rpcs = tuple(long_rpc_tasks)
+            for task in pending_long_rpcs:
+                task.cancel()
+            if pending_long_rpcs:
+                await asyncio.gather(*pending_long_rpcs, return_exceptions=True)
+
             # A stable clientId may already have reconnected on a newer socket.
             # Cleanup from the stale socket must not evict the replacement or
             # unregister its browser provider.
@@ -998,12 +1221,9 @@ class GatewayServer:
                 coaching_sid = f"coaching:{client_id}"
                 if self._coaching_manager.is_active(coaching_sid):
                     try:
-                        await self._coaching_manager.stop(
-                            coaching_sid, background_finalize=True
-                        )
+                        await self._coaching_manager.stop(coaching_sid, background_finalize=True)
                         logger.info(
-                            f"[WS] auto-stopped coaching session {coaching_sid} "
-                            f"on disconnect"
+                            f"[WS] auto-stopped coaching session {coaching_sid} on disconnect"
                         )
                     except Exception as e:
                         logger.warning(f"[WS] coaching auto-stop failed: {e}")
@@ -1156,9 +1376,7 @@ class GatewayServer:
                 provider_id = params.get("providerId")
                 registration_id = params.get("registrationId")
                 if not isinstance(provider_id, str) or not provider_id:
-                    await self._ws_rpc_error(
-                        ws, rpc_id, "INVALID_REQUEST", "Missing providerId"
-                    )
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Missing providerId")
                     return
                 if not isinstance(registration_id, str) or not registration_id:
                     await self._ws_rpc_error(
@@ -1168,51 +1386,67 @@ class GatewayServer:
                 provider = self._browser_providers.get(provider_id)
                 if provider is None:
                     await self._ws_rpc_error(
-                        ws, rpc_id, "BROWSER_PROVIDER_UNAVAILABLE",
+                        ws,
+                        rpc_id,
+                        "BROWSER_PROVIDER_UNAVAILABLE",
                         "Browser provider is not registered",
                     )
                     return
                 if provider["client_id"] != client_id:
                     await self._ws_rpc_error(
-                        ws, rpc_id, "BROWSER_PROVIDER_NOT_OWNED",
+                        ws,
+                        rpc_id,
+                        "BROWSER_PROVIDER_NOT_OWNED",
                         "Browser provider belongs to another connection",
                     )
                     return
                 if provider["registrationId"] != registration_id:
                     await self._ws_rpc_error(
-                        ws, rpc_id, "BROWSER_REGISTRATION_EXPIRED",
+                        ws,
+                        rpc_id,
+                        "BROWSER_REGISTRATION_EXPIRED",
                         "Browser provider registration has expired",
                     )
                     return
                 cancelled = self._unregister_browser_provider(client_id)
-                await self._ws_rpc_reply(ws, rpc_id, {
-                    "ok": True,
-                    "providerId": provider_id,
-                    "cancelledRequests": cancelled,
-                })
+                await self._ws_rpc_reply(
+                    ws,
+                    rpc_id,
+                    {
+                        "ok": True,
+                        "providerId": provider_id,
+                        "cancelledRequests": cancelled,
+                    },
+                )
 
             elif method == "browser.providers.list":
-                await self._ws_rpc_reply(ws, rpc_id, {
-                    "providers": self._list_browser_providers(),
-                    "activeProviderId": self._browser_provider_active,
-                })
+                await self._ws_rpc_reply(
+                    ws,
+                    rpc_id,
+                    {
+                        "providers": self._list_browser_providers(),
+                        "activeProviderId": self._browser_provider_active,
+                    },
+                )
 
             elif method == "browser.provider.select":
                 provider_id = params.get("providerId")
                 if not isinstance(provider_id, str) or not provider_id:
-                    await self._ws_rpc_error(
-                        ws, rpc_id, "INVALID_REQUEST", "Missing providerId"
-                    )
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "Missing providerId")
                     return
                 if not self._select_browser_provider(provider_id, explicit=True):
                     await self._ws_rpc_error(
                         ws, rpc_id, "NOT_FOUND", f"Browser provider not connected: {provider_id}"
                     )
                     return
-                await self._ws_rpc_reply(ws, rpc_id, {
-                    "ok": True,
-                    "activeProviderId": provider_id,
-                })
+                await self._ws_rpc_reply(
+                    ws,
+                    rpc_id,
+                    {
+                        "ok": True,
+                        "activeProviderId": provider_id,
+                    },
+                )
 
             else:
                 await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", f"Unknown method: {method}")
@@ -1222,7 +1456,9 @@ class GatewayServer:
 
     # --- RPC: exec.approval ---
 
-    async def _ws_rpc_exec_approval_resolve(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_exec_approval_resolve(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         approval_id = params.get("id", "")
         decision = params.get("decision", "")
         if decision not in ("allow-once", "allow-always", "deny"):
@@ -1230,28 +1466,32 @@ class GatewayServer:
             return
 
         from flowly.exec.approval_manager import get_approval_manager
+
         manager = get_approval_manager()
         if manager.resolve(approval_id, decision):
             await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
         else:
             await self._ws_rpc_error(ws, rpc_id, "NOT_FOUND", "Approval not found or expired")
 
-    async def _ws_rpc_exec_approval_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_exec_approval_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         from flowly.exec.approval_manager import get_approval_manager
+        from flowly.exec.wire import approval_to_wire
+
         manager = get_approval_manager()
         pending = manager.list_pending()
-        items = [{
-            "id": p.id,
-            "command": p.request.command,
-            "sessionKey": p.session_key,
-            "expiresAt": p.expires_at,
-            "supportsAlways": getattr(p, "supports_always", True),
-        } for p in pending]
+        # Same serializer as the broadcast: a surface that reconnects and
+        # catches up must see byte-identical objects to the ones it would have
+        # received live, or its dedupe-by-id turns into two different cards.
+        items = [approval_to_wire(p) for p in pending]
         await self._ws_rpc_reply(ws, rpc_id, {"approvals": items})
 
     # --- RPC: agent.clarify ---
 
-    async def _ws_rpc_clarify_resolve(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_clarify_resolve(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         clarify_id = params.get("id", "")
         answer = params.get("answer", "")
         if not clarify_id:
@@ -1262,43 +1502,54 @@ class GatewayServer:
             return
 
         from flowly.clarify.manager import get_clarify_manager
+
         manager = get_clarify_manager()
         if manager.resolve(clarify_id, answer):
             await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
         else:
             await self._ws_rpc_error(ws, rpc_id, "NOT_FOUND", "Clarify not found or expired")
 
-    async def _ws_rpc_clarify_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_clarify_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         from flowly.clarify.manager import get_clarify_manager
+        from flowly.clarify.wire import clarify_to_wire
+
         manager = get_clarify_manager()
-        items = [{
-            "id": p.id,
-            "question": p.question,
-            "choices": p.choices,
-            "sessionKey": p.session_key,
-            "expiresAt": p.expires_at,
-        } for p in manager.list_pending()]
+        # Same serializer as the broadcast — see the approval list for why.
+        items = [clarify_to_wire(p) for p in manager.list_pending()]
         await self._ws_rpc_reply(ws, rpc_id, {"clarifies": items})
 
-    async def broadcast_clarify_request(
-        self,
-        clarify_id: str,
-        question: str,
-        choices: list[str] | None,
-        session_key: str | None,
-        expires_at: float,
-    ) -> None:
+    async def broadcast_clarify_request(self, pending: "ClarifyRequest") -> None:
         """Push an agent clarify request to all connected desktop/web clients."""
+        from flowly.clarify.wire import clarify_to_wire
+
         event = {
             "type": "event",
             "event": "agent.clarify.requested",
-            "data": {
-                "id": clarify_id,
-                "question": question,
-                "choices": choices,
-                "sessionKey": session_key,
-                "expiresAt": expires_at,
-            },
+            "data": clarify_to_wire(pending),
+        }
+        for ws in list(self._ws_clients.values()):
+            await self._ws_send(ws, event)
+
+    async def broadcast_clarify_closed(
+        self,
+        clarify_id: str,
+        reason: str,
+        session_key: str | None,
+    ) -> None:
+        """Tell clients a clarify stopped waiting (``answered`` / ``timeout``).
+
+        The counterpart of ``broadcast_clarify_request``: a surface that drew a
+        prompt needs to retire it when the question is settled elsewhere or
+        expires, or the user answers into a prompt nothing is listening to.
+        """
+        from flowly.clarify.wire import clarify_closed_to_wire
+
+        event = {
+            "type": "event",
+            "event": "agent.clarify.closed",
+            "data": clarify_closed_to_wire(clarify_id, reason, session_key),
         }
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
@@ -1313,9 +1564,12 @@ class GatewayServer:
     def _audit_dir(self) -> Path:
         """Return the active profile's audit directory."""
         from flowly.profile import get_flowly_home
+
         return get_flowly_home() / "audit"
 
-    async def _ws_rpc_audit_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_audit_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """List audit entries with filter + pagination."""
         from flowly.audit.reader import read_entries
 
@@ -1343,7 +1597,9 @@ class GatewayServer:
         )
         await self._ws_rpc_reply(ws, rpc_id, result)
 
-    async def _ws_rpc_audit_stats(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_audit_stats(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """Folder-level stats for the Activity footer."""
         from flowly.audit.reader import get_stats
         from flowly.config.loader import load_config
@@ -1359,31 +1615,56 @@ class GatewayServer:
             pass
         await self._ws_rpc_reply(ws, rpc_id, stats)
 
-    async def _ws_rpc_audit_clear(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_audit_clear(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """Delete every audit file — confirmation lives in the desktop UI."""
         if not params.get("confirm"):
             await self._ws_rpc_error(
-                ws, rpc_id, "INVALID_REQUEST",
+                ws,
+                rpc_id,
+                "INVALID_REQUEST",
                 "Missing confirm=true",
             )
             return
 
         from flowly.audit.reader import clear_audit_logs
+
         result = clear_audit_logs(self._audit_dir())
         await self._ws_rpc_reply(ws, rpc_id, result)
 
-    async def broadcast_approval_request(self, approval_id: str, command: str, session_key: str | None, expires_at: float, supports_always: bool = True) -> None:
+    async def broadcast_approval_request(self, pending: "PendingApproval") -> None:
         """Push an exec approval request to all connected desktop/web clients."""
+        from flowly.exec.wire import approval_to_wire
+
         event = {
             "type": "event",
             "event": "exec.approval.requested",
-            "data": {
-                "id": approval_id,
-                "command": command,
-                "sessionKey": session_key,
-                "expiresAt": expires_at,
-                "supportsAlways": supports_always,
-            },
+            "data": approval_to_wire(pending),
+        }
+        for ws in list(self._ws_clients.values()):
+            await self._ws_send(ws, event)
+
+    async def broadcast_approval_closed(
+        self,
+        approval_id: str,
+        reason: str,
+        session_key: str | None,
+    ) -> None:
+        """Tell clients an approval stopped waiting (decision or ``timeout``).
+
+        The counterpart of ``broadcast_approval_request``, and the exact
+        sibling of ``broadcast_clarify_closed``: a surface that drew a card
+        needs to retire it when the request is settled elsewhere or expires.
+        Without it the stale card's own countdown eventually fires a decision
+        against an id the approval manager has already dropped.
+        """
+        from flowly.exec.wire import approval_closed_to_wire
+
+        event = {
+            "type": "event",
+            "event": "exec.approval.closed",
+            "data": approval_closed_to_wire(approval_id, reason, session_key),
         }
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
@@ -1391,7 +1672,10 @@ class GatewayServer:
     # --- RPC: commands.list ---
 
     async def _ws_rpc_commands_list(
-        self, ws: web.WebSocketResponse, rpc_id: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        params: dict,
     ) -> None:
         """Catalogue every ``/`` command the user can type in chat.
 
@@ -1411,11 +1695,21 @@ class GatewayServer:
         at least the built-ins so the dropdown stays useful.
         """
         from flowly.agent.skill_bundles import build_commands_catalogue
-        await self._ws_rpc_reply(ws, rpc_id, build_commands_catalogue())
+
+        surface = params.get("surface")
+        await self._ws_rpc_reply(
+            ws,
+            rpc_id,
+            build_commands_catalogue(
+                surface=surface if isinstance(surface, str) else None,
+            ),
+        )
 
     # --- RPC: subagents.list ---
 
-    async def _ws_rpc_board_snapshot(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_board_snapshot(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """Return the board snapshot for the TUI's inline /board view."""
         if self.board_store is None:
             await self._ws_rpc_reply(ws, rpc_id, {"snapshot": None})
@@ -1425,15 +1719,21 @@ class GatewayServer:
         except Exception as e:
             await self._ws_rpc_error(ws, rpc_id, "board_error", str(e))
 
-    async def _ws_rpc_board_action(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_board_action(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         """Apply a board action from the TUI (/board run|del|done|cancel|add)."""
         result, _status = await self._apply_board_action(params or {})
         if result.get("ok"):
             await self._ws_rpc_reply(ws, rpc_id, result)
         else:
-            await self._ws_rpc_error(ws, rpc_id, "board_error", result.get("error", "board action failed"))
+            await self._ws_rpc_error(
+                ws, rpc_id, "board_error", result.get("error", "board action failed")
+            )
 
-    async def _ws_rpc_subagents_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_subagents_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         records = []
         if self.subagent_registry:
             self.subagent_registry._load_from_disk()
@@ -1442,18 +1742,24 @@ class GatewayServer:
         # Also include delegate tool running tasks
         if self._delegate_tool:
             for run_id, info in self._delegate_tool._running.items():
-                records.append(type('R', (), {
-                    'run_id': run_id,
-                    'label': info.get('label', f'@{info.get("agent_id", "?")}'),
-                    'task': info.get('task', ''),
-                    'model': info.get('model', ''),
-                    'outcome': None,
-                    'created_at': info.get('started_at', 0),
-                    'started_at': info.get('started_at', 0),
-                    'ended_at': None,
-                    'error': None,
-                    'parent_session_key': '',
-                })())
+                records.append(
+                    type(
+                        "R",
+                        (),
+                        {
+                            "run_id": run_id,
+                            "label": info.get("label", f"@{info.get('agent_id', '?')}"),
+                            "task": info.get("task", ""),
+                            "model": info.get("model", ""),
+                            "outcome": None,
+                            "created_at": info.get("started_at", 0),
+                            "started_at": info.get("started_at", 0),
+                            "ended_at": None,
+                            "error": None,
+                            "parent_session_key": "",
+                        },
+                    )()
+                )
 
         status_filter = params.get("status")
         if status_filter == "running":
@@ -1464,6 +1770,7 @@ class GatewayServer:
             records = [r for r in records if r.outcome in ("error", "timeout")]
 
         import time as _time
+
         tasks = []
         for r in sorted(records, key=lambda x: x.created_at, reverse=True):
             duration = None
@@ -1472,24 +1779,28 @@ class GatewayServer:
             elif r.started_at:
                 duration = round(_time.time() - r.started_at, 1)
 
-            tasks.append({
-                "runId": r.run_id,
-                "label": r.label,
-                "task": r.task,
-                "model": r.model,
-                "status": "running" if r.ended_at is None else (r.outcome or "unknown"),
-                "duration": duration,
-                "createdAt": r.created_at,
-                "endedAt": r.ended_at,
-                "error": r.error,
-                "parentSessionKey": r.parent_session_key,
-            })
+            tasks.append(
+                {
+                    "runId": r.run_id,
+                    "label": r.label,
+                    "task": r.task,
+                    "model": r.model,
+                    "status": "running" if r.ended_at is None else (r.outcome or "unknown"),
+                    "duration": duration,
+                    "createdAt": r.created_at,
+                    "endedAt": r.ended_at,
+                    "error": r.error,
+                    "parentSessionKey": r.parent_session_key,
+                }
+            )
 
         await self._ws_rpc_reply(ws, rpc_id, {"tasks": tasks})
 
     # --- RPC: subagents.cancel ---
 
-    async def _ws_rpc_subagents_cancel(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_subagents_cancel(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         run_id = params.get("runId", "")
         if not run_id:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "runId is required")
@@ -1501,6 +1812,7 @@ class GatewayServer:
 
         result_json = await self._subagent_manager.cancel(run_id)
         import json as _json
+
         result = _json.loads(result_json)
         await self._ws_rpc_reply(ws, rpc_id, result)
 
@@ -1511,36 +1823,50 @@ class GatewayServer:
     # file without a gateway restart.
 
     async def _ws_rpc_assistants_list(
-        self, ws: web.WebSocketResponse, rpc_id: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        params: dict,
     ) -> None:
         registry = getattr(self, "_assistant_registry", None)
         if registry is None:
             await self._ws_rpc_error(
-                ws, rpc_id, "NOT_AVAILABLE", "Assistant registry not wired",
+                ws,
+                rpc_id,
+                "NOT_AVAILABLE",
+                "Assistant registry not wired",
             )
             return
         assistants = []
         for a in registry.all():
-            assistants.append({
-                "name": a.name,
-                "description": a.description,
-                "model": a.model,
-                "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
-                "autoSaveArtifact": a.auto_save_artifact,
-                "artifactType": a.artifact_type,
-                "systemPrompt": a.system_prompt,
-                "builtin": a.builtin,
-                "sourcePath": str(a.source_path) if a.source_path else None,
-            })
+            assistants.append(
+                {
+                    "name": a.name,
+                    "description": a.description,
+                    "model": a.model,
+                    "allowedTools": sorted(a.allowed_tools) if a.allowed_tools else None,
+                    "autoSaveArtifact": a.auto_save_artifact,
+                    "artifactType": a.artifact_type,
+                    "systemPrompt": a.system_prompt,
+                    "builtin": a.builtin,
+                    "sourcePath": str(a.source_path) if a.source_path else None,
+                }
+            )
         await self._ws_rpc_reply(ws, rpc_id, {"assistants": assistants})
 
     async def _ws_rpc_assistants_reload(
-        self, ws: web.WebSocketResponse, rpc_id: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        params: dict,
     ) -> None:
         registry = getattr(self, "_assistant_registry", None)
         if registry is None:
             await self._ws_rpc_error(
-                ws, rpc_id, "NOT_AVAILABLE", "Assistant registry not wired",
+                ws,
+                rpc_id,
+                "NOT_AVAILABLE",
+                "Assistant registry not wired",
             )
             return
         report = registry.reload()
@@ -1578,7 +1904,9 @@ class GatewayServer:
         )
         if result.get("status") == "at_capacity":
             await self._ws_rpc_error(
-                ws, rpc_id, "CAPACITY",
+                ws,
+                rpc_id,
+                "CAPACITY",
                 f"Max {result.get('limit')} concurrent coaching sessions",
             )
             return
@@ -1590,49 +1918,68 @@ class GatewayServer:
         # `seq` and `timestamp` are kwargs from the manager (post-snapshot
         # refactor); they propagate into the event payload so clients can
         # deduplicate live events against rehydrated snapshots.
-        async def _tip_cb(sid: str, tip_text: str, confidence: float, *, seq: int = -1, timestamp: float | None = None) -> None:
+        async def _tip_cb(
+            sid: str,
+            tip_text: str,
+            confidence: float,
+            *,
+            seq: int = -1,
+            timestamp: float | None = None,
+        ) -> None:
             if ws.closed:
                 return
-            await self._ws_send(ws, {
-                "type": "event",
-                "event": "coaching.tip",
-                "data": {
-                    "sessionId": sid,
-                    "text": tip_text,
-                    "confidence": confidence,
-                    "timestamp": timestamp if timestamp is not None else _time.time(),
-                    "seq": seq,
+            await self._ws_send(
+                ws,
+                {
+                    "type": "event",
+                    "event": "coaching.tip",
+                    "data": {
+                        "sessionId": sid,
+                        "text": tip_text,
+                        "confidence": confidence,
+                        "timestamp": timestamp if timestamp is not None else _time.time(),
+                        "seq": seq,
+                    },
                 },
-            })
+            )
 
         async def _transcript_cb(sid: str, text: str, source: str, *, seq: int = -1) -> None:
             if ws.closed:
                 return
-            await self._ws_send(ws, {
-                "type": "event",
-                "event": "coaching.transcript",
-                "data": {"sessionId": sid, "text": text, "source": source, "seq": seq},
-            })
+            await self._ws_send(
+                ws,
+                {
+                    "type": "event",
+                    "event": "coaching.transcript",
+                    "data": {"sessionId": sid, "text": text, "source": source, "seq": seq},
+                },
+            )
 
         async def _finalized_cb(sid: str, summary: dict) -> None:
             if ws.closed:
                 return
-            await self._ws_send(ws, {
-                "type": "event",
-                "event": "coaching.finalized",
-                "data": {"sessionId": sid, **summary},
-            })
+            await self._ws_send(
+                ws,
+                {
+                    "type": "event",
+                    "event": "coaching.finalized",
+                    "data": {"sessionId": sid, **summary},
+                },
+            )
 
         async def _gate_decision_cb(sid: str, **payload) -> None:
             """Forward gate-decision events to the desktop renderer for the
             Diagnostics panel. Best-effort — never raises."""
             if ws.closed:
                 return
-            await self._ws_send(ws, {
-                "type": "event",
-                "event": "coaching.gate_decision",
-                "data": {"sessionId": sid, "timestamp": _time.time(), **payload},
-            })
+            await self._ws_send(
+                ws,
+                {
+                    "type": "event",
+                    "event": "coaching.gate_decision",
+                    "data": {"sessionId": sid, "timestamp": _time.time(), **payload},
+                },
+            )
 
         self._coaching_manager.on_tip(session_id, _tip_cb)
         self._coaching_manager.on_transcript(session_id, _transcript_cb)
@@ -1795,7 +2142,9 @@ class GatewayServer:
 
     # --- RPC: sessions.list ---
 
-    async def _ws_rpc_sessions_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_sessions_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.sessions:
             await self._ws_rpc_reply(ws, rpc_id, {"sessions": []})
             return
@@ -1808,13 +2157,17 @@ class GatewayServer:
             # desktop see); fall back to the key suffix only until the session
             # has been titled after its first exchange.
             title = s.get("title")
-            sessions.append({
-                "key": key,
-                "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
-                "title": title,
-                "createdAt": s.get("created_at"),
-                "updatedAt": s.get("updated_at"),
-            })
+            sessions.append(
+                {
+                    "key": key,
+                    "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
+                    "title": title,
+                    "createdAt": s.get("created_at"),
+                    "updatedAt": s.get("updated_at"),
+                    "lastAssistantRunId": s.get("last_assistant_run_id"),
+                    "lastAssistantAt": s.get("last_assistant_at"),
+                }
+            )
 
         limit = params.get("limit")
         if limit and isinstance(limit, int):
@@ -1824,7 +2177,9 @@ class GatewayServer:
 
     # --- RPC: sessions.delete ---
 
-    async def _ws_rpc_sessions_delete(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_sessions_delete(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         session_key = params.get("sessionKey", "")
         if not session_key or not self.sessions:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "sessionKey is required")
@@ -1835,12 +2190,15 @@ class GatewayServer:
         # that happens to reuse this session_key would inherit the
         # deleted conversation's working directory.
         from flowly.runtime_cwd import clear_session_cwd
+
         clear_session_cwd(session_key)
         await self._ws_rpc_reply(ws, rpc_id, {"deleted": deleted, "sessionKey": session_key})
 
     # --- RPC: chat.history ---
 
-    async def _ws_rpc_chat_history(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_history(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         session_key = params.get("sessionKey", "")
         if not session_key or not self.sessions:
             await self._ws_rpc_reply(ws, rpc_id, {"sessionKey": session_key, "messages": []})
@@ -1876,6 +2234,16 @@ class GatewayServer:
                 msg["tool_call_id"] = m["tool_call_id"]
             if m.get("name"):
                 msg["name"] = m["name"]
+            # Context-boundary rows (a compaction happened here). Typed fields
+            # ride alongside the legacy text so a client can render the divider
+            # without matching a string — the relay's Firestore row carries the
+            # same pair, so both transports look identical to a client.
+            if m.get("kind"):
+                msg["kind"] = m["kind"]
+            if m.get("boundaryKind"):
+                msg["boundaryKind"] = m["boundaryKind"]
+            if m.get("compactionId"):
+                msg["compactionId"] = m["compactionId"]
             # Reconstruct attachment previews from the media paths saved on the
             # user turn. Images get a small base64 JPEG thumbnail (not the full
             # original — that could be 25 MB) so the desktop shows the same
@@ -1888,7 +2256,13 @@ class GatewayServer:
             # reply path. (mediaId is still set for clients that want full-res.)
             media_paths = m.get("media")
             if isinstance(media_paths, list) and media_paths:
-                atts = _reply_media_attachments(media_paths)
+                # Descriptors persisted with the turn. Without them a reopened
+                # chat would have to re-probe every file to learn a clip's
+                # duration — and on a host with no ffmpeg it could not, so the
+                # video would come back from history poorer than it was live.
+                atts = _reply_media_attachments(
+                    media_paths, _assets_index(m.get("media_assets"))
+                )
                 if atts:
                     msg["attachments"] = atts
             if "timestamp" in m:
@@ -1897,22 +2271,40 @@ class GatewayServer:
                 msg["usage"] = m["usage"]
             if m.get("aborted") is True:
                 msg["aborted"] = True
+            run_id = m.get("run_id")
+            if isinstance(run_id, str) and run_id:
+                msg["runId"] = run_id
             duration_ms = m.get("duration_ms")
             if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
                 msg["durationMs"] = max(0, int(duration_ms))
             messages.append(msg)
 
-        await self._ws_rpc_reply(ws, rpc_id, {
-            "sessionKey": session_key,
-            "sessionId": session_key,
-            "messages": messages,
-            "thinkingLevel": session.metadata.get("thinkingLevel"),
-        })
+        # ``messages`` is a transport DTO, not provider history. Flatten any
+        # deferred-call wrappers here so a reopened Desktop/iOS conversation
+        # renders the same effective tool identity it showed while streaming.
+        from flowly.tool_activity import project_tool_messages_for_ui
+
+        messages = project_tool_messages_for_ui(messages)
+
+        await self._ws_rpc_reply(
+            ws,
+            rpc_id,
+            {
+                "sessionKey": session_key,
+                "sessionId": session_key,
+                "messages": messages,
+                "thinkingLevel": session.metadata.get("thinkingLevel"),
+            },
+        )
 
     # --- RPC: chat.send ---
 
     async def _ws_rpc_chat_send(
-        self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        client_id: str,
+        rpc_id: str,
+        params: dict,
     ) -> None:
         message = params.get("message", "")
         attachments = params.get("attachments") or []
@@ -1948,11 +2340,10 @@ class GatewayServer:
         cwd = params.get("cwd")
         if cwd:
             from flowly.runtime_cwd import set_session_cwd
+
             try:
                 set_session_cwd(session_key, cwd)
-                logger.info(
-                    f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}"
-                )
+                logger.info(f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}")
             except ValueError:
                 # Defensive: a client may ship a path that doesn't exist
                 # on this host (older client without per-kind cwd gating,
@@ -1971,6 +2362,7 @@ class GatewayServer:
         # `.get(..., False)` is strict-validation-free so an old bot
         # ignores this silently (forward compat already verified).
         voice_mode = bool(params.get("voiceMode", False))
+        render_capabilities = normalize_render_capabilities(params.get("renderCapabilities"))
 
         # Save attachments to disk
         media: list[str] = []
@@ -1988,21 +2380,33 @@ class GatewayServer:
         # Build streaming callback that pushes delta events to the session's
         # CURRENT socket (follows the latest viewer on re-entry).
         async def stream_callback(delta: str) -> None:
-            await self._session_send(session_key, ws, {
-                "type": "event",
-                "event": "agent",
-                "data": {
-                    "runId": run_id,
-                    "stream": "assistant",
-                    "data": {"text": delta},
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "agent",
+                    "data": {
+                        "runId": run_id,
+                        "stream": "assistant",
+                        "data": {"text": delta},
+                    },
                 },
-            })
+            )
 
         # Process in background so we don't block the recv loop.
         task = asyncio.create_task(
             self._run_chat(
-                ws, client_id, session_key, message, run_id,
-                stream_callback, media, voice_mode, browser_binding,
+                ws,
+                client_id,
+                session_key,
+                message,
+                run_id,
+                stream_callback,
+                media,
+                voice_mode,
+                browser_binding,
+                render_capabilities,
             )
         )
         self._active_tasks[run_id] = task
@@ -2019,6 +2423,7 @@ class GatewayServer:
         media: list[str] | None = None,
         voice_mode: bool = False,
         browser_binding: _BrowserRunBinding | None = None,
+        render_capabilities: tuple[str, ...] = (),
     ) -> None:
         """Execute the chat and send final/error events."""
         run_started_at = asyncio.get_running_loop().time()
@@ -2027,6 +2432,7 @@ class GatewayServer:
         # Track the in-flight stream so a client that leaves and re-enters
         # mid-run can fetch the partial via the chat.inflight RPC.
         from flowly.agent import inflight
+
         inflight.begin(session_key, run_id, message)
 
         # Wrap the stream callback to accumulate full text for the final event.
@@ -2058,8 +2464,14 @@ class GatewayServer:
         try:
             assert self.on_chat_message is not None
             result = await self.on_chat_message(
-                session_key, message, run_id, tracking_callback, media or [], voice_mode,
+                session_key,
+                message,
+                run_id,
+                tracking_callback,
+                media or [],
+                voice_mode,
                 iteration_callback,
+                render_capabilities,
             )
             # Back-compat: older callbacks returned bare text. Detect the
             # tuple form and fall back to ``{}`` metadata otherwise so
@@ -2076,20 +2488,28 @@ class GatewayServer:
             # crashes. Emit the native error event with stable machine fields
             # and safe copy; never place a wrapped SDK payload on the wire.
             if isinstance(provider_error, dict):
-                await self._session_send(session_key, ws, {
-                    "type": "event",
-                    "event": "chat",
-                    "data": {
-                        "state": "error",
-                        "runId": run_id,
-                        "sessionKey": session_key,
-                        "model": model,
-                        "errorCode": str(provider_error.get("code") or "MODEL_PROVIDER_UNAVAILABLE"),
-                        "errorTitle": str(provider_error.get("title") or "The model couldn't respond"),
-                        "errorMessage": str(provider_error.get("message") or response),
-                        "retryable": bool(provider_error.get("retryable", False)),
+                await self._session_send(
+                    session_key,
+                    ws,
+                    {
+                        "type": "event",
+                        "event": "chat",
+                        "data": {
+                            "state": "error",
+                            "runId": run_id,
+                            "sessionKey": session_key,
+                            "model": model,
+                            "errorCode": str(
+                                provider_error.get("code") or "MODEL_PROVIDER_UNAVAILABLE"
+                            ),
+                            "errorTitle": str(
+                                provider_error.get("title") or "The model couldn't respond"
+                            ),
+                            "errorMessage": str(provider_error.get("message") or response),
+                            "retryable": bool(provider_error.get("retryable", False)),
+                        },
                     },
-                })
+                )
                 return
 
             # Send final chat event. ``usage`` rides inside ``message`` so
@@ -2112,7 +2532,9 @@ class GatewayServer:
             }
             reply_media = (metadata or {}).get("media") or []
             if reply_media:
-                atts = _reply_media_attachments(reply_media)
+                atts = _reply_media_attachments(
+                    reply_media, _assets_index((metadata or {}).get(ASSETS_META_KEY))
+                )
                 if atts:
                     final_message["attachments"] = atts
 
@@ -2121,12 +2543,26 @@ class GatewayServer:
                 "runId": run_id,
                 "sessionKey": session_key,
                 "model": model,
+                "completedAt": datetime.now(timezone.utc).isoformat(),
                 "message": final_message,
             }
+            # Context-window occupancy + ceiling, both already normalized for
+            # the active provider by the agent loop. Sent as separate fields
+            # (not inside ``usage``) because ``usage`` is the raw provider
+            # dialect and clients must not have to guess which one it is.
+            # Omitted when unknown so a client's own fallback still runs.
+            context_tokens = (metadata or {}).get("contextTokens")
+            if isinstance(context_tokens, int) and context_tokens > 0:
+                final_data["contextTokens"] = context_tokens
+            context_window = (metadata or {}).get("contextWindow")
+            if isinstance(context_window, int) and context_window > 0:
+                final_data["contextWindow"] = context_window
             if (metadata or {}).get("aborted") is True:
                 final_data["aborted"] = True
             metadata_duration = (metadata or {}).get("duration_ms")
-            if isinstance(metadata_duration, (int, float)) and not isinstance(metadata_duration, bool):
+            if isinstance(metadata_duration, (int, float)) and not isinstance(
+                metadata_duration, bool
+            ):
                 final_data["durationMs"] = max(0, int(metadata_duration))
             else:
                 final_data["durationMs"] = max(
@@ -2134,36 +2570,54 @@ class GatewayServer:
                     int((asyncio.get_running_loop().time() - run_started_at) * 1000),
                 )
 
-            await self._session_send(session_key, ws, {
-                "type": "event",
-                "event": "chat",
-                "data": final_data,
-            })
-            self._schedule_offline_chat_push(session_key, response)
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "chat",
+                    "data": final_data,
+                },
+            )
+            if not final_data.get("aborted"):
+                self._schedule_offline_chat_push(
+                    session_key,
+                    response,
+                    run_id=run_id,
+                    completed_at=final_data["completedAt"],
+                )
         except asyncio.CancelledError:
-            await self._session_send(session_key, ws, {
-                "type": "event",
-                "event": "chat",
-                "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key},
-            })
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "chat",
+                    "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key},
+                },
+            )
         except Exception as e:
             # Unexpected exceptions are logged with their native detail for
             # operators, but the gateway wire contract never exposes reprs,
             # SDK payloads, filesystem paths, or provider internals.
             logger.exception(f"[WS] chat.send run {run_id} failed: {e}")
-            await self._session_send(session_key, ws, {
-                "type": "event",
-                "event": "chat",
-                "data": {
-                    "state": "error",
-                    "runId": run_id,
-                    "sessionKey": session_key,
-                    "errorCode": "AGENT_INTERNAL_ERROR",
-                    "errorTitle": "The agent hit an unexpected error",
-                    "errorMessage": "Try again. If this continues, restart the bot.",
-                    "retryable": True,
+            await self._session_send(
+                session_key,
+                ws,
+                {
+                    "type": "event",
+                    "event": "chat",
+                    "data": {
+                        "state": "error",
+                        "runId": run_id,
+                        "sessionKey": session_key,
+                        "errorCode": "AGENT_INTERNAL_ERROR",
+                        "errorTitle": "The agent hit an unexpected error",
+                        "errorMessage": "Try again. If this continues, restart the bot.",
+                        "retryable": True,
+                    },
                 },
-            })
+            )
         finally:
             _BROWSER_RUN_BINDING.reset(binding_token)
             # Run settled (final / aborted / error) — the partial is no
@@ -2172,7 +2626,9 @@ class GatewayServer:
 
     # --- RPC: chat.abort ---
 
-    async def _ws_rpc_chat_abort(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_abort(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         run_id = params.get("runId", "")
         cancelled = False
         abort_callback = getattr(self, "on_chat_abort", None)
@@ -2194,7 +2650,9 @@ class GatewayServer:
     # RPC: chat.compact / chat.clear
     # ------------------------------------------------------------------
 
-    async def _ws_rpc_chat_compact(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_compact(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.on_compact:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Compaction not available")
         session_key = params.get("sessionKey", "desktop:default")
@@ -2206,7 +2664,9 @@ class GatewayServer:
             logger.error(f"[WS] chat.compact error: {e}")
             await self._ws_rpc_error(ws, rpc_id, "INTERNAL", str(e))
 
-    async def _ws_rpc_chat_clear(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_clear(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.on_clear:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Clear not available")
         session_key = params.get("sessionKey", "desktop:default")
@@ -2217,7 +2677,9 @@ class GatewayServer:
             logger.error(f"[WS] chat.clear error: {e}")
             await self._ws_rpc_error(ws, rpc_id, "INTERNAL", str(e))
 
-    async def _ws_rpc_chat_retry(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_chat_retry(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.on_retry:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Retry not available")
         session_key = params.get("sessionKey", "desktop:default")
@@ -2252,7 +2714,10 @@ class GatewayServer:
             pass
 
     async def _session_send(
-        self, session_key: str, fallback_ws: web.WebSocketResponse, data: dict,
+        self,
+        session_key: str,
+        fallback_ws: web.WebSocketResponse,
+        data: dict,
     ) -> None:
         """Send a live stream event to the session's CURRENT socket.
 
@@ -2270,13 +2735,22 @@ class GatewayServer:
             self._session_ws[session_key] = ws
 
     def _session_has_live_ws(
-        self, session_key: str, fallback_ws: web.WebSocketResponse | None = None,
+        self,
+        session_key: str,
+        fallback_ws: web.WebSocketResponse | None = None,
     ) -> bool:
         """Whether a session currently has an open direct-gateway socket."""
         target = self._session_ws.get(session_key) or fallback_ws
         return bool(target is not None and not target.closed)
 
-    def _schedule_offline_chat_push(self, session_key: str, text: str) -> None:
+    def _schedule_offline_chat_push(
+        self,
+        session_key: str,
+        text: str,
+        *,
+        run_id: str = "",
+        completed_at: str | None = None,
+    ) -> None:
         """Wake registered iOS/Android clients when a direct chat finished offline.
 
         Relay-backed chats are handled by the hosted relay's Firestore/device
@@ -2284,22 +2758,27 @@ class GatewayServer:
         clients install with ``push.register``; it is a no-op when no device has
         registered push credentials.
         """
-        if not text or self._session_has_live_ws(session_key):
+        if self._session_has_live_ws(session_key):
             return
 
         preview = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
         if not preview:
-            return
+            preview = "New message"
 
         async def _run() -> None:
             try:
                 from flowly.push.relay_push import notify_devices
 
+                push_data = {"type": "chat"}
+                if run_id:
+                    push_data["runId"] = run_id
+                if completed_at:
+                    push_data["completedAt"] = completed_at
                 await notify_devices(
                     "Flowly",
                     preview[:140],
                     conversation_id=session_key,
-                    data={"type": "chat"},
+                    data=push_data,
                 )
             except Exception as exc:  # pragma: no cover - best-effort background notify
                 logger.debug(f"[push] offline chat notify skipped: {exc}")
@@ -2307,7 +2786,11 @@ class GatewayServer:
         asyncio.create_task(_run())
 
     async def _handle_feature_rpc(
-        self, ws: web.WebSocketResponse, rpc_id: str, method: str, params: dict,
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        method: str,
+        params: dict,
     ) -> None:
         """Serve a feature RPC via the shared ``feature_rpc`` dispatch — the
         exact handlers the relay channel serves, so the desktop sees identical
@@ -2340,15 +2823,19 @@ class GatewayServer:
 
     def _schedule_feature_restart(self) -> None:
         """Bounce the gateway after the ACK frame has flushed."""
+
         async def _run() -> None:
             await asyncio.sleep(0.5)
             try:
                 from flowly.integrations.service_control import restart_gateway
+
                 await restart_gateway(
-                    health_check_host=self.host, health_check_port=self.port,
+                    health_check_host=self.host,
+                    health_check_port=self.port,
                 )
             except Exception:
                 logger.exception("[Gateway] feature restart failed")
+
         asyncio.create_task(_run())
 
     async def _ws_rpc_reply(self, ws: web.WebSocketResponse, rpc_id: str, result: Any) -> None:
@@ -2440,9 +2927,7 @@ class GatewayServer:
             or len(provider_id) > 64
             or any(char not in _BROWSER_PROVIDER_ID_CHARS for char in provider_id)
         ):
-            raise ValueError(
-                "providerId must be 1-64 ASCII letters, digits, '-', '_', '.', or ':'"
-            )
+            raise ValueError("providerId must be 1-64 ASCII letters, digits, '-', '_', '.', or ':'")
 
         raw_type = params.get("type")
         if raw_type is not None and not isinstance(raw_type, str):
@@ -2464,9 +2949,7 @@ class GatewayServer:
         if legacy and provider_type not in _BROWSER_PROVIDER_TYPES:
             provider_type = "chrome_extension"
         if provider_type not in _BROWSER_PROVIDER_TYPES:
-            raise ValueError(
-                f"type must be one of: {', '.join(sorted(_BROWSER_PROVIDER_TYPES))}"
-            )
+            raise ValueError(f"type must be one of: {', '.join(sorted(_BROWSER_PROVIDER_TYPES))}")
 
         display_name = params.get("displayName")
         if not isinstance(display_name, str) or not display_name.strip():
@@ -2547,26 +3030,23 @@ class GatewayServer:
                 key=lambda item: item["registrationOrder"],
                 reverse=True,
             ):
-                if candidate["id"] != provider_id and self._select_browser_provider(candidate["id"]):
+                if candidate["id"] != provider_id and self._select_browser_provider(
+                    candidate["id"]
+                ):
                     break
 
         # Preserve released extension behaviour (newest registration wins)
         # until a UI/user explicitly selects a provider. Re-registering the
         # selected provider refreshes its connection without losing selection.
-        if (
-            not session_scoped
-            and (
-                not self._browser_provider_active
-                or not self._browser_provider_selection_explicit
-                or self._browser_provider_active == provider_id
-            )
+        if not session_scoped and (
+            not self._browser_provider_active
+            or not self._browser_provider_selection_explicit
+            or self._browser_provider_active == provider_id
         ):
             self._select_browser_provider(provider_id)
         return {
             "ok": True,
-            "provider": self._public_browser_provider(
-                provider, include_registration=True
-            ),
+            "provider": self._public_browser_provider(provider, include_registration=True),
         }
 
     def _public_browser_provider(
@@ -2741,14 +3221,17 @@ class GatewayServer:
         provider["activeRequestId"] = request_id
 
         try:
-            await self._ws_send(ws, {
-                "type": "tool_request",
-                "id": request_id,
-                "action": action,
-                "params": params,
-                "providerId": target_provider_id,
-                "registrationId": provider["registrationId"],
-            })
+            await self._ws_send(
+                ws,
+                {
+                    "type": "tool_request",
+                    "id": request_id,
+                    "action": action,
+                    "params": params,
+                    "providerId": target_provider_id,
+                    "registrationId": provider["registrationId"],
+                },
+            )
             return await future
         finally:
             self._extension_pending.pop(request_id, None)
@@ -2757,9 +3240,7 @@ class GatewayServer:
             if provider.get("activeRequestId") == request_id:
                 provider.pop("activeRequestId", None)
 
-    async def send_extension_tool_request(
-        self, request_id: str, action: str, params: dict
-    ) -> dict:
+    async def send_extension_tool_request(self, request_id: str, action: str, params: dict) -> dict:
         """Compatibility alias for released agent/browser tool code."""
         return await self.send_browser_tool_request(request_id, action, params)
 
@@ -2778,10 +3259,11 @@ class GatewayServer:
         provider_id = self._browser_client_provider.get(client_id)
         provider = self._browser_providers.get(provider_id or "")
         received_registration_id = data.get("registrationId")
-        if received_registration_id is not None and received_registration_id != expected_registration_id:
-            logger.warning(
-                f"[WS] Ignoring browser result {request_id!r} from stale registration"
-            )
+        if (
+            received_registration_id is not None
+            and received_registration_id != expected_registration_id
+        ):
+            logger.warning(f"[WS] Ignoring browser result {request_id!r} from stale registration")
             return
         if (
             provider is not None
@@ -2856,18 +3338,25 @@ class GatewayServer:
             except Exception as e:
                 logger.debug(f"agent_state push to {client_id} failed: {e}")
 
-    async def _ws_rpc_error(self, ws: web.WebSocketResponse, rpc_id: str, code: str, message: str) -> None:
-        await self._ws_send(ws, {
-            "type": "rpc",
-            "id": rpc_id,
-            "error": {"code": code, "message": message},
-        })
+    async def _ws_rpc_error(
+        self, ws: web.WebSocketResponse, rpc_id: str, code: str, message: str
+    ) -> None:
+        await self._ws_send(
+            ws,
+            {
+                "type": "rpc",
+                "id": rpc_id,
+                "error": {"code": code, "message": message},
+            },
+        )
 
     # ------------------------------------------------------------------
     # RPC: artifacts
     # ------------------------------------------------------------------
 
-    async def _ws_rpc_artifacts_list(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_list(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         limit = int(params.get("limit", 50))
@@ -2892,7 +3381,9 @@ class GatewayServer:
             results = [artifact_summary(a) for a in results]
         await self._ws_rpc_reply(ws, rpc_id, {"artifacts": results})
 
-    async def _ws_rpc_artifacts_get(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_get(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact = self.artifact_store.get(params.get("id", ""))
@@ -2900,16 +3391,22 @@ class GatewayServer:
             return await self._ws_rpc_error(ws, rpc_id, "NOT_FOUND", "Artifact not found")
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
 
-    async def _ws_rpc_artifacts_create(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_create(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         art_type = params.get("type", "")
         title = params.get("title", "")
         content = params.get("content", "")
         if not art_type or not title or not content:
-            return await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "type, title, content required")
+            return await self._ws_rpc_error(
+                ws, rpc_id, "INVALID_REQUEST", "type, title, content required"
+            )
         artifact = self.artifact_store.create(
-            type=art_type, title=title, content=content,
+            type=art_type,
+            title=title,
+            content=content,
             pinned=params.get("pinned", False),
             dashboard_size=params.get("dashboardSize", "medium"),
             tags=params.get("tags"),
@@ -2918,7 +3415,9 @@ class GatewayServer:
         await self._broadcast_artifact_event("artifact.created", artifact)
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
 
-    async def _ws_rpc_artifacts_update(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_update(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact_id = params.get("id", "")
@@ -2937,7 +3436,9 @@ class GatewayServer:
         await self._broadcast_artifact_event("artifact.updated", artifact)
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
 
-    async def _ws_rpc_artifacts_delete(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_delete(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact_id = params.get("id", "")
@@ -2949,7 +3450,9 @@ class GatewayServer:
         await self._broadcast_artifact_event("artifact.deleted", {"id": artifact_id})
         await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
 
-    async def _ws_rpc_artifacts_pin(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_pin(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact_id = params.get("id", "")
@@ -2962,7 +3465,9 @@ class GatewayServer:
         await self._broadcast_artifact_event("artifact.updated", artifact)
         await self._ws_rpc_reply(ws, rpc_id, {"artifact": artifact})
 
-    async def _ws_rpc_artifacts_versions(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+    async def _ws_rpc_artifacts_versions(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
         artifact_id = params.get("id", "")
@@ -2978,8 +3483,23 @@ class GatewayServer:
             await self._ws_send(ws, event)
 
     async def _broadcast_compaction_event(self, data: dict) -> None:
-        """Push compaction event to all connected WS clients."""
+        """Push a compaction event to clients watching that session.
+
+        Compaction is a property of one conversation, so a blanket broadcast
+        put another chat's (or a cron run's) compaction notice into every open
+        transcript. Clients still filter defensively, but the server should not
+        be sending them the event in the first place.
+        """
         event = {"type": "event", "event": "compaction", "data": data}
+        session_key = str(data.get("sessionKey") or "")
+        target = self._session_ws.get(session_key) if session_key else None
+        if target is not None and not target.closed:
+            await self._ws_send(target, event)
+            return
+        # No live socket bound to this session (a client that connected but
+        # hasn't sent yet, or a rebind in flight). Fall back to everyone —
+        # a redundant notice beats a missing one, and clients filter on
+        # sessionKey anyway.
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 
@@ -3119,6 +3639,7 @@ class GatewayServer:
         if self.on_send and self._control_token:
             try:
                 from flowly.mcp.server.control import write_api_file
+
                 write_api_file(self.host, self.port, self._control_token)
             except Exception as exc:  # pragma: no cover
                 logger.debug("MCP control advertise failed: {}", exc)
@@ -3132,6 +3653,7 @@ class GatewayServer:
         if self.on_send and self._control_token:
             try:
                 from flowly.mcp.server.control import remove_api_file
+
                 remove_api_file()
             except Exception:
                 pass

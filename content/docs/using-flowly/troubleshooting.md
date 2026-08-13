@@ -88,12 +88,32 @@ the last line of its error is shown; `flowly service logs --no-follow` has the
 rest.
 
 **Port already in use / "gateway already running".**
-Something is already listening on the gateway port (default `18790`) — usually a
-foreground `flowly gateway` or a duplicate of the service. `flowly service status`
-shows a diagnostic and warns when a gateway is running **outside** the service.
-Stop the stray process (or `flowly service stop`) before starting again. Flowly
-never force-kills a gateway it didn't start — including the one Flowly Desktop
-manages — so two installs won't fight over the port silently.
+Something is already listening on the gateway port (default `18790`). If that
+something is *your own* background service, `flowly gateway` handles it for you:
+it asks, stops the service, serves the port itself, and restarts the service when
+you exit. Anything else — a foreground gateway you started elsewhere, another
+app, the one Flowly Desktop manages — is never touched; `flowly service status`
+names it, and you stop it yourself. Flowly force-kills nothing it didn't start,
+so two installs can't fight over the port silently.
+
+**macOS asks for a keychain, or says "a keychain cannot be found".**
+Expected on macOS, and nothing is wrong with your Mac. The CLI runs inside
+Flowly's sandbox, which hides `~/Library/Keychains` from the agent on purpose,
+so credentials are written to `0600` files under `~/.flowly/credentials/`
+instead. Current versions skip the keychain outright while sandboxed, so the
+panel no longer appears; if you saw it once on an older version, the fallback
+already saved your tokens correctly. `flowly keychain status` shows where
+credentials live, and `flowly keychain retry` clears the "keychain unavailable"
+marker if you want Flowly to try again (for instance when running with
+`FLOWLY_SANDBOX=0`).
+
+**Setup said the provider didn't answer.**
+`flowly setup` sends one small request before claiming success, so this is the
+provider talking, not Flowly. The line tells you which case it is — a rejected
+key (paste it again; setup echoes the last four characters so you can check it
+arrived whole), no credit left, a plan that doesn't cover the model, or an
+unreachable network. Your configuration is saved either way; rerun `flowly
+setup` or `flowly doctor` after fixing it.
 
 ### Windows-specific
 
@@ -102,22 +122,17 @@ No. `flowly service install` tries Task Scheduler first and, if that's denied,
 automatically falls back to a Startup-folder launcher that runs the gateway at
 logon — no elevation required either way.
 
-**A `~lowly-ai` folder appears / "flowly" isn't recognized (packaged pip install).**
-Specific to a `pip install --user flowly-ai` install: an interrupted `pip`
-upgrade — or one that ran while `flowly.exe` was locked — can leave a partial
-`~`-prefixed folder in your user site-packages. `flowly update` now relaunches
-itself on Windows to avoid the locked-exe case, but if you land in a half-broken
-state, delete the leftover and reinstall:
+**A `~lowly-ai` folder appears / "flowly" isn't recognized (legacy pip install).**
+Specific to the old PyPI-era `pip install --user flowly-ai` installs: an
+interrupted `pip` upgrade could leave a partial `~`-prefixed folder in your
+user site-packages. Those installs no longer receive updates — clean up the
+leftover and migrate to the current install, which never touches site-packages:
 
 ```powershell
 $sp = python -m site --user-site
 Remove-Item (Join-Path $sp "~lowly*") -Recurse -Force -ErrorAction SilentlyContinue
-pip install --user --force-reinstall flowly-ai
+irm https://useflowlyapp.com/install.ps1 | iex
 ```
-
-A git-checkout install — the default from the install script — never touches
-site-packages, so this can't happen to it; re-run the installer or `flowly
-update` to repair one.
 
 **A `UnicodeEncodeError` / `cp1252` traceback on Windows.**
 Flowly's `✦` logo (and other Unicode) can't encode on a non-UTF-8 Windows

@@ -8,8 +8,8 @@ Flowly Desktop and Flowly CLI are distributed differently:
 - CLI installs from a **git checkout**: the native script clones the repository,
   builds an isolated uv-managed virtualenv, and installs Flowly into it as an
   editable checkout. That checkout is what lets `flowly update` fast-forward with
-  `git pull` between PyPI releases. The installer must not download a second
-  standalone Flowly binary for normal users.
+  `git pull`. The installer must not download a second standalone Flowly binary
+  for normal users.
 
 ## Public Install Commands
 
@@ -74,22 +74,25 @@ The combined `/download` page should make the split explicit:
 - Desktop App: native GUI app with embedded local runtime.
 - CLI/TUI: terminal-first **git-checkout** install; uv-managed Python on every
   platform, portable git fetched on Windows when missing. `flowly update` pulls
-  the latest straight from git — no PyPI release required.
+  the latest straight from git.
 
-## Packaged install methods (still supported)
+## Legacy packaged installs (PyPI — retired)
 
-Users who prefer a PyPI package install can still do it by hand:
+Flowly no longer publishes releases to PyPI. The git checkout produced by the
+native scripts is the only install path that receives updates.
 
-```bash
-uv tool install flowly-ai      # isolated env
-pipx install flowly-ai         # isolated env
-pip install --user flowly-ai   # plain pip
-```
+Installs made back when the package was published (`uv tool install flowly-ai`,
+`pipx install flowly-ai`, `pip install --user flowly-ai`) still run, but can
+never move forward. `flowly update` recognises them and says so, pointing at the
+install script, which migrates in place: `~/.flowly` is untouched, the old
+package is retired only after the new install proves it works, and an installed
+background service is rewritten onto the new install and restarted.
 
-`flowly update` detects each of these and upgrades via the matching command
-(`uv tool upgrade`, `pipx upgrade`, `pip install --upgrade`). They track PyPI
-releases; only the git-checkout install produced by the native scripts receives
-between-release updates.
+Because that path is gone, so is its machinery: `update` no longer queries the
+PyPI JSON API, and the Windows detached-updater helper (which existed only
+because pip had to replace a running `flowly.exe`) was removed — the git
+install's launcher runs `python -m flowly`, so nothing overwrites a running
+executable.
 
 ## Desktop Runtime Note
 

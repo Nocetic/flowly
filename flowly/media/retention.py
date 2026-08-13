@@ -1,149 +1,261 @@
-"""Generated-media retention — age + size based pruning.
+"""Generated-media retention — reclaiming ``~/.flowly/media`` without breaking it.
 
-Generation tools (``image_generate`` and, later, video/speech) drop files under
-``<flowly home>/media`` so the delivery path can serve full-resolution media via
-``/api/media``. Nothing deleted them: the disk-cleanup plugin deliberately
-*protects* ``~/.flowly/media``, so on an always-on bot that generates images the
-folder grows without bound until the disk fills.
+Generation tools drop files here and the delivery path serves them from here, so
+nothing else reclaims the folder: the disk-cleanup plugin deliberately protects
+it. Left alone on an always-on agent it grows until the disk fills.
 
-This runs once at gateway start, mirroring :mod:`flowly.audit.retention`:
+Three decisions shape this module.
 
-  1. Age cap: any file older than ``retention_days`` is deleted. The default
-     (30 days) is generous enough that a recently generated image stays
-     re-fetchable from chat history, while old ones are reclaimed.
-  2. Size cap: if the folder is still larger than ``max_size_mb``, the oldest
-     remaining files are deleted until the total is under cap.
+**A clip and its poster are ONE thing.** ``vid-abc.mp4`` and ``vid-abc.jpg`` are
+two files but a single attachment, and deleting one without the other leaves a
+video with no preview or a preview with no video. Pruning therefore works on
+*units*, never on loose files.
 
-Both caps are best-effort and never raise — pruning must not block startup. A
-value of ``-1`` (age) or ``0`` (size) disables that cap. Only regular files
-directly inside the media dir are touched (the folder is owned by the
-generation layer); subdirectories are left alone.
+**Age is about relevance; size is about disk.** So there is one age cap for
+everything — a month-old clip is as stale as a month-old screenshot — and
+SEPARATE size budgets per kind. Video is one to two orders of magnitude larger
+than an image, and a shared budget means generating video silently evicts
+screenshots somebody still wanted. Audio earned its own budget the moment the
+media library made tracks browsable: a handful of generated songs sits between
+an image and a clip in size, and under the image budget a short music session
+would quietly evict months of screenshots.
+
+**Nothing deletes what was just made.** Callers pruning right after a generation
+pass the new files as ``protect``, so a clip larger than its own budget fails
+loudly at the quota rather than vanishing the moment it lands.
+
+Every cap is best-effort and never raises — pruning must not block startup or a
+reply. ``retention_days=-1`` disables the age cap; a size budget of ``0``
+disables that budget. Only regular files directly inside the media dir are
+touched; subdirectories belong to other code.
 """
 
 from __future__ import annotations
 
+import mimetypes
 import time
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from loguru import logger as _logger
 
 DEFAULT_RETENTION_DAYS = 30
-DEFAULT_MAX_SIZE_MB = 500
+
+# Separate budgets, sized to what each kind actually costs. A generated clip
+# runs from under a megabyte to tens of megabytes depending on length and
+# resolution; images are a fraction of that. The image budget is unchanged from
+# when this folder held nothing else, so no existing install suddenly prunes
+# differently because video arrived.
+DEFAULT_IMAGE_MAX_SIZE_MB = 500
+DEFAULT_VIDEO_MAX_SIZE_MB = 2000
+DEFAULT_AUDIO_MAX_SIZE_MB = 1000
+
+#: Bucket a kind falls into for the size cap. Stray files ride the image
+#: budget — they are rare, small, and not worth a knob of their own.
+_BUDGET_FOR_KIND = {"video": "video", "image": "image", "audio": "audio", "file": "image"}
+
+#: Every bucket, so totals start at zero even for a kind the directory happens
+#: not to contain yet.
+_BUDGETS = ("image", "video", "audio")
 
 
-def _media_files(media_dir: Path) -> list[Path]:
-    """Return the regular files directly in ``media_dir``, oldest first."""
-    if not media_dir.exists() or not media_dir.is_dir():
-        return []
-    files = [p for p in media_dir.iterdir() if p.is_file()]
-    files.sort(key=lambda p: p.stat().st_mtime)
-    return files
+@dataclass(frozen=True, slots=True)
+class MediaUnit:
+    """One attachment on disk: a primary file plus any sidecars it owns."""
+
+    paths: tuple[Path, ...]
+    kind: str
+    size: int
+    #: The NEWEST member's mtime. A unit is as fresh as its freshest file, so
+    #: regenerating a poster can't make the clip look stale.
+    mtime: float
+
+    @property
+    def budget(self) -> str:
+        return _BUDGET_FOR_KIND.get(self.kind, "image")
 
 
-def _safe_unlink(path: Path) -> int:
-    """Delete a file, returning its size if successful (0 otherwise)."""
+def _kind_of(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    mime = mime or ""
+    if mime.startswith("video/"):
+        return "video"
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("audio/"):
+        return "audio"
+    return "file"
+
+
+def _safe_size(path: Path) -> int:
     try:
-        size = path.stat().st_size
+        return path.stat().st_size
     except OSError:
         return 0
+
+
+def _safe_mtime(path: Path) -> float:
     try:
-        path.unlink()
+        return path.stat().st_mtime
+    except OSError:
+        # Unreadable: treat as brand new so a stat failure never causes a
+        # deletion it wouldn't otherwise have caused.
+        return time.time()
+
+
+def media_units(media_dir: Path) -> list[MediaUnit]:
+    """Group the media directory into deletable units, oldest first.
+
+    A video or audio file absorbs same-stem IMAGE files as sidecars — that is
+    exactly the poster relationship, and nothing else in this folder produces
+    it. Anything not in that relationship stays its own unit, so two unrelated
+    files that happen to share a stem (``cat.jpg`` and ``cat.png``) are never
+    deleted together.
+    """
+    if not media_dir.exists() or not media_dir.is_dir():
+        return []
+    try:
+        files = [p for p in media_dir.iterdir() if p.is_file()]
     except OSError as exc:
-        _logger.debug("[Media] retention: unlink failed for {}: {}", path, exc)
-        return 0
-    return size
+        _logger.debug("[Media] retention: list failed for {}: {}", media_dir, exc)
+        return []
+
+    by_stem: dict[str, list[Path]] = {}
+    for path in files:
+        by_stem.setdefault(path.stem, []).append(path)
+
+    units: list[MediaUnit] = []
+    for members in by_stem.values():
+        primaries = [p for p in members if _kind_of(p) in ("video", "audio")]
+        sidecars = [p for p in members if _kind_of(p) == "image"]
+
+        if len(primaries) == 1 and len(primaries) + len(sidecars) == len(members):
+            grouped = (primaries[0], *sidecars)
+            units.append(
+                MediaUnit(
+                    paths=grouped,
+                    kind=_kind_of(primaries[0]),
+                    size=sum(_safe_size(p) for p in grouped),
+                    mtime=max(_safe_mtime(p) for p in grouped),
+                )
+            )
+            continue
+
+        # No poster relationship — every file stands alone.
+        for path in members:
+            units.append(
+                MediaUnit(
+                    paths=(path,),
+                    kind=_kind_of(path),
+                    size=_safe_size(path),
+                    mtime=_safe_mtime(path),
+                )
+            )
+
+    units.sort(key=lambda u: u.mtime)
+    return units
+
+
+def _delete(unit: MediaUnit) -> int:
+    """Delete every file in a unit. Returns the bytes actually reclaimed."""
+    freed = 0
+    for path in unit.paths:
+        size = _safe_size(path)
+        try:
+            path.unlink()
+            freed += size
+        except OSError as exc:
+            _logger.debug("[Media] retention: unlink failed for {}: {}", path, exc)
+    return freed
 
 
 def prune_media(
     media_dir: Path,
     retention_days: int = DEFAULT_RETENTION_DAYS,
-    max_size_mb: int = DEFAULT_MAX_SIZE_MB,
+    image_max_size_mb: int = DEFAULT_IMAGE_MAX_SIZE_MB,
+    video_max_size_mb: int = DEFAULT_VIDEO_MAX_SIZE_MB,
+    protect: Iterable[Path] = (),
+    audio_max_size_mb: int = DEFAULT_AUDIO_MAX_SIZE_MB,
 ) -> dict:
-    """Trim old / oversized generated-media files.
+    """Trim old / oversized generated media. Never raises.
 
-    Returns a small summary dict. Never raises — the caller can rely on it
-    completing during gateway startup without try/except.
+    Returns a summary the caller can log, including ``deleted_paths`` so the
+    media library can expire exactly the rows this pass removed instead of
+    rescanning the whole directory. ``protect`` names files that must survive
+    regardless — what a caller just produced, so pruning immediately after a
+    generation can never delete the thing that triggered it.
+
+    ``audio_max_size_mb`` sits after ``protect`` on purpose: callers already
+    pass the first four arguments positionally, and moving ``protect`` would
+    silently reinterpret a protect-list as a byte budget.
     """
-    summary = {
-        "deleted_files": 0,
+    summary: dict = {
+        "deleted_units": 0,
         "deleted_bytes": 0,
-        "remaining_files": 0,
+        "deleted_paths": [],
+        "remaining_units": 0,
         "remaining_bytes": 0,
         "skipped": False,
     }
 
+    protected = {Path(p).resolve() for p in protect}
+
+    def _is_protected(unit: MediaUnit) -> bool:
+        return any(p.resolve() in protected for p in unit.paths)
+
     try:
-        files = _media_files(media_dir)
+        units = media_units(media_dir)
     except OSError as exc:
-        _logger.debug("[Media] retention: list failed for {}: {}", media_dir, exc)
+        _logger.debug("[Media] retention: scan failed for {}: {}", media_dir, exc)
         summary["skipped"] = True
         return summary
-
-    if not files:
+    if not units:
         return summary
 
-    survivors: list[Path] = list(files)
+    def _reclaim(unit: MediaUnit) -> None:
+        freed = _delete(unit)
+        if freed:
+            summary["deleted_units"] += 1
+            summary["deleted_bytes"] += freed
+            summary["deleted_paths"].extend(str(p) for p in unit.paths)
 
-    # ── 1. Age cap ─────────────────────────────────────────────────────
+    # ── 1. Age cap — one rule for every kind ────────────────────────────
+    survivors: list[MediaUnit] = []
     if retention_days >= 0:
         cutoff = time.time() - (retention_days * 86_400)
-        kept: list[Path] = []
-        for f in survivors:
-            try:
-                mtime = f.stat().st_mtime
-            except OSError:
-                kept.append(f)
-                continue
-            if mtime < cutoff:
-                bytes_freed = _safe_unlink(f)
-                if bytes_freed:
-                    summary["deleted_files"] += 1
-                    summary["deleted_bytes"] += bytes_freed
+        for unit in units:
+            if unit.mtime < cutoff and not _is_protected(unit):
+                _reclaim(unit)
             else:
-                kept.append(f)
-        survivors = kept
+                survivors.append(unit)
+    else:
+        survivors = list(units)
 
-    # ── 2. Size cap ────────────────────────────────────────────────────
-    if max_size_mb > 0:
-        max_bytes = max_size_mb * 1024 * 1024
-        sizes: dict[Path, int] = {}
-        total = 0
-        for f in survivors:
-            try:
-                s = f.stat().st_size
-            except OSError:
-                s = 0
-            sizes[f] = s
-            total += s
+    # ── 2. Size cap — one budget per kind ───────────────────────────────
+    megabytes = {
+        "image": image_max_size_mb,
+        "video": video_max_size_mb,
+        "audio": audio_max_size_mb,
+    }
+    budgets = {
+        name: (megabytes[name] * 1024 * 1024 if megabytes[name] > 0 else None)
+        for name in _BUDGETS
+    }
+    totals: dict[str, int] = dict.fromkeys(_BUDGETS, 0)
+    for unit in survivors:
+        totals[unit.budget] += unit.size
 
-        idx = 0
-        while total > max_bytes and idx < len(survivors):
-            f = survivors[idx]
-            bytes_freed = _safe_unlink(f)
-            if bytes_freed:
-                summary["deleted_files"] += 1
-                summary["deleted_bytes"] += bytes_freed
-                total -= sizes.get(f, 0)
-            idx += 1
-        survivors = survivors[idx:]
+    kept: list[MediaUnit] = []
+    for unit in survivors:  # oldest first
+        budget = budgets.get(unit.budget)
+        over = budget is not None and totals[unit.budget] > budget
+        if over and not _is_protected(unit):
+            _reclaim(unit)
+            totals[unit.budget] -= unit.size
+        else:
+            kept.append(unit)
 
-    # ── 3. Tally what's left ───────────────────────────────────────────
-    remaining_bytes = 0
-    for f in survivors:
-        try:
-            remaining_bytes += f.stat().st_size
-        except OSError:
-            continue
-    summary["remaining_files"] = len(survivors)
-    summary["remaining_bytes"] = remaining_bytes
-
-    if summary["deleted_files"]:
-        _logger.info(
-            "[Media] retention: pruned {} file(s), {:.1f} MB freed; "
-            "{} file(s), {:.1f} MB remaining",
-            summary["deleted_files"],
-            summary["deleted_bytes"] / 1_048_576,
-            summary["remaining_files"],
-            summary["remaining_bytes"] / 1_048_576,
-        )
+    summary["remaining_units"] = len(kept)
+    summary["remaining_bytes"] = sum(u.size for u in kept)
     return summary

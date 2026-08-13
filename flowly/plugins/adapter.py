@@ -20,6 +20,7 @@ import inspect
 from typing import Any, Callable
 
 from flowly.agent.tools.base import Tool
+from flowly.agent.tools.routing import ALL_BUILTIN_TOOLSETS
 
 
 class FunctionToolAdapter(Tool):
@@ -33,12 +34,21 @@ class FunctionToolAdapter(Tool):
         handler: Callable[..., Any],
         check_fn: Callable[[], bool] | None = None,
         description: str = "",
+        discovery_source: str = "",
+        toolset: str = "",
     ) -> None:
         self._name = name
         self._handler = handler
         self._check_fn = check_fn
         # Description precedence: explicit arg > schema.description > "".
         self._description = description or str(schema.get("description") or "")
+        self._discovery_source = str(discovery_source or "").strip()
+        declared_toolset = str(toolset or "extensions").strip().lower()
+        self._toolset = (
+            declared_toolset
+            if declared_toolset in ALL_BUILTIN_TOOLSETS
+            else "extensions"
+        )
         # Some manifests pass the full OpenAI function schema
         # (``{"type":"function","function":{"parameters":...}}``) and
         # others just the parameters block.  Accept both.
@@ -71,6 +81,21 @@ class FunctionToolAdapter(Tool):
     @property
     def parameters(self) -> dict[str, Any]:
         return self._parameters
+
+    @property
+    def toolset(self) -> str:
+        """Use the trusted plugin declaration, defaulting to deferred."""
+        return self._toolset
+
+    @property
+    def discovery_source(self) -> str | None:
+        return self._discovery_source or None
+
+    def is_available(self) -> bool:
+        """Hide plugin tools whose runtime capability check is currently false."""
+        if self._check_fn is None:
+            return True
+        return bool(self._check_fn())
 
     async def execute(self, **kwargs: Any) -> str:
         # Dispatch-time gating: if the plugin declared a check_fn (e.g.

@@ -29,32 +29,140 @@ Most new capabilities should be a **skill** or a **plugin**, not a core tool.
 
 ## Development setup
 
-**Prerequisites:** [uv](https://docs.astral.sh/uv/) (it manages Python for you)
-and Git. Python **3.11+** is required (`pyproject.toml`); 3.12 is the default the
-installer uses.
+Flowly keeps everything it knows in one place — `~/.flowly` — and a checkout
+uses that same state. That is deliberate: your providers, memory, channels and
+Desktop all keep working while you develop, because there is only ever one
+config. No second account, no state to keep in sync.
+
+### Prerequisites
+
+[uv](https://docs.astral.sh/uv/) (it manages Python for you) and Git. Python
+**3.11+** is required (`pyproject.toml`); 3.12 is what CI uses. Install uv:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh          # macOS / Linux
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
+```
+
+uv lands in `~/.local/bin`, which your current shell may not have on PATH yet —
+`uv: command not found` right after installing means exactly that. Open a new
+terminal, or `export PATH="$HOME/.local/bin:$PATH"`.
+
+Two optional system tools: **ffmpeg** (voice notes, the media library,
+`video_analyze`) and **ripgrep** (the `rg` binary the agent's shell tooling
+reaches for). Flowly runs without them — the features that need them fail.
+
+```bash
+brew install ffmpeg ripgrep                  # macOS
+sudo apt install -y ffmpeg ripgrep           # Debian / Ubuntu
+winget install Gyan.FFmpeg BurntSushi.ripgrep.MSVC   # Windows
+```
+
+### The loop
 
 ```bash
 git clone https://github.com/Nocetic/flowly.git
 cd flowly
 
-uv venv --python 3.12
-source .venv/bin/activate         # Windows: .venv\Scripts\activate
-
-uv pip install -e ".[dev]"
-
-# Point Flowly at an LLM provider (writes ~/.flowly/config.json)
-flowly setup byok openrouter --key sk-or-...
-# …or run the full wizard:
-flowly setup
-
-# Sanity check
-flowly doctor
-flowly                            # opens the terminal UI
+uv run flowly setup       # only on a machine that has never run Flowly
+uv run flowly gateway
 ```
 
-Config lives at `~/.flowly/config.json` (keys are **camelCase**). To keep dev
-state isolated from your real install, set `FLOWLY_HOME=/tmp/flowly-dev` (or use
-`-p <profile>`) before running any command.
+`uv run` builds the virtualenv and installs Flowly on first use, so there is no
+separate install step. The gateway then serves its usual port (18790) against
+your real `~/.flowly`. Edit code, restart, repeat.
+
+**`setup` is for the empty machine.** Flowly needs one provider before the
+agent can answer anything, and a fresh checkout inherits nothing — there is no
+config yet to inherit from. `flowly setup` asks that one question (sign in, or
+paste a key) and is a no-op for anyone who already uses Flowly, so it is safe
+to run either way. Skip it and `flowly gateway` stops with
+`Error: No LLM provider available` and the same instruction, which works but
+wastes a round trip.
+
+A gateway with no messaging channel is normal for development — you talk to it
+from the terminal (`flowly`) or from Flowly Desktop. It says so at startup;
+`flowly setup channels` is there when you actually want Telegram or Slack.
+
+**If Flowly is already installed and running,** its background service holds
+that port — and the gateway handles the handover itself. It detects the
+service, asks before stopping it, serves the port from your checkout, and
+reinstalls + restarts the service when you exit (Ctrl+C included). Only the
+machine's own service is ever touched; anything else on the port is left alone
+and surfaces as the normal bind error. Without a terminal it refuses and
+prints the two commands (`flowly service stop`, then
+`flowly service install --start`) so automation never stops a service
+silently. Don't `kill` the service by hand — launchd (`KeepAlive`) and systemd
+(`Restart=always`) bring it straight back; that's exactly why the gateway does
+this dance for you.
+
+For tests and lint, add the dev tooling once:
+
+```bash
+uv pip install -e ".[dev]"    # pytest + ruff
+uv run pytest
+uv run ruff check flowly/
+```
+
+**Trap worth knowing:** the `flowly` on your PATH is your *installed* copy, not
+this checkout — `install.sh` puts its own checkout in
+`~/.local/share/flowly/repo`, and `uv tool install` lives under
+`~/.local/share/uv/tools/`. Inside the checkout, run the CLI through
+`uv run flowly …` so you're exercising your code.
+
+### Desktop and iOS
+
+Nothing extra. Desktop finds the gateway on its configured port (18790 by
+default) and the iOS app reaches the same gateway over the relay — that port is
+now served by your checkout, so both are talking to your code with your real
+account and channels.
+
+While your foreground gateway is up, don't use Desktop's own start/restart
+control: it runs `flowly service install --port … --start --force`, which puts
+the installed build back on the port and takes yours down.
+
+### When you need an isolated instance
+
+Sometimes sharing the real state is wrong: a migration that rewrites memory, a
+destructive experiment, or a second agent you want running beside your own.
+`scripts/dev-install.sh` builds a separate instance — its own home, its own
+gateway port (18890), its own account registration (`<machine>-dev`), and every
+copied channel disabled so two bots never fight over one Telegram token or one
+relay identity.
+
+```bash
+mkdir ~/flowly-isolated && cd ~/flowly-isolated
+bash /path/to/flowly/scripts/dev-install.sh
+
+./flowly-dev            # this instance's CLI — never `uv run flowly`, which
+./flowly-dev gateway    # targets ~/.flowly instead
+```
+
+It copies your real `~/.flowly/config.json` when there is one, so providers and
+keys work immediately; otherwise it runs the normal `flowly setup` wizard.
+
+To reach it from Flowly Desktop, run a **second** Desktop against the same home
+and its own Electron state, so it lives beside your real one instead of
+focusing it:
+
+```bash
+FLOWLY_HOME=~/flowly-isolated/home \
+FLOWLY_DESKTOP_USER_DATA_DIR=~/flowly-isolated/desktop-data \
+FLOWLY_DESKTOP_APP_NAME=FlowlyDev \
+  npm run dev
+```
+
+Then sign in inside that Desktop: it registers a separate `<machine>-dev`
+server and writes that instance's relay credentials into the isolated home, so
+its composer talks to the isolated bot. Until you do, the gateway starts with
+no channels and Desktop's dashboard shows it running while the composer can't
+see it — the `Channels: none` line at startup is the tell.
+
+### Don't run `flowly update` in your checkout
+
+It is the *user* update path, and it acts on whatever checkout it's running
+from: fetch, autostash your uncommitted work, `git pull --ff-only`, reinstall
+dependencies, restart the gateway. Use `git` directly on a dev clone.
 
 ---
 
@@ -67,10 +175,15 @@ ruff check flowly/      # lint
 ruff check --fix flowly/
 ```
 
-CI runs `ruff check` and `pytest` on every PR. Run both locally first. Tests use
-`pytest-asyncio` in `auto` mode — write `async def test_...` directly, no
-decorator needed. Keep new tests hermetic (no network, no real keys): use
-`monkeypatch` and `tmp_path`.
+From a checkout, prefix with `uv run` (`uv run pytest`) unless you've activated
+the venv. The suite is ~3,800 tests and finishes in about a minute. Tests set
+their own `FLOWLY_HOME` and never touch your real state.
+
+CI runs `ruff check` and `pytest` on every PR (Ubuntu, Python 3.11 + 3.12). Run
+both locally first. Tests use `pytest-asyncio` in `auto` mode — write
+`async def test_...` directly, no decorator needed. Keep new tests hermetic (no
+network, no real keys): use `monkeypatch` and `tmp_path`, and set `FLOWLY_HOME`
+via `monkeypatch.setenv` in any test that touches user state.
 
 ---
 

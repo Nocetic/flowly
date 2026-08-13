@@ -1,9 +1,11 @@
-"""`flowly update` — install-mode detection and the right upgrade path.
+"""`flowly update` — install-mode detection and the right update path.
 
-The keystone is the **managed** mode: when Flowly runs as the Nuitka-compiled
-binary embedded in Flowly Desktop, self-update is a no-op (the desktop app's
-own auto-updater owns the binary). Every other mode (uv-tool, pipx, pip,
-source) maps to its native upgrade command.
+Two modes do real work: **managed** (inside Flowly Desktop) is a no-op —
+the app owns its binary — and **source** (the git checkout every current
+install is) pulls + reinstalls. The legacy packaged modes (uv-tool, pipx,
+pip: the old PyPI package) no longer receive releases, so `update` tells
+them the truth and points at the install-script migration instead of
+querying PyPI forever in vain.
 """
 
 import sys
@@ -54,23 +56,23 @@ def test_pip_fallback(monkeypatch):
     assert update_cmd.detect_install_mode() == "pip"
 
 
-@pytest.mark.parametrize(
-    "mode,expect_head",
-    [
-        ("uv-tool", ["uv", "tool", "upgrade"]),
-        ("pipx", ["pipx", "upgrade"]),
-        ("pip", [sys.executable, "-m", "pip", "install", "--upgrade"]),
-    ],
-)
-def test_upgrade_command_per_mode(mode, expect_head):
-    cmd = update_cmd.upgrade_command(mode)
-    assert cmd[: len(expect_head)] == expect_head
-    assert cmd[-1] == "flowly-ai" or "flowly-ai" in cmd
+@pytest.mark.parametrize("mode", ["uv-tool", "pipx", "pip"])
+def test_legacy_packaged_mode_points_at_migration(mode, monkeypatch, capsys):
+    """A legacy PyPI-era install gets the truth + the migration one-liner,
+    never a doomed PyPI check that reports "up to date" forever."""
+    monkeypatch.setattr(update_cmd, "detect_install_mode", lambda: mode)
+    rc = update_cmd.run_update(check_only=False, force=False, restart=False)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "legacy packaged install" in out
+    assert "install.sh" in out or "install.ps1" in out
 
 
-def test_managed_has_no_upgrade_command():
-    assert update_cmd.upgrade_command("managed") is None
-    assert update_cmd.upgrade_command("source") is None
+def test_legacy_packaged_check_also_says_so(monkeypatch, capsys):
+    monkeypatch.setattr(update_cmd, "detect_install_mode", lambda: "uv-tool")
+    rc = update_cmd.run_update(check_only=True, force=False, restart=False)
+    assert rc == 1
+    assert "legacy packaged install" in capsys.readouterr().out
 
 
 def test_version_newer():

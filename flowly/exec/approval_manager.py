@@ -14,6 +14,15 @@ from flowly.exec.types import PendingApproval, ExecApprovalDecision
 # Type for channel notification callback
 NotifyCallback = Callable[[PendingApproval], Awaitable[None]]
 
+# Fired once an approval stops waiting — decided here, decided on another
+# surface, or timed out. Surfaces use it to retire the prompt they drew;
+# without it a card outlives its request and its own countdown then fires a
+# decision against an id this manager has already forgotten. Mirrors
+# ``flowly.clarify.manager.CloseCallback``.
+# Args: (approval_id, reason, session_key) where reason is the decision that
+# settled it ("allow-once" / "allow-always" / "deny") or "timeout".
+CloseCallback = Callable[[str, str, str], Awaitable[None]]
+
 
 class ApprovalManager:
     """
@@ -30,10 +39,15 @@ class ApprovalManager:
         self._futures: dict[str, asyncio.Future[ExecApprovalDecision]] = {}
         self._pending: dict[str, PendingApproval] = {}
         self._notify_callbacks: list[NotifyCallback] = []
+        self._close_callbacks: list[CloseCallback] = []
 
     def add_notify_callback(self, callback: NotifyCallback) -> None:
         """Register a channel callback for approval notifications."""
         self._notify_callbacks.append(callback)
+
+    def add_close_callback(self, callback: CloseCallback) -> None:
+        """Register a channel callback for "this approval is settled"."""
+        self._close_callbacks.append(callback)
 
     async def request_and_wait(
         self,
@@ -83,16 +97,39 @@ class ApprovalManager:
 
         # Wait for decision with timeout
         timeout = max(0, pending.expires_at - time.time())
+        # Assigned on every exit path so the close callbacks describe what
+        # actually happened. "cancelled" is the honest default: it covers the
+        # awaiting task being torn down mid-wait (gateway shutdown), which is
+        # neither a decision nor a timeout.
+        reason = "cancelled"
         try:
             decision = await asyncio.wait_for(future, timeout=timeout)
             logger.info(f"[ApprovalManager] {pending.id} resolved: {decision}")
+            reason = str(decision)
             return decision
         except asyncio.TimeoutError:
             logger.info(f"[ApprovalManager] {pending.id} timed out")
+            reason = "timeout"
             return None
         finally:
             self._futures.pop(pending.id, None)
             self._pending.pop(pending.id, None)
+            await self._fire_close(pending, reason)
+
+    async def _fire_close(self, pending: PendingApproval, reason: str) -> None:
+        """Tell every channel the approval is settled so it can drop its card.
+
+        Never lets a channel failure escape — the agent's decision must survive
+        a broken client.
+        """
+        for cb in self._close_callbacks:
+            try:
+                await cb(pending.id, reason, pending.session_key or "")
+            except Exception as e:
+                logger.error(
+                    f"[ApprovalManager] Close callback failed: {e}",
+                    exc_info=True,
+                )
 
     @staticmethod
     def _cron_mode_decision(pending: PendingApproval) -> ExecApprovalDecision | None:

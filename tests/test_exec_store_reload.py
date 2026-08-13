@@ -14,6 +14,7 @@ import time
 
 import pytest
 
+from flowly.agent.tools.shell import SecureExecTool
 from flowly.exec import ExecConfig, ExecRequest, execute_command
 from flowly.exec.approvals import ExecApprovalStore, _get_approvals_path
 
@@ -62,6 +63,14 @@ def test_own_save_is_not_reloaded():
     # Our own write must not be seen as an external change.
     store.refresh_if_changed()
     assert store.config.security == "allowlist"
+
+
+def test_exec_tool_reports_live_unattended_policy():
+    tool = SecureExecTool(ExecConfig())
+    assert tool.runs_unattended()
+
+    _write_policy_file("full", "always")
+    assert not tool.runs_unattended()
 
 
 @pytest.mark.asyncio

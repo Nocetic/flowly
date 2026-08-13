@@ -1,7 +1,6 @@
 <div align="center">
   <img src="assets/banner.png" alt="Flowly — the personal AI agent you own, everywhere you are" width="100%">
   <p>
-    <a href="https://pypi.org/project/flowly-ai/"><img src="https://img.shields.io/pypi/v/flowly-ai?style=for-the-badge&label=pypi&color=7C5CFC" alt="PyPI"></a>
     <img src="https://img.shields.io/badge/python-≥3.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
     <img src="https://img.shields.io/badge/macOS%20·%20Linux%20·%20Windows-14181F?style=for-the-badge" alt="Platform">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-3B82F6?style=for-the-badge" alt="License"></a>
@@ -29,9 +28,9 @@
 ## Quick start
 
 ```bash
-# Install — sets up uv, Python, and a Flowly git checkout that `flowly update` keeps current
-curl -fsSL https://useflowlyapp.com/install.sh | bash
-# (prefer a packaged PyPI install? `uv tool install flowly-ai`)
+# Install — sets up uv, Python, and Flowly itself; `flowly update` keeps it current
+curl -fsSL https://useflowlyapp.com/install.sh | bash     # macOS / Linux
+irm https://useflowlyapp.com/install.ps1 | iex            # Windows (PowerShell)
 
 # First-time setup — pick an LLM provider, add any channels
 flowly setup
@@ -41,6 +40,13 @@ flowly
 ```
 
 `flowly setup` walks you through a provider (OpenRouter, Anthropic, OpenAI, Gemini, Groq, xAI/Grok, Zhipu, or a local model) and any channels you want. Two minutes, done. Add a Telegram bot? `flowly setup` → Telegram → paste token. The gateway hot-reloads each channel as you save.
+
+To keep the agent running with nobody at the terminal — channels reachable,
+cron firing, across reboots:
+
+```bash
+flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Scheduler (Windows)
+```
 
 ---
 
@@ -90,7 +96,7 @@ Adapters for **[OpenRouter](https://openrouter.ai), [Anthropic](https://www.anth
 ```bash
 flowly                     # open the chat
 /provider openrouter       # pick provider
-/model anthropic/claude-sonnet-4-6
+/model anthropic/claude-haiku-4.5
 ```
 
 Or edit `~/.flowly/config.json`. When nothing is pinned, Flowly cascades through whatever you've configured (OpenRouter → Anthropic → OpenAI → xAI → …) so it always has a working model.
@@ -152,23 +158,50 @@ The gateway runs as a local daemon, and the **whole process runs inside the OS s
 
 ---
 
-## Installation paths
+## Develop from source
 
-| Method | Command | When |
-|---|---|---|
-| Install script | `curl -fsSL https://useflowlyapp.com/install.sh \| bash` | Recommended — git checkout in a uv venv; `flowly update` pulls new versions between releases (Windows: `irm https://useflowlyapp.com/install.ps1 \| iex`) |
-| `uv tool` | `uv tool install flowly-ai` | Packaged PyPI install; tracks releases |
-| Source | `git clone … && pip install -e ".[dev]"` | Contributors |
-
-After install, run `flowly setup` to pick a provider, then `flowly` to chat — it
-starts the gateway for you if none is running.
-
-To keep it up without anyone running `flowly` (channels reachable, cron jobs
-firing, across reboots):
+Clone it anywhere and run it. Flowly keeps its state in one place — `~/.flowly`
+— and a checkout uses that same state, so there is no second config to keep in
+sync and nothing to set up twice:
 
 ```bash
-flowly service install --start    # launchd (macOS) / systemd (Linux) / Task Scheduler (Windows)
+git clone https://github.com/Nocetic/flowly.git
+cd flowly
+
+uv run flowly setup       # first time on this machine: pick a provider
+uv run flowly gateway     # your code, serving the usual gateway port
 ```
+
+**Already use Flowly?** Skip the first line — your provider, memory and
+channels are already there, and the gateway will use them. **New to it?** The
+agent can't answer without a provider, so `setup` is the one step that isn't
+optional; it takes a minute and you never repeat it.
+
+That's it. Edit, restart, repeat.
+
+If Flowly is already installed and running, its service holds that port — and
+the gateway handles the handover itself: it asks, stops the service, serves in
+its place, and restores the service when you press Ctrl+C. Nothing else to
+learn.
+
+Tests and lint:
+
+```bash
+uv pip install -e ".[dev]"    # pytest + ruff
+uv run pytest                 # ~3,800 tests, about a minute
+uv run ruff check flowly/
+```
+
+**Working on Flowly Desktop or the iOS app?** Nothing extra — they connect to
+the gateway on its usual port, which is now yours.
+
+**Want an instance that can't touch your real one?** For risky work — a
+migration, a destructive experiment, a second agent running side by side —
+`scripts/dev-install.sh` builds a fully isolated instance (its own home, port,
+and account). It's the exception, not the starting point.
+
+Full walkthrough — system dependencies, the isolated instance, PR conventions —
+in **[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)**.
 
 ---
 

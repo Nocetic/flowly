@@ -52,8 +52,12 @@ def _builtin_workspace_dir() -> Path:
     return candidates[0]
 
 
-def _create_workspace_templates(workspace: Path):
-    """Seed the workspace with every template the package ships.
+def _create_workspace_templates(workspace: Path) -> int:
+    """Seed the workspace with every template the package ships. Returns the count.
+
+    Counts rather than prints: a first-run user meets Flowly through fourteen
+    lines of "Created SOUL.md / personas/pirate.md …" before a single question
+    is asked. The files matter; the roll call doesn't.
 
     Copies ALL top-level ``*.md`` files from the package's ``workspace/``
     directory (AGENTS, SOUL, USER, TOOLS, HEARTBEAT, …) plus ``memory/MEMORY.md``
@@ -82,6 +86,7 @@ def _create_workspace_templates(workspace: Path):
     seeded: set[str] = set()
 
     # 1. Copy every top-level template the package ships.
+    created = 0
     if builtin_workspace.is_dir():
         for src in sorted(builtin_workspace.glob("*.md")):
             seeded.add(src.name)
@@ -89,7 +94,7 @@ def _create_workspace_templates(workspace: Path):
             if dst.exists():
                 continue
             dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-            console.print(f"  [dim]Created {src.name}[/dim]")
+            created += 1
 
     # 2. Ensure the core files exist even if the package shipped none of them.
     for filename, content in fallbacks.items():
@@ -99,7 +104,7 @@ def _create_workspace_templates(workspace: Path):
         if dst.exists():
             continue
         dst.write_text(content, encoding="utf-8")
-        console.print(f"  [dim]Created {filename}[/dim]")
+        created += 1
 
     # 3. memory/MEMORY.md — prefer the package copy, fall back to a default.
     memory_dir = workspace / "memory"
@@ -118,7 +123,8 @@ def _create_workspace_templates(workspace: Path):
                 "## Important Notes\n\n(Things to remember)\n",
                 encoding="utf-8",
             )
-        console.print("  [dim]Created memory/MEMORY.md[/dim]")
+        created += 1
+    return created
 
 
 # ============================================================================
@@ -160,8 +166,10 @@ def seed_workspace() -> Path:
 
     workspace = get_workspace_path()
     workspace.mkdir(parents=True, exist_ok=True)
-    _create_workspace_templates(workspace)
-    _install_persona_files(workspace)
+    created = _create_workspace_templates(workspace)
+    created += _install_persona_files(workspace)
+    if created:
+        console.print(f"  [dim]Workspace seeded ({created} files)[/dim]")
     return workspace
 
 
@@ -382,8 +390,33 @@ def _prompt_byok_key(slug: str) -> bool:
     provider_slot.api_key = key
     save_config(cfg)
     set_active_provider(slug)
-    console.print(f"  [green]✓[/green] {label} key saved · active provider → [b]{slug}[/b]")
+    # Masked echo: a truncated paste is invisible behind a password prompt, and
+    # the tail is what tells the user their clipboard survived intact.
+    tail = key[-4:] if len(key) > 8 else "…"
+    console.print(f"  [green]✓[/green] {label} key saved (…{tail}) · active provider → [b]{slug}[/b]")
+    _verify_provider(label=label)
     return True
+
+
+def _verify_provider(*, label: str = "") -> bool:
+    """Send one real request and report the verdict. True when it answered.
+
+    "Key saved" is a claim about a file; this is the claim that matters — that
+    the provider will actually answer. Failing here is the cheapest possible
+    moment to find out.
+    """
+    from flowly.integrations.provider_probe import probe_active_provider
+
+    what = label or "provider"
+    console.print(f"  [dim]Checking your {what}…[/dim]")
+    result = probe_active_provider()
+    if result.ok:
+        model = f" · {result.model}" if result.model else ""
+        console.print(f"  [green]✓[/green] {what.capitalize()} answered ({result.seconds:.1f}s){model}")
+        return True
+    console.print(f"  [yellow]![/yellow] Couldn't get an answer — {result.detail}")
+    console.print("  [dim]Saved anyway; fix it with [cyan]flowly setup[/cyan] or [cyan]flowly doctor[/cyan].[/dim]")
+    return False
 
 
 def _prompt_model(slug: str) -> None:
@@ -516,11 +549,16 @@ def _print_banner() -> None:
     console.print()
 
 
-def _run_provider_step() -> bool:
+def _run_provider_step(*, ask_model: bool = True) -> bool:
     """Show the provider picker and handle the choice. True if now configured.
 
     Returns False when the user backs out (← / Esc) so callers can return to the
     setup home instead of leaving onboarding.
+
+    ``ask_model=False`` keeps the provider's curated default. A first-run user
+    has no basis to choose a model — they haven't sent a message yet — and
+    ``/model`` is one keystroke away once they have. The step belongs to the
+    "configure everything" path, not to getting started.
     """
     choice = _onboarding_menu()
     if choice is None:
@@ -541,7 +579,8 @@ def _run_provider_step() -> bool:
     # hosted serves a plan-filtered list via the proxy; xAI / BYOK via /v1/models
     # or the models.dev catalogue.
     if _already_configured():
-        _prompt_model(choice)
+        if ask_model:
+            _prompt_model(choice)
         return True
     # Sign-in can succeed while the credential behind it doesn't arrive. Say
     # so here rather than dropping the user back on the picker in silence.
@@ -603,9 +642,9 @@ def _setup_home_menu() -> str | None:
 
     _status_line()
     choices = [
-        Choice(value="quick", name="Quick   ·  pick a provider and start chatting"),
-        Choice(value="full", name="Full    ·  provider → channels → integrations → media"),
-        Choice(value="blank", name="Blank   ·  just a provider, nothing else"),
+        Choice(value="quick", name="Quick   ·  sign in with a Flowly account — no API key, no model to pick"),
+        Choice(value="full", name="Full    ·  bring your own key, then channels, integrations, media"),
+        Choice(value="blank", name="Blank   ·  pick a provider and stop — configure the rest yourself"),
         Separator(),
         Choice(value="provider", name="Configure  ·  provider"),
         Choice(value="channels", name="Configure  ·  channels"),
@@ -619,13 +658,21 @@ def _setup_home_menu() -> str | None:
 
 
 def _flow_quick() -> bool:
-    """Provider, then the summary — straight to chatting.
+    """Sign in with a Flowly account, then start — the shortest real path.
 
-    Returns True when it ran to completion, False if the user backed out of the
-    provider step (so the caller re-shows the home instead of leaving).
+    Quick asks ONE question, and it isn't "which of these twelve providers?".
+    A first-run user can't answer that; the account sign-in needs no key, no
+    billing setup, and no model decision, so Quick commits to it. Anyone who
+    wants their own key picks Full, which opens the full picker.
+
+    Returns True when it ran to completion, False if sign-in didn't produce a
+    usable provider (caller re-shows the home).
     """
-    if not _run_provider_step():
+    _run_managed_login()
+    if not _already_configured():
+        _warn_signed_in_but_unusable()
         return False
+    _verify_provider(label="Flowly account")
     _show_summary()
     _offer_start_gateway()
     return True
@@ -635,6 +682,7 @@ def _flow_full() -> bool:
     """Provider → channels → integrations → media → summary, all inline."""
     if not _run_provider_step():
         return False
+    _verify_provider()
     _configure_channels()
     _configure_tools()
     _configure_media()
@@ -651,8 +699,9 @@ def _flow_blank() -> bool:
     `flowly service install --start` themselves (a real support case). One
     Enter on the default-Yes prompt covers it; decliners lose nothing.
     """
-    if not _run_provider_step():
+    if not _run_provider_step(ask_model=False):
         return False
+    _verify_provider()
     _show_summary()
     _offer_start_gateway()
     return True
@@ -687,6 +736,62 @@ def _run_setup_home() -> None:
             _show_summary()
 
 
+def _confirm_external_credential() -> bool:
+    """Surface a login Flowly would otherwise adopt in silence. True = adopted.
+
+    ``openai_codex`` and ``zai_coding`` can read another tool's login file, so
+    on a machine where the user ran ``codex login`` (or uses OpenCode) Flowly
+    resolves a provider without anyone choosing one — and onboarding would skip
+    itself entirely, leaving them on an account nobody mentioned. Ask once.
+    Answering writes ``providers.active``, which makes the choice explicit, so
+    this never asks again.
+    """
+    from flowly.integrations.active_provider import (
+        external_credential_in_use,
+        set_active_provider,
+    )
+
+    found = external_credential_in_use()
+    if found is None:
+        return False
+
+    from InquirerPy.base.control import Choice
+
+    console.print()
+    console.print(f"  [dim]Found a {found.label} login from {found.origin}.[/dim]")
+    console.print()
+    # Flowly's own account leads, always. The found credential is a
+    # convenience, not a recommendation: it bills someone else's plan, its
+    # model list is theirs, and nothing about Flowly's hosted setup gets
+    # configured by it. Offering it first would make the machine's leftovers
+    # decide what this install is.
+    choice = _select_with_back(
+        "How do you want to power Flowly?",
+        [
+            Choice(value="flowly", name="Sign in with Flowly      (recommended — hosted, nothing to configure)"),
+            Choice(value="use", name=f"Use the {found.label} found on this machine"),
+            Choice(value="other", name="Something else  ·  bring your own API key"),
+        ],
+        default="flowly",
+    )
+    if choice == "flowly":
+        _run_managed_login()
+        if not _already_configured():
+            _warn_signed_in_but_unusable()
+            return False
+        _verify_provider(label="Flowly account")
+        return True
+    if choice != "use":
+        return False
+
+    model_changed = set_active_provider(found.key)
+    console.print(f"  [green]✓[/green] Using your {found.label}.")
+    if model_changed:
+        console.print(f"  [dim]Model → {model_changed}[/dim]")
+    _verify_provider(label=found.label)
+    return True
+
+
 def run_onboarding() -> None:
     """Unified first-run onboarding. Safe in any context (see module note).
 
@@ -694,7 +799,16 @@ def run_onboarding() -> None:
     """
     workspace = seed_workspace()
 
-    if _already_configured():
+    adoptable = None
+    if sys.stdin.isatty():
+        try:
+            from flowly.integrations.active_provider import external_credential_in_use
+
+            adoptable = external_credential_in_use()
+        except Exception:  # noqa: BLE001 — never block first run on this
+            adoptable = None
+
+    if _already_configured() and adoptable is None:
         # Workspace refreshed; provider/account already set — nothing to ask.
         console.print(f"[green]✓[/green] Workspace ready at {workspace}")
         return
@@ -711,6 +825,9 @@ def run_onboarding() -> None:
     _print_banner()
     try:
         with _tty_friendly_event_loop():
+            if adoptable is not None and _confirm_external_credential():
+                _show_summary()
+                return
             _run_setup_home()
     except OSError as exc:
         # Last-resort guard: if the terminal still can't be attached to an event
@@ -726,8 +843,9 @@ def run_onboarding() -> None:
         )
 
 
-def _install_persona_files(workspace: Path):
-    """Copy builtin persona files to workspace/personas/ directory."""
+def _install_persona_files(workspace: Path) -> int:
+    """Copy builtin persona files to workspace/personas/. Returns the count."""
+    created = 0
     personas_dir = workspace / "personas"
     personas_dir.mkdir(exist_ok=True)
 
@@ -738,7 +856,7 @@ def _install_persona_files(workspace: Path):
             dst = personas_dir / src.name
             if not dst.exists():
                 dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-                console.print(f"  [dim]Created personas/{src.name}[/dim]")
+                created += 1
     else:
         # Fallback: create a minimal default persona
         default_file = personas_dir / "default.md"
@@ -752,4 +870,5 @@ def _install_persona_files(workspace: Path):
                 "- Curious and eager to learn\n",
                 encoding="utf-8",
             )
-            console.print("  [dim]Created personas/default.md[/dim]")
+            created += 1
+    return created

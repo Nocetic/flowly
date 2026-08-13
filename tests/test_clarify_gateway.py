@@ -43,8 +43,12 @@ async def test_broadcast_reaches_clients():
     ws = _fake_ws()
     server._ws_clients["c1"] = ws
 
+    now = time.time()
     await server.broadcast_clarify_request(
-        "id1", "Which?", ["A", "B"], "web:1", time.time() + 60,
+        ClarifyRequest(
+            id="id1", question="Which?", choices=["A", "B"],
+            session_key="web:1", created_at=now, expires_at=now + 60,
+        )
     )
 
     ws.send_json.assert_awaited_once()
@@ -121,3 +125,20 @@ async def test_list_returns_pending():
 
     asyncio.create_task(check_list_then_resolve())
     await mgr.request_and_wait(pending)
+
+
+@pytest.mark.asyncio
+async def test_closed_broadcast_reaches_clients():
+    """A tray opened by ``requested`` is retired by ``closed`` — otherwise a
+    question answered on another device (or timed out) leaves a dead prompt on
+    screen whose answer the manager would then reject."""
+    server = _server()
+    ws = _fake_ws()
+    server._ws_clients["c1"] = ws
+
+    await server.broadcast_clarify_closed("id1", "answered", "cli:1")
+
+    ws.send_json.assert_awaited_once()
+    sent = ws.send_json.await_args.args[0]
+    assert sent["event"] == "agent.clarify.closed"
+    assert sent["data"] == {"id": "id1", "reason": "answered", "sessionKey": "cli:1"}

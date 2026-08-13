@@ -2,13 +2,39 @@
 
 from typing import Any
 
-from flowly.compaction.estimator import estimate_messages_tokens, estimate_message_tokens
+from flowly.compaction.estimator import estimate_message_tokens, estimate_messages_tokens
 from flowly.compaction.types import (
     BASE_CHUNK_RATIO,
+    DEFAULT_PARTS,
     MIN_CHUNK_RATIO,
     SAFETY_MARGIN,
-    DEFAULT_PARTS,
 )
+
+
+def split_into_turn_blocks(
+    messages: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Group messages into atomic turn blocks.
+
+    A block is one user message plus every assistant/tool message that
+    answers it. Anything preceding the first user message (a leading
+    system prompt, a compaction summary) forms its own leading block.
+
+    Blocks are the safe unit for keeping or dropping history: an
+    ``assistant`` message carrying ``tool_calls`` and the ``tool``
+    results answering it must travel together or the provider rejects
+    the sequence.
+    """
+    blocks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") == "user" and current:
+            blocks.append(current)
+            current = []
+        current.append(msg)
+    if current:
+        blocks.append(current)
+    return blocks
 
 
 def normalize_parts(parts: int, message_count: int) -> int:

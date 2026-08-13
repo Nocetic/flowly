@@ -261,7 +261,45 @@ class TestPluginContext:
             handler=lambda: "ok",
         )
         assert mgr._tool_registry.has("my_tool")
+        assert mgr._tool_registry.get_toolsets()["my_tool"] == "extensions"
+        assert mgr._tool_registry.get_discovery_sources()["my_tool"] == "p"
         assert "my_tool" in mgr._plugin_tool_names["p"]
+
+    def test_plugin_can_declare_an_eager_core_toolset(self):
+        mgr = _make_manager()
+        ctx = PluginContext(PluginManifest(name="media-provider", key="media"), mgr)
+        ctx.register_tool(
+            name="custom_voice_generate",
+            schema={"parameters": {"type": "object"}},
+            handler=lambda: "ok",
+            toolset="media",
+        )
+
+        assert mgr._tool_registry.get_toolsets()["custom_voice_generate"] == "media"
+
+    def test_unknown_plugin_toolset_fails_closed_to_extensions(self):
+        mgr = _make_manager()
+        ctx = PluginContext(PluginManifest(name="p", key="p"), mgr)
+        ctx.register_tool(
+            name="typo_toolset_tool",
+            schema={"parameters": {"type": "object"}},
+            handler=lambda: "ok",
+            toolset="medai",
+        )
+
+        assert mgr._tool_registry.get_toolsets()["typo_toolset_tool"] == "extensions"
+
+    def test_unavailable_plugin_tool_is_not_advertised(self):
+        mgr = _make_manager()
+        ctx = PluginContext(PluginManifest(name="p", key="p"), mgr)
+        ctx.register_tool(
+            name="sleeping_tool",
+            schema={"parameters": {"type": "object"}},
+            handler=lambda: "should not run",
+            check_fn=lambda: False,
+        )
+
+        assert mgr._tool_registry.get_definitions() == []
 
     def test_register_hook_subscribes_to_registry(self):
         mgr = _make_manager()

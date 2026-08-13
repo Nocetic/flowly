@@ -88,6 +88,72 @@ class ProviderReadiness:
     has_account: bool
 
 
+@dataclass(frozen=True)
+class ExternalCredential:
+    """A credential Flowly can use but did not create — and the user never chose.
+
+    Two providers read another tool's login file so that "already signed in
+    over there" needs no extra step: ``openai_codex`` falls back to the Codex
+    CLI's ``~/.codex/auth.json`` and ``zai_coding`` to OpenCode's
+    ``auth.json``. Convenient, but it also means a brand-new Flowly on such a
+    machine resolves a provider *implicitly*: onboarding sees "configured",
+    asks nothing, and the user is left running on an account nobody mentioned.
+
+    This type marks exactly that state — resolved from an external store while
+    ``providers.active`` is still empty — so the first-run flow can surface it
+    as a question instead of a silent adoption. Once the user answers,
+    ``providers.active`` is set and this returns None forever after.
+    """
+
+    key: str
+    label: str
+    origin: str
+
+
+def external_credential_in_use(config: Config | None = None) -> ExternalCredential | None:
+    """The external login Flowly would silently adopt, or None."""
+    try:
+        if config is None:
+            from flowly.config.loader import load_config
+
+            config = load_config()
+        if (config.providers.active or "").strip():
+            return None  # a deliberate choice — not an adoption
+        active = resolve_active_provider(config)
+    except Exception as exc:  # noqa: BLE001 — first-run paths must not crash
+        logger.debug("external credential probe failed: %s", exc)
+        return None
+    if active is None:
+        return None
+
+    if active.key == "openai_codex":
+        try:
+            from flowly.auth.openai_codex import _payload_source, codex_auth_json_path
+
+            if _payload_source() == "codex_cli":
+                return ExternalCredential(
+                    key="openai_codex",
+                    label="ChatGPT subscription",
+                    origin=f"the Codex CLI ({codex_auth_json_path()})",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("codex origin probe failed: %s", exc)
+    elif active.key == "zai_coding":
+        try:
+            from flowly.auth.zai_coding import load_token_payload, opencode_auth_json_path
+
+            payload = load_token_payload()
+            if payload is not None and getattr(payload, "source", "") == "opencode":
+                return ExternalCredential(
+                    key="zai_coding",
+                    label="Z.AI GLM Coding Plan",
+                    origin=f"OpenCode ({opencode_auth_json_path()})",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("zai origin probe failed: %s", exc)
+    return None
+
+
 def provider_readiness(config: Config | None = None) -> ProviderReadiness:
     """Resolve the provider once and report it as a readiness verdict.
 

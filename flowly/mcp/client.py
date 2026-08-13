@@ -35,7 +35,9 @@ or the agent boot itself. We gather server connects with
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import threading
 from typing import Any
 from urllib.parse import urlparse
@@ -51,10 +53,11 @@ from flowly.mcp.security import (
 )
 from flowly.mcp.stderr_log import (
     get_stderr_log,
+    read_stderr_excerpt,
+    summarize_stderr_excerpt,
     write_stderr_log_header,
 )
 from flowly.mcp.stdio_resolver import resolve_stdio_command
-
 
 logger = logging.getLogger(__name__)
 
@@ -76,15 +79,18 @@ LATEST_PROTOCOL_VERSION = "2025-03-26"
 try:
     from mcp import ClientSession, StdioServerParameters  # type: ignore
     from mcp.client.stdio import stdio_client  # type: ignore
+
     _MCP_AVAILABLE = True
     try:
         from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+
         _MCP_HTTP_AVAILABLE = True
     except ImportError:
         _MCP_HTTP_AVAILABLE = False
     # SSE transport (T3) — older HTTP-style servers. Optional.
     try:
         from mcp.client.sse import sse_client  # type: ignore
+
         _MCP_SSE_AVAILABLE = True
     except ImportError:
         sse_client = None  # type: ignore
@@ -100,15 +106,15 @@ try:
             ServerNotification,
             ToolListChangedNotification,
         )
+
         _MCP_NOTIFICATIONS = True
     except ImportError:
         logger.debug("MCP notification types unavailable — list_changed disabled")
     # ClientSession only accepts ``message_handler`` on newer SDKs.
     try:
         import inspect as _inspect
-        _MCP_MESSAGE_HANDLER = (
-            "message_handler" in _inspect.signature(ClientSession).parameters
-        )
+
+        _MCP_MESSAGE_HANDLER = "message_handler" in _inspect.signature(ClientSession).parameters
     except (TypeError, ValueError):
         _MCP_MESSAGE_HANDLER = False
 except ImportError:
@@ -149,6 +155,7 @@ _KEEPALIVE_INTERVAL_SEC = 180.0
 
 def _bump_server_error(server_name: str) -> None:
     import time
+
     with _breaker_lock:
         count = _server_error_counts.get(server_name, 0) + 1
         _server_error_counts[server_name] = count
@@ -170,6 +177,7 @@ def circuit_breaker_block_reason(server_name: str) -> str | None:
     then resets or re-arms the breaker.
     """
     import time
+
     with _breaker_lock:
         count = _server_error_counts.get(server_name, 0)
         if count < _CIRCUIT_BREAKER_THRESHOLD:
@@ -254,8 +262,7 @@ class InvalidMCPUrlError(ValueError):
 def _validate_http_url(server_name: str, url: Any) -> str:
     if not isinstance(url, str):
         raise InvalidMCPUrlError(
-            f"MCP server '{server_name}': url must be a string, got "
-            f"{type(url).__name__}"
+            f"MCP server '{server_name}': url must be a string, got {type(url).__name__}"
         )
     stripped = url.strip()
     if not stripped:
@@ -263,18 +270,13 @@ def _validate_http_url(server_name: str, url: Any) -> str:
     try:
         parsed = urlparse(stripped)
     except Exception as exc:
-        raise InvalidMCPUrlError(
-            f"MCP server '{server_name}': invalid url ({exc})"
-        ) from exc
+        raise InvalidMCPUrlError(f"MCP server '{server_name}': invalid url ({exc})") from exc
     if parsed.scheme.lower() not in {"http", "https"}:
         raise InvalidMCPUrlError(
-            f"MCP server '{server_name}': scheme must be http or https, "
-            f"got {parsed.scheme!r}"
+            f"MCP server '{server_name}': scheme must be http or https, got {parsed.scheme!r}"
         )
     if not parsed.hostname:
-        raise InvalidMCPUrlError(
-            f"MCP server '{server_name}': missing host in {stripped!r}"
-        )
+        raise InvalidMCPUrlError(f"MCP server '{server_name}': missing host in {stripped!r}")
     return stripped
 
 
@@ -338,6 +340,12 @@ class MCPServerTask:
         self._config = config
         self.tool_timeout = float(config.get("timeout", 120.0))
         self.connect_timeout = float(config.get("connect_timeout", 60.0))
+        if not math.isfinite(self.tool_timeout) or self.tool_timeout <= 0:
+            raise ValueError(f"MCP server '{self.name}': timeout must be a positive finite number")
+        if not math.isfinite(self.connect_timeout) or self.connect_timeout <= 0:
+            raise ValueError(
+                f"MCP server '{self.name}': connect_timeout must be a positive finite number"
+            )
         self.ready = asyncio.Event()
         self.shutdown_event = asyncio.Event()
         self.rpc_lock = asyncio.Lock()
@@ -357,38 +365,66 @@ class MCPServerTask:
                 timeout=self.connect_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+        except asyncio.CancelledError:
+            await self._cancel_run_task()
+            raise
         finally:
             if not ready_wait.done():
                 ready_wait.cancel()
+                try:
+                    await ready_wait
+                except asyncio.CancelledError:
+                    pass
 
         if self.ready.is_set():
             return
 
-        # Either timed out or the run-task already exited with an error.
+        # The run-task records transport failures on ``self.error`` so it can
+        # log and exit cleanly.  A clean task result therefore does NOT mean
+        # the connection succeeded: surface the recorded root cause instead
+        # of mislabelling every fast subprocess/OAuth failure as a timeout.
         if self._task.done():
             exc = self._task.exception()
             if exc is not None:
                 raise exc
-        # Timeout: cancel the in-flight task so the transport closes.
-        self._task.cancel()
+            if self.error is not None:
+                raise self.error
+            raise RuntimeError(f"MCP server '{self.name}' exited before initialization")
+
+        # A real timeout: cancel AND await the in-flight task so transport
+        # context managers finish closing before this method returns.  Merely
+        # calling cancel() leaks subprocesses/tasks under repeated probes.
+        await self._cancel_run_task()
         raise asyncio.TimeoutError(
-            f"MCP server '{self.name}' connect timed out after "
-            f"{self.connect_timeout:.0f}s"
+            f"MCP server '{self.name}' connect timed out after {self.connect_timeout:.0f}s"
         )
+
+    async def _cancel_run_task(self) -> None:
+        """Cancel and join the transport task on its owning event loop."""
+        if self._task is None:
+            return
+        if not self._task.done():
+            self._task.cancel()
+        try:
+            await self._task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def shutdown(self) -> None:
         """Ask the run-task to exit, then wait for it."""
         if self.shutdown_event is not None:
             self.shutdown_event.set()
         if self._task is not None:
+            if self._task.done():
+                try:
+                    self._task.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+                return
             try:
                 await asyncio.wait_for(self._task, timeout=10)
             except asyncio.TimeoutError:
-                self._task.cancel()
-                try:
-                    await self._task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                await self._cancel_run_task()
 
     async def _run(self) -> None:
         try:
@@ -401,7 +437,9 @@ class MCPServerTask:
         except Exception as exc:
             self.error = exc
             logger.warning(
-                "MCP server '%s' run failed: %s", self.name, sanitize_error(str(exc)),
+                "MCP server '%s' run failed: %s",
+                self.name,
+                sanitize_error(str(exc)),
             )
 
     def _session_kwargs(self) -> dict[str, Any]:
@@ -414,6 +452,7 @@ class MCPServerTask:
         if sampling_cfg.get("enabled"):
             try:
                 from flowly.mcp.sampling import build_sampling_callback
+
                 cb = build_sampling_callback(self.name, sampling_cfg)
                 if cb is not None:
                     kwargs["sampling_callback"] = cb
@@ -427,9 +466,7 @@ class MCPServerTask:
 
         command = self._config.get("command") or ""
         if not command:
-            raise ValueError(
-                f"MCP server '{self.name}': stdio entry needs 'command'"
-            )
+            raise ValueError(f"MCP server '{self.name}': stdio entry needs 'command'")
 
         args = list(self._config.get("args") or [])
         user_env = self._config.get("env") or {}
@@ -440,6 +477,7 @@ class MCPServerTask:
         # known MAL-* advisory. Fail-open; default on, per-server opt-out.
         if self._config.get("osv_check", True):
             from flowly.mcp.osv import check_package_for_malware
+
             blocked = check_package_for_malware(command, args)
             if blocked:
                 raise ValueError(f"MCP server '{self.name}': {blocked}")
@@ -450,7 +488,7 @@ class MCPServerTask:
             env=resolved_env if resolved_env else None,
         )
 
-        write_stderr_log_header(self.name)
+        stderr_offset = write_stderr_log_header(self.name)
         errlog = get_stderr_log()
 
         # Orphan reap (S7) is OPT-IN per server (reap_orphans). Default
@@ -460,24 +498,35 @@ class MCPServerTask:
         # The MCP SDK already tears the child down on normal exit; this
         # only helps the Linux setsid-escapes-on-cancel edge case.
         reap = bool(self._config.get("reap_orphans"))
-        if not reap:
-            async with stdio_client(server_params, errlog=errlog) as (read, write):
-                async with ClientSession(read, write, **self._session_kwargs()) as session:
-                    await self._serve(session)
-            return
-
-        from flowly.mcp.proc import snapshot_child_pids, reap_pids
-        before = snapshot_child_pids()
-        spawned: set[int] = set()
         try:
-            async with stdio_client(server_params, errlog=errlog) as (read, write):
-                spawned = snapshot_child_pids() - before
-                async with ClientSession(read, write, **self._session_kwargs()) as session:
-                    await self._serve(session)
-        finally:
-            # Runs on clean exit, error, and cancellation. If the SDK's
-            # own teardown already reaped the child, reap_pids is a no-op.
-            reap_pids(spawned, self.name)
+            if not reap:
+                async with stdio_client(server_params, errlog=errlog) as (read, write):
+                    async with ClientSession(read, write, **self._session_kwargs()) as session:
+                        await self._serve(session)
+                return
+
+            from flowly.mcp.proc import reap_pids, snapshot_child_pids
+
+            before = snapshot_child_pids()
+            spawned: set[int] = set()
+            try:
+                async with stdio_client(server_params, errlog=errlog) as (read, write):
+                    spawned = snapshot_child_pids() - before
+                    async with ClientSession(read, write, **self._session_kwargs()) as session:
+                        await self._serve(session)
+            finally:
+                # Runs on clean exit, error, and cancellation. If the SDK's
+                # own teardown already reaped the child, reap_pids is a no-op.
+                reap_pids(spawned, self.name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            diagnostic = summarize_stderr_excerpt(read_stderr_excerpt(stderr_offset))
+            if diagnostic:
+                raise RuntimeError(
+                    f"MCP server '{self.name}' stdio transport failed: {diagnostic}"
+                ) from exc
+            raise
 
     def _use_sse(self) -> bool:
         """Decide whether to use the SSE transport for this HTTP server."""
@@ -498,8 +547,10 @@ class MCPServerTask:
         auth = None
         if str(self._config.get("auth") or "") == "oauth":
             from flowly.mcp.oauth import build_oauth_provider
+
             auth = build_oauth_provider(
-                self.name, url,
+                self.name,
+                url,
                 interactive=self.interactive,
                 scope=self._config.get("scope") or None,
             )
@@ -512,7 +563,8 @@ class MCPServerTask:
         # mTLS / custom CA (Faz 2c): only build a custom httpx factory
         # when the config actually sets a TLS knob, so the default path
         # keeps using the SDK's own factory.
-        from flowly.mcp.tls import needs_custom_tls, make_http_client_factory
+        from flowly.mcp.tls import make_http_client_factory, needs_custom_tls
+
         client_factory = None
         if needs_custom_tls(self._config):
             client_factory = make_http_client_factory(self.name, self._config)
@@ -553,7 +605,8 @@ class MCPServerTask:
         with the shutdown wait so long-idle connections stay warm (T8).
         """
         init_result = await asyncio.wait_for(
-            session.initialize(), timeout=self.connect_timeout,
+            session.initialize(),
+            timeout=self.connect_timeout,
         )
         self.capabilities = getattr(init_result, "capabilities", None)
         self.session = session
@@ -603,7 +656,8 @@ class MCPServerTask:
             except Exception as exc:
                 logger.debug(
                     "MCP server '%s' keepalive ping failed: %s",
-                    self.name, sanitize_error(str(exc) or repr(exc)),
+                    self.name,
+                    sanitize_error(str(exc) or repr(exc)),
                 )
                 return
 
@@ -622,6 +676,7 @@ class MCPServerTask:
         so the SDK's notification dispatch returns promptly and the
         stdio JSON-RPC stream doesn't wedge mid-notification.
         """
+
         async def _handler(message: Any) -> None:
             try:
                 if isinstance(message, Exception):
@@ -630,7 +685,8 @@ class MCPServerTask:
                     return
                 if isinstance(message.root, ToolListChangedNotification):
                     logger.info(
-                        "MCP server '%s': tools/list_changed received", self.name,
+                        "MCP server '%s': tools/list_changed received",
+                        self.name,
                     )
                     self._schedule_refresh()
                     await asyncio.sleep(0)
@@ -668,7 +724,8 @@ class MCPServerTask:
 
 
 def _filter_remote_tool(
-    server_cfg: dict[str, Any], remote_name: str,
+    server_cfg: dict[str, Any],
+    remote_name: str,
 ) -> bool:
     tools_cfg = server_cfg.get("tools") or {}
     include = [str(x) for x in (tools_cfg.get("include") or [])]
@@ -695,14 +752,15 @@ def _capability_advertised(server_task: MCPServerTask, attr: str) -> bool:
 
 
 def _utility_tools_for_server(
-    server_task: MCPServerTask, server_cfg: dict[str, Any],
+    server_task: MCPServerTask,
+    server_cfg: dict[str, Any],
 ) -> list[Any]:
     """Build resource/prompt utility tools allowed by config + capabilities (D9)."""
     from flowly.mcp.tool import (
+        MCPGetPromptTool,
         MCPListPromptsTool,
         MCPListResourcesTool,
         MCPReadResourceTool,
-        MCPGetPromptTool,
     )
 
     tools_cfg = server_cfg.get("tools") or {}
@@ -737,7 +795,8 @@ def _register_tools_for_server(
             logger.warning(
                 "MCP server '%s': tool '%s' collides with an existing tool; "
                 "keeping the existing entry.",
-                server_task.name, tool.name,
+                server_task.name,
+                tool.name,
             )
             return
         tool_registry.register(tool)
@@ -787,22 +846,69 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
     for util_tool in _utility_tools_for_server(server_task, server_cfg):
         desired[util_tool.name] = util_tool
 
+    def _registered(name: str) -> Any | None:
+        getter = getattr(registry, "get", None)
+        if callable(getter):
+            return getter(name)
+        tools = getattr(registry, "tools", None)
+        return tools.get(name) if isinstance(tools, dict) else None
+
+    def _owned_by_server(tool: Any) -> bool:
+        return str(getattr(tool, "_server_name", "")) == server_task.name
+
     desired_names = set(desired)
 
-    # Drop tools that disappeared (only ones THIS server registered).
+    # Drop vanished tools only if the live registry entry is still ours. A
+    # plugin may have replaced a formerly-owned name after registration; an
+    # MCP refresh must never delete that newer foreign entry.
     for stale in old_names - desired_names:
-        registry.unregister(stale)
+        existing = _registered(stale)
+        if existing is not None and _owned_by_server(existing):
+            registry.unregister(stale)
 
-    # Register newcomers, respecting collisions with non-MCP tools.
+    def _schema_fingerprint(tool: Any) -> str:
+        try:
+            schema = tool.to_schema()
+            return json.dumps(
+                schema,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except Exception:
+            return ""
+
+    # Register newcomers and replace same-name tools whose description or
+    # input schema changed. Replacing the registry entry is safe for an
+    # in-flight call: execute() already holds its old object reference, while
+    # future calls and semantic indexing see the new immutable schema.
     new_names: list[str] = []
+    changed: set[str] = set()
     for name in desired_names:
         if name in old_names:
+            existing = _registered(name)
+            if existing is None:
+                registry.register(desired[name])
+                changed.add(name)
+            elif not _owned_by_server(existing):
+                logger.warning(
+                    "MCP server '%s': formerly-owned tool '%s' now belongs to "
+                    "another source; skipping refresh.",
+                    server_task.name,
+                    name,
+                )
+                continue
+            elif _schema_fingerprint(existing) != _schema_fingerprint(desired[name]):
+                registry.register(desired[name])
+                changed.add(name)
             new_names.append(name)
             continue
         if registry.has(name):
             logger.warning(
-                "MCP server '%s': refreshed tool '%s' collides with an "
-                "existing tool; skipping.", server_task.name, name,
+                "MCP server '%s': refreshed tool '%s' collides with an existing tool; skipping.",
+                server_task.name,
+                name,
             )
             continue
         registry.register(desired[name])
@@ -812,10 +918,13 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
 
     added = desired_names - old_names
     removed = old_names - desired_names
-    if added or removed:
+    if added or removed or changed:
         logger.info(
-            "MCP server '%s': tools changed — added %s, removed %s",
-            server_task.name, sorted(added) or "none", sorted(removed) or "none",
+            "MCP server '%s': tools changed — added %s, removed %s, updated %s",
+            server_task.name,
+            sorted(added) or "none",
+            sorted(removed) or "none",
+            sorted(changed) or "none",
         )
 
 
@@ -870,6 +979,7 @@ def discover_mcp_tools(
     # Load $FLOWLY_HOME/.env so ${VAR} placeholders in config resolve.
     try:
         from flowly.mcp.env_loader import load_flowly_dotenv
+
         load_flowly_dotenv()
     except Exception as exc:
         logger.debug("MCP .env loader skipped: %s", exc)
@@ -901,15 +1011,20 @@ def discover_mcp_tools(
         server = _servers.get(name)
         if server is None:
             continue
-        registered.extend(_register_tools_for_server(
-            server_task=server, server_cfg=cfg, tool_registry=tool_registry,
-        ))
+        registered.extend(
+            _register_tools_for_server(
+                server_task=server,
+                server_cfg=cfg,
+                tool_registry=tool_registry,
+            )
+        )
 
     if not enabled:
         if registered:
             logger.info(
-                "MCP: re-registered %d tool(s) from %d already-connected "
-                "server(s)", len(registered), len(already_connected),
+                "MCP: re-registered %d tool(s) from %d already-connected server(s)",
+                len(registered),
+                len(already_connected),
             )
         return registered
 
@@ -923,9 +1038,7 @@ def discover_mcp_tools(
             return task
 
         results: dict[str, MCPServerTask | BaseException] = {}
-        coros = {
-            name: _connect_one(name, cfg) for name, cfg in enabled.items()
-        }
+        coros = {name: _connect_one(name, cfg) for name, cfg in enabled.items()}
         gathered = await asyncio.gather(*coros.values(), return_exceptions=True)
         for name, result in zip(coros.keys(), gathered):
             results[name] = result
@@ -942,15 +1055,18 @@ def discover_mcp_tools(
         if isinstance(result, BaseException):
             logger.warning(
                 "MCP server '%s' connect failed: %s",
-                name, sanitize_error(str(result) or repr(result)),
+                name,
+                sanitize_error(str(result) or repr(result)),
             )
             continue
         _servers[name] = result
-        registered.extend(_register_tools_for_server(
-            server_task=result,
-            server_cfg=enabled[name],
-            tool_registry=tool_registry,
-        ))
+        registered.extend(
+            _register_tools_for_server(
+                server_task=result,
+                server_cfg=enabled[name],
+                tool_registry=tool_registry,
+            )
+        )
 
     if registered:
         logger.info(

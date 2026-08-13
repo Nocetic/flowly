@@ -1,3 +1,12 @@
+# Keep the optional semantic-routing runtime usable inside the standalone
+# Desktop/CLI artifact. The model weights are never bundled; Nuitka otherwise
+# may omit these lazy imports and FastEmbed's required distribution metadata.
+# nuitka-project: --include-package=fastembed
+# nuitka-project: --include-package=huggingface_hub
+# nuitka-project: --include-package=onnxruntime
+# nuitka-project: --include-package=tokenizers
+# nuitka-project: --include-distribution-metadata=fastembed
+
 """CLI entry point — extracts --profile BEFORE any Flowly module import.
 
 This is critical because many modules evaluate ``get_flowly_home()`` at
@@ -72,6 +81,50 @@ def _configure_bundled_ssl_ca() -> None:
         pass
 
 
+def _warn_if_dev_home_ignored() -> None:
+    """Point out a dev instance the user is about to talk past.
+
+    ``scripts/dev-install.sh`` sets up an isolated instance whose state lives
+    in its own home, reached through the ``flowly-dev`` launcher it writes.
+    Running ``uv run flowly ...`` inside that same tree instead silently
+    targets ``~/.flowly`` — a different (often empty) instance — and every
+    symptom that follows ("my config is gone", "the gateway has no provider")
+    points at the wrong problem.
+
+    The launcher is the anchor, so this works for both layouts it creates
+    (``<root>/flowly`` + ``<root>/home``, or a home inside the checkout):
+    find ``flowly-dev``, read the home it exports, and speak up only if that
+    home is really a dev-install one.
+    """
+    if os.environ.get("FLOWLY_HOME") or os.environ.get("FLOWLY_PROFILE"):
+        return
+    try:
+        import re
+        from pathlib import Path
+
+        here = Path.cwd()
+        for base in (here, *list(here.parents)[:2]):
+            launcher = base / "flowly-dev"
+            if not launcher.is_file():
+                continue
+            m = re.search(
+                r'FLOWLY_HOME="([^"]+)"', launcher.read_text(encoding="utf-8", errors="ignore")
+            )
+            if not m:
+                continue
+            dev_home = Path(m.group(1))
+            if not (dev_home / ".dev-install").exists():
+                continue
+            sys.stderr.write(
+                f"\033[33m[flowly]\033[0m A development instance lives here "
+                f"({dev_home}), but this command targets ~/.flowly.\n"
+                f"         Run it with \033[1m{launcher}\033[0m instead.\n\n"
+            )
+            return
+    except Exception:
+        pass
+
+
 def main() -> None:
     """Parse profile flag, set FLOWLY_HOME, then launch the typer app."""
     # Belt-and-braces: do this before anything else might print.
@@ -93,6 +146,8 @@ def main() -> None:
     # aiohttp / websockets / openai pick up the correct trust store in the
     # Nuitka-bundled binary.
     _configure_bundled_ssl_ca()
+
+    _warn_if_dev_home_ignored()
 
     profile: str | None = None
     argv = sys.argv[1:]

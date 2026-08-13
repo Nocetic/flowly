@@ -22,8 +22,12 @@ from __future__ import annotations
 import os
 import platform
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
+from flowly.render_capabilities import (
+    MERMAID_RENDER_CAPABILITY,
+    normalize_render_capabilities,
+)
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -300,25 +304,35 @@ def build_platform_block(info: PlatformInfo | None = None) -> str:
 #
 
 
-# Enforcement rule — bans intent announcements in any language.
-# An earlier formulation said "if you say 'Let me check' you MUST
-# call the tool", which read to models as permission to say the
-# phrase as long as they followed through. Flowly users want
-# genuinely silent tool calls, not preamble-then-call. Stated
-# language-agnostically so Turkish / German / etc. preambles are
-# covered without hardcoding specific phrases.
+# Enforcement rule + progress-note contract. This block used to BAN
+# intent announcements outright — that predates the live tool timeline,
+# where every iteration's narration renders as its own line above the
+# tool chip. A blanket ban left that timeline mute. Retargeted
+# (2026-08-07) to the pattern Codex CLI / the GPT-5 prompting guide /
+# Cursor all mandate: ONE short, information-carrying note per logical
+# group of calls; bare filler stays banned in any language; and the
+# original enforcement goal (announcing must never replace acting)
+# survives as the same-turn rule.
 TOOL_USE_ENFORCEMENT_BLOCK = """\
 # Tool-use enforcement
 
 You MUST use your tools to take action — do not describe what you would do
 or plan to do without actually doing it.
 
-Do NOT announce your intent in ANY language before calling a tool. Any
-sentence that reads as "I will now do X", "let me check", "one moment
-while I look", "checking now", or the equivalent in the user's
-language, is a preamble — not progress. Skip it. Just call the tool.
-The tool result IS the progress; narrate AFTER the tool returns, not
-before.
+Before each logical group of tool calls, SEND one short progress note:
+a single sentence (roughly 8–12 words) that carries real information —
+what you just found, what you do next, and why. Example: "Config looks
+clean; now tracing where the key is read." Connect it to the work so
+far so the user follows the thread. Never send bare filler — "let me
+check", "one moment", "checking now", or the equivalent in ANY
+language carries no finding and no decision; it is noise, not
+progress. The only time to skip the note is a trivial single step,
+such as reading one file. On a task that will take several steps, open
+with ONE sentence framing the goal and your route before the first
+call. Write notes like a capable colleague thinking out loud — plain,
+specific, in the user's language; never like a log line. If you
+announce an action, the tool call MUST follow in the same turn —
+narration is never a substitute for acting.
 
 Never end your turn with a promise of future action — execute it now.
 
@@ -438,7 +452,9 @@ You are agentic. When the user asks for something, you carry it all the way to a
 real result — not a description of one. Bias toward doing over explaining.
 
 - **Act, then report.** For anything that needs an action or a live lookup, use
-  the tool and let the result speak — skip the "let me check…" preamble. Answer
+  the tool and let the result speak. Send a one-sentence progress note before
+  each group of calls when it can carry a finding or a decision ("found the bug
+  in the parser — fixing it"); bare filler like "let me check…" never. Answer
   conversational or explanatory questions directly, no tool needed.
 - **Finish the job.** Keep working until the task is actually done: a working
   artifact backed by real tool output, not a plan or a stub. On multi-step work,
@@ -469,20 +485,23 @@ def build_agency_block() -> str:
 PLAN_MODE_BLOCK = """\
 # Plan mode
 
-For a task that is **long or has several distinct steps**, propose a plan and get
-the user's approval BEFORE doing the work. The plan shows above the user's input on
-every device with live ticks as you finish each step.
+For a task that is **long or has several distinct steps**, propose a plan before
+doing the work. The plan shows above the user's input on every device with live
+ticks as you finish each step.
 
 - **When to plan:** the task spans multiple files/services, has 3+ real steps, will
   take a while, or involves risky external writes / deployment. Also whenever the
   user asked for a plan or ran `/plan`. A single quick edit or a short read-only
   answer does NOT need a plan — just do it.
 - **How:** call `plan(action="propose", goal=..., steps=[{id, content, activeForm}])`.
-  This blocks until the user decides. On **approved**, execute the steps, calling
+  In YOLO an ordinary tracking plan may auto-start; otherwise the call blocks until
+  the user decides. Always follow the returned decision. If the user explicitly
+  asked to review/approve the plan, or asked for a plan without execution, pass
+  `requiresApproval=true`. On **approved**, execute the steps, calling
   `plan(action="update_step", id, status="in_progress")` before each and
   `status="completed"` right after, then `plan(action="complete")` at the end. On
   **revise**, re-propose with the user's feedback. On **rejected**, stop.
-- **Before approval you cannot act.** While a plan is awaiting approval (or plan
+- **Before required approval you cannot act.** While a plan is awaiting approval (or plan
   mode was forced), side-effecting tools are blocked — you may still read files and
   search to build a good plan, but nothing that changes the world runs until the
   user approves."""
@@ -1127,6 +1146,48 @@ def build_platform_hint(channel: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-turn client rendering capabilities
+# ---------------------------------------------------------------------------
+
+
+_MERMAID_RENDER_HINT = """\
+# Client rendering capability — Mermaid
+
+This chat surface can render Mermaid diagrams in this response. Use a
+Mermaid diagram when the user explicitly asks for one, or when a diagram
+would make a multi-step flow, architecture, state transition, sequence, or
+relationship materially easier to understand. Do not force a diagram into a
+simple answer.
+
+Put valid Mermaid source in a fenced ``mermaid`` code block. Keep prose,
+context, and caveats outside the fence. Prefer a focused diagram with concise,
+quoted labels over a dense wall of nodes; split a large system into multiple
+diagrams when that improves readability. Prefer stable diagram families such
+as ``flowchart``, ``sequenceDiagram``, ``stateDiagram-v2``, ``classDiagram``,
+and ``erDiagram``. Keep source below 20,000 characters and 500 edges. Add
+``accTitle`` and ``accDescr`` when they can meaningfully describe the diagram.
+
+The renderer uses a strict security policy. Do not emit Mermaid init
+directives, ``click`` / hyperlink actions, raw HTML, or HTML labels. If the
+requested idea cannot be represented reliably in Mermaid, explain it with
+normal Markdown instead of returning knowingly invalid diagram source."""
+
+
+def build_render_capability_hint(capabilities: Any) -> str:
+    """Return per-turn guidance for the capabilities a client advertised.
+
+    This block is injected after the stable system prompt instead of being
+    baked into it, preserving prompt-cache reuse for clients that do not
+    advertise rich rendering.
+    """
+
+    normalized = normalize_render_capabilities(capabilities)
+    if MERMAID_RENDER_CAPABILITY in normalized:
+        return _MERMAID_RENDER_HINT
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Voice mode block (P4 — opt-in via voice_mode=True)
 # ---------------------------------------------------------------------------
 #
@@ -1199,6 +1260,7 @@ __all__ = [
     "build_agency_block",
     "model_needs_strict_discipline",
     "build_voice_mode_block",
+    "build_render_capability_hint",
     "build_model_family_block",
     "detect_model_families",
     "ModelFamily",

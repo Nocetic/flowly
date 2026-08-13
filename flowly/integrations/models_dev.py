@@ -44,6 +44,10 @@ PROVIDER_TO_MODELS_DEV: dict[str, str] = {
     "xai": "xai",
     "xai_oauth": "xai",
     "openrouter": "openrouter",
+    # The one provider left with neither a bespoke fetcher nor a registry
+    # entry, so every Fugu model fell through to the 128K "no idea" default
+    # against a real 1M window — compacting at about an eighth of it.
+    "sakana": "sakana",
 }
 
 # Model ids that are noise for an agent picker (TTS, embeddings, dated preview

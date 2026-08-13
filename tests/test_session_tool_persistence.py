@@ -293,6 +293,36 @@ class TestExtendWithTurnMessages:
         assert roles == ["user", "assistant"]
         assert s.messages[-1]["content"] == "Hello!"
 
+    def test_completed_turn_persists_unread_completion_identity(self) -> None:
+        s = Session(key="t")
+        s.extend_with_turn_messages(
+            user_content="hi",
+            new_messages=[{"role": "assistant", "content": "Hello!"}],
+            final_content="Hello!",
+            run_id="run-123",
+        )
+
+        assert s.messages[-1]["run_id"] == "run-123"
+        assert s.metadata["last_assistant_run_id"] == "run-123"
+        assert s.metadata["last_assistant_at"].endswith("+00:00")
+        assert s.metadata["last_assistant_at"] != s.messages[-1]["timestamp"]
+
+    def test_aborted_turn_does_not_advance_unread_completion_identity(self) -> None:
+        s = Session(key="t")
+        s.metadata["last_assistant_run_id"] = "prior-run"
+        s.metadata["last_assistant_at"] = "2026-07-29T12:00:00"
+        s.extend_with_turn_messages(
+            user_content="stop this",
+            new_messages=[],
+            final_content="partial",
+            aborted=True,
+            run_id="aborted-run",
+        )
+
+        assert s.messages[-1]["run_id"] == "aborted-run"
+        assert s.metadata["last_assistant_run_id"] == "prior-run"
+        assert s.metadata["last_assistant_at"] == "2026-07-29T12:00:00"
+
     def test_aborted_turn_without_text_persists_terminal_marker(self) -> None:
         """Stopping before the first token must not leave a user-only tail."""
         s = Session(key="t")

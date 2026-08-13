@@ -41,10 +41,15 @@ amp
 *_PLAN.md
 # Internal audit reports (MEMORY_AUDIT.md, TUI_UX_AUDIT.md, …) — same deal.
 *_AUDIT.md
+# Local scratch output from agent runs (3D models, renders, pilots) — keep local.
+artifacts/
 
 # Compiled iMessage send helper (built per-platform by helpers/build.sh)
 flowly/channels/helpers/Flowly iMessage Helper.app/
 !docs/feature-rpc-architecture.md
+# The chat wire contract — bot, relay, desktop and iOS all implement it, so
+# it has to be readable by anyone cloning any of them.
+!docs/chat-wire-protocol.md
 
 # Internal engineering notes (not shipped)
 STREAMING_ENGINEERING.md
@@ -52,3 +57,7 @@ GATEWAY_CONNECTION_PLAN.md
 
 # Local agent guidance — contains local paths + private repo names; never publish.
 CLAUDE.md
+
+# dev-install.sh artifacts (in-repo mode)
+.dev-home/
+/flowly-dev

@@ -106,6 +106,23 @@ def test_returns_builtin_commands(isolated_home: Path, monkeypatch):
         assert entry["description"]
 
 
+def test_radio_is_advertised_only_to_desktop(isolated_home: Path, monkeypatch):
+    """Native actions stay hidden from clients that cannot execute them."""
+    monkeypatch.setattr(
+        "flowly.plugins.get_plugin_manager",
+        lambda: (_ for _ in ()).throw(RuntimeError),
+    )
+    server, replies = _fresh_server()
+
+    _run(server._ws_rpc_commands_list(MagicMock(), "desktop", {"surface": "desktop"}))
+    _run(server._ws_rpc_commands_list(MagicMock(), "ios", {"surface": "ios"}))
+
+    desktop = {entry["name"]: entry for entry in replies[0]["result"]["builtin"]}
+    ios = {entry["name"] for entry in replies[1]["result"]["builtin"]}
+    assert desktop["radio"]["description"] == "Open Flowly Radio"
+    assert "radio" not in ios
+
+
 def test_builtin_list_is_well_formed(isolated_home: Path, monkeypatch):
     """Each builtin has 'name' (str) and 'description' (str)."""
     monkeypatch.setattr(

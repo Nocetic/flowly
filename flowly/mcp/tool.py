@@ -33,7 +33,6 @@ from flowly.agent.tools.base import Tool
 from flowly.mcp.schema import mcp_tool_name, normalize_mcp_input_schema
 from flowly.mcp.security import sanitize_error
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -63,9 +62,9 @@ async def _run_on_mcp_loop(
     Shared by :class:`MCPTool` and the resource/prompt utility tools.
     """
     from flowly.mcp.client import (
-        get_mcp_loop,
         _bump_server_error,
         _reset_server_error,
+        get_mcp_loop,
     )
 
     server_name = server_task.name
@@ -158,6 +157,14 @@ class MCPTool(Tool):
     @property
     def parameters(self) -> dict[str, Any]:
         return self._parameters
+
+    @property
+    def toolset(self) -> str:
+        return "mcp"
+
+    @property
+    def discovery_source(self) -> str:
+        return self._server_name
 
     async def execute(self, **kwargs: Any) -> str:
         from flowly.mcp.client import (
@@ -256,6 +263,14 @@ class _MCPUtilityTool(Tool):
     @property
     def name(self) -> str:
         return self._tool_name
+
+    @property
+    def toolset(self) -> str:
+        return "mcp"
+
+    @property
+    def discovery_source(self) -> str:
+        return self._server_name
 
     async def _run(self, coro_factory: Any) -> str:
         from flowly.mcp.client import MCPCallInterrupted

@@ -42,10 +42,19 @@ def channel():
     return ch
 
 
+def _request(cid: str, question: str, choices, expires_at: float):
+    from flowly.clarify.types import ClarifyRequest
+
+    return ClarifyRequest(
+        id=cid, question=question, choices=choices,
+        session_key="web:abc", created_at=0.0, expires_at=expires_at,
+    )
+
+
 @pytest.mark.asyncio
 async def test_send_clarify_event_shape(channel):
     await channel.send_clarify_event(
-        "web:abc", "cid1", "Which environment?", ["staging", "prod"], 1234.0,
+        "web:abc", _request("cid1", "Which environment?", ["staging", "prod"], 1234.0),
     )
     assert len(channel._capture) == 1
     frame = channel._capture[0]
@@ -54,17 +63,43 @@ async def test_send_clarify_event_shape(channel):
     assert frame["data"]["id"] == "cid1"
     assert frame["data"]["choices"] == ["staging", "prod"]
     assert frame["data"]["question"] == "Which environment?"
+    # Additive: the relay path now carries the same sessionKey the gateway
+    # broadcast always did, so a surface can tell whether a question belongs to
+    # the conversation it is showing.
+    assert frame["data"]["sessionKey"] == "web:abc"
 
 
 @pytest.mark.asyncio
 async def test_send_clarify_event_open_ended(channel):
-    await channel.send_clarify_event("web:abc", "cid2", "Say what?", None, 99.0)
+    await channel.send_clarify_event("web:abc", _request("cid2", "Say what?", None, 99.0))
     assert channel._capture[0]["data"]["choices"] is None
 
 
 @pytest.mark.asyncio
 async def test_send_clarify_event_unmapped_session_is_noop(channel):
-    await channel.send_clarify_event("web:ghost", "cid3", "Q?", None, 1.0)
+    await channel.send_clarify_event("web:ghost", _request("cid3", "Q?", None, 1.0))
+    assert channel._capture == []
+
+
+@pytest.mark.asyncio
+async def test_send_clarify_closed_reaches_relay(channel):
+    """The gateway has broadcast ``closed`` for a while; the relay path never
+    did, so a question answered on the phone left a dead prompt on every other
+    relay-connected surface."""
+    await channel.send_clarify_closed("web:abc", "cid5", "answered")
+    assert channel._capture == [
+        {
+            "type": "event",
+            "sessionId": "relay-uuid-1",
+            "event": "agent.clarify.closed",
+            "data": {"id": "cid5", "reason": "answered", "sessionKey": "web:abc"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_clarify_closed_unmapped_session_is_noop(channel):
+    await channel.send_clarify_closed("web:ghost", "cid6", "timeout")
     assert channel._capture == []
 
 

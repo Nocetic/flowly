@@ -36,6 +36,19 @@ class Field:
     # ``choices`` is a list of (value, display) tuples for SELECT fields.
     choices: list[tuple[str, str]] = dc_field(default_factory=list)
     default: Any = None
+    # Optional richer editor a client MAY offer for a TEXT field. Two forms:
+    #
+    #   ``"media_model:<category>"`` — the shared model catalog, via
+    #       ``media.models.search``.
+    #   ``"options:<source>"``       — a list the BOT fetches from wherever it
+    #       actually lives, via ``picker.options``. A voice provider's models
+    #       and voices belong to the user's own account, so no catalog could
+    #       list them; the bot asks the provider and passes the answer through.
+    #
+    # Deliberately a hint on TEXT rather than a new FieldType: a client that
+    # doesn't know the form renders a perfectly usable text input, where a
+    # field type it had never seen might render nothing at all.
+    picker: str = ""
 
 
 ProbeStatus = Literal[

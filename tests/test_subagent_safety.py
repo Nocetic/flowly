@@ -513,6 +513,51 @@ class TestToolTrace:
         assert entry["duration_ms"] >= 0  # monotonic diff, can be 0 on fast ops
 
     @pytest.mark.asyncio
+    async def test_builtin_safe_tool_stays_direct_for_subagent(
+        self, tmp_path: Path
+    ) -> None:
+        from flowly.providers.base import ToolCallRequest
+
+        class _P(LLMProvider):
+            def __init__(self) -> None:
+                super().__init__(api_key="x")
+                self.calls = 0
+                self.first_surface: set[str] = set()
+
+            def get_default_model(self) -> str:  # type: ignore[override]
+                return "fake/model"
+
+            async def chat(self, *a: Any, **kw: Any) -> LLMResponse:  # type: ignore[override]
+                self.calls += 1
+                if self.calls == 1:
+                    self.first_surface = {
+                        item["function"]["name"] for item in kw.get("tools", [])
+                    }
+                    return LLMResponse(
+                        content=None,
+                        tool_calls=[ToolCallRequest(
+                            id="tc-direct",
+                            name="artifact",
+                            arguments={"action": "list"},
+                        )],
+                    )
+                return LLMResponse(content="all done", tool_calls=[])
+
+        provider = _P()
+        mgr = self._manager_with_provider(tmp_path, provider)
+        await mgr.spawn(
+            "list artifacts", "tt-deferred", "cli", "s",
+            timeout_seconds=120, wait=True,
+        )
+
+        record = mgr._registry.all()[0]
+        assert record.outcome == "ok"
+        assert record.tool_trace[0]["tool"] == "artifact"
+        assert "artifact" in provider.first_surface
+        bridge_names = {"tool_search", "tool_describe", "tool_call"}
+        assert not (bridge_names & provider.first_surface)
+
+    @pytest.mark.asyncio
     async def test_event_payload_includes_tool_trace(
         self, tmp_path: Path
     ) -> None:

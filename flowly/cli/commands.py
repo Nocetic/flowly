@@ -20,6 +20,10 @@ from flowly import __version__, __logo__
 app = typer.Typer(
     name="flowly",
     help=f"{__logo__} flowly - Personal AI Assistant",
+    # Config/provider objects contain credentials. Unexpected command errors
+    # may still show a useful stack trace, but Rich must never render frame
+    # locals (which previously printed API keys on a session I/O failure).
+    pretty_exceptions_show_locals=False,
     # Bare `flowly` (no args) hands off to the smart-entry callback in
     # ``main()`` — opens the TUI when a provider is configured, else
     # opens the first-run onboarding picker. Click's default

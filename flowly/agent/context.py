@@ -957,6 +957,28 @@ def _extract_pptx_text(path: Path) -> str:
         return f"[File: {path.name} (PowerPoint) — could not extract text: {e}]"
 
 
+# A browser task normally stays on the purpose-built browser_tab surface.  If
+# that surface fails and the model elects to fall back to OS automation, keep
+# the non-negotiable computer safety/workflow floor available without charging
+# the full ~7.8K-token desktop playbook to every browser turn.  Backend media,
+# approval, and plan gates remain authoritative regardless of this text.
+_COMPUTER_FALLBACK_GUIDANCE = """\
+## Computer Fallback Floor
+
+Prefer `browser_tab` for web-page work. If it is unavailable or fails and you
+must continue through `computer`, follow this minimum workflow:
+
+- Inspect structured accessibility state (`list_apps`, `list_windows`,
+  `read_window_state`, `read_window_text`) before acting.
+- Do not capture pixels unless the user explicitly asked for a screenshot,
+  image, or visual output. Re-read structured state after each action instead.
+- Launch/activate the exact app, target current indexed elements or coordinates,
+  perform one bounded action, then verify the resulting state before continuing.
+- Never infer success from a click alone, never repeat a failed action blindly,
+  and never bypass approval or destructive-action safeguards.
+"""
+
+
 def _resize_image_b64(path: Path, mime: str, max_px: int = 768) -> tuple[str, str]:
     """Return (base64_str, mime_type) with the image resized to *max_px*.
 
@@ -1032,6 +1054,27 @@ class ContextBuilder:
         self._freeze_injected_memory = False
         self._session_memory_snapshot: dict[str, str] = {}
         self._SESSION_MEMORY_CAP = 64
+        # Large capability playbooks and the skill catalog are dynamic tail
+        # context, not part of the stable cacheable prefix.  The host routes
+        # them from intent/history without an LLM discovery call.  All three
+        # knobs are wired from tools.routing by AgentLoop; these defaults make
+        # standalone ContextBuilder usage match production.
+        self._capability_guidance_enabled = True
+        self._capability_guidance_fail_open = True
+        self._skill_catalog_max_chars = 8_000
+
+    def set_capability_guidance(
+        self,
+        *,
+        enabled: bool,
+        fail_open: bool = True,
+        skill_catalog_max_chars: int = 8_000,
+    ) -> None:
+        """Configure JIT playbook routing and its legacy rollback path."""
+
+        self._capability_guidance_enabled = bool(enabled)
+        self._capability_guidance_fail_open = bool(fail_open)
+        self._skill_catalog_max_chars = max(1_000, int(skill_catalog_max_chars))
 
     def set_freeze_injected_memory(self, enabled: bool) -> None:
         """Enable/disable the per-session frozen memory snapshot (cache opt)."""
@@ -1113,13 +1156,19 @@ class ContextBuilder:
         """
         self._tool_registry = registry
 
-    def _has_tool(self, name: str) -> bool:
+    def _has_tool(
+        self,
+        name: str,
+        available_tools: set[str] | frozenset[str] | None = None,
+    ) -> bool:
         """True if the named tool is in the registry.
 
         Guarded against the registry not being wired yet (early-startup
         prompt builds during tests) — returns False, which keeps the
         prompt leaner rather than leakier.
         """
+        if available_tools is not None:
+            return name in available_tools
         reg = self._tool_registry
         if reg is None:
             return False
@@ -1128,7 +1177,10 @@ class ContextBuilder:
         except Exception:
             return False
 
-    def _get_available_tool_names(self) -> set[str] | None:
+    def _get_available_tool_names(
+        self,
+        available_tools: set[str] | frozenset[str] | None = None,
+    ) -> set[str] | None:
         """Return the names of every registered tool, or None if the
         registry isn't wired yet.
 
@@ -1137,6 +1189,8 @@ class ContextBuilder:
         don't know what's available, include everything" which matches
         the prior behaviour of the legacy ``hasattr`` check.
         """
+        if available_tools is not None:
+            return set(available_tools)
         reg = self._tool_registry
         if reg is None:
             return None
@@ -1173,8 +1227,13 @@ class ContextBuilder:
             del self._session_timestamps[oldest]
         return now
 
-    def _has_google_tools(self) -> bool:
+    def _has_google_tools(
+        self,
+        available_tools: set[str] | frozenset[str] | None = None,
+    ) -> bool:
         """Check if Google Workspace tools are available (gmail.json exists)."""
+        if available_tools is not None and "email" not in available_tools:
+            return False
         from flowly.channels.gmail_auth import load_credentials
         return load_credentials() is not None
 
@@ -1214,6 +1273,9 @@ class ContextBuilder:
         session_key: str | None = None,
         model: str | None = None,
         channel: str | None = None,
+        available_tools: set[str] | frozenset[str] | None = None,
+        reachable_tools: set[str] | frozenset[str] | None = None,
+        defer_dynamic_guidance: bool = False,
     ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
@@ -1267,7 +1329,10 @@ class ContextBuilder:
         parts = []
 
         # Core identity
-        parts.append(self._get_identity(memory_search_enabled=memory_search_enabled))
+        parts.append(self._get_identity(
+            memory_search_enabled=memory_search_enabled,
+            available_tools=available_tools,
+        ))
 
         # Strict, prohibition-framed tool-use enforcement (mandatory tool use,
         # missing-context, act-don't-ask). The POSITIVE, principle-framed
@@ -1324,19 +1389,31 @@ class ContextBuilder:
             except Exception:
                 logger.exception("[context] channel hint render failed")
 
+        if available_tools is not None and "tool_call" in available_tools:
+            parts.append(
+                "# Deferred Tools\n\n"
+                "Some available tools are represented by a compact catalog instead of "
+                "their full schemas. External tools may be called directly when visible "
+                "or through `tool_call`. `tool_search` is available when an exact tool or "
+                "schema is unclear; it searches all route-enabled external tools and "
+                "reports complete input schemas plus valid invocation options. Deferred "
+                "tools keep the same permissions and safety rules as direct tools."
+            )
+
         # P3.1 — Platform-aware command cheatsheet. Detects the live OS
         # and injects per-OS guidance (Windows cmd, macOS `open -a`,
         # Linux xdg-open, + WSL/Termux/Docker caveats). Fixes the
         # "bot tries `ls ~/Desktop` on Windows" failure mode that
         # most agent frameworks don't ship a per-OS cheatsheet.
-        try:
-            from flowly.agent.prompt_blocks import (
-                build_platform_block,
-                detect_platform,
-            )
-            parts.append(build_platform_block(detect_platform()))
-        except Exception:
-            logger.exception("[context] platform block render failed")
+        if available_tools is None or "exec" in available_tools:
+            try:
+                from flowly.agent.prompt_blocks import (
+                    build_platform_block,
+                    detect_platform,
+                )
+                parts.append(build_platform_block(detect_platform()))
+            except Exception:
+                logger.exception("[context] platform block render failed")
 
         # Tool output protocol — keep raw tool payloads OUT of user-facing replies.
         # Smaller models (Haiku, etc.) otherwise tend to paste raw JSON, stack
@@ -1383,7 +1460,11 @@ class ContextBuilder:
         # Onboarding flag — tells the agent to run the first-time setup.
         # Skipped for cron runs so scheduled tasks don't derail into
         # "introduce yourself and fill USER.md" flows.
-        if not skip_context_files and self._is_onboarding_pending():
+        if (
+            not skip_context_files
+            and (available_tools is None or "write_file" in available_tools)
+            and self._is_onboarding_pending()
+        ):
             parts.append(
                 "## Getting to know the user\n\n"
                 "USER.md isn't filled in yet. You MAY — once, lightly — offer to "
@@ -1421,15 +1502,31 @@ class ContextBuilder:
         # Skills - progressive loading
         # 1. Always-loaded skills: include full content
         always_skills = self.skills.get_always_skills()
+        if defer_dynamic_guidance:
+            # The browser playbook is capability-scoped despite its historical
+            # always=true metadata.  Other always skills retain their previous
+            # semantics until they have an explicit router of their own.
+            always_skills = [
+                name for name in always_skills if name != "flowly-browser"
+            ]
+        if skill_names and not defer_dynamic_guidance:
+            always_skills = list(dict.fromkeys([*always_skills, *skill_names]))
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
         
         # 2. Available skills: metadata-only summary (agent uses skill_view to load full content)
-        skills_summary = self.skills.build_skills_summary(
-            available_tools=self._get_available_tool_names(),
-        )
+        skills_summary = ""
+        if (
+            not defer_dynamic_guidance
+            and (available_tools is None or "skill_view" in available_tools)
+        ):
+            skills_summary = self.skills.build_skills_summary(
+                available_tools=self._get_available_tool_names(
+                    reachable_tools if reachable_tools is not None else available_tools
+                ),
+            )
         if skills_summary:
             parts.append(f"""# Skills
 
@@ -1439,7 +1536,12 @@ Skills with available="false" need dependencies — try installing with apt/brew
 {skills_summary}""")
 
         # Self-improvement guidance
-        parts.append(
+        if (
+            available_tools is None
+            or "knowledge_graph" in available_tools
+            or "memory_append" in available_tools
+        ):
+            parts.append(
             "# Self-Improvement\n\n"
             "You have persistent memory and a knowledge graph.\n\n"
             "## Knowledge Graph (knowledge_graph tool)\n\n"
@@ -1472,11 +1574,12 @@ Skills with available="false" need dependencies — try installing with apt/brew
             "## Memory (memory_append tool)\n\n"
             "For free-form notes, general preferences, environment details, tool quirks, "
             "and corrections. NOT for structured facts — those go to knowledge_graph."
-        )
+            )
 
         # Built-in agents — routing is handled at framework level (code),
         # this is just informational for the LLM
-        parts.append(
+        if available_tools is None or "builtin_agent" in available_tools:
+            parts.append(
             "# Specialist Agents\n\n"
             "Delegate research / writing / code work with `builtin_agent`:\n"
             "- `researcher` — SELF-CONTAINED: researches a topic (web_search, "
@@ -1534,10 +1637,11 @@ Skills with available="false" need dependencies — try installing with apt/brew
             "\n"
             "Specialists run in-process with dedicated models and return their "
             "final result to you as a tool_result — deliver it to the user."
-        )
+            )
 
         # Artifacts — tell the bot where artifacts live and how to access them
-        parts.append(
+        if available_tools is None or "artifact" in available_tools:
+            parts.append(
             "# Artifacts\n\n"
             "Long-form outputs (reports, essays, research, documents) are stored as "
             "**artifacts** in a SQLite database at `~/.flowly/artifacts.sqlite`, "
@@ -1569,7 +1673,7 @@ Skills with available="false" need dependencies — try installing with apt/brew
             "When a user asks 'what's in my artifacts' or 'show my reports', "
             "use `artifact(action='list')` directly — do NOT spawn a subagent "
             "and do NOT inspect the filesystem."
-        )
+            )
 
         # Per-tool guidance — conditional loading.
         # Each block is only included when its tool is actually registered,
@@ -1577,26 +1681,26 @@ Skills with available="false" need dependencies — try installing with apt/brew
         # optional integrations. Order is stable so prompt caching holds:
         # blocks that exist this turn always appear in the same relative
         # order, blocks that don't simply drop out (filter-style).
-        if self._has_tool("trello"):
+        if self._has_tool("trello", available_tools):
             parts.append(_TRELLO_GUIDANCE)
-        if self._has_tool("docker"):
+        if self._has_tool("docker", available_tools):
             parts.append(_DOCKER_GUIDANCE)
-        if self._has_tool("system"):
+        if self._has_tool("system", available_tools):
             parts.append(_SYSTEM_MONITORING_GUIDANCE)
         # voice_call guidance is intentionally suppressed in iOS voice
         # mode: the Twilio block mandates "narrate before every tool
         # call" while VOICE_MODE_BLOCK forbids preambles. Keeping both
         # in the prompt made the model oscillate — user-visible as
         # "it still says 'Bir saniye bakıyorum' in voice mode".
-        if self._has_tool("voice_call") and not voice_mode:
+        if self._has_tool("voice_call", available_tools) and not voice_mode:
             parts.append(_VOICE_CALL_GUIDANCE)
-        if self._has_tool("computer"):
+        if not defer_dynamic_guidance and self._has_tool("computer", available_tools):
             parts.append(_COMPUTER_USE_GUIDANCE)
-        if self._has_tool("browser_tab"):
+        if not defer_dynamic_guidance and self._has_tool("browser_tab", available_tools):
             parts.append(_BROWSER_TAB_GUIDANCE)
 
         # Google Workspace guidance (only when email tool is available)
-        if self._has_google_tools():
+        if self._has_google_tools(available_tools):
             parts.append(
                 "# Google Workspace\n\n"
                 "You have access to the user's Google account:\n\n"
@@ -1708,7 +1812,11 @@ Skills with available="false" need dependencies — try installing with apt/brew
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, memory_search_enabled: bool = False) -> str:
+    def _get_identity(
+        self,
+        memory_search_enabled: bool = False,
+        available_tools: set[str] | frozenset[str] | None = None,
+    ) -> str:
         """Get the core identity section."""
         import os as _os
         # Collapse the user's home prefix to `~/...` in every path we
@@ -1723,26 +1831,43 @@ Skills with available="false" need dependencies — try installing with apt/brew
         _home = _os.path.expanduser("~")
         workspace_path = ("~" + _abs[len(_home):]) if _abs.startswith(_home) else _abs
 
-        # Build memory section
-        if memory_search_enabled:
-            memory_section = f"""## Memory
+        def has_tool(name: str) -> bool:
+            return available_tools is None or name in available_tools
 
-MEMORY.md is loaded above — read it before responding.
-Archive: `{workspace_path}/memory/` (daily notes, past conversations).
-
-**Write immediately** — the moment you learn a fact (name, job, preference, email), append it to MEMORY.md. Do not wait for more details. 1-3 lines per fact, never delete.
-- Append to: `{workspace_path}/memory/MEMORY.md`
-- Daily logs: `{workspace_path}/memory/YYYY-MM-DD.md` (run `exec date +%F` if you need today's filename)
-
-**Search tools**: `memory_search` for daily notes. `session_search` for past conversations — three modes, zero LLM cost: (a) `query=...` to FTS5-search across all past sessions; results include snippet, ±3 context, plus the session's first/last 3 messages (bookends) so you can judge relevance instantly. Each hit carries `anchor_id`. (b) `target_session` + `around_message_id` to scroll into a hit and read the surrounding window (re-anchor on the first/last id to paginate). (c) no args to browse recent sessions. Use it when `memory_search` returns empty or when the user references a prior conversation."""
+        # Build only the memory instructions that the current route can obey.
+        memory_lines = ["## Memory"]
+        if memory_search_enabled and has_tool("memory_search"):
+            memory_lines.extend([
+                "MEMORY.md is loaded above — read it before responding.",
+                f"Archive: `{workspace_path}/memory/` (daily notes, past conversations).",
+            ])
         else:
-            memory_section = f"""## Memory
-
-Persistent memory: `{workspace_path}/memory/MEMORY.md` (curated facts).
-Daily notes: `{workspace_path}/memory/YYYY-MM-DD.md` (run `exec date +%F` if you need today's filename).
-
-**Write immediately** — the moment you learn a fact (name, job, preference, email), append it to MEMORY.md. Do not wait. 1-3 lines per fact, never delete.
-Use `session_search` when the user references a prior conversation. Three modes (zero LLM cost): `query=...` to keyword-search past sessions (returns snippet + context + first/last-3 bookends + an `anchor_id`); `target_session` + `around_message_id` to scroll into a hit; no args to browse recent sessions chronologically."""
+            date_hint = (
+                " (run `exec date +%F` if you need today's filename)"
+                if has_tool("exec") else ""
+            )
+            memory_lines.extend([
+                f"Persistent memory: `{workspace_path}/memory/MEMORY.md` (curated facts).",
+                f"Daily notes: `{workspace_path}/memory/YYYY-MM-DD.md`{date_hint}.",
+            ])
+        if has_tool("memory_append") or has_tool("write_file"):
+            memory_lines.append(
+                "**Write immediately** — the moment you learn a fact (name, job, "
+                "preference, email), append it to MEMORY.md. Do not wait. "
+                "1-3 lines per fact, never delete."
+            )
+        search_tools: list[str] = []
+        if has_tool("memory_search"):
+            search_tools.append("`memory_search` for daily notes")
+        if has_tool("session_search"):
+            search_tools.append(
+                "`session_search` for past conversations (query to search, "
+                "target_session + around_message_id to scroll, or no arguments "
+                "to browse recent sessions)"
+            )
+        if search_tools:
+            memory_lines.append("**Search tools**: " + "; ".join(search_tools) + ".")
+        memory_section = "\n\n".join(memory_lines)
 
         # Load persona-specific identity if available. This branch
         # REPLACES the default Flowly identity entirely (that's by
@@ -1805,65 +1930,79 @@ and free of filler."""
         # so the inline list was pure duplication.
         from flowly.agent.prompt_blocks import build_agency_block, build_plan_mode_block
 
-        return f"""{identity_header}
+        identity_parts = [
+            identity_header,
+            build_agency_block(),
+            build_plan_mode_block(),
+        ]
 
-{build_agency_block()}
-
-{build_plan_mode_block()}
-
-## exec Tool - Application and System Control
+        if has_tool("exec"):
+            identity_parts.append(f"""## exec Tool - Application and System Control
 
 The exec tool can run ANY shell command on the computer:
 
 {self._get_exec_examples()}
 
-Do not use `exec` unless it is actually needed for the task.
+Do not use `exec` unless it is actually needed for the task.""")
 
-## Filesystem Access
-- **read_file, write_file, list_dir** tools work within the workspace (`{workspace_path}`) and `~/.flowly/` only.
-- **For files outside the workspace** (Desktop, Downloads, Documents, /tmp, etc.) use the **exec** tool instead: `exec(command="ls ~/Downloads")`, `exec(command="cat ~/Desktop/file.txt")`.
-- Never say "I don't have access" — use exec to access any file on the computer.
-- Default working directory for shell commands: `{workspace_path}` (unless a project directory is set for this session, in which case `exec` runs there). Pass `working_dir=...` to override per command.
+        if any(has_tool(name) for name in ("read_file", "write_file", "edit_file", "list_dir")):
+            filesystem_lines = [
+                "## Filesystem Access",
+                f"- File tools work within the workspace (`{workspace_path}`) and `~/.flowly/` only.",
+            ]
+            if has_tool("exec"):
+                filesystem_lines.extend([
+                    "- For files outside the workspace (Desktop, Downloads, Documents, "
+                    "/tmp, etc.) use `exec`.",
+                    f"- Default working directory for shell commands: `{workspace_path}`. "
+                    "Pass `working_dir=...` to override per command.",
+                ])
+            identity_parts.append("\n".join(filesystem_lines))
 
-## Internal Data
+        if any(has_tool(name) for name in (
+            "memory_append", "memory_search", "session_search", "skill_view", "skill_manage",
+        )):
+            identity_parts.append(f"""## Internal Data
 Your memory and skills are stored at: `{workspace_path}`
 - Memory: `{workspace_path}/memory/MEMORY.md`
 - Daily notes: `{workspace_path}/memory/YYYY-MM-DD.md`
-- Custom skills: `{workspace_path}/skills/{{skill-name}}/SKILL.md`
+- Custom skills: `{workspace_path}/skills/{{skill-name}}/SKILL.md`""")
 
-## Cron
+        if has_tool("cron"):
+            voice_example = ""
+            if has_tool("voice_call"):
+                voice_example = (
+                    '\n- "Call me in 1 min" → cron(action="add", schedule="at +1m", '
+                    'tool_name="voice_call", tool_args={{...}}, deliver=true)'
+                )
+            identity_parts.append(f"""## Cron
 
 Use cron for reminders, schedules, recurring tasks. Always set deliver=true.
 Formats: "at +5m", "at +1h", "at +2d", "at 14:30", "at tomorrow 09:00", "every 30m", "every 1h", "0 9 * * *"
 Examples:
 - "Remind me in 5 min" → cron(action="add", schedule="at +5m", message="...", deliver=true)
-- "Every day at 9am" → cron(action="add", schedule="0 9 * * *", message="...", deliver=true)
-- "Call me in 1 min" → cron(action="add", schedule="at +1m", tool_name="voice_call", tool_args={{...}}, deliver=true)
-Cron jobs run the full agent loop with ALL tools — they can search web, fetch URLs, send messages.
+- "Every day at 9am" → cron(action="add", schedule="0 9 * * *", message="...", deliver=true){voice_example}
+Scheduled jobs run the full agent loop with the tools allowed by their cron route.
 
-If a cron job tool call fails, include the error in your response — do not silently ignore errors.
+If a scheduled job tool call fails, include the error in your response — do not silently ignore errors.""")
 
-## Background Tasks
+        background_lines: list[str] = []
+        if has_tool("spawn"):
+            background_lines.extend([
+                "Use `spawn` for tasks taking 15+ seconds (web research, file analysis, builds).",
+                "Do not spawn for quick commands, screenshots, or when the user needs an answer now.",
+            ])
+        if has_tool("sessions_list"):
+            background_lines.extend([
+                "**Managing tasks with `sessions_list`:**",
+                '- List tasks: `sessions_list(action="list")`',
+                '- Cancel a task: `sessions_list(action="cancel", run_id="65ef714e")`',
+                "- Do not poll in a loop; completion is push-based.",
+            ])
+        if background_lines:
+            identity_parts.append("## Background Tasks\n\n" + "\n".join(background_lines))
 
-Use `spawn` for tasks taking 15+ seconds (web research, file analysis, builds).
-Do not spawn for quick commands, screenshots, or when the user needs an answer now.
-
-**Managing tasks with `sessions_list`:**
-- List tasks: `sessions_list(action="list")` or `sessions_list(action="list", status="running")`
-- Cancel a task: `sessions_list(action="cancel", run_id="65ef714e")`
-- When user says "durdur", "iptal et", "cancel", "stop the task" → use cancel action immediately
-
-**DO NOT poll `sessions_list` in a loop.** Subagent completion is
-push-based — when a background task finishes, its result arrives as
-a system message on a later turn automatically. Calling
-`sessions_list` repeatedly in the same turn to "check if the task is
-done" wastes tokens and doesn't speed anything up. Use
-`sessions_list` only for explicit management actions (list, cancel)
-or when the user directly asks for the status. If you spawned a
-task and it hasn't replied yet, tell the user it's in progress and
-stop — do NOT start doing the same work yourself.
-
-**CRITICAL SAFETY — Destructive Actions:**
+        identity_parts.append("""**CRITICAL SAFETY — Destructive Actions:**
 NEVER perform these without explicit user confirmation first:
 - Deleting files, emails, messages, or any user data
 - Overwriting config files, documents, or code
@@ -1872,9 +2011,9 @@ NEVER perform these without explicit user confirmation first:
 - Modifying system settings (permissions, services, startup items)
 - `rm`, `del`, `format`, `drop`, and similar destructive commands
 
-When in doubt, ASK FIRST. A wrong action can't be undone.
-
-{memory_section}"""
+When in doubt, ASK FIRST. A wrong action can't be undone.""")
+        identity_parts.append(memory_section)
+        return "\n\n".join(part for part in identity_parts if part)
     
     def _get_exec_examples(self) -> str:
         """Get platform-appropriate exec tool examples."""
@@ -1965,6 +2104,8 @@ When in doubt, ASK FIRST. A wrong action can't be undone.
         model: str | None = None,
         channel: str | None = None,
         session_key: str | None = None,
+        available_tools: set[str] | frozenset[str] | None = None,
+        reachable_tools: set[str] | frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -1988,8 +2129,14 @@ When in doubt, ASK FIRST. A wrong action can't be undone.
         messages = []
 
         # System prompt
+        # ``None`` means the caller has not supplied a routed tool surface.
+        # Optimising that unknown case could silently remove a guide from an
+        # older/third-party caller, so preserve the exact legacy eager prompt.
+        defer_dynamic_guidance = (
+            self._capability_guidance_enabled and available_tools is not None
+        )
         system_prompt = self.build_system_prompt(
-            skill_names,
+            None if defer_dynamic_guidance else skill_names,
             memory_search_enabled=memory_search_enabled,
             skip_memory=skip_memory,
             skip_context_files=skip_context_files,
@@ -1997,8 +2144,22 @@ When in doubt, ASK FIRST. A wrong action can't be undone.
             session_key=session_key,
             model=model,
             channel=channel,
+            available_tools=available_tools,
+            reachable_tools=reachable_tools,
+            defer_dynamic_guidance=defer_dynamic_guidance,
         )
         messages.append({"role": "system", "content": system_prompt})
+
+        if defer_dynamic_guidance:
+            dynamic_message = self._build_dynamic_guidance_message(
+                history=history,
+                current_message=current_message,
+                skill_names=skill_names,
+                available_tools=available_tools,
+                reachable_tools=reachable_tools,
+            )
+            if dynamic_message is not None:
+                messages.append(dynamic_message)
 
         # History
         messages.extend(history)
@@ -2008,6 +2169,99 @@ When in doubt, ASK FIRST. A wrong action can't be undone.
         messages.append({"role": "user", "content": user_content})
 
         return messages
+
+    def _build_dynamic_guidance_message(
+        self,
+        *,
+        history: list[dict[str, Any]],
+        current_message: str,
+        skill_names: list[str] | None,
+        available_tools: set[str] | frozenset[str] | None,
+        reachable_tools: set[str] | frozenset[str] | None,
+    ) -> dict[str, Any] | None:
+        """Build the non-cacheable capability/skill tail for one turn.
+
+        The first system message remains byte-stable across unrelated intents.
+        Anthropic caches that prefix; this smaller second system message may
+        vary freely without invalidating it.
+        """
+
+        from flowly.agent.capability_guidance import (
+            BROWSER_CAPABILITY,
+            COMPUTER_CAPABILITY,
+            CapabilityGuidanceDecision,
+            route_capability_guidance,
+        )
+
+        routed_tools = set(available_tools or ())
+        try:
+            decision = route_capability_guidance(
+                current_message=current_message,
+                history=history,
+                available_tools=routed_tools,
+            )
+        except Exception:
+            logger.exception("[context] capability guidance routing failed")
+            active = {
+                capability
+                for capability, tool_name in (
+                    (COMPUTER_CAPABILITY, "computer"),
+                    (BROWSER_CAPABILITY, "browser_tab"),
+                )
+                if tool_name in routed_tools
+            } if self._capability_guidance_fail_open else set()
+            decision = CapabilityGuidanceDecision(
+                active=frozenset(active),
+                confidence="low",
+                reason="router error; legacy fail-open",
+                fail_open=bool(active),
+            )
+
+        parts: list[str] = []
+        if COMPUTER_CAPABILITY in decision.active:
+            parts.append(_COMPUTER_USE_GUIDANCE)
+        if BROWSER_CAPABILITY in decision.active:
+            parts.append(_BROWSER_TAB_GUIDANCE)
+            browser_skill = self.skills.load_skills_for_context(["flowly-browser"])
+            if browser_skill:
+                parts.append(f"# Active Skills\n\n{browser_skill}")
+            if "computer" in routed_tools:
+                parts.append(_COMPUTER_FALLBACK_GUIDANCE)
+
+        if skill_names:
+            requested_content = self.skills.load_skills_for_context(skill_names)
+            if requested_content:
+                parts.append(f"# Active Skills\n\n{requested_content}")
+
+        if "skill_view" in routed_tools:
+            skills_summary = self.skills.build_skills_summary(
+                available_tools=self._get_available_tool_names(
+                    reachable_tools if reachable_tools is not None else available_tools
+                ),
+                max_chars=self._skill_catalog_max_chars,
+                intent_text=current_message,
+            )
+            if skills_summary:
+                parts.append(
+                    "# Skills\n\n"
+                    "Relevant skills include descriptions; every remaining skill "
+                    "is still named in the compact index. Load a matching skill "
+                    "with `skill_view(name)` and follow it. Skills marked "
+                    "available=\"false\" need setup.\n\n"
+                    f"{skills_summary}"
+                )
+
+        if not parts:
+            return None
+        return {
+            "role": "system",
+            "content": "\n\n---\n\n".join(parts),
+            # Internal observability only. Providers strip underscore keys and
+            # the message sits before turn_start_idx, so it is not persisted.
+            "_capability_guidance": sorted(decision.active),
+            "_capability_guidance_reason": decision.reason,
+            "_capability_guidance_fail_open": decision.fail_open,
+        }
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional media attachments.

@@ -65,11 +65,18 @@ One-shot interaction with the agent.
 
 ## flowly gateway
 
-Start the gateway daemon.
+Start the gateway daemon in the foreground.
+
+If the background service already holds the port, the gateway offers to take
+it over for this session — it stops the service, serves the port itself, and
+reinstalls + restarts the service when you exit (Ctrl+C included). Anything
+else listening on that port is left alone and reported as a normal bind
+error. Without a terminal to ask (scripts, CI) it refuses and prints the two
+commands instead, so automation can never stop a service silently.
 
 | Option | Description |
 |---|---|
-| `--port`, `-p` | Gateway port (default `18790`). |
+| `--port`, `-p` | Gateway port (defaults to `gateway.port` in config, `18790` out of the box). |
 | `--verbose`, `-v` | Verbose output. |
 | `--persona` | Bot persona: `default`, `jarvis`, `pirate`, `samurai`, `casual`, `professor`, `butler`, `friday`. |
 | `--remote` | Accept connections from your phone / other devices (plain-language alias for `--host 0.0.0.0`; a token is ensured automatically). |
@@ -83,7 +90,7 @@ Connect a phone or another device to this gateway in one step: enables remote ac
 
 ## flowly setup
 
-The first-run onboarding + configuration surface. Bare `flowly setup` seeds the workspace and opens the picker — **sign in with a Flowly account or enter your own API key** — then offers to start the gateway. Subcommands:
+The first-run onboarding + configuration surface. Bare `flowly setup` seeds the workspace, asks how to power Flowly (**Quick** = sign in with a Flowly account; **Full** = the whole provider list plus channels/integrations/media; **Blank** = a provider and nothing else), verifies that the provider actually answers, and offers to keep the gateway running. A login found from another tool (the Codex CLI, OpenCode) is offered as a choice, never adopted silently. See [Setup wizard](../getting-started/setup-wizard.md). Subcommands:
 
 | Subcommand | What it does |
 |---|---|
