@@ -18,8 +18,12 @@ from typing import Any
 
 from loguru import logger
 
+from flowly.session.archive import snapshot_from_rows
+
+
 def _default_db_path() -> Path:
     from flowly.profile import get_flowly_home
+
     return get_flowly_home() / "session_index.sqlite"
 
 _SCHEMA_SQL = """
@@ -33,6 +37,9 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_key TEXT NOT NULL,
+    event_id    TEXT,
+    event_seq   INTEGER,
+    state       TEXT NOT NULL DEFAULT 'active',
     role        TEXT NOT NULL,
     content     TEXT NOT NULL,
     timestamp   REAL NOT NULL,
@@ -118,7 +125,29 @@ class SessionIndexer:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA_SQL)
+        self._migrate_schema()
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        """Add archive columns to existing indexes without rebuilding rows."""
+        columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        additions = {
+            "event_id": "TEXT",
+            "event_seq": "INTEGER",
+            "state": "TEXT NOT NULL DEFAULT 'active'",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE messages ADD COLUMN {name} {declaration}"
+                )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_session_event "
+            "ON messages(session_key, event_id) WHERE event_id IS NOT NULL"
+        )
 
     # ── Indexing ───────────────────────────────────────────────────
 
@@ -196,6 +225,100 @@ class SessionIndexer:
                 )
         except Exception as e:
             logger.debug("Session index failed for {}: {}", key, e)
+
+    def index_archive(self, key: str, rows: list[dict[str, Any]]) -> None:
+        """Upsert the append-only archive without deleting historical rows.
+
+        Existing pre-migration rows are claimed in place by matching their
+        role/content occurrence. Their SQLite ids therefore remain stable for
+        downstream watermarks. Once claimed, event ids are the only identity
+        used; compaction changes ``state`` and never deletes/reinserts content.
+        """
+        snapshot = snapshot_from_rows(rows)
+        content_events = [
+            event
+            for event in snapshot.events
+            if event.message.get("content")
+            and event.message.get("role") in ("user", "assistant")
+            and not event.message.get("_display_hidden")
+        ]
+        now = time.time()
+        try:
+            with self._conn:
+                existing = self._conn.execute(
+                    "SELECT id, event_id, role, content FROM messages "
+                    "WHERE session_key = ? ORDER BY id",
+                    (key,),
+                ).fetchall()
+                by_event_id = {
+                    str(row["event_id"]): row
+                    for row in existing
+                    if row["event_id"]
+                }
+                unclaimed_legacy = [row for row in existing if not row["event_id"]]
+                claimed_legacy: set[int] = set()
+
+                for event in content_events:
+                    current = by_event_id.get(event.event_id)
+                    if current is not None:
+                        self._conn.execute(
+                            "UPDATE messages SET event_seq = ?, state = ? "
+                            "WHERE id = ?",
+                            (event.sequence, event.state, current["id"]),
+                        )
+                        continue
+
+                    legacy = next(
+                        (
+                            row
+                            for row in unclaimed_legacy
+                            if row["id"] not in claimed_legacy
+                            and row["role"] == event.message.get("role")
+                            and row["content"] == event.message.get("content")
+                        ),
+                        None,
+                    )
+                    if legacy is not None:
+                        claimed_legacy.add(int(legacy["id"]))
+                        self._conn.execute(
+                            "UPDATE messages SET event_id = ?, event_seq = ?, "
+                            "state = ? WHERE id = ?",
+                            (
+                                event.event_id,
+                                event.sequence,
+                                event.state,
+                                legacy["id"],
+                            ),
+                        )
+                        continue
+
+                    self._conn.execute(
+                        "INSERT INTO messages "
+                        "(session_key, event_id, event_seq, state, role, content, timestamp) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            key,
+                            event.event_id,
+                            event.sequence,
+                            event.state,
+                            event.message["role"],
+                            event.message["content"],
+                            self._parse_ts(event.message, now),
+                        ),
+                    )
+
+                created_at = now
+                if content_events:
+                    created_at = self._parse_ts(content_events[0].message, now)
+                self._conn.execute(
+                    "INSERT INTO sessions (key, created_at, updated_at, msg_count) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET "
+                    "updated_at=excluded.updated_at, msg_count=excluded.msg_count",
+                    (key, created_at, now, len(content_events)),
+                )
+        except Exception as e:
+            logger.debug("Session archive index failed for {}: {}", key, e)
 
     @staticmethod
     def _parse_ts(msg: dict[str, Any], fallback: float) -> float:
@@ -456,10 +579,28 @@ class SessionIndexer:
     def rebuild_from_sessions_dir(self, sessions_dir: Path) -> int:
         """Rebuild entire index from JSONL session files. Returns count."""
         import json as _json
+
         from flowly.session.manager import iter_session_files
+
         count = 0
         for path in iter_session_files(sessions_dir):
             try:
+                key = path.stem.replace("_", ":", 1)
+                full_path = path.with_name(f"{path.stem}.full.jsonl")
+                if full_path.exists():
+                    rows = []
+                    with open(full_path, encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            data = _json.loads(line)
+                            if isinstance(data, dict):
+                                rows.append(data)
+                    if rows:
+                        self.index_archive(key, rows)
+                        count += 1
+                        continue
                 messages = []
                 with open(path, encoding="utf-8") as f:
                     for line in f:
@@ -471,7 +612,6 @@ class SessionIndexer:
                             continue
                         messages.append(data)
                 if messages:
-                    key = path.stem.replace("_", ":", 1)
                     self.index_session(key, messages)
                     count += 1
             except Exception as e:

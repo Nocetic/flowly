@@ -39,6 +39,14 @@ from flowly.exec.process_registry import get_registry as _get_process_registry
 from flowly.exec.process_checkpoint import ProcessCheckpoint
 from flowly.agent.subagent import SubagentManager
 from flowly.session.manager import SessionManager
+from flowly.session.archive import (
+    ARCHIVE_STATE_KEY,
+    ARCHIVE_SUMMARY_KEY,
+    ARCHIVE_TRANSACTION_KEY,
+    EVENT_ID_KEY,
+    EVENT_SEQ_KEY,
+    SUMMARY_COVERS_KEY,
+)
 from flowly.cron.service import CronService
 from flowly.compaction.service import CompactionService
 from flowly.compaction.types import (
@@ -5894,9 +5902,14 @@ class AgentLoop:
         # family directives would defeat the whole point. Channel
         # flows through too so e.g. a flush on the WhatsApp surface
         # doesn't suddenly emit Markdown formatting.
+        flush_coverage = self._context_coverage_sidecar(session)
         messages = self.context.build_messages(
             history=self._history_with_summary_anchor(session),
-            current_message=user_prompt,
+            current_message=(
+                f"{flush_coverage}\n\n{user_prompt}"
+                if flush_coverage
+                else user_prompt
+            ),
             model=self.model,
             channel=channel,
             available_tools=available_tools,
@@ -6574,6 +6587,11 @@ class AgentLoop:
             )
         session.metadata["persona"] = current_persona
 
+        # Prove the persisted archive and working context still form one
+        # complete lineage. The sidecar is added only to this request copy;
+        # the user's stored message remains byte-for-byte clean.
+        coverage_sidecar = self._context_coverage_sidecar(session)
+
         # Get history and check for compaction. The session-length snapshot
         # travels with the history snapshot: if this turn ends up committing a
         # compaction, anything appended past this point by a concurrent turn
@@ -6589,10 +6607,15 @@ class AgentLoop:
         skip_context_files_flag = bool(msg.metadata.get("skip_context_files", False))
         voice_mode_flag = bool(msg.metadata.get("voice_mode", False))
         effective_model = msg.metadata.get("model_override") or self.model
-        llm_current_message = (
-            f"{group_context_block}\n---\n{msg.content}"
-            if group_context_block
+        covered_current_message = (
+            f"{coverage_sidecar}\n\n{msg.content}"
+            if coverage_sidecar
             else msg.content
+        )
+        llm_current_message = (
+            f"{group_context_block}\n---\n{covered_current_message}"
+            if group_context_block
+            else covered_current_message
         )
 
         # Estimate the fixed overhead the FIRST provider call will carry: the
@@ -6631,7 +6654,7 @@ class AgentLoop:
                 msg.channel,
                 available_tools=turn_available_tools,
                 reachable_tools=turn_reachable_tools,
-            ) + estimate_tokens(msg.content or "")
+            ) + estimate_tokens(covered_current_message or "")
         fixed_overhead = (
             prompt_overhead
             + self._tool_schema_tokens(msg.channel)
@@ -7178,9 +7201,14 @@ class AgentLoop:
             for item in system_disclosure.definitions
             if str(item.get("function", {}).get("name", ""))
         }
+        announce_coverage = self._context_coverage_sidecar(session)
         messages = self.context.build_messages(
             history=self._history_with_summary_anchor(session),
-            current_message=msg.content,
+            current_message=(
+                f"{announce_coverage}\n\n{msg.content}"
+                if announce_coverage
+                else msg.content
+            ),
             memory_search_enabled=self._memory_manager is not None,
             model=self.model,
             channel=origin_channel,
@@ -7914,6 +7942,39 @@ class AgentLoop:
         anchor = {"role": "system", "content": content}
         return [anchor] + history
 
+    def _context_coverage_sidecar(self, session: Any) -> str:
+        """Return a deterministic request-only archive coverage manifest."""
+        try:
+            manifest = self.sessions.context_coverage(session)
+        except Exception as exc:  # noqa: BLE001 — safety telemetry, not a turn blocker
+            logger.error(
+                "Context coverage audit failed for {}: {}",
+                getattr(session, "key", "<unknown>"),
+                exc,
+            )
+            return (
+                "<conversation_coverage status=\"UNKNOWN\" coverage_gap=\"unknown\" />\n"
+                "The archive coverage audit is unavailable. Do not make exact "
+                "claims about the beginning or completeness of this conversation."
+            )
+        session.metadata["context_coverage"] = manifest.as_dict()
+        if manifest.total_events == 0:
+            return ""
+        sidecar = manifest.prompt_sidecar()
+        if manifest.coverage_gap:
+            logger.error(
+                "Context coverage invariant violated for {}: gap={} total={}",
+                session.key,
+                manifest.coverage_gap,
+                manifest.total_events,
+            )
+            sidecar += (
+                "\nCoverage is incomplete. Do not infer the first message or "
+                "claim the visible context is the entire conversation; retrieve "
+                "the archived events before answering exact-history questions."
+            )
+        return sidecar
+
     # A summary of a two-line chat costs an LLM call and buys nothing.
     _COMPACT_MIN_TURNS = 3
     _COMPACT_MIN_TOKENS = 1000
@@ -8110,11 +8171,26 @@ class AgentLoop:
                 "summary rather than restoring what the user cleared"
             )
         appended_tail: list[dict[str, Any]] = []
+        original_messages = [dict(message) for message in session.messages]
+        original_metadata = dict(session.metadata)
         if source_message_count is not None and 0 <= source_message_count < len(session.messages):
             appended_tail = [dict(m) for m in session.messages[source_message_count:]]
-        # Preserve the full pre-compaction history in the append-only display
-        # transcript before trimming the LLM context jsonl.
-        self.sessions.flush_full(session)
+        source_count = (
+            source_message_count
+            if source_message_count is not None
+            else len(session.messages)
+        )
+        # Persist the full source and append its state transition BEFORE the
+        # working file is rewritten. A failure here aborts the commit: no
+        # summary may replace events whose durable lineage was not recorded.
+        kept_identities, summary_covers, archive_transaction = (
+            self.sessions.prepare_compaction_archive(
+            session,
+            result.kept_messages,
+            source_message_count=source_count,
+            compaction_id=compaction_id,
+            )
+        )
         # Mark the boundary in the display transcript, between the turns that
         # were summarised and what follows. The relay writes the equivalent row
         # into Firestore for its own clients; this is the copy the transports
@@ -8137,30 +8213,103 @@ class AgentLoop:
         # Flag it as a summary rather than relying on the text prefix. The
         # session store's allowlist projection strips this before the message
         # reaches a provider, so it stays an internal fact.
-        session.add_message("system", summary_msg, **{SUMMARY_METADATA_KEY: True})
+        session.add_message(
+            "system",
+            summary_msg,
+            **{
+                SUMMARY_METADATA_KEY: True,
+                ARCHIVE_SUMMARY_KEY: True,
+                "_display_hidden": True,
+                SUMMARY_COVERS_KEY: summary_covers,
+                ARCHIVE_TRANSACTION_KEY: archive_transaction,
+            },
+        )
+        # The summary is a derived working-context event, not a chat bubble.
+        # Archive it explicitly, then suppress it from display readers.
+        self.sessions.append_compaction_summary(session, dict(session.messages[-1]))
         # kept_messages may carry assistant_with_tool_calls / tool_result
         # entries preserved verbatim. Their ``tool_calls`` / ``tool_call_id``
         # / ``name`` fields must persist alongside ``content`` or the next
         # chat call hits a provider 400 on a malformed sequence.
-        for kept_msg in result.kept_messages:
+        for kept_index, kept_msg in enumerate(result.kept_messages):
             extras = {
                 k: kept_msg[k]
                 for k in ("tool_calls", "tool_call_id", "name")
                 if k in kept_msg
             }
+            identity = (
+                kept_identities[kept_index]
+                if kept_index < len(kept_identities)
+                else None
+            )
+            if identity:
+                extras.update({
+                    key: identity[key]
+                    for key in (EVENT_ID_KEY, EVENT_SEQ_KEY, ARCHIVE_STATE_KEY)
+                    if identity.get(key) is not None
+                })
+                if identity.get("_display_hidden"):
+                    extras["_display_hidden"] = True
+            else:
+                # An essential-tail extract should normally match its source
+                # event. If a future compactor synthesises a kept row, give it
+                # a new hidden archive identity instead of pretending it was a
+                # user-visible historical message.
+                extras["_display_hidden"] = True
+                extras["_archive_derived_copy"] = True
             session.add_message(
                 kept_msg.get("role", "user"),
                 kept_msg.get("content", ""),
                 **extras,
             )
+            if identity is None:
+                self.sessions.append_compaction_summary(
+                    session, dict(session.messages[-1])
+                )
         # Re-append messages that landed while we were summarising — raw
         # dicts, so their timestamps and internal flags survive verbatim.
         for late_msg in appended_tail:
             session.messages.append(late_msg)
         self.sessions.mark_full_synced(session)
         session.metadata["last_compaction_summary"] = result.summary
+        session.metadata["last_compaction_coverage"] = summary_covers
         session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
-        self.sessions.save(session)
+        session.metadata["_pending_archive_transaction"] = archive_transaction
+        try:
+            self.sessions.save(session)
+        except Exception:
+            # The canonical swap did not complete, so the prepared archive
+            # transition remains invisible. Restore the live object as well;
+            # an automatic compaction failure must leave the turn's history
+            # untouched in memory and on disk.
+            session.messages = original_messages
+            session.metadata = original_metadata
+            raise
+        try:
+            self.sessions.finalize_compaction_archive(
+                session, archive_transaction
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The canonical file carries the pending transaction id. Startup
+            # recovery will append the idempotent commit marker; never roll a
+            # successfully swapped summary back to stale working history.
+            logger.error(
+                "Archive transaction {} awaits recovery: {}",
+                archive_transaction,
+                exc,
+            )
+        else:
+            # Persist removal of the recovery marker and re-index the now-
+            # committed state. Failure is non-destructive: recovery sees the
+            # already-present commit marker and clears it on the next load.
+            try:
+                self.sessions.save(session)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Archive transaction committed; pending marker cleanup "
+                    "will retry on reload: {}",
+                    exc,
+                )
         # Compaction is a snapshot boundary: drop the frozen memory block
         # so post-compaction turns re-inject freshly-written memory.
         self.context.invalidate_memory_snapshot(session_key)

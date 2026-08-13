@@ -61,6 +61,33 @@ class _Sessions:
     def flush_full(self, session: Session) -> None:
         pass
 
+    def prepare_compaction_archive(
+        self,
+        session: Session,
+        kept_messages: list[dict],
+        *,
+        source_message_count: int,
+        compaction_id: str,
+    ):
+        session.ensure_event_identities()
+        descriptor = {
+            "start_event_id": "",
+            "end_event_id": "",
+            "start_sequence": 0,
+            "end_sequence": 0,
+            "event_count": 0,
+            "event_ids_sha256": "",
+        }
+        return [None] * len(kept_messages), descriptor, "ctx_test"
+
+    def append_compaction_summary(self, session: Session, message: dict) -> None:
+        pass
+
+    def finalize_compaction_archive(
+        self, session: Session, transaction_id: str,
+    ) -> None:
+        session.metadata.pop("_pending_archive_transaction", None)
+
     def append_context_boundary(self, session: Session, compaction_id: str = "") -> None:
         # The divider the direct-gateway surfaces read back from disk.
         self.boundaries.append(compaction_id)

@@ -12,9 +12,35 @@ from typing import Any
 
 from loguru import logger
 
-from flowly.compaction.types import CONTEXT_BOUNDARY_CONTENT
+from flowly.compaction.types import (
+    CONTEXT_BOUNDARY_CONTENT,
+    is_context_boundary,
+    is_summary_message,
+)
 from flowly.media.assets import assets_to_meta as _assets_to_meta
 from flowly.profile import get_flowly_home
+from flowly.session.archive import (
+    ARCHIVE_COMMIT_TYPE,
+    ARCHIVE_STATE_KEY,
+    ARCHIVE_SUMMARY_KEY,
+    ARCHIVE_TRANSITION_TYPE,
+    EVENT_ID_KEY,
+    EVENT_SEQ_KEY,
+    SUMMARY_COVERS_KEY,
+    ArchiveSnapshot,
+    ArchiveState,
+    ContextCoverageManifest,
+    build_coverage_manifest,
+    commit_record,
+    coverage_descriptor,
+    ensure_event_identity,
+    legacy_event_id,
+    match_kept_events,
+    message_fingerprint,
+    snapshot_from_rows,
+    transaction_is_committed,
+    transition_record,
+)
 from flowly.utils.helpers import ensure_dir, safe_filename
 
 #: Re-exported so callers that write the row can reach it from here; the
@@ -294,6 +320,39 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def _next_event_sequence(self) -> int:
+        """Allocate a monotonically increasing archive sequence."""
+        try:
+            next_sequence = int(self.metadata.get("_next_event_seq", 0))
+        except (TypeError, ValueError):
+            next_sequence = 0
+        if next_sequence <= 0:
+            next_sequence = 1 + max(
+                (
+                    int(message.get(EVENT_SEQ_KEY) or 0)
+                    for message in self.messages
+                    if isinstance(message, dict)
+                ),
+                default=0,
+            )
+        self.metadata["_next_event_seq"] = next_sequence + 1
+        return next_sequence
+
+    def ensure_event_identities(self) -> None:
+        """Backfill identities on in-memory rows without changing content."""
+        for message in self.messages:
+            if message.get(EVENT_ID_KEY) and message.get(EVENT_SEQ_KEY):
+                continue
+            ensure_event_identity(message, sequence=self._next_event_sequence())
+        max_sequence = max(
+            (int(message.get(EVENT_SEQ_KEY) or 0) for message in self.messages),
+            default=0,
+        )
+        self.metadata["_next_event_seq"] = max(
+            int(self.metadata.get("_next_event_seq", 1) or 1),
+            max_sequence + 1,
+        )
+
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
         msg = {
@@ -302,6 +361,19 @@ class Session:
             "timestamp": datetime.now().isoformat(),
             **kwargs
         }
+        requested_sequence = msg.get(EVENT_SEQ_KEY)
+        try:
+            sequence = int(requested_sequence) if requested_sequence else 0
+        except (TypeError, ValueError):
+            sequence = 0
+        if sequence <= 0:
+            sequence = self._next_event_sequence()
+        else:
+            self.metadata["_next_event_seq"] = max(
+                int(self.metadata.get("_next_event_seq", 1) or 1),
+                sequence + 1,
+            )
+        ensure_event_identity(msg, sequence=sequence)
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
@@ -705,6 +777,143 @@ class SessionManager:
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / f"{safe_key}.full.jsonl"
 
+    def _read_full_rows(self, key: str) -> list[dict[str, Any]]:
+        """Read valid append-only archive rows, skipping corrupt lines."""
+        path = self._get_full_path(key)
+        if not path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        rows.append(row)
+        except Exception as e:  # pragma: no cover - disk best-effort
+            logger.debug("Archive read failed for {}: {}", key, e)
+        return rows
+
+    def get_archive_snapshot(self, key: str) -> ArchiveSnapshot:
+        return snapshot_from_rows(self._read_full_rows(key))
+
+    def _append_archive_row(self, key: str, row: dict[str, Any]) -> None:
+        path = self._get_full_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row) + "\n")
+
+    def _reconcile_archive_identities(self, session: "Session") -> None:
+        """Hydrate old canonical rows from deterministic archive identities."""
+        pending_transaction = str(
+            session.metadata.get("_pending_archive_transaction") or ""
+        )
+        if pending_transaction:
+            rows = self._read_full_rows(session.key)
+            if not transaction_is_committed(rows, pending_transaction):
+                # The canonical swap carrying the new summary completed, but
+                # the process died before the tiny archive commit marker was
+                # appended. Finish the prepared transaction idempotently.
+                self._append_archive_row(
+                    session.key,
+                    commit_record(
+                        pending_transaction,
+                        timestamp=datetime.now().isoformat(),
+                    ),
+                )
+            session.metadata.pop("_pending_archive_transaction", None)
+        snapshot = self.get_archive_snapshot(session.key)
+        by_fingerprint: dict[str, list[Any]] = {}
+        for event in snapshot.events:
+            by_fingerprint.setdefault(
+                message_fingerprint(event.message), []
+            ).append(event)
+
+        consumed: set[str] = set()
+        next_sequence = snapshot.max_sequence + 1
+        for message in session.messages:
+            if message.get(EVENT_ID_KEY) and message.get(EVENT_SEQ_KEY):
+                consumed.add(str(message[EVENT_ID_KEY]))
+                continue
+            candidates = by_fingerprint.get(message_fingerprint(message), [])
+            matched = next(
+                (event for event in candidates if event.event_id not in consumed),
+                None,
+            )
+            if matched is not None:
+                ensure_event_identity(
+                    message,
+                    sequence=matched.sequence,
+                    event_id=matched.event_id,
+                )
+                message[ARCHIVE_STATE_KEY] = matched.state
+                consumed.add(matched.event_id)
+            else:
+                ensure_event_identity(message, sequence=next_sequence)
+                consumed.add(str(message[EVENT_ID_KEY]))
+                next_sequence += 1
+
+        session.metadata["_next_event_seq"] = max(
+            int(session.metadata.get("_next_event_seq", 1) or 1),
+            snapshot.max_sequence + 1,
+            1 + max(
+                (int(message.get(EVENT_SEQ_KEY) or 0) for message in session.messages),
+                default=0,
+            ),
+        )
+        if snapshot.events:
+            # Pre-identity archives already contain the current working rows.
+            # Without this migration watermark the next save would append a
+            # duplicate copy merely because old metadata lacked the counter.
+            session.metadata.setdefault("_full_log_count", len(session.messages))
+
+        # One-time append-only migration for sessions compacted by an older
+        # build: rows absent from the working context are represented by the
+        # stored summary. Never rewrite the original archive.
+        summary = session.metadata.get("last_compaction_summary")
+        if not summary or not snapshot.events:
+            return
+        working_ids = {
+            str(message.get(EVENT_ID_KEY))
+            for message in session.messages
+            if message.get(EVENT_ID_KEY)
+        }
+        missing_active = [
+            event.event_id
+            for event in snapshot.events
+            if event.state in ("active", "internal_hidden")
+            and event.event_id not in working_ids
+        ]
+        if missing_active:
+            try:
+                self._append_archive_row(
+                    session.key,
+                    transition_record(
+                        missing_active,
+                        "compacted",
+                        timestamp=datetime.now().isoformat(),
+                        reason="legacy_compaction_migration",
+                    ),
+                )
+                snapshot = self.get_archive_snapshot(session.key)
+            except Exception as e:  # pragma: no cover - disk best-effort
+                logger.debug("Archive migration failed for {}: {}", session.key, e)
+
+        compacted = [event for event in snapshot.events if event.state == "compacted"]
+        descriptor = coverage_descriptor(compacted)
+        session.metadata["last_compaction_coverage"] = descriptor
+        for message in session.messages:
+            if is_summary_message(message):
+                message[ARCHIVE_SUMMARY_KEY] = True
+                message["_display_hidden"] = True
+                message[SUMMARY_COVERS_KEY] = descriptor
+                break
+
     # -- Display transcript (append-only) -----------------------------------
 
     _FULL_WATERMARK_KEY = "_full_log_count"
@@ -714,6 +923,7 @@ class SessionManager:
         append-only display log. Idempotent via a per-session watermark stored in
         metadata (which survives ``Session.clear()``). Best-effort: a failure
         here never blocks the canonical save."""
+        session.ensure_event_identities()
         try:
             mark = int(session.metadata.get(self._FULL_WATERMARK_KEY, 0))
         except (TypeError, ValueError):
@@ -728,13 +938,9 @@ class SessionManager:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8", newline="\n") as f:
                 for msg in new:
-                    # Internal triggers (subagent/board/memory announces) live in
-                    # the LLM context but must never surface in the user-facing
-                    # display transcript as a "user" message. Skip on write; the
-                    # watermark still advances to ``total`` so they're never
-                    # reconsidered.
-                    if msg.get("_display_hidden"):
-                        continue
+                    # Internal rows are archived too; display readers filter
+                    # them. Omitting them here made the supposedly complete
+                    # lineage unable to prove what the model actually saw.
                     f.write(json.dumps(msg) + "\n")
             session.metadata[self._FULL_WATERMARK_KEY] = total
         except Exception as e:  # pragma: no cover - disk best-effort
@@ -780,6 +986,138 @@ class SessionManager:
         correctly."""
         session.metadata[self._FULL_WATERMARK_KEY] = len(session.messages)
 
+    def transition_archive_events(
+        self,
+        session: "Session",
+        event_ids: list[str],
+        state: ArchiveState,
+        *,
+        reason: str = "",
+        compaction_id: str = "",
+        transaction_id: str = "",
+    ) -> None:
+        """Append one durable state transition and update in-memory matches."""
+        clean_ids = [event_id for event_id in dict.fromkeys(event_ids) if event_id]
+        if not clean_ids:
+            return
+        self._append_archive_row(
+            session.key,
+            transition_record(
+                clean_ids,
+                state,
+                timestamp=datetime.now().isoformat(),
+                reason=reason,
+                compaction_id=compaction_id,
+                transaction_id=transaction_id,
+            ),
+        )
+        wanted = set(clean_ids)
+        for message in session.messages:
+            if message.get(EVENT_ID_KEY) in wanted:
+                message[ARCHIVE_STATE_KEY] = state
+
+    def prepare_compaction_archive(
+        self,
+        session: "Session",
+        kept_messages: list[dict[str, Any]],
+        *,
+        source_message_count: int,
+        compaction_id: str,
+    ) -> tuple[list[dict[str, Any] | None], dict[str, Any], str]:
+        """Atomically describe which immutable events a new summary replaces."""
+        session.ensure_event_identities()
+        self.flush_full(session)
+        source = session.messages[:source_message_count]
+        kept_identities = match_kept_events(source, kept_messages)
+        kept_ids = {
+            str(identity.get(EVENT_ID_KEY))
+            for identity in kept_identities
+            if identity and identity.get(EVENT_ID_KEY)
+        }
+        compacted_ids = [
+            str(message.get(EVENT_ID_KEY))
+            for message in source
+            if message.get(EVENT_ID_KEY)
+            and str(message.get(EVENT_ID_KEY)) not in kept_ids
+        ]
+        transaction_id = f"ctx_{secrets.token_hex(12)}"
+        self.transition_archive_events(
+            session,
+            compacted_ids,
+            "compacted",
+            reason="context_compaction",
+            compaction_id=compaction_id,
+            transaction_id=transaction_id,
+        )
+        # Prepared transitions are intentionally invisible until the
+        # canonical working file carrying the summary has been swapped in.
+        snapshot = self.get_archive_snapshot(session.key)
+        newly_compacted = set(compacted_ids)
+        compacted = [
+            event
+            for event in snapshot.events
+            if event.state == "compacted" or event.event_id in newly_compacted
+        ]
+        descriptor = coverage_descriptor(compacted)
+        session.metadata["last_compaction_coverage"] = descriptor
+        return kept_identities, descriptor, transaction_id
+
+    def append_compaction_summary(
+        self,
+        session: "Session",
+        summary_message: dict[str, Any],
+    ) -> None:
+        """Archive the derived summary without exposing it in chat history."""
+        self._append_archive_row(session.key, summary_message)
+
+    def finalize_compaction_archive(
+        self,
+        session: "Session",
+        transaction_id: str,
+    ) -> None:
+        """Commit a prepared archive transition after canonical swap succeeds."""
+        rows = self._read_full_rows(session.key)
+        if not transaction_is_committed(rows, transaction_id):
+            self._append_archive_row(
+                session.key,
+                commit_record(
+                    transaction_id,
+                    timestamp=datetime.now().isoformat(),
+                ),
+            )
+        session.metadata.pop("_pending_archive_transaction", None)
+
+    def context_coverage(self, session: "Session") -> ContextCoverageManifest:
+        return build_coverage_manifest(
+            self.get_archive_snapshot(session.key),
+            session.messages,
+            session.metadata.get("last_compaction_coverage"),
+        )
+
+    def _withdraw_removed_active_events(self, session: "Session") -> None:
+        """Record undo/reset removals without deleting immutable archive rows."""
+        snapshot = self.get_archive_snapshot(session.key)
+        if not snapshot.events:
+            return
+        working_ids = {
+            str(message.get(EVENT_ID_KEY))
+            for message in session.messages
+            if message.get(EVENT_ID_KEY)
+        }
+        removed = [
+            event.event_id
+            for event in snapshot.events
+            if event.state in ("active", "internal_hidden")
+            and event.event_id not in working_ids
+        ]
+        if removed:
+            self.transition_archive_events(
+                session,
+                removed,
+                "withdrawn",
+                reason="removed_from_working_context",
+            )
+
     def get_full_messages(self, key: str) -> list[dict[str, Any]]:
         """The full display transcript for a session — every real message, in
         order, unaffected by compaction. Falls back to the live (possibly
@@ -789,22 +1127,33 @@ class SessionManager:
         if path.exists():
             out: list[dict[str, Any]] = []
             try:
-                with open(path, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            d = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if (
-                            isinstance(d, dict)
-                            and d.get("_type") != "metadata"
-                            and not d.get("_display_hidden")
-                        ):
-                            out.append(d)
-                if out:
+                rows = self._read_full_rows(key)
+                state_by_id = self.get_archive_snapshot(key).by_id
+                occurrences: dict[str, int] = {}
+                for d in rows:
+                    if d.get("_type") in (
+                        "metadata", ARCHIVE_TRANSITION_TYPE, ARCHIVE_COMMIT_TYPE,
+                    ):
+                        continue
+                    if is_context_boundary(d):
+                        out.append(d)
+                        continue
+                    fingerprint = message_fingerprint(d)
+                    occurrence = occurrences.get(fingerprint, 0)
+                    occurrences[fingerprint] = occurrence + 1
+                    event_id = str(
+                        d.get(EVENT_ID_KEY) or legacy_event_id(d, occurrence)
+                    )
+                    event = state_by_id.get(event_id)
+                    state = event.state if event else d.get(ARCHIVE_STATE_KEY)
+                    if (
+                        d.get("_display_hidden")
+                        or d.get(ARCHIVE_SUMMARY_KEY)
+                        or state in ("withdrawn", "internal_hidden")
+                    ):
+                        continue
+                    out.append(d)
+                if rows:
                     return out
             except Exception as e:  # pragma: no cover
                 logger.debug("Display-log read failed for {}: {}", key, e)
@@ -834,6 +1183,7 @@ class SessionManager:
         session = self._load(key)
         if session is None:
             session = Session(key=key)
+        self._reconcile_archive_identities(session)
 
         # Add to cache with LRU eviction
         self._cache[key] = session
@@ -908,6 +1258,9 @@ class SessionManager:
         loop). The final ``save(session)`` at turn end omits the extra and
         rewrites the file canonically.
         """
+        session.ensure_event_identities()
+        if not session.metadata.get("_pending_archive_transaction"):
+            self._withdraw_removed_active_events(session)
         path = self._get_session_path(session.key)
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -954,7 +1307,11 @@ class SessionManager:
         # Update search index (best-effort, never blocks save)
         if self._indexer is not None:
             try:
-                self._indexer.index_session(session.key, session.messages)
+                index_archive = getattr(self._indexer, "index_archive", None)
+                if callable(index_archive):
+                    index_archive(session.key, self._read_full_rows(session.key))
+                else:
+                    self._indexer.index_session(session.key, session.messages)
             except Exception as e:
                 logger.debug("Session index update failed: {}", e)
 
