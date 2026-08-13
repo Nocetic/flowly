@@ -168,6 +168,14 @@ def _run_agent_coroutine_with_cleanup(
     finally:
         agent_loop.stop()
 
+
+async def _wait_for_goal_runtime(agent_loop: Any, session_id: str) -> None:
+    """Let post-delivery scheduling run, then drain this session's goal queue."""
+    await asyncio.sleep(0)
+    runtime = getattr(agent_loop, "goal_runtime", None)
+    if runtime is not None:
+        await runtime.wait_idle(session_id)
+
 # ============================================================================
 # Agent Commands
 # ============================================================================
@@ -411,6 +419,19 @@ def agent(
             f"[dim]{model_name} | session: {session_id} | persona: {persona_name}[/dim]"
         )
 
+    async def _display_goal_output(outbound) -> None:
+        """Render autonomous goal turns through the same terminal contract."""
+        meta = dict(outbound.metadata or {})
+        if outbound.media:
+            meta["media"] = list(outbound.media)
+        _display_tool_results(meta)
+        console.print(f"\n{__logo__} {outbound.content}")
+        _display_media(meta)
+        _display_usage(meta)
+        console.print()
+
+    agent_loop.set_goal_output_callback(_display_goal_output)
+
     if message:
         # Single message mode - check for /compact
         if message.strip().startswith("/compact"):
@@ -435,6 +456,13 @@ def agent(
                 # So the CLI got the check but never the work: the session
                 # stayed over budget and the NEXT invocation paid for it.
                 await agent_loop.await_post_turn_compaction(session_id)
+                # ``process_direct`` queues goal evaluation only after the
+                # visible confirmation. Drain that queue before asyncio.run()
+                # tears down the one-shot process and cancels continuations.
+                await _wait_for_goal_runtime(agent_loop, session_id)
+                # A continuation can itself cross the post-turn compaction
+                # threshold, so drain once more after the autonomous chain.
+                await agent_loop.await_post_turn_compaction(session_id)
             _run_agent_coroutine_with_cleanup(run_once(), agent_loop)
     else:
         # Interactive mode
@@ -447,7 +475,10 @@ def agent(
             nonlocal session_id
             while True:
                 try:
-                    user_input = console.input("[bold blue]You:[/bold blue] ")
+                    user_input = await asyncio.to_thread(
+                        console.input,
+                        "[bold blue]You:[/bold blue] ",
+                    )
                     if not user_input.strip():
                         continue
 
@@ -525,6 +556,8 @@ def agent(
                             console.print("  /compact [instructions] - Summarize conversation history")
                             console.print("  /clear                  - Clear session history")
                             console.print("  /status                 - Show model, session, persona info")
+                            console.print("  /goal [text|status|...] - Set or manage a standing goal")
+                            console.print("  /subgoal [text|...]     - Manage completion criteria")
                             console.print("  /model [name]           - Show or set current model")
                             console.print("  /session [key]          - Show or switch session")
                             console.print("  /sessions               - List all sessions")
