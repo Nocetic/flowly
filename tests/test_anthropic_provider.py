@@ -22,6 +22,46 @@ def test_factory_uses_native_anthropic_provider():
 
 
 @pytest.mark.asyncio
+async def test_http_error_preserves_status_and_machine_type(monkeypatch):
+    class FakeResponse:
+        status_code = 429
+        text = '{"error":{"type":"rate_limit_error","message":"slow down"}}'
+
+        def json(self):
+            return {
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "slow down",
+                }
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    import flowly.providers.anthropic_provider as mod
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", FakeAsyncClient)
+    response = await AnthropicProvider(api_key="sk-ant-api03-secret").chat(
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert response.finish_reason == "error"
+    assert response.error_info is not None
+    assert response.error_info.status_code == 429
+    assert response.error_info.type == "rate_limit_error"
+
+
+@pytest.mark.asyncio
 async def test_chat_posts_to_native_messages_api_and_parses_tool_use(monkeypatch):
     captured = {}
 

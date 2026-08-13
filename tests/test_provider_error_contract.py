@@ -23,11 +23,123 @@ from flowly.agent.loop import (
 from flowly.gateway.server import GatewayServer
 from flowly.integrations import model_catalog
 from flowly.integrations.model_catalog import Model
-from flowly.providers.base import LLMResponse
+from flowly.providers.base import LLMErrorInfo, LLMResponse, error_info_from_exception
+from flowly.providers.key_rotator import is_context_overflow, is_input_too_large
 
 
 def _error(content: str) -> LLMResponse:
     return LLMResponse(content=content, finish_reason="error")
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            LLMResponse(
+                content="request too large for your tier",
+                finish_reason="error",
+                error_info=LLMErrorInfo(status_code=429),
+            ),
+            ErrorCategory.RATE_LIMIT,
+        ),
+        (
+            _error("HTTP 429: request too large for your tier"),
+            ErrorCategory.RATE_LIMIT,
+        ),
+        (
+            LLMResponse(
+                content="context too large",
+                finish_reason="error",
+                error_info=LLMErrorInfo(status_code=413),
+            ),
+            ErrorCategory.INPUT_TOO_LARGE,
+        ),
+        (
+            _error("context_too_large: estimated input exceeds proxy cap"),
+            ErrorCategory.INPUT_TOO_LARGE,
+        ),
+        (
+            _error("maximum context length exceeded"),
+            ErrorCategory.CONTEXT_OVERFLOW,
+        ),
+        (
+            LLMResponse(
+                content="HTTP 429",
+                finish_reason="error",
+                error_info=LLMErrorInfo(
+                    status_code=429,
+                    code="context_length_exceeded",
+                ),
+            ),
+            ErrorCategory.CONTEXT_OVERFLOW,
+        ),
+    ],
+)
+def test_input_budget_errors_use_structured_precedence(
+    response: LLMResponse,
+    expected: ErrorCategory,
+) -> None:
+    assert classify_response(response) is expected
+
+
+def test_context_detector_rejects_generic_request_size_and_tpm_errors() -> None:
+    assert not is_context_overflow("HTTP 413 request too large")
+    assert not is_context_overflow("too large for your tier: 429 tokens per minute")
+    assert is_input_too_large("HTTP 413 request too large")
+    assert is_context_overflow("maximum context length exceeded")
+
+
+def test_input_limit_presentation_is_terminal_and_stable() -> None:
+    presentation = present_provider_error(LLMResponse(
+        content="raw request detail",
+        finish_reason="error",
+        error_info=LLMErrorInfo(status_code=413),
+    ))
+
+    assert presentation.code == "MODEL_INPUT_LIMIT_EXCEEDED"
+    assert presentation.category is ErrorCategory.INPUT_TOO_LARGE
+    assert presentation.retryable is False
+    assert "raw request detail" not in str(presentation.as_dict())
+
+
+def test_rate_limit_backoff_honors_bounded_retry_after() -> None:
+    assert backoff_for(
+        ErrorCategory.RATE_LIMIT,
+        1,
+        retry_after_seconds=17.5,
+    ) == 17.5
+    assert backoff_for(
+        ErrorCategory.RATE_LIMIT,
+        1,
+        retry_after_seconds=3600,
+    ) == 900.0
+
+
+def test_sdk_error_metadata_is_extracted_without_raw_payload() -> None:
+    class Response:
+        status_code = 429
+        headers = {"Retry-After": "12"}
+
+    class SDKError(RuntimeError):
+        status_code = 429
+        response = Response()
+        body = {
+            "error": {
+                "code": "rate_limit_exceeded",
+                "type": "tokens_per_minute",
+                "debug": "must-not-cross-provider-boundary",
+            }
+        }
+
+    info = error_info_from_exception(SDKError("raw provider detail"))
+
+    assert info == LLMErrorInfo(
+        status_code=429,
+        code="rate_limit_exceeded",
+        type="tokens_per_minute",
+        retry_after_seconds=12.0,
+    )
+    assert "debug" not in repr(info)
 
 
 @pytest.mark.parametrize(

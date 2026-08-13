@@ -7,17 +7,16 @@ status code. Explicit terminal product states are separated where callers
 can offer a concrete recovery action:
 
     * rate_limit      → long jittered backoff, retry
-    * context_overflow → no retry, surface as error so the outer layer
-                         can compact and respawn
+    * context_overflow → compact against the model's context window
+    * input_too_large  → compact against the provider/request input ceiling
     * auth            → no retry, fail fast (retries don't fix bad keys)
     * insufficient_credits → no retry, billing action required
     * image_input_unsupported → no retry, choose vision model/remove image
     * transient       → short jittered backoff, retry
 
-Pattern matching uses the same phrase catalogs the key rotator already
-relies on (`flowly.providers.key_rotator.classify_error` +
-`is_context_overflow`), so a future provider-level upgrade (status_code
-preservation) will upgrade every caller at once.
+Classification prefers structured HTTP status and provider error codes carried
+by ``LLMResponse.error_info``. Text catalogs remain only as a compatibility
+fallback for providers that expose no structured failure metadata.
 """
 
 from __future__ import annotations
@@ -28,7 +27,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from flowly.providers.key_rotator import classify_error, is_context_overflow
+from flowly.providers.key_rotator import (
+    classify_error,
+    is_context_overflow,
+    is_input_too_large,
+)
 
 if TYPE_CHECKING:
     from flowly.providers.base import LLMResponse
@@ -37,6 +40,7 @@ if TYPE_CHECKING:
 class ErrorCategory(str, Enum):
     RATE_LIMIT = "rate_limit"
     CONTEXT_OVERFLOW = "context_overflow"
+    INPUT_TOO_LARGE = "input_too_large"
     AUTH = "auth"
     INSUFFICIENT_CREDITS = "insufficient_credits"
     IMAGE_INPUT_UNSUPPORTED = "image_input_unsupported"
@@ -129,19 +133,58 @@ def classify_response(response: "LLMResponse") -> ErrorCategory:
     retry rather than failing immediately.
     """
     msg = response.content or ""
+    info = getattr(response, "error_info", None)
+    status_code = info.status_code if info is not None else None
+    machine_signals = {
+        str(value).strip().lower().replace("-", "_")
+        for value in (
+            info.code if info is not None else None,
+            info.type if info is not None else None,
+        )
+        if value
+    }
+
+    # Machine-readable provider codes are the highest-confidence signal.
+    if machine_signals & {
+        "context_length_exceeded",
+        "model_context_window_exceeded",
+    }:
+        return ErrorCategory.CONTEXT_OVERFLOW
+    if machine_signals & {
+        "context_too_large",
+        "input_too_large",
+        "request_too_large",
+        "payload_too_large",
+    }:
+        return ErrorCategory.INPUT_TOO_LARGE
+
+    # HTTP status wins over ambiguous prose. In particular, provider 429
+    # messages can say "request too large for your tier" while actually
+    # enforcing a token-per-minute bucket; compacting cannot fix that.
+    if status_code == 402:
+        return ErrorCategory.INSUFFICIENT_CREDITS
+    if status_code == 413:
+        return ErrorCategory.INPUT_TOO_LARGE
+    if status_code == 429:
+        return ErrorCategory.RATE_LIMIT
+    if status_code in {401, 403}:
+        return ErrorCategory.AUTH
+
     # Checked first: a 402 is terminal regardless of any other phrasing the
     # wrapped error string might happen to contain.
     if is_insufficient_credits(msg):
         return ErrorCategory.INSUFFICIENT_CREDITS
     if is_image_input_unsupported(msg):
         return ErrorCategory.IMAGE_INPUT_UNSUPPORTED
-    if is_context_overflow(msg):
-        return ErrorCategory.CONTEXT_OVERFLOW
     reason = classify_error(msg)
     if reason == "auth_error":
         return ErrorCategory.AUTH
     if reason == "rate_limit":
         return ErrorCategory.RATE_LIMIT
+    if is_input_too_large(msg):
+        return ErrorCategory.INPUT_TOO_LARGE
+    if is_context_overflow(msg):
+        return ErrorCategory.CONTEXT_OVERFLOW
     # "overload" and everything else → treat as transient + retry.
     return ErrorCategory.TRANSIENT
 
@@ -165,6 +208,16 @@ def present_provider_error(response: "LLMResponse") -> ProviderErrorPresentation
             code="MODEL_CONTEXT_LIMIT_EXCEEDED",
             title="This conversation is too large",
             message="Start a new chat or compact the conversation, then try again.",
+            retryable=False,
+            category=category,
+        )
+    if category == ErrorCategory.INPUT_TOO_LARGE:
+        return ProviderErrorPresentation(
+            code="MODEL_INPUT_LIMIT_EXCEEDED",
+            title="This request is too large",
+            message=(
+                "Compact the conversation or reduce large attachments, then try again."
+            ),
             retryable=False,
             category=category,
         )
@@ -226,14 +279,22 @@ def jittered_backoff(
     return delay + jitter
 
 
-def backoff_for(category: ErrorCategory, attempt: int) -> float | None:
+def backoff_for(
+    category: ErrorCategory,
+    attempt: int,
+    *,
+    retry_after_seconds: float | None = None,
+) -> float | None:
     """Recovery policy for each category.
 
     Returns the number of seconds to wait before retrying, or ``None``
     if the category is not retryable (caller should exit the loop with
     a clear error message).
     """
-    if category == ErrorCategory.CONTEXT_OVERFLOW:
+    if category in {
+        ErrorCategory.CONTEXT_OVERFLOW,
+        ErrorCategory.INPUT_TOO_LARGE,
+    }:
         return None  # retrying with same context won't help
     if category == ErrorCategory.AUTH:
         return None  # same key will still be rejected
@@ -242,6 +303,8 @@ def backoff_for(category: ErrorCategory, attempt: int) -> float | None:
     if category == ErrorCategory.IMAGE_INPUT_UNSUPPORTED:
         return None  # same model + same image will be rejected again
     if category == ErrorCategory.RATE_LIMIT:
+        if retry_after_seconds is not None:
+            return max(0.0, min(float(retry_after_seconds), 900.0))
         # Long windows, jittered — anti thundering-herd.
         return jittered_backoff(attempt, base_delay=30.0, max_delay=120.0)
     # TRANSIENT: keep current 5/10/20-ish shape but jittered.

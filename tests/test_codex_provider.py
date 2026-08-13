@@ -226,6 +226,18 @@ def test_http_error_returns_error_response_not_raise():
     resp = asyncio.run(prov.chat(messages=[{"role": "user", "content": "hi"}]))
     assert resp.finish_reason == "error"
     assert "Error calling LLM" in (resp.content or "")
+    assert resp.error_info is not None
+    assert resp.error_info.status_code == 400
+
+
+def test_http_input_cap_preserves_structured_status():
+    prov = _provider()
+    _install(['data: {"type":"noise"}', ""], status=413)
+    resp = asyncio.run(prov.chat(messages=[{"role": "user", "content": "hi"}]))
+
+    assert resp.finish_reason == "error"
+    assert resp.error_info is not None
+    assert resp.error_info.status_code == 413
 
 
 def test_default_model_matches_curated_default():

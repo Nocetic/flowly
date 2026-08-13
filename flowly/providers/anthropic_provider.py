@@ -17,7 +17,12 @@ from typing import Any, AsyncIterator
 import httpx
 from loguru import logger
 
-from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from flowly.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    ToolCallRequest,
+    error_info_from_exception,
+)
 from flowly.providers.key_rotator import KeyRotator, classify_error
 from flowly.providers.prompt_caching import apply_cache_control, is_cacheable_model
 
@@ -38,9 +43,18 @@ _STOP_REASON_MAP = {
 class AnthropicAPIError(RuntimeError):
     """HTTP/API error raised before conversion to an ``LLMResponse``."""
 
-    def __init__(self, status_code: int, message: str):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        code: str | None = None,
+        error_type: str | None = None,
+    ):
         super().__init__(f"Anthropic HTTP {status_code}: {message}")
         self.status_code = status_code
+        self.code = code
+        self.type = error_type
 
 
 def _normalize_base_url(api_base: str | None) -> str:
@@ -397,7 +411,11 @@ class AnthropicProvider(LLMProvider):
     def _error_response(self, exc: Exception) -> LLMResponse:
         message = self._redact(str(exc))
         logger.error("Anthropic call error: {}", message)
-        return LLMResponse(content=f"Error calling LLM: {message}", finish_reason="error")
+        return LLMResponse(
+            content=f"Error calling LLM: {message}",
+            finish_reason="error",
+            error_info=error_info_from_exception(exc),
+        )
 
     def _prepare_model(self, model: str | None) -> str:
         return _strip_known_prefixes((model or self.default_model).strip())
@@ -440,16 +458,25 @@ class AnthropicProvider(LLMProvider):
     async def _raise_for_error(self, response: httpx.Response) -> None:
         if response.status_code < 400:
             return
+        error_code = None
+        error_type = None
         try:
             data = response.json()
             error = data.get("error") if isinstance(data, dict) else None
             if isinstance(error, dict):
                 detail = str(error.get("message") or error.get("type") or response.text)
+                error_code = error.get("code")
+                error_type = error.get("type")
             else:
                 detail = response.text
         except Exception:
             detail = response.text
-        raise AnthropicAPIError(response.status_code, self._redact(detail[:500]))
+        raise AnthropicAPIError(
+            response.status_code,
+            self._redact(detail[:500]),
+            code=str(error_code) if error_code is not None else None,
+            error_type=str(error_type) if error_type is not None else None,
+        )
 
     async def chat(
         self,

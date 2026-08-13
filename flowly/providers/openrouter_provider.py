@@ -38,7 +38,12 @@ from openai import (
     RateLimitError,
 )
 
-from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from flowly.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    ToolCallRequest,
+    error_info_from_exception,
+)
 from flowly.providers.key_rotator import KeyRotator, classify_error
 from flowly.providers.prompt_caching import apply_cache_control, is_cacheable_model
 
@@ -292,6 +297,7 @@ class OpenRouterProvider(LLMProvider):
         return LLMResponse(
             content=f"Error calling LLM: {error_msg}",
             finish_reason="error",
+            error_info=error_info_from_exception(exc),
         )
 
     # ------------------------------------------------------------------- chat

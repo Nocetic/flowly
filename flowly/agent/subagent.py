@@ -822,7 +822,7 @@ class SubagentManager:
             _MAX_CONSECUTIVE_ERRORS = 3
             # Context overflow gets one rescue attempt per run. Beyond that the
             # task genuinely does not fit and retrying only burns tokens.
-            _overflow_recovered = False
+            _input_budget_recovered = False
 
             # P1.1 — subagent→parent activity heartbeat. Called at each
             # iteration + tool boundary so a 10-min subagent keeps the
@@ -1075,7 +1075,15 @@ class SubagentManager:
                             classify_response, backoff_for, ErrorCategory,
                         )
                         _category = classify_response(response)
-                        _delay = backoff_for(_category, _consecutive_errors)
+                        _delay = backoff_for(
+                            _category,
+                            _consecutive_errors,
+                            retry_after_seconds=(
+                                response.error_info.retry_after_seconds
+                                if response.error_info is not None
+                                else None
+                            ),
+                        )
                         _err_snippet = (response.content or "")[:100]
 
                         # One-shot overflow recovery. Giving up here throws
@@ -1084,16 +1092,19 @@ class SubagentManager:
                         # needs. Trim hard and retry once; a second overflow
                         # means the task really is too big.
                         if (
-                            _category == ErrorCategory.CONTEXT_OVERFLOW
-                            and not _overflow_recovered
+                            _category in {
+                                ErrorCategory.CONTEXT_OVERFLOW,
+                                ErrorCategory.INPUT_TOO_LARGE,
+                            }
+                            and not _input_budget_recovered
                         ):
-                            _overflow_recovered = True
+                            _input_budget_recovered = True
                             _before = len(messages)
                             messages = _strip_subagent_tool_results(
                                 messages, keep_last=1, max_old_chars=60,
                             )
                             logger.warning(
-                                f"[SubagentManager] [{run_id[:8]}] context overflow — "
+                                f"[SubagentManager] [{run_id[:8]}] input budget exceeded — "
                                 f"trimmed tool history ({_before} messages) and retrying once"
                             )
                             continue
@@ -1108,6 +1119,11 @@ class SubagentManager:
                                     "Error: Context overflow — task too large "
                                     "for the model's window. Retry with a "
                                     "smaller scope."
+                                )
+                            elif _category == ErrorCategory.INPUT_TOO_LARGE:
+                                final_result = (
+                                    "Error: The provider input limit was exceeded. "
+                                    "Retry with fewer large inputs or a smaller scope."
                                 )
                             elif _category == ErrorCategory.AUTH:
                                 final_result = (

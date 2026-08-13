@@ -1,5 +1,9 @@
 """Base LLM provider interface."""
 
+from __future__ import annotations
+
+import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
@@ -19,6 +23,104 @@ class ToolCallRequest:
     extra_content: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class LLMErrorInfo:
+    """Provider error signals that are safe to route on programmatically.
+
+    Raw provider payloads remain in server logs. Only stable status/type/code
+    fields cross the provider boundary so retry and compaction policy never
+    has to infer a 413 or 429 from user-facing text when the SDK exposed it.
+    """
+
+    status_code: int | None = None
+    code: str | None = None
+    type: str | None = None
+    retry_after_seconds: float | None = None
+
+
+class ProviderHTTPError(RuntimeError):
+    """HTTP failure with structured metadata for non-SDK providers."""
+
+    def __init__(
+        self,
+        provider: str,
+        status_code: int,
+        detail: str,
+        *,
+        code: str | None = None,
+        error_type: str | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(f"{provider} HTTP {status_code}: {detail}")
+        mapping = _error_mapping(detail)
+        self.status_code = status_code
+        self.code = code or mapping.get("code")
+        self.type = error_type or mapping.get("type")
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _error_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        nested = value.get("error")
+        return nested if isinstance(nested, dict) else value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return _error_mapping(parsed)
+    return {}
+
+
+def error_info_from_exception(exc: Exception) -> LLMErrorInfo | None:
+    """Extract stable routing metadata from SDK or direct-HTTP exceptions."""
+
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    try:
+        status_code = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    if status_code is None:
+        match = re.search(r"\bHTTP\s+(\d{3})\b", str(exc), re.IGNORECASE)
+        if match:
+            status_code = int(match.group(1))
+
+    body = getattr(exc, "body", None)
+    mapping = _error_mapping(body)
+    code = getattr(exc, "code", None) or mapping.get("code")
+    error_type = getattr(exc, "type", None) or mapping.get("type")
+
+    retry_after = getattr(exc, "retry_after_seconds", None)
+    headers = getattr(response, "headers", None)
+    if retry_after is None and headers is not None:
+        try:
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:
+            retry_after = None
+    try:
+        retry_after_seconds = float(retry_after) if retry_after is not None else None
+    except (TypeError, ValueError):
+        retry_after_seconds = None
+
+    info = LLMErrorInfo(
+        status_code=status_code,
+        code=str(code) if code is not None else None,
+        type=str(error_type) if error_type is not None else None,
+        retry_after_seconds=retry_after_seconds,
+    )
+    if all(value is None for value in (
+        info.status_code,
+        info.code,
+        info.type,
+        info.retry_after_seconds,
+    )):
+        return None
+    return info
+
+
 @dataclass
 class LLMResponse:
     """Response from an LLM provider."""
@@ -26,6 +128,7 @@ class LLMResponse:
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
+    error_info: LLMErrorInfo | None = None
 
     @property
     def has_tool_calls(self) -> bool:

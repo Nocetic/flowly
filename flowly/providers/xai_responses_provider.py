@@ -20,7 +20,13 @@ from flowly.auth.xai_oauth import (
     resolve_runtime_credentials,
     validate_xai_oauth_base_url,
 )
-from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from flowly.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    ProviderHTTPError,
+    ToolCallRequest,
+    error_info_from_exception,
+)
 
 DEFAULT_XAI_RESPONSES_MODEL = os.getenv("FLOWLY_XAI_OAUTH_MODEL", "grok-4.20-reasoning")
 
@@ -258,7 +264,11 @@ class XAIResponsesProvider(LLMProvider):
     def _error_response(self, exc: Exception) -> LLMResponse:
         message = self._redact(str(exc))
         logger.error("xAI Responses call error: {}", message)
-        return LLMResponse(content=f"Error calling LLM: {message}", finish_reason="error")
+        return LLMResponse(
+            content=f"Error calling LLM: {message}",
+            finish_reason="error",
+            error_info=error_info_from_exception(exc),
+        )
 
     async def _refresh_api_key(self) -> None:
         payload = await _to_thread(refresh_tokens, client_id=self._client_id or None)
@@ -327,9 +337,10 @@ class XAIResponsesProvider(LLMProvider):
                         + (f" xAI says: {detail}" if detail else "")
                     )
                 if response.status_code >= 400:
-                    raise XAIAuthError(
-                        f"xAI Responses HTTP {response.status_code}: "
-                        f"{self._redact(response.text[:500])}"
+                    raise ProviderHTTPError(
+                        "xAI Responses",
+                        response.status_code,
+                        self._redact(response.text[:500]),
                     )
                 return self._parse_response(response.json())
             except Exception as exc:
@@ -455,9 +466,10 @@ class XAIResponsesProvider(LLMProvider):
                             )
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "replace")
-                            raise XAIAuthError(
-                                f"xAI Responses HTTP {response.status_code}: "
-                                f"{self._redact(body[:500])}"
+                            raise ProviderHTTPError(
+                                "xAI Responses",
+                                response.status_code,
+                                self._redact(body[:500]),
                             )
 
                         async for line in response.aiter_lines():

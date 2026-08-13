@@ -10,7 +10,7 @@ from flowly.agent import inflight
 from flowly.agent.loop import AgentLoop
 from flowly.agent.run_abort import RunAbortController, RunAbortedError
 from flowly.gateway.server import GatewayServer
-from flowly.providers.base import LLMResponse
+from flowly.providers.base import LLMErrorInfo, LLMResponse
 
 
 class _FakeWS:
@@ -106,6 +106,43 @@ async def test_streaming_provider_is_cancelled_without_waiting_for_next_chunk() 
     assert chunks == ["partial"]
     assert response.content == "partial"
     assert response.finish_reason == "aborted"
+
+
+@pytest.mark.asyncio
+async def test_stream_aggregation_preserves_structured_provider_error() -> None:
+    error_info = LLMErrorInfo(
+        status_code=429,
+        code="rate_limit_exceeded",
+        retry_after_seconds=9.0,
+    )
+
+    class FailingStreamingProvider:
+        async def chat_stream(self, **_: Any):
+            yield LLMResponse(
+                content="Error calling LLM: rate limited",
+                finish_reason="error",
+                error_info=error_info,
+            )
+
+    agent = object.__new__(AgentLoop)
+    agent._run_aborts = RunAbortController()
+    agent.provider = FailingStreamingProvider()
+    agent._touch_activity = lambda _: None
+    chunks: list[str] = []
+
+    response = await agent._chat_with_stream(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        model="test/model",
+        temperature=0.0,
+        tool_choice="auto",
+        stream_callback=lambda chunk: _append_chunk(chunks, chunk),
+        run_id="run-a",
+    )
+
+    assert response.finish_reason == "error"
+    assert response.error_info == error_info
+    assert chunks == []
 
 
 @pytest.mark.asyncio

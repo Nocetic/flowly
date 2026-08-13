@@ -40,7 +40,13 @@ from flowly.auth.openai_codex import (
     redact_secret,
     resolve_runtime_credentials,
 )
-from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from flowly.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    ProviderHTTPError,
+    ToolCallRequest,
+    error_info_from_exception,
+)
 
 # Keep the startup/provider-switch default aligned with the first visible
 # model in the live ChatGPT Codex catalogue.
@@ -343,7 +349,11 @@ class CodexResponsesProvider(LLMProvider):
     def _error_response(self, exc: Exception) -> LLMResponse:
         message = self._redact(str(exc))
         logger.error("Codex Responses call error: {}", message)
-        return LLMResponse(content=f"Error calling LLM: {message}", finish_reason="error")
+        return LLMResponse(
+            content=f"Error calling LLM: {message}",
+            finish_reason="error",
+            error_info=error_info_from_exception(exc),
+        )
 
     def _instructions(self, from_messages: str) -> str:
         # Flowly's system prompt (extracted from messages) is the system
@@ -447,9 +457,10 @@ class CodexResponsesProvider(LLMProvider):
                             )
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "replace")
-                            raise CodexAuthError(
-                                f"Codex Responses HTTP {response.status_code}: "
-                                f"{self._redact(body[:500])}"
+                            raise ProviderHTTPError(
+                                "Codex Responses",
+                                response.status_code,
+                                self._redact(body[:500]),
                             )
                         return await self._aggregate_stream(response)
         except Exception as exc:
@@ -611,9 +622,10 @@ class CodexResponsesProvider(LLMProvider):
                             )
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", "replace")
-                            raise CodexAuthError(
-                                f"Codex Responses HTTP {response.status_code}: "
-                                f"{self._redact(body[:500])}"
+                            raise ProviderHTTPError(
+                                "Codex Responses",
+                                response.status_code,
+                                self._redact(body[:500]),
                             )
 
                         collected_items: list[dict[str, Any]] = []

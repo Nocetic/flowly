@@ -146,6 +146,10 @@ _RATE_PHRASES = frozenset([
     "rate limit",
     "ratelimit",
     "too many requests",
+    "tokens per minute",
+    "token rate",
+    "requests per minute",
+    " tpm ",
     "429",
     "quota exceeded",
     "resource_exhausted",
@@ -172,26 +176,46 @@ def classify_error(error_msg: str) -> str | None:
 
 
 def is_context_overflow(error_msg: str) -> bool:
-    """Return True if the error is a context-length overflow.
+    """Return True only for evidence that the model context is exhausted.
 
-    Also detects Anthropic's 429 "request too large for your tier"
-    which means the prompt exceeds the user's context-length tier.
+    Request-body/tier caps and rate limits are intentionally excluded. They
+    require different recovery and must never trigger destructive history
+    trimming merely because an error contains the words "too large".
     """
     lowered = error_msg.lower()
     phrases = [
         "context_length_exceeded",
         "maximum context length",
-        "too many tokens",
+        "model context window exceeded",
+        "model_context_window_exceeded",
         "prompt is too long",
         "input is too long",
-        "reduce the length",
-        "reduce your prompt",
-        "context window",
-        "token limit",
-        "request too large",          # Anthropic 429 tier limit
-        "context too large",          # Flowly proxy 413 (MAX_INPUT_TOKENS guard)
-        "context_too_large",          # same — machine-readable error code
-        "exceeds the maximum",        # generic overflow
-        "too large for your tier",    # Anthropic specific
+        "exceed context limit",
+        "exceeds context limit",
+        "context limit is exceeded",
+        "exceeds the model's context",
+        "exceeds the model context",
+        "exceeds this model's context",
+    ]
+    return any(p in lowered for p in phrases)
+
+
+def is_input_too_large(error_msg: str) -> bool:
+    """Return True for provider/proxy request-size or input-tier ceilings."""
+    lowered = error_msg.lower()
+    phrases = [
+        "context_too_large",
+        "context too large",
+        "input_too_large",
+        "input too large",
+        "request_too_large",
+        "request too large",
+        "payload_too_large",
+        "payload too large",
+        "request entity too large",
+        "too large for your tier",
+        "http 413",
+        "status 413",
+        "error code: 413",
     ]
     return any(p in lowered for p in phrases)

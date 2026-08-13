@@ -66,7 +66,6 @@ from flowly.compaction.estimator import (
 from flowly.exec.types import ExecConfig
 from flowly.config.schema import TrelloConfig, VoiceBridgeConfig, XConfig, MemorySearchConfig
 from flowly.audit.logger import get_audit_logger
-from flowly.providers.key_rotator import is_context_overflow
 from flowly.agent.prompt_blocks import (
     build_render_capability_hint,
     detect_model_families,
@@ -4130,7 +4129,10 @@ class AgentLoop:
                 if run_id and self.is_run_aborted(run_id):
                     aborted = True
                     break
-                if chunk.content:
+                # Error text is routing input, not user-visible model output.
+                # Keep it on the final response for classification but never
+                # stream raw provider/SDK payloads into a client bubble.
+                if chunk.content and chunk.finish_reason != "error":
                     chunk_count += 1
                     accumulated_text += chunk.content
                     # Heartbeat for the inactivity watchdog — every stream
@@ -4181,6 +4183,7 @@ class AgentLoop:
         # empty dict rather than None to keep downstream ``dict.get``
         # calls safe.
         final_usage = dict(final_response.usage) if final_response and final_response.usage else {}
+        final_error_info = final_response.error_info if final_response else None
         if final_response is None:
             final_response = LLMResponse(
                 content=accumulated_text or None,
@@ -4194,6 +4197,7 @@ class AgentLoop:
                 tool_calls=final_response.tool_calls,
                 finish_reason=final_response.finish_reason,
                 usage=final_usage,
+                error_info=final_error_info,
             )
         else:
             # Pure text — use accumulated content
@@ -4201,6 +4205,7 @@ class AgentLoop:
                 content=accumulated_text or final_response.content,
                 finish_reason=final_response.finish_reason,
                 usage=final_usage,
+                error_info=final_error_info,
             )
 
         return final_response
@@ -4451,7 +4456,6 @@ class AgentLoop:
         )
         tools_were_used = False
         _audit = get_audit_logger()
-        _overflow_recovered = False  # allow at most one overflow recovery per turn
         _empty_response_count = 0   # detect think-only empty responses
         _current_session_key: str = session_key
         successful_tools_were_used = False
@@ -4907,33 +4911,6 @@ class AgentLoop:
                     or "input_schema does not support allof" in lowered_error
                     or "input_schema does not support anyof" in lowered_error
                 )
-
-                # ── Overflow recovery ──────────────────────────────────────
-                if not _overflow_recovered and is_context_overflow(response.content):
-                    _overflow_recovered = True
-                    logger.warning(
-                        "Context overflow detected — trimming messages and retrying"
-                    )
-                    # Keep system prompt (first message) + last 20 messages
-                    system_msgs = [m for m in messages if m.get("role") == "system"]
-                    non_system = [m for m in messages if m.get("role") != "system"]
-                    tokens_before = estimate_messages_tokens(messages)
-                    keep = non_system[-20:]
-                    messages = system_msgs + keep
-                    tokens_after = estimate_messages_tokens(messages)
-                    dropped = len(non_system) - len(keep)
-                    logger.info(
-                        f"Overflow recovery: dropped {dropped} messages, "
-                        f"{tokens_before} → {tokens_after} tokens"
-                    )
-                    _audit.log_overflow_recovery(
-                        session_key=_current_session_key,
-                        tokens_before=tokens_before,
-                        tokens_after=tokens_after,
-                        messages_dropped=dropped,
-                    )
-                    continue  # retry the LLM call with trimmed context
-                # ─────────────────────────────────────────────────────────
 
                 if schema_rejected:
                     logger.error("Provider rejected tool schema; aborting turn without additional retries.")

@@ -709,7 +709,7 @@ async def test_turn_journal_survives_working_context_shrink(
     tmp_path,
     monkeypatch,
 ) -> None:
-    """Overflow recovery may make the final list shorter than its input.
+    """Prompt compaction may make the final list shorter than its input.
 
     Durable assistant/tool events must come from the append-only turn journal,
     never from a positional slice of that mutable working list.
@@ -735,10 +735,6 @@ async def test_turn_journal_survives_working_context_shrink(
                         arguments={"query": "context integrity"},
                     )],
                 )
-            if self.index == 2:
-                return LLMResponse(
-                    content="Error calling LLM: maximum context length exceeded"
-                )
             return LLMResponse(content="done")
 
     loop = AgentLoop(
@@ -748,6 +744,16 @@ async def test_turn_journal_survives_working_context_shrink(
         main_config=Config(),
         max_iterations=4,
         soft_warn_at_iteration=0,
+    )
+    monkeypatch.setattr(
+        type(loop.compaction),
+        "compaction_threshold",
+        property(lambda _service: 1),
+    )
+    monkeypatch.setattr(
+        loop.compaction,
+        "microcompact",
+        lambda working: [working[0], *working[-2:]],
     )
     input_messages = [{"role": "system", "content": "test"}]
     input_messages.extend(
