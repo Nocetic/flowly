@@ -849,6 +849,11 @@ class AgentLoop:
             provider=provider,
             model=self.model,
             config=compaction_config,
+            # The canonical sessions are profile-global, so their lock and
+            # breaker records must live beside that store. A workspace-local
+            # lock would let two processes opened from different cwd values
+            # both believe they owned the same conversation.
+            state_dir=self.sessions.sessions_dir,
         )
 
         # Trello config
@@ -6851,8 +6856,11 @@ class AgentLoop:
             # this lock is an asyncio.Lock and is NOT reentrant, so a turn
             # that both handled /compact and fell through to here would wait
             # on itself forever.
-            _session_lock = self.compaction.session_lock(msg.session_key)
+            _compaction_lease = self.compaction.compaction_lease(msg.session_key)
             _pre_lock_generation = self._compaction_generation(session)
+            _pre_lock_source = self.sessions.source_fingerprint(
+                session.messages, len(session.messages)
+            )
             _cycle = self.compaction_cycle(msg.session_key)
             # The UI cycle is owned by whoever HOLDS the lock — never by
             # whoever observed it free. Announcing before acquiring looks
@@ -6861,9 +6869,16 @@ class AgentLoop:
             # and announces too. Both then close their own cycle and the notice
             # flaps between phases even though only one compaction ran.
             _announced = False
-            async with _session_lock:
+            async with _compaction_lease as _lease:
+                self.sessions.refresh(session)
                 _generation = self._compaction_generation(session)
-                if _generation != _pre_lock_generation:
+                _current_source = self.sessions.source_fingerprint(
+                    session.messages, len(session.messages)
+                )
+                if (
+                    _generation != _pre_lock_generation
+                    or _current_source != _pre_lock_source
+                ):
                     # Whoever held the lock before us (manual /compact, the
                     # post-turn background pass) already compacted this
                     # session. Our snapshot describes history that no longer
@@ -6875,6 +6890,11 @@ class AgentLoop:
                     session_snapshot_len = len(session.messages)
                     _concurrent = True
                 else:
+                    history = self._history_with_summary_anchor(session)
+                    session_snapshot_len = len(session.messages)
+                    _source_fingerprint = self.sessions.source_fingerprint(
+                        session.messages, session_snapshot_len
+                    )
                     # Announce now that the cycle is provably ours. Staged
                     # summarisation is several LLM calls, and without this the
                     # clients show a frozen agent.
@@ -6921,7 +6941,6 @@ class AgentLoop:
                     # queued waiter (manual /compact, the post-turn pass)
                     # re-read the still-uncompacted session and start a
                     # redundant summarisation before our commit lands.
-                    self.compaction.record_compaction_success(msg.session_key)
                     logger.info(
                         f"Compaction complete: {result.tokens_before} -> {result.tokens_after} tokens, "
                         f"removed {result.messages_removed} messages "
@@ -6934,7 +6953,10 @@ class AgentLoop:
                             source_message_count=session_snapshot_len,
                             compaction_id=_compaction_id,
                             source_epoch=session_epoch,
+                            source_fingerprint=_source_fingerprint,
+                            fence=_lease.fence,
                         )
+                        self.compaction.record_compaction_success(msg.session_key)
                     except Exception as _commit_exc:  # noqa: BLE001
                         # A reset landed while we summarised, or the save
                         # failed. Either way this turn must continue: the
@@ -8274,6 +8296,7 @@ class AgentLoop:
         committing the old conversation over the new one.
         """
         session = self.sessions.get_or_create(session_key)
+        self.sessions.refresh(session)
         removed = len(session.messages)
         self._context_epoch[session_key] = self.context_epoch(session_key) + 1
         session.reset_conversation_context()
@@ -8305,6 +8328,43 @@ class AgentLoop:
         source_message_count: int | None = None,
         compaction_id: str = "",
         source_epoch: int | None = None,
+        source_fingerprint: str | None = None,
+        fence: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Fence and atomically persist a validated compaction result."""
+        source_count = (
+            source_message_count
+            if source_message_count is not None
+            else len(session.messages)
+        )
+        fingerprint = source_fingerprint or self.sessions.source_fingerprint(
+            session.messages, source_count
+        )
+        with self.sessions.compaction_commit_guard(
+            session,
+            source_message_count=source_count,
+            source_fingerprint=fingerprint,
+            fence=fence,
+        ) as commit_guard:
+            return self._commit_compaction_locked(
+                session,
+                result,
+                session_key,
+                source_message_count=source_count,
+                compaction_id=compaction_id,
+                source_epoch=source_epoch,
+                commit_guard=commit_guard,
+            )
+
+    def _commit_compaction_locked(
+        self,
+        session: Any,
+        result: Any,
+        session_key: str,
+        source_message_count: int,
+        compaction_id: str,
+        source_epoch: int | None,
+        commit_guard: Any,
     ) -> list[dict[str, Any]]:
         """Persist a successful compaction and return the new working history.
 
@@ -8340,11 +8400,7 @@ class AgentLoop:
         original_metadata = dict(session.metadata)
         if source_message_count is not None and 0 <= source_message_count < len(session.messages):
             appended_tail = [dict(m) for m in session.messages[source_message_count:]]
-        source_count = (
-            source_message_count
-            if source_message_count is not None
-            else len(session.messages)
-        )
+        source_count = source_message_count
         # Persist the full source and append its state transition BEFORE the
         # working file is rewritten. A failure here aborts the commit: no
         # summary may replace events whose durable lineage was not recorded.
@@ -8356,12 +8412,6 @@ class AgentLoop:
             compaction_id=compaction_id,
             )
         )
-        # Mark the boundary in the display transcript, between the turns that
-        # were summarised and what follows. The relay writes the equivalent row
-        # into Firestore for its own clients; this is the copy the transports
-        # that read history from disk (direct gateway: desktop, iOS) rely on —
-        # without it a reopened chat gave no hint anything had been summarised.
-        self.sessions.append_context_boundary(session, compaction_id)
         session.clear()
         summary_msg = build_summary_content(result.summary)
         # An approved plan mid-execution must survive compaction in the
@@ -8440,8 +8490,13 @@ class AgentLoop:
         session.metadata["last_compaction_coverage"] = summary_covers
         session.metadata["compaction_count"] = session.metadata.get("compaction_count", 0) + 1
         session.metadata["_pending_archive_transaction"] = archive_transaction
+        # The display seam is phase two of the canonical swap. Persisting its
+        # intent first means a crash after the swap can finish it on reload;
+        # writing the seam before the swap left a false divider when save
+        # failed and the old conversation remained canonical.
+        self.sessions.prepare_context_boundary(session, compaction_id)
         try:
-            self.sessions.save(session)
+            commit_guard.save(session)
         except Exception:
             # The canonical swap did not complete, so the prepared archive
             # transition remains invisible. Restore the live object as well;
@@ -8463,18 +8518,22 @@ class AgentLoop:
                 archive_transaction,
                 exc,
             )
-        else:
-            # Persist removal of the recovery marker and re-index the now-
-            # committed state. Failure is non-destructive: recovery sees the
-            # already-present commit marker and clears it on the next load.
-            try:
-                self.sessions.save(session)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Archive transaction committed; pending marker cleanup "
-                    "will retry on reload: {}",
-                    exc,
-                )
+        # Direct-gateway clients (desktop/iOS) read this seam from the display
+        # archive. It is idempotent by compaction id and has its own persisted
+        # recovery marker, so process death at either side of the append is
+        # harmless. Relay clients continue receiving the equivalent wire event.
+        self.sessions.finalize_context_boundary(session, compaction_id)
+        # Persist removal of whichever recovery markers completed and re-index
+        # the committed state. Failure is non-destructive: reload sees the
+        # remaining marker(s), deduplicates completed work, and finishes them.
+        try:
+            commit_guard.save(session)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Compaction committed; recovery-marker cleanup will retry "
+                "on reload: {}",
+                exc,
+            )
         # Compaction is a snapshot boundary: drop the frozen memory block
         # so post-compaction turns re-inject freshly-written memory.
         self.context.invalidate_memory_snapshot(session_key)
@@ -8514,6 +8573,7 @@ class AgentLoop:
             Dict with compaction results.
         """
         session = self.sessions.get_or_create(session_key)
+        self.sessions.refresh(session)
         history = self._history_with_summary_anchor(session)
         tokens_before = estimate_messages_tokens(history)
 
@@ -8535,14 +8595,18 @@ class AgentLoop:
         #
         # The UI cycle is announced from INSIDE the lock — see the pre-turn
         # path for why observing an unlocked lock is not the same as owning it.
-        _session_lock = self.compaction.session_lock(session_key)
+        _compaction_lease = self.compaction.compaction_lease(session_key)
         cycle = self.compaction_cycle(session_key)
-        async with cycle, _session_lock:
+        async with cycle, _compaction_lease as lease:
+            self.sessions.refresh(session)
             generation = self._compaction_generation(session)
             # Re-read inside the lock: whoever held it before us may have
             # already compacted, in which case our snapshot is stale.
             history = self._history_with_summary_anchor(session)
             source_len = len(session.messages)
+            source_fingerprint = self.sessions.source_fingerprint(
+                session.messages, source_len
+            )
             source_epoch = self.context_epoch(session_key)
             # Re-apply the eligibility checks to what we ACTUALLY hold. Running
             # them only on the pre-lock snapshot meant a second device could
@@ -8604,11 +8668,12 @@ class AgentLoop:
                     ),
                 }
 
-            self.compaction.record_compaction_success(session_key)
             try:
                 self._commit_compaction(
                     session, result, session_key, source_message_count=source_len,
                     compaction_id=cycle.id, source_epoch=source_epoch,
+                    source_fingerprint=source_fingerprint,
+                    fence=lease.fence,
                 )
             except Exception as exc:  # noqa: BLE001
                 # A reset landing mid-summary, or the session save failing.
@@ -8616,6 +8681,7 @@ class AgentLoop:
                 # the notice still spinning — and the in-memory session already
                 # rewritten while the canonical file still held the old one.
                 logger.info(f"Manual compaction not committed: {exc}")
+                self.compaction.record_compaction_failure(session_key)
                 await cycle.fail(tokens_before, tokens_before)
                 return {
                     "success": False,
@@ -8625,6 +8691,7 @@ class AgentLoop:
                         self._history_with_summary_anchor(session)
                     ),
                 }
+            self.compaction.record_compaction_success(session_key)
 
         # No transcript separator is published: the boundary row is written by
         # whichever transport persists the conversation, keyed off this event.
@@ -8940,12 +9007,13 @@ class AgentLoop:
                 f"Post-turn compaction: {history_tokens} history tokens over "
                 "budget — summarising in the background"
             )
-            _session_lock = self.compaction.session_lock(session_key)
+            _compaction_lease = self.compaction.compaction_lease(session_key)
             # Same ownership rule as the pre-turn path: the cycle belongs to
             # whoever HOLDS the lock, not to whoever saw it free. See there.
             _announced = False
             pre_lock_generation = self._compaction_generation(session)
-            async with _session_lock:
+            async with _compaction_lease as lease:
+                self.sessions.refresh(session)
                 generation = self._compaction_generation(session)
                 if generation != pre_lock_generation:
                     # Someone compacted while we queued. Their cycle already
@@ -8955,6 +9023,9 @@ class AgentLoop:
                 # pre-turn pass may have already done the work while we waited.
                 history = self._history_with_summary_anchor(session)
                 source_len = len(session.messages)
+                source_fingerprint = self.sessions.source_fingerprint(
+                    session.messages, source_len
+                )
                 source_epoch = self.context_epoch(session_key)
                 history_tokens = estimate_messages_tokens(history)
                 # Re-read the observation too: a commit that happened while we
@@ -8965,6 +9036,7 @@ class AgentLoop:
                     observed_total_tokens=self._observed_total_tokens(
                         session_key, session,
                     ),
+                    breaker_probe_authorized=True,
                 ):
                     # Nothing to do and nothing announced — stay silent.
                     return
@@ -8997,7 +9069,6 @@ class AgentLoop:
                     await cycle.complete(tokens_now, tokens_now, 0)
                     return
 
-                self.compaction.record_compaction_success(session_key)
                 logger.info(
                     f"Post-turn compaction complete: {result.tokens_before} -> "
                     f"{result.tokens_after} tokens, removed "
@@ -9005,12 +9076,19 @@ class AgentLoop:
                     f"({len(history) - len(result.kept_messages)} context entries), "
                     f"kept {len(result.kept_messages)} recent"
                 )
-                self._commit_compaction(
-                    session, result, session_key,
-                    source_message_count=source_len,
-                    compaction_id=cycle.id,
-                    source_epoch=source_epoch,
-                )
+                try:
+                    self._commit_compaction(
+                        session, result, session_key,
+                        source_message_count=source_len,
+                        compaction_id=cycle.id,
+                        source_epoch=source_epoch,
+                        source_fingerprint=source_fingerprint,
+                        fence=lease.fence,
+                    )
+                except Exception:
+                    self.compaction.record_compaction_failure(session_key)
+                    raise
+                self.compaction.record_compaction_success(session_key)
 
             # No transcript separator here either — see the pre-turn path.
             await cycle.complete(

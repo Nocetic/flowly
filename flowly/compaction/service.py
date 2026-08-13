@@ -2,11 +2,18 @@
 
 import asyncio
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, AsyncIterator
 
 from loguru import logger
 
+from flowly.compaction.coordination import (
+    BreakerState,
+    CompactionCoordinator,
+    CompactionLease,
+)
 from flowly.compaction.estimator import estimate_messages_tokens
 from flowly.compaction.pruning import (
     compute_adaptive_chunk_ratio,
@@ -170,6 +177,7 @@ class CompactionService:
         provider: LLMProvider,
         model: str,
         config: CompactionConfig | None = None,
+        state_dir: Path | None = None,
     ):
         """
         Initialize the compaction service.
@@ -178,10 +186,15 @@ class CompactionService:
             provider: LLM provider for summarization.
             model: Model to use for summarization.
             config: Compaction configuration.
+            state_dir: Durable coordination root. Production callers should
+                provide it; ``None`` keeps isolated/stateless uses in-memory.
         """
         self.provider = provider
         self.model = model
         self.config = config or CompactionConfig()
+        self._coordinator = (
+            CompactionCoordinator(Path(state_dir)) if state_dir is not None else None
+        )
         # Compaction bookkeeping is PER SESSION. A single service instance
         # serves every chat on the gateway, so a global counter let one
         # conversation's memory-flush cycle cancel another's, and one
@@ -205,6 +218,67 @@ class CompactionService:
         if state.lock is None:
             state.lock = asyncio.Lock()
         return state.lock
+
+    @asynccontextmanager
+    async def compaction_lease(
+        self,
+        session_key: str = "",
+    ) -> AsyncIterator[CompactionLease]:
+        """Serialise one session in-process and across independent processes.
+
+        The local lock is acquired first and remains the compatibility surface
+        for callers/tests that inspect lock ownership.  The OS-backed lease is
+        then held across summarisation and commit.  A stateless service still
+        receives a fence-shaped value, but only production services configured
+        with ``state_dir`` claim cross-process safety.
+        """
+        key = session_key or ""
+        async with self.session_lock(key):
+            if self._coordinator is None:
+                yield CompactionLease(key, 0, "in-process", 0.0)
+                return
+            async with self._coordinator.lease(key) as lease:
+                yield lease
+
+    def _sync_breaker(self, session_key: str, state: _SessionState) -> None:
+        if self._coordinator is None:
+            return
+        try:
+            durable = self._coordinator.read_breaker(session_key)
+        except OSError as exc:
+            logger.warning(
+                "Durable compaction breaker unavailable for {}: {}",
+                session_key or "<default>",
+                exc,
+            )
+            return
+        state.consecutive_failures = durable.consecutive_failures
+        state.checks_since_suppression = durable.checks_since_suppression
+
+    def _update_breaker(
+        self,
+        session_key: str,
+        state: _SessionState,
+        update: Callable[[BreakerState], BreakerState],
+    ) -> bool:
+        if self._coordinator is None:
+            return False
+        try:
+            durable = self._coordinator.update_breaker(session_key, update)
+        except OSError as exc:
+            logger.warning(
+                "Durable compaction breaker update failed for {}: {}",
+                session_key or "<default>",
+                exc,
+            )
+            return False
+        self._copy_breaker(state, durable)
+        return True
+
+    @staticmethod
+    def _copy_breaker(state: _SessionState, durable: BreakerState) -> None:
+        state.consecutive_failures = durable.consecutive_failures
+        state.checks_since_suppression = durable.checks_since_suppression
 
     def _state(self, session_key: str = "") -> "_SessionState":
         """Per-session counters, created on first use.
@@ -232,11 +306,26 @@ class CompactionService:
         relying on that exclusion.
         """
         state = self._sessions.get(session_key or "")
-        if state is None:
-            return
-        if state.lock is not None and state.lock.locked():
-            return
-        self._sessions.pop(session_key or "", None)
+        if state is not None:
+            if state.lock is not None and state.lock.locked():
+                # Keep the lock object the in-flight owner relies on, but none
+                # of the old conversation's counters.  Returning here used to
+                # carry a poisoned breaker and memory-flush cycle across /new.
+                state.compaction_count = 0
+                state.memory_flush_at_count = None
+                state.consecutive_failures = 0
+                state.checks_since_suppression = 0
+            else:
+                self._sessions.pop(session_key or "", None)
+        if self._coordinator is not None:
+            try:
+                self._coordinator.clear_breaker(session_key or "")
+            except OSError as exc:
+                logger.warning(
+                    "Durable compaction breaker reset failed for {}: {}",
+                    session_key or "<default>",
+                    exc,
+                )
 
     def _evict_stale_sessions(self) -> None:
         """Bound the counter map on a long-lived gateway.
@@ -349,6 +438,7 @@ class CompactionService:
         session_key: str = "",
         overhead_tokens: int = 0,
         observed_total_tokens: int = 0,
+        breaker_probe_authorized: bool = False,
     ) -> bool:
         """
         Check if compaction should be triggered.
@@ -380,6 +470,10 @@ class CompactionService:
             overhead_tokens: Everything else the request carries (estimate).
             observed_total_tokens: Provider-reported size of the last turn's
                 request, 0 when unknown.
+            breaker_probe_authorized: The caller already passed the durable
+                backoff gate immediately before acquiring the session lease.
+                Used only for the under-lease recheck; avoids consuming the
+                same recovery probe twice.
 
         Returns:
             True if compaction is needed.
@@ -416,8 +510,20 @@ class CompactionService:
             return False
 
         state = self._state(session_key)
-        if state.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
-            state.checks_since_suppression += 1
+        self._sync_breaker(session_key or "", state)
+        if (
+            state.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES
+            and not breaker_probe_authorized
+        ):
+            if not self._update_breaker(
+                session_key or "",
+                state,
+                lambda current: BreakerState(
+                    current.consecutive_failures,
+                    current.checks_since_suppression + 1,
+                ),
+            ):
+                state.checks_since_suppression += 1
             if state.checks_since_suppression < self.FAILURE_PROBE_INTERVAL:
                 logger.warning(
                     f"Compaction suppressed for {session_key or '<default>'} — "
@@ -425,7 +531,15 @@ class CompactionService:
                     f"(retry in {self.FAILURE_PROBE_INTERVAL - state.checks_since_suppression} checks)"
                 )
                 return False
-            state.checks_since_suppression = 0
+            if not self._update_breaker(
+                session_key or "",
+                state,
+                lambda current: BreakerState(
+                    current.consecutive_failures,
+                    0,
+                ),
+            ):
+                state.checks_since_suppression = 0
             logger.info(
                 f"Compaction probe after back-off for {session_key or '<default>'}"
             )
@@ -434,14 +548,25 @@ class CompactionService:
     def record_compaction_success(self, session_key: str = "") -> None:
         """Reset failure counter after successful compaction."""
         state = self._state(session_key)
-        state.consecutive_failures = 0
-        state.checks_since_suppression = 0
+        if not self._update_breaker(
+            session_key or "", state, lambda _current: BreakerState()
+        ):
+            state.consecutive_failures = 0
+            state.checks_since_suppression = 0
 
     def record_compaction_failure(self, session_key: str = "") -> None:
         """Increment failure counter to detect death spirals."""
         state = self._state(session_key)
-        state.consecutive_failures += 1
-        state.checks_since_suppression = 0
+        if not self._update_breaker(
+            session_key or "",
+            state,
+            lambda current: BreakerState(
+                current.consecutive_failures + 1,
+                0,
+            ),
+        ):
+            state.consecutive_failures += 1
+            state.checks_since_suppression = 0
 
     def should_memory_flush(
         self,

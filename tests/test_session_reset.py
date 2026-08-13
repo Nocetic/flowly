@@ -118,3 +118,7 @@ async def test_reset_never_evicts_a_session_mid_compaction():
             "dropping a locked session hands the next caller a fresh lock and "
             "silently undoes the exclusion an in-flight commit depends on"
         )
+        assert service._sessions["web:conv-1"].consecutive_failures == 0, (
+            "the lock belongs to the in-flight operation, but its breaker "
+            "must not leak into the freshly reset conversation"
+        )

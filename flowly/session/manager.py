@@ -1,10 +1,12 @@
 """Session management for conversation history."""
 
+import hashlib
 import json
 import os
 import secrets
 from collections import OrderedDict
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +45,11 @@ from flowly.session.archive import (
 )
 from flowly.utils.helpers import ensure_dir, safe_filename
 
+try:  # Session persistence is local-file based on macOS/Linux in production.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback remains atomic
+    fcntl = None  # type: ignore[assignment]
+
 #: Re-exported so callers that write the row can reach it from here; the
 #: definition lives with the other compaction constants.
 COMPACTION_BOUNDARY_CONTENT = CONTEXT_BOUNDARY_CONTENT
@@ -52,6 +59,25 @@ COMPACTION_BOUNDARY_CONTENT = CONTEXT_BOUNDARY_CONTENT
 # that lists session files must skip it — otherwise each session surfaces a
 # phantom ``<key>.full`` twin (seen as a clone of a streaming chat).
 FULL_TRANSCRIPT_SUFFIX = ".full.jsonl"
+_PENDING_CONTEXT_BOUNDARY_KEY = "_pending_context_boundary"
+
+
+class ConcurrentSessionWriteError(RuntimeError):
+    """A stale process tried to overwrite a newer canonical session."""
+
+
+@dataclass(frozen=True)
+class _CompactionCommitGuard:
+    """Save capability valid while SessionManager holds the write lock."""
+
+    manager: "SessionManager"
+
+    def save(
+        self,
+        session: "Session",
+        extra_messages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.manager._save_unlocked(session, extra_messages=extra_messages)
 
 
 def iter_session_files(sessions_dir: Path) -> Iterator[Path]:
@@ -651,6 +677,8 @@ class Session:
         "cwd",                # the working directory pinned to this chat
         "model_override",     # the model the user picked for this chat
         "visibility",
+        "_session_revision",  # cross-process compare-and-swap generation
+        "_compaction_fence",  # rejects a stale destructive lease holder
     })
 
     def reset_conversation_context(self) -> None:
@@ -788,6 +816,194 @@ class SessionManager:
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / f"{safe_key}.full.jsonl"
 
+    def _get_write_lock_path(self, key: str) -> Path:
+        safe_key = safe_filename(key.replace(":", "_"))
+        return self.sessions_dir / ".locks" / f"{safe_key}.lock"
+
+    @contextmanager
+    def _session_write_lock(self, key: str) -> Iterator[None]:
+        """Serialise canonical swaps from every local process.
+
+        Atomic rename prevents torn files; it does not prevent a stale process
+        from atomically replacing a newer file.  This lock makes the revision
+        check and the following rename one indivisible operation.  The kernel
+        drops the lock on process death.
+        """
+        lock_path = self._get_write_lock_path(key)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _revision(metadata: dict[str, Any] | None) -> int:
+        try:
+            return max(0, int((metadata or {}).get("_session_revision", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _disk_revision_unlocked(self, key: str) -> int:
+        path = self._get_session_path(key)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    if isinstance(row, dict) and row.get("_type") == "metadata":
+                        return self._revision(row.get("metadata"))
+                    return 0
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return 0
+        return 0
+
+    @staticmethod
+    def source_fingerprint(
+        messages: list[dict[str, Any]],
+        source_message_count: int | None = None,
+    ) -> str:
+        """Digest the exact canonical prefix a summary was derived from."""
+        count = len(messages) if source_message_count is None else source_message_count
+        digest = hashlib.sha256()
+        for message in messages[: max(0, count)]:
+            digest.update(message_fingerprint(message).encode("ascii"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def refresh(self, session: "Session") -> bool:
+        """Refresh a stale cached object from a newer canonical revision.
+
+        Returns ``True`` when another process had advanced the file.  Equal
+        revisions are left alone because the caller may hold intentional,
+        not-yet-saved local changes.
+        """
+        with self._session_write_lock(session.key):
+            fresh = self._load(session.key)
+            if fresh is None:
+                return False
+            if self._revision(fresh.metadata) <= self._revision(session.metadata):
+                return False
+            session.messages = fresh.messages
+            session.metadata = fresh.metadata
+            session.created_at = fresh.created_at
+            session.updated_at = fresh.updated_at
+            self._cache[session.key] = session
+            return True
+
+    @contextmanager
+    def compaction_commit_guard(
+        self,
+        session: "Session",
+        *,
+        source_message_count: int,
+        source_fingerprint: str,
+        fence: int,
+    ) -> Iterator[_CompactionCommitGuard]:
+        """Validate and fence a destructive rewrite under the write lock.
+
+        A summary may take minutes.  While it is generated, ordinary turns can
+        append in another process.  The canonical source prefix must still be
+        byte-for-byte the one summarized; any appended tail is merged into the
+        live object and carried across the rewrite.  A reset, edit, earlier
+        compaction, or stale lease changes the prefix/fence and aborts safely.
+        """
+        with self._session_write_lock(session.key):
+            local_metadata = dict(session.metadata)
+            local_revision = self._revision(local_metadata)
+            fresh = self._load(session.key)
+            if fresh is None:
+                if source_message_count:
+                    raise ConcurrentSessionWriteError(
+                        "canonical session disappeared while summarising"
+                    )
+                fresh = Session(key=session.key)
+            else:
+                # Direct disk loads intentionally skip archive hydration.
+                # A commit candidate needs it: in particular, the display-log
+                # watermark is advanced after the canonical rename and may not
+                # yet be in that file.  Without reconciliation the source rows
+                # are appended to the immutable archive a second time.
+                self._reconcile_archive_identities(fresh)
+
+            if len(fresh.messages) < source_message_count:
+                raise ConcurrentSessionWriteError(
+                    "canonical history became shorter while summarising"
+                )
+            actual = self.source_fingerprint(
+                fresh.messages, source_message_count
+            )
+            if actual != source_fingerprint:
+                raise ConcurrentSessionWriteError(
+                    "canonical history changed while summarising; stale summary discarded"
+                )
+            if fence > 0:
+                try:
+                    previous_fence = int(
+                        fresh.metadata.get("_compaction_fence", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    previous_fence = 0
+                if previous_fence >= fence:
+                    raise ConcurrentSessionWriteError(
+                        "compaction fence is stale; summary discarded"
+                    )
+
+            local_tail = list(session.messages[source_message_count:])
+            merged = list(fresh.messages)
+            known_ids = {
+                str(message.get(EVENT_ID_KEY))
+                for message in merged
+                if message.get(EVENT_ID_KEY)
+            }
+            known_legacy = {
+                message_fingerprint(message)
+                for message in merged
+                if not message.get(EVENT_ID_KEY)
+            }
+            for message in local_tail:
+                event_id = str(message.get(EVENT_ID_KEY) or "")
+                fingerprint = message_fingerprint(message)
+                if event_id and event_id in known_ids:
+                    continue
+                if not event_id and fingerprint in known_legacy:
+                    continue
+                merged.append(message)
+                if event_id:
+                    known_ids.add(event_id)
+                else:
+                    known_legacy.add(fingerprint)
+
+            session.messages = merged
+            fresh_revision = self._revision(fresh.metadata)
+            # No process advanced the canonical file: preserve metadata that
+            # legitimately accompanied an unsaved local tail.  If the disk is
+            # newer it is authoritative; only the event-sequence high-water
+            # mark can be merged without double-counting usage totals.
+            session.metadata = (
+                local_metadata
+                if fresh_revision == local_revision
+                else dict(fresh.metadata)
+            )
+            try:
+                session.metadata["_next_event_seq"] = max(
+                    int(session.metadata.get("_next_event_seq", 1) or 1),
+                    int(fresh.metadata.get("_next_event_seq", 1) or 1),
+                )
+            except (TypeError, ValueError):
+                session.metadata["_next_event_seq"] = 1
+            session.created_at = fresh.created_at
+            session.updated_at = fresh.updated_at
+            if fence > 0:
+                session.metadata["_compaction_fence"] = fence
+            self._cache[session.key] = session
+            yield _CompactionCommitGuard(self)
+
     def _read_full_rows(self, key: str) -> list[dict[str, Any]]:
         """Read valid append-only archive rows, skipping corrupt lines."""
         path = self._get_full_path(key)
@@ -818,9 +1034,20 @@ class SessionManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(row) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     def _reconcile_archive_identities(self, session: "Session") -> None:
         """Hydrate old canonical rows from deterministic archive identities."""
+        pending_boundary = str(
+            session.metadata.get(_PENDING_CONTEXT_BOUNDARY_KEY) or ""
+        )
+        if pending_boundary:
+            # Canonical summary swap won, then the process died before its
+            # display seam landed.  The marker makes that tiny second phase
+            # restart-safe; append_context_boundary is idempotent by id.
+            if self.append_context_boundary(session, pending_boundary):
+                session.metadata.pop(_PENDING_CONTEXT_BOUNDARY_KEY, None)
         pending_transaction = str(
             session.metadata.get("_pending_archive_transaction") or ""
         )
@@ -929,7 +1156,7 @@ class SessionManager:
 
     _FULL_WATERMARK_KEY = "_full_log_count"
 
-    def flush_full(self, session: "Session") -> None:
+    def flush_full(self, session: "Session", *, required: bool = False) -> None:
         """Mirror any not-yet-persisted tail of ``session.messages`` into the
         append-only display log. Idempotent via a per-session watermark stored in
         metadata (which survives ``Session.clear()``). Best-effort: a failure
@@ -953,13 +1180,21 @@ class SessionManager:
                     # them. Omitting them here made the supposedly complete
                     # lineage unable to prove what the model actually saw.
                     f.write(json.dumps(msg) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             session.metadata[self._FULL_WATERMARK_KEY] = total
         except Exception as e:  # pragma: no cover - disk best-effort
+            if required:
+                raise
             logger.debug("Display-log flush failed for {}: {}", session.key, e)
 
     def append_context_boundary(
-        self, session: "Session", compaction_id: str = "",
-    ) -> None:
+        self,
+        session: "Session",
+        compaction_id: str = "",
+        *,
+        required: bool = False,
+    ) -> bool:
         """Record a compaction boundary in the display transcript.
 
         The relay writes this row into Firestore for its own clients; this is
@@ -981,13 +1216,48 @@ class SessionManager:
         }
         if compaction_id:
             row["compactionId"] = compaction_id
+            if any(
+                existing.get("kind") == "context_boundary"
+                and existing.get("compactionId") == compaction_id
+                for existing in self._read_full_rows(session.key)
+            ):
+                return True
         try:
             path = self._get_full_path(session.key)
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8", newline="\n") as f:
                 f.write(json.dumps(row) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            return True
         except Exception as e:  # pragma: no cover - disk best-effort
+            if required:
+                raise
             logger.debug("Context boundary append failed for {}: {}", session.key, e)
+            return False
+
+    def prepare_context_boundary(
+        self,
+        session: "Session",
+        compaction_id: str,
+    ) -> None:
+        """Make a post-swap display seam restart-recoverable."""
+        if compaction_id:
+            session.metadata[_PENDING_CONTEXT_BOUNDARY_KEY] = compaction_id
+
+    def finalize_context_boundary(
+        self,
+        session: "Session",
+        compaction_id: str,
+    ) -> bool:
+        """Append the seam idempotently and clear its recovery marker."""
+        if not compaction_id:
+            return True
+        if not self.append_context_boundary(session, compaction_id):
+            return False
+        if session.metadata.get(_PENDING_CONTEXT_BOUNDARY_KEY) == compaction_id:
+            session.metadata.pop(_PENDING_CONTEXT_BOUNDARY_KEY, None)
+        return True
 
     def mark_full_synced(self, session: "Session") -> None:
         """Declare the current ``session.messages`` as already represented in the
@@ -1037,7 +1307,7 @@ class SessionManager:
     ) -> tuple[list[dict[str, Any] | None], dict[str, Any], str]:
         """Atomically describe which immutable events a new summary replaces."""
         session.ensure_event_identities()
-        self.flush_full(session)
+        self.flush_full(session, required=True)
         source = session.messages[:source_message_count]
         kept_identities = match_kept_events(source, kept_messages)
         kept_ids = {
@@ -1258,6 +1528,15 @@ class SessionManager:
             return None
 
     def save(self, session: Session, extra_messages: list[dict[str, Any]] | None = None) -> None:
+        """Compare-and-swap the canonical session under its process lock."""
+        with self._session_write_lock(session.key):
+            self._save_unlocked(session, extra_messages=extra_messages)
+
+    def _save_unlocked(
+        self,
+        session: Session,
+        extra_messages: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Save a session to disk atomically.
 
         ``extra_messages`` are written to the jsonl AFTER ``session.messages``
@@ -1269,6 +1548,14 @@ class SessionManager:
         loop). The final ``save(session)`` at turn end omits the extra and
         rewrites the file canonically.
         """
+        expected_revision = self._revision(session.metadata)
+        current_revision = self._disk_revision_unlocked(session.key)
+        if current_revision != expected_revision:
+            raise ConcurrentSessionWriteError(
+                f"stale session revision for {session.key}: expected "
+                f"{expected_revision}, canonical is {current_revision}"
+            )
+
         session.ensure_event_identities()
         if not session.metadata.get("_pending_archive_transaction"):
             self._withdraw_removed_active_events(session)
@@ -1277,6 +1564,9 @@ class SessionManager:
 
         # Write to temp file first, then atomic rename
         tmp_path = path.with_suffix(f".tmp.{secrets.token_hex(4)}")
+        had_revision = "_session_revision" in session.metadata
+        previous_revision = session.metadata.get("_session_revision")
+        session.metadata["_session_revision"] = current_revision + 1
         try:
             with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
                 # Write metadata first
@@ -1296,9 +1586,30 @@ class SessionManager:
                 for msg in (extra_messages or []):
                     f.write(json.dumps(msg) + "\n")
 
+                # The rename is only a durable transaction boundary when the
+                # file contents reach storage before the directory entry is
+                # swapped.  Without this, power loss can leave a zero-length
+                # canonical file despite a successful return from save().
+                f.flush()
+                os.fsync(f.fileno())
+
             # Atomic rename (POSIX guarantees this is atomic on same filesystem)
             os.replace(str(tmp_path), str(path))
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                # Some filesystems do not support directory fsync.  The file
+                # itself is still flushed and the rename remains atomic.
+                pass
         except Exception:
+            if had_revision:
+                session.metadata["_session_revision"] = previous_revision
+            else:
+                session.metadata.pop("_session_revision", None)
             # Clean up temp file on failure
             try:
                 tmp_path.unlink(missing_ok=True)

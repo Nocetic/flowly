@@ -53,6 +53,7 @@ class _Context:
 
 class _CommitHarness:
     _commit_compaction = AgentLoop._commit_compaction
+    _commit_compaction_locked = AgentLoop._commit_compaction_locked
     _context_coverage_sidecar = AgentLoop._context_coverage_sidecar
 
     def __init__(self, manager: SessionManager):
@@ -169,10 +170,10 @@ def test_prepared_transition_is_invisible_when_canonical_swap_fails(
     before_messages = [dict(message) for message in session.messages]
     before_metadata = dict(session.metadata)
 
-    def fail_save(_session):
+    def fail_save(_session, extra_messages=None):
         raise OSError("disk full")
 
-    monkeypatch.setattr(manager, "save", fail_save)
+    monkeypatch.setattr(manager, "_save_unlocked", fail_save)
     with pytest.raises(OSError, match="disk full"):
         _compact(manager, session)
 
@@ -180,6 +181,10 @@ def test_prepared_transition_is_invisible_when_canonical_swap_fails(
     assert session.metadata == before_metadata
     snapshot = manager.get_archive_snapshot(session.key)
     assert {event.state for event in snapshot.events} == {"active"}
+    assert not any(
+        row.get("kind") == "context_boundary"
+        for row in manager._read_full_rows(session.key)
+    ), "a failed canonical swap must not leave a false compaction seam"
 
 
 def test_pending_transaction_is_committed_idempotently_on_reload(
@@ -206,6 +211,49 @@ def test_pending_transaction_is_committed_idempotently_on_reload(
     rows = manager._read_full_rows(session.key)
     commits = [row for row in rows if row.get("_type") == "archive_commit"]
     assert len(commits) == 1
+
+
+def test_pending_context_boundary_is_recovered_once_after_restart(
+    archive_home, monkeypatch,
+):
+    manager = _manager()
+    session = _seed(manager)
+    original_finalize = manager.finalize_context_boundary
+
+    monkeypatch.setattr(
+        manager,
+        "finalize_context_boundary",
+        lambda _session, _compaction_id: False,
+    )
+    _compact(manager, session)
+    assert session.metadata.get("_pending_context_boundary") == "cmp_archive_test"
+    assert not any(
+        row.get("kind") == "context_boundary"
+        for row in manager._read_full_rows(session.key)
+    )
+
+    monkeypatch.setattr(manager, "finalize_context_boundary", original_finalize)
+    manager._cache.clear()
+    resumed = manager.get_or_create(session.key)
+
+    assert "_pending_context_boundary" not in resumed.metadata
+    boundaries = [
+        row
+        for row in manager._read_full_rows(session.key)
+        if row.get("kind") == "context_boundary"
+        and row.get("compactionId") == "cmp_archive_test"
+    ]
+    assert len(boundaries) == 1
+
+    manager._cache.clear()
+    manager.get_or_create(session.key)
+    boundaries = [
+        row
+        for row in manager._read_full_rows(session.key)
+        if row.get("kind") == "context_boundary"
+        and row.get("compactionId") == "cmp_archive_test"
+    ]
+    assert len(boundaries) == 1
 
 
 def test_undo_appends_withdrawal_and_hides_rows_without_rewriting(archive_home):

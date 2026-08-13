@@ -9,9 +9,15 @@ already replaced.
 """
 
 import asyncio
+import multiprocessing
+from pathlib import Path
 
 import pytest
 
+from flowly.compaction.coordination import (
+    CompactionCoordinator,
+    CompactionLeaseTimeoutError,
+)
 from flowly.compaction.service import CompactionService
 from flowly.compaction.types import CompactionConfig
 from flowly.providers.base import LLMResponse
@@ -37,13 +43,35 @@ class _SlowProvider:
             self.concurrent -= 1
 
 
-def _service(provider) -> CompactionService:
+def _service(provider, *, state_dir: Path | None = None) -> CompactionService:
     return CompactionService(
         provider=provider,
         model="m",
         config=CompactionConfig(mode="default", context_window=2_000,
                                 reserve_tokens_floor=100),
+        state_dir=state_dir,
     )
+
+
+def _lease_worker(state_dir: str, ready, release) -> None:
+    async def run() -> None:
+        coordinator = CompactionCoordinator(Path(state_dir))
+        async with coordinator.lease("shared-session"):
+            ready.set()
+            release.wait(10)
+
+    asyncio.run(run())
+
+
+def _crashing_lease_worker(state_dir: str, ready) -> None:
+    async def run() -> None:
+        coordinator = CompactionCoordinator(Path(state_dir))
+        async with coordinator.lease("crash-session"):
+            ready.set()
+            while True:
+                await asyncio.sleep(1)
+
+    asyncio.run(run())
 
 
 async def test_one_session_compacts_one_at_a_time():
@@ -103,6 +131,111 @@ async def test_a_busy_session_is_never_evicted():
 
         assert busy in service._sessions
         assert service._sessions[busy].lock.locked()
+
+
+# ── Cross-process lease and durable breaker ───────────────────────────────
+
+
+async def test_process_lease_serialises_independent_services(tmp_path):
+    """A gateway and CLI do not share an asyncio loop or service instance."""
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Event()
+    release = ctx.Event()
+    process = ctx.Process(
+        target=_lease_worker,
+        args=(str(tmp_path), ready, release),
+    )
+    process.start()
+    try:
+        assert ready.wait(5), "child never acquired the lease"
+        coordinator = CompactionCoordinator(tmp_path)
+        with pytest.raises(CompactionLeaseTimeoutError, match="timed out"):
+            async with coordinator.lease("shared-session", timeout=0.1):
+                pass
+
+        release.set()
+        process.join(5)
+        assert process.exitcode == 0
+
+        async with coordinator.lease("shared-session", timeout=1) as lease:
+            assert lease.fence >= 2
+    finally:
+        release.set()
+        process.join(2)
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+
+
+async def test_process_crash_releases_lease_and_advances_fence(tmp_path):
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Event()
+    process = ctx.Process(
+        target=_crashing_lease_worker,
+        args=(str(tmp_path), ready),
+    )
+    process.start()
+    assert ready.wait(5), "child never acquired the lease"
+    process.terminate()
+    process.join(5)
+    assert process.exitcode is not None
+
+    coordinator = CompactionCoordinator(tmp_path)
+    async with coordinator.lease("crash-session", timeout=1) as recovered:
+        assert recovered.fence >= 2, "crash recovery reused a stale fence"
+
+
+def test_breaker_survives_service_restart_and_success_resets_it(tmp_path):
+    first = _service(_SlowProvider(), state_dir=tmp_path)
+    first.record_compaction_failure("chat-1")
+    first.record_compaction_failure("chat-1")
+
+    reborn = _service(_SlowProvider(), state_dir=tmp_path)
+    assert not reborn.should_compact(10_000, "chat-1")
+
+    reborn.record_compaction_success("chat-1")
+    third = _service(_SlowProvider(), state_dir=tmp_path)
+    assert third.should_compact(10_000, "chat-1")
+
+
+def test_breaker_updates_from_two_services_are_not_lost(tmp_path):
+    one = _service(_SlowProvider(), state_dir=tmp_path)
+    two = _service(_SlowProvider(), state_dir=tmp_path)
+
+    one.record_compaction_failure("chat-1")
+    two.record_compaction_failure("chat-1")
+
+    reborn = _service(_SlowProvider(), state_dir=tmp_path)
+    assert reborn._coordinator is not None
+    assert reborn._coordinator.read_breaker("chat-1").consecutive_failures == 2
+
+
+def test_authorized_probe_is_not_consumed_twice_by_under_lease_recheck(tmp_path):
+    service = _service(_SlowProvider(), state_dir=tmp_path)
+    service.record_compaction_failure("chat-1")
+    service.record_compaction_failure("chat-1")
+
+    for _ in range(service.FAILURE_PROBE_INTERVAL - 1):
+        assert not service.should_compact(10_000, "chat-1")
+    assert service.should_compact(10_000, "chat-1"), "probe should open"
+    assert service.should_compact(
+        10_000,
+        "chat-1",
+        breaker_probe_authorized=True,
+    ), "the same probe must survive the under-lease freshness recheck"
+
+
+def test_breaker_disk_failure_degrades_to_in_memory_backoff(tmp_path, monkeypatch):
+    service = _service(_SlowProvider(), state_dir=tmp_path)
+    assert service._coordinator is not None
+
+    def unavailable(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service._coordinator, "update_breaker", unavailable)
+    service.record_compaction_failure("chat-1")
+
+    assert service._sessions["chat-1"].consecutive_failures == 1
 
 
 # ── Generation guard ──────────────────────────────────────────────────────

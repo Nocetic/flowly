@@ -28,7 +28,7 @@ from flowly.compaction.types import (
     is_summary_message,
 )
 from flowly.providers.base import LLMResponse
-from flowly.session.manager import Session
+from flowly.session.manager import Session, SessionManager
 
 
 class _Provider:
@@ -57,6 +57,21 @@ class _Sessions:
 
     def get_or_create(self, key: str) -> Session:
         return self.session
+
+    def refresh(self, session: Session) -> bool:
+        return False
+
+    source_fingerprint = staticmethod(SessionManager.source_fingerprint)
+
+    @contextlib.contextmanager
+    def compaction_commit_guard(self, session: Session, **kwargs):
+        owner = self
+
+        class _Guard:
+            def save(self, guarded_session: Session) -> None:
+                owner.save(guarded_session)
+
+        yield _Guard()
 
     def flush_full(self, session: Session) -> None:
         pass
@@ -92,6 +107,16 @@ class _Sessions:
         # The divider the direct-gateway surfaces read back from disk.
         self.boundaries.append(compaction_id)
 
+    def prepare_context_boundary(self, session: Session, compaction_id: str) -> None:
+        if compaction_id:
+            session.metadata["_pending_context_boundary"] = compaction_id
+
+    def finalize_context_boundary(self, session: Session, compaction_id: str) -> bool:
+        if compaction_id:
+            self.append_context_boundary(session, compaction_id)
+            session.metadata.pop("_pending_context_boundary", None)
+        return True
+
     def mark_full_synced(self, session: Session) -> None:
         pass
 
@@ -115,6 +140,7 @@ class _Harness:
     model = "m"
 
     _commit_compaction = AgentLoop._commit_compaction
+    _commit_compaction_locked = AgentLoop._commit_compaction_locked
     _history_with_summary_anchor = AgentLoop._history_with_summary_anchor
     _system_prompt_tokens = AgentLoop._system_prompt_tokens
     _compaction_generation = staticmethod(AgentLoop._compaction_generation)
