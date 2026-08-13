@@ -69,6 +69,7 @@ class _Bus:
 
 class _Harness:
     _run_memory_flush = AgentLoop._run_memory_flush
+    _history_with_summary_anchor = AgentLoop._history_with_summary_anchor
     # The flush now asks the route which tools it may advertise and execute,
     # so the harness borrows that resolution rather than stubbing a policy.
     _resolve_toolset_route = AgentLoop._resolve_toolset_route

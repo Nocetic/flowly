@@ -755,6 +755,11 @@ class AgentLoop:
         self.soft_warn_at_iteration = max(0, soft_warn_at_iteration)
         self.brave_api_key = brave_api_key
         self.cron_service = cron_service
+        # Retained as a configuration compatibility field. It must not be used
+        # to cap the model's history: request sizing and compaction are token-
+        # budget decisions over the complete working context. Explicitly
+        # bounded auxiliary surfaces (for example voice recall) may still set
+        # their own local limits.
         self.context_messages = context_messages
 
         self.context = ContextBuilder(workspace, persona=persona)
@@ -5890,7 +5895,7 @@ class AgentLoop:
         # flows through too so e.g. a flush on the WhatsApp surface
         # doesn't suddenly emit Markdown formatting.
         messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.context_messages),
+            history=self._history_with_summary_anchor(session),
             current_message=user_prompt,
             model=self.model,
             channel=channel,
@@ -7174,7 +7179,7 @@ class AgentLoop:
             if str(item.get("function", {}).get("name", ""))
         }
         messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.context_messages),
+            history=self._history_with_summary_anchor(session),
             current_message=msg.content,
             memory_search_enabled=self._memory_manager is not None,
             model=self.model,
@@ -7866,29 +7871,25 @@ class AgentLoop:
             return 0
 
     def _history_with_summary_anchor(self, session: Any) -> list[dict[str, Any]]:
-        """Session history for the LLM, with the compaction summary pinned.
+        """Complete working history with the durable summary normalised.
 
-        ``get_history`` returns a sliding window over the last N messages, and
-        a compaction summary is an ordinary message inside it. After N further
-        messages the summary slides out and the model silently loses every
-        earlier turn compaction was preserving — while the chat UI still shows
-        the whole conversation, so nobody notices. Re-inject the stored summary
-        at the head whenever the window no longer carries one.
+        A fixed record-count slice here used to run *before* request token
+        estimation. Older messages could therefore disappear without being
+        represented by a summary, while the smaller slice kept compaction
+        below its trigger forever. The model now receives the complete working
+        history; token budgeting decides whether that history must be compacted.
+
+        The metadata copy remains a recovery anchor for sessions whose summary
+        message was lost by an older build. When the summary message exists we
+        refresh its attached plan note in the request copy only, so a durable
+        plan can advance without rewriting the stored transcript.
         """
-        history = session.get_history(max_messages=self.context_messages)
+        history = session.get_history()
         try:
             summary = session.metadata.get("last_compaction_summary")
         except AttributeError:
             return history
         if not summary:
-            return history
-        # Check the RAW messages, not the projection: the summary flag is
-        # stripped on the way to the LLM, so the projected history only ever
-        # carries the text marker.
-        window = getattr(session, "messages", [])[-self.context_messages:]
-        if any(is_summary_message(m) for m in window) or any(
-            is_summary_message(m) for m in history
-        ):
             return history
         content = build_summary_content(summary)
         # The plan note is baked into the summary MESSAGE at compaction time
@@ -7904,6 +7905,12 @@ class AgentLoop:
                 content += f"\n\n{plan_note}"
         except Exception:
             logger.debug("[plan] anchor note skipped (non-fatal)")
+        # Work on the projected request copy, never the persisted message.
+        for index, message in enumerate(history):
+            if is_summary_message(message):
+                refreshed = dict(message)
+                refreshed["content"] = content
+                return history[:index] + [refreshed] + history[index + 1:]
         anchor = {"role": "system", "content": content}
         return [anchor] + history
 

@@ -1,11 +1,10 @@
-"""The summary must outlive the history window, and events must be readable.
+"""The complete working history and compaction events must remain readable.
 
 Two separate regressions live here:
 
-  * A compaction summary used to be an ordinary message inside the sliding
-    ``get_history`` window. After ``context_messages`` further messages it
-    slid out, and the model lost every turn the summary was protecting —
-    invisibly, because the chat UI reads a different (full) transcript.
+  * Agent history used to be sliced to ``context_messages`` records before
+    token estimation. Early turns disappeared without a summary and the
+    reduced request could remain below the compaction trigger forever.
   * The gateway sends ``tokensBefore`` / ``tokensAfter`` / ``messagesRemoved``
     while the TUI read ``beforeTokens`` / ``afterTokens`` / ``beforeMessages``,
     so every compaction rendered as "0→0 msgs".
@@ -50,7 +49,7 @@ def _session_with_summary(extra_messages: int) -> Session:
     return session
 
 
-# ── Summary survives the sliding window ───────────────────────────────────
+# ── Complete working history ───────────────────────────────────────────────
 
 
 def test_summary_present_right_after_compaction():
@@ -62,7 +61,7 @@ def test_summary_present_right_after_compaction():
 
 
 def test_summary_survives_far_past_the_history_window():
-    # 400 messages — four times the 100-message window that used to drop it.
+    # 400 messages — four times the old 100-record ceiling.
     session = _session_with_summary(200)
 
     history = _Loop()._history_with_summary_anchor(session)
@@ -73,6 +72,10 @@ def test_summary_survives_far_past_the_history_window():
     )
     assert "migrating a database" in history[0]["content"]
     assert sum(1 for m in history if is_summary_message(m)) == 1
+    assert len(history) == len(session.messages), (
+        "working history was capped before token budgeting; early turns can "
+        "silently disappear and never trigger compaction"
+    )
 
 
 def test_no_anchor_when_session_was_never_compacted():
@@ -85,13 +88,25 @@ def test_no_anchor_when_session_was_never_compacted():
     assert len(history) == 1
 
 
-def test_anchor_is_dropped_once_the_stored_summary_is_gone():
+def test_existing_summary_message_survives_if_recovery_metadata_is_missing():
     session = _session_with_summary(200)
     session.metadata.pop("last_compaction_summary")
 
     history = _Loop()._history_with_summary_anchor(session)
 
-    assert not any(is_summary_message(m) for m in history)
+    assert any(is_summary_message(m) for m in history)
+    assert len(history) == len(session.messages)
+
+
+def test_session_history_defaults_to_complete_with_explicit_window_compatibility():
+    session = Session(key="cli:test")
+    for i in range(150):
+        session.add_message("user", f"m{i}")
+
+    assert len(session.get_history()) == 150
+    assert [m["content"] for m in session.get_history(max_messages=2)] == [
+        "m148", "m149",
+    ]
 
 
 # ── Event contract matches the producer ───────────────────────────────────
@@ -158,8 +173,7 @@ def test_missing_counts_degrade_to_zero_not_crash():
 
 
 def test_anchor_keeps_an_approved_plan_in_context():
-    """The plan note is baked into the summary MESSAGE, not the stored text.
-    When that message slides out, the anchor must carry the plan forward."""
+    """The request copy refreshes the current durable plan note each turn."""
     from flowly.plans.manager import get_plan_manager
 
     session = _session_with_summary(200)

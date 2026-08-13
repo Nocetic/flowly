@@ -305,7 +305,7 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
-    def get_history(self, max_messages: int = 50) -> list[dict[str, Any]]:
+    def get_history(self, max_messages: int | None = None) -> list[dict[str, Any]]:
         """
         Get message history for LLM context.
 
@@ -333,12 +333,23 @@ class Session:
         provider errors.
 
         Args:
-            max_messages: Maximum messages to return.
+            max_messages: Optional compatibility window. ``None`` (the
+                default) returns the complete working history. Agent request
+                budgeting must operate on that complete history; applying a
+                record-count ceiling before token estimation silently drops
+                context and can prevent compaction from ever triggering.
 
         Returns:
             List of messages in LLM-protocol shape.
         """
-        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
+        if max_messages is None or max_messages <= 0:
+            recent = self.messages
+        else:
+            recent = (
+                self.messages[-max_messages:]
+                if len(self.messages) > max_messages
+                else self.messages
+            )
         projected = [_project_for_llm(m) for m in recent]
         return _repair_tool_sequence(projected)
 
