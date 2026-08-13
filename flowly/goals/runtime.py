@@ -134,13 +134,36 @@ class GoalRuntime:
         if timer and not timer.done():
             timer.cancel()
 
-    async def close(self) -> None:
+    def cancel_session(self, session_key: str) -> None:
+        """Cancel queued work and wake polling for one conversation."""
+        self.cancel_wait_timer(session_key)
+        worker = self._workers.pop(session_key, None)
+        if worker and not worker.done():
+            worker.cancel()
+        self._queues.pop(session_key, None)
+        self._routes.pop(session_key, None)
+
+    async def wait_idle(self, session_key: str) -> None:
+        """Wait until all currently queued work for a session is settled."""
+        queue = self._queues.get(session_key)
+        if queue is not None:
+            await queue.join()
+
+    def cancel(self) -> None:
+        """Synchronously stop all runtime-owned workers and timers."""
         self._closed = True
         tasks = [*self._workers.values(), *self._wake_timers.values()]
         self._workers.clear()
         self._wake_timers.clear()
+        self._queues.clear()
+        self._routes.clear()
         for task in tasks:
-            task.cancel()
+            if not task.done():
+                task.cancel()
+
+    async def close(self) -> None:
+        tasks = [*self._workers.values(), *self._wake_timers.values()]
+        self.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -187,8 +210,19 @@ class GoalRuntime:
         finally:
             if self._workers.get(session_key) is current:
                 self._workers.pop(session_key, None)
-            if queue.empty() and self._queues.get(session_key) is queue:
-                self._queues.pop(session_key, None)
+            if queue.empty():
+                if self._queues.get(session_key) is queue:
+                    self._queues.pop(session_key, None)
+            elif not self._closed and session_key not in self._workers:
+                # A wake can land at the same instant as the idle timeout.
+                # Removing the retiring worker before this check closes the
+                # otherwise-stranded-queue race without keeping one task alive
+                # forever for every historical conversation.
+                replacement = asyncio.create_task(
+                    self._worker(session_key, queue),
+                    name=f"goal-runtime:{session_key}",
+                )
+                self._workers[session_key] = replacement
 
     async def _after_turn(
         self,
@@ -219,6 +253,7 @@ class GoalRuntime:
                     revision=state.revision,
                 )
             )
+            self._schedule_wait_wake(turn.session_key, delivery)
             return
 
         try:
@@ -241,8 +276,8 @@ class GoalRuntime:
         if decision.status is GoalStatus.PAUSED or decision.status is GoalStatus.DONE:
             self.cancel_wait_timer(turn.session_key)
             return
-        if decision.verdict is GoalVerdict.WAIT:
-            self._schedule_time_wake(turn.session_key, delivery)
+        if decision.verdict in {GoalVerdict.WAIT, GoalVerdict.WAITING}:
+            self._schedule_wait_wake(turn.session_key, delivery)
             return
         if not decision.should_continue or not decision.goal_id:
             return
@@ -283,6 +318,11 @@ class GoalRuntime:
 
     async def _resume_wait(self, session_key: str, delivery: GoalDelivery) -> None:
         state = self.manager.waiting_state(session_key)
+        if state is None:
+            # A polling timer may have atomically cleared the barrier before it
+            # enqueued this wake item. Reload the live goal instead of treating
+            # that already-resolved wait as an inactive goal.
+            state = self.manager.get(session_key)
         if state is None or not state.is_active or state.has_wait:
             return
         self.cancel_wait_timer(session_key)
@@ -294,23 +334,34 @@ class GoalRuntime:
             kickoff=False,
         )
 
-    def _schedule_time_wake(self, session_key: str, delivery: GoalDelivery) -> None:
+    def _schedule_wait_wake(self, session_key: str, delivery: GoalDelivery) -> None:
         state = self.manager.get(session_key)
-        if state is None or not state.waiting_until:
+        if state is None or not state.is_active or not state.has_wait:
             return
         self.cancel_wait_timer(session_key)
-        # ``waiting_until`` is wall-clock time, while ``loop.time()`` is
-        # monotonic, so compute the sleep from wall time.
-        import time
-
-        delay = max(0.0, state.waiting_until - time.time())
 
         async def wake_later() -> None:
             try:
-                await asyncio.sleep(delay)
-                self.wake(session_key, delivery)
+                while not self._closed:
+                    fresh = self.manager.waiting_state(session_key)
+                    if fresh is None or not fresh.is_active:
+                        return
+                    if not fresh.has_wait:
+                        self.wake(session_key, delivery)
+                        return
+                    delay = 1.0
+                    if fresh.waiting_until:
+                        # ``waiting_until`` is wall-clock time, whereas sleeps
+                        # are duration based. Recompute on every pass so clock
+                        # adjustments cannot strand the goal.
+                        import time
+
+                        delay = min(1.0, max(0.0, fresh.waiting_until - time.time()))
+                    await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 return
+            except Exception:
+                logger.exception("goal wait polling failed for {}", session_key)
             finally:
                 if self._wake_timers.get(session_key) is asyncio.current_task():
                     self._wake_timers.pop(session_key, None)

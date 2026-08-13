@@ -201,3 +201,54 @@ async def test_pending_plan_parks_without_consuming_turn_and_wakes_on_resolution
         ("notice", "done"),
     ]
     await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_parked_goal_polls_and_wakes_without_an_external_event(
+    tmp_path: Path,
+) -> None:
+    provider = Provider('{"verdict":"done","reason":"complete"}')
+    epochs = {"s": 1}
+    barrier = {"active": True}
+    manager, runtime = _runtime(
+        tmp_path,
+        provider,
+        epochs,
+        session_is_waiting=lambda target: target == "process-1" and barrier["active"],
+    )
+    state = manager.set("s", "ship")
+    manager.wait_on_session("s", "process-1", reason="background work")
+    delivery = Delivery("after process")
+
+    runtime.delivered(DeliveredGoalTurn("s", "started process", user_epoch=1), delivery)
+    await asyncio.sleep(0.05)
+    assert delivery.events == [("notice", "waiting")]
+
+    barrier["active"] = False
+    await asyncio.wait_for(delivery.finished.wait(), timeout=2)
+    assert delivery.events[-3:] == [
+        ("run", {"goal_id": state.goal_id, "kickoff": False}),
+        ("assistant", "after process"),
+        ("notice", "done"),
+    ]
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_session_drops_route_timer_and_queued_work(tmp_path: Path) -> None:
+    provider = Provider('{"verdict":"done","reason":"complete"}')
+    epochs = {"s": 1}
+    manager, runtime = _runtime(tmp_path, provider, epochs)
+    manager.set("s", "ship")
+    manager.wait_for_seconds("s", 30)
+    delivery = Delivery("must not run")
+
+    runtime.delivered(DeliveredGoalTurn("s", "park", user_epoch=1), delivery)
+    await asyncio.sleep(0.05)
+    runtime.cancel_session("s")
+    manager.clear("s")
+    await asyncio.sleep(0)
+
+    assert runtime.wake("s") is False
+    assert delivery.events == [("notice", "waiting")]
+    await runtime.close()
