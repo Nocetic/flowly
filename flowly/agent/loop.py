@@ -221,7 +221,11 @@ class _AgentGoalDelivery(GoalDelivery):
 
         # No transport-native entry (plain channels, one-shot CLI, tests): the
         # bus IS the generic user-turn entry point, and channel adapters give
-        # these turns the same delivery a typed message gets.
+        # these turns the same delivery a typed message gets. It still needs a
+        # run identity — an unidentified run is one pause/stop cannot end.
+        fallback_run_id = uuid.uuid4().hex
+        metadata["run_id"] = fallback_run_id
+        self.agent.note_autonomous_run(fallback_run_id)
         await self.agent.bus.publish_inbound(_GoalInboundMessage(
             channel=self.channel,
             sender_id="goal",
@@ -7435,6 +7439,12 @@ class AgentLoop:
                         user_epoch=self.goal_user_epoch(msg.session_key),
                         kickoff=True,
                     ))
+                    # This turn is goal work even though a person started it:
+                    # the chip's pause/stop must be able to end it, so it
+                    # registers as an autonomous run like every continuation.
+                    kickoff_run_id = str(msg.metadata.get("run_id") or "")
+                    if kickoff_run_id:
+                        self.note_autonomous_run(kickoff_run_id)
                 msg.metadata.setdefault("_display_content", msg.content)
                 msg.content = result.start_turn
                 is_command = False

@@ -378,3 +378,35 @@ def test_restart_resume_is_a_no_op_without_goals_configured():
     loop.goal_runtime = None
 
     assert loop.resume_active_goals() == 0
+
+
+@pytest.mark.asyncio
+async def test_pause_can_end_the_kickoff_turn_too():
+    """`/goal X` runs under chat.send's run id — the chip must still stop it."""
+    from flowly.agent import inflight
+
+    loop, _manager, _runtime, _bus = _loop()
+    aborted: list[str] = []
+    loop.mark_aborted = lambda run_id: (aborted.append(run_id), True)[1]
+
+    loop.note_autonomous_run("kickoff-run-1")
+    inflight.begin("web:c1", "kickoff-run-1", "goal text")
+    try:
+        assert loop.abort_autonomous_run("web:c1") is True
+        assert aborted == ["kickoff-run-1"]
+    finally:
+        inflight.finish("web:c1", "kickoff-run-1")
+
+
+@pytest.mark.asyncio
+async def test_a_users_own_turn_is_never_aborted_by_goal_controls():
+    from flowly.agent import inflight
+
+    loop, _manager, _runtime, _bus = _loop()
+    loop.mark_aborted = lambda run_id: (_ for _ in ()).throw(AssertionError("must not abort"))
+
+    inflight.begin("web:c1", "user-run-9", "typed by a person")
+    try:
+        assert loop.abort_autonomous_run("web:c1") is False
+    finally:
+        inflight.finish("web:c1", "user-run-9")
