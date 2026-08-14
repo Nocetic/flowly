@@ -9555,10 +9555,26 @@ class AgentLoop:
         goal_manager = getattr(self, "goal_manager", None)
         if goal_manager is not None:
             try:
-                goal_manager.clear(
+                cleared = goal_manager.clear(
                     session_key,
                     conversation_epoch=self._context_epoch[session_key],
                 )
+                # Tell the clients too. Clearing the store alone left the chip
+                # on screen for a goal that no longer exists until something
+                # else happened to refetch it.
+                if cleared is not None:
+                    channel, _, chat_id = session_key.partition(":")
+                    asyncio.create_task(self.publish_goal_snapshot(
+                        session_key,
+                        channel or "cli",
+                        chat_id or session_key,
+                        "",
+                        cleared,
+                    ))
+            except RuntimeError:
+                # No running loop (synchronous CLI reset): the store is already
+                # correct and the next read serves the cleared state.
+                logger.debug("[reset] goal snapshot push skipped (no loop)")
             except Exception:
                 logger.exception("[reset] goal clear failed")
         session.reset_conversation_context()

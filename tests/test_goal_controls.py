@@ -258,3 +258,49 @@ async def test_web_channel_delivers_a_terminal_notice_as_a_visible_row():
     assert any(
         e["event"] == "chat" and e["data"].get("state") == "final" for e in events
     ), "a finished goal must report in words, not only as chip state"
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_conversation_drops_the_chip_everywhere():
+    """Clearing the store alone left a chip on screen for a goal that is gone."""
+    import asyncio as _asyncio
+
+    from flowly.agent.loop import AgentLoop as _Loop
+
+    loop = _Loop.__new__(_Loop)
+    bus = _Bus()
+    loop.bus = bus
+    loop._gateway_server = None
+    loop.goal_runtime = _Runtime()
+    loop._context_epoch = {"web:c1": 0}
+    loop._last_turn_total_tokens = {}
+
+    cleared = GoalState(session_key="web:c1", goal="ship it")
+    cleared.status = type(cleared.status)("cleared")
+
+    class _Manager:
+        def clear(self, session_key: str, *, conversation_epoch: int | None = None):
+            return cleared
+
+    loop.goal_manager = _Manager()
+
+    class _Sessions:
+        def get_or_create(self, _key):
+            return type("S", (), {"messages": [], "reset_conversation_context": lambda _s: None})()
+
+        def refresh(self, _s):
+            pass
+
+    loop.sessions = _Sessions()
+    loop.compaction = type("C", (), {"reset_session": lambda _s, _k: None})()
+
+    try:
+        loop.reset_conversation("web:c1")
+    except Exception:
+        # The rest of the reset path needs a fuller agent; the goal push is
+        # scheduled before any of it, which is what this test pins.
+        pass
+    await _asyncio.sleep(0)
+
+    assert bus.outbound, "a cleared goal must be announced to every client"
+    assert bus.outbound[0].metadata["goal"]["status"] == "cleared"
