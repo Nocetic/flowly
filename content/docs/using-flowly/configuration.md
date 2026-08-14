@@ -89,6 +89,19 @@ The loader is resilient by design:
 | `memoryFlush.enabled` | `true` |
 | `memoryFlush.softThresholdTokens` | `4000` |
 
+`agents.defaults.goals` — see [Standing goals](../features/goals.md):
+
+| Key | Default |
+|---|---|
+| `enabled` | `true` |
+| `maxTurns` | `20` (turn budget before a goal pauses for review) |
+| `judgeProvider` | `""` (empty inherits the conversation's provider) |
+| `judgeModel` | `""` (empty inherits the conversation's model) |
+| `judgeTimeoutSeconds` | `30` |
+| `judgeMaxTokens` | `4096` |
+| `gateTimeoutSeconds` | `300` |
+| `gateMaxRetries` | `3` |
+
 `agents.defaults.heartbeat`:
 
 | Key | Default |

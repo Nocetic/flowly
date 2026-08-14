@@ -179,5 +179,6 @@ test instance.
 
 - [Sandbox & exec approvals](/docs/using-flowly/sandbox-and-approvals) — the per-command gate plan mode sits on top of
 - [Slash commands](/docs/reference/slash-commands) — `/plan` and the `Shift+Tab` cycle
+- [Standing goals](/docs/features/goals) — for an objective pursued across turns; an active goal parks while a plan awaits approval
 - [Board](/docs/features/board) — for work you want queued and run, not planned per turn
 - [File layout](/docs/reference/file-layout) — where plans live on disk

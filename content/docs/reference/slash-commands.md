@@ -19,6 +19,24 @@ Inside the Flowly TUI, type `/` to run a command instead of sending a message to
 | `/abort` | Cancel the current turn. |
 | `/quit` | Exit. |
 
+## Standing goals
+
+A [standing goal](/docs/features/goals) keeps the agent working across turns until it is achieved, needs you, or exhausts its budget. Setting one starts the work in the same turn.
+
+| Command | What it does |
+|---|---|
+| `/goal` or `/goal status` | Show the current goal, its status and turn budget. |
+| `/goal <text>` | Set (or replace) the goal and start working immediately. Inline `verify:` / `constraints:` / `boundaries:` / `stop when:` lines become its completion contract. |
+| `/goal draft <text>` | Draft the completion contract first, then set the goal. |
+| `/goal show` | Show the goal with its full completion contract. |
+| `/goal pause` / `/goal resume` | Pause the loop (stays resumable) / resume and reset the turn budget. |
+| `/goal clear` (`/goal stop`, `/goal done`) | End the goal for good. |
+| `/goal wait <pid> [reason]` / `/goal unwait` | Park the loop on a process / release it. |
+| `/goal gate [list \| add <cmd> \| remove <n> \| clear]` | Manage quality gates — commands that must pass before the goal may be judged done. |
+| `/subgoal [<criterion> \| remove <n> \| clear]` | Manage extra completion criteria the judge factors in. |
+
+Pausing or ending a goal also stops the goal turn that is streaming at that moment. A turn you typed yourself is never stopped by these commands.
+
 ## Model & persona
 
 | Command | What it does |
@@ -165,5 +183,6 @@ There is a 30-second timeout and a 4000-character output cap.
 ## Related
 
 - [CLI commands](cli-commands.md)
+- [Standing goals](../features/goals.md)
 - [Tools](tools.md)
 - [Sessions](../using-flowly/sessions.md)

@@ -22,6 +22,7 @@ written outside it without your involvement.
 | `plan-mode/` | [Plan mode](/docs/features/plan-mode) state: per-session plans (`<session>/plan_<id>.json` plus an append-only `plan_<id>.revisions.log`) and `sticky.json`, which conversations have the standing mode on (what makes the mode survive restarts). |
 | `audit/` | Command + decision [audit log](/docs/features/audit-log). |
 | `sessions/` | Session routing index and transcripts. |
+| `goals/` | Durable [standing goal](/docs/features/goals) state — one lock + JSON record per conversation. |
 | `assistants/` | Saved assistant / multi-agent definitions. |
 | `desktop-client-id` | Stable id Flowly Desktop reconnects with. |
 
