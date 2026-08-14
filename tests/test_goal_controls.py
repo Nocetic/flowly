@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from flowly.agent.loop import AgentLoop
 from flowly.channels.web import WebChannel
@@ -410,3 +410,62 @@ async def test_a_users_own_turn_is_never_aborted_by_goal_controls():
         assert loop.abort_autonomous_run("web:c1") is False
     finally:
         inflight.finish("web:c1", "user-run-9")
+
+
+# ── The agent can drive goals when the user asks in plain language ─────────
+
+
+@pytest.mark.asyncio
+async def test_goal_tool_sets_a_goal_and_makes_this_turn_its_first():
+    from unittest.mock import Mock
+
+    from flowly.agent.tools.goal import GoalTool
+    from flowly.goals.commands import GoalCommandResult
+
+    agent = Mock()
+    state = GoalState(session_key="web:c1", goal="tüm testler geçene kadar çalış")
+    agent.goal_manager = object()
+    agent.context_epoch = Mock(return_value=3)
+    agent.publish_goal_snapshot = AsyncMock()
+
+    async def _set(session_key, text, conversation_epoch):
+        assert (session_key, text, conversation_epoch) == (
+            "web:c1", "tüm testler geçene kadar çalış", 3,
+        )
+        return GoalCommandResult("⊙ Goal set", state, start_turn=state.goal)
+
+    agent.goal_commands = Mock(goal=_set)
+    tool = GoalTool(agent=agent)
+
+    out = await tool.execute(
+        action="set", goal="tüm testler geçene kadar çalış", session_key="web:c1",
+    )
+
+    assert "Standing goal set" in out
+    assert "continue directly with the work" in out
+    agent.publish_goal_snapshot.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_goal_tool_controls_route_through_goal_control():
+    from flowly.agent.tools.goal import GoalTool
+
+    agent = Mock()
+    agent.goal_manager = object()
+    agent.goal_control = AsyncMock(return_value={"goal": {"status": "paused"}})
+    tool = GoalTool(agent=agent)
+
+    out = await tool.execute(action="pause", session_key="web:c1")
+
+    agent.goal_control.assert_awaited_once_with("web:c1", "pause")
+    assert '"paused"' in out
+
+
+def test_the_system_prompt_knows_goals_exist():
+    import inspect
+
+    from flowly.agent import context as context_module
+
+    source = inspect.getsource(context_module)
+    assert "Standing goals" in source
+    assert "never invent a goal" in source

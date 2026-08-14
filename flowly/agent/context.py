@@ -1867,6 +1867,18 @@ Skills with available="false" need dependencies — try installing with apt/brew
             )
         if search_tools:
             memory_lines.append("**Search tools**: " + "; ".join(search_tools) + ".")
+        if has_tool("goal"):
+            memory_lines.append(
+                "**Standing goals**: this conversation can carry a durable "
+                "goal that keeps you working across turns — after each turn a "
+                "judge decides continue/done, and the user sees pause/resume/"
+                "stop controls. The user manages it with `/goal` commands, or "
+                "asks you in plain language: use the `goal` tool to set one "
+                "ONLY when the user explicitly asks for ongoing autonomous "
+                "work (never invent a goal), and to pause/resume/stop/status "
+                "on request. While a goal turn is running, work toward the "
+                "stated goal and its completion contract."
+            )
         memory_section = "\n\n".join(memory_lines)
 
         # Load persona-specific identity if available. This branch

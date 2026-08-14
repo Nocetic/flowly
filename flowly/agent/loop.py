@@ -2294,6 +2294,11 @@ class AgentLoop:
             from flowly.agent.tools.session_search import SessionSearchTool
             self.tools.register(SessionSearchTool(indexer=self._session_indexer))
 
+        # Standing-goal control — lets the user drive goals in plain language
+        # ("keep working on this until it passes") instead of only /goal.
+        from flowly.agent.tools.goal import GoalTool
+        self.tools.register(GoalTool(agent=self))
+
         # Cron tool (for scheduling)
         cron_tool = CronTool(cron_service=self.cron_service)
         self.tools.register(cron_tool)
@@ -6396,6 +6401,7 @@ class AgentLoop:
                                 "clarify",
                                 "artifact",
                                 "session_search",
+                                "goal",
                             )
                             and "session_key" not in call_args
                         ):
