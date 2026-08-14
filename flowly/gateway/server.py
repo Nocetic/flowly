@@ -2420,7 +2420,7 @@ class GatewayServer:
         self,
         session_key: str,
         goal_metadata: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         """Run an agent-authored turn exactly like a client's ``chat.send``.
 
         Reuses :meth:`_run_chat` verbatim, so the turn is indistinguishable
@@ -2431,8 +2431,11 @@ class GatewayServer:
         """
         ws = self._session_ws.get(session_key)
         if ws is None or ws.closed:
+            # No client bound to this conversation right now. Report it so the
+            # caller can still run the turn through the channel layer instead
+            # of silently dropping the goal's work.
             logger.debug("[GatewayWS] no bound socket for autonomous turn on %s", session_key)
-            return
+            return False
         run_id = str(uuid.uuid4())
 
         async def stream_callback(delta: str) -> None:
@@ -2486,6 +2489,7 @@ class GatewayServer:
             stream_callback,
             extra_metadata={**goal_metadata, "on_user_message": announce_user},
         )
+        return True
 
     async def _run_chat(
         self,

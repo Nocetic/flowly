@@ -56,8 +56,9 @@ async def test_goal_continuation_uses_the_surfaces_own_turn_entry() -> None:
     loop._process_message = AsyncMock()
     submitted: list[tuple[str, dict]] = []
 
-    async def submitter(session_key: str, metadata: dict) -> None:
+    async def submitter(session_key: str, metadata: dict) -> bool:
         submitted.append((session_key, metadata))
+        return True
 
     loop.register_goal_turn_submitter("web", submitter)
     delivery = _AgentGoalDelivery(
@@ -130,11 +131,13 @@ async def test_direct_surface_prefers_the_gateway_runner() -> None:
     direct_calls: list[str] = []
     web_calls: list[str] = []
 
-    async def direct(session_key: str, metadata: dict) -> None:
+    async def direct(session_key: str, metadata: dict) -> bool:
         direct_calls.append(session_key)
+        return True
 
-    async def web(session_key: str, metadata: dict) -> None:
+    async def web(session_key: str, metadata: dict) -> bool:
         web_calls.append(session_key)
+        return True
 
     loop.register_goal_turn_submitter("direct", direct)
     loop.register_goal_turn_submitter("web", web)
@@ -357,3 +360,37 @@ async def test_goal_slash_command_surfaces_snapshot_and_kickoff_metadata() -> No
     assert response.metadata["goal"] == {"goalId": "goal-1"}
     assert response.metadata["_goal_kickoff_goal_id"] == "goal-1"
     loop.goal_commands.goal.assert_awaited_once_with("web:chat", "ship", conversation_epoch=2)
+
+
+@pytest.mark.asyncio
+async def test_a_surface_that_cannot_take_the_turn_falls_back_to_the_bus() -> None:
+    """No bound socket must not mean the goal silently stops working."""
+    loop = object.__new__(AgentLoop)
+    loop.bus = Mock()
+    loop.bus.publish_inbound = AsyncMock()
+    declined: list[str] = []
+
+    async def submitter(session_key: str, _metadata: dict) -> bool:
+        declined.append(session_key)
+        return False
+
+    loop.register_goal_turn_submitter("web", submitter)
+    delivery = _AgentGoalDelivery(
+        loop,
+        session_key="web:stable-chat",
+        channel="web",
+        chat_id="relay-1",
+        direct=False,
+    )
+
+    await delivery.run_continuation(
+        session_key="web:stable-chat", goal_id="goal-1", user_epoch=0, kickoff=False,
+    )
+
+    assert declined == ["web:stable-chat"]
+    published = loop.bus.publish_inbound.await_args.args[0]
+    assert published.session_key == "web:stable-chat"
+    assert published.metadata["_goal_continuation_goal_id"] == "goal-1"
+    # The run-start hook belongs to the surface that minted a run id; the bus
+    # path has none, so it must not leak a stale callback into the turn.
+    assert "on_run_started" not in published.metadata

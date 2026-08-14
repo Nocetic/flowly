@@ -207,8 +207,17 @@ class _AgentGoalDelivery(GoalDelivery):
             # The surface reports the run identity it minted so a later goal
             # control can stop that turn — and only that turn.
             metadata["on_run_started"] = lambda run_id: self.agent.note_autonomous_run(run_id)
-            await submitter(session_key, metadata)
-            return None
+            if await submitter(session_key, metadata):
+                return None
+            # The surface could not take it — no bound socket, no relay session
+            # yet after a restart. Falling through keeps the goal working
+            # instead of dropping the turn on the floor; the reply is queued
+            # by the channel and delivered when the client returns.
+            metadata.pop("on_run_started", None)
+            logger.info(
+                "[goal] {} has no live surface; running the turn over the bus",
+                session_key,
+            )
 
         # No transport-native entry (plain channels, one-shot CLI, tests): the
         # bus IS the generic user-turn entry point, and channel adapters give
@@ -3416,6 +3425,53 @@ class AgentLoop:
             ))
         except Exception:  # noqa: BLE001 — never block a turn on a notice
             logger.debug("[goal] channel snapshot push skipped", exc_info=True)
+
+    def resume_active_goals(self) -> int:
+        """Re-arm every standing goal this process owes work to.
+
+        Goal STATE is durable; the work queue is not. A process that comes
+        back therefore has to find the goals that were mid-flight and put them
+        back in motion — otherwise an active goal sits idle until the user
+        happens to send a message, which is exactly the "it stopped on its
+        own" failure a standing goal exists to prevent.
+
+        Waiting goals are re-armed rather than run: their barrier (a process,
+        a deadline) is re-evaluated and the wake fires when it clears. Paused,
+        done and cleared goals are left alone — they are stopped on purpose.
+
+        Returns the number of goals put back in motion.
+        """
+        manager = getattr(self, "goal_manager", None)
+        runtime = getattr(self, "goal_runtime", None)
+        if manager is None or runtime is None:
+            return 0
+        try:
+            states = manager.store.iter_states()
+        except Exception:  # noqa: BLE001 — a boot sweep must never block startup
+            logger.exception("[goal] could not enumerate goals for resume")
+            return 0
+
+        resumed = 0
+        for state in states:
+            if not state.is_active or not state.session_key:
+                continue
+            channel, _, chat_id = state.session_key.partition(":")
+            delivery = _AgentGoalDelivery(
+                self,
+                session_key=state.session_key,
+                channel=channel or "cli",
+                chat_id=chat_id or state.session_key,
+                # A restart has no bound socket yet; the surface decides for
+                # itself whether it can take the turn (see run_continuation).
+                direct=False,
+            )
+            # ``wake`` re-evaluates barriers first, so a goal parked on a
+            # process or a deadline resumes when that clears, not now.
+            if runtime.wake(state.session_key, delivery):
+                resumed += 1
+        if resumed:
+            logger.info("[goal] resumed {} standing goal(s) after restart", resumed)
+        return resumed
 
     def register_goal_turn_submitter(self, key: str, submitter: Any) -> None:
         """Register a surface's normal user-turn entry point for goal turns.

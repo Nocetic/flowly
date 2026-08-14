@@ -304,3 +304,77 @@ async def test_clearing_a_conversation_drops_the_chip_everywhere():
 
     assert bus.outbound, "a cleared goal must be announced to every client"
     assert bus.outbound[0].metadata["goal"]["status"] == "cleared"
+
+
+# ── Restart resume ─────────────────────────────────────────────────────────
+#
+# Goal state is durable but the work queue is not: a process that comes back
+# has to put mid-flight goals back in motion, or a standing goal quietly stops
+# until the user sends a message.
+
+
+def _resume_loop(states):
+    from flowly.agent.loop import AgentLoop as _Loop
+
+    loop = _Loop.__new__(_Loop)
+    woken: list[str] = []
+
+    class _Store:
+        def iter_states(self):
+            return states
+
+    class _Manager:
+        store = _Store()
+
+    class _Rt:
+        def wake(self, session_key, delivery=None):
+            woken.append(session_key)
+            return True
+
+    loop.goal_manager = _Manager()
+    loop.goal_runtime = _Rt()
+    return loop, woken
+
+
+def test_restart_resumes_active_goals_only():
+    active = GoalState(session_key="web:a", goal="ship")
+    paused = GoalState(session_key="web:b", goal="later")
+    paused.status = type(paused.status)("paused")
+    done = GoalState(session_key="web:c", goal="shipped")
+    done.status = type(done.status)("done")
+
+    loop, woken = _resume_loop([active, paused, done])
+
+    assert loop.resume_active_goals() == 1
+    # Paused and finished goals are stopped on purpose; only the live one is
+    # put back in motion.
+    assert woken == ["web:a"]
+
+
+def test_restart_resume_survives_an_unreadable_store():
+    from flowly.agent.loop import AgentLoop as _Loop
+
+    loop = _Loop.__new__(_Loop)
+
+    class _Store:
+        def iter_states(self):
+            raise OSError("disk gone")
+
+    class _Manager:
+        store = _Store()
+
+    loop.goal_manager = _Manager()
+    loop.goal_runtime = object()
+
+    # A boot sweep must never take the gateway down with it.
+    assert loop.resume_active_goals() == 0
+
+
+def test_restart_resume_is_a_no_op_without_goals_configured():
+    from flowly.agent.loop import AgentLoop as _Loop
+
+    loop = _Loop.__new__(_Loop)
+    loop.goal_manager = None
+    loop.goal_runtime = None
+
+    assert loop.resume_active_goals() == 0

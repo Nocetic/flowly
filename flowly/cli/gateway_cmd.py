@@ -2138,9 +2138,21 @@ Respond to the user now:"""
 
             # Run until shutdown signal
             async def run_until_shutdown():
+                # Standing goals are durable, their work queue is not: a
+                # restart has to put the goals that were mid-flight back in
+                # motion, or they wait for a message the user should not have
+                # to send. Scheduled alongside the loop so a slow sweep never
+                # delays the gateway coming up.
+                async def _resume_goals() -> None:
+                    try:
+                        agent.resume_active_goals()
+                    except Exception:
+                        logger.exception("[goal] restart resume failed")
+
                 await asyncio.gather(
                     agent.run(),
                     channels.start_all(),
+                    _resume_goals(),
                 )
 
             # Create main task

@@ -135,8 +135,9 @@ async def test_a_goal_turn_is_judged_once_through_the_normal_delivery_hook():
     loop._goal_turn_from_outbound = Mock()
     submitted: list[str] = []
 
-    async def submitter(session_key: str, _metadata: dict) -> None:
+    async def submitter(session_key: str, _metadata: dict) -> bool:
         submitted.append(session_key)
+        return True
 
     loop.register_goal_turn_submitter("web", submitter)
     delivery = _AgentGoalDelivery(

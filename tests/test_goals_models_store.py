@@ -162,3 +162,23 @@ def test_cross_process_updates_do_not_lose_writes(tmp_path: Path) -> None:
     assert final is not None
     assert final.turns_used == 100
     assert final.revision == 101
+
+
+def test_iter_states_reads_every_goal_and_skips_damage(tmp_path):
+    """The restart sweep must find all goals and survive one bad record."""
+    from flowly.goals.store import GoalStore
+
+    store = GoalStore(tmp_path)
+    store.save(GoalState(session_key="web:a", goal="first"))
+    store.save(GoalState(session_key="web:b", goal="second"))
+    (tmp_path / "damaged.json").write_text("{not json", encoding="utf-8")
+
+    keys = {state.session_key for state in store.iter_states()}
+
+    assert keys == {"web:a", "web:b"}
+
+
+def test_iter_states_on_an_empty_store(tmp_path):
+    from flowly.goals.store import GoalStore
+
+    assert GoalStore(tmp_path).iter_states() == []

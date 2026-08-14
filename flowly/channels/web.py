@@ -1596,7 +1596,7 @@ class WebChannel(BaseChannel):
         self,
         session_key: str,
         goal_metadata: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         """Run an agent-authored turn exactly like a client's ``chat.send``.
 
         Same run identity, streaming callback, in-flight registration and
@@ -1608,8 +1608,11 @@ class WebChannel(BaseChannel):
         if not session_id and session_key.startswith("web:"):
             session_id = session_key.split(":", 1)[1]
         if not session_id:
+            # Nothing to stream to yet (fresh process, client not back). Report
+            # it so the caller can still run the turn over the bus rather than
+            # dropping the goal's work.
             logger.debug("[WebChannel] no relay session for {}", session_key)
-            return
+            return False
         run_id = str(uuid.uuid4())
 
         from flowly.agent import inflight
@@ -1651,6 +1654,7 @@ class WebChannel(BaseChannel):
         ))
         self._active_tasks[run_id] = task
         task.add_done_callback(lambda _t, _rid=run_id: self._active_tasks.pop(_rid, None))
+        return True
 
     async def _process_message(
         self,

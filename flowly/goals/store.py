@@ -134,6 +134,34 @@ class GoalStore:
             state = self._read(path)
             return GoalState.from_dict(state.to_dict()) if state else None
 
+    def iter_states(self) -> "list[GoalState]":
+        """Every goal on disk, newest first.
+
+        Used to re-arm the runtime after a restart: goal state is durable but
+        the work queue is not, so a process that comes back has to find the
+        goals it owes work to. Unreadable files are skipped rather than
+        failing the sweep — one corrupt goal must not strand the others.
+        """
+        states: list[GoalState] = []
+        try:
+            paths = sorted(self.root.glob("*.json"))
+        except OSError:
+            return states
+        for path in paths:
+            # Read WITHOUT the per-goal lock: every write lands through
+            # ``os.replace`` on a fsynced temp file, so a reader either sees
+            # the whole previous record or the whole new one. Taking the lock
+            # would need the original session key, which is only knowable from
+            # the record itself.
+            try:
+                state = self._read(path)
+            except Exception:  # noqa: BLE001 — one bad record must not strand the rest
+                continue
+            if state is not None and state.session_key:
+                states.append(state)
+        states.sort(key=lambda item: item.updated_at, reverse=True)
+        return states
+
     def save(
         self,
         state: GoalState,
