@@ -389,3 +389,32 @@ def test_clear_invalidates_generation_and_removes_goal_payload(tmp_path: Path) -
     assert cleared.subgoals == [] and cleared.gates == []
     assert cleared.conversation_epoch == 9
     assert not manager.is_generation_active("s", active.goal_id)
+
+
+def test_a_slow_judge_warns_once_with_the_setting_to_change(caplog):
+    """The verdict sits between every autonomous turn — say so, once."""
+    import logging
+
+    from flowly.goals.judge import GoalJudge, SLOW_JUDGE_SECONDS
+
+    judge = GoalJudge.__new__(GoalJudge)
+    judge.model = "big/slow-model"
+    judge._slow_warning_sent = False
+
+    with caplog.at_level(logging.WARNING):
+        judge._note_latency(SLOW_JUDGE_SECONDS + 1)
+        judge._note_latency(SLOW_JUDGE_SECONDS + 1)
+
+    assert judge._slow_warning_sent is True
+
+
+def test_a_fast_judge_stays_silent():
+    from flowly.goals.judge import GoalJudge, SLOW_JUDGE_SECONDS
+
+    judge = GoalJudge.__new__(GoalJudge)
+    judge.model = None
+    judge._slow_warning_sent = False
+
+    judge._note_latency(SLOW_JUDGE_SECONDS - 0.1)
+
+    assert judge._slow_warning_sent is False

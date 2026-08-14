@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
+from loguru import logger
+
 from flowly.goals.models import (
     MAX_GOAL_CHARS,
     MAX_REASON_CHARS,
@@ -19,6 +21,8 @@ from flowly.goals.models import (
 from flowly.providers.base import LLMProvider
 
 DEFAULT_JUDGE_TIMEOUT_SECONDS = 30.0
+#: A verdict slower than this is a pause the user feels between turns.
+SLOW_JUDGE_SECONDS = 5.0
 DEFAULT_JUDGE_MAX_TOKENS = 4_096
 MAX_RESPONSE_SNIPPET_CHARS = 4_000
 MAX_PROCESS_LINES = 20
@@ -172,6 +176,12 @@ class GoalJudge:
         self.model = model
         self.timeout_seconds = max(1.0, min(300.0, float(timeout_seconds)))
         self.max_tokens = max(64, min(16_384, int(max_tokens)))
+        # A judge that is slow is the ONLY thing between one autonomous turn
+        # and the next, so the operator is told once — with the setting to
+        # change — instead of the goal simply feeling sluggish forever. Not
+        # auto-corrected: choosing a different model on the user's behalf is
+        # exactly what this product does not do.
+        self._slow_warning_sent = False
 
     async def evaluate(
         self,
@@ -181,6 +191,7 @@ class GoalJudge:
         background_processes: Iterable[Mapping[str, Any]] = (),
     ) -> GoalJudgeResult:
         prompt = self._user_prompt(state, latest_response, background_processes)
+        started = time.monotonic()
         try:
             response = await self.provider.chat(
                 [
@@ -198,12 +209,32 @@ class GoalJudge:
             raise GoalJudgeTransportError(
                 f"judge request failed: {type(exc).__name__}: {exc}"
             ) from exc
+        self._note_latency(time.monotonic() - started)
         content = str(response.content or "").strip()
         if not content:
             if response.error_info is not None:
                 raise GoalJudgeTransportError("judge provider returned an error without content")
             raise GoalJudgeParseError("judge returned an empty response")
         return parse_judge_result(content)
+
+    def _note_latency(self, seconds: float) -> None:
+        """Warn once when the verdict costs more than the pause a user feels.
+
+        The judge runs between every pair of autonomous turns, so its latency
+        IS the gap the user sees. When it is unset it inherits the main
+        conversation model, which on a large model is seconds per turn.
+        """
+        if self._slow_warning_sent or seconds < SLOW_JUDGE_SECONDS:
+            return
+        self._slow_warning_sent = True
+        logger.warning(
+            "Goal judge took {:.1f}s on {} — that pause sits between every "
+            "autonomous turn. Point it at a small fast model with "
+            "agents.defaults.goals.judgeModel (and judgeProvider if it lives "
+            "elsewhere) to shorten it.",
+            seconds,
+            self.model or "the main conversation model",
+        )
 
     async def draft_contract(self, objective: str) -> GoalContract:
         objective = str(objective or "").strip()
