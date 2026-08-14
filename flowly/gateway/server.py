@@ -3477,8 +3477,12 @@ class GatewayServer:
             if not (metadata.get("goalTerminal") and text.strip()):
                 return
             # The snapshot has already gone out; drop it so the message path
-            # below does not broadcast the same revision a second time.
-            metadata = {k: v for k, v in metadata.items() if k != "goal"}
+            # below does not broadcast the same revision a second time. Keep a
+            # marker so clients render the report as the system line it is —
+            # unmarked it reads as something the model chose to say.
+            metadata = {
+                k: v for k, v in metadata.items() if k not in ("goal", "goalStatus")
+            }
             goal_snapshot = None
         if not text and not media and not isinstance(goal_snapshot, dict):
             return
@@ -3541,6 +3545,8 @@ class GatewayServer:
             data["goal"] = goal_snapshot
         if metadata.get("goal_run") is True:
             data["goalRun"] = True
+        if metadata.get("goalTerminal") is True:
+            data["goalNotice"] = True
         if isinstance(metadata.get("usage"), dict) and metadata["usage"]:
             final_message["usage"] = metadata["usage"]
         if metadata.get("model"):

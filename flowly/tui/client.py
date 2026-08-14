@@ -27,6 +27,13 @@ class StreamDelta:
 
 
 @dataclass
+class GoalNotice:
+    """A goal lifecycle report (achieved / paused). System line, not a reply."""
+    session_key: str
+    text: str
+
+
+@dataclass
 class AgentAuthoredUser:
     """A user-role turn the agent authored (a standing goal's next step).
 
@@ -872,6 +879,16 @@ class GatewayClient:
                     await self._inbox.put(
                         AgentAuthoredUser(run_id, session_key, text)
                     )
+                return
+            if state == "final" and payload.get("goalNotice") is True:
+                msg_block = payload.get("message") or {}
+                text = "".join(
+                    str(part.get("text", ""))
+                    for part in (msg_block.get("content") or [])
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+                if text:
+                    await self._inbox.put(GoalNotice(session_key, text))
                 return
             if state == "final":
                 msg = payload.get("message") or {}

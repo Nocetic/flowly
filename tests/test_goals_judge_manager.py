@@ -418,3 +418,39 @@ def test_a_fast_judge_stays_silent():
     judge._note_latency(SLOW_JUDGE_SECONDS - 0.1)
 
     assert judge._slow_warning_sent is False
+
+
+def test_a_contract_about_contract_writing_is_rejected():
+    """The live failure: a small model drafted a contract about producing
+    JSON, the continuation then instructed the agent to emit JSON, and the
+    judge declared that JSON done."""
+    from flowly.goals.judge import _is_meta_contract
+    from flowly.goals.models import GoalContract
+
+    leaked = GoalContract(
+        outcome="Produce a single JSON completion contract object that satisfies all structural and content requirements for the test goal",
+        verification="Validate that the response contains exactly one JSON object with 5 non-empty string fields",
+        constraints="Output must be pure JSON with no surrounding markdown, prose, or formatting",
+        boundaries="Do not output code blocks or markdown wrappers",
+        stop_when="The JSON object has been fully written and validated, with no further tokens generated beyond the closing brace",
+    )
+    assert _is_meta_contract(leaked) is True
+
+    real = GoalContract(
+        outcome="Examine the files on the desktop, including names, types and sizes",
+        verification="A list of all desktop files with their metadata is produced",
+        constraints="Only the desktop directory is examined",
+        boundaries="No files are modified or deleted",
+        stop_when="All desktop files have been listed",
+    )
+    assert _is_meta_contract(real) is False
+
+
+def test_the_drafter_wraps_the_objective_as_data():
+    import inspect
+
+    from flowly.goals import judge as judge_module
+
+    source = inspect.getsource(judge_module.GoalJudge.draft_contract)
+    assert "<objective>" in source
+    assert "authoritative" in judge_module._JUDGE_SYSTEM_PROMPT

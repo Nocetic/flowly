@@ -594,6 +594,8 @@ class WebChannel(BaseChannel):
             data_block["streamRunId"] = str(stream_run_id)
         if msg.metadata.get("goal_run") is True:
             data_block["goalRun"] = True
+        if msg.metadata.get("goalTerminal") is True:
+            data_block["goalNotice"] = True
         usage_meta = msg.metadata.get("usage")
         if isinstance(usage_meta, dict) and usage_meta:
             data_block["usage"] = {

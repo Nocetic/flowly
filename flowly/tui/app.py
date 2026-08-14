@@ -37,6 +37,7 @@ from flowly.tui.client import (
     GatewayUnavailable,
     PlanApprovalRequested,
     AgentAuthoredUser,
+    GoalNotice,
     GoalUpdated,
     PlanUpdated,
     Reconnected,
@@ -1078,6 +1079,11 @@ class FlowlyTUI(App[None]):
 
         if isinstance(ev, GoalUpdated):
             self._on_goal_updated(ev.goal)
+            return
+
+        if isinstance(ev, GoalNotice):
+            if not ev.session_key or ev.session_key == self._session_key:
+                self._add_notice(ev.text)
             return
 
         if isinstance(ev, AgentAuthoredUser):
