@@ -323,7 +323,15 @@ class GoalRuntime:
             # enqueued this wake item. Reload the live goal instead of treating
             # that already-resolved wait as an inactive goal.
             state = self.manager.get(session_key)
-        if state is None or not state.is_active or state.has_wait:
+        if state is None or not state.is_active:
+            return
+        if state.has_wait:
+            # Still parked. Re-arm the poller rather than returning: a wake
+            # that arrives without one — the restart sweep is the normal case —
+            # would otherwise leave the barrier with nothing watching it, and
+            # the goal would wait for a message the user should not have to
+            # send. Idempotent: scheduling replaces any existing timer.
+            self._schedule_wait_wake(session_key, delivery)
             return
         self.cancel_wait_timer(session_key)
         await self._run_next(

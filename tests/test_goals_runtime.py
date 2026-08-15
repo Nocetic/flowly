@@ -306,3 +306,36 @@ async def test_cancel_session_drops_route_timer_and_queued_work(tmp_path: Path) 
     assert runtime.wake("s") is False
     assert delivery.events == [("notice", "waiting")]
     await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_parked_goal_rearms_its_barrier_on_wake(tmp_path):
+    """After a restart the sweep wakes parked goals — something must watch
+    the barrier, or the goal waits for a message it should not need."""
+    from flowly.goals.manager import GoalManager
+    from flowly.goals.store import GoalStore
+
+    manager = GoalManager(GoalStore(tmp_path), judge=None)
+    state = manager.set("web:c1", "ship it", conversation_epoch=0)
+    # A deterministic barrier: an unknown process id would fail safe and
+    # release immediately, which is correct but not what this pins.
+    manager.wait_for_seconds("web:c1", 600, reason="cooling down")
+
+    runtime = GoalRuntime(manager, current_user_epoch=lambda _k: 0)
+    scheduled: list[str] = []
+    runtime._schedule_wait_wake = lambda key, _d: scheduled.append(key)
+
+    class _Delivery:
+        async def run_continuation(self, **_kwargs):
+            raise AssertionError("a parked goal must not run a turn")
+
+        async def deliver_turn(self, _turn):
+            pass
+
+        async def deliver_notice(self, _decision):
+            pass
+
+    await runtime._resume_wait("web:c1", _Delivery())
+
+    assert scheduled == ["web:c1"], "the barrier must be watched again"
+    assert manager.get("web:c1").goal_id == state.goal_id
