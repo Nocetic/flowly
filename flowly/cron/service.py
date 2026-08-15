@@ -162,6 +162,7 @@ class CronService:
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
         on_alert: Callable[[CronJob, str], Coroutine[Any, Any, None]] | None = None,
         on_complete: Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]] | None = None,
+        on_run_start: Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]] | None = None,
         activity_probe: Callable[[], dict[str, Any]] | None = None,
         interrupt_fn: Callable[[str], None] | None = None,
     ):
@@ -178,6 +179,12 @@ class CronService:
         # wires this to a WS broadcast (``cron.completed``) so desktop clients
         # can raise a native OS notification. Optional — no callback = silent.
         self.on_complete = on_complete
+        # Called the moment a job STARTS executing, with the same event shape
+        # ``on_complete`` uses (``cron.started``). Together the two bracket a
+        # run, so a Schedule UI can show "running now" the instant it begins
+        # instead of inferring it from the next poll. Optional — no callback =
+        # the run is still tracked in ``_active_runs`` for pollers.
+        self.on_run_start = on_run_start
         # Inactivity-based timeout wiring. `activity_probe` returns the
         # agent's get_activity_summary() dict (at minimum with
         # `seconds_since_activity`). `interrupt_fn` signals cooperative
@@ -189,6 +196,13 @@ class CronService:
         self._timer_task: asyncio.Task | None = None
         self._running = False
         self._executing = False  # Prevent concurrent _on_timer() calls
+        # job_id → in-flight run record. Populated for the whole duration of
+        # ``_execute_job`` so live views (cron.list, health_report) can tell
+        # which job is executing right now, and the run's ``sessionKey`` /
+        # ``runId`` let them follow its output while it happens. Keyed by job
+        # rather than a single slot because a manual trigger can overlap a
+        # scheduled fire of a DIFFERENT job.
+        self._active_runs: dict[str, dict[str, Any]] = {}
     
     def _load_store(self) -> CronStore:
         """Load jobs from disk."""
@@ -791,9 +805,52 @@ class CronService:
             job.state.next_run_at_ms = new_next
             self._save_store()
 
+    def _run_record(self, job: CronJob, started_at_ms: int) -> dict[str, Any]:
+        """Describe one in-flight run for live views and the start event.
+
+        ``sessionKey`` is the session the agent turn runs under, so a client
+        holding this record can follow the run's partial output through the
+        ordinary ``chat.inflight`` RPC — no cron-specific streaming channel.
+        """
+        return {
+            "jobId": job.id,
+            "jobName": job.name,
+            "runId": str(uuid.uuid4()),
+            "startedAtMs": started_at_ms,
+            "sessionKey": f"cron:{job.id}",
+            "scheduleKind": job.schedule.kind,
+        }
+
     async def _execute_job(self, job: CronJob) -> None:
+        """Execute a job while publishing its in-flight state.
+
+        The run is registered BEFORE the callback so ``on_job`` can read its
+        own ``runId`` (via :meth:`current_run`) and tag the stream it emits
+        with the same identity the start event announced.
+        """
+        run = self._run_record(job, _now_ms())
+        self._active_runs[job.id] = run
+
+        if self.on_run_start is not None:
+            try:
+                await self.on_run_start("cron.started", dict(run))
+            except Exception as e:
+                logger.warning(
+                    f"Cron: on_run_start callback failed for '{job.name}': {e}"
+                )
+
+        try:
+            await self._run_job_body(job, run=run)
+        finally:
+            # Reap only OUR record. A re-entrant run for the same job (a manual
+            # trigger racing the scheduler) owns a different record, and the
+            # older run finishing must not erase the newer one's marker.
+            if self._active_runs.get(job.id) is run:
+                del self._active_runs[job.id]
+
+    async def _run_job_body(self, job: CronJob, *, run: dict[str, Any]) -> None:
         """Execute a single job."""
-        start_ms = _now_ms()
+        start_ms = int(run["startedAtMs"])
         logger.info(f"Cron: executing job '{job.name}' ({job.id})")
 
         response: str | None = None
@@ -876,6 +933,9 @@ class CronService:
                     {
                         "jobId": job.id,
                         "jobName": job.name,
+                        # Same identity ``cron.started`` announced, so a client
+                        # retires exactly the run it was watching.
+                        "runId": run["runId"],
                         "status": job.state.last_status,  # "ok" | "error"
                         "errorMessage": job.state.last_error,
                         "preview": preview[:500] if preview else None,
@@ -929,7 +989,22 @@ class CronService:
                 job.state.next_run_at_ms = None
     
     # ========== Public API ==========
-    
+
+    def running_runs(self) -> list[dict[str, Any]]:
+        """Every run executing right now, oldest first.
+
+        Copies are returned so a caller can't mutate the live bookkeeping.
+        """
+        return sorted(
+            (dict(run) for run in self._active_runs.values()),
+            key=lambda r: r.get("startedAtMs") or 0,
+        )
+
+    def current_run(self, job_id: str) -> dict[str, Any] | None:
+        """The in-flight run for one job, or None when it isn't executing."""
+        run = self._active_runs.get(job_id)
+        return dict(run) if run else None
+
     def list_jobs(self, include_disabled: bool = False) -> list[CronJob]:
         """List all jobs."""
         store = self._load_store()
@@ -1202,6 +1277,7 @@ class CronService:
             "enabled": self._running,
             "jobs": len(store.jobs),
             "next_wake_at_ms": self._get_next_wake_ms(),
+            "running": self.running_runs(),
         }
 
     def health_report(self) -> dict:
@@ -1286,5 +1362,9 @@ class CronService:
             "enabledJobs": enabled_count,
             "healthyJobs": enabled_count - len(affected_ids),
             "warnings": warnings,
+            # Runs executing right now. The desktop already polls this endpoint
+            # for the local bot, so carrying live-run state here means the
+            # Schedule screen shows "running" without a second round-trip.
+            "running": self.running_runs(),
             "timestampMs": now,
         }

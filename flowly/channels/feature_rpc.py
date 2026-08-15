@@ -3521,12 +3521,22 @@ def board_card(params: dict) -> dict:
 # relay AND gateway). The relay's cron delivery is untouched.
 
 
-def _cron_job_to_dict(j) -> dict:
-    """Serialize a CronJob to the UI shape (mirrors the jobs.json on-disk form)."""
+def _cron_job_to_dict(j, run: dict | None = None) -> dict:
+    """Serialize a CronJob to the UI shape (mirrors the jobs.json on-disk form).
+
+    ``run`` is the job's in-flight run record (``CronService.current_run``)
+    when it is executing right now, and None otherwise. It rides along in
+    ``state`` so one ``cron.list`` answers both "what is scheduled" and "what
+    is happening", and ``sessionKey`` tells a client which session to follow
+    for the live output.
+    """
     return {
         "id": j.id,
         "name": j.name,
         "enabled": j.enabled,
+        # The session a run of this job executes under — stable, so a client
+        # can subscribe to its live output via ``chat.inflight``.
+        "sessionKey": f"cron:{j.id}",
         "schedule": {
             "kind": j.schedule.kind,
             "atMs": j.schedule.at_ms,
@@ -3548,6 +3558,9 @@ def _cron_job_to_dict(j) -> dict:
             "lastError": j.state.last_error,
             "lastDeliveryError": j.state.last_delivery_error,
             "consecutiveFailures": j.state.consecutive_failures,
+            "running": run is not None,
+            "runId": (run or {}).get("runId"),
+            "runStartedAtMs": (run or {}).get("startedAtMs"),
         },
         "origin": (
             {
@@ -3569,13 +3582,22 @@ def _cron_job_to_dict(j) -> dict:
 
 
 def cron_list(params: dict) -> dict:
-    """All scheduled jobs (enabled + disabled) as ``{jobs: [...]}``."""
+    """All scheduled jobs (enabled + disabled) as ``{jobs: [...], running: [...]}``.
+
+    ``running`` lists the runs executing at this instant; the same records are
+    mirrored onto each job's ``state`` so a UI can render a per-row badge
+    without cross-referencing.
+    """
     svc = _cron()
     if svc is None:
         raise FeatureRpcError("UNAVAILABLE", "Scheduler not configured")
     include_disabled = bool(params.get("includeDisabled", True))
     jobs = svc.list_jobs(include_disabled=include_disabled)
-    return {"jobs": [_cron_job_to_dict(j) for j in jobs]}
+    running = {r["jobId"]: r for r in svc.running_runs()}
+    return {
+        "jobs": [_cron_job_to_dict(j, running.get(j.id)) for j in jobs],
+        "running": list(running.values()),
+    }
 
 
 def cron_add(params: dict) -> dict:
@@ -3629,7 +3651,7 @@ def cron_add(params: dict) -> dict:
         )
     except ValueError as e:
         raise FeatureRpcError("INVALID", str(e))
-    return {"job": _cron_job_to_dict(job)}
+    return {"job": _cron_job_to_dict(job, svc.current_run(job.id))}
 
 
 def cron_remove(params: dict) -> dict:
@@ -3659,23 +3681,63 @@ def cron_update(params: dict) -> dict:
         raise FeatureRpcError("INVALID", "provide enabled or updates")
     if job is None:
         raise FeatureRpcError("NOT_FOUND", "job not found")
-    return {"job": _cron_job_to_dict(job)}
+    return {"job": _cron_job_to_dict(job, svc.current_run(job.id))}
+
+
+#: Strong references to detached ``cron.run`` tasks. Without this the event
+#: loop only holds a weak reference and a fire-and-forget run can be garbage
+#: collected mid-flight. Entries remove themselves when the run settles.
+_cron_run_tasks: set = set()
 
 
 async def cron_run(params: dict) -> dict:
-    """Run a job now (``force`` defaults true so disabled jobs still run)."""
+    """Run a job now (``force`` defaults true so disabled jobs still run).
+
+    ``wait`` (default true) blocks until the run finishes, preserving the
+    original contract. Pass false to start the run and return immediately —
+    what a UI wants when it intends to watch the output live rather than sit
+    on an open request for the length of an agent turn.
+    """
     svc = _cron()
     if svc is None:
         raise FeatureRpcError("UNAVAILABLE", "Scheduler not configured")
     jid = str(params.get("id") or "")
     if not jid:
         raise FeatureRpcError("INVALID", "id required")
-    ok = await svc.run_job(jid, force=bool(params.get("force", True)))
-    return {"ok": ok}
+    force = bool(params.get("force", True))
+
+    if bool(params.get("wait", True)):
+        ok = await svc.run_job(jid, force=force)
+        return {"ok": ok}
+
+    # Detached mode. Resolve the job up front so the caller still gets a real
+    # error instead of an "ok" that silently did nothing.
+    job = next(
+        (j for j in svc.list_jobs(include_disabled=True) if j.id == jid or j.name == jid),
+        None,
+    )
+    if job is None:
+        raise FeatureRpcError("NOT_FOUND", "job not found")
+    if svc.current_run(job.id) is not None:
+        raise FeatureRpcError("BUSY", "job is already running")
+    if not force and not job.enabled:
+        return {"ok": False}
+
+    task = asyncio.create_task(svc.run_job(jid, force=force))
+    _cron_run_tasks.add(task)
+    task.add_done_callback(_cron_run_tasks.discard)
+    return {"ok": True, "started": True, "sessionKey": f"cron:{job.id}"}
 
 
 def cron_output(params: dict) -> dict:
-    """Recent run outputs (archived ``.md`` per run) for a job, newest-first."""
+    """Run outputs for a job, newest-first, plus the run in progress.
+
+    A settled run is an archived ``.md`` transcript. A run still executing has
+    no transcript yet — its partial reply and tool turns live in the in-flight
+    registry under the job's session key, and come back as ``live``. Answering
+    both from one call keeps a live output view to a single poll, and keeps it
+    identical over relay and direct gateway.
+    """
     svc = _cron()
     if svc is None:
         raise FeatureRpcError("UNAVAILABLE", "Scheduler not configured")
@@ -3686,7 +3748,17 @@ def cron_output(params: dict) -> dict:
         limit = max(1, min(int(params.get("limit", 10) or 10), 50))
     except (TypeError, ValueError):
         limit = 10
-    job_dir = svc.store_path.parent / "output" / jid
+
+    # Accept a name as well as an id, like cron.remove / cron.update do. The
+    # archive is keyed by id, so resolve first and fall back to the raw value
+    # for a job that no longer exists.
+    job = next(
+        (j for j in svc.list_jobs(include_disabled=True) if j.id == jid or j.name == jid),
+        None,
+    )
+    job_id = job.id if job else jid
+
+    job_dir = svc.store_path.parent / "output" / job_id
     outputs: list[dict[str, Any]] = []
     if job_dir.exists():
         files = sorted(job_dir.glob("*.md"), reverse=True)[:limit]
@@ -3695,7 +3767,32 @@ def cron_output(params: dict) -> dict:
                 outputs.append({"name": f.stem, "content": f.read_text(encoding="utf-8")})
             except OSError:
                 continue
-    return {"outputs": outputs}
+
+    return {"outputs": outputs, "live": _cron_live_run(svc, job_id)}
+
+
+def _cron_live_run(svc, job_id: str) -> dict | None:
+    """The executing run's partial output, or None when the job is idle.
+
+    The stream is only reported when the registry entry belongs to the run
+    that is actually in flight: a leftover entry from a previous run would
+    otherwise be replayed as if it were the current one.
+    """
+    run = svc.current_run(job_id)
+    if run is None:
+        return None
+
+    from flowly.agent.inflight import get as _inflight_get
+
+    partial = _inflight_get(run["sessionKey"]) or {}
+    matched = partial.get("runId") == run["runId"]
+    return {
+        "runId": run["runId"],
+        "sessionKey": run["sessionKey"],
+        "startedAtMs": run["startedAtMs"],
+        "text": partial.get("text", "") if matched else "",
+        "iterations": list(partial.get("iterations", [])) if matched else [],
+    }
 
 
 # ── Push notifications (anonymous push-relay) ──────────────────────────────
@@ -4051,6 +4148,11 @@ LONG_RUNNING_METHODS = frozenset({
     "tools.semantic.enable",
     # A cold catalog sync walks every category over the network.
     "media.models.refresh",
+    # A blocking (``wait``) manual run lasts a whole agent turn. Without this
+    # the relay transport's receive loop is stalled for its duration — no
+    # pings, no Stop, no other RPC. Detached runs return at once and don't
+    # depend on this, but the legacy blocking form does.
+    "cron.run",
 })
 
 

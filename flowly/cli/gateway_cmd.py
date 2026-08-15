@@ -7,6 +7,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from loguru import logger
@@ -305,6 +306,7 @@ def gateway(
     from flowly.cron.types import CronJob
     from flowly.cron import script_runner, skill_loader
     from flowly.cron.context import cron_context
+    from flowly.agent import inflight
 
     # Tools hidden from the agent during cron runs.
     #
@@ -698,14 +700,49 @@ def gateway(
 
     # Set cron job callback (needs agent to be created first)
     async def on_cron_job(job: CronJob) -> str | None:
-        """Execute a cron job through the agent."""
-        with cron_context():
-            return await _on_cron_job_inner(job)
+        """Execute a cron job through the agent, publishing its live output.
 
-    async def _on_cron_job_inner(job: CronJob) -> str | None:
+        The run identity comes from the CronService record registered just
+        before this callback fires, so the partial output is filed under the
+        same ``runId`` the ``cron.started`` event announced. Registering the
+        run in the in-flight registry is what makes a scheduled job watchable
+        WHILE it runs: every surface — desktop, iOS, TUI, over relay or direct
+        gateway alike — reads it back through the ordinary
+        ``cron.output`` / ``chat.inflight`` path, with no cron-specific
+        streaming transport to keep in sync.
+        """
+        run = cron.current_run(job.id) or {}
+        run_id = str(run.get("runId") or uuid.uuid4())
+        session_key = str(run.get("sessionKey") or f"cron:{job.id}")
+
+        # The job's prompt is the run's "user" turn — a watcher joining
+        # mid-run sees WHAT was asked, not just a reply materialising.
+        inflight.begin(session_key, run_id, job.payload.message or job.name)
+        try:
+            with cron_context():
+                return await _on_cron_job_inner(
+                    job, run_id=run_id, session_key=session_key
+                )
+        finally:
+            # Every exit — success, agent error, timeout, cancellation — must
+            # retire the entry, or a finished run keeps rendering as live.
+            inflight.finish(session_key, run_id)
+
+    async def _on_cron_job_inner(
+        job: CronJob, *, run_id: str, session_key: str
+    ) -> str | None:
         """Actual implementation, wrapped by cron_context() above so the
         executor's approval gate and any cron-aware downstream code can
         detect we're inside a scheduled run."""
+
+        async def _record_delta(delta: str) -> None:
+            """Accumulate streamed text for watchers of this run."""
+            inflight.append(session_key, run_id, delta)
+
+        async def _record_iteration(event: dict) -> None:
+            """Accumulate one tool turn so watchers get the live tool panel,
+            not just the text between tool calls."""
+            inflight.append_iteration(session_key, run_id, {**event, "runId": run_id})
 
         async def _notify_error(error_text: str) -> None:
             """Send an error notification to the user if deliver is configured."""
@@ -914,13 +951,16 @@ def gateway(
 
                     response = await agent.process_direct(
                         cron_prompt,
-                        session_key=f"cron:{job.id}",
+                        session_key=session_key,
                         model_override=model_override,
                         disabled_tools=CRON_DISABLED_TOOLS,
                         skip_memory=True,
                         skip_context_files=True,
                         origin_channel=origin_channel,
                         origin_chat_id=origin_chat_id,
+                        stream_callback=_record_delta,
+                        on_iteration=_record_iteration,
+                        run_id=run_id,
                     )
                 except Exception as e:
                     err = f"Agent execution failed: {e}"
@@ -1016,13 +1056,16 @@ def gateway(
             )
             response = await agent.process_direct(
                 _augment(prompt),
-                session_key=f"cron:{job.id}",
+                session_key=session_key,
                 model_override=model_override,
                 disabled_tools=CRON_DISABLED_TOOLS,
                 skip_memory=True,
                 skip_context_files=True,
                 origin_channel=fallback_origin_channel,
                 origin_chat_id=fallback_origin_chat_id,
+                stream_callback=_record_delta,
+                on_iteration=_record_iteration,
+                run_id=run_id,
             )
         except Exception as e:
             err = f"Agent execution failed: {e}"
@@ -1862,14 +1905,19 @@ Respond to the user now:"""
 
     agent.tool_callback = _on_tool_event
 
-    # Wire cron completion (cron.completed) → WS broadcast so desktop clients
-    # can raise a native OS notification when a scheduled job finishes. The
-    # cron service was created before the gateway server existed (it's needed
-    # by the agent), so the callback is attached here once both are live.
-    async def _on_cron_complete(event_name: str, data: dict) -> None:
+    # Wire cron lifecycle (cron.started / cron.completed) → WS broadcast so
+    # desktop clients can show a run as it happens and raise a native OS
+    # notification when it finishes. The cron service was created before the
+    # gateway server existed (it's needed by the agent), so the callbacks are
+    # attached here once both are live.
+    async def _on_cron_lifecycle(event_name: str, data: dict) -> None:
         await gateway_server.broadcast_cron_event(event_name, data)
 
-    cron.on_complete = _on_cron_complete
+    # Both ends of a run go out on the same broadcast: `cron.started` flips a
+    # Schedule screen to "running" the instant a job fires instead of making
+    # it wait out the next poll, and `cron.completed` retires it.
+    cron.on_run_start = _on_cron_lifecycle
+    cron.on_complete = _on_cron_lifecycle
 
     # Wire delegate tool to same subagent event callback (if multi-agent is active)
     delegate = agent.tools.get('delegate_to')
