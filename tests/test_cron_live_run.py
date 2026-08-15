@@ -399,7 +399,7 @@ class TestCronOutputRpc:
 
     async def test_unknown_job_is_empty_not_an_error(self, wired):
         res = feature_rpc.cron_output({"id": "no-such-job"})
-        assert res == {"outputs": [], "live": None}
+        assert res == {"outputs": [], "live": None, "artifacts": []}
 
 
 # ── cron.run RPC ────────────────────────────────────────────────────
@@ -490,6 +490,116 @@ class TestCronRunRpc:
         """The blocking form spans a whole agent turn — transports must not
         serve it on their receive loop."""
         assert "cron.run" in feature_rpc.LONG_RUNNING_METHODS
+
+
+# ── archived actions ────────────────────────────────────────────────
+
+
+class TestRunActions:
+    async def test_actions_land_in_the_archived_transcript(self, wired):
+        """A finished run records what it DID, not only what it concluded."""
+        job = wired.add_job("acting", EVERY_MINUTE, "go")
+
+        async def on_job(j):
+            wired.record_run_actions(j.id, ["web_search", "exec"])
+            return "all done"
+
+        wired.on_job = on_job
+        await wired.run_job(job.id)
+
+        content = feature_rpc.cron_output({"id": job.id})["outputs"][0]["content"]
+        assert "## Actions" in content
+        assert "- web_search" in content
+        assert "- exec" in content
+
+    async def test_a_run_with_no_tools_has_no_actions_section(self, wired):
+        job = wired.add_job("quiet", EVERY_MINUTE, "go")
+        wired.on_job = lambda _j: asyncio.sleep(0, result="just an answer")
+        await wired.run_job(job.id)
+
+        content = feature_rpc.cron_output({"id": job.id})["outputs"][0]["content"]
+        assert "## Actions" not in content
+
+    async def test_actions_do_not_leak_into_the_next_run(self, svc):
+        """Each run's record is its own; a late report can't attach to a
+        run that has already been retired."""
+        job = svc.add_job("sequential", EVERY_MINUTE, "go")
+        calls: list[int] = []
+
+        async def on_job(j):
+            calls.append(1)
+            if len(calls) == 1:
+                svc.record_run_actions(j.id, ["web_search"])
+            return "ok"
+
+        svc.on_job = on_job
+        await svc.run_job(job.id)
+        # Reported after the first run retired — must be dropped, not carried.
+        svc.record_run_actions(job.id, ["should_not_stick"])
+        await svc.run_job(job.id)
+
+        archives = sorted((svc.store_path.parent / "output" / job.id).glob("*.md"))
+        latest = archives[-1].read_text()
+        assert "should_not_stick" not in latest
+
+    async def test_a_failed_run_still_records_its_actions(self, wired):
+        job = wired.add_job("failing", EVERY_MINUTE, "go")
+
+        async def on_job(j):
+            wired.record_run_actions(j.id, ["exec"])
+            raise RuntimeError("tool blew up")
+
+        wired.on_job = on_job
+        await wired.run_job(job.id)
+
+        content = feature_rpc.cron_output({"id": job.id})["outputs"][0]["content"]
+        assert "- exec" in content
+        assert "(FAILED)" in content
+
+
+# ── artifacts produced by a job ─────────────────────────────────────
+
+
+class TestCronArtifacts:
+    async def test_artifacts_are_absent_when_none_were_produced(self, wired):
+        job = wired.add_job("no-files", EVERY_MINUTE, "go")
+        assert feature_rpc.cron_output({"id": job.id})["artifacts"] == []
+
+    async def test_artifacts_of_this_job_session_are_returned(self, wired, monkeypatch):
+        job = wired.add_job("writer", EVERY_MINUTE, "go")
+        seen: dict = {}
+
+        class _Store:
+            def list(self, *, session_key=None, limit=50, **_kw):
+                seen["sessionKey"] = session_key
+                return [
+                    {
+                        "id": "art-1",
+                        "type": "markdown",
+                        "title": "Weekly report",
+                        "session_key": session_key,
+                    }
+                ]
+
+        monkeypatch.setattr(feature_rpc, "_artifact_store", lambda: _Store())
+
+        artifacts = feature_rpc.cron_output({"id": job.id})["artifacts"]
+
+        assert seen["sessionKey"] == f"cron:{job.id}"
+        assert [a["id"] for a in artifacts] == ["art-1"]
+        assert artifacts[0]["title"] == "Weekly report"
+
+    async def test_a_broken_artifact_store_never_fails_the_call(self, wired, monkeypatch):
+        job = wired.add_job("resilient", EVERY_MINUTE, "go")
+
+        def _boom():
+            raise RuntimeError("store offline")
+
+        monkeypatch.setattr(feature_rpc, "_artifact_store", _boom)
+
+        res = feature_rpc.cron_output({"id": job.id})
+        assert res["artifacts"] == []
+        assert res["live"] is None
 
 
 # ── persistence is untouched by run tracking ────────────────────────

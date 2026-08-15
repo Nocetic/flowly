@@ -735,6 +735,11 @@ def gateway(
         executor's approval gate and any cron-aware downstream code can
         detect we're inside a scheduled run."""
 
+        # Tools this run has called, in order. Reported to the scheduler as
+        # they happen so the archived transcript records what the run DID,
+        # not only what it concluded.
+        run_actions: list[str] = []
+
         async def _record_delta(delta: str) -> None:
             """Accumulate streamed text for watchers of this run."""
             inflight.append(session_key, run_id, delta)
@@ -743,6 +748,17 @@ def gateway(
             """Accumulate one tool turn so watchers get the live tool panel,
             not just the text between tool calls."""
             inflight.append_iteration(session_key, run_id, {**event, "runId": run_id})
+
+            if event.get("role") != "assistant":
+                return
+            called = [
+                name
+                for call in (event.get("tool_calls") or [])
+                if (name := ((call or {}).get("function") or {}).get("name"))
+            ]
+            if called:
+                run_actions.extend(called)
+                cron.record_run_actions(job.id, run_actions)
 
         async def _notify_error(error_text: str) -> None:
             """Send an error notification to the user if deliver is configured."""

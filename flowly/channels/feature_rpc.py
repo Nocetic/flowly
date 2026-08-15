@@ -3768,7 +3768,37 @@ def cron_output(params: dict) -> dict:
             except OSError:
                 continue
 
-    return {"outputs": outputs, "live": _cron_live_run(svc, job_id)}
+    return {
+        "outputs": outputs,
+        "live": _cron_live_run(svc, job_id),
+        "artifacts": _cron_artifacts(job_id),
+    }
+
+
+def _cron_artifacts(job_id: str, limit: int = 20) -> list[dict]:
+    """Artifacts this job's runs produced, newest first.
+
+    A scheduled run's real deliverable is often a file rather than a reply —
+    a written report, a generated chart. Those are already tagged with the
+    run's session key, so the job's whole output history is one query away
+    and needs no cron-specific bookkeeping.
+
+    Never fatal: a bot with no artifact store still answers cron.output.
+    """
+    try:
+        from flowly.artifacts.context import is_internal_context_artifact
+        from flowly.artifacts.summary import artifact_summary
+
+        rows = _artifact_store().list(
+            session_key=f"cron:{job_id}", limit=max(limit * 5, 50)
+        )
+        visible = [a for a in rows if not is_internal_context_artifact(a)]
+        return [artifact_summary(a) for a in visible[:limit]]
+    except Exception as e:
+        from loguru import logger
+
+        logger.debug(f"cron.output: artifact lookup skipped: {e}")
+        return []
 
 
 def _cron_live_run(svc, job_id: str) -> dict | None:

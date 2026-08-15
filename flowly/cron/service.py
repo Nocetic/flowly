@@ -616,6 +616,7 @@ class CronService:
         run_start_ms: int,
         response: str | None = None,
         error: str | None = None,
+        actions: list[str] | None = None,
     ) -> Path | None:
         """Write a single-run transcript to the per-job archive directory.
 
@@ -644,6 +645,12 @@ class CronService:
         ]
         if job.payload.message:
             parts += ["## Prompt", "", job.payload.message, ""]
+        if actions:
+            # What the run DID, in call order — the half of a scheduled run
+            # that is otherwise lost the moment it finishes.
+            parts += ["## Actions", ""]
+            parts += [f"- {name}" for name in actions]
+            parts += [""]
         if response is not None:
             parts += ["## Response", "", response, ""]
         if error:
@@ -891,6 +898,7 @@ class CronService:
                 run_start_ms=start_ms,
                 response=response if error_text is None else None,
                 error=error_text,
+                actions=run.get("actions"),
             )
         except Exception as archive_err:
             logger.warning(
@@ -1004,6 +1012,22 @@ class CronService:
         """The in-flight run for one job, or None when it isn't executing."""
         run = self._active_runs.get(job_id)
         return dict(run) if run else None
+
+    def record_run_actions(self, job_id: str, actions: list[str]) -> None:
+        """Attach the tools a run has called, for its archived transcript.
+
+        The scheduler doesn't watch the agent — the ``on_job`` callback does,
+        and it reports back through here. Without this, a finished run's
+        transcript says what the agent CONCLUDED but not what it actually did,
+        which is exactly what you want to see when a scheduled job's answer
+        looks wrong.
+
+        A no-op once the run has been retired, so a late report can't attach
+        itself to the next one.
+        """
+        run = self._active_runs.get(job_id)
+        if run is not None:
+            run["actions"] = list(actions)
 
     def list_jobs(self, include_disabled: bool = False) -> list[CronJob]:
         """List all jobs."""
