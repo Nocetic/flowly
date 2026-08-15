@@ -1,6 +1,7 @@
 """CLI commands — gateway_cmd."""
 
 import asyncio
+import json
 import os
 import platform
 import signal
@@ -339,6 +340,55 @@ def gateway(
         # AWAY from these unless the task explicitly asks — that's softer
         # and more user-respecting than a blanket blacklist.
     ]
+
+    # Tools whose `path` argument names a file the run produced. Kept to the
+    # tools that take an explicit path so the recorded list is exact — a shell
+    # command's output redirection would only ever be a guess.
+    CRON_FILE_WRITING_TOOLS = {"write_file", "edit_file"}
+
+    # The argument worth showing next to a tool's name, most specific first.
+    # "web_search" alone says a run searched; "web_search — flowly pricing"
+    # says what it went looking for, which is the part worth reading later.
+    CRON_ACTION_DETAIL_KEYS = (
+        "query", "q", "search", "command", "cmd", "url", "path",
+        "to", "title", "task", "prompt", "text", "name",
+    )
+    CRON_ACTION_DETAIL_MAX = 120
+
+    def _tool_call_args(raw_arguments) -> dict | None:
+        """Decode a tool call's arguments, however the provider sent them.
+
+        Some hand over a JSON string, some a decoded mapping. Malformed JSON
+        is normal enough mid-stream that it isn't worth logging — the call
+        simply goes unsummarised.
+        """
+        args = raw_arguments
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (ValueError, TypeError):
+                return None
+        return args if isinstance(args, dict) else None
+
+    def _tool_call_path(args: dict | None) -> str | None:
+        """The file a write-style tool call targets."""
+        path = (args or {}).get("path")
+        return path.strip() if isinstance(path, str) and path.strip() else None
+
+    def _tool_call_detail(args: dict | None) -> str:
+        """A one-line summary of what a tool call was asked to do."""
+        for key in CRON_ACTION_DETAIL_KEYS:
+            value = (args or {}).get(key)
+            if not isinstance(value, str):
+                continue
+            text = " ".join(value.split())
+            if not text:
+                continue
+            if len(text) > CRON_ACTION_DETAIL_MAX:
+                text = text[: CRON_ACTION_DETAIL_MAX - 1].rstrip() + "…"
+            return text
+        return ""
+
     from flowly.heartbeat.service import HeartbeatService
     from flowly.gateway.server import GatewayServer
 
@@ -739,6 +789,10 @@ def gateway(
         # they happen so the archived transcript records what the run DID,
         # not only what it concluded.
         run_actions: list[str] = []
+        # Files the run wrote. A scheduled job's deliverable is often a file
+        # ("write the report to ~/Desktop") that leaves nothing in the reply,
+        # so the path is the only trace of what it produced.
+        run_files: list[str] = []
 
         async def _record_delta(delta: str) -> None:
             """Accumulate streamed text for watchers of this run."""
@@ -751,14 +805,32 @@ def gateway(
 
             if event.get("role") != "assistant":
                 return
-            called = [
-                name
-                for call in (event.get("tool_calls") or [])
-                if (name := ((call or {}).get("function") or {}).get("name"))
-            ]
+
+            called: list[str] = []
+            wrote: list[str] = []
+            for call in event.get("tool_calls") or []:
+                fn = (call or {}).get("function") or {}
+                name = fn.get("name")
+                if not name:
+                    continue
+
+                args = _tool_call_args(fn.get("arguments"))
+                detail = _tool_call_detail(args)
+                # `name — detail` is the archive's line format; the detail is
+                # what makes a past run's action list worth reading.
+                called.append(f"{name} — {detail}" if detail else str(name))
+
+                if name in CRON_FILE_WRITING_TOOLS:
+                    path = _tool_call_path(args)
+                    if path and path not in run_files and path not in wrote:
+                        wrote.append(path)
+
             if called:
                 run_actions.extend(called)
                 cron.record_run_actions(job.id, run_actions)
+            if wrote:
+                run_files.extend(wrote)
+                cron.record_run_files(job.id, run_files)
 
         async def _notify_error(error_text: str) -> None:
             """Send an error notification to the user if deliver is configured."""

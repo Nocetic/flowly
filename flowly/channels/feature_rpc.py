@@ -3822,6 +3822,9 @@ def _cron_live_run(svc, job_id: str) -> dict | None:
         "startedAtMs": run["startedAtMs"],
         "text": partial.get("text", "") if matched else "",
         "iterations": list(partial.get("iterations", [])) if matched else [],
+        # Files already written by this run — visible before it finishes, so a
+        # long job that produces its output early doesn't look empty.
+        "files": list(run.get("files") or []),
     }
 
 

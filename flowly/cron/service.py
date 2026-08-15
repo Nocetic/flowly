@@ -617,6 +617,7 @@ class CronService:
         response: str | None = None,
         error: str | None = None,
         actions: list[str] | None = None,
+        files: list[str] | None = None,
     ) -> Path | None:
         """Write a single-run transcript to the per-job archive directory.
 
@@ -650,6 +651,11 @@ class CronService:
             # that is otherwise lost the moment it finishes.
             parts += ["## Actions", ""]
             parts += [f"- {name}" for name in actions]
+            parts += [""]
+        if files:
+            # Where the run left its output, when that wasn't the reply.
+            parts += ["## Files", ""]
+            parts += [f"- {path}" for path in files]
             parts += [""]
         if response is not None:
             parts += ["## Response", "", response, ""]
@@ -899,6 +905,7 @@ class CronService:
                 response=response if error_text is None else None,
                 error=error_text,
                 actions=run.get("actions"),
+                files=run.get("files"),
             )
         except Exception as archive_err:
             logger.warning(
@@ -1028,6 +1035,18 @@ class CronService:
         run = self._active_runs.get(job_id)
         if run is not None:
             run["actions"] = list(actions)
+
+    def record_run_files(self, job_id: str, paths: list[str]) -> None:
+        """Attach the files a run wrote, for its archived transcript.
+
+        A scheduled job's deliverable is frequently a file on disk rather than
+        the reply — "write the report to ~/Desktop" leaves nothing in the
+        answer worth reading. Recorded the same way as actions, and a no-op
+        once the run is retired.
+        """
+        run = self._active_runs.get(job_id)
+        if run is not None:
+            run["files"] = list(paths)
 
     def list_jobs(self, include_disabled: bool = False) -> list[CronJob]:
         """List all jobs."""

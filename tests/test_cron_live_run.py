@@ -557,6 +557,59 @@ class TestRunActions:
         assert "(FAILED)" in content
 
 
+# ── files a run wrote ───────────────────────────────────────────────
+
+
+class TestRunFiles:
+    async def test_written_files_land_in_the_transcript(self, wired):
+        """A job whose deliverable is a file leaves a trace of where."""
+        job = wired.add_job("writer", EVERY_MINUTE, "write a report")
+
+        async def on_job(j):
+            wired.record_run_files(j.id, ["~/Desktop/text.md"])
+            return "Masaüstünde `text.md` dosyası oluşturuldu."
+
+        wired.on_job = on_job
+        await wired.run_job(job.id)
+
+        content = feature_rpc.cron_output({"id": job.id})["outputs"][0]["content"]
+        assert "## Files" in content
+        assert "- ~/Desktop/text.md" in content
+
+    async def test_a_run_that_wrote_nothing_has_no_files_section(self, wired):
+        job = wired.add_job("talker", EVERY_MINUTE, "just answer")
+        wired.on_job = lambda _j: asyncio.sleep(0, result="an answer")
+        await wired.run_job(job.id)
+
+        content = feature_rpc.cron_output({"id": job.id})["outputs"][0]["content"]
+        assert "## Files" not in content
+
+    async def test_files_are_visible_before_the_run_finishes(self, wired):
+        job = wired.add_job("early", EVERY_MINUTE, "write then think")
+        seen: dict = {}
+
+        async def on_job(j):
+            wired.record_run_files(j.id, ["/tmp/out.md"])
+            seen["live"] = feature_rpc.cron_output({"id": j.id})["live"]
+            return "ok"
+
+        wired.on_job = on_job
+        await wired.run_job(job.id)
+
+        assert seen["live"]["files"] == ["/tmp/out.md"]
+
+    async def test_files_do_not_leak_into_the_next_run(self, svc):
+        job = svc.add_job("sequential", EVERY_MINUTE, "go")
+        svc.on_job = lambda _j: asyncio.sleep(0, result="ok")
+
+        await svc.run_job(job.id)
+        svc.record_run_files(job.id, ["/tmp/stale.md"])
+        await svc.run_job(job.id)
+
+        latest = sorted((svc.store_path.parent / "output" / job.id).glob("*.md"))[-1]
+        assert "stale.md" not in latest.read_text()
+
+
 # ── artifacts produced by a job ─────────────────────────────────────
 
 
