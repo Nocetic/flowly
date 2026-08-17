@@ -54,8 +54,10 @@ dependencies = [
     "keyring>=24.0.0",
     # Core, API-key-free multilingual tool routing. Model weights are pinned
     # separately and prepared in the background; conversation memory does not
-    # use this runtime.
-    "fastembed==0.8.0",
+    # use this runtime. Excluded on Intel macOS: onnxruntime stopped shipping
+    # x86_64 wheels there, and the runtime is optional by design
+    # (semantic_runtime_available() gates every use).
+    "fastembed==0.8.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 
 [project.optional-dependencies]

@@ -1,11 +1,15 @@
 # Keep the optional semantic-routing runtime usable inside the standalone
 # Desktop/CLI artifact. The model weights are never bundled; Nuitka otherwise
 # may omit these lazy imports and FastEmbed's required distribution metadata.
-# nuitka-project: --include-package=fastembed
-# nuitka-project: --include-package=huggingface_hub
-# nuitka-project: --include-package=onnxruntime
-# nuitka-project: --include-package=tokenizers
-# nuitka-project: --include-distribution-metadata=fastembed
+# Guarded by an env var so builds on platforms where the optional runtime
+# cannot be installed (Intel macOS: onnxruntime ships no x86_64 wheels) can
+# opt out — semantic_runtime_available() already tolerates the absence.
+# nuitka-project-if: os.getenv("FLOWLY_NUITKA_NO_SEMANTIC", "0") != "1":
+#    nuitka-project: --include-package=fastembed
+#    nuitka-project: --include-package=huggingface_hub
+#    nuitka-project: --include-package=onnxruntime
+#    nuitka-project: --include-package=tokenizers
+#    nuitka-project: --include-distribution-metadata=fastembed
 
 """CLI entry point — extracts --profile BEFORE any Flowly module import.
 
