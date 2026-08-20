@@ -472,6 +472,10 @@ class GatewayServer:
         self._delegate_tool: Any | None = None
         self._subagent_manager: Any | None = None
         self._coaching_manager: Any | None = None
+        # Explicit ``params.sessionId`` sessions still belong to the WS client
+        # that started them. Track ownership so disconnect cleanup remains as
+        # reliable as the legacy per-client derived id path.
+        self._coaching_sessions_by_client: dict[str, set[str]] = {}
         self.artifact_store = artifact_store
         self.board_store = board_store
         self.board_orchestrator = board_orchestrator
@@ -1219,18 +1223,12 @@ class GatewayServer:
             elif is_current_connection:
                 logger.info(f"[WS] Desktop client disconnected: {client_id}")
 
-            # Auto-stop any coaching session owned by this WS so background
-            # finalization still runs (summary, KG, artifact).
-            if self._coaching_manager:
-                coaching_sid = f"coaching:{client_id}"
-                if self._coaching_manager.is_active(coaching_sid):
-                    try:
-                        await self._coaching_manager.stop(coaching_sid, background_finalize=True)
-                        logger.info(
-                            f"[WS] auto-stopped coaching session {coaching_sid} on disconnect"
-                        )
-                    except Exception as e:
-                        logger.warning(f"[WS] coaching auto-stop failed: {e}")
+            # Auto-stop only when this was still the current socket. A stable
+            # client id may already have reattached on a replacement WS; stale
+            # cleanup must not tear down the live connection's Coach session.
+            # A real disconnect still finalizes normally.
+            if is_current_connection:
+                await self._stop_client_coaching_sessions(client_id)
 
         return ws
 
@@ -1886,6 +1884,36 @@ class GatewayServer:
             return override
         return f"coaching:{client_id}"
 
+    def _track_coaching_session(self, client_id: str, session_id: str) -> None:
+        self._coaching_sessions_by_client.setdefault(client_id, set()).add(session_id)
+
+    def _untrack_coaching_session(self, client_id: str, session_id: str) -> None:
+        owned = self._coaching_sessions_by_client.get(client_id)
+        if not owned:
+            return
+        owned.discard(session_id)
+        if not owned:
+            self._coaching_sessions_by_client.pop(client_id, None)
+
+    async def _stop_client_coaching_sessions(self, client_id: str) -> None:
+        if not self._coaching_manager:
+            self._coaching_sessions_by_client.pop(client_id, None)
+            return
+        owned = self._coaching_sessions_by_client.pop(client_id, set())
+        # Backward compatibility for a session started before ownership
+        # tracking existed or by an older caller using the derived id.
+        owned.add(f"coaching:{client_id}")
+        for session_id in owned:
+            if not self._coaching_manager.is_active(session_id):
+                continue
+            try:
+                await self._coaching_manager.stop(session_id, background_finalize=True)
+                logger.info(
+                    f"[WS] auto-stopped coaching session {session_id} on disconnect"
+                )
+            except Exception as e:
+                logger.warning(f"[WS] coaching auto-stop failed for {session_id}: {e}")
+
     async def _ws_rpc_coaching_start(
         self, ws: web.WebSocketResponse, client_id: str, rpc_id: str, params: dict
     ) -> None:
@@ -1914,6 +1942,7 @@ class GatewayServer:
                 f"Max {result.get('limit')} concurrent coaching sessions",
             )
             return
+        self._track_coaching_session(client_id, session_id)
 
         import time as _time
 
@@ -2089,6 +2118,7 @@ class GatewayServer:
             return
         session_id = self._coaching_session_id(client_id, params)
         result = await self._coaching_manager.stop(session_id)
+        self._untrack_coaching_session(client_id, session_id)
         result["sessionId"] = session_id
         await self._ws_rpc_reply(ws, rpc_id, result)
 

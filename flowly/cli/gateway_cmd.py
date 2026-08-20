@@ -24,6 +24,27 @@ console = Console()
 _GATEWAY_FILE_SINK_ID: int | None = None
 
 
+def _reload_coaching_runtime(
+    gateway_server,
+    provider,
+    model: str,
+) -> bool:
+    """Move Meeting Coach to the same provider/model generation as chat.
+
+    Returns whether a manager was wired. Reconfiguration errors intentionally
+    propagate so the outer provider reload cannot report a partial success.
+    """
+    coaching_manager = getattr(gateway_server, "_coaching_manager", None)
+    if coaching_manager is None:
+        return False
+    coaching_manager.reconfigure_llm(
+        provider,
+        gate_model=model,
+        summary_model=model,
+    )
+    return True
+
+
 def _schedule_cron_push_notification(
     job, response: str | None, *, conversation_id: str = ""
 ) -> None:
@@ -1536,6 +1557,19 @@ Respond to the user now:"""
                 "ok": False,
                 "error": f"provider build failed: {type(exc).__name__}: {exc}",
             }
+        # Meeting Coach owns an independent provider/model runtime. Apply the
+        # same generation before advertising a successful hot reload; session
+        # stop/start only replaces session data and cannot refresh the manager.
+        try:
+            _reload_coaching_runtime(gateway_server, new_provider, new_model)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": (
+                    "coaching runtime reload failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
         # Hot-swap BOTH the provider client AND the agent's selected
         # model. Previously we only swapped the provider, which left
         # ``agent.model`` pointing at the boot-time string — every chat
@@ -2042,6 +2076,8 @@ Respond to the user now:"""
 
         coaching_mgr = CoachingManager(
             llm_provider=agent.provider,
+            gate_model=agent.model,
+            summary_model=agent.model,
             knowledge_graph=coaching_kg,
             memory_path=memory_path,
             artifact_store=getattr(agent, "_artifact_store", None) or gateway_server.artifact_store,

@@ -1396,6 +1396,22 @@ def set_provider_reload_callback(cb) -> None:
     _provider_reload_cb = cb
 
 
+async def _live_provider_reload_succeeded() -> bool:
+    """Apply the registered reload and validate its explicit result contract.
+
+    The gateway reports build/config failures as ``{"ok": False}`` instead of
+    raising. Treating any awaited callback as success falsely advertised a live
+    provider switch while runtime consumers still held the old provider.
+    """
+    if _provider_reload_cb is None:
+        return False
+    try:
+        result = await _provider_reload_cb()
+    except Exception:
+        return False
+    return isinstance(result, dict) and result.get("ok") is True
+
+
 # Coroutine the host registers so a tools.codex_session change (approval policy
 # / sandbox) can be applied LIVE — re-reading config, dropping the warm Codex
 # subprocesses that captured the old policy at spawn, and re-registering the
@@ -1617,13 +1633,8 @@ async def model_set(params: dict) -> dict:
     cfg = load_config()
     cfg.agents.defaults.model = model
     save_config(cfg)
-    if _provider_reload_cb is not None:
-        try:
-            await _provider_reload_cb()
-            return {"ok": True, "model": model, "willRestart": False}
-        except Exception:
-            # Live reload failed — fall back to a restart so the change still lands.
-            pass
+    if await _live_provider_reload_succeeded():
+        return {"ok": True, "model": model, "willRestart": False}
     return {"ok": True, "model": model, "willRestart": True}
 
 
@@ -1894,12 +1905,8 @@ async def provider_set(params: dict) -> dict:
     from flowly.integrations import model_catalog
 
     model_catalog.flush_cache()
-    if _provider_reload_cb is not None:
-        try:
-            await _provider_reload_cb()
-            return {"ok": True, "key": key, "model": model_changed, "willRestart": False}
-        except Exception:
-            pass
+    if await _live_provider_reload_succeeded():
+        return {"ok": True, "key": key, "model": model_changed, "willRestart": False}
     return {"ok": True, "key": key, "model": model_changed, "willRestart": True}
 
 
@@ -1931,12 +1938,8 @@ async def provider_set_key(params: dict) -> dict:
 
         model_catalog.flush_cache()
         has_key = zai_coding.resolve_runtime_credentials(config=load_config()) is not None
-        if _provider_reload_cb is not None:
-            try:
-                await _provider_reload_cb()
-                return {"ok": True, "key": key, "hasKey": has_key, "willRestart": False}
-            except Exception:
-                pass
+        if await _live_provider_reload_succeeded():
+            return {"ok": True, "key": key, "hasKey": has_key, "willRestart": False}
         return {"ok": True, "key": key, "hasKey": has_key, "willRestart": True}
     from flowly.config.loader import load_config, save_config
 
@@ -1949,12 +1952,8 @@ async def provider_set_key(params: dict) -> dict:
     from flowly.integrations import model_catalog
 
     model_catalog.flush_cache()
-    if _provider_reload_cb is not None:
-        try:
-            await _provider_reload_cb()
-            return {"ok": True, "key": key, "hasKey": bool(value), "willRestart": False}
-        except Exception:
-            pass
+    if await _live_provider_reload_succeeded():
+        return {"ok": True, "key": key, "hasKey": bool(value), "willRestart": False}
     return {"ok": True, "key": key, "hasKey": bool(value), "willRestart": True}
 
 
@@ -1986,12 +1985,8 @@ async def provider_set_flowly_account(params: dict) -> dict:
 
     model_catalog.flush_cache()
     has = bool(account_key or (server_id and auth_token))
-    if _provider_reload_cb is not None:
-        try:
-            await _provider_reload_cb()
-            return {"ok": True, "hasCredential": has, "willRestart": False}
-        except Exception:
-            pass
+    if await _live_provider_reload_succeeded():
+        return {"ok": True, "hasCredential": has, "willRestart": False}
     return {"ok": True, "hasCredential": has, "willRestart": True}
 
 

@@ -187,6 +187,66 @@ class TestSessionLifecycle:
         assert manager.session_info("s1")["frequency"] == "moderate"
 
 
+class TestLLMRuntimeReload:
+    def test_reconfigure_swaps_provider_and_models(self):
+        old = _FakeLLM([])
+        new = _FakeLLM([])
+        mgr = CoachingManager(
+            llm_provider=old,
+            gate_model="old-model",
+            summary_model="old-summary",
+        )
+
+        mgr.reconfigure_llm(
+            new,
+            gate_model="new-model",
+            summary_model="new-summary",
+        )
+
+        assert mgr.llm is new
+        assert mgr.gate_model == "new-model"
+        assert mgr.summary_model == "new-summary"
+
+    @pytest.mark.asyncio
+    async def test_inflight_gate_keeps_one_runtime_snapshot(self, monkeypatch):
+        old = _FakeLLM([])
+        new = _FakeLLM([])
+        mgr = CoachingManager(
+            llm_provider=old,
+            gate_model="old-model",
+            summary_model="old-model",
+        )
+        seen: list[tuple[object, str]] = []
+
+        async def _fake_relevance(provider, model, *_args, **_kwargs):
+            seen.append((provider, model))
+            mgr.reconfigure_llm(
+                new,
+                gate_model="new-model",
+                summary_model="new-model",
+            )
+            return True, 0.9, "ok"
+
+        async def _fake_generate(provider, model, *_args, **_kwargs):
+            seen.append((provider, model))
+            return "Use the old runtime for this in-flight evaluation"
+
+        monkeypatch.setattr(gate_pipeline, "relevance_gate", _fake_relevance)
+        monkeypatch.setattr(gate_pipeline, "generate_tip", _fake_generate)
+
+        await mgr.start("s1", frequency="proactive")
+        mgr._sessions["s1"].last_tip_at = 0
+        for i in range(MIN_NEW_SEGMENTS_FOR_EVAL):
+            await mgr.add_transcript(
+                "s1",
+                f"unique line number {i} with enough words to pass evaluation",
+            )
+
+        assert seen == [(old, "old-model"), (old, "old-model")]
+        assert mgr.llm is new
+        assert mgr.gate_model == "new-model"
+
+
 # ── CoachingManager — segment ingestion ───────────────────────────────────────
 
 
@@ -317,6 +377,59 @@ class TestGatePipeline:
         assert mgr.session_info("s1")["metrics"]["gate_evaluations"] == 1
 
     @pytest.mark.asyncio
+    async def test_gate2_provider_failure_is_reported_to_diagnostics(self, monkeypatch):
+        async def _fake_relevance(*_args, **_kwargs):
+            return True, 0.9, "ok"
+
+        async def _failed_generate(*_args, **_kwargs):
+            raise gate_pipeline.CoachingProviderError("provider unavailable")
+
+        monkeypatch.setattr(gate_pipeline, "relevance_gate", _fake_relevance)
+        monkeypatch.setattr(gate_pipeline, "generate_tip", _failed_generate)
+
+        mgr = CoachingManager(llm_provider=_FakeLLM([]))
+        await mgr.start("s1", frequency="proactive")
+        mgr._sessions["s1"].last_tip_at = 0
+        decisions: list[dict] = []
+
+        async def _decision(_session_id: str, **payload):
+            decisions.append(payload)
+
+        mgr.on_gate_decision("s1", _decision)
+        result = None
+        for i in range(MIN_NEW_SEGMENTS_FOR_EVAL):
+            result = await mgr.add_transcript(
+                "s1",
+                f"line number {i} with enough words to pass the evaluation guard",
+            )
+
+        assert result is not None and result["type"] == "ack"
+        assert any(
+            d["stage"] == "gate2"
+            and d["passed"] is False
+            and d["reason"] == "provider_error"
+            for d in decisions
+        )
+
+    @pytest.mark.asyncio
+    async def test_generate_tip_rejects_error_shaped_provider_response(self):
+        class _ErrorLLM:
+            async def chat(self, **_kwargs):
+                return _FakeResponse(
+                    content="Error calling LLM: rate limited",
+                    finish_reason="error",
+                )
+
+        with pytest.raises(gate_pipeline.CoachingProviderError):
+            await gate_pipeline.generate_tip(
+                _ErrorLLM(),
+                "model",
+                "conversation",
+                "context",
+                "knowledge",
+            )
+
+    @pytest.mark.asyncio
     async def test_rate_limit(self, monkeypatch):
         """A tip within RATE_LIMIT_SECONDS must be blocked."""
 
@@ -418,3 +531,39 @@ class TestCallbacks:
         r = await mgr.add_transcript("s1", "hello")
         assert r["type"] == "ack"
         assert mgr.session_info("s1")["metrics"]["callback_failures"] == 1
+
+
+class TestFinalizationSafety:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("content", "finish_reason"),
+        [
+            ("Error calling LLM: rate limited", "error"),
+            ("Error calling LLM: provider unavailable", "stop"),
+        ],
+    )
+    async def test_provider_error_is_not_persisted_as_summary(
+        self,
+        tmp_path,
+        content: str,
+        finish_reason: str,
+    ):
+        class _ErrorLLM:
+            async def chat(self, **_kwargs):
+                return _FakeResponse(content=content, finish_reason=finish_reason)
+
+        memory_path = tmp_path / "memory" / "MEMORY.md"
+        mgr = CoachingManager(
+            llm_provider=_ErrorLLM(),
+            gate_model="model",
+            summary_model="model",
+            memory_path=memory_path,
+        )
+        await mgr.start("s1")
+        await mgr.add_transcript("s1", "A sufficiently long meeting transcript segment")
+
+        result = await mgr.stop("s1", background_finalize=False)
+
+        assert result["summary"] == ""
+        assert result["memory_updated"] is False
+        assert not memory_path.exists()
