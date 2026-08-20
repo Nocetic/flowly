@@ -87,6 +87,20 @@ class RestartResult:
     paused_seconds: float = 0.0  # how long we waited for the gateway to come back up
 
 
+def gateway_is_listening(
+    host: str = "127.0.0.1",
+    port: int = 18790,
+    *,
+    timeout: float = 0.25,
+) -> bool:
+    """Return whether a local gateway process is accepting connections."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 async def restart_gateway(
     label: str = DEFAULT_LABEL,
     *,

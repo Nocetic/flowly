@@ -2878,33 +2878,51 @@ class FlowlyTUI(App[None]):
         )
 
     async def action_logout(self) -> None:
+        from flowly.account.account_key import clear_account_key
         from flowly.account.auth import clear_account, load_account_sync
         from flowly.account.relay_config import clear_relay_credentials
         transcript = self.query_one(TranscriptPane)
         existing = load_account_sync()
-        if not existing:
-            transcript.add_system("not signed in")
-            return
-        clear_account()
+        key_clear = await asyncio.to_thread(
+            clear_account_key,
+            existing,
+            revoke=existing is not None,
+        )
+        if existing is not None:
+            clear_account()
         # Disable the gateway's web channel too — otherwise it would keep
         # trying to authenticate to the relay with revoked credentials and
         # iOS would still appear "paired" from the server side.
-        clear_relay_credentials()
+        relay_cleared = clear_relay_credentials()
         # If Flowly was the explicit default LLM provider, clear that
         # pointer so the gateway falls back to the BYOK cascade instead
         # of refusing to boot on missing credentials.
+        provider_cleared = False
         try:
             from flowly.integrations.active_provider import clear_active_if_matches
-            clear_active_if_matches("flowly")
+            provider_cleared = clear_active_if_matches("flowly")
         except Exception:
             pass
+        if (
+            existing is None
+            and not key_clear.changed
+            and not relay_cleared
+            and not provider_cleared
+        ):
+            transcript.add_system("not signed in")
+            return
         self._account = None
         if getattr(self, "_account_refresh_task", None):
             self._account_refresh_task.cancel()
             self._account_refresh_task = None
         self._refresh_active_provider_status()
+        identity = (
+            existing.email or existing.user_id
+            if existing
+            else "local credentials"
+        )
         transcript.add_system(
-            f"✓ signed out [dim]({existing.email or existing.user_id})[/dim] · "
+            f"✓ signed out [dim]({identity})[/dim] · "
             f"iOS pairing disabled [dim](restart gateway to apply)[/dim]"
         )
 

@@ -1978,21 +1978,182 @@ async def provider_set_flowly_account(params: dict) -> dict:
     from flowly.config.loader import load_config, save_config
 
     cfg = load_config()
-    cfg.providers.flowly.account_key = account_key
-    cfg.providers.flowly.server_id = server_id
-    cfg.providers.flowly.auth_token = auth_token
+    flowly = cfg.providers.flowly
+    previous = (
+        (flowly.account_key or "").strip(),
+        (getattr(flowly, "account_key_owner_uid", "") or "").strip(),
+        (getattr(flowly, "account_key_id", "") or "").strip(),
+        (getattr(flowly, "account_key_origin", "") or "").strip(),
+        (flowly.server_id or "").strip(),
+        (flowly.auth_token or "").strip(),
+    )
+    incoming_key_changed = previous[0] != account_key
+    flowly.account_key = account_key
+    # Legacy Desktop clients send no ownership tuple. Preserve metadata only
+    # when they idempotently re-send the exact same bearer; a different/empty
+    # bearer must never inherit the previous key's owner.
+    if incoming_key_changed or not account_key:
+        flowly.account_key_owner_uid = ""
+        flowly.account_key_id = ""
+        flowly.account_key_origin = ""
+    flowly.server_id = server_id
+    flowly.auth_token = auth_token
+    current = (
+        (flowly.account_key or "").strip(),
+        (getattr(flowly, "account_key_owner_uid", "") or "").strip(),
+        (getattr(flowly, "account_key_id", "") or "").strip(),
+        (getattr(flowly, "account_key_origin", "") or "").strip(),
+        (flowly.server_id or "").strip(),
+        (flowly.auth_token or "").strip(),
+    )
+    changed = current != previous
+    if changed:
+        save_config(cfg)
+    from flowly.integrations import model_catalog
+
+    if changed:
+        model_catalog.flush_cache()
+    has = bool(account_key or (server_id and auth_token))
+    if not changed:
+        return {
+            "ok": True,
+            "changed": False,
+            "hasCredential": has,
+            "willRestart": False,
+        }
+    if _provider_reload_cb is not None:
+        try:
+            await _provider_reload_cb()
+            return {
+                "ok": True,
+                "changed": True,
+                "hasCredential": has,
+                "willRestart": False,
+            }
+        except Exception:
+            pass
+    return {
+        "ok": True,
+        "changed": True,
+        "hasCredential": has,
+        "willRestart": True,
+    }
+
+
+async def provider_bind_flowly_account(params: dict) -> dict:
+    """Atomically install/remove a Desktop-managed Flowly account credential.
+
+    ``expectedAccountKeyId`` is a compare-and-set guard. An empty expectation
+    means "only if no Flowly credential exists"; a non-empty expectation means
+    "only if this exact managed key is still installed". A stale Desktop can
+    therefore never overwrite or remove a credential installed later by CLI or
+    another account. No secret or current key id is returned.
+    """
+    action = params.get("action")
+    expected_present = "expectedAccountKeyId" in params
+    expected_key_id = params.get("expectedAccountKeyId")
+    if action not in {"install", "remove"}:
+        raise FeatureRpcError("INVALID", "action must be 'install' or 'remove'")
+    if not expected_present or not isinstance(expected_key_id, str):
+        raise FeatureRpcError("INVALID", "expectedAccountKeyId must be a string")
+    expected_key_id = expected_key_id.strip()
+    if len(expected_key_id) > 128:
+        raise FeatureRpcError("INVALID", "expectedAccountKeyId is too long")
+    if action == "install" and expected_key_id:
+        raise FeatureRpcError(
+            "INVALID", "install requires an observed-empty Flowly credential slot"
+        )
+    if action == "remove" and not expected_key_id:
+        raise FeatureRpcError(
+            "INVALID", "remove requires the managed account key id"
+        )
+
+    from flowly.config.loader import load_config, save_config
+
+    cfg = load_config()
+    flowly = cfg.providers.flowly
+    current_key = (flowly.account_key or "").strip()
+    current_key_id = (
+        (getattr(flowly, "account_key_id", "") or "").strip()
+        if current_key
+        else ""
+    )
+    current_server_id = (flowly.server_id or "").strip()
+    current_auth_token = (flowly.auth_token or "").strip()
+    has_current = bool(
+        current_key or (current_server_id and current_auth_token)
+    )
+    expectation_matches = (
+        not has_current
+        if not expected_key_id
+        else bool(current_key_id and current_key_id == expected_key_id)
+    )
+    if not expectation_matches:
+        return {
+            "ok": True,
+            "changed": False,
+            "conflict": True,
+            "hasCredential": has_current,
+            "willRestart": False,
+        }
+
+    if action == "install":
+        account_key = params.get("accountKey")
+        account_key_id = params.get("accountKeyId")
+        account_owner_uid = params.get("accountOwnerUid")
+        if not all(
+            isinstance(value, str)
+            for value in (account_key, account_key_id, account_owner_uid)
+        ):
+            raise FeatureRpcError(
+                "INVALID", "accountKey, accountKeyId and accountOwnerUid must be strings"
+            )
+        account_key = account_key.strip()
+        account_key_id = account_key_id.strip()
+        account_owner_uid = account_owner_uid.strip()
+        if not account_key.startswith("flw_") or len(account_key) > 256:
+            raise FeatureRpcError("INVALID", "accountKey is invalid")
+        if not account_key_id or len(account_key_id) > 128:
+            raise FeatureRpcError("INVALID", "accountKeyId is invalid")
+        if not account_owner_uid or len(account_owner_uid) > 256:
+            raise FeatureRpcError("INVALID", "accountOwnerUid is invalid")
+
+        flowly.account_key = account_key
+        flowly.account_key_owner_uid = account_owner_uid
+        flowly.account_key_id = account_key_id
+        flowly.account_key_origin = "desktop"
+        flowly.server_id = ""
+        flowly.auth_token = ""
+        flowly.enabled = True
+    else:
+        flowly.account_key = ""
+        flowly.account_key_owner_uid = ""
+        flowly.account_key_id = ""
+        flowly.account_key_origin = ""
+        flowly.server_id = ""
+        flowly.auth_token = ""
+        flowly.enabled = False
+        if (cfg.providers.active or "").strip() == "flowly":
+            cfg.providers.active = ""
+
     save_config(cfg)
     from flowly.integrations import model_catalog
 
     model_catalog.flush_cache()
-    has = bool(account_key or (server_id and auth_token))
+    has = action == "install"
+    result = {
+        "ok": True,
+        "changed": True,
+        "conflict": False,
+        "hasCredential": has,
+    }
     if _provider_reload_cb is not None:
         try:
             await _provider_reload_cb()
-            return {"ok": True, "hasCredential": has, "willRestart": False}
+            return {**result, "willRestart": False}
         except Exception:
             pass
-    return {"ok": True, "hasCredential": has, "willRestart": True}
+    return {**result, "willRestart": True}
 
 
 # ── Artifacts ────────────────────────────────────────────────────────────────
@@ -4122,6 +4283,7 @@ _DISPATCH: dict[str, tuple] = {
     "provider.set": (provider_set, True, True),
     "provider.set_key": (provider_set_key, True, True),
     "provider.set_flowly_account": (provider_set_flowly_account, True, True),
+    "provider.bind_flowly_account": (provider_bind_flowly_account, True, True),
     "logs.tail": (logs_tail, True, False),
     "media.library.list": (media_library_list, True, False),
     "media.library.get": (media_library_get, True, False),

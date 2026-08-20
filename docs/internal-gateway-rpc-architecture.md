@@ -332,7 +332,7 @@ extension answers with a top-level `{type:"tool_result", id, result}` frame
 | `persona.list` | — → `{personas:[…], active}` | |
 | `provider.active` | — → `{provider:{key,source,apiBase}, model}` | |
 | `provider.list` | — → `{providers:[{key,name,keyable,hasKey,isActive}], active, resolved}` | |
-| `provider.set` / `set_key` / `set_flowly_account` | `{…}` → `{ok, …, willRestart}` | ✓ |
+| `provider.set` / `set_key` / `set_flowly_account` / `bind_flowly_account` | `{…}` → `{ok, …, willRestart}` | ✓ |
 | `model.list` | `{forceRefresh?}` → `{provider, models:[{id,name,contextWindow,tags}]}` | |
 | `model.set` | `{model}` → `{ok, model, willRestart}` | ✓ |
 | `skills.list` | — → `{skills:[{slug,name,description,category,source,installed}]}` | |
