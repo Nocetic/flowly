@@ -69,18 +69,26 @@ def audit_dir() -> Path:
 
 
 def state_db(filename: str) -> Path:
-    """Resolve a state sqlite file, probing the known locations (newest layout
-    first). Returns the first existing candidate, else the canonical path."""
+    """Resolve a state sqlite file against the gateway's canonical state dir.
+
+    The live agent and the CLI both write profile state directly under
+    ``get_flowly_home()``.  Older builds may have left databases under the
+    workspace, so retain those as read-compatible fallbacks — but never let a
+    stray/empty legacy database shadow the canonical store when both exist.
+    """
     home = get_flowly_home()
+    canonical = home / filename
+    if canonical.exists():
+        return canonical
+
     candidates = [
         home / "workspace" / ".flowly_state" / filename,
-        home / filename,
         home / "workspace" / filename,
     ]
     for c in candidates:
         if c.exists():
             return c
-    return candidates[0]
+    return canonical
 
 
 # ── Connections (integration cards: channels / tools / voice / media) ───────
