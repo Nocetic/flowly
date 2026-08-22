@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -53,8 +54,16 @@ def test_nuitka_entry_preserves_lazy_runtime_and_fastembed_metadata() -> None:
     source = entry.read_text(encoding="utf-8")
 
     for package in ("fastembed", "huggingface_hub", "onnxruntime", "tokenizers"):
-        assert f"# nuitka-project: --include-package={package}" in source
-    assert "# nuitka-project: --include-distribution-metadata=fastembed" in source
+        assert re.search(
+            rf"^#\s+nuitka-project:\s+--include-package={re.escape(package)}$",
+            source,
+            re.MULTILINE,
+        )
+    assert re.search(
+        r"^#\s+nuitka-project:\s+--include-distribution-metadata=fastembed$",
+        source,
+        re.MULTILINE,
+    )
 
 
 def test_enabled_preference_with_missing_model_is_repairable(monkeypatch) -> None:
