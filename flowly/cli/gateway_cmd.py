@@ -283,6 +283,12 @@ def gateway(
     remote: bool = typer.Option(False, "--remote", help="Accept connections from your phone / other devices — plain-language alias for --host 0.0.0.0 (a token is ensured automatically)."),
     token: str = typer.Option("", "--token", help="Set an explicit remote-access token (persisted). Otherwise one is auto-generated on first non-loopback bind."),
     rotate_token: bool = typer.Option(False, "--rotate-token", help="Generate a fresh remote-access token before starting (invalidates the old one), print it, and persist it."),
+    local_runtime: bool = typer.Option(
+        False,
+        "--local-runtime",
+        hidden=True,
+        help="Run a Desktop-managed, loopback-only profile backend.",
+    ),
 ):
     """Start the flowly gateway."""
     # Windows: make stdout/stderr encode the Unicode glyphs we print (✓, →, the
@@ -434,12 +440,12 @@ def gateway(
     # configured port drifted from the default, an externally-started
     # `flowly gateway` became invisible to the desktop dashboard even though
     # it was perfectly healthy. One source of truth ends that split.
-    port = resolve_gateway_port(port, config)
+    port = port if local_runtime else resolve_gateway_port(port, config)
 
     # If the installed background service holds this port, offer to take it
     # over for this session (and restore it on exit). This is the entire
     # "develop from a checkout" story: no separate script, no second config.
-    service_taken_over = take_over_port(port)
+    service_taken_over = False if local_runtime else take_over_port(port)
 
     console.print(f"Starting gateway on port {port}...")
 
@@ -453,7 +459,9 @@ def gateway(
 
     # --remote is the friendly alias for --host 0.0.0.0; an explicit --host
     # still wins, otherwise fall back to the configured bind address.
-    if host.strip():
+    if local_runtime:
+        effective_host = "127.0.0.1"
+    elif host.strip():
         effective_host = host.strip()
     elif remote:
         effective_host = "0.0.0.0"
@@ -463,7 +471,9 @@ def gateway(
     remote_exposed = not is_loopback_host(effective_host)
 
     _token_changed = False
-    if token.strip():
+    if local_runtime:
+        auth_token = token.strip() or generate_gateway_token()
+    elif token.strip():
         auth_token = token.strip()
         _token_changed = True
     elif rotate_token:
@@ -473,7 +483,7 @@ def gateway(
         auth_token = generate_gateway_token()
         _token_changed = True
 
-    if _token_changed or (host.strip() and config.gateway.host != effective_host):
+    if not local_runtime and (_token_changed or (host.strip() and config.gateway.host != effective_host)):
         config.gateway.token = auth_token
         if host.strip():
             config.gateway.host = effective_host
@@ -1342,6 +1352,19 @@ def gateway(
         deliver=hb_cfg.deliver,
     )
 
+    # A managed profile backend is a local RPC process, never a second copy of
+    # the account's messaging gateway. Disable every channel in memory even if
+    # an older or hand-edited profile config still contains transport secrets.
+    # The on-disk config is left untouched; this is a runtime safety boundary.
+    if local_runtime:
+        for channel_name in (
+            "whatsapp", "telegram", "discord", "slack", "web", "email",
+            "teams", "imessage",
+        ):
+            channel = getattr(config.channels, channel_name, None)
+            if channel is not None and hasattr(channel, "enabled"):
+                channel.enabled = False
+
     # Create channel manager
     channels = ChannelManager(config, bus)
 
@@ -1413,7 +1436,9 @@ def gateway(
     channels.set_abort_callback(agent.mark_aborted)
 
     # Legacy bridge fallback (disabled by default; integrated Python plugin is official path)
-    legacy_voice_bridge_enabled = bool(config.integrations.voice.legacy_bridge_enabled)
+    legacy_voice_bridge_enabled = bool(
+        config.integrations.voice.legacy_bridge_enabled and not local_runtime
+    )
 
     # Create gateway API callback for legacy voice bridge
     async def on_voice_message(call_sid: str, from_number: str, text: str) -> str:
@@ -1645,6 +1670,8 @@ Respond to the user now:"""
         host=effective_host,
         port=port,
         auth_token=auth_token,
+        require_loopback_auth=local_runtime,
+        advertise_control=not local_runtime,
         on_voice_message=on_voice_message if legacy_voice_bridge_enabled else None,
         on_cron_run=on_cron_run,
         on_cron_reload=cron.reload,
@@ -1662,8 +1689,8 @@ Respond to the user now:"""
         on_retry=on_retry,
         on_undo=on_undo,
         on_provider_reload=on_provider_reload,
-        on_send=_mcp_control_send,
-        control_token=_mcp_control_token,
+        on_send=None if local_runtime else _mcp_control_send,
+        control_token=None if local_runtime else _mcp_control_token,
     )
 
     # Wire browser_tab tool to gateway server
@@ -2090,7 +2117,7 @@ Respond to the user now:"""
         else:
             console.print(f"[yellow]Warning: Voice enabled but Twilio credentials not configured[/yellow]")
 
-    console.print(f"[green]✓[/green] API: http://{config.gateway.host}:{port}")
+    console.print(f"[green]✓[/green] API: http://{effective_host}:{port}")
 
     async def run():
         shutdown_event = asyncio.Event()
@@ -2113,8 +2140,29 @@ Respond to the user now:"""
         _catalog_task: asyncio.Task | None = None
         try:
             await gateway_server.start()
-            await cron.start()
-            await heartbeat.start(run_on_start=True)
+            if local_runtime:
+                from flowly.profile import get_active_profile_name, update_runtime_lease
+
+                update_runtime_lease(_local_runtime_instance, port=gateway_server.port)
+                typer.echo(
+                    "FLOWLY_LOCAL_RUNTIME_READY "
+                    + json.dumps(
+                        {
+                            "protocolVersion": 1,
+                            "profile": get_active_profile_name(),
+                            "host": effective_host,
+                            "port": gateway_server.port,
+                            "token": auth_token,
+                            "pid": os.getpid(),
+                            "instanceId": _local_runtime_instance,
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+                sys.stdout.flush()
+            else:
+                await cron.start()
+                await heartbeat.start(run_on_start=True)
 
             # Warm the active provider's model catalogue.
             #
@@ -2326,8 +2374,27 @@ Respond to the user now:"""
             await channels.stop_all()
             console.print("[green]✓[/green] Shutdown complete")
 
+    _local_runtime_instance = ""
+    if local_runtime:
+        from flowly.profile import (
+            claim_runtime_lease,
+            get_active_profile_name,
+        )
+
+        runtime_profile = get_active_profile_name()
+        if runtime_profile in ("default", "custom"):
+            raise typer.BadParameter(
+                "A managed local runtime requires a named profile selected with --profile."
+            )
+        _local_runtime_instance = str(uuid.uuid4())
+        claim_runtime_lease(_local_runtime_instance)
+
     try:
         asyncio.run(run())
     finally:
+        if _local_runtime_instance:
+            from flowly.profile import release_runtime_lease
+
+            release_runtime_lease(_local_runtime_instance)
         if service_taken_over:
             restore_service(port)

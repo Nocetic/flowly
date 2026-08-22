@@ -17,12 +17,14 @@ module-level constants evaluate to the correct profile directory.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import stat
-import subprocess
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -55,8 +57,16 @@ _CLONE_WORKSPACE_FILES = [
 
 _CLONE_ALL_STRIP = [
     "session_index.sqlite", "session_index.sqlite-wal",
-    "session_index.sqlite-shm", "logs", "subagents",
+    "session_index.sqlite-shm", "logs", "subagents", ".machine-id",
+    ".desktop-runtime.json",
 ]
+
+_PROFILE_METADATA_FILE = "profile.json"
+_RUNTIME_LEASE_FILE = ".desktop-runtime.json"
+_LOCAL_RUNTIME_ENV_DROP = frozenset({
+    "FLOWLY_SERVER_ID",
+    "MOLTBOT_PROXY_JWT_SECRET",
+})
 
 
 # ── Path resolution ───────────────────────────────────────────────
@@ -218,6 +228,67 @@ class ProfileInfo:
     is_default: bool
     has_config: bool = False
     skill_count: int = 0
+    display_name: str = ""
+    description: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict:
+        """Return the stable, JSON-safe profile descriptor used by clients."""
+        return {
+            "name": self.name,
+            "path": str(self.path),
+            "isDefault": self.is_default,
+            "hasConfig": self.has_config,
+            "skillCount": self.skill_count,
+            "displayName": self.display_name or self.name,
+            "description": self.description,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+        }
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _profile_metadata(profile_dir: Path) -> dict:
+    path = profile_dir / _PROFILE_METADATA_FILE
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _atomic_write_json(path: Path, value: dict) -> None:
+    """Write owner-only JSON without exposing a partial profile descriptor."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _metadata_for(name: str, profile_dir: Path, *, is_default: bool) -> dict:
+    meta = _profile_metadata(profile_dir)
+    return {
+        "display_name": str(meta.get("displayName") or ("Flowly" if is_default else name)).strip(),
+        "description": str(meta.get("description") or "").strip(),
+        "created_at": str(meta.get("createdAt") or "").strip(),
+        "updated_at": str(meta.get("updatedAt") or "").strip(),
+    }
 
 
 def list_profiles() -> list[ProfileInfo]:
@@ -225,11 +296,13 @@ def list_profiles() -> list[ProfileInfo]:
     profiles = []
 
     # Default profile
+    default_meta = _metadata_for("default", _DEFAULT_HOME, is_default=True)
     profiles.append(ProfileInfo(
         name="default",
         path=_DEFAULT_HOME,
         is_default=True,
         has_config=(_DEFAULT_HOME / "config.json").exists(),
+        **default_meta,
     ))
 
     # Named profiles
@@ -240,12 +313,14 @@ def list_profiles() -> list[ProfileInfo]:
                 skills_dir = d / "skills"
                 if skills_dir.exists():
                     skill_count = sum(1 for s in skills_dir.iterdir() if s.is_dir())
+                meta = _metadata_for(d.name, d, is_default=False)
                 profiles.append(ProfileInfo(
                     name=d.name,
                     path=d,
                     is_default=False,
                     has_config=(d / "config.json").exists(),
                     skill_count=skill_count,
+                    **meta,
                 ))
 
     return profiles
@@ -257,6 +332,10 @@ def create_profile(
     name: str,
     clone_from: str | None = None,
     clone_all: bool = False,
+    *,
+    display_name: str = "",
+    description: str = "",
+    local_runtime: bool = False,
 ) -> Path:
     """Create a new profile directory.
 
@@ -284,37 +363,245 @@ def create_profile(
         if not source_dir.is_dir():
             raise FileNotFoundError(f"Source profile does not exist at {source_dir}")
 
-    if clone_all and source_dir:
-        shutil.copytree(source_dir, profile_dir)
-        # Strip runtime files
-        for stale in _CLONE_ALL_STRIP:
-            p = profile_dir / stale
-            if p.is_file():
-                p.unlink(missing_ok=True)
-            elif p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-    else:
-        # Bootstrap directory structure
-        for subdir in _PROFILE_SUBDIRS:
-            (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
+    _PROFILES_ROOT.mkdir(parents=True, exist_ok=True)
+    # Stage outside ``~/.flowly``. A full clone of the default profile must not
+    # recursively copy its own ``profiles/`` directory (including this staging
+    # directory) into itself. The default home's parent is on the same volume,
+    # so the final ``os.replace`` remains atomic.
+    staging_parent = _DEFAULT_HOME.parent
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=f".flowly-profile-{name}.", dir=staging_parent))
 
-        # Clone config files
-        if source_dir:
-            for f in _CLONE_CONFIG_FILES + _CLONE_WORKSPACE_FILES:
-                src = source_dir / f
-                if src.exists():
-                    dst = profile_dir / f
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
+    try:
+        if clone_all and source_dir:
+            ignore = shutil.ignore_patterns("profiles", "active_profile") if source_dir == _DEFAULT_HOME else None
+            shutil.copytree(source_dir, temp_dir, dirs_exist_ok=True, ignore=ignore)
+            # Strip runtime files
+            for stale in _CLONE_ALL_STRIP:
+                p = temp_dir / stale
+                if p.is_file() or p.is_symlink():
+                    p.unlink(missing_ok=True)
+                elif p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+        else:
+            # Bootstrap directory structure
+            for subdir in _PROFILE_SUBDIRS:
+                (temp_dir / subdir).mkdir(parents=True, exist_ok=True)
 
-            # Clone persona files
-            src_personas = source_dir / "workspace" / "personas"
-            if src_personas.exists():
-                dst_personas = profile_dir / "workspace" / "personas"
+            # Clone config files
+            if source_dir:
+                for f in _CLONE_CONFIG_FILES + _CLONE_WORKSPACE_FILES:
+                    src = source_dir / f
+                    if src.exists() and src.is_file():
+                        dst = temp_dir / f
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
+
+                # Clone persona files
+                src_personas = source_dir / "workspace" / "personas"
                 if src_personas.is_dir():
+                    dst_personas = temp_dir / "workspace" / "personas"
                     shutil.copytree(src_personas, dst_personas, dirs_exist_ok=True)
 
+        if local_runtime:
+            _sanitize_local_runtime_clone(temp_dir)
+
+        now = _utc_now()
+        _atomic_write_json(temp_dir / _PROFILE_METADATA_FILE, {
+            "version": 1,
+            "displayName": display_name.strip() or name,
+            "description": description.strip(),
+            "createdAt": now,
+            "updatedAt": now,
+            "localRuntime": bool(local_runtime),
+        })
+
+        # Publishing the completed directory is the commit point. A crash
+        # before this line leaves only a hidden temp dir, never a half-profile.
+        os.replace(temp_dir, profile_dir)
+    except BaseException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
     return profile_dir
+
+
+def _sanitize_local_runtime_clone(profile_dir: Path) -> None:
+    """Remove transport identity from a Desktop-managed local profile clone.
+
+    Provider credentials stay intact so the new profile can use the selected
+    model immediately. Messaging-channel credentials are not copied into the
+    runnable config, and legacy hosted-provider relay credentials are removed;
+    the account-scoped provider key remains valid without a relay registration.
+    """
+    config_path = profile_dir / "config.json"
+    if config_path.exists():
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot clone invalid config.json: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError("Cannot clone invalid config.json: root must be an object")
+
+        channels = raw.get("channels")
+        if isinstance(channels, dict):
+            for channel in channels.values():
+                if isinstance(channel, dict):
+                    channel["enabled"] = False
+            channels["web"] = {"enabled": False}
+
+        gateway = raw.get("gateway")
+        if not isinstance(gateway, dict):
+            gateway = {}
+            raw["gateway"] = gateway
+        gateway.update({"host": "127.0.0.1", "token": ""})
+
+        providers = raw.get("providers")
+        if isinstance(providers, dict):
+            hosted = providers.get("flowlyHosted")
+            if not isinstance(hosted, dict):
+                hosted = providers.get("flowly_hosted")
+            if isinstance(hosted, dict):
+                hosted.pop("serverId", None)
+                hosted.pop("server_id", None)
+                hosted.pop("authToken", None)
+                hosted.pop("auth_token", None)
+
+        _atomic_write_json(config_path, raw)
+
+    env_path = profile_dir / ".env"
+    if env_path.exists():
+        try:
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(f"Cannot clone invalid .env: {exc}") from exc
+        retained = []
+        for line in lines:
+            key = line.split("=", 1)[0].strip() if "=" in line else ""
+            if key not in _LOCAL_RUNTIME_ENV_DROP:
+                retained.append(line)
+        env_path.write_text("\n".join(retained) + ("\n" if retained else ""), encoding="utf-8")
+
+
+def describe_profile(name: str) -> ProfileInfo:
+    """Return one profile descriptor or raise ``FileNotFoundError``."""
+    if name == "default":
+        return list_profiles()[0]
+    validate_profile_name(name)
+    for profile in list_profiles()[1:]:
+        if profile.name == name:
+            return profile
+    raise FileNotFoundError(f"Profile '{name}' does not exist.")
+
+
+def update_profile_metadata(
+    name: str,
+    *,
+    display_name: str | None = None,
+    description: str | None = None,
+) -> ProfileInfo:
+    """Atomically update renderer-facing metadata for one profile."""
+    profile = describe_profile(name)
+    current = _profile_metadata(profile.path)
+    now = _utc_now()
+    current.update({
+        "version": 1,
+        "displayName": (
+            str(display_name).strip() if display_name is not None
+            else str(current.get("displayName") or profile.display_name or name).strip()
+        ),
+        "description": (
+            str(description).strip() if description is not None
+            else str(current.get("description") or profile.description).strip()
+        ),
+        "createdAt": str(current.get("createdAt") or profile.created_at or now),
+        "updatedAt": now,
+    })
+    _atomic_write_json(profile.path / _PROFILE_METADATA_FILE, current)
+    return describe_profile(name)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def read_runtime_lease(profile_dir: Path) -> dict | None:
+    """Return a live Desktop-runtime lease, pruning a stale lease."""
+    path = profile_dir / _RUNTIME_LEASE_FILE
+    try:
+        lease = json.loads(path.read_text(encoding="utf-8"))
+        pid = int(lease.get("pid") or 0) if isinstance(lease, dict) else 0
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if _pid_is_alive(pid):
+        return lease
+    path.unlink(missing_ok=True)
+    return None
+
+
+def claim_runtime_lease(instance_id: str) -> Path:
+    """Exclusively claim the current profile for one managed runtime."""
+    if not instance_id:
+        raise ValueError("runtime instance id is required")
+    path = get_flowly_home() / _RUNTIME_LEASE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = read_runtime_lease(path.parent)
+    if existing:
+        raise RuntimeError(
+            f"Profile runtime is already active (pid {existing.get('pid')})."
+        )
+    path.unlink(missing_ok=True)
+    payload = {
+        "version": 1,
+        "instanceId": instance_id,
+        "pid": os.getpid(),
+        "port": 0,
+        "startedAt": _utc_now(),
+    }
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def update_runtime_lease(instance_id: str, *, port: int) -> None:
+    """Publish the bound port without changing lease ownership."""
+    path = get_flowly_home() / _RUNTIME_LEASE_FILE
+    lease = read_runtime_lease(path.parent)
+    if not lease or lease.get("instanceId") != instance_id or lease.get("pid") != os.getpid():
+        raise RuntimeError("Profile runtime lease ownership was lost.")
+    lease["port"] = int(port)
+    lease["readyAt"] = _utc_now()
+    _atomic_write_json(path, lease)
+
+
+def release_runtime_lease(instance_id: str) -> None:
+    """Release only the lease owned by this runtime instance."""
+    path = get_flowly_home() / _RUNTIME_LEASE_FILE
+    try:
+        lease = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return
+    if isinstance(lease, dict) and lease.get("instanceId") == instance_id:
+        path.unlink(missing_ok=True)
 
 
 def delete_profile(name: str) -> None:
@@ -326,6 +613,12 @@ def delete_profile(name: str) -> None:
     profile_dir = _PROFILES_ROOT / name
     if not profile_dir.exists():
         raise FileNotFoundError(f"Profile '{name}' does not exist.")
+
+    lease = read_runtime_lease(profile_dir)
+    if lease:
+        raise RuntimeError(
+            f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before deletion."
+        )
 
     shutil.rmtree(profile_dir)
 

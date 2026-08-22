@@ -436,6 +436,12 @@ class GatewayServer:
         # single-use ticket minted at POST /api/auth/ws-ticket. See
         # flowly/gateway/auth.py (token + ws-ticket model).
         auth_token: str | None = None,
+        # Desktop-managed profile runtimes are loopback-only but still use a
+        # per-process secret. This keeps the ordinary local gateway's legacy
+        # trust-localhost behavior unchanged.
+        require_loopback_auth: bool = False,
+        # Only the primary gateway owns the machine-wide MCP control pointer.
+        advertise_control: bool = True,
     ):
         self.host = host
         self.port = port
@@ -448,7 +454,10 @@ class GatewayServer:
         # nothing is actually exposed. Remote binds (0.0.0.0 / a public IP)
         # still require the token.
         self._auth_token = (auth_token or "").strip()
-        self._require_auth = bool(self._auth_token) and not is_loopback_host(host)
+        self._require_auth = bool(self._auth_token) and (
+            require_loopback_auth or not is_loopback_host(host)
+        )
+        self._advertise_control = advertise_control
         self._ticket_store = WsTicketStore()
         # Playback tickets: short-lived, scoped to a single media id, reusable
         # across the many Range requests one clip generates.
@@ -562,7 +571,7 @@ class GatewayServer:
         if self.on_chat_message:
             app.router.add_get("/ws", self._handle_ws)
         # MCP write-plane control routes — additive, opt-in, localhost+token.
-        if self.on_send and self._control_token:
+        if self._advertise_control and self.on_send and self._control_token:
             try:
                 from flowly.mcp.server.control import register_control_routes
 
@@ -3910,10 +3919,20 @@ class GatewayServer:
                     f"  flowly service restart   — restart it\n"
                 ) from None
             raise
+        # Port 0 asks the OS for an unused ephemeral port. Publish the actual
+        # bound value before any readiness signal or control advertisement.
+        # aiohttp exposes the listening sockets on the underlying server after
+        # ``TCPSite.start``; all sockets for this site share the same port.
+        if self.port == 0:
+            server = getattr(self._site, "_server", None)
+            sockets = list(getattr(server, "sockets", None) or [])
+            if not sockets:
+                raise RuntimeError("gateway started without a listening socket")
+            self.port = int(sockets[0].getsockname()[1])
         if self.on_chat_message:
             self._tick_task = asyncio.create_task(self._tick_loop())
         # Advertise the MCP control endpoint for `flowly mcp serve`.
-        if self.on_send and self._control_token:
+        if self._advertise_control and self.on_send and self._control_token:
             try:
                 from flowly.mcp.server.control import write_api_file
 

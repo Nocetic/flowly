@@ -112,6 +112,9 @@ app.add_typer(setup_app, name="setup")
 from flowly.cli.persona_cmd import persona_app
 app.add_typer(persona_app, name="persona")
 
+from flowly.cli.profile_cmd import profile_app
+app.add_typer(profile_app, name="profile")
+
 from flowly.cli.service_cmd import service_app
 app.add_typer(service_app, name="service")
 
@@ -166,6 +169,9 @@ app.command("onboard")(onboard)
 
 from flowly.cli.gateway_cmd import gateway
 app.command("gateway")(gateway)
+
+from flowly.cli.serve_cmd import serve
+app.command("serve", hidden=True)(serve)
 
 from flowly.cli.agent_cmd import agent
 app.command("agent")(agent)
