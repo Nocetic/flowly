@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 import flowly.profile as profiles
+from flowly.cli.profile_cmd import profile_app
 
 
 @pytest.fixture()
@@ -34,6 +36,7 @@ def test_local_runtime_clone_keeps_provider_but_drops_transport_identity(profile
                     },
                 },
                 "gateway": {"host": "0.0.0.0", "port": 19999, "token": "gateway-secret"},
+                "agents": {"defaults": {"workspace": "~/.flowly/workspace", "model": "old/model"}},
                 "providers": {
                     "active": "flowly_hosted",
                     "flowlyHosted": {
@@ -67,6 +70,7 @@ def test_local_runtime_clone_keeps_provider_but_drops_transport_identity(profile
     assert config["channels"]["telegram"]["enabled"] is False
     assert config["channels"]["web"] == {"enabled": False}
     assert config["gateway"] == {"host": "127.0.0.1", "port": 19999, "token": ""}
+    assert config["agents"]["defaults"]["workspace"] == str(created / "workspace")
     assert config["providers"]["flowlyHosted"]["accountKey"] == "flw_account"
     assert "serverId" not in config["providers"]["flowlyHosted"]
     assert "authToken" not in config["providers"]["flowlyHosted"]
@@ -120,6 +124,81 @@ def test_profile_metadata_updates_without_touching_profile_data(profile_roots) -
     assert updated.description == "Long-form writing"
     assert updated.updated_at.endswith("Z")
     assert sentinel.read_text(encoding="utf-8") == "untouched"
+
+
+def test_fresh_local_profile_gets_isolated_workspace_config(profile_roots) -> None:
+    _default, root = profile_roots
+
+    created = profiles.create_profile("fresh", local_runtime=True)
+
+    config = json.loads((created / "config.json").read_text(encoding="utf-8"))
+    assert config["agents"]["defaults"]["workspace"] == str(root / "fresh" / "workspace")
+
+
+def test_profile_model_and_soul_are_isolated_and_editable(profile_roots) -> None:
+    default, _root = profile_roots
+    (default / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "base/model"}}}),
+        encoding="utf-8",
+    )
+
+    created = profiles.create_profile(
+        "analyst",
+        clone_from="default",
+        local_runtime=True,
+        model="profile/model",
+        soul="# Analyst\n\nVerify every claim.\n",
+    )
+
+    assert profiles.read_profile_settings("analyst") == {
+        "name": "analyst",
+        "model": "profile/model",
+        "soul": "# Analyst\n\nVerify every claim.\n",
+        "workspace": str(created / "workspace"),
+    }
+    updated = profiles.update_profile_settings(
+        "analyst",
+        model="profile/model-v2",
+        soul="",
+    )
+    assert updated["model"] == "profile/model-v2"
+    assert updated["soul"] == ""
+    assert json.loads((default / "config.json").read_text(encoding="utf-8"))["agents"]["defaults"]["model"] == "base/model"
+    assert not (default / "workspace" / "SOUL.md").exists()
+
+
+def test_running_profile_settings_cannot_change(profile_roots) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("busy", local_runtime=True)
+    (created / ".desktop-runtime.json").write_text(
+        json.dumps({"instanceId": "runtime-1", "pid": profiles.os.getpid(), "port": 12345}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="Stop it before changing settings"):
+        profiles.update_profile_settings("busy", model="new/model")
+
+
+def test_profile_cli_round_trips_isolated_settings(profile_roots) -> None:
+    default, _root = profile_roots
+    (default / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "base/model"}}}),
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+
+    created = runner.invoke(profile_app, [
+        "create", "planner", "--clone-from", "default", "--local-only",
+        "--display-name", "Planner", "--model", "planner/model",
+        "--soul", "Plan before acting.\n", "--json",
+    ])
+    assert created.exit_code == 0, created.output
+
+    settings = runner.invoke(profile_app, ["settings", "planner", "--json"])
+    assert settings.exit_code == 0, settings.output
+    payload = json.loads(settings.output)
+    assert payload["settings"]["model"] == "planner/model"
+    assert payload["settings"]["soul"] == "Plan before acting.\n"
 
 
 def test_running_profile_cannot_be_deleted(profile_roots) -> None:

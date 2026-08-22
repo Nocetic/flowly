@@ -63,6 +63,8 @@ _CLONE_ALL_STRIP = [
 
 _PROFILE_METADATA_FILE = "profile.json"
 _RUNTIME_LEASE_FILE = ".desktop-runtime.json"
+_MAX_SOUL_BYTES = 64 * 1024
+_MAX_MODEL_LENGTH = 256
 _LOCAL_RUNTIME_ENV_DROP = frozenset({
     "FLOWLY_SERVER_ID",
     "MOLTBOT_PROXY_JWT_SECRET",
@@ -281,6 +283,78 @@ def _atomic_write_json(path: Path, value: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _atomic_write_text(path: Path, value: str) -> None:
+    """Write owner-only UTF-8 text without exposing a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _validate_model(model: str) -> str:
+    value = model.strip()
+    if not value:
+        raise ValueError("Model must not be empty.")
+    if len(value) > _MAX_MODEL_LENGTH or "\x00" in value:
+        raise ValueError(f"Model must be at most {_MAX_MODEL_LENGTH} characters.")
+    return value
+
+
+def _validate_soul(soul: str) -> str:
+    if "\x00" in soul:
+        raise ValueError("Persona instructions cannot contain null bytes.")
+    if len(soul.encode("utf-8")) > _MAX_SOUL_BYTES:
+        raise ValueError(f"Persona instructions must be at most {_MAX_SOUL_BYTES // 1024} KiB.")
+    return soul
+
+
+def _load_config_object(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid profile config.json: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("Invalid profile config.json: root must be an object")
+    return value
+
+
+def _set_profile_model(config: dict, model: str) -> None:
+    agents = config.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        agents = {}
+        config["agents"] = agents
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+        agents["defaults"] = defaults
+    defaults["model"] = _validate_model(model)
+
+
+def _set_profile_workspace(config: dict, workspace: Path) -> None:
+    agents = config.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        agents = {}
+        config["agents"] = agents
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+        agents["defaults"] = defaults
+    defaults["workspace"] = str(workspace)
+
+
 def _metadata_for(name: str, profile_dir: Path, *, is_default: bool) -> dict:
     meta = _profile_metadata(profile_dir)
     return {
@@ -336,6 +410,8 @@ def create_profile(
     display_name: str = "",
     description: str = "",
     local_runtime: bool = False,
+    model: str | None = None,
+    soul: str | None = None,
 ) -> Path:
     """Create a new profile directory.
 
@@ -404,7 +480,16 @@ def create_profile(
                     shutil.copytree(src_personas, dst_personas, dirs_exist_ok=True)
 
         if local_runtime:
-            _sanitize_local_runtime_clone(temp_dir)
+            _sanitize_local_runtime_clone(temp_dir, profile_dir / "workspace")
+
+        if model is not None:
+            config_path = temp_dir / "config.json"
+            config = _load_config_object(config_path)
+            _set_profile_model(config, model)
+            _atomic_write_json(config_path, config)
+
+        if soul is not None:
+            _atomic_write_text(temp_dir / "workspace" / "SOUL.md", _validate_soul(soul))
 
         now = _utc_now()
         _atomic_write_json(temp_dir / _PROFILE_METADATA_FILE, {
@@ -426,7 +511,7 @@ def create_profile(
     return profile_dir
 
 
-def _sanitize_local_runtime_clone(profile_dir: Path) -> None:
+def _sanitize_local_runtime_clone(profile_dir: Path, workspace: Path) -> None:
     """Remove transport identity from a Desktop-managed local profile clone.
 
     Provider credentials stay intact so the new profile can use the selected
@@ -437,11 +522,9 @@ def _sanitize_local_runtime_clone(profile_dir: Path) -> None:
     config_path = profile_dir / "config.json"
     if config_path.exists():
         try:
-            raw = json.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cannot clone invalid config.json: {exc}") from exc
-        if not isinstance(raw, dict):
-            raise ValueError("Cannot clone invalid config.json: root must be an object")
+            raw = _load_config_object(config_path)
+        except ValueError as exc:
+            raise ValueError(str(exc).replace("Invalid profile", "Cannot clone invalid")) from exc
 
         channels = raw.get("channels")
         if isinstance(channels, dict):
@@ -467,6 +550,11 @@ def _sanitize_local_runtime_clone(profile_dir: Path) -> None:
                 hosted.pop("authToken", None)
                 hosted.pop("auth_token", None)
 
+        _set_profile_workspace(raw, workspace)
+        _atomic_write_json(config_path, raw)
+    else:
+        raw = {}
+        _set_profile_workspace(raw, workspace)
         _atomic_write_json(config_path, raw)
 
     env_path = profile_dir / ".env"
@@ -519,6 +607,57 @@ def update_profile_metadata(
     })
     _atomic_write_json(profile.path / _PROFILE_METADATA_FILE, current)
     return describe_profile(name)
+
+
+def read_profile_settings(name: str) -> dict:
+    """Return the non-secret settings exposed in Desktop's profile editor."""
+    profile = describe_profile(name)
+    config = _load_config_object(profile.path / "config.json")
+    agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
+    defaults = agents.get("defaults") if isinstance(agents.get("defaults"), dict) else {}
+    soul_path = profile.path / "workspace" / "SOUL.md"
+    try:
+        soul = soul_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        soul = ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Cannot read profile persona instructions: {exc}") from exc
+    return {
+        "name": profile.name,
+        "model": str(defaults.get("model") or "").strip(),
+        "soul": soul,
+        "workspace": str(profile.path / "workspace"),
+    }
+
+
+def update_profile_settings(
+    name: str,
+    *,
+    model: str | None = None,
+    soul: str | None = None,
+) -> dict:
+    """Safely update profile-local model and persona files."""
+    if model is None and soul is None:
+        raise ValueError("At least one profile setting is required.")
+    validated_model = _validate_model(model) if model is not None else None
+    validated_soul = _validate_soul(soul) if soul is not None else None
+    profile = describe_profile(name)
+    lease = read_runtime_lease(profile.path)
+    if lease:
+        raise RuntimeError(
+            f"Profile runtime is active (pid {lease.get('pid')}). Stop it before changing settings."
+        )
+
+    if validated_model is not None:
+        config_path = profile.path / "config.json"
+        config = _load_config_object(config_path)
+        if bool(_profile_metadata(profile.path).get("localRuntime")):
+            _set_profile_workspace(config, profile.path / "workspace")
+        _set_profile_model(config, validated_model)
+        _atomic_write_json(config_path, config)
+    if validated_soul is not None:
+        _atomic_write_text(profile.path / "workspace" / "SOUL.md", validated_soul)
+    return read_profile_settings(name)
 
 
 def _pid_is_alive(pid: int) -> bool:
