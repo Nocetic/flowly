@@ -283,8 +283,19 @@ def test_profile_mark_rejects_invalid_values(profile_roots) -> None:
         profiles.create_profile("writer", mark_text="LONG")
     with pytest.raises(ValueError, match="Unknown profile mark tone"):
         profiles.create_profile("writer", mark_tone="neon")
+    with pytest.raises(ValueError, match="Unknown profile mark tone"):
+        profiles.create_profile("writer", mark_tone="#fff")
     with pytest.raises(ValueError, match="Unknown model provider"):
         profiles.create_profile("writer", provider="unknown-provider")
+
+
+def test_profile_mark_accepts_normalized_custom_hex_color(profile_roots) -> None:
+    profiles.create_profile("custom-mark", mark_tone="#FfEeDd")
+
+    info = profiles.describe_profile("custom-mark")
+
+    assert info.mark_tone == "#ffeedd"
+    assert info.to_dict()["markTone"] == "#ffeedd"
 
 
 def test_running_profile_cannot_be_deleted(profile_roots) -> None:

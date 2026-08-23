@@ -74,6 +74,7 @@ _MAX_IMPORT_BYTES = 512 * 1024 * 1024
 _PROFILE_MARK_TONES = frozenset({
     "aqua", "violet", "rose", "amber", "lime", "sky", "slate",
 })
+_PROFILE_MARK_COLOR_RE = re.compile(r"^#[0-9a-f]{6}$")
 _LOCAL_RUNTIME_ENV_ALLOW = frozenset({
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -389,7 +390,7 @@ def _validate_mark_tone(mark_tone: str) -> str:
     value = mark_tone.strip().lower()
     if not value:
         return ""
-    if value not in _PROFILE_MARK_TONES:
+    if value not in _PROFILE_MARK_TONES and not _PROFILE_MARK_COLOR_RE.fullmatch(value):
         raise ValueError(f"Unknown profile mark tone: {value}")
     return value
 
