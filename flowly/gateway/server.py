@@ -5,6 +5,7 @@ import base64
 import inspect
 import json
 import mimetypes
+import secrets
 import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
@@ -34,6 +35,7 @@ from flowly.gateway.auth import (
 )
 from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
+from flowly.profile_host_contract import ProfileHostError
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
 
@@ -185,9 +187,31 @@ _PROFILE_RUN_BINDING: ContextVar[_ProfileRunBinding | None] = ContextVar(
     "flowly_profile_run_binding", default=None
 )
 
+
+class _ProfileHostSocket:
+    """Private in-process WS-shaped sink used for default-profile brokering."""
+
+    def __init__(self, owner: "GatewayServer"):
+        self._owner = owner
+        self.closed = False
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        if not self.closed:
+            await self._owner._handle_profile_host_internal_frame(payload)
+
+    async def close(self) -> None:
+        self.closed = True
+
 _PROFILE_ID_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyz0123456789-_"
 )
+_PROFILE_HOST_LONG_RUNNING_METHODS = frozenset({
+    "profiles.connect",
+    "profiles.configure",
+    "profiles.delete.commit",
+    "profiles.rpc",
+    "profiles.stop",
+})
 
 
 def _valid_profile_id(value: str) -> bool:
@@ -196,6 +220,13 @@ def _valid_profile_id(value: str) -> bool:
         and value[0].isalnum()
         and all(char in _PROFILE_ID_CHARS for char in value)
     )
+
+
+def _profile_name_param(params: dict[str, Any]) -> str:
+    value = params.get("name")
+    if not isinstance(value, str):
+        raise ProfileHostError("INVALID_PARAMS", "Bot name must be a string.")
+    return value.strip()
 
 
 def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
@@ -472,6 +503,9 @@ class GatewayServer:
         require_loopback_auth: bool = False,
         # Only the primary gateway owns the machine-wide MCP control pointer.
         advertise_control: bool = True,
+        # Child profile gateways disable this so runtimes never recursively
+        # start or control sibling runtimes.
+        enable_profile_host: bool = False,
     ):
         self.host = host
         self.port = port
@@ -488,6 +522,8 @@ class GatewayServer:
             require_loopback_auth or not is_loopback_host(host)
         )
         self._advertise_control = advertise_control
+        if enable_profile_host and not is_loopback_host(host) and not self._require_auth:
+            raise ValueError("Remote profile hosting requires gateway authentication.")
         self._ticket_store = WsTicketStore()
         # Playback tickets: short-lived, scoped to a single media id, reusable
         # across the many Range requests one clip generates.
@@ -557,6 +593,28 @@ class GatewayServer:
         # relay transport.
         self._profile_pending: dict[str, asyncio.Future] = {}
         self._profile_pending_clients: dict[str, str] = {}
+        self._profile_host_rpc_pending: dict[str, asyncio.Future[Any]] = {}
+        self._profile_host_client_id = f"profile-host-{uuid.uuid4().hex}"
+        self._profile_host_socket: _ProfileHostSocket | None = None
+        self._profile_host_external_events = False
+        self._profile_host_pending_chats = 0
+        self._profile_host_active_runs: set[str] = set()
+        self._profile_host_terminal_runs: OrderedDict[str, None] = OrderedDict()
+        self._profile_host = None
+        if enable_profile_host:
+            from flowly.profile_host import ProfileHost
+
+            self._profile_host_socket = _ProfileHostSocket(self)
+            self._profile_host = ProfileHost(
+                on_event=self._broadcast_profile_host_event,
+                primary_rpc=self._profile_host_primary_rpc,
+                primary_event_lease=self._set_profile_host_primary_event_lease,
+            )
+
+    @property
+    def profile_host(self) -> Any | None:
+        """The authenticated profile manager shared with transport adapters."""
+        return self._profile_host
 
     def _create_app(self) -> web.Application:
         """Create the aiohttp application."""
@@ -692,6 +750,7 @@ class GatewayServer:
                     "browser_provider_v2",
                     "browser_session_binding_v1",
                     "browser_provider_unregister_v1",
+                    *(["profile_host_v1"] if self._profile_host is not None else []),
                 ],
             }
         )
@@ -1208,7 +1267,10 @@ class GatewayServer:
                         continue
                     msg_type = data.get("type")
                     if msg_type == "rpc":
-                        if data.get("method") in feature_rpc.LONG_RUNNING_METHODS:
+                        if data.get("method") in (
+                            feature_rpc.LONG_RUNNING_METHODS
+                            | _PROFILE_HOST_LONG_RUNNING_METHODS
+                        ):
                             # Browser auth/probes can take minutes. Keep the
                             # receive loop alive for WS heartbeat frames and
                             # unrelated RPCs, while retaining ownership so a
@@ -1299,6 +1361,9 @@ class GatewayServer:
         try:
             if method == "health":
                 await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
+
+            elif method.startswith("profiles."):
+                await self._handle_profile_host_rpc(ws, rpc_id, method, params)
 
             # Shared feature surface (connections, config, memory, kg, sessions,
             # audit, persona, provider, skills, assistants, pairing) — the SAME
@@ -1519,6 +1584,67 @@ class GatewayServer:
         except Exception as e:
             logger.error(f"[WS] RPC {method} error: {e}")
             await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", str(e))
+
+    async def _handle_profile_host_rpc(
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        method: str,
+        params: Any,
+    ) -> None:
+        """Dispatch the authenticated, remote-safe isolated-profile surface."""
+        host = self._profile_host
+        if host is None:
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "PROFILE_HOST_UNAVAILABLE",
+                "This gateway does not manage isolated bot profiles.",
+            )
+            return
+        try:
+            result = await host.dispatch(method, params)
+        except ProfileHostError as exc:
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                exc.code,
+                exc.message,
+                retryable=exc.retryable,
+            )
+            return
+        except FileNotFoundError:
+            await self._ws_rpc_error(ws, rpc_id, "PROFILE_NOT_FOUND", "The bot no longer exists.")
+            return
+        except FileExistsError:
+            await self._ws_rpc_error(
+                ws, rpc_id, "PROFILE_ALREADY_EXISTS", "A bot with this name already exists."
+            )
+            return
+        except ValueError as exc:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_PARAMS", str(exc))
+            return
+        except RuntimeError:
+            logger.exception("[Gateway] profile host operation failed: {}", method)
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "PROFILE_OPERATION_FAILED",
+                "The bot operation could not be completed on its host.",
+                retryable=True,
+            )
+            return
+        except Exception:
+            logger.exception("[Gateway] unexpected profile host failure: {}", method)
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "PROFILE_OPERATION_FAILED",
+                "The bot operation could not be completed on its host.",
+                retryable=True,
+            )
+            return
+        await self._ws_rpc_reply(ws, rpc_id, result)
 
     # --- RPC: exec.approval ---
 
@@ -3225,6 +3351,8 @@ class GatewayServer:
         # started it (which the client may have already left).
         if method == "chat.inflight":
             self.bind_session_ws(str(params.get("sessionKey") or ""), ws)
+        if method == "system.capabilities" and self._profile_host is not None:
+            result = {**result, "profileHost": self._profile_host.capabilities()}
         await self._ws_rpc_reply(ws, rpc_id, result)
         if needs_restart:
             self._schedule_feature_restart()
@@ -3997,14 +4125,23 @@ class GatewayServer:
                 logger.debug(f"agent_state push to {client_id} failed: {e}")
 
     async def _ws_rpc_error(
-        self, ws: web.WebSocketResponse, rpc_id: str, code: str, message: str
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        code: str,
+        message: str,
+        *,
+        retryable: bool | None = None,
     ) -> None:
+        error: dict[str, Any] = {"code": code, "message": message}
+        if retryable is not None:
+            error["retryable"] = retryable
         await self._ws_send(
             ws,
             {
                 "type": "rpc",
                 "id": rpc_id,
-                "error": {"code": code, "message": message},
+                "error": error,
             },
         )
 
@@ -4197,6 +4334,125 @@ class GatewayServer:
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 
+    async def _broadcast_profile_host_event(self, data: dict[str, Any]) -> None:
+        """Tag and forward one child gateway event to remote clients."""
+        event = {"type": "event", "event": "profile.event", "data": data}
+        for client_id, ws in list(self._ws_clients.items()):
+            if client_id != self._profile_host_client_id:
+                await self._ws_send(ws, event)
+
+    async def _handle_profile_host_internal_frame(self, frame: dict[str, Any]) -> None:
+        """Resolve private default-profile RPCs or forward their live events."""
+        if frame.get("type") == "rpc":
+            future = self._profile_host_rpc_pending.get(str(frame.get("id") or ""))
+            if future is None or future.done():
+                return
+            error = frame.get("error")
+            if isinstance(error, dict):
+                future.set_exception(ProfileHostError(
+                    str(error.get("code") or "PROFILE_RPC_FAILED"),
+                    str(error.get("message") or "Profile operation failed."),
+                    retryable=bool(error.get("retryable", False)),
+                ))
+            else:
+                future.set_result(frame.get("result"))
+            return
+        if self._profile_host is not None:
+            await self._profile_host.handle_primary_frame(frame)
+        if (
+            frame.get("type") == "event"
+            and frame.get("event") == "chat"
+            and isinstance(frame.get("data"), dict)
+            and frame["data"].get("state") in {"final", "aborted", "error"}
+        ):
+            run_id = str(frame["data"].get("runId") or "")
+            if run_id:
+                self._profile_host_active_runs.discard(run_id)
+                self._profile_host_terminal_runs[run_id] = None
+                self._profile_host_terminal_runs.move_to_end(run_id)
+                while len(self._profile_host_terminal_runs) > 256:
+                    self._profile_host_terminal_runs.popitem(last=False)
+            self._sync_profile_host_socket()
+
+    async def _profile_host_primary_rpc(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float,
+    ) -> Any:
+        """Run a default-profile RPC through the exact normal gateway path."""
+        socket = self._profile_host_socket
+        if socket is None or socket.closed:
+            raise ProfileHostError(
+                "DEFAULT_PROFILE_UNAVAILABLE",
+                "The default profile is not available.",
+                retryable=True,
+            )
+        request_id = secrets.token_urlsafe(18)
+        future = asyncio.get_running_loop().create_future()
+        self._profile_host_rpc_pending[request_id] = future
+        if method == "chat.send":
+            self._profile_host_pending_chats += 1
+            self._sync_profile_host_socket()
+        try:
+            await self._handle_ws_rpc(socket, self._profile_host_client_id, {
+                "type": "rpc",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            })
+            result = await asyncio.wait_for(future, timeout=timeout)
+            if method == "chat.send" and isinstance(result, dict):
+                run_id = str(result.get("runId") or "")
+                if run_id and run_id not in self._profile_host_terminal_runs:
+                    self._profile_host_active_runs.add(run_id)
+            return result
+        except asyncio.TimeoutError as exc:
+            raise ProfileHostError(
+                "PROFILE_RPC_TIMEOUT",
+                "The default profile operation timed out.",
+                retryable=True,
+            ) from exc
+        finally:
+            self._profile_host_rpc_pending.pop(request_id, None)
+            if method == "chat.send":
+                self._profile_host_pending_chats = max(
+                    0, self._profile_host_pending_chats - 1
+                )
+                self._sync_profile_host_socket()
+
+    def _set_profile_host_primary_event_lease(self, active: bool) -> None:
+        self._profile_host_external_events = active
+        self._sync_profile_host_socket()
+
+    def _sync_profile_host_socket(self) -> None:
+        socket = self._profile_host_socket
+        if socket is None or socket.closed:
+            return
+        should_listen = (
+            self._profile_host_external_events
+            or self._profile_host_pending_chats > 0
+            or bool(self._profile_host_active_runs)
+        )
+        if should_listen:
+            self._ws_clients[self._profile_host_client_id] = socket  # type: ignore[assignment]
+        else:
+            self._release_profile_host_socket(force=True)
+
+    def _release_profile_host_socket(self, *, force: bool = False) -> None:
+        if not force and (
+            self._profile_host_external_events
+            or self._profile_host_pending_chats > 0
+            or self._profile_host_active_runs
+        ):
+            return
+        self._ws_clients.pop(self._profile_host_client_id, None)
+        socket = self._profile_host_socket
+        if socket is not None:
+            for session_key, candidate in list(self._session_ws.items()):
+                if candidate is socket:
+                    self._session_ws.pop(session_key, None)
+
     # ------------------------------------------------------------------
     # HTTP: artifacts
     # ------------------------------------------------------------------
@@ -4317,6 +4573,18 @@ class GatewayServer:
 
     async def stop(self) -> None:
         """Stop the server and clean up."""
+        if self._profile_host is not None:
+            await self._profile_host.shutdown()
+        self._profile_host_external_events = False
+        self._profile_host_pending_chats = 0
+        self._profile_host_active_runs.clear()
+        self._release_profile_host_socket(force=True)
+        for future in self._profile_host_rpc_pending.values():
+            if not future.done():
+                future.set_exception(ProfileHostError(
+                    "HOST_STOPPED", "The profile host is shutting down."
+                ))
+        self._profile_host_rpc_pending.clear()
         # Withdraw the MCP control endpoint advertisement.
         if self.on_send and self._control_token:
             try:

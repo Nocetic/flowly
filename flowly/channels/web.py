@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import ssl
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from flowly.channels import feature_rpc
 from flowly.channels.base import BaseChannel
 from flowly.config.schema import WebChannelConfig
 from flowly.profile import get_flowly_home
+from flowly.profile_host_contract import ProfileHostError
 from flowly.render_capabilities import normalize_render_capabilities
 
 # ─── Transport limits ──────────────────────────────────────────────────────
@@ -42,6 +44,16 @@ _IMAGE_MAX_DIMENSION = 1280  # px on the longest edge
 _IMAGE_INITIAL_QUALITY = 75
 _IMAGE_MIN_QUALITY = 40
 _OUTBOUND_QUEUE_LIMIT = 50  # cap pending replays to avoid unbounded growth
+_PROFILE_BINDING_LIMIT = 1024
+_PROFILE_BINDING_TTL_SECONDS = 6 * 60 * 60
+_PROFILE_RUN_BINDING_LIMIT = 2048
+_PROFILE_LONG_RUNNING_METHODS = frozenset({
+    "profiles.connect",
+    "profiles.configure",
+    "profiles.delete.commit",
+    "profiles.rpc",
+    "profiles.stop",
+})
 
 LocalEventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 
@@ -275,6 +287,21 @@ class WebChannel(BaseChannel):
         # and is done by the time abort fires.
         self._abort_callback: Callable[[str], None] | None = None
         self._local_event_callback: LocalEventCallback | None = None
+        # The primary gateway owns the ProfileHost; the relay channel only
+        # borrows it. Browser session ids are transport-authenticated routing
+        # authority and never accepted from profiles.rpc params.
+        self._profile_host: Any | None = None
+        self._profile_event_token: str | None = None
+        self._profile_directory_sessions: dict[str, float] = {}
+        self._profile_conversation_sessions: dict[
+            tuple[str, str], dict[str, float]
+        ] = {}
+        self._profile_bindings_by_relay: dict[
+            str, set[tuple[str, str]]
+        ] = {}
+        self._profile_run_bindings: dict[
+            tuple[str, str], tuple[str, float]
+        ] = {}
 
     @property
     def cron_session_id(self) -> str | None:
@@ -305,6 +332,20 @@ class WebChannel(BaseChannel):
         """
         self._local_event_callback = callback
 
+    def set_profile_host(self, host: Any | None) -> None:
+        """Attach the primary gateway's authenticated isolated-profile host."""
+        if self._profile_host is host:
+            return
+        if self._profile_host is not None and self._profile_event_token:
+            self._profile_host.unsubscribe_events(self._profile_event_token)
+        self._clear_profile_subscriptions()
+        self._profile_host = host
+        self._profile_event_token = (
+            host.subscribe_events(self._forward_profile_event)
+            if host is not None
+            else None
+        )
+
     async def _emit_local_event(self, event_name: str, data: dict[str, Any]) -> None:
         cb = self._local_event_callback
         if not cb:
@@ -315,6 +356,249 @@ class WebChannel(BaseChannel):
                 await result
         except Exception as exc:
             logger.debug(f"[WebChannel] local event mirror failed: {exc}")
+
+    @staticmethod
+    def _profile_lease_owner(session_id: str) -> str:
+        return f"relay:{session_id}"
+
+    def _bind_profile_directory(self, session_id: str) -> None:
+        if session_id and len(session_id) <= 256:
+            self._profile_directory_sessions[session_id] = time.monotonic()
+
+    def _bind_profile_conversation(
+        self, profile: str, session_key: str, session_id: str
+    ) -> None:
+        if not (
+            profile
+            and session_key
+            and session_id
+            and len(profile) <= 64
+            and len(session_key) <= 256
+            and len(session_id) <= 256
+        ):
+            return
+        now = time.monotonic()
+        key = (profile, session_key)
+        subscribers = self._profile_conversation_sessions.setdefault(key, {})
+        is_new = session_id not in subscribers
+        subscribers[session_id] = now
+        bindings = self._profile_bindings_by_relay.setdefault(session_id, set())
+        first_default = profile == "default" and not any(
+            candidate_profile == "default" for candidate_profile, _ in bindings
+        )
+        bindings.add(key)
+        if is_new and first_default and self._profile_host is not None:
+            self._profile_host.retain_default_events(
+                self._profile_lease_owner(session_id)
+            )
+        self._prune_profile_bindings(now)
+
+    def _unbind_profile_conversation(
+        self, profile: str, session_key: str, session_id: str
+    ) -> None:
+        key = (profile, session_key)
+        subscribers = self._profile_conversation_sessions.get(key)
+        if subscribers is not None:
+            subscribers.pop(session_id, None)
+            if not subscribers:
+                self._profile_conversation_sessions.pop(key, None)
+        bindings = self._profile_bindings_by_relay.get(session_id)
+        if bindings is None:
+            return
+        bindings.discard(key)
+        if not bindings:
+            self._profile_bindings_by_relay.pop(session_id, None)
+        if profile == "default" and not any(
+            candidate_profile == "default" for candidate_profile, _ in bindings
+        ):
+            if self._profile_host is not None:
+                self._profile_host.release_default_events(
+                    self._profile_lease_owner(session_id)
+                )
+
+    def _remove_profile_relay_session(self, session_id: str) -> None:
+        self._profile_directory_sessions.pop(session_id, None)
+        for profile, session_key in tuple(
+            self._profile_bindings_by_relay.get(session_id, set())
+        ):
+            self._unbind_profile_conversation(profile, session_key, session_id)
+
+    def _clear_profile_subscriptions(self) -> None:
+        for session_id in tuple(self._profile_bindings_by_relay):
+            self._remove_profile_relay_session(session_id)
+        self._profile_directory_sessions.clear()
+        self._profile_conversation_sessions.clear()
+        self._profile_bindings_by_relay.clear()
+        self._profile_run_bindings.clear()
+
+    def _prune_profile_bindings(self, now: float | None = None) -> None:
+        now = now if now is not None else time.monotonic()
+        cutoff = now - _PROFILE_BINDING_TTL_SECONDS
+        for session_id, touched_at in tuple(self._profile_directory_sessions.items()):
+            if touched_at < cutoff:
+                self._profile_directory_sessions.pop(session_id, None)
+        all_bindings = sorted(
+            (
+                (touched_at, profile, session_key, session_id)
+                for (profile, session_key), subscribers
+                in self._profile_conversation_sessions.items()
+                for session_id, touched_at in subscribers.items()
+            ),
+            key=lambda item: item[0],
+        )
+        expired = [item for item in all_bindings if item[0] < cutoff]
+        overflow = max(0, len(all_bindings) - _PROFILE_BINDING_LIMIT)
+        victims = expired + [
+            item for item in all_bindings[:overflow] if item not in expired
+        ]
+        for _touched, profile, session_key, session_id in victims:
+            self._unbind_profile_conversation(profile, session_key, session_id)
+        for key, (_session_key, touched_at) in tuple(self._profile_run_bindings.items()):
+            if touched_at < cutoff:
+                self._profile_run_bindings.pop(key, None)
+        while len(self._profile_run_bindings) > _PROFILE_RUN_BINDING_LIMIT:
+            oldest = min(
+                self._profile_run_bindings,
+                key=lambda key: self._profile_run_bindings[key][1],
+            )
+            self._profile_run_bindings.pop(oldest, None)
+
+    async def _forward_profile_event(self, envelope: dict[str, Any]) -> None:
+        """Route a nested profile event only to relay sessions bound to it."""
+        now = time.monotonic()
+        self._prune_profile_bindings(now)
+        profile = str(envelope.get("profile") or "")
+        event_type = str(envelope.get("type") or "")
+        data = envelope.get("data")
+        payload = data if isinstance(data, dict) else {}
+        targets: set[str] = set()
+
+        if event_type == "directory":
+            targets.update(self._profile_directory_sessions)
+        elif event_type == "connection":
+            targets.update(self._profile_directory_sessions)
+            for (candidate_profile, _session_key), subscribers in (
+                self._profile_conversation_sessions.items()
+            ):
+                if candidate_profile == profile:
+                    targets.update(subscribers)
+
+        session_key = str(payload.get("sessionKey") or "")
+        if session_key:
+            subscribers = self._profile_conversation_sessions.get(
+                (profile, session_key), {}
+            )
+            targets.update(subscribers)
+            for session_id in subscribers:
+                subscribers[session_id] = now
+
+        run_id = str(payload.get("runId") or "")
+        if run_id:
+            bound = self._profile_run_bindings.get((profile, run_id))
+            if bound is not None:
+                run_session_key, _ = bound
+                self._profile_run_bindings[(profile, run_id)] = (
+                    run_session_key, now
+                )
+                targets.update(
+                    self._profile_conversation_sessions.get(
+                        (profile, run_session_key), {}
+                    )
+                )
+
+        for session_id in sorted(targets):
+            await self._send_or_queue(json.dumps({
+                "type": "event",
+                "sessionId": session_id,
+                "event": "profile.event",
+                "data": envelope,
+            }))
+
+    async def _handle_profile_rpc(self, ws, msg: dict[str, Any]) -> None:
+        rpc_id = str(msg.get("id") or "")
+        session_id = str(msg.get("sessionId") or "")
+        method = str(msg.get("method") or "")
+        params = msg.get("params")
+        host = self._profile_host
+        if host is None:
+            await ws.send(json.dumps({
+                "type": "rpc",
+                "id": rpc_id,
+                "sessionId": session_id,
+                "error": {
+                    "code": "PROFILE_HOST_UNAVAILABLE",
+                    "message": "This agent host does not manage isolated profiles.",
+                    "retryable": False,
+                },
+            }))
+            return
+
+        self._bind_profile_directory(session_id)
+        profile = ""
+        inner_method = ""
+        inner_session_key = ""
+        if isinstance(params, dict) and method == "profiles.rpc":
+            profile = str(params.get("name") or "")
+            inner_method = str(params.get("method") or "")
+            inner_params = params.get("params")
+            if isinstance(inner_params, dict):
+                inner_session_key = str(inner_params.get("sessionKey") or "")
+            if inner_session_key:
+                # Bind before dispatch: chat.send may emit its first event
+                # immediately after the acknowledgement on a fast local model.
+                self._bind_profile_conversation(
+                    profile, inner_session_key, session_id
+                )
+
+        try:
+            result = await host.dispatch(method, params)
+        except ProfileHostError as exc:
+            await ws.send(json.dumps({
+                "type": "rpc",
+                "id": rpc_id,
+                "sessionId": session_id,
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "retryable": exc.retryable,
+                },
+            }))
+            return
+        except FileNotFoundError:
+            error = {"code": "PROFILE_NOT_FOUND", "message": "The agent no longer exists."}
+        except FileExistsError:
+            error = {"code": "PROFILE_ALREADY_EXISTS", "message": "An agent with this name already exists."}
+        except ValueError as exc:
+            error = {"code": "INVALID_PARAMS", "message": str(exc)[:500]}
+        except Exception:
+            logger.exception("[WebChannel] profile rpc {} failed", method)
+            error = {"code": "INTERNAL", "message": "The profile operation failed."}
+        else:
+            if (
+                inner_method == "chat.send"
+                and inner_session_key
+                and isinstance(result, dict)
+            ):
+                run_id = str(result.get("runId") or "")
+                if run_id:
+                    self._profile_run_bindings[(profile, run_id)] = (
+                        inner_session_key, time.monotonic()
+                    )
+                    self._prune_profile_bindings()
+            await ws.send(json.dumps({
+                "type": "rpc",
+                "id": rpc_id,
+                "sessionId": session_id,
+                "result": result,
+            }))
+            return
+
+        await ws.send(json.dumps({
+            "type": "rpc",
+            "id": rpc_id,
+            "sessionId": session_id,
+            "error": {**error, "retryable": False},
+        }))
 
     def _session_key_for_relay_id(self, session_id: str) -> str:
         """Best-effort reverse lookup for relay session id → stable session key."""
@@ -359,6 +643,7 @@ class WebChannel(BaseChannel):
 
     async def stop(self) -> None:
         self._running = False
+        self._clear_profile_subscriptions()
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -1000,7 +1285,7 @@ class WebChannel(BaseChannel):
         """Open one WebSocket connection to the relay proxy and process messages."""
         import time
 
-        from jose import jwt as jose_jwt
+        import jwt
 
         jwt_secret = os.environ.get("MOLTBOT_PROXY_JWT_SECRET", "")
         if not jwt_secret or jwt_secret == "flowly-moltbot-proxy-secret-change-in-production":
@@ -1022,7 +1307,7 @@ class WebChannel(BaseChannel):
             "iss": "flowly",
             "aud": "moltbot-proxy",
         }
-        token = jose_jwt.encode(payload, jwt_secret, algorithm="HS256")
+        token = jwt.encode(payload, jwt_secret, algorithm="HS256")
         url = f"{self.config.relay_url}?token={token}"
 
         logger.info(f"[WebChannel] Connecting to relay: {self.config.relay_url}")
@@ -1068,7 +1353,10 @@ class WebChannel(BaseChannel):
                         msg = json.loads(raw)
                         if (
                             msg.get("type") == "rpc"
-                            and msg.get("method") in feature_rpc.LONG_RUNNING_METHODS
+                            and (
+                                msg.get("method") in feature_rpc.LONG_RUNNING_METHODS
+                                or msg.get("method") in _PROFILE_LONG_RUNNING_METHODS
+                            )
                         ):
                             # Keep receiving relay pings and other sessions'
                             # traffic while a browser OAuth flow is pending.
@@ -1091,6 +1379,7 @@ class WebChannel(BaseChannel):
                 if pending_long_rpcs:
                     await asyncio.gather(*pending_long_rpcs, return_exceptions=True)
 
+        self._clear_profile_subscriptions()
         self._ws = None
 
     async def _serve_media_fetch(self, ws, msg: dict) -> None:
@@ -1169,6 +1458,7 @@ class WebChannel(BaseChannel):
             session_id = msg.get("sessionId", "")
             logger.info(f"[WebChannel] Browser disconnected: {session_id}")
             self._pending.pop(session_id, None)
+            self._remove_profile_relay_session(session_id)
 
         elif msg_type == "rpc":
             await self._handle_rpc(ws, msg)
@@ -1476,6 +1766,9 @@ class WebChannel(BaseChannel):
             }
             await ws.send(json.dumps(ack))
 
+        elif method.startswith("profiles."):
+            await self._handle_profile_rpc(ws, msg)
+
         elif method in feature_rpc.FEATURE_METHODS:
             # Every desktop/iOS feature RPC (connections, config, memory, kg,
             # sessions, audit, persona, provider, skills, assistants, pairing)
@@ -1526,6 +1819,8 @@ class WebChannel(BaseChannel):
                 )
             )
             return
+        if method == "system.capabilities" and self._profile_host is not None:
+            result = {**result, "profileHost": self._profile_host.capabilities()}
         await ws.send(
             json.dumps(
                 {

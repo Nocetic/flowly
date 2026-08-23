@@ -27,6 +27,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,7 @@ _CLONE_ALL_STRIP = [
 ]
 
 _PROFILE_METADATA_FILE = "profile.json"
+_PROFILE_HOST_FILE = "profile-host.json"
 _RUNTIME_LEASE_FILE = ".desktop-runtime.json"
 _MAX_SOUL_BYTES = 64 * 1024
 _MAX_MODEL_LENGTH = 256
@@ -277,6 +279,7 @@ class ProfileInfo:
     mark_tone: str = ""
     created_at: str = ""
     updated_at: str = ""
+    bot_id: str = ""
 
     def to_dict(self) -> dict:
         """Return the stable, JSON-safe profile descriptor used by clients."""
@@ -294,7 +297,19 @@ class ProfileInfo:
             "markTone": self.mark_tone,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
+            "botId": self.bot_id,
         }
+
+    def to_public_dict(self) -> dict:
+        """Return the remote-safe profile descriptor.
+
+        ``path`` is intentionally omitted: remote Desktop/iOS clients need a
+        stable bot identity and presentation metadata, never the host's local
+        filesystem layout.
+        """
+        value = self.to_dict()
+        value.pop("path", None)
+        return value
 
 
 def _utc_now() -> str:
@@ -448,6 +463,7 @@ def _metadata_for(name: str, profile_dir: Path, *, is_default: bool) -> dict:
         "mark_tone": str(meta.get("markTone") or "").strip(),
         "created_at": str(meta.get("createdAt") or "").strip(),
         "updated_at": str(meta.get("updatedAt") or "").strip(),
+        "bot_id": str(meta.get("botId") or "").strip(),
     }
 
 
@@ -623,6 +639,7 @@ def create_profile(
         now = _utc_now()
         _atomic_write_json(temp_dir / _PROFILE_METADATA_FILE, {
             "version": 1,
+            "botId": str(uuid.uuid4()),
             "displayName": display_name.strip() or name,
             "description": description.strip(),
             "markText": _validate_mark_text(mark_text),
@@ -734,6 +751,57 @@ def describe_profile(name: str) -> ProfileInfo:
     raise FileNotFoundError(f"Profile '{name}' does not exist.")
 
 
+def ensure_profile_bot_id(name: str) -> ProfileInfo:
+    """Backfill and return the stable public UUID for one profile.
+
+    Older profiles predate remote bot hosts and therefore have no durable
+    identity beyond their renameable directory name. The host calls this at
+    its public boundary so existing profiles migrate lazily without moving any
+    data or rewriting their sessions.
+    """
+    profile = describe_profile(name)
+    current = _profile_metadata(profile.path)
+    raw = str(current.get("botId") or "").strip()
+    try:
+        parsed = uuid.UUID(raw)
+    except (ValueError, AttributeError):
+        parsed = uuid.uuid4()
+    bot_id = str(parsed)
+    if raw != bot_id:
+        now = _utc_now()
+        current.update({
+            "version": 1,
+            "botId": bot_id,
+            "displayName": str(current.get("displayName") or profile.display_name or name),
+            "description": str(current.get("description") or profile.description),
+            "markText": str(current.get("markText") or profile.mark_text),
+            "markTone": str(current.get("markTone") or profile.mark_tone),
+            "createdAt": str(current.get("createdAt") or profile.created_at or now),
+            "updatedAt": str(current.get("updatedAt") or profile.updated_at or now),
+        })
+        _atomic_write_json(profile.path / _PROFILE_METADATA_FILE, current)
+        profile = describe_profile(name)
+    return profile
+
+
+def get_or_create_profile_host_id() -> str:
+    """Return the installation's stable, opaque remote bot-host UUID."""
+    path = _DEFAULT_HOME / _PROFILE_HOST_FILE
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        current = {}
+    raw = str(current.get("hostId") or "") if isinstance(current, dict) else ""
+    try:
+        parsed = uuid.UUID(raw)
+    except (ValueError, AttributeError):
+        parsed = uuid.uuid4()
+    host_id = str(parsed)
+    if raw != host_id:
+        _atomic_write_json(path, {"version": 1, "hostId": host_id})
+    return host_id
+
+
 def update_profile_metadata(
     name: str,
     *,
@@ -748,6 +816,7 @@ def update_profile_metadata(
     now = _utc_now()
     current.update({
         "version": 1,
+        "botId": str(current.get("botId") or profile.bot_id or uuid.uuid4()),
         "displayName": (
             str(display_name).strip() if display_name is not None
             else str(current.get("displayName") or profile.display_name or name).strip()

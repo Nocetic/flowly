@@ -1,0 +1,243 @@
+from __future__ import annotations
+
+import json
+import os
+
+import aiohttp
+import pytest
+
+import flowly.profile as profiles
+from flowly.gateway.server import GatewayServer
+from flowly.profile_host import ProfileHost
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="managed process-group lifecycle is POSIX-specific")
+async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    default = home / ".flowly"
+    root = default / "profiles"
+    home.mkdir()
+    default.mkdir()
+    (default / "workspace").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-profile-host-key")
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", default)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", root)
+    created = profiles.create_profile(
+        "writer",
+        local_runtime=True,
+        provider="openai",
+        model="openai/gpt-4o-mini",
+    )
+    config_path = created / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.setdefault("providers", {}).setdefault("openai", {})["apiKey"] = (
+        "test-profile-host-key"
+    )
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    host = ProfileHost()
+
+    try:
+        connected = await host.connect("writer")
+        assert connected["status"]["state"] == "connected"
+
+        result = await host.rpc("writer", "sessions.list", {})
+        assert result == {"sessions": []}
+
+        stopped = await host.stop("writer")
+        assert stopped["status"]["state"] == "stopped"
+        assert profiles.read_runtime_lease(root / "writer") is None
+    finally:
+        await host.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="managed process-group lifecycle is POSIX-specific")
+async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    default = home / ".flowly"
+    root = default / "profiles"
+    home.mkdir()
+    default.mkdir()
+    (default / "workspace").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", default)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", root)
+    created = profiles.create_profile(
+        "writer",
+        local_runtime=True,
+        provider="openai",
+        model="openai/gpt-4o-mini",
+    )
+    config_path = created / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.setdefault("providers", {}).setdefault("openai", {})["apiKey"] = "test-key"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    async def on_chat(*_args):
+        return "", {}
+
+    server = GatewayServer(
+        host="127.0.0.1",
+        port=0,
+        auth_token="remote-profile-secret",
+        require_loopback_auth=True,
+        advertise_control=False,
+        enable_profile_host=True,
+        on_chat_message=on_chat,
+    )
+    await server.start()
+    try:
+        origin = f"http://127.0.0.1:{server.port}"
+        async with aiohttp.ClientSession() as session:
+            ticket_response = await session.post(
+                f"{origin}/api/auth/ws-ticket",
+                headers={"Authorization": "Bearer remote-profile-secret"},
+            )
+            assert ticket_response.status == 200
+            ticket = (await ticket_response.json())["ticket"]
+            async with session.ws_connect(f"{origin}/ws?ticket={ticket}") as ws:
+                request_number = 0
+                events: list[dict] = []
+
+                async def rpc(method: str, params: dict | None = None):
+                    nonlocal request_number
+                    request_number += 1
+                    request_id = f"request-{request_number}"
+                    await ws.send_json({
+                        "type": "rpc",
+                        "id": request_id,
+                        "method": method,
+                        "params": params or {},
+                    })
+                    while True:
+                        frame = await ws.receive_json(timeout=100)
+                        if frame.get("type") == "rpc" and frame.get("id") == request_id:
+                            assert "error" not in frame, frame.get("error")
+                            return frame.get("result")
+                        if frame.get("type") == "event":
+                            events.append(frame)
+
+                capabilities = await rpc("profiles.capabilities")
+                assert "profiles.rpc" in capabilities["methods"]
+                assert "config.get" not in capabilities["profileRpcMethods"]
+                system = await rpc("system.capabilities")
+                assert system["profileHost"]["hostId"] == capabilities["hostId"]
+
+                directory = await rpc("profiles.list")
+                assert {item["name"] for item in directory["profiles"]} == {
+                    "default",
+                    "writer",
+                }
+                assert all("path" not in item for item in directory["profiles"])
+
+                created_remote = await rpc("profiles.create", {
+                    "name": "review-bot",
+                    "cloneFrom": "writer",
+                    "displayName": "Review Bot",
+                    "description": "Reviews drafts",
+                })
+                assert created_remote["profile"]["displayName"] == "Review Bot"
+                configured = await rpc("profiles.configure", {
+                    "name": "review-bot",
+                    "description": "Reviews final drafts",
+                    "markTone": "violet",
+                })
+                assert configured["profile"]["description"] == "Reviews final drafts"
+                settings = await rpc("profiles.settings", {"name": "review-bot"})
+                assert "workspace" not in settings["settings"]
+                prepared = await rpc("profiles.delete.prepare", {"name": "review-bot"})
+                deleted = await rpc("profiles.delete.commit", {
+                    "name": "review-bot",
+                    "confirmation": prepared["confirmation"],
+                })
+                assert deleted["botId"] == prepared["profile"]["botId"]
+
+                connected = await rpc("profiles.connect", {"name": "writer"})
+                assert connected["status"]["state"] == "connected"
+                assert any(
+                    event.get("event") == "profile.event"
+                    and event.get("data", {}).get("profile") == "writer"
+                    and event.get("data", {}).get("type") == "connection"
+                    and event.get("data", {}).get("data", {}).get("state") == "connected"
+                    for event in events
+                )
+                sessions = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "sessions.list",
+                    "params": {},
+                })
+                assert sessions == {"sessions": []}
+                history = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "chat.history",
+                    "params": {"sessionKey": "ios:writer-thread"},
+                })
+                assert history["messages"] == []
+                selected = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "sessions.model.set",
+                    "params": {
+                        "sessionKey": "ios:writer-thread",
+                        "model": "openai/gpt-4o-mini",
+                    },
+                })
+                assert selected["model"] == "openai/gpt-4o-mini"
+                model = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "sessions.model.get",
+                    "params": {"sessionKey": "ios:writer-thread"},
+                })
+                assert model["model"] == "openai/gpt-4o-mini"
+                approvals = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "exec.approval.list",
+                    "params": {},
+                })
+                assert approvals == {"approvals": []}
+                clarifies = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "agent.clarify.list",
+                    "params": {},
+                })
+                assert clarifies == {"clarifies": []}
+                routines = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "cron.list",
+                    "params": {},
+                })
+                assert routines == {"jobs": [], "running": []}
+                added = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "cron.add",
+                    "params": {
+                        "name": "daily-review",
+                        "message": "Review the inbox",
+                        "schedule": {"kind": "every", "everyMs": 86_400_000},
+                        "deliver": False,
+                    },
+                })
+                job_id = added["job"]["id"]
+                updated = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "cron.update",
+                    "params": {"id": job_id, "enabled": False},
+                })
+                assert updated["job"]["enabled"] is False
+                removed = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "cron.remove",
+                    "params": {"id": job_id},
+                })
+                assert removed == {"ok": True}
+                stopped = await rpc("profiles.stop", {"name": "writer"})
+                assert stopped["status"]["state"] == "stopped"
+    finally:
+        await server.stop()

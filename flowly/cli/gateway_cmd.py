@@ -1690,12 +1690,15 @@ Respond to the user now:"""
     except Exception:
         pass
 
+    from flowly.profile import current_profile_name
+
     gateway_server = GatewayServer(
         host=effective_host,
         port=port,
         auth_token=auth_token,
         require_loopback_auth=local_runtime,
         advertise_control=not local_runtime,
+        enable_profile_host=not local_runtime and current_profile_name() == "default",
         on_voice_message=on_voice_message if legacy_voice_bridge_enabled else None,
         on_cron_run=on_cron_run,
         on_cron_reload=cron.reload,
@@ -1746,6 +1749,8 @@ Respond to the user now:"""
     web = channels.get_channel("web")
     if web and hasattr(web, "set_local_event_callback"):
         web.set_local_event_callback(gateway_server.broadcast_event)
+    if web and hasattr(web, "set_profile_host"):
+        web.set_profile_host(gateway_server.profile_host)
 
     # Wire artifact broadcast callback — push to desktop (gateway) AND relay (web channel)
     if artifact_store:

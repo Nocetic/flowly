@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,31 @@ def test_local_runtime_clone_keeps_provider_but_drops_transport_identity(profile
     assert info.to_dict()["markTone"] == "violet"
     assert info.created_at.endswith("Z")
     assert info.to_dict()["path"] == str(created)
+    assert str(uuid.UUID(info.bot_id)) == info.bot_id
+    assert info.to_public_dict()["botId"] == info.bot_id
+    assert "path" not in info.to_public_dict()
+
+
+def test_legacy_profile_and_host_ids_are_backfilled_once(profile_roots) -> None:
+    default, root = profile_roots
+    (default / "config.json").write_text("{}", encoding="utf-8")
+    legacy = root / "legacy"
+    legacy.mkdir(parents=True)
+    (legacy / "config.json").write_text("{}", encoding="utf-8")
+    (legacy / "profile.json").write_text(
+        json.dumps({"version": 1, "displayName": "Legacy"}),
+        encoding="utf-8",
+    )
+
+    first = profiles.ensure_profile_bot_id("legacy")
+    second = profiles.ensure_profile_bot_id("legacy")
+    first_host = profiles.get_or_create_profile_host_id()
+    second_host = profiles.get_or_create_profile_host_id()
+
+    assert first.bot_id == second.bot_id == str(uuid.UUID(first.bot_id))
+    assert first_host == second_host == str(uuid.UUID(first_host))
+    assert first.to_public_dict()["displayName"] == "Legacy"
+    assert "path" not in first.to_public_dict()
 
 
 def test_profile_creation_is_atomic_when_clone_config_is_invalid(profile_roots) -> None:
