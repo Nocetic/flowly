@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -806,7 +807,7 @@ def update_profile_settings(
     validated_model = _validate_model(model) if model is not None else None
     validated_soul = _validate_soul(soul) if soul is not None else None
     profile = describe_profile(name)
-    lease = read_runtime_lease(profile.path)
+    lease = reconcile_runtime_lease(profile.path, profile_name=name)
     if lease:
         raise RuntimeError(
             f"Profile runtime is active (pid {lease.get('pid')}). Stop it before changing settings."
@@ -865,6 +866,204 @@ def _process_identity(pid: int) -> str | None:
         return None
 
 
+def _process_command(pid: int) -> list[str] | None:
+    """Return one process argv without invoking a shell."""
+    if pid <= 0:
+        return None
+    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    try:
+        raw = proc_cmdline.read_bytes()
+        argv = [
+            part.decode("utf-8", errors="replace")
+            for part in raw.split(b"\0")
+            if part
+        ]
+        return argv or None
+    except (FileNotFoundError, OSError):
+        pass
+    try:
+        value = subprocess.check_output(
+            ["ps", "-ww", "-o", "command=", "-p", str(pid)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip()
+        return shlex.split(value) if value else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _process_parent_pid(pid: int) -> int | None:
+    """Return a process parent PID, or ``None`` when it cannot be verified."""
+    if pid <= 0:
+        return None
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        tail = proc_stat.read_text(encoding="utf-8").rsplit(") ", 1)[1].split()
+        return int(tail[1])
+    except (FileNotFoundError, OSError, ValueError, IndexError, UnicodeDecodeError):
+        pass
+    try:
+        value = subprocess.check_output(
+            ["ps", "-o", "ppid=", "-p", str(pid)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip()
+        return int(value.split()[0]) if value else None
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def _option_values(argv: list[str], option: str) -> list[str]:
+    values: list[str] = []
+    prefix = f"{option}="
+    for index, token in enumerate(argv):
+        if token == option and index + 1 < len(argv):
+            values.append(argv[index + 1])
+        elif token.startswith(prefix):
+            values.append(token[len(prefix):])
+    return values
+
+
+def _is_managed_profile_runtime_command(pid: int, profile_name: str) -> bool:
+    """Match only the ephemeral named-profile runtime spawn shape."""
+    argv = _process_command(pid)
+    if not argv or "serve" not in argv:
+        return False
+    serve_index = argv.index("serve")
+    basenames = [Path(token).name.lower() for token in argv[:serve_index]]
+    executable_shape = bool(basenames) and basenames[0] in {"flowly", "flowly.exe"}
+    if len(basenames) >= 2 and basenames[0].startswith(("python", "pythonw")):
+        executable_shape = basenames[1] in {"flowly", "flowly.exe"}
+    if basenames and basenames[0] in {"uv", "uv.exe"} and "run" in argv[:serve_index]:
+        executable_shape = "flowly" in basenames or "flowly.exe" in basenames
+    if not executable_shape:
+        return False
+    profiles = _option_values(argv, "--profile")
+    ports = _option_values(argv, "--port")
+    return (
+        bool(profiles)
+        and set(profiles) == {profile_name}
+        and bool(ports)
+        and set(ports) == {"0"}
+    )
+
+
+def _desktop_manager_context() -> tuple[int, str, str | None] | None:
+    raw_pid = os.environ.get("FLOWLY_DESKTOP_MANAGER_PID", "").strip()
+    instance = os.environ.get("FLOWLY_DESKTOP_MANAGER_INSTANCE", "").strip()
+    expected_identity = os.environ.get("FLOWLY_DESKTOP_MANAGER_IDENTITY", "").strip()
+    try:
+        pid = int(raw_pid)
+    except ValueError:
+        return None
+    if pid <= 0 or not instance or len(instance) > 128 or not _pid_is_alive(pid):
+        return None
+    actual_identity = _process_identity(pid)
+    if expected_identity and actual_identity and expected_identity != actual_identity:
+        return None
+    return pid, instance, expected_identity or actual_identity
+
+
+def _lease_owned_by_manager(
+    lease: dict,
+    manager: tuple[int, str, str | None],
+) -> bool:
+    pid, instance, identity = manager
+    try:
+        lease_pid = int(lease.get("managerPid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if lease_pid != pid or str(lease.get("managerInstance") or "") != instance:
+        return False
+    expected_identity = str(lease.get("managerIdentity") or "")
+    return not expected_identity or (identity is not None and identity == expected_identity)
+
+
+def _legacy_runtime_is_recoverable(
+    lease: dict,
+    profile_name: str,
+    manager: tuple[int, str, str | None],
+) -> bool:
+    """Recognize a legacy child owned by this Desktop or reparented to init."""
+    try:
+        current = int(lease.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    manager_pid = manager[0]
+    for _ in range(12):
+        if not _is_managed_profile_runtime_command(current, profile_name):
+            return False
+        parent = _process_parent_pid(current)
+        if parent in (0, 1):
+            return True
+        if parent is None or parent == current:
+            return False
+        if parent == manager_pid:
+            return True
+        current = parent
+    return False
+
+
+def _process_matches_identity(pid: int, identity: str) -> bool:
+    return bool(identity) and _pid_is_alive(pid) and _process_identity(pid) == identity
+
+
+def _unlink_matching_runtime_lease(path: Path, lease: dict) -> None:
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return
+    if not isinstance(current, dict):
+        return
+    if (
+        current.get("pid") == lease.get("pid")
+        and current.get("instanceId") == lease.get("instanceId")
+    ):
+        path.unlink(missing_ok=True)
+
+
+def _terminate_runtime_lease(path: Path, lease: dict) -> bool:
+    """Stop the exact leased process with bounded TERM/KILL escalation."""
+    try:
+        pid = int(lease.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    identity = str(lease.get("processIdentity") or "") or (_process_identity(pid) or "")
+    if not _process_matches_identity(pid, identity):
+        _unlink_matching_runtime_lease(path, lease)
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _unlink_matching_runtime_lease(path, lease)
+        return True
+    except OSError:
+        return False
+    for _ in range(40):
+        if not _process_matches_identity(pid, identity):
+            _unlink_matching_runtime_lease(path, lease)
+            return True
+        time.sleep(0.05)
+    if not _process_matches_identity(pid, identity):
+        _unlink_matching_runtime_lease(path, lease)
+        return True
+    try:
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except ProcessLookupError:
+        _unlink_matching_runtime_lease(path, lease)
+        return True
+    except OSError:
+        return False
+    for _ in range(20):
+        if not _process_matches_identity(pid, identity):
+            _unlink_matching_runtime_lease(path, lease)
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def _lease_process_matches(lease: dict) -> bool:
     try:
         pid = int(lease.get("pid") or 0)
@@ -906,26 +1105,54 @@ def read_runtime_lease(profile_dir: Path) -> dict | None:
     return None
 
 
+def reconcile_runtime_lease(
+    profile_dir: Path,
+    *,
+    profile_name: str | None = None,
+) -> dict | None:
+    """Retire a runtime provably owned by this Desktop or left by a dead one."""
+    path = profile_dir / _RUNTIME_LEASE_FILE
+    lease = read_runtime_lease(profile_dir)
+    if not lease:
+        if path.exists() or path.is_symlink():
+            lease = read_runtime_lease(profile_dir)
+        if not lease and (path.exists() or path.is_symlink()):
+            raise RuntimeError(
+                "Profile runtime ownership data is unreadable. "
+                "Restart Flowly Desktop before trying again."
+            )
+    if not lease:
+        return None
+    manager = _desktop_manager_context()
+    if manager is None:
+        return lease
+
+    has_manager = bool(lease.get("managerPid") or lease.get("managerInstance"))
+    recoverable = (
+        _lease_owned_by_manager(lease, manager)
+        or (has_manager and _lease_manager_dead(lease))
+    )
+    if not has_manager:
+        recoverable = _legacy_runtime_is_recoverable(
+            lease,
+            profile_name or profile_dir.name,
+            manager,
+        )
+    if recoverable and _terminate_runtime_lease(path, lease):
+        return read_runtime_lease(profile_dir)
+    return lease
+
+
 def claim_runtime_lease(instance_id: str) -> Path:
     """Exclusively claim the current profile for one managed runtime."""
     if not instance_id:
         raise ValueError("runtime instance id is required")
     path = get_flowly_home() / _RUNTIME_LEASE_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = read_runtime_lease(path.parent)
-    if existing and _lease_manager_dead(existing):
-        # A Desktop crash can strand a detached runtime briefly. Only signal a
-        # process whose birth identity still matches the owner-only lease.
-        try:
-            os.kill(int(existing["pid"]), signal.SIGTERM)
-        except (KeyError, TypeError, ValueError, OSError):
-            pass
-        for _ in range(40):
-            if not _lease_process_matches(existing):
-                path.unlink(missing_ok=True)
-                existing = None
-                break
-            time.sleep(0.05)
+    existing = reconcile_runtime_lease(
+        path.parent,
+        profile_name=current_profile_name(),
+    )
     if existing:
         raise RuntimeError(
             f"Profile runtime is already active (pid {existing.get('pid')})."
@@ -939,17 +1166,13 @@ def claim_runtime_lease(instance_id: str) -> Path:
         "port": 0,
         "startedAt": _utc_now(),
     }
-    manager_pid_raw = os.environ.get("FLOWLY_DESKTOP_MANAGER_PID", "").strip()
-    manager_instance = os.environ.get("FLOWLY_DESKTOP_MANAGER_INSTANCE", "").strip()
-    try:
-        manager_pid = int(manager_pid_raw)
-    except ValueError:
-        manager_pid = 0
-    if manager_pid > 0 and manager_instance:
+    manager = _desktop_manager_context()
+    if manager is not None:
+        manager_pid, manager_instance, manager_identity = manager
         payload.update({
             "managerPid": manager_pid,
-            "managerIdentity": _process_identity(manager_pid),
-            "managerInstance": manager_instance[:128],
+            "managerIdentity": manager_identity,
+            "managerInstance": manager_instance,
         })
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o600)
@@ -999,7 +1222,7 @@ def delete_profile(name: str) -> None:
     if profile_dir.is_symlink() or _PROFILES_ROOT.resolve() not in profile_dir.resolve().parents:
         raise ValueError("Profile directory failed containment validation.")
 
-    lease = read_runtime_lease(profile_dir)
+    lease = reconcile_runtime_lease(profile_dir, profile_name=name)
     if lease:
         raise RuntimeError(
             f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before deletion."

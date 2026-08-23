@@ -2214,9 +2214,11 @@ Respond to the user now:"""
                         while not shutdown_event.is_set():
                             await asyncio.sleep(2)
                             alive = _pid_is_alive(manager_pid)
+                            actual_identity = _process_identity(manager_pid)
                             same_process = (
                                 not manager_identity
-                                or _process_identity(manager_pid) == manager_identity
+                                or actual_identity is None
+                                or actual_identity == manager_identity
                             )
                             if not alive or not same_process:
                                 logger.warning(

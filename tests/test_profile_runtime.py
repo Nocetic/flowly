@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import signal
+import subprocess
+import sys
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -347,6 +352,253 @@ def test_runtime_lease_rejects_pid_reuse(profile_roots, monkeypatch) -> None:
 
     assert profiles.read_runtime_lease(created) is None
     assert not lease.exists()
+
+
+def test_corrupt_runtime_lease_fails_closed_before_profile_mutation(profile_roots) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("writer", local_runtime=True)
+    (created / ".desktop-runtime.json").write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="ownership data is unreadable"):
+        profiles.delete_profile("writer")
+
+    assert created.exists()
+
+
+def test_managed_runtime_command_requires_exact_profile_and_ephemeral_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = {
+        101: ["python", "/venv/bin/flowly", "--profile", "writer", "serve", "--port", "0"],
+        102: ["flowly", "--profile=other", "serve", "--port=0"],
+        103: ["flowly", "--profile", "writer", "serve", "--port", "9119"],
+        104: ["python", "notes.py", "flowly", "--profile", "writer", "serve", "--port", "0"],
+    }
+    monkeypatch.setattr(profiles, "_process_command", commands.get)
+
+    assert profiles._is_managed_profile_runtime_command(101, "writer") is True
+    assert profiles._is_managed_profile_runtime_command(102, "writer") is False
+    assert profiles._is_managed_profile_runtime_command(103, "writer") is False
+    assert profiles._is_managed_profile_runtime_command(104, "writer") is False
+
+
+def test_desktop_reconciles_legacy_runtime_reparented_to_init(
+    profile_roots,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("writer", local_runtime=True)
+    lease_path = created / ".desktop-runtime.json"
+    lease_path.write_text(
+        json.dumps({"version": 1, "instanceId": "legacy", "pid": 101}),
+        encoding="utf-8",
+    )
+    alive = {101, 102, 700}
+    commands = {
+        101: ["python", "/venv/bin/flowly", "--profile", "writer", "serve", "--port", "0"],
+        102: ["uv", "tool", "run", "flowly", "--profile", "writer", "serve", "--port", "0"],
+    }
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_PID", "700")
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_INSTANCE", "desktop-a")
+    monkeypatch.setattr(profiles, "_pid_is_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(profiles, "_process_identity", lambda pid: f"identity-{pid}" if pid in alive else None)
+    monkeypatch.setattr(profiles, "_process_command", commands.get)
+    monkeypatch.setattr(profiles, "_process_parent_pid", lambda pid: {101: 102, 102: 1}.get(pid))
+    monkeypatch.setattr(profiles.os, "kill", lambda pid, _signal: alive.discard(pid))
+
+    assert profiles.reconcile_runtime_lease(created, profile_name="writer") is None
+    assert not lease_path.exists()
+
+
+def test_desktop_preserves_legacy_runtime_with_another_live_parent(
+    profile_roots,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("writer", local_runtime=True)
+    lease = {"version": 1, "instanceId": "legacy", "pid": 101}
+    (created / ".desktop-runtime.json").write_text(json.dumps(lease), encoding="utf-8")
+    commands = {
+        101: ["python", "/venv/bin/flowly", "--profile", "writer", "serve", "--port", "0"],
+        102: ["uv", "tool", "run", "flowly", "--profile", "writer", "serve", "--port", "0"],
+        333: ["/Applications/Flowly.app/Contents/MacOS/Flowly"],
+    }
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_PID", "700")
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_INSTANCE", "desktop-a")
+    monkeypatch.setattr(profiles, "_pid_is_alive", lambda _pid: True)
+    monkeypatch.setattr(profiles, "_process_identity", lambda pid: f"identity-{pid}")
+    monkeypatch.setattr(profiles, "_process_command", commands.get)
+    monkeypatch.setattr(
+        profiles,
+        "_process_parent_pid",
+        lambda pid: {101: 102, 102: 333, 333: 1}.get(pid),
+    )
+    monkeypatch.setattr(profiles.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    assert profiles.reconcile_runtime_lease(created, profile_name="writer") == lease
+    assert kills == []
+
+
+@pytest.mark.parametrize("same_manager,manager_dead", [(True, False), (False, True)])
+def test_desktop_reconciles_owned_or_dead_manager_v2_runtime(
+    profile_roots,
+    monkeypatch: pytest.MonkeyPatch,
+    same_manager: bool,
+    manager_dead: bool,
+) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("writer", local_runtime=True)
+    old_manager = 700 if same_manager else 333
+    lease_path = created / ".desktop-runtime.json"
+    lease_path.write_text(
+        json.dumps({
+            "version": 2,
+            "instanceId": "runtime-a",
+            "pid": 101,
+            "processIdentity": "identity-101",
+            "managerPid": old_manager,
+            "managerIdentity": "old-manager" if manager_dead else f"identity-{old_manager}",
+            "managerInstance": "desktop-a" if same_manager else "desktop-old",
+        }),
+        encoding="utf-8",
+    )
+    alive = {101, 333, 700}
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_PID", "700")
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_INSTANCE", "desktop-a")
+    monkeypatch.setattr(profiles, "_pid_is_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(profiles, "_process_identity", lambda pid: f"identity-{pid}" if pid in alive else None)
+    monkeypatch.setattr(profiles.os, "kill", lambda pid, _signal: alive.discard(pid))
+
+    assert profiles.reconcile_runtime_lease(created, profile_name="writer") is None
+    assert not lease_path.exists()
+
+
+def test_desktop_preserves_v2_runtime_owned_by_another_live_manager(
+    profile_roots,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("writer", local_runtime=True)
+    lease = {
+        "version": 2,
+        "instanceId": "runtime-a",
+        "pid": 101,
+        "processIdentity": "identity-101",
+        "managerPid": 333,
+        "managerIdentity": "identity-333",
+        "managerInstance": "desktop-old",
+    }
+    (created / ".desktop-runtime.json").write_text(json.dumps(lease), encoding="utf-8")
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_PID", "700")
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_INSTANCE", "desktop-a")
+    monkeypatch.setattr(profiles, "_pid_is_alive", lambda _pid: True)
+    monkeypatch.setattr(profiles, "_process_identity", lambda pid: f"identity-{pid}")
+    monkeypatch.setattr(profiles.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    assert profiles.reconcile_runtime_lease(created, profile_name="writer") == lease
+    assert kills == []
+
+
+def test_cli_without_desktop_identity_never_reaps_a_live_runtime(
+    profile_roots,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("writer", local_runtime=True)
+    lease = {"version": 1, "instanceId": "legacy", "pid": 101}
+    (created / ".desktop-runtime.json").write_text(json.dumps(lease), encoding="utf-8")
+    kills: list[tuple[int, int]] = []
+    monkeypatch.delenv("FLOWLY_DESKTOP_MANAGER_PID", raising=False)
+    monkeypatch.delenv("FLOWLY_DESKTOP_MANAGER_INSTANCE", raising=False)
+    monkeypatch.setattr(profiles, "_pid_is_alive", lambda _pid: True)
+    monkeypatch.setattr(profiles.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    assert profiles.reconcile_runtime_lease(created, profile_name="writer") == lease
+    assert kills == []
+
+
+def test_desktop_manager_identity_is_passed_across_the_sandbox_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_PID", "700")
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_INSTANCE", "desktop-a")
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_IDENTITY", "ps:desktop-start")
+    monkeypatch.setattr(profiles, "_pid_is_alive", lambda pid: pid == 700)
+    monkeypatch.setattr(profiles, "_process_identity", lambda _pid: None)
+
+    assert profiles._desktop_manager_context() == (700, "desktop-a", "ps:desktop-start")
+
+
+def test_desktop_manager_identity_mismatch_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_PID", "700")
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_INSTANCE", "desktop-a")
+    monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_IDENTITY", "ps:old-start")
+    monkeypatch.setattr(profiles, "_pid_is_alive", lambda pid: pid == 700)
+    monkeypatch.setattr(profiles, "_process_identity", lambda _pid: "ps:new-start")
+
+    assert profiles._desktop_manager_context() is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX orphan lifecycle integration")
+def test_real_legacy_orphan_is_reaped_before_desktop_reclaims_profile(
+    profile_roots,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("writer", local_runtime=True)
+    pid_file = tmp_path / "child.pid"
+    entrypoint = tmp_path / "flowly"
+    entrypoint.write_text(
+        "import os,sys,time\n"
+        "pid=os.fork()\n"
+        "if pid:\n"
+        " open(sys.argv[-1], 'w').write(str(pid))\n"
+        " os._exit(0)\n"
+        "os.setsid()\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    launcher = subprocess.Popen([
+        sys.executable,
+        str(entrypoint),
+        "--profile",
+        "writer",
+        "serve",
+        "--port",
+        "0",
+        str(pid_file),
+    ])
+    launcher.wait(timeout=5)
+    deadline = time.monotonic() + 5
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    child_pid = int(pid_file.read_text(encoding="utf-8"))
+    try:
+        while profiles._process_parent_pid(child_pid) not in (0, 1):
+            if time.monotonic() >= deadline:
+                pytest.fail("test runtime was not reparented to init")
+            time.sleep(0.02)
+        lease_path = created / ".desktop-runtime.json"
+        lease_path.write_text(
+            json.dumps({"version": 1, "instanceId": "legacy", "pid": child_pid}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_PID", str(os.getpid()))
+        monkeypatch.setenv("FLOWLY_DESKTOP_MANAGER_INSTANCE", "integration-desktop")
+
+        assert profiles.reconcile_runtime_lease(created, profile_name="writer") is None
+        assert not lease_path.exists()
+        assert profiles._pid_is_alive(child_pid) is False
+    finally:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def test_profile_import_rejects_path_traversal(profile_roots, tmp_path: Path) -> None:
