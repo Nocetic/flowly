@@ -279,9 +279,9 @@ class CodexAppServerClient:
         # codex_home (if supplied) is folded in as a Codex-specific
         # override. Doing it in two steps (rather than one dict
         # merge) makes the precedence explicit in code review.
-        spawn_env = os.environ.copy()
-        if env:
-            spawn_env.update(env)
+        from flowly.exec.env_scrub import sanitize_subprocess_env
+
+        spawn_env = sanitize_subprocess_env(os.environ, env)
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
         # The `codex` binary is itself a Node launcher and shells out to

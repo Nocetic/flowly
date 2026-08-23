@@ -11,6 +11,8 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from flowly.agent.tools.filesystem import (
     ListDirTool,
     ReadFileTool,
@@ -21,7 +23,6 @@ from flowly.agent.tools.filesystem import (
     _write_denied_error,
 )
 from flowly.agent.tools.shell import _interpret_exit_code
-
 
 HOME = Path.home()
 
@@ -78,6 +79,26 @@ def test_write_file_tool_still_denied_in_home(tmp_path):
     result = asyncio.run(tool.execute(str(HOME / "flowly-test-denied.txt"), "x"))
     assert result.startswith("Error: write access denied")
     assert not (HOME / "flowly-test-denied.txt").exists()
+
+
+def test_named_profile_cannot_read_sibling_profile(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    profile = tmp_path / ".flowly" / "profiles" / "alpha"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    own_note = workspace / "note.txt"
+    own_note.write_text("own", encoding="utf-8")
+    sibling_note = tmp_path / ".flowly" / "profiles" / "beta" / "workspace" / "secret.txt"
+    sibling_note.parent.mkdir(parents=True)
+    sibling_note.write_text("private", encoding="utf-8")
+    monkeypatch.setenv("FLOWLY_HOME", str(profile))
+
+    tool = ReadFileTool(workspace=workspace)
+    assert asyncio.run(tool.execute(str(own_note))) == "own"
+    denied = asyncio.run(tool.execute(str(sibling_note)))
+    assert denied.startswith("Error: Access denied")
+    assert "private-content" not in denied
 
 
 # ── Denial messages carry next steps ──────────────────────────────────────

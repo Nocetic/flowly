@@ -19,14 +19,19 @@ def _get_allowed_prefixes() -> tuple[Path, ...]:
     (artifacts, summaries, generated files) that the user can find. Sensitive
     paths under ``~/.flowly`` are still blocked via ``_get_denied_paths``.
     """
-    from flowly.profile import get_flowly_home
+    from flowly.profile import current_profile_name, get_flowly_home
     from flowly.agent.tool_result_spill import get_spill_dir
     home = Path.home()
-    return (
+    private_prefixes = (
         get_flowly_home(),
         # Oversized tool results spilled to temp — read_file must be able
         # to read them back. Only this one directory, not the whole temp.
         get_spill_dir(),
+    )
+    if current_profile_name() != "default":
+        return private_prefixes
+    return (
+        *private_prefixes,
         home / "Downloads",
         home / "Desktop",
         home / "Documents",
@@ -106,6 +111,14 @@ def _is_read_allowed(resolved_path: Path, workspace: Path | None) -> bool:
             continue
         except OSError:
             continue
+
+    # Desktop-managed named profiles are intentionally private agents. They
+    # may read their own FLOWLY_HOME/workspace and spill files only; granting
+    # the whole OS-user home here would let one profile inspect every sibling
+    # profile even when its process sandbox was configured correctly.
+    from flowly.profile import current_profile_name
+    if current_profile_name() != "default":
+        return _is_path_allowed(resolved_path, workspace)
 
     try:
         resolved_path.relative_to(Path.home().resolve())

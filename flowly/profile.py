@@ -21,8 +21,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
+import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,12 +68,23 @@ _PROFILE_METADATA_FILE = "profile.json"
 _RUNTIME_LEASE_FILE = ".desktop-runtime.json"
 _MAX_SOUL_BYTES = 64 * 1024
 _MAX_MODEL_LENGTH = 256
+_MAX_IMPORT_MEMBERS = 20_000
+_MAX_IMPORT_BYTES = 512 * 1024 * 1024
 _PROFILE_MARK_TONES = frozenset({
     "aqua", "violet", "rose", "amber", "lime", "sky", "slate",
 })
-_LOCAL_RUNTIME_ENV_DROP = frozenset({
-    "FLOWLY_SERVER_ID",
-    "MOLTBOT_PROXY_JWT_SECRET",
+_LOCAL_RUNTIME_ENV_ALLOW = frozenset({
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GROQ_API_KEY",
+    "XAI_API_KEY",
+    "ZAI_API_KEY",
+    "ZHIPU_API_KEY",
+    "ZHIPUAI_API_KEY",
+    "VLLM_API_KEY",
 })
 
 
@@ -239,7 +253,8 @@ def profile_exists(name: str) -> bool:
     """Check if a named profile exists."""
     if name == "default":
         return True
-    return (_PROFILES_ROOT / name).is_dir()
+    candidate = _PROFILES_ROOT / name
+    return candidate.is_dir() and not candidate.is_symlink()
 
 
 # ── Profile info ──────────────────────────────────────────────────
@@ -474,7 +489,7 @@ def list_profiles() -> list[ProfileInfo]:
     # Named profiles
     if _PROFILES_ROOT.exists():
         for d in sorted(_PROFILES_ROOT.iterdir()):
-            if d.is_dir() and _PROFILE_NAME_RE.match(d.name):
+            if d.is_dir() and not d.is_symlink() and _PROFILE_NAME_RE.match(d.name):
                 skill_count = 0
                 skills_dir = d / "skills"
                 if skills_dir.exists():
@@ -522,7 +537,7 @@ def create_profile(
         raise ValueError("Cannot create a profile named 'default'.")
 
     profile_dir = _PROFILES_ROOT / name
-    if profile_dir.exists():
+    if profile_dir.exists() or profile_dir.is_symlink():
         raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
 
     # Resolve clone source
@@ -533,10 +548,14 @@ def create_profile(
         else:
             validate_profile_name(clone_from)
             source_dir = _PROFILES_ROOT / clone_from
-        if not source_dir.is_dir():
+        if not source_dir.is_dir() or source_dir.is_symlink():
             raise FileNotFoundError(f"Source profile does not exist at {source_dir}")
 
     _PROFILES_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        _PROFILES_ROOT.chmod(0o700)
+    except OSError:
+        pass
     # Stage outside ``~/.flowly``. A full clone of the default profile must not
     # recursively copy its own ``profiles/`` directory (including this staging
     # directory) into itself. The default home's parent is on the same volume,
@@ -547,6 +566,11 @@ def create_profile(
 
     try:
         if clone_all and source_dir:
+            _assert_tree_no_symlinks(
+                source_dir,
+                ignored_top_level={"profiles", "active_profile"}
+                if source_dir == _DEFAULT_HOME else set(),
+            )
             ignore = shutil.ignore_patterns("profiles", "active_profile") if source_dir == _DEFAULT_HOME else None
             shutil.copytree(source_dir, temp_dir, dirs_exist_ok=True, ignore=ignore)
             # Strip runtime files
@@ -566,6 +590,8 @@ def create_profile(
                 for f in _CLONE_CONFIG_FILES + _CLONE_WORKSPACE_FILES:
                     src = source_dir / f
                     if src.exists() and src.is_file():
+                        if src.is_symlink():
+                            raise ValueError(f"Cannot clone symbolic link: {src}")
                         dst = temp_dir / f
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(src, dst)
@@ -573,6 +599,7 @@ def create_profile(
                 # Clone persona files
                 src_personas = source_dir / "workspace" / "personas"
                 if src_personas.is_dir():
+                    _assert_tree_no_symlinks(src_personas)
                     dst_personas = temp_dir / "workspace" / "personas"
                     shutil.copytree(src_personas, dst_personas, dirs_exist_ok=True)
 
@@ -606,11 +633,32 @@ def create_profile(
         # Publishing the completed directory is the commit point. A crash
         # before this line leaves only a hidden temp dir, never a half-profile.
         os.replace(temp_dir, profile_dir)
+        try:
+            profile_dir.chmod(0o700)
+        except OSError:
+            pass
     except BaseException:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
 
     return profile_dir
+
+
+def _assert_tree_no_symlinks(
+    root: Path, *, ignored_top_level: set[str] | None = None
+) -> None:
+    """Reject clone sources that could escape their profile via a link."""
+    if root.is_symlink():
+        raise ValueError(f"Cannot clone symbolic link: {root}")
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        if current_path == root and ignored_top_level:
+            directories[:] = [name for name in directories if name not in ignored_top_level]
+            files = [name for name in files if name not in ignored_top_level]
+        for name in [*directories, *files]:
+            candidate = current_path / name
+            if candidate.is_symlink():
+                raise ValueError(f"Cannot clone symbolic link: {candidate}")
 
 
 def _sanitize_local_runtime_clone(profile_dir: Path, workspace: Path) -> None:
@@ -668,9 +716,9 @@ def _sanitize_local_runtime_clone(profile_dir: Path, workspace: Path) -> None:
         retained = []
         for line in lines:
             key = line.split("=", 1)[0].strip() if "=" in line else ""
-            if key not in _LOCAL_RUNTIME_ENV_DROP:
+            if key in _LOCAL_RUNTIME_ENV_ALLOW:
                 retained.append(line)
-        env_path.write_text("\n".join(retained) + ("\n" if retained else ""), encoding="utf-8")
+        _atomic_write_text(env_path, "\n".join(retained) + ("\n" if retained else ""))
 
 
 def describe_profile(name: str) -> ProfileInfo:
@@ -793,15 +841,66 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _process_identity(pid: int) -> str | None:
+    """Best-effort process birth identity used to reject PID reuse."""
+    if pid <= 0:
+        return None
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        # Field 22 is process starttime. The command field may contain spaces,
+        # so split only after its final closing parenthesis.
+        tail = proc_stat.read_text(encoding="utf-8").rsplit(") ", 1)[1].split()
+        return f"linux:{tail[19]}"
+    except (FileNotFoundError, OSError, IndexError, UnicodeDecodeError):
+        pass
+    try:
+        value = subprocess.check_output(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip()
+        return f"ps:{value}" if value else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _lease_process_matches(lease: dict) -> bool:
+    try:
+        pid = int(lease.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not _pid_is_alive(pid):
+        return False
+    expected = str(lease.get("processIdentity") or "")
+    if not expected:
+        return True  # v1 compatibility
+    return _process_identity(pid) == expected
+
+
+def _lease_manager_dead(lease: dict) -> bool:
+    try:
+        pid = int(lease.get("managerPid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if not _pid_is_alive(pid):
+        return True
+    expected = str(lease.get("managerIdentity") or "")
+    return bool(expected) and _process_identity(pid) != expected
+
+
 def read_runtime_lease(profile_dir: Path) -> dict | None:
     """Return a live Desktop-runtime lease, pruning a stale lease."""
     path = profile_dir / _RUNTIME_LEASE_FILE
     try:
+        if path.is_symlink():
+            return None
         lease = json.loads(path.read_text(encoding="utf-8"))
-        pid = int(lease.get("pid") or 0) if isinstance(lease, dict) else 0
     except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
-    if _pid_is_alive(pid):
+    if isinstance(lease, dict) and _lease_process_matches(lease):
         return lease
     path.unlink(missing_ok=True)
     return None
@@ -814,19 +913,45 @@ def claim_runtime_lease(instance_id: str) -> Path:
     path = get_flowly_home() / _RUNTIME_LEASE_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = read_runtime_lease(path.parent)
+    if existing and _lease_manager_dead(existing):
+        # A Desktop crash can strand a detached runtime briefly. Only signal a
+        # process whose birth identity still matches the owner-only lease.
+        try:
+            os.kill(int(existing["pid"]), signal.SIGTERM)
+        except (KeyError, TypeError, ValueError, OSError):
+            pass
+        for _ in range(40):
+            if not _lease_process_matches(existing):
+                path.unlink(missing_ok=True)
+                existing = None
+                break
+            time.sleep(0.05)
     if existing:
         raise RuntimeError(
             f"Profile runtime is already active (pid {existing.get('pid')})."
         )
     path.unlink(missing_ok=True)
     payload = {
-        "version": 1,
+        "version": 2,
         "instanceId": instance_id,
         "pid": os.getpid(),
+        "processIdentity": _process_identity(os.getpid()),
         "port": 0,
         "startedAt": _utc_now(),
     }
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    manager_pid_raw = os.environ.get("FLOWLY_DESKTOP_MANAGER_PID", "").strip()
+    manager_instance = os.environ.get("FLOWLY_DESKTOP_MANAGER_INSTANCE", "").strip()
+    try:
+        manager_pid = int(manager_pid_raw)
+    except ValueError:
+        manager_pid = 0
+    if manager_pid > 0 and manager_instance:
+        payload.update({
+            "managerPid": manager_pid,
+            "managerIdentity": _process_identity(manager_pid),
+            "managerInstance": manager_instance[:128],
+        })
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -871,6 +996,8 @@ def delete_profile(name: str) -> None:
     profile_dir = _PROFILES_ROOT / name
     if not profile_dir.exists():
         raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    if profile_dir.is_symlink() or _PROFILES_ROOT.resolve() not in profile_dir.resolve().parents:
+        raise ValueError("Profile directory failed containment validation.")
 
     lease = read_runtime_lease(profile_dir)
     if lease:
@@ -911,9 +1038,32 @@ def import_profile(archive_path: str, name: str | None = None) -> Path:
         raise FileNotFoundError(f"Archive not found: {archive}")
 
     with tarfile.open(archive, "r:gz") as tf:
-        top_dirs = {m.name.split("/")[0] for m in tf.getmembers() if "/" in m.name}
+        members = tf.getmembers()
+        if len(members) > _MAX_IMPORT_MEMBERS:
+            raise ValueError("Profile archive contains too many entries.")
+        total_size = 0
+        top_dirs: set[str] = set()
+        for member in members:
+            normalized = member.name.replace("\\", "/")
+            parts = [part for part in normalized.split("/") if part not in ("", ".")]
+            if (
+                not parts
+                or normalized.startswith("/")
+                or ".." in parts
+                or member.issym()
+                or member.islnk()
+                or member.isdev()
+                or not (member.isdir() or member.isfile())
+            ):
+                raise ValueError(f"Profile archive contains an unsafe entry: {member.name}")
+            top_dirs.add(parts[0])
+            if member.isfile():
+                total_size += max(0, member.size)
+                if total_size > _MAX_IMPORT_BYTES:
+                    raise ValueError("Profile archive exceeds the safe extracted-size limit.")
 
-    inferred = name or (top_dirs.pop() if len(top_dirs) == 1 else None)
+    source_root = next(iter(top_dirs)) if len(top_dirs) == 1 else None
+    inferred = name or source_root
     if not inferred:
         raise ValueError("Cannot determine profile name from archive. Specify --name.")
 
@@ -923,13 +1073,34 @@ def import_profile(archive_path: str, name: str | None = None) -> Path:
         raise FileExistsError(f"Profile '{inferred}' already exists.")
 
     _PROFILES_ROOT.mkdir(parents=True, exist_ok=True)
-    shutil.unpack_archive(str(archive), str(_PROFILES_ROOT))
-
-    extracted = _PROFILES_ROOT / (top_dirs.pop() if top_dirs else inferred)
-    if extracted != profile_dir and extracted.exists():
-        extracted.rename(profile_dir)
-
-    return profile_dir
+    try:
+        _PROFILES_ROOT.chmod(0o700)
+    except OSError:
+        pass
+    staging = Path(tempfile.mkdtemp(prefix=".flowly-import-", dir=_DEFAULT_HOME.parent))
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            # Python's data filter rejects absolute paths, traversal, links,
+            # devices and unsafe permission bits a second time while writing.
+            tf.extractall(staging, filter="data")
+        if source_root is None:
+            raise ValueError("Profile archive must contain one top-level directory.")
+        extracted = staging / source_root
+        if not extracted.is_dir() or extracted.is_symlink():
+            raise ValueError("Profile archive must contain one profile directory.")
+        _assert_tree_no_symlinks(extracted)
+        os.replace(extracted, profile_dir)
+        try:
+            profile_dir.chmod(0o700)
+        except OSError:
+            pass
+        return profile_dir
+    except BaseException:
+        if profile_dir.exists() and profile_dir.is_dir() and not profile_dir.is_symlink():
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # ── Wrapper scripts ───────────────────────────────────────────────

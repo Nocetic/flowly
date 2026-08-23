@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -52,6 +54,8 @@ def test_local_runtime_clone_keeps_provider_but_drops_transport_identity(profile
     )
     (default / ".env").write_text(
         "OPENROUTER_API_KEY=keep-me\n"
+        "AWS_SECRET_ACCESS_KEY=drop-custom-secret\n"
+        "GITHUB_TOKEN=drop-custom-token\n"
         "FLOWLY_SERVER_ID=drop-me\n"
         "MOLTBOT_PROXY_JWT_SECRET=drop-me-too\n",
         encoding="utf-8",
@@ -237,6 +241,38 @@ def test_profile_cli_round_trips_isolated_settings(profile_roots) -> None:
     assert descriptor["markTone"] == "sky"
 
 
+def test_profile_cli_reads_persona_from_owner_only_file(profile_roots, tmp_path: Path) -> None:
+    _default, _root = profile_roots
+    soul_file = tmp_path / "SOUL.md"
+    soul_file.write_text("Keep private instructions out of argv.\n", encoding="utf-8")
+    soul_file.chmod(0o600)
+    runner = CliRunner()
+
+    created = runner.invoke(profile_app, [
+        "create", "private", "--local-only", "--soul-file", str(soul_file), "--json",
+    ])
+    assert created.exit_code == 0, created.output
+    assert profiles.read_profile_settings("private")["soul"] == (
+        "Keep private instructions out of argv.\n"
+    )
+
+
+def test_profile_cli_rejects_shared_persona_file(profile_roots, tmp_path: Path) -> None:
+    _default, _root = profile_roots
+    soul_file = tmp_path / "SOUL.md"
+    soul_file.write_text("Do not accept shared instructions.\n", encoding="utf-8")
+    soul_file.chmod(0o640)
+
+    created = CliRunner().invoke(
+        profile_app,
+        ["create", "private", "--local-only", "--soul-file", str(soul_file), "--json"],
+        terminal_width=180,
+    )
+
+    assert created.exit_code != 0
+    assert "Persona file must use 0600 permissions" in created.output
+
+
 def test_profile_mark_rejects_invalid_values(profile_roots) -> None:
     with pytest.raises(ValueError, match="one or two"):
         profiles.create_profile("writer", mark_text="LONG")
@@ -270,3 +306,79 @@ def test_stale_runtime_lease_is_pruned_before_delete(profile_roots, monkeypatch)
     profiles.delete_profile("stale")
 
     assert not created.exists()
+
+
+def test_symlink_profile_is_never_listed_or_cloned(profile_roots, tmp_path: Path) -> None:
+    _default, root = profile_roots
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+
+    assert "linked" not in {profile.name for profile in profiles.list_profiles()}
+    assert profiles.profile_exists("linked") is False
+    with pytest.raises(FileNotFoundError):
+        profiles.create_profile("copy", clone_from="linked", clone_all=True)
+
+
+def test_clone_all_rejects_links_inside_source(profile_roots, tmp_path: Path) -> None:
+    _default, _root = profile_roots
+    source = profiles.create_profile("source", local_runtime=True)
+    secret = tmp_path / "outside-secret"
+    secret.write_text("do not copy", encoding="utf-8")
+    (source / "workspace" / "linked-secret").symlink_to(secret)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        profiles.create_profile("copy", clone_from="source", clone_all=True)
+    assert not profiles.profile_exists("copy")
+
+
+def test_runtime_lease_rejects_pid_reuse(profile_roots, monkeypatch) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("lease", local_runtime=True)
+    lease = created / ".desktop-runtime.json"
+    lease.write_text(json.dumps({
+        "version": 2,
+        "instanceId": "old-runtime",
+        "pid": profiles.os.getpid(),
+        "processIdentity": "old-process",
+    }), encoding="utf-8")
+    monkeypatch.setattr(profiles, "_process_identity", lambda _pid: "new-process")
+
+    assert profiles.read_runtime_lease(created) is None
+    assert not lease.exists()
+
+
+def test_profile_import_rejects_path_traversal(profile_roots, tmp_path: Path) -> None:
+    _default, _root = profile_roots
+    archive = tmp_path / "malicious.tar.gz"
+    payload = b"escaped"
+    with tarfile.open(archive, "w:gz") as bundle:
+        member = tarfile.TarInfo("alpha/../../escaped.txt")
+        member.size = len(payload)
+        bundle.addfile(member, io.BytesIO(payload))
+
+    with pytest.raises(ValueError, match="unsafe entry"):
+        profiles.import_profile(str(archive), name="imported")
+    assert not (tmp_path / "escaped.txt").exists()
+    assert not profiles.profile_exists("imported")
+
+
+def test_profile_import_extracts_atomically(profile_roots, tmp_path: Path) -> None:
+    _default, root = profile_roots
+    archive = tmp_path / "valid.tar.gz"
+    payload = b'{"agents":{"defaults":{"model":"test/model"}}}'
+    with tarfile.open(archive, "w:gz") as bundle:
+        directory = tarfile.TarInfo("exported")
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        bundle.addfile(directory)
+        member = tarfile.TarInfo("exported/config.json")
+        member.size = len(payload)
+        member.mode = 0o600
+        bundle.addfile(member, io.BytesIO(payload))
+
+    imported = profiles.import_profile(str(archive), name="imported")
+    assert imported == root / "imported"
+    assert (imported / "config.json").read_bytes() == payload
+    assert not list(_default.parent.glob(".flowly-import-*"))

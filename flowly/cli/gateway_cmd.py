@@ -22,6 +22,29 @@ from flowly import __version__, __logo__
 console = Console()
 
 _GATEWAY_FILE_SINK_ID: int | None = None
+_LOCAL_RUNTIME_CAPABILITIES = (
+    "profile-rpc-v2",
+    "allowed-tools-v1",
+    "manager-lease-v2",
+    "profile-cron-v1",
+)
+
+
+def _local_runtime_ready_payload(
+    *, profile: str, host: str, port: int, token: str, pid: int, instance_id: str
+) -> dict:
+    """Versioned Desktop/core boot handshake for a named local runtime."""
+    return {
+        "protocolVersion": 2,
+        "runtimeVersion": __version__,
+        "capabilities": list(_LOCAL_RUNTIME_CAPABILITIES),
+        "profile": profile,
+        "host": host,
+        "port": port,
+        "token": token,
+        "pid": pid,
+        "instanceId": instance_id,
+    }
 
 
 def _schedule_cron_push_notification(
@@ -2149,30 +2172,63 @@ Respond to the user now:"""
         _watch_task: asyncio.Task | None = None
         _source_task: asyncio.Task | None = None
         _catalog_task: asyncio.Task | None = None
+        _manager_task: asyncio.Task | None = None
         try:
             await gateway_server.start()
             if local_runtime:
-                from flowly.profile import get_active_profile_name, update_runtime_lease
+                from flowly.profile import (
+                    _pid_is_alive,
+                    _process_identity,
+                    get_active_profile_name,
+                    get_flowly_home,
+                    read_runtime_lease,
+                    update_runtime_lease,
+                )
 
                 update_runtime_lease(_local_runtime_instance, port=gateway_server.port)
                 typer.echo(
                     "FLOWLY_LOCAL_RUNTIME_READY "
                     + json.dumps(
-                        {
-                            "protocolVersion": 1,
-                            "profile": get_active_profile_name(),
-                            "host": effective_host,
-                            "port": gateway_server.port,
-                            "token": auth_token,
-                            "pid": os.getpid(),
-                            "instanceId": _local_runtime_instance,
-                        },
+                        _local_runtime_ready_payload(
+                            profile=get_active_profile_name(),
+                            host=effective_host,
+                            port=gateway_server.port,
+                            token=auth_token,
+                            pid=os.getpid(),
+                            instance_id=_local_runtime_instance,
+                        ),
                         separators=(",", ":"),
                     ),
                 )
                 sys.stdout.flush()
-            else:
-                await cron.start()
+
+                manager_pid_raw = os.environ.get("FLOWLY_DESKTOP_MANAGER_PID", "").strip()
+                try:
+                    manager_pid = int(manager_pid_raw)
+                except ValueError:
+                    manager_pid = 0
+                lease = read_runtime_lease(get_flowly_home()) or {}
+                manager_identity = str(lease.get("managerIdentity") or "")
+                if manager_pid > 0:
+                    async def _watch_desktop_manager() -> None:
+                        while not shutdown_event.is_set():
+                            await asyncio.sleep(2)
+                            alive = _pid_is_alive(manager_pid)
+                            same_process = (
+                                not manager_identity
+                                or _process_identity(manager_pid) == manager_identity
+                            )
+                            if not alive or not same_process:
+                                logger.warning(
+                                    "[Gateway] Desktop manager disappeared; "
+                                    "stopping managed profile runtime"
+                                )
+                                shutdown_event.set()
+                                return
+
+                    _manager_task = asyncio.create_task(_watch_desktop_manager())
+            await cron.start()
+            if not local_runtime:
                 await heartbeat.start(run_on_start=True)
 
             # Warm the active provider's model catalogue.
@@ -2378,6 +2434,8 @@ Respond to the user now:"""
                 _source_task.cancel()
             if _catalog_task is not None:
                 _catalog_task.cancel()
+            if _manager_task is not None:
+                _manager_task.cancel()
             await gateway_server.stop()
             heartbeat.stop()
             cron.stop()

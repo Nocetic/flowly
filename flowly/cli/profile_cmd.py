@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -20,6 +23,7 @@ from flowly.profile import (
 
 profile_app = typer.Typer(help="Manage isolated local agent profiles")
 console = Console()
+_MAX_SOUL_OPTION_BYTES = 64 * 1024
 
 
 def _emit(value: dict | list, json_output: bool) -> None:
@@ -31,6 +35,35 @@ def _emit(value: dict | list, json_output: bool) -> None:
 
 def _fail(exc: Exception) -> None:
     raise typer.BadParameter(str(exc)) from exc
+
+
+def _resolve_soul_option(soul: str | None, soul_file: str | None) -> str | None:
+    if soul is not None and soul_file is not None:
+        raise ValueError("Use either --soul or --soul-file, not both.")
+    if soul_file is None:
+        return soul
+    path = Path(soul_file)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_SOUL_OPTION_BYTES:
+            raise ValueError("Persona instruction file is invalid or too large.")
+        if os.name != "nt" and metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise ValueError("Persona file must use 0600 permissions.")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise ValueError("Persona file must be owned by this user.")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            value = handle.read(_MAX_SOUL_OPTION_BYTES + 1)
+            if len(value.encode("utf-8")) > _MAX_SOUL_OPTION_BYTES:
+                raise ValueError("Persona instruction file is invalid or too large.")
+            return value
+    except UnicodeDecodeError as exc:
+        raise ValueError("Persona instruction file is not valid UTF-8.") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 @profile_app.command("list")
@@ -65,6 +98,7 @@ def profile_create(
     provider: str | None = typer.Option(None, "--provider", help="Profile-local active model provider."),
     model: str | None = typer.Option(None, "--model", help="Profile-local default model."),
     soul: str | None = typer.Option(None, "--soul", help="Profile-local SOUL.md contents."),
+    soul_file: str | None = typer.Option(None, "--soul-file", hidden=True),
     mark_text: str = typer.Option("", "--mark-text", help="One or two characters shown in Desktop."),
     mark_tone: str = typer.Option("", "--mark-tone", help="Desktop signature color."),
     local_only: bool = typer.Option(
@@ -86,7 +120,7 @@ def profile_create(
             local_runtime=local_only,
             provider=provider,
             model=model,
-            soul=soul,
+            soul=_resolve_soul_option(soul, soul_file),
             mark_text=mark_text,
             mark_tone=mark_tone,
         )
@@ -104,17 +138,22 @@ def profile_configure(
     provider: str | None = typer.Option(None, "--provider", help="Profile-local active model provider."),
     model: str | None = typer.Option(None, "--model", help="Profile-local default model."),
     soul: str | None = typer.Option(None, "--soul", help="Replace profile-local SOUL.md contents."),
+    soul_file: str | None = typer.Option(None, "--soul-file", hidden=True),
     mark_text: str | None = typer.Option(None, "--mark-text", help="One or two characters shown in Desktop."),
     mark_tone: str | None = typer.Option(None, "--mark-tone", help="Desktop signature color."),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Update profile metadata and isolated runtime settings."""
-    if display_name is None and description is None and provider is None and model is None and soul is None and mark_text is None and mark_tone is None:
+    if all(
+        value is None
+        for value in (display_name, description, provider, model, soul, soul_file, mark_text, mark_tone)
+    ):
         raise typer.BadParameter("at least one field is required")
     try:
         settings = None
-        if provider is not None or model is not None or soul is not None:
-            settings = update_profile_settings(name, provider=provider, model=model, soul=soul)
+        resolved_soul = _resolve_soul_option(soul, soul_file)
+        if provider is not None or model is not None or resolved_soul is not None:
+            settings = update_profile_settings(name, provider=provider, model=model, soul=resolved_soul)
         if display_name is not None or description is not None or mark_text is not None or mark_tone is not None:
             profile = update_profile_metadata(
                 name,

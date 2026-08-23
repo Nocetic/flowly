@@ -2537,13 +2537,45 @@ class GatewayServer:
                 return
             disabled_tools: list[str] = []
             for value in raw_disabled_tools:
-                name = str(value or "").strip()
+                if not isinstance(value, str):
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "disabledTools is invalid")
+                    return
+                name = value.strip()
                 if not name or len(name) > 128 or "\x00" in name:
                     await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "disabledTools is invalid")
                     return
                 if name not in disabled_tools:
                     disabled_tools.append(name)
             collaboration_metadata["disabled_tools"] = disabled_tools
+
+        raw_allowed_tools = params.get("allowedTools")
+        if raw_allowed_tools is not None:
+            if not isinstance(raw_allowed_tools, list) or len(raw_allowed_tools) > 64:
+                await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "allowedTools is invalid")
+                return
+            allowed_tools: list[str] = []
+            for value in raw_allowed_tools:
+                if not isinstance(value, str):
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "allowedTools is invalid")
+                    return
+                name = value.strip()
+                if not name or len(name) > 128 or "\x00" in name:
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "allowedTools is invalid")
+                    return
+                if name not in allowed_tools:
+                    allowed_tools.append(name)
+            collaboration_metadata["allowed_tools"] = allowed_tools
+        elif source_profile:
+            # Nested profile turns are model-authored input. Older Desktop
+            # builds did not send a positive grant, so fail safe with no tools
+            # instead of treating absence as unrestricted authority.
+            collaboration_metadata["allowed_tools"] = []
+
+        turn_origin = str(params.get("turnOrigin") or "user").strip()
+        if turn_origin not in {"user", "profile", "group", "routine"}:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "turnOrigin is invalid")
+            return
+        collaboration_metadata["turn_origin"] = turn_origin
 
         # Direct gateway runs never inherit the process-global browser
         # selection. The desktop must attach an opaque registration owned by

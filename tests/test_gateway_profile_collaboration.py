@@ -15,6 +15,16 @@ from flowly.gateway.server import (
 from flowly.session.manager import SessionManager
 
 
+class _GatewaySocket:
+    closed = False
+
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+
+    async def send_json(self, payload: dict) -> None:
+        self.messages.append(payload)
+
+
 @pytest.mark.asyncio
 async def test_conversation_model_pin_round_trips_and_can_be_cleared(
     tmp_path, monkeypatch: pytest.MonkeyPatch
@@ -106,3 +116,83 @@ async def test_message_profile_tool_returns_structured_broker_result() -> None:
     assert '"targetProfile":"beta"' in result
     assert '"response":"Checked"' in result
     gateway.send_profile_message_request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_nested_chat_turn_carries_positive_tool_grant_and_origin() -> None:
+    observed: dict = {}
+    callback_called = asyncio.Event()
+
+    async def on_chat(
+        _session_key,
+        _message,
+        _run_id,
+        _stream_callback,
+        _media,
+        _voice_mode,
+        _iteration_callback,
+        _render_capabilities,
+        extra_metadata,
+    ):
+        observed.update(extra_metadata)
+        callback_called.set()
+        return "done", {}
+
+    server = GatewayServer(host="127.0.0.1", port=0, on_chat_message=on_chat)
+    socket = _GatewaySocket()
+    await server._ws_rpc_chat_send(
+        socket,  # type: ignore[arg-type]
+        "desktop-owner",
+        "rpc-profile",
+        {
+            "sessionKey": "desktop:profile-room:one",
+            "message": "Review this",
+            "idempotencyKey": "profile-run-1",
+            "profileDirectory": ["alpha", "beta"],
+            "profileMessageContext": {
+                "sourceProfile": "alpha",
+                "correlationId": "correlation-1",
+                "hop": 1,
+            },
+            "allowedTools": ["read_file", "memory_search"],
+            "disabledTools": ["message_profile"],
+            "turnOrigin": "group",
+        },
+    )
+    active = list(server._active_tasks.values())
+    await asyncio.wait_for(callback_called.wait(), timeout=1)
+    await asyncio.gather(*active)
+
+    assert observed["allowed_tools"] == ["read_file", "memory_search"]
+    assert observed["disabled_tools"] == ["message_profile"]
+    assert observed["turn_origin"] == "group"
+
+
+@pytest.mark.asyncio
+async def test_nested_chat_without_grant_fails_safe_to_no_tools() -> None:
+    observed: dict = {}
+
+    async def on_chat(*args):
+        observed.update(args[-1])
+        return "done", {}
+
+    server = GatewayServer(host="127.0.0.1", port=0, on_chat_message=on_chat)
+    socket = _GatewaySocket()
+    await server._ws_rpc_chat_send(
+        socket,  # type: ignore[arg-type]
+        "desktop-owner",
+        "rpc-profile",
+        {
+            "sessionKey": "desktop:nested",
+            "message": "Review this",
+            "idempotencyKey": "profile-run-2",
+            "profileDirectory": ["alpha", "beta"],
+            "profileMessageContext": {
+                "sourceProfile": "alpha",
+                "correlationId": "correlation-2",
+                "hop": 1,
+            },
+        },
+    )
+    await asyncio.gather(*list(server._active_tasks.values()))
+    assert observed["allowed_tools"] == []

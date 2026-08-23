@@ -94,6 +94,26 @@ from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
 
 
+def resolve_capability_disabled_tools(
+    all_tool_names: set[str] | frozenset[str],
+    disabled_tools: object,
+    allowed_tools: object,
+) -> list[str] | object:
+    """Turn an optional positive grant into the executor's hard deny list."""
+    if not isinstance(allowed_tools, (list, tuple, set)):
+        return disabled_tools
+    allowed_set = {
+        value for value in allowed_tools
+        if isinstance(value, str) and value
+    }
+    disabled_set = {
+        value for value in disabled_tools
+        if isinstance(value, str)
+    } if isinstance(disabled_tools, (list, tuple, set)) else set()
+    disabled_set.update(set(all_tool_names) - allowed_set)
+    return sorted(disabled_set)
+
+
 # ---------------------------------------------------------------------------
 # Tool result sanitization — prevent token bloat
 # ---------------------------------------------------------------------------
@@ -7828,6 +7848,14 @@ class AgentLoop:
             tool_chat_id = (msg.metadata.get("origin_chat_id") or "").strip() or msg.chat_id
 
         disabled_tools = msg.metadata.get("disabled_tools")
+        allowed_tools = msg.metadata.get("allowed_tools")
+        disabled_tools = resolve_capability_disabled_tools(
+            set(self.tools.tool_names), disabled_tools, allowed_tools
+        )
+        if isinstance(allowed_tools, (list, tuple, set)):
+            # The resolved list affects schema disclosure and executor lookup,
+            # so a hallucinated call cannot bypass the positive grant.
+            msg.metadata["disabled_tools"] = disabled_tools
         collaboration_directory = msg.metadata.get("profile_directory")
         collaboration_current = str(msg.metadata.get("profile_current") or "default")
         has_profile_target = isinstance(collaboration_directory, list) and any(
