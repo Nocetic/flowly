@@ -277,6 +277,9 @@ class TestCronListRpc:
         assert entry["state"]["running"] is False
         assert entry["state"]["runId"] is None
         assert entry["state"]["runStartedAtMs"] is None
+        assert entry["state"]["retryAttempt"] == 0
+        assert entry["retryMaxAttempts"] == 0
+        assert entry["retryBackoffMs"] == []
         assert entry["sessionKey"] == f"cron:{job.id}"
 
     async def test_executing_job_is_marked_on_its_row(self, wired):
