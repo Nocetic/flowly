@@ -25,7 +25,7 @@ from flowly.channels import feature_rpc
 from flowly.channels.base import BaseChannel
 from flowly.config.schema import WebChannelConfig
 from flowly.profile import get_flowly_home
-from flowly.profile_host_contract import ProfileHostError
+from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
 from flowly.render_capabilities import normalize_render_capabilities
 
 # ─── Transport limits ──────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ _IMAGE_INITIAL_QUALITY = 75
 _IMAGE_MIN_QUALITY = 40
 _OUTBOUND_QUEUE_LIMIT = 50  # cap pending replays to avoid unbounded growth
 _PROFILE_BINDING_LIMIT = 1024
+_PROFILE_DIRECTORY_BINDING_LIMIT = 256
 _PROFILE_BINDING_TTL_SECONDS = 6 * 60 * 60
 _PROFILE_RUN_BINDING_LIMIT = 2048
 _PROFILE_LONG_RUNNING_METHODS = frozenset({
@@ -363,7 +364,18 @@ class WebChannel(BaseChannel):
 
     def _bind_profile_directory(self, session_id: str) -> None:
         if session_id and len(session_id) <= 256:
-            self._profile_directory_sessions[session_id] = time.monotonic()
+            now = time.monotonic()
+            self._profile_directory_sessions[session_id] = now
+            self._prune_profile_bindings(now)
+            while (
+                len(self._profile_directory_sessions)
+                > _PROFILE_DIRECTORY_BINDING_LIMIT
+            ):
+                oldest = min(
+                    self._profile_directory_sessions,
+                    key=self._profile_directory_sessions.__getitem__,
+                )
+                self._profile_directory_sessions.pop(oldest, None)
 
     def _bind_profile_conversation(
         self, profile: str, session_key: str, session_id: str
@@ -475,7 +487,7 @@ class WebChannel(BaseChannel):
 
         if event_type == "directory":
             targets.update(self._profile_directory_sessions)
-        elif event_type == "connection":
+        elif event_type in {"connection", "error"}:
             targets.update(self._profile_directory_sessions)
             for (candidate_profile, _session_key), subscribers in (
                 self._profile_conversation_sessions.items()
@@ -514,6 +526,13 @@ class WebChannel(BaseChannel):
                 "data": envelope,
             }))
 
+        if (
+            run_id
+            and event_type == "chat"
+            and payload.get("state") in {"final", "aborted", "error"}
+        ):
+            self._profile_run_bindings.pop((profile, run_id), None)
+
     async def _handle_profile_rpc(self, ws, msg: dict[str, Any]) -> None:
         rpc_id = str(msg.get("id") or "")
         session_id = str(msg.get("sessionId") or "")
@@ -541,8 +560,13 @@ class WebChannel(BaseChannel):
             profile = str(params.get("name") or "")
             inner_method = str(params.get("method") or "")
             inner_params = params.get("params")
-            if isinstance(inner_params, dict):
-                inner_session_key = str(inner_params.get("sessionKey") or "")
+            try:
+                _validated_method, validated_params = validate_profile_rpc(
+                    inner_method, inner_params
+                )
+            except ProfileHostError:
+                validated_params = {}
+            inner_session_key = str(validated_params.get("sessionKey") or "")
             if inner_session_key:
                 # Bind before dispatch: chat.send may emit its first event
                 # immediately after the acknowledgement on a fast local model.

@@ -25,6 +25,7 @@ from typing import Any
 import aiohttp
 from loguru import logger
 
+from flowly.exec.env_scrub import sanitize_subprocess_env
 from flowly.profile import (
     create_profile,
     delete_profile,
@@ -69,12 +70,34 @@ _SAFE_DELEGATED_TOOLS = (
     "skill_view",
 )
 
+_PROFILE_RUNTIME_ENV_DENY = frozenset({
+    "FLOWLY_CWD",
+    "FLOWLY_HOME",
+    "FLOWLY_PROFILE",
+    "FLOWLY_SERVER_ID",
+})
+
 
 def _runtime_command() -> list[str]:
     """Launch the same installed Flowly build as the owning gateway."""
     if getattr(sys, "frozen", False) or "__compiled__" in globals():
         return [sys.executable]
     return [sys.executable, "-m", "flowly.cli.entry"]
+
+
+def _profile_runtime_environment() -> dict[str, str]:
+    """Return a child environment without the owning gateway's credentials.
+
+    A named profile is a separate configuration and credential scope. The
+    process still needs ordinary OS/runtime variables, but it must not inherit
+    Flowly-managed provider, channel, relay, or gateway secrets from the
+    primary gateway. Profile-local config, ``.env`` and keychain scopes remain
+    available after ``--profile`` selects the child home.
+    """
+    env = sanitize_subprocess_env(os.environ)
+    for key in _PROFILE_RUNTIME_ENV_DENY:
+        env.pop(key, None)
+    return env
 
 
 def _public_profile(name: str) -> dict[str, Any]:
@@ -529,9 +552,24 @@ class ProfileHost:
             safe.pop("allowedTools", None)
             safe.pop("disabledTools", None)
             safe["turnOrigin"] = "user"
-        return await self._target_rpc(
+        result = await self._target_rpc(
             name, method, safe, bounded_timeout(method, timeout_ms)
         )
+        if method == "sessions.list" and isinstance(result, dict):
+            sessions = result.get("sessions")
+            if isinstance(sessions, list):
+                result = {
+                    **result,
+                    "sessions": [
+                        session
+                        for session in sessions
+                        if isinstance(session, dict)
+                        and isinstance(session.get("key"), str)
+                        and session["key"].startswith(("desktop:", "web:", "ios:"))
+                        and not session["key"].startswith("desktop:profile-inbox:")
+                    ],
+                }
+        return result
 
     async def shutdown(self) -> None:
         if self._closed:
@@ -609,7 +647,7 @@ class ProfileHost:
 
     async def _start_runtime(self, name: str) -> _Runtime:
         await self._emit(name, "connection", {"state": "starting"})
-        env = os.environ.copy()
+        env = _profile_runtime_environment()
         env.update({
             "FLOWLY_DESKTOP_MANAGER_PID": str(os.getpid()),
             "FLOWLY_DESKTOP_MANAGER_INSTANCE": self._manager_instance,
@@ -660,7 +698,10 @@ class ProfileHost:
                     if response.status != 200:
                         raise ProfileHostError("STARTUP_AUTH", "Profile runtime rejected its manager connection.")
                     ticket = str((await response.json()).get("ticket") or "")
-                ws = await session.ws_connect(f"http://127.0.0.1:{port}/ws?ticket={ticket}")
+                ws = await session.ws_connect(
+                    f"http://127.0.0.1:{port}/ws?ticket={ticket}",
+                    max_msg_size=40 * 1024 * 1024,
+                )
             except BaseException:
                 await session.close()
                 raise

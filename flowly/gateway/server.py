@@ -9,7 +9,7 @@ import secrets
 import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -35,7 +35,7 @@ from flowly.gateway.auth import (
 )
 from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
-from flowly.profile_host_contract import ProfileHostError
+from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
 
@@ -202,6 +202,15 @@ class _ProfileHostSocket:
     async def close(self) -> None:
         self.closed = True
 
+
+@dataclass(slots=True)
+class _ProfileClientSubscription:
+    """Server-owned profile event scope for one authenticated WebSocket."""
+
+    directory: bool = False
+    profiles: set[str] = field(default_factory=set)
+    conversations: set[tuple[str, str]] = field(default_factory=set)
+
 _PROFILE_ID_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyz0123456789-_"
 )
@@ -212,6 +221,10 @@ _PROFILE_HOST_LONG_RUNNING_METHODS = frozenset({
     "profiles.rpc",
     "profiles.stop",
 })
+_PROFILE_CLIENT_SUBSCRIPTION_LIMIT = 128
+_PROFILE_PROFILES_PER_CLIENT_LIMIT = 64
+_PROFILE_CONVERSATIONS_PER_CLIENT_LIMIT = 256
+_PROFILE_RUN_SUBSCRIPTION_LIMIT = 2048
 
 
 def _valid_profile_id(value: str) -> bool:
@@ -600,6 +613,15 @@ class GatewayServer:
         self._profile_host_pending_chats = 0
         self._profile_host_active_runs: set[str] = set()
         self._profile_host_terminal_runs: OrderedDict[str, None] = OrderedDict()
+        # Authenticated clients receive only the profile events they explicitly
+        # bound through directory/lifecycle/conversation RPCs. Client-side
+        # filtering remains defence in depth; it is never the privacy boundary.
+        self._profile_client_subscriptions: OrderedDict[
+            str, _ProfileClientSubscription
+        ] = OrderedDict()
+        self._profile_run_subscriptions: OrderedDict[
+            tuple[str, str], str
+        ] = OrderedDict()
         self._profile_host = None
         if enable_profile_host:
             from flowly.profile_host import ProfileHost
@@ -1314,6 +1336,7 @@ class GatewayServer:
             is_current_connection = self._ws_clients.get(client_id) is ws
             if is_current_connection:
                 self._ws_clients.pop(client_id, None)
+                self._remove_profile_client_subscription(client_id)
                 for request_id, expected_client in tuple(self._profile_pending_clients.items()):
                     if expected_client != client_id:
                         continue
@@ -1363,7 +1386,9 @@ class GatewayServer:
                 await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
 
             elif method.startswith("profiles."):
-                await self._handle_profile_host_rpc(ws, rpc_id, method, params)
+                await self._handle_profile_host_rpc(
+                    ws, client_id, rpc_id, method, params
+                )
 
             # Shared feature surface (connections, config, memory, kg, sessions,
             # audit, persona, provider, skills, assistants, pairing) — the SAME
@@ -1387,6 +1412,9 @@ class GatewayServer:
 
             elif method == "chat.history":
                 await self._ws_rpc_chat_history(ws, rpc_id, params)
+
+            elif method == "media.read":
+                await self._ws_rpc_media_read(ws, rpc_id, params)
 
             elif method == "chat.send":
                 await self._ws_rpc_chat_send(ws, client_id, rpc_id, params)
@@ -1588,6 +1616,7 @@ class GatewayServer:
     async def _handle_profile_host_rpc(
         self,
         ws: web.WebSocketResponse,
+        client_id: str,
         rpc_id: str,
         method: str,
         params: Any,
@@ -1602,6 +1631,16 @@ class GatewayServer:
                 "This gateway does not manage isolated bot profiles.",
             )
             return
+        self._bind_profile_client_request(client_id, method, params)
+        profile = ""
+        inner_method = ""
+        inner_session_key = ""
+        if isinstance(params, dict) and method == "profiles.rpc":
+            profile = str(params.get("name") or "")
+            inner_method = str(params.get("method") or "")
+            inner_params = params.get("params")
+            if isinstance(inner_params, dict):
+                inner_session_key = str(inner_params.get("sessionKey") or "")
         try:
             result = await host.dispatch(method, params)
         except ProfileHostError as exc:
@@ -1644,6 +1683,85 @@ class GatewayServer:
                 retryable=True,
             )
             return
+        if (
+            inner_method == "chat.send"
+            and inner_session_key
+            and isinstance(result, dict)
+        ):
+            run_id = str(result.get("runId") or "")
+            if run_id:
+                key = (profile, run_id)
+                self._profile_run_subscriptions[key] = inner_session_key
+                self._profile_run_subscriptions.move_to_end(key)
+                while (
+                    len(self._profile_run_subscriptions)
+                    > _PROFILE_RUN_SUBSCRIPTION_LIMIT
+                ):
+                    self._profile_run_subscriptions.popitem(last=False)
+        await self._ws_rpc_reply(ws, rpc_id, result)
+
+    async def _ws_rpc_media_read(
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        params: dict[str, Any],
+    ) -> None:
+        """Read one bounded generated-media window over authenticated RPC.
+
+        Profile runtimes are loopback-only, so their HTTP media route cannot
+        be exposed to a remote phone. This stateless window protocol preserves
+        the same basename/containment/MIME rules as HTTP and the relay bridge,
+        while keeping every frame comfortably below the relay's 10 MB limit.
+        """
+        media_id = params.get("mediaId")
+        offset = params.get("offset", 0)
+        length = params.get("length", 0)
+        if (
+            not isinstance(media_id, str)
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+            or not isinstance(length, int)
+            or isinstance(length, bool)
+            or not 0 <= length <= 1024 * 1024
+        ):
+            await self._ws_rpc_error(
+                ws, rpc_id, "INVALID_REQUEST", "Invalid media window."
+            )
+            return
+
+        from flowly.media.serving import read_media_window
+
+        window = await asyncio.to_thread(
+            read_media_window,
+            media_id,
+            offset,
+            length,
+        )
+        if not window.ok:
+            codes = {
+                "not_found": "NOT_FOUND",
+                "invalid_id": "INVALID_REQUEST",
+                "forbidden": "FORBIDDEN",
+                "unsupported_type": "UNSUPPORTED_MEDIA_TYPE",
+                "too_large": "MEDIA_TOO_LARGE",
+            }
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                codes.get(window.error, "MEDIA_UNAVAILABLE"),
+                "The media file is unavailable.",
+            )
+            return
+        result: dict[str, Any] = {
+            "mediaId": media_id,
+            "size": window.size,
+            "mimeType": window.mime_type,
+            "offset": offset,
+            "eof": window.eof,
+        }
+        if window.data:
+            result["data"] = base64.b64encode(window.data).decode("ascii")
         await self._ws_rpc_reply(ws, rpc_id, result)
 
     # --- RPC: exec.approval ---
@@ -2774,6 +2892,7 @@ class GatewayServer:
                     "event": "agent",
                     "data": {
                         "runId": run_id,
+                        "sessionKey": session_key,
                         "stream": "assistant",
                         "data": {"text": delta},
                     },
@@ -4334,12 +4453,153 @@ class GatewayServer:
         for ws in list(self._ws_clients.values()):
             await self._ws_send(ws, event)
 
+    @staticmethod
+    def _profile_subscription_uses_default(
+        subscription: _ProfileClientSubscription,
+    ) -> bool:
+        return "default" in subscription.profiles or any(
+            profile == "default" for profile, _session in subscription.conversations
+        )
+
+    @staticmethod
+    def _profile_subscription_owner(client_id: str) -> str:
+        return f"gateway:{client_id}"
+
+    def _remove_profile_client_subscription(self, client_id: str) -> None:
+        subscription = self._profile_client_subscriptions.pop(client_id, None)
+        if (
+            subscription is not None
+            and self._profile_subscription_uses_default(subscription)
+            and self._profile_host is not None
+        ):
+            self._profile_host.release_default_events(
+                self._profile_subscription_owner(client_id)
+            )
+
+    def _bind_profile_client_request(
+        self,
+        client_id: str,
+        method: str,
+        params: Any,
+    ) -> None:
+        """Derive an event subscription only from an authenticated RPC."""
+        subscription = self._profile_client_subscriptions.get(client_id)
+        if subscription is None:
+            subscription = _ProfileClientSubscription()
+            self._profile_client_subscriptions[client_id] = subscription
+        self._profile_client_subscriptions.move_to_end(client_id)
+        while (
+            len(self._profile_client_subscriptions)
+            > _PROFILE_CLIENT_SUBSCRIPTION_LIMIT
+        ):
+            evicted_id, evicted = self._profile_client_subscriptions.popitem(
+                last=False
+            )
+            if (
+                self._profile_subscription_uses_default(evicted)
+                and self._profile_host is not None
+            ):
+                self._profile_host.release_default_events(
+                    self._profile_subscription_owner(evicted_id)
+                )
+
+        used_default_before = self._profile_subscription_uses_default(subscription)
+        if method in {"profiles.capabilities", "profiles.list", "profiles.statuses"}:
+            subscription.directory = True
+
+        if not isinstance(params, dict):
+            return
+        profile = str(params.get("name") or "").strip()
+        if profile != "default" and not _valid_profile_id(profile):
+            return
+        if method in {"profiles.connect", "profiles.stop", "profiles.rpc"}:
+            if (
+                profile not in subscription.profiles
+                and len(subscription.profiles)
+                >= _PROFILE_PROFILES_PER_CLIENT_LIMIT
+            ):
+                subscription.profiles.pop()
+            subscription.profiles.add(profile)
+
+        if method == "profiles.rpc":
+            inner_params = params.get("params")
+            try:
+                _inner_method, validated_params = validate_profile_rpc(
+                    params.get("method"), inner_params
+                )
+            except ProfileHostError:
+                return
+            session_key = (
+                str(validated_params.get("sessionKey") or "")
+                if isinstance(validated_params, dict)
+                else ""
+            )
+            if session_key and len(session_key) <= 256 and "\x00" not in session_key:
+                binding = (profile, session_key)
+                if (
+                    binding not in subscription.conversations
+                    and len(subscription.conversations)
+                    >= _PROFILE_CONVERSATIONS_PER_CLIENT_LIMIT
+                ):
+                    subscription.conversations.pop()
+                subscription.conversations.add(binding)
+
+        uses_default_after = self._profile_subscription_uses_default(subscription)
+        if self._profile_host is not None:
+            if not used_default_before and uses_default_after:
+                self._profile_host.retain_default_events(
+                    self._profile_subscription_owner(client_id)
+                )
+            elif used_default_before and not uses_default_after:
+                self._profile_host.release_default_events(
+                    self._profile_subscription_owner(client_id)
+                )
+
     async def _broadcast_profile_host_event(self, data: dict[str, Any]) -> None:
-        """Tag and forward one child gateway event to remote clients."""
+        """Forward an isolated event only to explicitly bound clients."""
+        profile = str(data.get("profile") or "")
+        event_type = str(data.get("type") or "")
+        payload = data.get("data")
+        event_data = payload if isinstance(payload, dict) else {}
+        session_key = str(event_data.get("sessionKey") or "")
+        run_id = str(event_data.get("runId") or "")
+        if not session_key and run_id:
+            session_key = self._profile_run_subscriptions.get(
+                (profile, run_id), ""
+            )
+
+        targets: set[str] = set()
+        for client_id, subscription in tuple(
+            self._profile_client_subscriptions.items()
+        ):
+            if event_type == "directory" and subscription.directory:
+                targets.add(client_id)
+            elif event_type in {"connection", "error"} and (
+                subscription.directory
+                or profile in subscription.profiles
+                or any(
+                    candidate == profile
+                    for candidate, _session in subscription.conversations
+                )
+            ):
+                targets.add(client_id)
+            elif session_key and (
+                profile, session_key
+            ) in subscription.conversations:
+                targets.add(client_id)
+
         event = {"type": "event", "event": "profile.event", "data": data}
-        for client_id, ws in list(self._ws_clients.items()):
-            if client_id != self._profile_host_client_id:
+        for client_id in sorted(targets):
+            ws = self._ws_clients.get(client_id)
+            if ws is not None:
                 await self._ws_send(ws, event)
+
+        if (
+            run_id
+            and event_type == "chat"
+            and event_data.get("state") in {"final", "aborted", "error"}
+        ):
+            self._profile_run_subscriptions.pop((profile, run_id), None)
 
     async def _handle_profile_host_internal_frame(self, frame: dict[str, Any]) -> None:
         """Resolve private default-profile RPCs or forward their live events."""
@@ -4575,6 +4835,8 @@ class GatewayServer:
         """Stop the server and clean up."""
         if self._profile_host is not None:
             await self._profile_host.shutdown()
+        self._profile_client_subscriptions.clear()
+        self._profile_run_subscriptions.clear()
         self._profile_host_external_events = False
         self._profile_host_pending_chats = 0
         self._profile_host_active_runs.clear()

@@ -80,6 +80,8 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config.setdefault("providers", {}).setdefault("openai", {})["apiKey"] = "test-key"
     config_path.write_text(json.dumps(config), encoding="utf-8")
+    (created / "media").mkdir(exist_ok=True)
+    (created / "media" / "generated.png").write_bytes(b"abcdefgh")
 
     async def on_chat(*_args):
         return "", {}
@@ -181,6 +183,23 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                     "params": {"sessionKey": "ios:writer-thread"},
                 })
                 assert history["messages"] == []
+                media = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "media.read",
+                    "params": {
+                        "mediaId": "generated.png",
+                        "offset": 2,
+                        "length": 3,
+                    },
+                })
+                assert media == {
+                    "mediaId": "generated.png",
+                    "size": 8,
+                    "mimeType": "image/png",
+                    "offset": 2,
+                    "eof": False,
+                    "data": "Y2Rl",
+                }
                 selected = await rpc("profiles.rpc", {
                     "name": "writer",
                     "method": "sessions.model.set",

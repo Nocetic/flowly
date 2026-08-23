@@ -50,7 +50,7 @@ Strategy:
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Mapping
+from typing import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,7 @@ _FLOWLY_PROVIDER_ENV_BLOCKLIST: frozenset[str] = frozenset({
     "FLOWLY_AUTH_TOKEN",
     "FLOWLY_GATEWAY_TOKEN",
     "FLOWLY_RELAY_TOKEN",
+    "MOLTBOT_PROXY_JWT_SECRET",
 
     # ── Flowly-managed integrations ──
     "TRELLO_API_KEY",

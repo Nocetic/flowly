@@ -14,18 +14,17 @@ from __future__ import annotations
 
 import pytest
 
+from flowly.exec.env_passthrough import (
+    clear_env_passthrough,
+    is_env_passthrough,
+    register_env_passthrough,
+)
 from flowly.exec.env_scrub import (
     force_prefix,
     is_flowly_credential,
     list_blocklist,
     sanitize_subprocess_env,
 )
-from flowly.exec.env_passthrough import (
-    clear_env_passthrough,
-    is_env_passthrough,
-    register_env_passthrough,
-)
-
 
 # ── §2.3 — Flowly-managed credentials stripped ────────────────────────
 
@@ -49,6 +48,7 @@ class TestBlocklistStrips:
             "SLACK_APP_TOKEN",
             "FLOWLY_JWT_SECRET",
             "FLOWLY_AUTH_TOKEN",
+            "MOLTBOT_PROXY_JWT_SECRET",
             "TRELLO_API_KEY",
             "LINEAR_API_KEY",
             "BRAVE_API_KEY",
@@ -179,6 +179,7 @@ class TestGHSAGuard:
             "ANTHROPIC_API_KEY",
             "TELEGRAM_BOT_TOKEN",
             "FLOWLY_JWT_SECRET",
+            "MOLTBOT_PROXY_JWT_SECRET",
             "SLACK_BOT_TOKEN",
         ],
     )

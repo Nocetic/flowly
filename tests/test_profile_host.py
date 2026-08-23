@@ -10,7 +10,7 @@ import pytest
 import flowly.profile as profiles
 import flowly.profile_host as profile_host_module
 from flowly.gateway.server import GatewayServer
-from flowly.profile_host import ProfileHost
+from flowly.profile_host import ProfileHost, _profile_runtime_environment
 from flowly.profile_host_contract import ProfileHostError
 
 
@@ -83,6 +83,26 @@ async def test_remote_chat_proxy_assigns_identity_and_authority(profile_roots) -
     assert "allowedTools" not in sent
     assert "disabledTools" not in sent
     assert runtime.active_runs == {"run-1"}
+
+
+@pytest.mark.asyncio
+async def test_remote_session_directory_hides_internal_collaboration(profile_roots) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    host = ProfileHost()
+    runtime = SimpleNamespace(last_used_at=0.0, active_runs=set())
+    host._ensure_runtime = AsyncMock(return_value=runtime)  # type: ignore[method-assign]
+    host._rpc = AsyncMock(return_value={  # type: ignore[method-assign]
+        "sessions": [
+            {"key": "ios:visible"},
+            {"key": "desktop:profile-inbox:writer:source"},
+            {"key": "cron:internal"},
+            {"key": 123},
+        ],
+    })
+
+    result = await host.rpc("writer", "sessions.list", {})
+
+    assert result == {"sessions": [{"key": "ios:visible"}]}
 
 
 @pytest.mark.asyncio
@@ -233,6 +253,40 @@ async def test_profile_rpc_dispatch_preserves_structured_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_gateway_media_read_rpc_is_windowed_and_scoped(profile_roots) -> None:
+    default, _root = profile_roots
+    media_dir = default / "media"
+    media_dir.mkdir()
+    (media_dir / "generated.png").write_bytes(b"abcdefgh")
+    server = GatewayServer(host="127.0.0.1")
+    ws = SimpleNamespace(closed=False, messages=[])
+
+    async def send_json(payload):
+        ws.messages.append(payload)
+
+    ws.send_json = send_json
+    await server._handle_ws_rpc(ws, "ios-client", {
+        "type": "rpc",
+        "id": "media-1",
+        "method": "media.read",
+        "params": {"mediaId": "generated.png", "offset": 2, "length": 3},
+    })
+
+    assert ws.messages == [{
+        "type": "rpc",
+        "id": "media-1",
+        "result": {
+            "mediaId": "generated.png",
+            "size": 8,
+            "mimeType": "image/png",
+            "offset": 2,
+            "eof": False,
+            "data": "Y2Rl",
+        },
+    }]
+
+
+@pytest.mark.asyncio
 async def test_wrapped_default_profile_rpc_uses_primary_gateway(profile_roots) -> None:
     primary = AsyncMock(return_value={"messages": []})
     host = ProfileHost(primary_rpc=primary)
@@ -296,3 +350,129 @@ async def test_internal_broker_serializes_turns_per_target(profile_roots) -> Non
     await asyncio.gather(host._broker("writer", params), host._broker("writer", params))
 
     assert max_active == 1
+
+
+def test_profile_runtime_environment_drops_owner_credentials(monkeypatch) -> None:
+    inherited = {
+        "PATH": "/usr/bin",
+        "AWS_REGION": "eu-west-1",
+        "GH_TOKEN": "user-owned",
+        "OPENAI_API_KEY": "owner-provider-secret",
+        "MOLTBOT_PROXY_JWT_SECRET": "owner-relay-secret",
+        "FLOWLY_HOME": "/owner/home",
+        "FLOWLY_CWD": "/owner/workspace",
+        "FLOWLY_PROFILE": "owner",
+        "FLOWLY_SERVER_ID": "owner-server",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+
+    child = _profile_runtime_environment()
+
+    assert child["PATH"] == "/usr/bin"
+    assert child["AWS_REGION"] == "eu-west-1"
+    assert child["GH_TOKEN"] == "user-owned"
+    for secret in (
+        "OPENAI_API_KEY",
+        "MOLTBOT_PROXY_JWT_SECRET",
+        "FLOWLY_HOME",
+        "FLOWLY_CWD",
+        "FLOWLY_PROFILE",
+        "FLOWLY_SERVER_ID",
+    ):
+        assert secret not in child
+
+
+@pytest.mark.asyncio
+async def test_profile_events_are_scoped_to_bound_conversation(profile_roots) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    server = GatewayServer(host="127.0.0.1", enable_profile_host=True)
+
+    def socket():
+        ws = SimpleNamespace(closed=False, messages=[])
+
+        async def send_json(payload):
+            ws.messages.append(payload)
+
+        async def close():
+            ws.closed = True
+
+        ws.send_json = send_json
+        ws.close = close
+        return ws
+
+    writer_a = socket()
+    writer_b = socket()
+    directory = socket()
+    server._ws_clients.update({
+        "writer-a": writer_a,
+        "writer-b": writer_b,
+        "directory": directory,
+    })
+    server._bind_profile_client_request("writer-a", "profiles.rpc", {
+        "name": "writer",
+        "method": "chat.history",
+        "params": {"sessionKey": "ios:a"},
+    })
+    server._bind_profile_client_request("writer-b", "profiles.rpc", {
+        "name": "writer",
+        "method": "chat.history",
+        "params": {"sessionKey": "ios:b"},
+    })
+    server._bind_profile_client_request("directory", "profiles.list", {})
+
+    await server._broadcast_profile_host_event({
+        "hostId": "host",
+        "profile": "writer",
+        "botId": "bot",
+        "type": "chat",
+        "data": {
+            "sessionKey": "ios:a",
+            "runId": "run-a",
+            "state": "final",
+        },
+    })
+    assert len(writer_a.messages) == 1
+    assert writer_b.messages == []
+    assert directory.messages == []
+
+    await server._broadcast_profile_host_event({
+        "hostId": "host",
+        "profile": "writer",
+        "botId": "bot",
+        "type": "connection",
+        "data": {"state": "connected"},
+    })
+    assert len(writer_a.messages) == 2
+    assert len(writer_b.messages) == 1
+    assert len(directory.messages) == 1
+
+    await server.stop()
+
+
+def test_default_profile_event_lease_tracks_direct_client(profile_roots) -> None:
+    server = GatewayServer(host="127.0.0.1", enable_profile_host=True)
+    assert server._profile_host_external_events is False
+
+    server._bind_profile_client_request("ios", "profiles.rpc", {
+        "name": "default",
+        "method": "chat.history",
+        "params": {"sessionKey": "ios:default"},
+    })
+    assert server._profile_host_external_events is True
+
+    server._remove_profile_client_subscription("ios")
+    assert server._profile_host_external_events is False
+
+
+def test_rejected_internal_session_is_not_bound_to_direct_client(profile_roots) -> None:
+    server = GatewayServer(host="127.0.0.1", enable_profile_host=True)
+
+    server._bind_profile_client_request("ios", "profiles.rpc", {
+        "name": "default",
+        "method": "chat.history",
+        "params": {"sessionKey": "desktop:profile-inbox:writer:source"},
+    })
+
+    assert server._profile_client_subscriptions["ios"].conversations == set()
+    server._remove_profile_client_subscription("ios")

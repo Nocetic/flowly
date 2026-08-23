@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import ipaddress
 import json
 from typing import Any
+from urllib.parse import urlsplit
 
 
 class ProfileHostError(RuntimeError):
@@ -20,6 +24,16 @@ MAX_REQUEST_BYTES = 40 * 1024 * 1024
 MAX_PROFILE_MESSAGE_CHARS = 32_000
 MAX_PROFILE_HOPS = 3
 MAX_ATTACHMENT_B64_CHARS = 34 * 1024 * 1024
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+_NON_PUBLIC_ATTACHMENT_HOST_SUFFIXES = (
+    ".internal",
+    ".invalid",
+    ".local",
+    ".localhost",
+    ".test",
+    ".home.arpa",
+)
 
 # Deliberately excludes config/secrets, arbitrary CLI execution, policy
 # mutation, and MCP/skill installation. Those remain on the owning host.
@@ -35,6 +49,7 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "chat.inflight": 30_000,
     "chat.send": 60_000,
     "chat.abort": 30_000,
+    "media.read": 30_000,
     "exec.approval.list": 30_000,
     "exec.approval.resolve": 30_000,
     "agent.clarify.list": 30_000,
@@ -58,6 +73,137 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
 }
 
 
+_REMOTE_SESSION_PREFIXES = ("desktop:", "web:", "ios:")
+_INTERNAL_PROFILE_SESSION_PREFIX = "desktop:profile-inbox:"
+
+
+def _validate_session_key(value: Any, *, required: bool = False) -> None:
+    if value is None and not required:
+        return
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 256
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+    ):
+        raise ProfileHostError(
+            "INVALID_PARAMS",
+            "Profile conversation identity is invalid.",
+        )
+    if (
+        not value.startswith(_REMOTE_SESSION_PREFIXES)
+        or value.startswith(_INTERNAL_PROFILE_SESSION_PREFIX)
+    ):
+        raise ProfileHostError(
+            "REMOTE_SESSION_DENIED",
+            "This profile conversation is not available to remote clients.",
+        )
+
+
+def _validate_remote_attachment_url(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or len(value) > 4096
+        or any(ord(char) < 0x20 for char in value)
+    ):
+        raise ProfileHostError("INVALID_PARAMS", "Attachment URL is invalid.")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ProfileHostError("INVALID_PARAMS", "Attachment URL is invalid.") from exc
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or port not in (None, 443)
+        or hostname == "localhost"
+        or "." not in hostname
+        or hostname.endswith(_NON_PUBLIC_ATTACHMENT_HOST_SUFFIXES)
+    ):
+        raise ProfileHostError(
+            "REMOTE_ATTACHMENT_URL_DENIED",
+            "Remote bot attachments must use a public HTTPS media URL.",
+        )
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        if not address.is_global:
+            raise ProfileHostError(
+                "REMOTE_ATTACHMENT_URL_DENIED",
+                "Remote bot attachments cannot target a private network address.",
+            )
+    return value
+
+
+def _validate_attachment_content(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > MAX_ATTACHMENT_B64_CHARS:
+        raise ProfileHostError(
+            "INVALID_PARAMS",
+            "Attachment content is invalid or too large.",
+        )
+    encoded = value
+    if value.startswith("data:"):
+        header, separator, encoded = value.partition(",")
+        if not separator or ";base64" not in header.lower():
+            raise ProfileHostError("INVALID_PARAMS", "Attachment content is invalid.")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ProfileHostError("INVALID_PARAMS", "Attachment content is invalid.") from exc
+    if len(decoded) > MAX_ATTACHMENT_BYTES:
+        raise ProfileHostError(
+            "REQUEST_TOO_LARGE",
+            "A remote attachment can contain up to 25 MB.",
+        )
+    return value
+
+
+def _sanitize_remote_attachment(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ProfileHostError("INVALID_PARAMS", "Attachment is invalid.")
+    if value.get("filePath"):
+        raise ProfileHostError(
+            "REMOTE_FILE_PATH_DENIED",
+            "Remote profile messages must upload file content, not host file paths.",
+        )
+    filename = value.get("fileName", "")
+    mime_type = value.get("mimeType", "application/octet-stream")
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or len(filename) > 255
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in filename)
+        or "/" in filename
+        or "\\" in filename
+        or not isinstance(mime_type, str)
+        or not mime_type
+        or len(mime_type) > 255
+        or any(ord(char) < 0x20 for char in mime_type)
+    ):
+        raise ProfileHostError("INVALID_PARAMS", "Attachment metadata is invalid.")
+    content = value.get("content")
+    cdn_url = value.get("cdnUrl")
+    if bool(content) == bool(cdn_url):
+        raise ProfileHostError(
+            "INVALID_PARAMS",
+            "Remote attachments must include either uploaded content or a media URL.",
+        )
+    sanitized: dict[str, Any] = {"fileName": filename, "mimeType": mime_type}
+    if content:
+        sanitized["content"] = _validate_attachment_content(content)
+    else:
+        sanitized["cdnUrl"] = _validate_remote_attachment_url(cdn_url)
+    return sanitized
+
+
 def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(method, str) or method not in PROFILE_RPC_TIMEOUTS:
         raise ProfileHostError(
@@ -76,6 +222,44 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
         raise ProfileHostError("INVALID_PARAMS", "Profile request parameters are invalid.") from exc
     if size > MAX_REQUEST_BYTES:
         raise ProfileHostError("REQUEST_TOO_LARGE", "Profile request is too large.")
+    session_key_methods = {
+        "chat.history",
+        "chat.inflight",
+        "chat.send",
+        "sessions.model.get",
+        "sessions.model.set",
+    }
+    if method in session_key_methods:
+        _validate_session_key(value.get("sessionKey"), required=True)
+    elif "sessionKey" in value:
+        _validate_session_key(value.get("sessionKey"))
+    if method == "sessions.delete":
+        _validate_session_key(value.get("key"), required=True)
+    if method == "media.read":
+        media_id = value.get("mediaId")
+        offset = value.get("offset", 0)
+        length = value.get("length", 0)
+        if (
+            not isinstance(media_id, str)
+            or not media_id
+            or len(media_id) > 255
+            or media_id.startswith(".")
+            or ".." in media_id
+            or "/" in media_id
+            or "\\" in media_id
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in media_id)
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+            or not isinstance(length, int)
+            or isinstance(length, bool)
+            or not 0 <= length <= 1024 * 1024
+        ):
+            raise ProfileHostError(
+                "INVALID_PARAMS",
+                "Profile media request is invalid.",
+            )
+        value = {"mediaId": media_id, "offset": offset, "length": length}
     if method == "chat.send":
         # Remote clients may upload bytes, but they may never select paths or
         # browser registrations on the machine that owns the bot host.
@@ -91,31 +275,9 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
             raise ProfileHostError("INVALID_PARAMS", "Attachments must be an array.")
         if len(attachments) > 10:
             raise ProfileHostError("INVALID_PARAMS", "A message can include up to 10 files.")
-        for attachment in attachments:
-            if not isinstance(attachment, dict):
-                raise ProfileHostError("INVALID_PARAMS", "Attachment is invalid.")
-            if attachment.get("filePath"):
-                raise ProfileHostError(
-                    "REMOTE_FILE_PATH_DENIED",
-                    "Remote profile messages must upload file content, not host file paths.",
-                )
-            content = attachment.get("content")
-            cdn_url = attachment.get("cdnUrl")
-            if content is not None and (
-                not isinstance(content, str) or len(content) > MAX_ATTACHMENT_B64_CHARS
-            ):
-                raise ProfileHostError("INVALID_PARAMS", "Attachment content is invalid or too large.")
-            if cdn_url is not None and (
-                not isinstance(cdn_url, str)
-                or len(cdn_url) > 4096
-                or not cdn_url.startswith(("https://", "http://"))
-            ):
-                raise ProfileHostError("INVALID_PARAMS", "Attachment URL is invalid.")
-            if not content and not cdn_url:
-                raise ProfileHostError(
-                    "INVALID_PARAMS",
-                    "Remote attachments must include uploaded content or a media URL.",
-                )
+        value["attachments"] = [
+            _sanitize_remote_attachment(attachment) for attachment in attachments
+        ]
         message = value.get("message", "")
         if not isinstance(message, str) or len(message) > MAX_PROFILE_MESSAGE_CHARS:
             raise ProfileHostError(
@@ -124,6 +286,18 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
             )
         if not message and not attachments:
             raise ProfileHostError("INVALID_PARAMS", "A bot message cannot be empty.")
+        idempotency_key = value.get("idempotencyKey")
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or idempotency_key != idempotency_key.strip()
+            or len(idempotency_key) > 128
+            or any(
+                ord(char) < 0x20 or ord(char) == 0x7F
+                for char in idempotency_key
+            )
+        ):
+            raise ProfileHostError("INVALID_PARAMS", "Message identity is invalid.")
     return method, value
 
 
