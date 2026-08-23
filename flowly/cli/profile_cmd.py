@@ -14,7 +14,9 @@ from flowly.profile import (
     create_profile,
     delete_profile,
     describe_profile,
+    export_profile,
     get_active_profile,
+    import_profile,
     list_profiles,
     read_profile_settings,
     update_profile_metadata,
@@ -202,3 +204,37 @@ def profile_delete(
     except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
         _fail(exc)
     _emit({"ok": True, "deleted": name}, json_output)
+
+
+@profile_app.command("export")
+def profile_export(
+    name: str = typer.Argument(..., help="Profile identifier."),
+    output: str = typer.Option(..., "--output", help="Destination .tar.gz archive."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Export one complete isolated profile to a portable archive."""
+    try:
+        archive = export_profile(name, output)
+    except (ValueError, FileNotFoundError, FileExistsError, RuntimeError, OSError) as exc:
+        _fail(exc)
+    _emit({"ok": True, "profile": name, "archive": str(archive)}, json_output)
+
+
+@profile_app.command("import")
+def profile_import(
+    archive: str = typer.Argument(..., help="Source .tar.gz profile archive."),
+    name: str | None = typer.Option(None, "--name", help="New profile identifier."),
+    local_only: bool = typer.Option(
+        False,
+        "--local-only",
+        help="Remove messaging transports and relay identity for a managed local bot.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Import a portable profile archive after validating every entry."""
+    try:
+        profile_dir = import_profile(archive, name=name, local_runtime=local_only)
+        profile = describe_profile(profile_dir.name)
+    except (ValueError, FileNotFoundError, FileExistsError, OSError) as exc:
+        _fail(exc)
+    _emit({"ok": True, "profile": profile.to_dict()}, json_output)

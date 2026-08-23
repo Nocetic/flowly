@@ -381,4 +381,130 @@ def test_profile_import_extracts_atomically(profile_roots, tmp_path: Path) -> No
     imported = profiles.import_profile(str(archive), name="imported")
     assert imported == root / "imported"
     assert (imported / "config.json").read_bytes() == payload
+    assert (imported.stat().st_mode & 0o777) == 0o700
+    assert ((imported / "config.json").stat().st_mode & 0o777) == 0o600
     assert not list(_default.parent.glob(".flowly-import-*"))
+
+
+def test_profile_export_round_trips_without_runtime_identity(
+    profile_roots, tmp_path: Path
+) -> None:
+    _default, _root = profile_roots
+    source = profiles.create_profile("writer", local_runtime=True)
+    (source / "sessions" / "chat.jsonl").write_text("private history", encoding="utf-8")
+    (source / ".desktop-runtime.json").write_text(
+        json.dumps({"instanceId": "stale", "pid": 999_999_999}), encoding="utf-8"
+    )
+
+    archive = profiles.export_profile("writer", str(tmp_path / "writer-backup"))
+
+    assert archive == tmp_path / "writer-backup.tar.gz"
+    assert (archive.stat().st_mode & 0o777) == 0o600
+    with tarfile.open(archive, "r:gz") as bundle:
+        names = bundle.getnames()
+        assert "writer/sessions/chat.jsonl" in names
+        assert "writer/.desktop-runtime.json" not in names
+        assert all((member.mode & 0o077) == 0 for member in bundle.getmembers())
+
+    imported = profiles.import_profile(str(archive), name="writer-copy")
+    assert (imported / "sessions" / "chat.jsonl").read_text(encoding="utf-8") == (
+        "private history"
+    )
+    assert not (imported / ".desktop-runtime.json").exists()
+
+
+def test_default_profile_export_excludes_named_profiles_and_active_pointer(
+    profile_roots, tmp_path: Path
+) -> None:
+    default, _root = profile_roots
+    (default / "config.json").write_text("{}", encoding="utf-8")
+    profiles.create_profile("worker", local_runtime=True)
+    profiles.set_active_profile("worker")
+
+    archive = profiles.export_profile("default", str(tmp_path / "default.tgz"))
+
+    with tarfile.open(archive, "r:gz") as bundle:
+        names = bundle.getnames()
+    assert "default/config.json" in names
+    assert all(not name.startswith("default/profiles") for name in names)
+    assert "default/active_profile" not in names
+
+
+def test_profile_export_rejects_live_runtime_and_symbolic_links(
+    profile_roots, tmp_path: Path
+) -> None:
+    _default, _root = profile_roots
+    source = profiles.create_profile("active", local_runtime=True)
+    lease = source / ".desktop-runtime.json"
+    lease.write_text(
+        json.dumps({"instanceId": "runtime", "pid": profiles.os.getpid()}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="Stop it before export"):
+        profiles.export_profile("active", str(tmp_path / "active.tar.gz"))
+
+    lease.unlink()
+    (source / "workspace" / "outside-link").symlink_to(tmp_path)
+    with pytest.raises(ValueError, match="symbolic link"):
+        profiles.export_profile("active", str(tmp_path / "unsafe.tar.gz"))
+    assert not (tmp_path / "unsafe.tar.gz").exists()
+    assert not list(tmp_path.glob(".unsafe.tar.gz.*.tmp"))
+
+
+def test_profile_cli_exports_and_imports_archive(profile_roots, tmp_path: Path) -> None:
+    profiles.create_profile("portable", local_runtime=True)
+    archive = tmp_path / "portable.tar.gz"
+    runner = CliRunner()
+
+    exported = runner.invoke(
+        profile_app, ["export", "portable", "--output", str(archive), "--json"]
+    )
+    assert exported.exit_code == 0, exported.output
+    assert json.loads(exported.output)["archive"] == str(archive)
+
+    imported = runner.invoke(
+        profile_app, ["import", str(archive), "--name", "restored", "--json"]
+    )
+    assert imported.exit_code == 0, imported.output
+    assert json.loads(imported.output)["profile"]["name"] == "restored"
+
+
+def test_local_profile_import_strips_transport_identity(profile_roots, tmp_path: Path) -> None:
+    archive = tmp_path / "external.tar.gz"
+    config = json.dumps({
+        "channels": {
+            "telegram": {"enabled": True, "token": "secret"},
+            "web": {"enabled": True, "relayUrl": "wss://relay.example"},
+        },
+        "gateway": {"host": "0.0.0.0", "token": "gateway-secret"},
+        "agents": {"defaults": {"workspace": "/foreign/path", "model": "test/model"}},
+    }).encode()
+    environment = b"OPENAI_API_KEY=keep\nFLOWLY_SERVER_ID=drop\n"
+    with tarfile.open(archive, "w:gz") as bundle:
+        directory = tarfile.TarInfo("external")
+        directory.type = tarfile.DIRTYPE
+        bundle.addfile(directory)
+        for filename, payload in (("config.json", config), (".env", environment)):
+            member = tarfile.TarInfo(f"external/{filename}")
+            member.size = len(payload)
+            bundle.addfile(member, io.BytesIO(payload))
+
+    imported = profiles.import_profile(
+        str(archive), name="safe-copy", local_runtime=True,
+    )
+
+    imported_config = json.loads((imported / "config.json").read_text(encoding="utf-8"))
+    assert imported_config["channels"]["telegram"]["enabled"] is False
+    assert imported_config["channels"]["web"] == {"enabled": False}
+    assert imported_config["gateway"]["host"] == "127.0.0.1"
+    assert imported_config["gateway"]["token"] == ""
+    assert imported_config["agents"]["defaults"]["workspace"] == str(
+        imported / "workspace"
+    )
+    assert (imported / ".env").read_text(encoding="utf-8") == (
+        "OPENAI_API_KEY=keep\n"
+    )
+    assert json.loads((imported / "profile.json").read_text(encoding="utf-8"))[
+        "localRuntime"
+    ] is True

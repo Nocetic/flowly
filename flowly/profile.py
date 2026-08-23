@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # ── Constants ──────────────────────────────────────────────────────
 
@@ -1018,19 +1018,109 @@ def delete_profile(name: str) -> None:
 # ── Export / Import ───────────────────────────────────────────────
 
 def export_profile(name: str, output_path: str) -> Path:
-    """Export a profile to a tar.gz archive."""
-    validate_profile_name(name)
+    """Export a profile to an atomically-written portable tar.gz archive.
+
+    Runtime leases are machine/process credentials, not profile data. The
+    default home also owns the named-profile directory and active CLI pointer;
+    neither may be nested into a default-profile export. Symlinks are rejected
+    rather than dereferenced so an archive can never pull in data from outside
+    the isolated profile tree.
+    """
+    import tarfile
+
+    if name != "default":
+        validate_profile_name(name)
     profile_dir = _PROFILES_ROOT / name if name != "default" else _DEFAULT_HOME
-    if not profile_dir.is_dir():
+    if not profile_dir.is_dir() or profile_dir.is_symlink():
         raise FileNotFoundError(f"Profile '{name}' does not exist.")
 
-    base = str(output_path).removesuffix(".tar.gz").removesuffix(".tgz")
-    result = shutil.make_archive(base, "gztar", str(profile_dir.parent), profile_dir.name)
-    return Path(result)
+    lease = read_runtime_lease(profile_dir)
+    if lease:
+        raise RuntimeError(
+            f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before export."
+        )
+
+    raw_output = str(output_path)
+    target = Path(
+        raw_output if raw_output.endswith((".tar.gz", ".tgz")) else f"{raw_output}.tar.gz"
+    ).expanduser()
+    if not target.parent.is_dir():
+        raise FileNotFoundError(f"Export directory does not exist: {target.parent}")
+    resolved_profile = profile_dir.resolve()
+    resolved_target = target.resolve(strict=False)
+    if resolved_target == resolved_profile or resolved_profile in resolved_target.parents:
+        raise ValueError("Profile exports must be written outside the profile directory.")
+
+    excluded_roots = {_RUNTIME_LEASE_FILE}
+    if name == "default":
+        excluded_roots.update({"profiles", "active_profile"})
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        with tarfile.open(temporary, "w:gz") as bundle:
+            root_info = tarfile.TarInfo(name)
+            root_info.type = tarfile.DIRTYPE
+            root_info.mode = 0o700
+            root_info.mtime = int(time.time())
+            bundle.addfile(root_info)
+            for candidate in sorted(profile_dir.rglob("*")):
+                relative = candidate.relative_to(profile_dir)
+                if relative.parts[0] in excluded_roots:
+                    continue
+                metadata = candidate.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise ValueError(
+                        f"Profile export contains a symbolic link: {relative.as_posix()}"
+                    )
+                if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                    raise ValueError(
+                        f"Profile export contains an unsupported entry: {relative.as_posix()}"
+                    )
+                bundle.add(
+                    candidate,
+                    arcname=(Path(name) / relative).as_posix(),
+                    recursive=False,
+                    filter=lambda info: _portable_profile_tar_info(info),
+                )
+        os.replace(temporary, target)
+        try:
+            target.chmod(0o600)
+        except OSError:
+            pass
+        return target
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
-def import_profile(archive_path: str, name: str | None = None) -> Path:
-    """Import a profile from a tar.gz archive."""
+def _portable_profile_tar_info(info: Any) -> Any:
+    """Strip host ownership and unsafe mode bits from one exported entry."""
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    # A profile can contain provider credentials and private memory. Preserve
+    # only owner permissions (including an executable owner's script bit).
+    info.mode = (info.mode & 0o700) | (0o700 if info.isdir() else 0o600)
+    return info
+
+
+def import_profile(
+    archive_path: str,
+    name: str | None = None,
+    *,
+    local_runtime: bool = False,
+) -> Path:
+    """Import a profile from a tar.gz archive.
+
+    ``local_runtime`` converts the imported profile into a Desktop-managed
+    bot before publication: messaging transports and machine relay identity
+    are removed while model-provider credentials remain profile-local.
+    """
     import tarfile
 
     archive = Path(archive_path)
@@ -1049,6 +1139,7 @@ def import_profile(archive_path: str, name: str | None = None) -> Path:
             if (
                 not parts
                 or normalized.startswith("/")
+                or "\\" in member.name
                 or ".." in parts
                 or member.issym()
                 or member.islnk()
@@ -1089,6 +1180,22 @@ def import_profile(archive_path: str, name: str | None = None) -> Path:
         if not extracted.is_dir() or extracted.is_symlink():
             raise ValueError("Profile archive must contain one profile directory.")
         _assert_tree_no_symlinks(extracted)
+        if local_runtime:
+            _sanitize_local_runtime_clone(extracted, profile_dir / "workspace")
+            metadata = _profile_metadata(extracted)
+            now = _utc_now()
+            metadata.update({
+                "version": 1,
+                "displayName": str(metadata.get("displayName") or inferred).strip(),
+                "description": str(metadata.get("description") or "").strip(),
+                "markText": _validate_mark_text(str(metadata.get("markText") or "")),
+                "markTone": _validate_mark_tone(str(metadata.get("markTone") or "")),
+                "createdAt": str(metadata.get("createdAt") or now),
+                "updatedAt": now,
+                "localRuntime": True,
+            })
+            _atomic_write_json(extracted / _PROFILE_METADATA_FILE, metadata)
+        _harden_profile_tree_permissions(extracted)
         os.replace(extracted, profile_dir)
         try:
             profile_dir.chmod(0o700)
@@ -1101,6 +1208,21 @@ def import_profile(archive_path: str, name: str | None = None) -> Path:
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def _harden_profile_tree_permissions(root: Path) -> None:
+    """Make imported private data owner-only while preserving owner execute bits."""
+    for candidate in [root, *sorted(root.rglob("*"))]:
+        metadata = candidate.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            candidate.chmod(0o700)
+        elif stat.S_ISREG(metadata.st_mode):
+            candidate.chmod(0o700 if metadata.st_mode & stat.S_IXUSR else 0o600)
+        else:
+            raise ValueError(
+                f"Profile import contains an unsupported entry: "
+                f"{candidate.relative_to(root).as_posix()}"
+            )
 
 
 # ── Wrapper scripts ───────────────────────────────────────────────
