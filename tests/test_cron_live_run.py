@@ -315,6 +315,35 @@ class TestCronListRpc:
         )
 
 
+class TestCronUpdateRpc:
+    async def test_schedule_mapping_updates_the_persisted_job(self, wired):
+        job = wired.add_job("morning", EVERY_MINUTE, "old message")
+
+        result = feature_rpc.cron_update({
+            "id": job.id,
+            "updates": {
+                "name": "weekday briefing",
+                "message": "new message",
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6",
+                "schedule": {"kind": "cron", "expr": "30 8 * * 1-5"},
+            },
+        })
+
+        assert result["job"]["name"] == "weekday briefing"
+        assert result["job"]["payload"]["message"] == "new message"
+        assert result["job"]["schedule"]["kind"] == "cron"
+        assert result["job"]["schedule"]["expr"] == "30 8 * * 1-5"
+        assert result["job"]["provider"] == "openrouter"
+        assert result["job"]["model"] == "openai/gpt-5.6"
+
+        persisted = wired.list_jobs(include_disabled=True)[0]
+        assert persisted.schedule.kind == "cron"
+        assert persisted.schedule.expr == "30 8 * * 1-5"
+        assert persisted.provider == "openrouter"
+        assert persisted.model == "openai/gpt-5.6"
+
+
 # ── cron.output RPC ─────────────────────────────────────────────────
 
 

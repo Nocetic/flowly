@@ -26,7 +26,7 @@ TOOLSET_MEMBERS: dict[str, frozenset[str]] = {
     }),
     "delegation": frozenset({
         "spawn", "builtin_agent", "sessions_list", "delegate_to",
-        "codex_session",
+        "codex_session", "message_profile",
     }),
     "sessions": frozenset({"session_search"}),
     "scheduling": frozenset({"cron"}),

@@ -62,6 +62,8 @@ def test_local_runtime_clone_keeps_provider_but_drops_transport_identity(profile
         clone_from="default",
         display_name="Research",
         description="Deep research profile",
+        mark_text="RS",
+        mark_tone="violet",
         local_runtime=True,
     )
 
@@ -79,6 +81,12 @@ def test_local_runtime_clone_keeps_provider_but_drops_transport_identity(profile
     info = profiles.describe_profile("research")
     assert info.display_name == "Research"
     assert info.description == "Deep research profile"
+    assert info.model
+    assert info.to_dict()["model"] == info.model
+    assert info.mark_text == "RS"
+    assert info.mark_tone == "violet"
+    assert info.to_dict()["markText"] == "RS"
+    assert info.to_dict()["markTone"] == "violet"
     assert info.created_at.endswith("Z")
     assert info.to_dict()["path"] == str(created)
 
@@ -92,6 +100,20 @@ def test_profile_creation_is_atomic_when_clone_config_is_invalid(profile_roots) 
 
     assert not (root / "broken").exists()
     assert not list(default.parent.glob(".flowly-profile-broken.*"))
+
+
+def test_current_profile_name_follows_process_home_not_sticky_selection(
+    profile_roots, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    default, root = profile_roots
+    monkeypatch.setenv("FLOWLY_HOME", str(default))
+    assert profiles.current_profile_name() == "default"
+
+    monkeypatch.setenv("FLOWLY_HOME", str(root / "research"))
+    assert profiles.current_profile_name() == "research"
+
+    monkeypatch.setenv("FLOWLY_HOME", str(root / "bad profile"))
+    assert profiles.current_profile_name() == "default"
 
 
 def test_clone_all_does_not_copy_machine_or_runtime_identity(profile_roots) -> None:
@@ -118,10 +140,14 @@ def test_profile_metadata_updates_without_touching_profile_data(profile_roots) -
         "writer",
         display_name="Writer Room",
         description="Long-form writing",
+        mark_text="WR",
+        mark_tone="amber",
     )
 
     assert updated.display_name == "Writer Room"
     assert updated.description == "Long-form writing"
+    assert updated.mark_text == "WR"
+    assert updated.mark_tone == "amber"
     assert updated.updated_at.endswith("Z")
     assert sentinel.read_text(encoding="utf-8") == "untouched"
 
@@ -146,21 +172,25 @@ def test_profile_model_and_soul_are_isolated_and_editable(profile_roots) -> None
         "analyst",
         clone_from="default",
         local_runtime=True,
+        provider="openrouter",
         model="profile/model",
         soul="# Analyst\n\nVerify every claim.\n",
     )
 
     assert profiles.read_profile_settings("analyst") == {
         "name": "analyst",
+        "provider": "openrouter",
         "model": "profile/model",
         "soul": "# Analyst\n\nVerify every claim.\n",
         "workspace": str(created / "workspace"),
     }
     updated = profiles.update_profile_settings(
         "analyst",
+        provider="anthropic",
         model="profile/model-v2",
         soul="",
     )
+    assert updated["provider"] == "anthropic"
     assert updated["model"] == "profile/model-v2"
     assert updated["soul"] == ""
     assert json.loads((default / "config.json").read_text(encoding="utf-8"))["agents"]["defaults"]["model"] == "base/model"
@@ -189,7 +219,8 @@ def test_profile_cli_round_trips_isolated_settings(profile_roots) -> None:
 
     created = runner.invoke(profile_app, [
         "create", "planner", "--clone-from", "default", "--local-only",
-        "--display-name", "Planner", "--model", "planner/model",
+        "--display-name", "Planner", "--provider", "openrouter", "--model", "planner/model",
+        "--mark-text", "PL", "--mark-tone", "sky",
         "--soul", "Plan before acting.\n", "--json",
     ])
     assert created.exit_code == 0, created.output
@@ -197,8 +228,22 @@ def test_profile_cli_round_trips_isolated_settings(profile_roots) -> None:
     settings = runner.invoke(profile_app, ["settings", "planner", "--json"])
     assert settings.exit_code == 0, settings.output
     payload = json.loads(settings.output)
+    assert payload["settings"]["provider"] == "openrouter"
     assert payload["settings"]["model"] == "planner/model"
     assert payload["settings"]["soul"] == "Plan before acting.\n"
+    described = runner.invoke(profile_app, ["describe", "planner", "--json"])
+    descriptor = json.loads(described.output)["profile"]
+    assert descriptor["markText"] == "PL"
+    assert descriptor["markTone"] == "sky"
+
+
+def test_profile_mark_rejects_invalid_values(profile_roots) -> None:
+    with pytest.raises(ValueError, match="one or two"):
+        profiles.create_profile("writer", mark_text="LONG")
+    with pytest.raises(ValueError, match="Unknown profile mark tone"):
+        profiles.create_profile("writer", mark_tone="neon")
+    with pytest.raises(ValueError, match="Unknown model provider"):
+        profiles.create_profile("writer", provider="unknown-provider")
 
 
 def test_running_profile_cannot_be_deleted(profile_roots) -> None:

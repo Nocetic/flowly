@@ -7828,6 +7828,22 @@ class AgentLoop:
             tool_chat_id = (msg.metadata.get("origin_chat_id") or "").strip() or msg.chat_id
 
         disabled_tools = msg.metadata.get("disabled_tools")
+        collaboration_directory = msg.metadata.get("profile_directory")
+        collaboration_current = str(msg.metadata.get("profile_current") or "default")
+        has_profile_target = isinstance(collaboration_directory, list) and any(
+            isinstance(value, str) and value and value != collaboration_current
+            for value in collaboration_directory
+        )
+        if not has_profile_target:
+            disabled_tools = [
+                *(
+                    value for value in disabled_tools
+                    if isinstance(value, str)
+                )
+            ] if isinstance(disabled_tools, (list, tuple, set)) else []
+            if "message_profile" not in disabled_tools:
+                disabled_tools.append("message_profile")
+            msg.metadata["disabled_tools"] = disabled_tools
         turn_disclosure = (
             self._routed_tool_disclosure(
                 msg.channel,
@@ -7915,6 +7931,45 @@ class AgentLoop:
                 "call is rejected by the executor."
             )
 
+        profile_collaboration_sidecar = ""
+        raw_profile_directory = msg.metadata.get("profile_directory")
+        if isinstance(raw_profile_directory, list):
+            current_profile = str(msg.metadata.get("profile_current") or "default")
+            targets = [
+                str(value)
+                for value in raw_profile_directory
+                if isinstance(value, str) and value and value != current_profile
+            ]
+            mentions = [
+                str(value)
+                for value in (msg.metadata.get("profile_mentions") or [])
+                if isinstance(value, str) and value in targets
+            ]
+            source_profile = str(msg.metadata.get("profile_message_source") or "")
+            if targets or source_profile:
+                lines = [
+                    "<profile_collaboration transport=\"desktop-local\">",
+                    f"Current profile id: {current_profile}",
+                    "Available target profile ids: " + (", ".join(targets) or "none"),
+                ]
+                if mentions:
+                    lines.append(
+                        "The user explicitly mentioned: " + ", ".join(mentions)
+                        + ". Use message_profile when their response is relevant."
+                    )
+                if source_profile:
+                    lines.append(
+                        f"This turn is a correlated message from profile {source_profile}. "
+                        "Answer its request directly. You may use message_profile for a "
+                        "necessary follow-up, but avoid acknowledgement loops."
+                    )
+                lines.append(
+                    "Profile messages stay in profile-local sessions and are brokered "
+                    "by Desktop; they do not use relay or cloud conversation storage."
+                )
+                lines.append("</profile_collaboration>")
+                profile_collaboration_sidecar = "\n".join(lines)
+
         # Cron isolation flags affect both the real prompt and its compaction
         # estimate. Resolve them before the preview so the estimator measures
         # the exact context policy the provider call below will carry.
@@ -7926,6 +7981,7 @@ class AgentLoop:
             for block in (
                 coverage_sidecar,
                 tool_policy_sidecar,
+                profile_collaboration_sidecar,
             )
             if block
         ]

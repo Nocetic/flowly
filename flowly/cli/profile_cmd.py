@@ -62,8 +62,11 @@ def profile_create(
     clone_all: bool = typer.Option(False, "--clone-all", help="Also copy sessions and memory."),
     display_name: str = typer.Option("", "--display-name", help="Name shown in clients."),
     description: str = typer.Option("", "--description", help="Short purpose shown in clients."),
+    provider: str | None = typer.Option(None, "--provider", help="Profile-local active model provider."),
     model: str | None = typer.Option(None, "--model", help="Profile-local default model."),
     soul: str | None = typer.Option(None, "--soul", help="Profile-local SOUL.md contents."),
+    mark_text: str = typer.Option("", "--mark-text", help="One or two characters shown in Desktop."),
+    mark_tone: str = typer.Option("", "--mark-tone", help="Desktop signature color."),
     local_only: bool = typer.Option(
         False,
         "--local-only",
@@ -81,8 +84,11 @@ def profile_create(
             display_name=display_name,
             description=description,
             local_runtime=local_only,
+            provider=provider,
             model=model,
             soul=soul,
+            mark_text=mark_text,
+            mark_tone=mark_tone,
         )
         profile = describe_profile(name)
     except (ValueError, FileExistsError, FileNotFoundError, OSError) as exc:
@@ -95,22 +101,27 @@ def profile_configure(
     name: str = typer.Argument(..., help="Profile identifier."),
     display_name: str | None = typer.Option(None, "--display-name", help="Name shown in clients."),
     description: str | None = typer.Option(None, "--description", help="Short purpose shown in clients."),
+    provider: str | None = typer.Option(None, "--provider", help="Profile-local active model provider."),
     model: str | None = typer.Option(None, "--model", help="Profile-local default model."),
     soul: str | None = typer.Option(None, "--soul", help="Replace profile-local SOUL.md contents."),
+    mark_text: str | None = typer.Option(None, "--mark-text", help="One or two characters shown in Desktop."),
+    mark_tone: str | None = typer.Option(None, "--mark-tone", help="Desktop signature color."),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Update profile metadata and isolated runtime settings."""
-    if display_name is None and description is None and model is None and soul is None:
+    if display_name is None and description is None and provider is None and model is None and soul is None and mark_text is None and mark_tone is None:
         raise typer.BadParameter("at least one field is required")
     try:
         settings = None
-        if model is not None or soul is not None:
-            settings = update_profile_settings(name, model=model, soul=soul)
-        if display_name is not None or description is not None:
+        if provider is not None or model is not None or soul is not None:
+            settings = update_profile_settings(name, provider=provider, model=model, soul=soul)
+        if display_name is not None or description is not None or mark_text is not None or mark_tone is not None:
             profile = update_profile_metadata(
                 name,
                 display_name=display_name,
                 description=description,
+                mark_text=mark_text,
+                mark_tone=mark_tone,
             )
         else:
             profile = describe_profile(name)

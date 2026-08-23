@@ -1590,12 +1590,19 @@ async def model_list(params: dict) -> dict:
     from flowly.integrations.active_provider import resolve_active_provider
     from flowly.integrations.model_catalog import fetch_models
 
+    requested = str(params.get("provider") or "").strip()
     active = resolve_active_provider(load_config())
-    if active is None:
+    provider_key = requested or (active.key if active is not None else "")
+    if not provider_key:
         return {"provider": None, "models": []}
-    models = await fetch_models(active.key, force_refresh=bool(params.get("forceRefresh")))
+    if requested:
+        from flowly.config.schema import ProvidersConfig
+
+        if requested == "active" or requested not in ProvidersConfig.model_fields:
+            raise FeatureRpcError("INVALID", f"unknown provider: {requested}")
+    models = await fetch_models(provider_key, force_refresh=bool(params.get("forceRefresh")))
     return {
-        "provider": active.key,
+        "provider": provider_key,
         "models": [
             {
                 "id": m.id,
@@ -2998,6 +3005,65 @@ def skills_list() -> dict:
     return {"skills": skills}
 
 
+async def skills_install(params: dict) -> dict:
+    """Install one managed skill into the active profile.
+
+    ``source`` accepts the same registry slug, GitHub reference, URL or local
+    path as ``flowly skills install``. The explicit managed directory keeps
+    profile runtimes isolated even when ``SkillManager`` was imported before
+    ``FLOWLY_HOME`` was rebound for the profile.
+    """
+    source = str(params.get("source") or "").strip()
+    if not source:
+        raise FeatureRpcError("INVALID", "source is required")
+
+    def _install():
+        from flowly.agent.skills import clear_skills_snapshot
+        from flowly.hub.manager import SkillManager
+
+        with SkillManager(
+            managed_dir=get_flowly_home() / "skills",
+            workspace_dir=workspace_dir(),
+        ) as manager:
+            result = manager.install(source, force=bool(params.get("force")))
+        if result is not None:
+            clear_skills_snapshot()
+        return result
+
+    result = await asyncio.to_thread(_install)
+    if result is None:
+        raise FeatureRpcError("INSTALL_FAILED", f"could not install skill: {source}")
+    return {
+        "ok": True,
+        "skill": result.to_dict(),
+        "willRestart": bool(params.get("restart", True)),
+    }
+
+
+async def skills_remove(params: dict) -> dict:
+    """Remove one profile-managed skill; bundled skills are never targeted."""
+    slug = str(params.get("slug") or params.get("name") or "").strip()
+    if not slug:
+        raise FeatureRpcError("INVALID", "slug is required")
+
+    def _remove() -> bool:
+        from flowly.agent.skills import clear_skills_snapshot
+        from flowly.hub.manager import SkillManager
+
+        with SkillManager(
+            managed_dir=get_flowly_home() / "skills",
+            workspace_dir=workspace_dir(),
+        ) as manager:
+            removed = manager.remove(slug)
+        if removed:
+            clear_skills_snapshot()
+        return removed
+
+    if not await asyncio.to_thread(_remove):
+        raise FeatureRpcError("NOT_FOUND", f"managed skill not found: {slug}")
+    return {"ok": True, "willRestart": bool(params.get("restart", True))}
+
+
 # ── Knowledge graph ─────────────────────────────────────────────────────────
 
 
@@ -3143,6 +3209,14 @@ def sessions_list() -> dict:
                         # True while a turn for this session is in flight — drives the
                         # client's "running" shimmer. Old clients ignore the field.
                         "running": _inflight_get(key) is not None,
+                        # Conversation-scoped model selection. This is safe to
+                        # expose (it is a public model id, never a credential)
+                        # and lets local profile clients label each chat
+                        # without opening every JSONL file a second time.
+                        "modelOverride": (
+                            str(metadata.get("model_override") or "").strip()
+                            or None
+                        ),
                     }
                 )
             except Exception:
@@ -3845,7 +3919,25 @@ def cron_update(params: dict) -> dict:
     if "enabled" in params:
         job = svc.enable_job(jid, bool(params.get("enabled")))
     elif isinstance(params.get("updates"), dict):
-        job = svc.update_job(jid, params["updates"])
+        updates = dict(params["updates"])
+        schedule = updates.get("schedule")
+        if isinstance(schedule, dict):
+            from flowly.cron.types import CronSchedule
+
+            try:
+                updates["schedule"] = CronSchedule(
+                    kind=schedule.get("kind"),
+                    at_ms=schedule.get("atMs"),
+                    every_ms=schedule.get("everyMs"),
+                    expr=schedule.get("expr"),
+                    tz=schedule.get("tz"),
+                )
+            except Exception as e:
+                raise FeatureRpcError("INVALID", f"bad schedule: {e}") from e
+        try:
+            job = svc.update_job(jid, updates)
+        except ValueError as e:
+            raise FeatureRpcError("INVALID", str(e)) from e
     else:
         raise FeatureRpcError("INVALID", "provide enabled or updates")
     if job is None:
@@ -4322,6 +4414,8 @@ _DISPATCH: dict[str, tuple] = {
     "assistants.write": (assistants_write, True, False),
     "assistants.delete": (assistants_delete, True, False),
     "skills.list": (skills_list, False, False),
+    "skills.install": (skills_install, True, True),
+    "skills.remove": (skills_remove, True, True),
     "kg.graph": (kg_graph, False, False),
     "kg.delete_entity": (kg_delete_entity, True, False),
     "sessions.list": (sessions_list, False, False),

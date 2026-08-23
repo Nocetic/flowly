@@ -339,6 +339,7 @@ def gateway(
         # for an async announcement that never arrives inline.
         "spawn",
         "delegate_to",
+        "message_profile",
         # NOTE: Side-effect integrations (google_drive, email, linear, etc.)
         # are NOT blocked here by default. If the user says "every morning
         # draft a Gmail reply" the cron must be able to call gmail. The
@@ -1695,6 +1696,16 @@ Respond to the user now:"""
 
     # Wire browser_tab tool to gateway server
     agent.set_gateway_server(gateway_server)
+
+    # Profiles collaborate through the Desktop process, which is the only
+    # authority that can see and start sibling runtimes. The tool is restricted
+    # to the direct ``desktop`` platform and its reverse-RPC binding is scoped
+    # to the authenticated socket, so relay/web turns never see or invoke it.
+    # Registering on the primary gateway too lets the default profile take part
+    # alongside Desktop-managed named profiles.
+    from flowly.agent.tools.message_profile import MessageProfileTool
+
+    agent.tools.register(MessageProfileTool(gateway_server))
 
     # A standing goal's turns re-enter through each surface's OWN chat entry,
     # so an autonomous turn is indistinguishable from a typed one: the direct

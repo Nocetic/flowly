@@ -104,6 +104,7 @@ ChatCallback = Callable[
         bool,
         Callable[[dict], Awaitable[None]] | None,
         tuple[str, ...],
+        dict[str, Any] | None,
     ],
     Awaitable[tuple[str, dict]],
 ]
@@ -166,6 +167,35 @@ class _BrowserRunBinding:
 _BROWSER_RUN_BINDING: ContextVar[_BrowserRunBinding | None] = ContextVar(
     "flowly_browser_run_binding", default=None
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileRunBinding:
+    """Desktop collaboration authority scoped to one chat coroutine."""
+
+    client_id: str
+    session_key: str
+    current_profile: str
+    available_profiles: tuple[str, ...]
+    correlation_id: str
+    hop: int = 0
+
+
+_PROFILE_RUN_BINDING: ContextVar[_ProfileRunBinding | None] = ContextVar(
+    "flowly_profile_run_binding", default=None
+)
+
+_PROFILE_ID_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
+
+def _valid_profile_id(value: str) -> bool:
+    return (
+        1 <= len(value) <= 64
+        and value[0].isalnum()
+        and all(char in _PROFILE_ID_CHARS for char in value)
+    )
 
 
 def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
@@ -521,6 +551,12 @@ class GatewayServer:
         # A result from another provider must never resolve that request.
         self._browser_pending_clients: dict[str, str] = {}
         self._browser_pending_registrations: dict[str, str] = {}
+        # Profile collaboration requests are reverse RPCs to the exact Desktop
+        # socket that owns the originating chat. They are intentionally
+        # independent from browser-provider registration and never reach the
+        # relay transport.
+        self._profile_pending: dict[str, asyncio.Future] = {}
+        self._profile_pending_clients: dict[str, str] = {}
 
     def _create_app(self) -> web.Application:
         """Create the aiohttp application."""
@@ -1197,6 +1233,8 @@ class GatewayServer:
                             logger.warning(
                                 f"[WS] tool_result from non-extension client {client_id}, ignoring"
                             )
+                    elif msg_type == "profile_message_result":
+                        self._handle_profile_message_result(data, client_id)
                 elif raw_msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                     break
         except Exception as e:
@@ -1214,6 +1252,15 @@ class GatewayServer:
             is_current_connection = self._ws_clients.get(client_id) is ws
             if is_current_connection:
                 self._ws_clients.pop(client_id, None)
+                for request_id, expected_client in tuple(self._profile_pending_clients.items()):
+                    if expected_client != client_id:
+                        continue
+                    future = self._profile_pending.get(request_id)
+                    if future is not None and not future.done():
+                        future.set_result({
+                            "error": "Desktop disconnected while another profile was responding",
+                            "error_code": "PROFILE_BROKER_DISCONNECTED",
+                        })
             # Drop any session→ws bindings that pointed at this closed socket so
             # we don't hold a dead ref (a live re-entry re-binds via chat.inflight
             # anyway; _ws_send already no-ops on a closed socket).
@@ -1266,6 +1313,12 @@ class GatewayServer:
 
             elif method == "sessions.delete":
                 await self._ws_rpc_sessions_delete(ws, rpc_id, params)
+
+            elif method == "sessions.model.get":
+                await self._ws_rpc_sessions_model_get(ws, rpc_id, params)
+
+            elif method == "sessions.model.set":
+                await self._ws_rpc_sessions_model_set(ws, rpc_id, params)
 
             elif method == "chat.history":
                 await self._ws_rpc_chat_history(ws, rpc_id, params)
@@ -2207,6 +2260,64 @@ class GatewayServer:
         clear_session_cwd(session_key)
         await self._ws_rpc_reply(ws, rpc_id, {"deleted": deleted, "sessionKey": session_key})
 
+    async def _ws_rpc_sessions_model_get(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
+        """Read the model pinned to one local conversation.
+
+        The profile default remains untouched. An empty value means inherit
+        the profile's current default model.
+        """
+        session_key = str(params.get("sessionKey") or "").strip()
+        if not session_key or not self.sessions:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "sessionKey is required")
+            return
+        session = self.sessions.get_or_create(session_key)
+        model = str(session.metadata.get("model_override") or "").strip()
+        await self._ws_rpc_reply(
+            ws,
+            rpc_id,
+            {"sessionKey": session_key, "model": model or None, "inherited": not bool(model)},
+        )
+
+    async def _ws_rpc_sessions_model_set(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
+        """Atomically pin or clear a conversation-scoped model override."""
+        session_key = str(params.get("sessionKey") or "").strip()
+        if not session_key or not self.sessions:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "sessionKey is required")
+            return
+        from flowly.agent import inflight
+
+        if inflight.get(session_key) is not None:
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "SESSION_BUSY",
+                "Finish or stop the active turn before changing its model.",
+            )
+            return
+        raw_model = params.get("model")
+        if raw_model is not None and not isinstance(raw_model, str):
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "model must be a string or null")
+            return
+        model = str(raw_model or "").strip()
+        if len(model) > 256 or "\x00" in model:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "model is invalid")
+            return
+        session = self.sessions.get_or_create(session_key)
+        if model:
+            session.metadata["model_override"] = model
+        else:
+            session.metadata.pop("model_override", None)
+        self.sessions.save(session)
+        await self._ws_rpc_reply(
+            ws,
+            rpc_id,
+            {"sessionKey": session_key, "model": model or None, "inherited": not bool(model)},
+        )
+
     # --- RPC: chat.history ---
 
     async def _ws_rpc_chat_history(
@@ -2307,6 +2418,7 @@ class GatewayServer:
                 "sessionId": session_key,
                 "messages": messages,
                 "thinkingLevel": session.metadata.get("thinkingLevel"),
+                "modelOverride": session.metadata.get("model_override"),
             },
         )
 
@@ -2329,6 +2441,109 @@ class GatewayServer:
         session_key = params.get("sessionKey") or f"desktop:{client_id}"
         idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
         run_id = idempotency_key
+
+        # A chat inherits its persisted model pin. A one-turn override may be
+        # supplied by trusted direct clients, but it is deliberately not
+        # persisted here — sessions.model.set owns that explicit state change.
+        raw_model_override = params.get("modelOverride")
+        if raw_model_override is not None and not isinstance(raw_model_override, str):
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "modelOverride must be a string")
+            return
+        model_override = str(raw_model_override or "").strip()
+        if len(model_override) > 256 or "\x00" in model_override:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "modelOverride is invalid")
+            return
+        if not model_override and self.sessions:
+            model_override = str(
+                self.sessions.get_or_create(session_key).metadata.get("model_override") or ""
+            ).strip()
+
+        # Desktop is the directory authority: sibling runtimes do not scan or
+        # start one another. Keep only stable ids and small scalar context on
+        # the agent request; display labels and filesystem paths never cross
+        # this boundary.
+        raw_directory = params.get("profileDirectory")
+        if raw_directory is None:
+            raw_directory = []
+        if not isinstance(raw_directory, list) or len(raw_directory) > 64:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "profileDirectory is invalid")
+            return
+        profile_directory: list[str] = []
+        for item in raw_directory:
+            candidate = str(item or "").strip()
+            if not _valid_profile_id(candidate):
+                await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "profileDirectory contains an invalid id")
+                return
+            if candidate not in profile_directory:
+                profile_directory.append(candidate)
+
+        raw_mentions = params.get("profileMentions")
+        if raw_mentions is None:
+            raw_mentions = []
+        if not isinstance(raw_mentions, list) or len(raw_mentions) > 32:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "profileMentions is invalid")
+            return
+        profile_mentions: list[str] = []
+        for item in raw_mentions:
+            candidate = str(item or "").strip()
+            if candidate not in profile_directory:
+                await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "profileMentions contains an unknown id")
+                return
+            if candidate not in profile_mentions:
+                profile_mentions.append(candidate)
+
+        collaboration_context = params.get("profileMessageContext")
+        source_profile = ""
+        correlation_id = run_id
+        profile_hop = 0
+        if collaboration_context is not None:
+            if not isinstance(collaboration_context, dict):
+                await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "profileMessageContext is invalid")
+                return
+            source_profile = str(collaboration_context.get("sourceProfile") or "").strip()
+            correlation_id = str(collaboration_context.get("correlationId") or "").strip()
+            raw_hop = collaboration_context.get("hop")
+            if (
+                not _valid_profile_id(source_profile)
+                or not correlation_id
+                or len(correlation_id) > 128
+                or not isinstance(raw_hop, int)
+                or isinstance(raw_hop, bool)
+                or raw_hop < 1
+                or raw_hop > 3
+            ):
+                await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "profileMessageContext failed validation")
+                return
+            profile_hop = raw_hop
+
+        from flowly.profile import current_profile_name
+
+        current_profile = current_profile_name()
+        collaboration_metadata: dict[str, Any] = {
+            "profile_current": current_profile,
+            "profile_directory": profile_directory,
+            "profile_mentions": profile_mentions,
+            "profile_correlation_id": correlation_id,
+            "profile_hop": profile_hop,
+        }
+        if source_profile:
+            collaboration_metadata["profile_message_source"] = source_profile
+        if model_override:
+            collaboration_metadata["model_override"] = model_override
+        raw_disabled_tools = params.get("disabledTools")
+        if raw_disabled_tools is not None:
+            if not isinstance(raw_disabled_tools, list) or len(raw_disabled_tools) > 64:
+                await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "disabledTools is invalid")
+                return
+            disabled_tools: list[str] = []
+            for value in raw_disabled_tools:
+                name = str(value or "").strip()
+                if not name or len(name) > 128 or "\x00" in name:
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "disabledTools is invalid")
+                    return
+                if name not in disabled_tools:
+                    disabled_tools.append(name)
+            collaboration_metadata["disabled_tools"] = disabled_tools
 
         # Direct gateway runs never inherit the process-global browser
         # selection. The desktop must attach an opaque registration owned by
@@ -2420,6 +2635,7 @@ class GatewayServer:
                 voice_mode,
                 browser_binding,
                 render_capabilities,
+                collaboration_metadata,
             )
         )
         self._active_tasks[run_id] = task
@@ -2557,6 +2773,24 @@ class GatewayServer:
             )
 
         binding_token = _BROWSER_RUN_BINDING.set(browser_binding)
+        profile_binding_token = _PROFILE_RUN_BINDING.set(
+            _ProfileRunBinding(
+                client_id=client_id,
+                session_key=session_key,
+                current_profile=str((extra_metadata or {}).get("profile_current") or "default"),
+                available_profiles=tuple(
+                    str(value)
+                    for value in ((extra_metadata or {}).get("profile_directory") or [])
+                    if isinstance(value, str)
+                ),
+                correlation_id=str(
+                    (extra_metadata or {}).get("profile_correlation_id") or run_id
+                ),
+                hop=int((extra_metadata or {}).get("profile_hop") or 0),
+            )
+            if client_id
+            else None
+        )
         try:
             assert self.on_chat_message is not None
             call_args = (
@@ -2760,6 +2994,7 @@ class GatewayServer:
                 },
             )
         finally:
+            _PROFILE_RUN_BINDING.reset(profile_binding_token)
             _BROWSER_RUN_BINDING.reset(binding_token)
             # Run settled (final / aborted / error) — the partial is no
             # longer needed; the final message carries the full text.
@@ -3380,6 +3615,111 @@ class GatewayServer:
             self._browser_pending_registrations.pop(request_id, None)
             if provider.get("activeRequestId") == request_id:
                 provider.pop("activeRequestId", None)
+
+    async def send_profile_message_request(
+        self,
+        request_id: str,
+        target_profile: str,
+        message: str,
+    ) -> dict:
+        """Ask the owning Desktop client to broker one sibling-profile turn.
+
+        The gateway never discovers sibling directories and never opens their
+        ports. Desktop validates the target, starts it if necessary, and
+        returns the correlated result on this same authenticated socket.
+        """
+        binding = _PROFILE_RUN_BINDING.get()
+        if binding is None or not binding.client_id:
+            return {
+                "error": "Profile messaging is available only in a Desktop-managed conversation",
+                "error_code": "PROFILE_BROKER_UNAVAILABLE",
+            }
+        target = str(target_profile or "").strip()
+        content = str(message or "").strip()
+        if not _valid_profile_id(target) or target not in binding.available_profiles:
+            return {
+                "error": f"Unknown profile '{target}'. Available: "
+                + (", ".join(binding.available_profiles) or "none"),
+                "error_code": "PROFILE_NOT_FOUND",
+            }
+        if target == binding.current_profile:
+            return {
+                "error": "A profile cannot message itself",
+                "error_code": "PROFILE_SELF_MESSAGE",
+            }
+        if not content or len(content) > 32_000:
+            return {
+                "error": "Profile message must contain 1–32,000 characters",
+                "error_code": "PROFILE_MESSAGE_INVALID",
+            }
+        if binding.hop >= 3:
+            return {
+                "error": "Profile collaboration reached its three-hop safety limit",
+                "error_code": "PROFILE_HOP_LIMIT",
+            }
+        ws = self._ws_clients.get(binding.client_id)
+        if ws is None or ws.closed:
+            return {
+                "error": "Desktop profile broker is not connected",
+                "error_code": "PROFILE_BROKER_UNAVAILABLE",
+            }
+        if request_id in self._profile_pending:
+            return {
+                "error": f"Duplicate profile message request: {request_id}",
+                "error_code": "PROFILE_REQUEST_DUPLICATE",
+            }
+
+        future = asyncio.get_running_loop().create_future()
+        self._profile_pending[request_id] = future
+        self._profile_pending_clients[request_id] = binding.client_id
+        try:
+            await self._ws_send(
+                ws,
+                {
+                    "type": "profile_message_request",
+                    "id": request_id,
+                    "params": {
+                        "sourceProfile": binding.current_profile,
+                        "sourceSessionKey": binding.session_key,
+                        "targetProfile": target,
+                        "message": content,
+                        "correlationId": binding.correlation_id,
+                        "hop": binding.hop + 1,
+                    },
+                },
+            )
+            try:
+                return await asyncio.wait_for(future, timeout=600)
+            except asyncio.TimeoutError:
+                return {
+                    "error": f"Profile '{target}' did not respond in time",
+                    "error_code": "PROFILE_RESPONSE_TIMEOUT",
+                }
+        finally:
+            self._profile_pending.pop(request_id, None)
+            self._profile_pending_clients.pop(request_id, None)
+
+    def _handle_profile_message_result(self, data: dict, client_id: str) -> None:
+        """Resolve a reverse RPC only from the Desktop socket it was sent to."""
+        request_id = str(data.get("id") or "")
+        expected_client = self._profile_pending_clients.get(request_id)
+        if not request_id or expected_client != client_id:
+            logger.warning(
+                "[WS] Ignoring profile result %r from %s; expected %s",
+                request_id,
+                client_id,
+                expected_client,
+            )
+            return
+        result = data.get("result")
+        if not isinstance(result, dict):
+            result = {
+                "error": "Desktop returned an invalid profile message result",
+                "error_code": "PROFILE_RESULT_INVALID",
+            }
+        future = self._profile_pending.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(result)
 
     async def send_extension_tool_request(self, request_id: str, action: str, params: dict) -> dict:
         """Compatibility alias for released agent/browser tool code."""

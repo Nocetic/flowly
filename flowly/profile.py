@@ -65,6 +65,9 @@ _PROFILE_METADATA_FILE = "profile.json"
 _RUNTIME_LEASE_FILE = ".desktop-runtime.json"
 _MAX_SOUL_BYTES = 64 * 1024
 _MAX_MODEL_LENGTH = 256
+_PROFILE_MARK_TONES = frozenset({
+    "aqua", "violet", "rose", "amber", "lime", "sky", "slate",
+})
 _LOCAL_RUNTIME_ENV_DROP = frozenset({
     "FLOWLY_SERVER_ID",
     "MOLTBOT_PROXY_JWT_SECRET",
@@ -100,6 +103,25 @@ def default_home() -> Path:
 def is_default_home() -> bool:
     """True iff the active ``FLOWLY_HOME`` is the default (``~/.flowly``)."""
     return get_flowly_home() == _DEFAULT_HOME
+
+
+def current_profile_name() -> str:
+    """Return the stable identifier for the process' active profile.
+
+    Unlike ``get_active_profile()``, this reflects ``FLOWLY_HOME`` selected for
+    this process instead of the user's sticky CLI preference. Desktop-managed
+    runtimes rely on that distinction when brokering profile-to-profile work.
+    """
+    home = get_flowly_home()
+    if home == _DEFAULT_HOME:
+        return "default"
+    try:
+        relative = home.relative_to(_PROFILES_ROOT)
+    except ValueError:
+        return "default"
+    if len(relative.parts) == 1 and _PROFILE_NAME_RE.fullmatch(relative.name):
+        return relative.name
+    return "default"
 
 
 def credential_scope_suffix() -> str:
@@ -232,6 +254,10 @@ class ProfileInfo:
     skill_count: int = 0
     display_name: str = ""
     description: str = ""
+    provider: str = ""
+    model: str = ""
+    mark_text: str = ""
+    mark_tone: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -245,6 +271,10 @@ class ProfileInfo:
             "skillCount": self.skill_count,
             "displayName": self.display_name or self.name,
             "description": self.description,
+            "provider": self.provider,
+            "model": self.model,
+            "markText": self.mark_text,
+            "markTone": self.mark_tone,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -311,12 +341,41 @@ def _validate_model(model: str) -> str:
     return value
 
 
+def _validate_provider(provider: str) -> str:
+    value = provider.strip()
+    if not value:
+        raise ValueError("Provider must not be empty.")
+    from flowly.config.schema import ProvidersConfig
+
+    if value == "active" or value not in ProvidersConfig.model_fields:
+        raise ValueError(f"Unknown model provider: {value}")
+    return value
+
+
 def _validate_soul(soul: str) -> str:
     if "\x00" in soul:
         raise ValueError("Persona instructions cannot contain null bytes.")
     if len(soul.encode("utf-8")) > _MAX_SOUL_BYTES:
         raise ValueError(f"Persona instructions must be at most {_MAX_SOUL_BYTES // 1024} KiB.")
     return soul
+
+
+def _validate_mark_text(mark_text: str) -> str:
+    value = mark_text.strip().upper()
+    if not value:
+        return ""
+    if len(value) > 2 or not all(char.isalnum() for char in value):
+        raise ValueError("Profile mark must contain one or two letters or numbers.")
+    return value
+
+
+def _validate_mark_tone(mark_tone: str) -> str:
+    value = mark_tone.strip().lower()
+    if not value:
+        return ""
+    if value not in _PROFILE_MARK_TONES:
+        raise ValueError(f"Unknown profile mark tone: {value}")
+    return value
 
 
 def _load_config_object(path: Path) -> dict:
@@ -343,6 +402,14 @@ def _set_profile_model(config: dict, model: str) -> None:
     defaults["model"] = _validate_model(model)
 
 
+def _set_profile_provider(config: dict, provider: str) -> None:
+    providers = config.setdefault("providers", {})
+    if not isinstance(providers, dict):
+        providers = {}
+        config["providers"] = providers
+    providers["active"] = _validate_provider(provider)
+
+
 def _set_profile_workspace(config: dict, workspace: Path) -> None:
     agents = config.setdefault("agents", {})
     if not isinstance(agents, dict):
@@ -360,8 +427,31 @@ def _metadata_for(name: str, profile_dir: Path, *, is_default: bool) -> dict:
     return {
         "display_name": str(meta.get("displayName") or ("Flowly" if is_default else name)).strip(),
         "description": str(meta.get("description") or "").strip(),
+        "mark_text": str(meta.get("markText") or "").strip(),
+        "mark_tone": str(meta.get("markTone") or "").strip(),
         "created_at": str(meta.get("createdAt") or "").strip(),
         "updated_at": str(meta.get("updatedAt") or "").strip(),
+    }
+
+
+def _runtime_summary(profile_dir: Path) -> dict:
+    """Return non-secret provider/model fields for roster clients.
+
+    Profile lists must remain cheap and must never initialize a provider or
+    touch credential stores. Reading the two explicit config fields gives the
+    desktop enough information to label stopped profiles without starting all
+    of their gateways.
+    """
+    try:
+        config = _load_config_object(profile_dir / "config.json")
+    except ValueError:
+        return {"provider": "", "model": ""}
+    agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
+    defaults = agents.get("defaults") if isinstance(agents.get("defaults"), dict) else {}
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    return {
+        "provider": str(providers.get("active") or "").strip(),
+        "model": str(defaults.get("model") or "").strip(),
     }
 
 
@@ -371,12 +461,14 @@ def list_profiles() -> list[ProfileInfo]:
 
     # Default profile
     default_meta = _metadata_for("default", _DEFAULT_HOME, is_default=True)
+    default_runtime = _runtime_summary(_DEFAULT_HOME)
     profiles.append(ProfileInfo(
         name="default",
         path=_DEFAULT_HOME,
         is_default=True,
         has_config=(_DEFAULT_HOME / "config.json").exists(),
         **default_meta,
+        **default_runtime,
     ))
 
     # Named profiles
@@ -388,6 +480,7 @@ def list_profiles() -> list[ProfileInfo]:
                 if skills_dir.exists():
                     skill_count = sum(1 for s in skills_dir.iterdir() if s.is_dir())
                 meta = _metadata_for(d.name, d, is_default=False)
+                runtime = _runtime_summary(d)
                 profiles.append(ProfileInfo(
                     name=d.name,
                     path=d,
@@ -395,6 +488,7 @@ def list_profiles() -> list[ProfileInfo]:
                     has_config=(d / "config.json").exists(),
                     skill_count=skill_count,
                     **meta,
+                    **runtime,
                 ))
 
     return profiles
@@ -410,8 +504,11 @@ def create_profile(
     display_name: str = "",
     description: str = "",
     local_runtime: bool = False,
+    provider: str | None = None,
     model: str | None = None,
     soul: str | None = None,
+    mark_text: str = "",
+    mark_tone: str = "",
 ) -> Path:
     """Create a new profile directory.
 
@@ -482,10 +579,13 @@ def create_profile(
         if local_runtime:
             _sanitize_local_runtime_clone(temp_dir, profile_dir / "workspace")
 
-        if model is not None:
+        if provider is not None or model is not None:
             config_path = temp_dir / "config.json"
             config = _load_config_object(config_path)
-            _set_profile_model(config, model)
+            if provider is not None:
+                _set_profile_provider(config, provider)
+            if model is not None:
+                _set_profile_model(config, model)
             _atomic_write_json(config_path, config)
 
         if soul is not None:
@@ -496,6 +596,8 @@ def create_profile(
             "version": 1,
             "displayName": display_name.strip() or name,
             "description": description.strip(),
+            "markText": _validate_mark_text(mark_text),
+            "markTone": _validate_mark_tone(mark_tone),
             "createdAt": now,
             "updatedAt": now,
             "localRuntime": bool(local_runtime),
@@ -587,6 +689,8 @@ def update_profile_metadata(
     *,
     display_name: str | None = None,
     description: str | None = None,
+    mark_text: str | None = None,
+    mark_tone: str | None = None,
 ) -> ProfileInfo:
     """Atomically update renderer-facing metadata for one profile."""
     profile = describe_profile(name)
@@ -602,6 +706,14 @@ def update_profile_metadata(
             str(description).strip() if description is not None
             else str(current.get("description") or profile.description).strip()
         ),
+        "markText": (
+            _validate_mark_text(mark_text) if mark_text is not None
+            else _validate_mark_text(str(current.get("markText") or profile.mark_text))
+        ),
+        "markTone": (
+            _validate_mark_tone(mark_tone) if mark_tone is not None
+            else _validate_mark_tone(str(current.get("markTone") or profile.mark_tone))
+        ),
         "createdAt": str(current.get("createdAt") or profile.created_at or now),
         "updatedAt": now,
     })
@@ -615,6 +727,7 @@ def read_profile_settings(name: str) -> dict:
     config = _load_config_object(profile.path / "config.json")
     agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     defaults = agents.get("defaults") if isinstance(agents.get("defaults"), dict) else {}
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
     soul_path = profile.path / "workspace" / "SOUL.md"
     try:
         soul = soul_path.read_text(encoding="utf-8")
@@ -624,6 +737,7 @@ def read_profile_settings(name: str) -> dict:
         raise ValueError(f"Cannot read profile persona instructions: {exc}") from exc
     return {
         "name": profile.name,
+        "provider": str(providers.get("active") or "").strip(),
         "model": str(defaults.get("model") or "").strip(),
         "soul": soul,
         "workspace": str(profile.path / "workspace"),
@@ -633,12 +747,14 @@ def read_profile_settings(name: str) -> dict:
 def update_profile_settings(
     name: str,
     *,
+    provider: str | None = None,
     model: str | None = None,
     soul: str | None = None,
 ) -> dict:
     """Safely update profile-local model and persona files."""
-    if model is None and soul is None:
+    if provider is None and model is None and soul is None:
         raise ValueError("At least one profile setting is required.")
+    validated_provider = _validate_provider(provider) if provider is not None else None
     validated_model = _validate_model(model) if model is not None else None
     validated_soul = _validate_soul(soul) if soul is not None else None
     profile = describe_profile(name)
@@ -648,12 +764,15 @@ def update_profile_settings(
             f"Profile runtime is active (pid {lease.get('pid')}). Stop it before changing settings."
         )
 
-    if validated_model is not None:
+    if validated_provider is not None or validated_model is not None:
         config_path = profile.path / "config.json"
         config = _load_config_object(config_path)
         if bool(_profile_metadata(profile.path).get("localRuntime")):
             _set_profile_workspace(config, profile.path / "workspace")
-        _set_profile_model(config, validated_model)
+        if validated_provider is not None:
+            _set_profile_provider(config, validated_provider)
+        if validated_model is not None:
+            _set_profile_model(config, validated_model)
         _atomic_write_json(config_path, config)
     if validated_soul is not None:
         _atomic_write_text(profile.path / "workspace" / "SOUL.md", validated_soul)
