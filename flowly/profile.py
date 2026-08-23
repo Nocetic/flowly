@@ -1258,13 +1258,30 @@ def claim_runtime_lease(instance_id: str) -> Path:
     return path
 
 
-def update_runtime_lease(instance_id: str, *, port: int) -> None:
-    """Publish the bound port without changing lease ownership."""
+def update_runtime_lease(instance_id: str, *, port: int, auth_token: str) -> None:
+    """Publish the owner-only endpoint used by sibling Flowly managers.
+
+    Desktop and the primary gateway can coexist in separate processes.  The
+    runtime remains owned by the process that claimed the lease, but another
+    Flowly manager running as the same OS user may attach as an authenticated
+    client instead of attempting to spawn a duplicate gateway.  The lease is
+    atomically written with mode ``0600`` and is excluded from profile exports.
+    """
+    token = auth_token.strip() if isinstance(auth_token, str) else ""
+    if (
+        not isinstance(port, int)
+        or isinstance(port, bool)
+        or not 1 <= port <= 65_535
+        or not 32 <= len(token) <= 512
+        or any(ord(char) < 0x21 or ord(char) == 0x7F for char in token)
+    ):
+        raise ValueError("Profile runtime endpoint is invalid.")
     path = get_flowly_home() / _RUNTIME_LEASE_FILE
     lease = read_runtime_lease(path.parent)
     if not lease or lease.get("instanceId") != instance_id or lease.get("pid") != os.getpid():
         raise RuntimeError("Profile runtime lease ownership was lost.")
-    lease["port"] = int(port)
+    lease["port"] = port
+    lease["authToken"] = token
     lease["readyAt"] = _utc_now()
     _atomic_write_json(path, lease)
 

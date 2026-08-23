@@ -9,6 +9,7 @@ import pytest
 import flowly.profile as profiles
 from flowly.gateway.server import GatewayServer
 from flowly.profile_host import ProfileHost
+from flowly.profile_host_contract import ProfileHostError
 
 
 @pytest.mark.asyncio
@@ -53,6 +54,56 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
         assert profiles.read_runtime_lease(root / "writer") is None
     finally:
         await host.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="managed process-group lifecycle is POSIX-specific")
+async def test_second_manager_attaches_to_desktop_owned_profile_runtime(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    default = home / ".flowly"
+    root = default / "profiles"
+    home.mkdir()
+    default.mkdir()
+    (default / "workspace").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", default)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", root)
+    created = profiles.create_profile(
+        "writer",
+        local_runtime=True,
+        provider="openai",
+        model="openai/gpt-4o-mini",
+    )
+    config_path = created / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.setdefault("providers", {}).setdefault("openai", {})["apiKey"] = "test-key"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    desktop_owner = ProfileHost()
+    remote_manager = ProfileHost()
+
+    try:
+        owner_status = await desktop_owner.connect("writer")
+        assert owner_status["status"]["owned"] is True
+
+        remote_status = await remote_manager.connect("writer")
+        assert remote_status["status"]["state"] == "connected"
+        assert remote_status["status"]["owned"] is False
+        assert await remote_manager.rpc("writer", "sessions.list", {}) == {"sessions": []}
+
+        with pytest.raises(ProfileHostError) as stop_conflict:
+            await remote_manager.stop("writer")
+        assert stop_conflict.value.code == "PROFILE_OWNERSHIP_CONFLICT"
+
+        await remote_manager.shutdown()
+        assert await desktop_owner.rpc("writer", "sessions.list", {}) == {"sessions": []}
+        stopped = await desktop_owner.stop("writer")
+        assert stopped["status"]["state"] == "stopped"
+    finally:
+        await remote_manager.shutdown()
+        await desktop_owner.shutdown()
 
 
 @pytest.mark.asyncio

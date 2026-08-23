@@ -192,10 +192,11 @@ def _safe_rpc_error_message(value: Any) -> str:
 @dataclass(slots=True)
 class _Runtime:
     profile: str
-    process: asyncio.subprocess.Process
+    process: asyncio.subprocess.Process | None
     session: aiohttp.ClientSession
     ws: aiohttp.ClientWebSocketResponse
     instance_id: str
+    owned: bool = True
     state: str = "connected"
     active_runs: set[str] = field(default_factory=set)
     last_used_at: float = field(default_factory=time.time)
@@ -381,7 +382,7 @@ class ProfileHost:
             "profile": name,
             "botId": bot_id,
             "state": runtime.state,
-            "owned": True,
+            "owned": runtime.owned,
             "activeRuns": len(runtime.active_runs),
             "lastUsedAt": int(runtime.last_used_at * 1000),
         }
@@ -514,8 +515,14 @@ class ProfileHost:
             if starting:
                 starting.cancel()
                 await asyncio.gather(starting, return_exceptions=True)
-            runtime = self._runtimes.pop(name, None)
+            runtime = self._runtimes.get(name)
             if runtime is not None:
+                if not runtime.owned:
+                    raise ProfileHostError(
+                        "PROFILE_OWNERSHIP_CONFLICT",
+                        "This bot is owned by another Flowly process and cannot be stopped here.",
+                    )
+                self._runtimes.pop(name, None)
                 await self._close_runtime(runtime)
             else:
                 profile = describe_profile(name)
@@ -610,22 +617,20 @@ class ProfileHost:
         _validate_named_profile(name)
         profile = describe_profile(name)
         current = self._runtimes.get(name)
-        if current and not current.ws.closed and current.process.returncode is None:
+        if self._runtime_is_open(current):
+            assert current is not None
             return current
         pending = self._starting.get(name)
         if pending:
             return await pending
         async with self._lock(name):
             current = self._runtimes.get(name)
-            if current and not current.ws.closed and current.process.returncode is None:
+            if self._runtime_is_open(current):
+                assert current is not None
                 return current
             pending = self._starting.get(name)
             if pending is None:
-                if reconcile_runtime_lease(profile.path, profile_name=name):
-                    raise ProfileHostError(
-                        "PROFILE_OWNERSHIP_CONFLICT",
-                        "This bot is already running under another Flowly process.",
-                    )
+                lease = reconcile_runtime_lease(profile.path, profile_name=name)
                 async with self._capacity_lock:
                     allocated = set(self._runtimes) | set(self._starting)
                     if name not in allocated and len(allocated) >= _MAX_RUNTIMES:
@@ -634,16 +639,141 @@ class ProfileHost:
                             "Four bots are already running. Stop one and try again.",
                             retryable=True,
                         )
-                    pending = asyncio.create_task(
-                        self._start_runtime(name),
-                        name=f"profile-start:{name}",
-                    )
+                    if lease:
+                        pending = asyncio.create_task(
+                            self._attach_runtime(name, lease),
+                            name=f"profile-attach:{name}",
+                        )
+                    else:
+                        pending = asyncio.create_task(
+                            self._start_runtime(name),
+                            name=f"profile-start:{name}",
+                        )
                     self._starting[name] = pending
         try:
             return await pending
         finally:
             if self._starting.get(name) is pending:
                 self._starting.pop(name, None)
+
+    @staticmethod
+    def _runtime_is_open(runtime: _Runtime | None) -> bool:
+        return bool(
+            runtime is not None
+            and not runtime.ws.closed
+            and (runtime.process is None or runtime.process.returncode is None)
+        )
+
+    async def _open_runtime_transport(
+        self,
+        *,
+        port: int,
+        token: str,
+        error_code: str,
+        error_message: str,
+    ) -> tuple[aiohttp.ClientSession, aiohttp.ClientWebSocketResponse]:
+        """Open one authenticated loopback socket without exposing its token."""
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+        try:
+            async with session.post(
+                f"http://127.0.0.1:{port}/api/auth/ws-ticket",
+                headers={"Authorization": f"Bearer {token}"},
+            ) as response:
+                if response.status != 200:
+                    raise ProfileHostError(error_code, error_message, retryable=True)
+                ticket = str((await response.json()).get("ticket") or "")
+            if not ticket:
+                raise ProfileHostError(error_code, error_message, retryable=True)
+            ws = await session.ws_connect(
+                f"http://127.0.0.1:{port}/ws?ticket={ticket}",
+                max_msg_size=40 * 1024 * 1024,
+            )
+            return session, ws
+        except BaseException:
+            await session.close()
+            raise
+
+    async def _attach_runtime(self, name: str, lease: dict[str, Any]) -> _Runtime:
+        """Attach to a live Desktop-owned gateway instead of spawning twice.
+
+        The runtime lease is owner-only and authenticated.  Attaching never
+        transfers lifecycle ownership: shutdown closes this manager's socket,
+        while ``profiles.stop`` continues to reject attempts to terminate the
+        Desktop-owned process.
+        """
+        await self._emit(name, "connection", {"state": "starting"})
+        instance_id = str(lease.get("instanceId") or "")
+        token = str(lease.get("authToken") or "")
+        try:
+            port = int(lease.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if (
+            not instance_id
+            or not 1 <= port <= 65_535
+            or not 32 <= len(token) <= 512
+            or any(ord(char) < 0x21 or ord(char) == 0x7F for char in token)
+        ):
+            raise ProfileHostError(
+                "PROFILE_OWNERSHIP_CONFLICT",
+                "This bot is running in an older Flowly Desktop runtime. Restart the bot in Desktop, then try again.",
+            )
+
+        session: aiohttp.ClientSession | None = None
+        ws: aiohttp.ClientWebSocketResponse | None = None
+        try:
+            session, ws = await self._open_runtime_transport(
+                port=port,
+                token=token,
+                error_code="PROFILE_ATTACH_FAILED",
+                error_message="The running bot did not accept a secure manager connection.",
+            )
+            profile = describe_profile(name)
+            current = reconcile_runtime_lease(profile.path, profile_name=name)
+            if (
+                not current
+                or str(current.get("instanceId") or "") != instance_id
+                or int(current.get("port") or 0) != port
+                or not secrets.compare_digest(
+                    str(current.get("authToken") or ""), token
+                )
+            ):
+                raise ProfileHostError(
+                    "PROFILE_RUNTIME_CHANGED",
+                    "The bot restarted while Flowly was connecting. Try again.",
+                    retryable=True,
+                )
+            runtime = _Runtime(
+                profile=name,
+                process=None,
+                session=session,
+                ws=ws,
+                instance_id=instance_id,
+                owned=False,
+            )
+            runtime.reader_task = asyncio.create_task(
+                self._read_runtime(runtime), name=f"profile-reader:{name}"
+            )
+            self._runtimes[name] = runtime
+            await self._emit(name, "connection", {"state": "connected"})
+            return runtime
+        except BaseException as exc:
+            if ws is not None:
+                await ws.close()
+            if session is not None:
+                await session.close()
+            message = (
+                exc.message
+                if isinstance(exc, ProfileHostError)
+                else "The running bot could not be reached securely."
+            )
+            logger.warning("Could not attach to existing profile runtime {}: {}", name, message)
+            await self._emit(name, "error", {"message": message})
+            if isinstance(exc, ProfileHostError):
+                raise
+            raise ProfileHostError(
+                "PROFILE_ATTACH_FAILED", message, retryable=True
+            ) from exc
 
     async def _start_runtime(self, name: str) -> _Runtime:
         await self._emit(name, "connection", {"state": "starting"})
@@ -689,22 +819,12 @@ class ProfileHost:
             port = int(ready.get("port") or 0)
             if not token or not 1 <= port <= 65535:
                 raise ProfileHostError("STARTUP_INVALID", "Profile runtime returned invalid startup data.")
-            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
-            try:
-                async with session.post(
-                    f"http://127.0.0.1:{port}/api/auth/ws-ticket",
-                    headers={"Authorization": f"Bearer {token}"},
-                ) as response:
-                    if response.status != 200:
-                        raise ProfileHostError("STARTUP_AUTH", "Profile runtime rejected its manager connection.")
-                    ticket = str((await response.json()).get("ticket") or "")
-                ws = await session.ws_connect(
-                    f"http://127.0.0.1:{port}/ws?ticket={ticket}",
-                    max_msg_size=40 * 1024 * 1024,
-                )
-            except BaseException:
-                await session.close()
-                raise
+            session, ws = await self._open_runtime_transport(
+                port=port,
+                token=token,
+                error_code="STARTUP_AUTH",
+                error_message="Profile runtime rejected its manager connection.",
+            )
             runtime = _Runtime(
                 profile=name,
                 process=process,
@@ -1111,7 +1231,8 @@ class ProfileHost:
             runtime.reader_task.cancel()
         await runtime.ws.close()
         await runtime.session.close()
-        await self._terminate_process(runtime.process)
+        if runtime.owned and runtime.process is not None:
+            await self._terminate_process(runtime.process)
         tasks = [
             task for task in (runtime.reader_task, runtime.stdout_task, runtime.stderr_task)
             if task and task is not current

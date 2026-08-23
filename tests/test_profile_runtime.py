@@ -391,6 +391,49 @@ def test_runtime_lease_rejects_pid_reuse(profile_roots, monkeypatch) -> None:
     assert not lease.exists()
 
 
+def test_runtime_lease_publishes_owner_only_attach_endpoint(
+    profile_roots,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("writer", local_runtime=True)
+    monkeypatch.setenv("FLOWLY_HOME", str(created))
+    instance_id = "runtime-attach-test"
+    token = "t" * 48
+
+    lease_path = profiles.claim_runtime_lease(instance_id)
+    profiles.update_runtime_lease(instance_id, port=19_191, auth_token=token)
+    lease = profiles.read_runtime_lease(created)
+
+    assert lease is not None
+    assert lease["port"] == 19_191
+    assert lease["authToken"] == token
+    assert lease_path.stat().st_mode & 0o777 == 0o600
+    profiles.release_runtime_lease(instance_id)
+
+
+def test_runtime_lease_rejects_invalid_attach_endpoint(
+    profile_roots,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _default, _root = profile_roots
+    created = profiles.create_profile("writer", local_runtime=True)
+    monkeypatch.setenv("FLOWLY_HOME", str(created))
+    instance_id = "runtime-invalid-endpoint"
+    profiles.claim_runtime_lease(instance_id)
+
+    with pytest.raises(ValueError, match="endpoint is invalid"):
+        profiles.update_runtime_lease(instance_id, port=True, auth_token="t" * 48)
+    with pytest.raises(ValueError, match="endpoint is invalid"):
+        profiles.update_runtime_lease(instance_id, port=19_191, auth_token="short")
+
+    lease = profiles.read_runtime_lease(created)
+    assert lease is not None
+    assert lease["port"] == 0
+    assert "authToken" not in lease
+    profiles.release_runtime_lease(instance_id)
+
+
 def test_corrupt_runtime_lease_fails_closed_before_profile_mutation(profile_roots) -> None:
     _default, _root = profile_roots
     created = profiles.create_profile("writer", local_runtime=True)

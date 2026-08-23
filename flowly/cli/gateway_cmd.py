@@ -2190,7 +2190,11 @@ Respond to the user now:"""
                     update_runtime_lease,
                 )
 
-                update_runtime_lease(_local_runtime_instance, port=gateway_server.port)
+                update_runtime_lease(
+                    _local_runtime_instance,
+                    port=gateway_server.port,
+                    auth_token=auth_token,
+                )
                 typer.echo(
                     "FLOWLY_LOCAL_RUNTIME_READY "
                     + json.dumps(
