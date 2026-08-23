@@ -829,10 +829,13 @@ class IntegrationSetupModal(ModalScreen[dict[str, Any] | None]):
     @on(Button.Pressed, "#btn-flowly-signout")
     @work
     async def _flowly_signout(self) -> None:
-        from flowly.account.auth import clear_account
+        from flowly.account.account_key import clear_account_key
+        from flowly.account.auth import clear_account, load_account_sync
         from flowly.account.relay_config import clear_relay_credentials
         from flowly.integrations.active_provider import clear_active_if_matches
         try:
+            existing = await asyncio.to_thread(load_account_sync)
+            await asyncio.to_thread(clear_account_key, existing, revoke=True)
             await asyncio.to_thread(clear_account)
             await asyncio.to_thread(clear_relay_credentials)
             # Don't leave a dangling default pointing at an account that

@@ -31,6 +31,7 @@ Exit codes
     1   token refresh failed — user must run full re-login
     2   backend / network error during register_machine
     3   ``--repair`` invoked but nothing to repair
+    4   credentials were saved but the running gateway could not apply them
     130 Ctrl-C / EOF
 """
 
@@ -75,6 +76,8 @@ class _RepairResult:
     server_existing: bool = False
     provider_promoted: bool = False
     provider_promoted_to: str = ""
+    needs_gateway_restart: bool = False
+    needs_provider_reload: bool = False
     notes: list[str] = field(default_factory=list)
 
 
@@ -132,6 +135,7 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
     change = wire_relay_credentials(srv)
     result.relay_wired = True
     result.relay_changed = change.changed
+    result.needs_gateway_restart = change.needs_gateway_restart
     result.server_id = srv.server_id
     result.server_name = srv.name
     result.server_existing = srv.existing
@@ -147,6 +151,7 @@ async def _apply_repair(account, *, dry_run: bool) -> _RepairResult:
             set_active_provider("flowly")
             result.provider_promoted = True
             result.provider_promoted_to = "flowly"
+            result.needs_provider_reload = True
         except Exception as exc:  # noqa: BLE001
             result.notes.append(f"provider auto-set failed: {exc}")
 
@@ -192,6 +197,67 @@ def _print_repair_summary(result: _RepairResult, *, header: str) -> None:
 # ── Command ─────────────────────────────────────────────────────────
 
 
+def _apply_runtime_changes(
+    *,
+    provider_reload_required: bool,
+    relay_restart_required: bool,
+    security_sensitive: bool,
+) -> bool:
+    """Apply login changes without restarting for provider-only changes."""
+    from flowly.account.runtime_apply import apply_account_runtime_change
+
+    result = asyncio.run(
+        apply_account_runtime_change(
+            provider_reload_required=provider_reload_required,
+            relay_restart_required=relay_restart_required,
+            security_sensitive=security_sensitive,
+        )
+    )
+    if result.status == "unchanged":
+        return True
+    if result.status == "provider_reloaded":
+        console.print(
+            f"  [green]✓[/] Running provider reloaded "
+            f"[dim]({result.detail})[/]"
+        )
+        return True
+    if result.status == "gateway_restarted":
+        console.print(
+            f"  [green]✓[/] Gateway restarted with the new relay config "
+            f"[dim]({result.detail})[/]"
+        )
+        return True
+    if result.status == "next_start":
+        console.print(
+            "  [dim]· Gateway isn't running — the saved changes will be used "
+            "on its next start.[/]"
+        )
+        return True
+    if result.status == "manual_restart":
+        console.print(
+            "\n  [yellow]⚠ Changes are saved, but a manually started gateway "
+            "still has the old relay/account state.[/]\n"
+            "  Stop that gateway terminal and run [cyan]flowly gateway[/] again."
+        )
+        return False
+    if result.status == "provider_reload_failed":
+        console.print(
+            f"\n  [yellow]⚠ Login is saved, but provider hot-reload failed:[/] "
+            f"{result.detail}\n"
+            "  The provider flow was not restarted. Retry after checking "
+            "[cyan]flowly service status[/]."
+        )
+        return False
+
+    console.print(
+        f"\n  [yellow]⚠ Login is saved, but gateway restart failed:[/] "
+        f"{result.detail}\n"
+        "  Retry: [cyan]flowly service restart[/] · then "
+        "[cyan]flowly service status[/]"
+    )
+    return False
+
+
 def _login_with_account_key(key: str) -> None:
     """Connect to Flowly with an account key (``flw_…``) — the no-browser path
     for self-hosted / CLI bots NOT managed by the Desktop app.
@@ -211,7 +277,12 @@ def _login_with_account_key(key: str) -> None:
         raise typer.Exit(code=2)
 
     cfg = load_config()
+    previous_key = (cfg.providers.flowly.account_key or "").strip()
+    previous_active = (cfg.providers.active or "").strip()
     cfg.providers.flowly.account_key = key
+    cfg.providers.flowly.account_key_owner_uid = ""
+    cfg.providers.flowly.account_key_id = ""
+    cfg.providers.flowly.account_key_origin = "manual"
     cfg.providers.flowly.enabled = True
     save_config(cfg)
     # Explicit intent ("use flowly with this key") → switch active. Routed
@@ -237,6 +308,17 @@ def _login_with_account_key(key: str) -> None:
         "  LLM usage is billed to your Flowly account. "
         "Run [cyan]flowly[/] to start chatting."
     )
+    runtime_ok = _apply_runtime_changes(
+        provider_reload_required=(
+            previous_key != key
+            or previous_active != "flowly"
+            or bool(model_changed)
+        ),
+        relay_restart_required=False,
+        security_sensitive=False,
+    )
+    if not runtime_ok:
+        raise typer.Exit(code=4)
 
 
 def _mint_and_save_account_key(account) -> bool:
@@ -244,6 +326,18 @@ def _mint_and_save_account_key(account) -> bool:
     login modal). Idempotent + best-effort — see ``flowly.account.account_key``."""
     from flowly.account.account_key import ensure_account_key
     return ensure_account_key(account)
+
+
+def _provision_account_key(account):
+    from flowly.account.account_key import ensure_account_key_change
+
+    return ensure_account_key_change(account)
+
+
+def _account_key_matches(account) -> bool:
+    from flowly.account.account_key import account_key_matches
+
+    return account_key_matches(account)
 
 
 def _repair_account_credentials(account) -> bool:
@@ -374,12 +468,14 @@ def login(
             audit_log.info("cli.login.repair_token_unusable")
             raise typer.Exit(code=1)
 
-        # Short-circuit if everything is already wired AND not dry-run —
-        # don't burn a backend call for nothing.
+        key_change = None
+        repair_relay_or_provider = True
         if not dry_run:
+            key_change = _provision_account_key(account)
             relay = _check_relay_state()
             is_active, _ = _check_provider_state()
-            if relay.healthy and is_active:
+            repair_relay_or_provider = not (relay.healthy and is_active)
+            if not repair_relay_or_provider and not key_change.changed:
                 console.print(
                     "[green]✓[/] Nothing to repair — relay config and "
                     "provider are already healthy."
@@ -400,37 +496,60 @@ def login(
                 "  Re-using existing tokens (no browser needed)...\n"
             )
 
-        try:
-            result = asyncio.run(_apply_repair(account, dry_run=dry_run))
-        except KeyboardInterrupt:
-            console.print("\n[dim]cancelled[/]")
-            raise typer.Exit(code=130)
-        except Exception as exc:  # noqa: BLE001
-            console.print(f"[red]✗ Backend error during repair:[/] {exc}")
-            audit_log.error("cli.login.repair_backend_failed", error=str(exc))
-            raise typer.Exit(code=2)
+        result = _RepairResult()
+        if dry_run or repair_relay_or_provider:
+            try:
+                result = asyncio.run(_apply_repair(account, dry_run=dry_run))
+            except KeyboardInterrupt:
+                console.print("\n[dim]cancelled[/]")
+                raise typer.Exit(code=130)
+            except Exception as exc:  # noqa: BLE001
+                runtime_ok = True
+                if key_change is not None and key_change.changed:
+                    runtime_ok = _apply_runtime_changes(
+                        provider_reload_required=True,
+                        relay_restart_required=False,
+                        security_sensitive=key_change.replaced_stale,
+                    )
+                console.print(f"[red]✗ Backend error during repair:[/] {exc}")
+                audit_log.error("cli.login.repair_backend_failed", error=str(exc))
+                raise typer.Exit(code=2 if runtime_ok else 4)
 
         if dry_run:
             console.print()
             console.print("  [dim](dry run — nothing changed)[/]\n")
         else:
-            # The account key is the credential the LLM proxy authenticates.
-            # Repairing server registration and relay config without it fixes
-            # everything except the thing most likely to be broken.
-            _repair_account_credentials(account)
             _print_repair_summary(
                 result,
                 header=f"Account: {account.email or account.user_id}",
             )
+            if key_change.changed and not result.relay_wired:
+                console.print("  [green]✓[/] Flowly account credential refreshed")
+            runtime_ok = _apply_runtime_changes(
+                provider_reload_required=(
+                    key_change.changed or result.needs_provider_reload
+                ),
+                relay_restart_required=result.needs_gateway_restart,
+                security_sensitive=key_change.replaced_stale,
+            )
             _print_provider_verdict()
+            if not runtime_ok:
+                raise typer.Exit(code=4)
         return
 
     # ── Path: already signed in — detect gaps, never mutate ──────
     if existing is not None:
-        # Auto-provision the account-key provider if it isn't there yet
-        # (idempotent, best-effort) so a returning user is billed without
-        # dealing with keys — same transparent behaviour as a fresh login.
-        _mint_and_save_account_key(existing)
+        # A missing/unowned key needs a fresh Firebase token before minting.
+        # Same-owner keys remain a pure local no-op and avoid a network call.
+        provision_account = existing
+        if not _account_key_matches(existing):
+            try:
+                refreshed = asyncio.run(load_account_refreshing())
+                if refreshed is not None:
+                    provision_account = refreshed
+            except Exception:  # noqa: BLE001
+                pass
+        key_change = _provision_account_key(provision_account)
         relay = _check_relay_state()
         is_active, slug = _check_provider_state()
         corruption = check_provider_corruption()
@@ -457,17 +576,33 @@ def login(
                         raise RuntimeError("token refresh failed")
                     result = asyncio.run(_apply_repair(account, dry_run=False))
                 except Exception as exc:  # noqa: BLE001
+                    runtime_ok = True
+                    if key_change.changed:
+                        runtime_ok = _apply_runtime_changes(
+                            provider_reload_required=True,
+                            relay_restart_required=False,
+                            security_sensitive=key_change.replaced_stale,
+                        )
                     console.print(
                         f"  [yellow]⚠ Relay registration failed:[/] {exc}\n"
                         f"  Re-run [cyan]flowly login --repair[/] when ready."
                     )
                     audit_log.error("cli.login.relay_optin_failed", error=str(exc))
-                    raise typer.Exit(code=2)
+                    raise typer.Exit(code=2 if runtime_ok else 4)
                 _print_repair_summary(
                     result,
                     header=f"Account: {existing.email or existing.user_id}",
                 )
+                runtime_ok = _apply_runtime_changes(
+                    provider_reload_required=(
+                        key_change.changed or result.needs_provider_reload
+                    ),
+                    relay_restart_required=result.needs_gateway_restart,
+                    security_sensitive=key_change.replaced_stale,
+                )
                 audit_log.info("cli.login.relay_optin_wired")
+                if not runtime_ok:
+                    raise typer.Exit(code=4)
                 raise typer.Exit()
 
         gaps: list[str] = []
@@ -531,6 +666,13 @@ def login(
                 slot_count=len(slots),
                 slots=",".join(slots),
             )
+        runtime_ok = _apply_runtime_changes(
+            provider_reload_required=key_change.changed,
+            relay_restart_required=False,
+            security_sensitive=key_change.replaced_stale,
+        )
+        if not runtime_ok:
+            raise typer.Exit(code=4)
         raise typer.Exit()
 
     # ── Path: fresh sign-in (no tokens, no account) ──────────────
@@ -582,7 +724,8 @@ def login(
     # Provider: ALWAYS auto-provision an account key so the user is billed
     # immediately without ever dealing with keys (Source 0). Best-effort —
     # the verdict printed at the end reports whether it actually landed.
-    minted = _mint_and_save_account_key(account)
+    key_change = _provision_account_key(account)
+    minted = key_change.ready
 
     # Reach: remote / phone access via the relay is OPT-IN — it registers a
     # server. Ask interactively unless the caller forced it with
@@ -602,22 +745,28 @@ def login(
             # existing automation depends on that. Opt out with --no-relay.
             want_relay = True
 
+    repair_result = _RepairResult()
     if want_relay:
         # Same wiring path the standalone --repair uses (server registration +
         # relay config), so post-OAuth wiring matches a recovery wiring.
         try:
-            result = asyncio.run(_apply_repair(account, dry_run=False))
+            repair_result = asyncio.run(_apply_repair(account, dry_run=False))
         except Exception as exc:  # noqa: BLE001
             # Login succeeded (tokens are in keychain) and the provider key is
             # set — only the relay wiring failed. Don't lose the user.
+            runtime_ok = _apply_runtime_changes(
+                provider_reload_required=key_change.changed,
+                relay_restart_required=False,
+                security_sensitive=key_change.replaced_stale,
+            )
             console.print(
                 f"  [yellow]⚠ Signed in, but relay registration failed:[/] {exc}\n"
                 f"  Re-run [cyan]flowly login --repair[/] when ready."
             )
             audit_log.error("cli.login.full_flow_post_register_failed", error=str(exc))
-            raise typer.Exit(code=2)
+            raise typer.Exit(code=2 if runtime_ok else 4)
         _print_repair_summary(
-            result,
+            repair_result,
             header=f"Signed in as {account.email or account.user_id}",
         )
     elif minted:
@@ -633,11 +782,23 @@ def login(
     console.print(
         f"  [green]✓[/] Tokens saved to {credential_storage_status()}"
     )
+    runtime_ok = _apply_runtime_changes(
+        provider_reload_required=(
+            key_change.changed or repair_result.needs_provider_reload
+        ),
+        relay_restart_required=repair_result.needs_gateway_restart,
+        security_sensitive=key_change.replaced_stale,
+    )
     # Exit code stays 0 even when the key didn't land: the sign-in itself
     # succeeded and the tokens are stored, so failing here would tell every
     # caller (installers, Desktop, scripts) that login broke when it didn't.
     # The verdict above is what tells the user what's left to do.
     ready = _print_provider_verdict()
     audit_log.info(
-        "cli.login.full_flow_success", relay=bool(want_relay), provider_ready=ready
+        "cli.login.full_flow_success",
+        relay=bool(want_relay),
+        provider_ready=ready,
+        gateway_runtime_applied=runtime_ok,
     )
+    if not runtime_ok:
+        raise typer.Exit(code=4)

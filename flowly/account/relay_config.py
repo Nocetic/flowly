@@ -113,15 +113,16 @@ def wire_relay_credentials(server: RegisteredServer) -> WebChannelChange:
     )
 
 
-def clear_relay_credentials() -> None:
-    """Disable the web channel — called from /logout."""
+def clear_relay_credentials() -> bool:
+    """Disable the web channel. Returns whether persisted config changed."""
     cfg = load_config()
     web = cfg.channels.web
-    if not (web.enabled or web.server_id or web.auth_token):
-        return
+    if not (web.enabled or web.server_id or web.auth_token or web.jwt_secret):
+        return False
     web.enabled = False
     web.server_id = ""
     web.auth_token = ""
     web.jwt_secret = ""
     save_config(cfg)
     audit_log.info("relay.config.cleared")
+    return True

@@ -448,6 +448,17 @@ class FlowlyHostedConfig(BaseModel):
     # `serverId:authToken`) and is kept for relay-registered bots. account_key
     # wins when both are present.
     account_key: str = ""
+    # An account key does not encode its owner. Persist the Firebase UID and
+    # backend keyId beside keys minted by this installation so an account
+    # switch can reject stale credentials and logout can revoke only its own
+    # key. CLI-minted and v2 Desktop-managed keys populate both fields;
+    # manually supplied and legacy Desktop-pushed keys leave them empty.
+    account_key_owner_uid: str = ""
+    account_key_id: str = ""
+    # ``verified`` = minted/verified with this CLI account's Firebase token;
+    # ``desktop`` = asserted by an authenticated gateway controller but still
+    # verified by CLI before reuse; ``manual`` = raw --key input.
+    account_key_origin: str = ""
     server_id: str = ""
     auth_token: str = ""
 
