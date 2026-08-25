@@ -7,6 +7,18 @@ from typing import Any
 from loguru import logger
 
 
+def should_notify_board_finished(card: Any, outcome: str) -> bool:
+    """Return true only for a real terminal finish, never a queued retry."""
+    status = str(getattr(card, "status", "") or "")
+    if outcome == "done":
+        return not status or status == "done"
+    if outcome == "failed":
+        # A failed attempt normally moves back to ready/todo with backoff. Do
+        # not announce failure until the retry budget has been exhausted.
+        return status == "blocked"
+    return False
+
+
 async def notify_board_finished(card: Any, outcome: str) -> None:
     """Send a best-effort board completion push via the relay.
 
@@ -15,7 +27,7 @@ async def notify_board_finished(card: Any, outcome: str) -> None:
     ``serverId`` payloads. The app only needs ``type=board`` plus one of those
     identifiers to deep-link to the board.
     """
-    if outcome not in ("done", "failed"):
+    if not should_notify_board_finished(card, outcome):
         return
     try:
         from flowly.push import relay_push

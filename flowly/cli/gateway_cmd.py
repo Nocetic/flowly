@@ -2052,11 +2052,17 @@ Respond to the user now:"""
 
     agent.subagents._on_event = _on_subagent_event
 
-    # Board completion delivery is handled inside the agent loop: the
-    # orchestrator wakes the agent with the result (relay turn) and the
-    # agent's reply reaches local clients via _process_system_message's
-    # gateway push, or remote channels via their adapter. No wiring needed
-    # here beyond the gateway reference already set by set_gateway_server().
+    # Board completion also wakes authenticated Desktop clients. Deliberately
+    # broadcast no card content or identifiers: clients can refresh the Board
+    # through its existing authorized RPC after receiving this signal.
+    async def _on_board_finished(card, outcome: str) -> None:
+        from flowly.push.board_push import should_notify_board_finished
+
+        if should_notify_board_finished(card, outcome):
+            event_name = "board.completed" if outcome == "done" else "board.failed"
+            await gateway_server.broadcast_event(event_name, {})
+
+    agent._on_board_finished = _on_board_finished
 
     # Wire tool lifecycle events (tool.start / tool.complete) → WS broadcast.
     # Lightweight: emitted from agent loop around tools.execute(); failure

@@ -15,6 +15,7 @@ class _Card:
     title: str = "Ship task"
     result: str = "first line\nsecond line"
     error: str = ""
+    status: str = "done"
 
 
 @pytest.mark.asyncio
@@ -50,9 +51,24 @@ async def test_board_failed_push_payload(monkeypatch) -> None:
     from flowly.push import relay_push
 
     monkeypatch.setattr(relay_push, "notify_devices", fake_notify)
-    await notify_board_finished(_Card(error="boom"), "failed")
+    await notify_board_finished(_Card(error="boom", status="blocked"), "failed")
 
     assert calls[0]["title"] == "Board · Ship task"
     assert calls[0]["body"] == "failed: boom"
     assert calls[0]["data"]["type"] == "board"
     assert calls[0]["data"]["outcome"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_retryable_failure_does_not_push(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    async def fake_notify(title: str, body: str, **kwargs) -> None:
+        calls.append({"title": title, "body": body, **kwargs})
+
+    from flowly.push import relay_push
+
+    monkeypatch.setattr(relay_push, "notify_devices", fake_notify)
+    await notify_board_finished(_Card(error="temporary", status="ready"), "failed")
+
+    assert calls == []

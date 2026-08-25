@@ -956,6 +956,10 @@ class AgentLoop:
         # Signature: (event_name, payload_dict) -> Awaitable[None] | None.
         # event_name is "tool.start" or "tool.complete". Wired by gateway.
         self.tool_callback: Callable[[str, dict], Any] | None = None
+        # Terminal shared-Board event callback. Wired by the gateway after
+        # construction; the callback receives the in-memory card but decides
+        # independently what can cross its transport boundary.
+        self._on_board_finished: Callable[[Any, str], Awaitable[None]] | None = None
 
         # ─── Codex app-server runtime (opt-in) ─────────────────────────
         # Warm Codex subprocess sessions, keyed by Flowly session_key.
@@ -2697,6 +2701,8 @@ class AgentLoop:
                     from flowly.push.board_push import notify_board_finished
 
                     await notify_board_finished(card, outcome)
+                    if self._on_board_finished is not None:
+                        await self._on_board_finished(card, outcome)
 
                 self._board_orchestrator = BoardOrchestrator(
                     self._board_store, _board_spawn,
