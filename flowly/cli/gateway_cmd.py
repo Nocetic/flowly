@@ -2185,8 +2185,11 @@ Respond to the user now:"""
         _source_task: asyncio.Task | None = None
         _catalog_task: asyncio.Task | None = None
         _manager_task: asyncio.Task | None = None
+        _board_orchestrator = getattr(agent, "_board_orchestrator", None)
         try:
             await gateway_server.start()
+            if _board_orchestrator is not None:
+                _board_orchestrator.start_dispatcher()
             if local_runtime:
                 from flowly.profile import (
                     _pid_is_alive,
@@ -2454,6 +2457,8 @@ Respond to the user now:"""
                 _catalog_task.cancel()
             if _manager_task is not None:
                 _manager_task.cancel()
+            if _board_orchestrator is not None:
+                await _board_orchestrator.stop_dispatcher()
             await gateway_server.stop()
             heartbeat.stop()
             cron.stop()

@@ -1029,105 +1029,30 @@ class GatewayServer:
         return web.json_response(result, status=status)
 
     async def _apply_board_action(self, body: dict) -> tuple[dict, int]:
-        """Apply a board action; return ``(result, http_status)``.
+        """Apply one Board action through the transport-independent core."""
+        from flowly.board.actions import apply_board_action
 
-        Shared by the HTTP API (desktop) and the ``board.action`` WS RPC (TUI).
-        Body: ``{"action": "add|move|update|note|delete|cancel|run", ...}``.
-        All writes go through the single-writer BoardStore.
-        """
-        from flowly.board.store import BoardError
-
-        if self.board_store is None:
-            return {"ok": False, "error": "Board not configured"}, 500
-        action = (body.get("action") or "").strip()
-        try:
-            if action == "add":
-                card = self.board_store.add_card(
-                    body.get("title") or "",
-                    body=body.get("body", "") or "",
-                    origin_channel=body.get("originChannel", "desktop") or "desktop",
-                    origin_chat_id=body.get("originChatId", "") or "",
-                    created_by="user",
-                )
-                return {"ok": True, "card": card.to_dict()}, 200
-
-            if action in ("clear_done", "clear"):
-                # Bulk-remove finished cards (Done by default).
-                from flowly.board.store import STATUS_DONE
-
-                target = body.get("status") or STATUS_DONE
-                removed = self.board_store.delete_by_status(target)
-                return {"ok": True, "removed": removed}, 200
-
+        # Compatibility for boards created before the durable dispatcher: an
+        # in-process subagent may still own the stored run id even when no
+        # orchestrator is attached to this server.
+        if (
+            body.get("action") == "cancel"
+            and self.board_orchestrator is None
+            and self.board_store is not None
+            and self._subagent_manager is not None
+        ):
             card_id = body.get("cardId") or body.get("card_id") or ""
-            if not card_id:
-                return {"ok": False, "error": "cardId required"}, 400
-
-            if action == "move":
-                card = self.board_store.set_status(card_id, body.get("status") or "")
-                return {"ok": True, "card": card.to_dict()}, 200
-
-            if action == "update":
-                card = self.board_store.update_card(
-                    card_id, title=body.get("title"), body=body.get("body")
-                )
-                return {"ok": True, "card": card.to_dict()}, 200
-
-            if action == "note":
-                self.board_store.add_note(
-                    card_id,
-                    author=body.get("author", "user") or "user",
-                    text=body.get("text", "") or "",
-                )
-                card = self.board_store.get_card(card_id)
-                return {"ok": True, "card": card.to_dict() if card else None}, 200
-
-            if action == "delete":
-                return {"ok": self.board_store.delete_card(card_id)}, 200
-
-            if action == "run":
-                if self.board_orchestrator is None:
-                    return {"ok": False, "error": "board execution not available"}, 400
-                card = self.board_store.get_card(card_id)
-                if card is None:
-                    return {"ok": False, "error": "card not found"}, 404
-                # Fire-and-forget: the board reflects progress via polling. The
-                # result lands on the card (deliver=False) — we do NOT relay it
-                # into the origin conversation, so running a card from the board
-                # UI never posts the answer as a chat message. Errors are logged.
-                import asyncio as _asyncio
-
-                def _log_done(t: "_asyncio.Task") -> None:
-                    if not t.cancelled() and t.exception() is not None:
-                        logger.error(f"[board] run_card {card_id} failed: {t.exception()}")
-
-                _asyncio.ensure_future(
-                    self.board_orchestrator.run_card(card_id, deliver=False)
-                ).add_done_callback(_log_done)
-                return {"ok": True, "status": "started", "card": card.to_dict()}, 200
-
-            if action == "cancel":
-                if self.board_orchestrator is not None:
-                    await self.board_orchestrator.cancel_card(card_id)
-                else:
-                    card = self.board_store.get_card(card_id)
-                    if card and card.run_id and self._subagent_manager is not None:
-                        try:
-                            await self._subagent_manager.cancel(card.run_id)
-                        except Exception as exc:
-                            logger.warning(f"[board] cancel subagent failed: {exc}")
-                    from flowly.board.store import STATUS_CANCELLED
-
-                    self.board_store.set_status(card_id, STATUS_CANCELLED)
-                card = self.board_store.get_card(card_id)
-                return {"ok": True, "card": card.to_dict() if card else None}, 200
-
-            return {"ok": False, "error": f"unknown action: {action}"}, 400
-        except BoardError as e:
-            return {"ok": False, "error": str(e)}, 400
-        except Exception as e:
-            logger.error(f"Error applying board action {action!r}: {e}")
-            return {"ok": False, "error": "Internal server error"}, 500
+            card = self.board_store.get_card(card_id) if card_id else None
+            if card is not None and card.run_id:
+                try:
+                    await self._subagent_manager.cancel(card.run_id)
+                except Exception as exc:
+                    logger.warning("[board] legacy subagent cancel failed: {}", exc)
+        return await apply_board_action(
+            self.board_store,
+            self.board_orchestrator,
+            body,
+        )
 
     async def _handle_provider_active(self, request: web.Request) -> web.Response:
         """Read-only: report which provider is currently serving requests.
@@ -2816,7 +2741,7 @@ class GatewayServer:
             collaboration_metadata["allowed_tools"] = []
 
         turn_origin = str(params.get("turnOrigin") or "user").strip()
-        if turn_origin not in {"user", "profile", "group", "routine"}:
+        if turn_origin not in {"user", "profile", "group", "routine", "task"}:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "turnOrigin is invalid")
             return
         collaboration_metadata["turn_origin"] = turn_origin

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -68,6 +69,13 @@ _SAFE_DELEGATED_TOOLS = (
     "session_search",
     "sessions_list",
     "skill_view",
+)
+_PROFILE_TASK_DISABLED_TOOLS = (
+    "message_profile",
+    "spawn",
+    "delegate_to",
+    "board_run",
+    "board_update",
 )
 
 _PROFILE_RUNTIME_ENV_DENY = frozenset({
@@ -229,6 +237,7 @@ class ProfileHost:
         self._broker_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
         self._terminal_events: dict[tuple[str, str], dict[str, Any]] = {}
         self._broker_target_locks: dict[str, asyncio.Lock] = {}
+        self._task_target_locks: dict[str, asyncio.Lock] = {}
         self._broker_sessions: dict[tuple[str, str], str] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._capacity_lock = asyncio.Lock()
@@ -573,10 +582,120 @@ class ProfileHost:
                         if isinstance(session, dict)
                         and isinstance(session.get("key"), str)
                         and session["key"].startswith(("desktop:", "web:", "ios:"))
-                        and not session["key"].startswith("desktop:profile-inbox:")
+                        and not session["key"].startswith((
+                            "desktop:profile-inbox:",
+                            "desktop:profile-task:",
+                        ))
                     ],
                 }
         return result
+
+    async def run_task(
+        self,
+        name: str,
+        *,
+        task_id: str,
+        prompt: str,
+        idempotency_key: str,
+        timeout: float = 1800.0,
+    ) -> dict[str, Any]:
+        """Run one dispatcher-owned task in a hidden named-profile session.
+
+        This is an internal broker operation, deliberately absent from the
+        public profile-host method table. The primary Board owns identity,
+        retries, and completion; the worker receives only task text and its
+        ordinary sandboxed profile capabilities.
+        """
+        _validate_named_profile(name)
+        task_id = str(task_id or "").strip()
+        prompt = str(prompt or "").strip()
+        idempotency_key = str(idempotency_key or "").strip()
+        if not task_id or len(task_id) > 128 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", task_id):
+            raise ProfileHostError("TASK_INVALID", "The Board task identity is invalid.")
+        task_prefix = (
+            "You are executing an assigned Flowly Board task. Work on the "
+            "task completely, use your profile capabilities when useful, "
+            "and return a concise final handoff with results, files changed, "
+            "verification, and any blocker. Do not delegate this task to "
+            "another profile.\n\nTask:\n"
+        )
+        task_message = f"{task_prefix}{prompt}"
+        if not prompt or len(task_message) > MAX_PROFILE_MESSAGE_CHARS:
+            raise ProfileHostError(
+                "TASK_INVALID",
+                "The Board task must contain 1–32,000 characters.",
+            )
+        if (
+            not idempotency_key
+            or len(idempotency_key) > 128
+            or any(ord(char) < 0x20 for char in idempotency_key)
+        ):
+            raise ProfileHostError("TASK_INVALID", "The task run identity is invalid.")
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise ProfileHostError("TASK_INVALID", "The task timeout is invalid.") from exc
+        if not math.isfinite(timeout):
+            raise ProfileHostError("TASK_INVALID", "The task timeout is invalid.")
+        timeout = max(30.0, min(timeout, 3600.0))
+        session_suffix = hashlib.sha256(task_id.encode()).hexdigest()[:24]
+        session_key = f"desktop:profile-task:{session_suffix}"
+        correlation_id = f"task:{task_id}:{idempotency_key}"
+
+        async with self._task_target_locks.setdefault(name, asyncio.Lock()):
+            self._broker_sessions[(name, session_key)] = correlation_id
+            run_id = ""
+            try:
+                accepted = await self._target_rpc(name, "chat.send", {
+                    "sessionKey": session_key,
+                    "message": task_message,
+                    "thinking": False,
+                    "idempotencyKey": idempotency_key,
+                    "profileDirectory": [],
+                    "profileMentions": [],
+                    "disabledTools": list(_PROFILE_TASK_DISABLED_TOOLS),
+                    "turnOrigin": "task",
+                }, 60)
+                run_id = str((accepted or {}).get("runId") or "")
+                if not run_id:
+                    raise ProfileHostError(
+                        "TASK_START_FAILED",
+                        "The assigned bot did not accept the task.",
+                        retryable=True,
+                    )
+                key = (name, run_id)
+                terminal = self._terminal_events.pop(key, None)
+                if terminal is None:
+                    waiter = asyncio.get_running_loop().create_future()
+                    self._broker_waiters[key] = waiter
+                    try:
+                        terminal = await asyncio.wait_for(waiter, timeout=timeout)
+                    except asyncio.TimeoutError as exc:
+                        await self._target_rpc(name, "chat.abort", {"runId": run_id}, 30)
+                        raise ProfileHostError(
+                            "TASK_TIMEOUT",
+                            "The assigned bot did not finish before the task timeout.",
+                            retryable=True,
+                        ) from exc
+                    finally:
+                        self._broker_waiters.pop(key, None)
+                        self._terminal_events.pop(key, None)
+                response = _profile_reply_text(terminal.get("message"))
+                if not response:
+                    raise ProfileHostError(
+                        "TASK_EMPTY_RESPONSE",
+                        "The assigned bot completed without a task handoff.",
+                    )
+                return {"runId": run_id, "response": response}
+            except asyncio.CancelledError:
+                if run_id:
+                    try:
+                        await self._target_rpc(name, "chat.abort", {"runId": run_id}, 30)
+                    except Exception:
+                        logger.debug("Could not abort cancelled Board task {}", task_id)
+                raise
+            finally:
+                self._broker_sessions.pop((name, session_key), None)
 
     async def shutdown(self) -> None:
         if self._closed:
@@ -1025,15 +1144,16 @@ class ProfileHost:
         if runtime is not None:
             runtime.last_used_at = time.time()
         session_key = str(payload.get("sessionKey") or "")
+        internal_turn = bool(self._broker_sessions.get((profile, session_key)))
         if event == "exec.approval.requested" and payload.get("id"):
-            if self._broker_sessions.get((profile, session_key)):
+            if internal_turn:
                 self._spawn_background(self._resolve_internal_prompt(
                     profile,
                     "exec.approval.resolve",
                     {"id": payload["id"], "decision": "deny"},
                 ), name=f"profile-approval:{profile}")
         elif event == "agent.clarify.requested" and payload.get("id"):
-            if self._broker_sessions.get((profile, session_key)):
+            if internal_turn:
                 self._spawn_background(self._resolve_internal_prompt(
                     profile,
                     "agent.clarify.resolve",
@@ -1045,7 +1165,13 @@ class ProfileHost:
                         ),
                     },
                 ), name=f"profile-clarify:{profile}")
-        await self._emit(profile, event, payload)
+        # Internal collaboration and Board-worker sessions are deliberately
+        # absent from public session lists. Their live events must be private
+        # too, otherwise remote clients can momentarily render hidden turns or
+        # count them as user conversations. The primary Board publishes the
+        # durable task state and completion notification instead.
+        if not internal_turn:
+            await self._emit(profile, event, payload)
 
     def _spawn_background(self, coroutine: Awaitable[Any], *, name: str) -> None:
         task = asyncio.create_task(coroutine, name=name)

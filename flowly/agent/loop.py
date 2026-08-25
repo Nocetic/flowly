@@ -2618,12 +2618,45 @@ class AgentLoop:
 
                 self._board_store = BoardStore(_get_flowly_home_board() / "board.db")
 
-                async def _board_spawn(task, *, label=None, origin_channel="",
-                                       origin_chat_id="", model=None):
+                async def _board_spawn(
+                    task,
+                    *,
+                    label=None,
+                    origin_channel="",
+                    origin_chat_id="",
+                    model=None,
+                    profile=None,
+                    task_id=None,
+                    claim_token=None,
+                ):
                     # Run a full agent turn on the card text and return its
                     # result. wait=True executes inline; silent=True suppresses
                     # the per-child parent announce because the orchestrator
                     # sends one consolidated notification.
+                    if profile and profile != "default":
+                        gateway = self._gateway_server
+                        profile_host = (
+                            getattr(gateway, "profile_host", None)
+                            if gateway is not None
+                            else None
+                        )
+                        if profile_host is None:
+                            raise RuntimeError("The assigned bot runtime host is unavailable.")
+                        task_result = await profile_host.run_task(
+                            profile,
+                            task_id=str(task_id or label or ""),
+                            prompt=task,
+                            idempotency_key=str(claim_token or ""),
+                        )
+                        worker_run_id = str(task_result.get("runId") or "")
+                        if label and claim_token and worker_run_id:
+                            self._board_store.set_worker_run_id(
+                                label,
+                                str(claim_token),
+                                worker_run_id,
+                            )
+                        return str(task_result.get("response") or "")
+
                     result = await self.subagents.spawn(
                         task=task,
                         label=label,

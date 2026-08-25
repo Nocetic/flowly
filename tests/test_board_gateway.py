@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from flowly.board.store import BoardStore, STATUS_DONE, STATUS_IN_PROGRESS
+from flowly.board.store import STATUS_DONE, STATUS_IN_PROGRESS, BoardStore
 from flowly.gateway.server import GatewayServer
 
 
@@ -77,7 +77,7 @@ async def test_snapshot_empty(store):
     data = _body(resp)
     assert data["total"] == 0
     assert [c["status"] for c in data["columns"]] == [
-        "todo", "in_progress", "waiting", "done"
+        "todo", "ready", "in_progress", "waiting", "review", "blocked", "done"
     ]
 
 
@@ -94,6 +94,52 @@ async def test_action_add_then_snapshot(store):
     snap = _body(await server._handle_board_snapshot(_Req()))
     assert snap["total"] == 1
     assert snap["columns"][0]["cards"][0]["title"] == "from desktop"
+
+
+@pytest.mark.asyncio
+async def test_action_add_is_idempotent(store):
+    server = _server(store)
+    payload = {
+        "action": "add",
+        "title": "once",
+        "idempotencyKey": "desktop-create-1",
+    }
+
+    first = _body(await server._handle_board_action(_Req(payload)))
+    replay = _body(await server._handle_board_action(_Req({**payload, "title": "changed"})))
+
+    assert replay["idempotentReplay"] is True
+    assert replay["card"]["id"] == first["card"]["id"]
+    assert replay["card"]["title"] == "once"
+    assert len(store.list_cards()) == 1
+
+
+@pytest.mark.asyncio
+async def test_action_update_worker_controls(store):
+    card = store.add_card("task")
+    server = _server(store)
+
+    response = await server._handle_board_action(_Req({
+        "action": "update",
+        "cardId": card.id,
+        "expectedRevision": card.revision,
+        "priority": 42,
+        "scheduledAt": 2_000_000_000,
+        "maxAttempts": 4,
+    }))
+    updated = _body(response)["card"]
+
+    assert updated["priority"] == 42
+    assert updated["scheduledAt"] == 2_000_000_000
+    assert updated["maxAttempts"] == 4
+
+    cleared = _body(await server._handle_board_action(_Req({
+        "action": "update",
+        "cardId": card.id,
+        "expectedRevision": updated["revision"],
+        "scheduledAt": None,
+    })))["card"]
+    assert cleared["scheduledAt"] is None
 
 
 @pytest.mark.asyncio

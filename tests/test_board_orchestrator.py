@@ -13,11 +13,12 @@ import pytest
 
 from flowly.board.orchestrator import BoardOrchestrator
 from flowly.board.store import (
-    BoardError,
-    BoardStore,
     STATUS_CANCELLED,
     STATUS_DONE,
+    STATUS_READY,
     STATUS_TODO,
+    BoardError,
+    BoardStore,
 )
 
 
@@ -214,3 +215,118 @@ async def test_spawn_fn_never_receives_store(store):
     await orch.run_card(card.id)
     assert set(seen_kwargs) == {"label", "origin_channel", "origin_chat_id", "model"}
     assert "store" not in seen_kwargs
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_routes_assigned_card_without_store_authority(store):
+    seen = {}
+
+    async def profile_spawn(task, **kwargs):
+        seen["task"] = task
+        seen.update(kwargs)
+        return "profile result"
+
+    card = store.add_card(
+        "research task",
+        body="use sources",
+        status=STATUS_READY,
+        assignee_profile="research",
+        assignee_bot_id="bot-1",
+    )
+    orch = BoardOrchestrator(store, profile_spawn)
+
+    assert await orch.dispatch_once() == 1
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if not orch._dispatch_tasks:
+            break
+
+    finished = store.get_card(card.id)
+    assert finished.status == STATUS_DONE
+    assert finished.result == "profile result"
+    assert seen["profile"] == "research"
+    assert seen["task_id"] == card.id
+    assert seen["claim_token"].startswith("claim_")
+    assert "store" not in seen
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_serializes_work_per_named_profile(store):
+    release = asyncio.Event()
+    state = {"active": 0, "max": 0}
+
+    async def profile_spawn(task, **kwargs):
+        state["active"] += 1
+        state["max"] = max(state["max"], state["active"])
+        try:
+            await release.wait()
+        finally:
+            state["active"] -= 1
+        return task
+
+    for title in ("one", "two"):
+        store.add_card(
+            title,
+            status=STATUS_READY,
+            assignee_profile="research",
+            assignee_bot_id="bot-1",
+        )
+    orch = BoardOrchestrator(store, profile_spawn)
+    assert await orch.dispatch_once() == 1
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if state["active"]:
+            break
+
+    assert state["active"] == 1
+    assert state["max"] == 1
+    release.set()
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if not orch._dispatch_tasks:
+            break
+    assert sum(card.status == STATUS_DONE for card in store.list_cards()) == 1
+    assert await orch.dispatch_once() == 1
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if not orch._dispatch_tasks:
+            break
+    assert all(card.status == STATUS_DONE for card in store.list_cards())
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_preserves_capacity_for_other_profiles(store):
+    release = asyncio.Event()
+    started = []
+
+    async def profile_spawn(task, **kwargs):
+        started.append(kwargs["profile"])
+        await release.wait()
+        return "ok"
+
+    for index in range(8):
+        store.add_card(
+            f"research-{index}",
+            status=STATUS_READY,
+            assignee_profile="research",
+            assignee_bot_id="bot-research",
+            priority=100 - index,
+        )
+    store.add_card(
+        "writer-task",
+        status=STATUS_READY,
+        assignee_profile="writer",
+        assignee_bot_id="bot-writer",
+        priority=1,
+    )
+    orch = BoardOrchestrator(store, profile_spawn)
+
+    assert await orch.dispatch_once() == 2
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if len(started) == 2:
+            break
+
+    assert set(started) == {"research", "writer"}
+    release.set()
+    await orch.stop_dispatcher()

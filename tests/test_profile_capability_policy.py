@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from flowly.agent.loop import resolve_capability_disabled_tools
-from flowly.agent.loop import AgentLoop
+from flowly.agent.loop import AgentLoop, resolve_capability_disabled_tools
 from flowly.bus.queue import MessageBus
 from flowly.channels import feature_rpc
 from flowly.cli.gateway_cmd import _local_runtime_ready_payload
@@ -126,3 +127,79 @@ async def test_named_runtime_feature_rpc_rejects_primary_surfaces(
         await feature_rpc.dispatch(method, {})
 
     assert raised.value.code == "UNAVAILABLE"
+
+
+def test_named_runtime_capabilities_do_not_advertise_primary_surfaces(
+    monkeypatch,
+) -> None:
+    capabilities = resolve_runtime_capabilities(profile_name="research")
+    monkeypatch.setattr(
+        "flowly.runtime_capabilities.resolve_runtime_capabilities",
+        lambda: capabilities,
+    )
+
+    advertised = feature_rpc.system_capabilities()
+
+    assert advertised["runtime"] == {
+        "role": RuntimeRole.NAMED_PROFILE.value,
+        "profile": "research",
+    }
+    assert "board" not in advertised
+    assert not any(
+        method.startswith(("board.", "flowlets."))
+        for method in advertised["featureMethods"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_primary_board_routes_assigned_work_through_profile_host(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "primary"
+    workspace = home / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    calls = []
+
+    class _ProfileHost:
+        async def run_task(self, profile, **kwargs):
+            calls.append((profile, kwargs))
+            return {"runId": "worker-run-1", "response": "worker handoff"}
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=_NoopProvider(),
+        workspace=workspace,
+        state_dir=home,
+        main_config=Config(),
+        runtime_capabilities=resolve_runtime_capabilities(profile_name="default"),
+    )
+    assert loop._board_store is not None
+    assert loop._board_orchestrator is not None
+    loop._gateway_server = SimpleNamespace(profile_host=_ProfileHost())
+    loop._board_orchestrator._on_finished = None
+    card = loop._board_store.add_card(
+        "Prepare launch notes",
+        body="Cover verification and rollback.",
+        assignee_profile="writer",
+        assignee_bot_id="bot-writer",
+    )
+
+    try:
+        result = await loop._board_orchestrator.run_card(card.id, deliver=False)
+        fresh = loop._board_store.get_card(card.id)
+
+        assert result["ok"] is True
+        assert fresh is not None
+        assert fresh.status == "done"
+        assert fresh.result == "worker handoff"
+        assert calls[0][0] == "writer"
+        assert calls[0][1]["task_id"] == card.id
+        assert calls[0][1]["prompt"] == (
+            "Prepare launch notes\n\nCover verification and rollback."
+        )
+        assert calls[0][1]["idempotency_key"].startswith("claim_")
+        assert loop._board_store.get_runs(card.id)[0]["workerRunId"] == "worker-run-1"
+    finally:
+        loop._board_store.close()

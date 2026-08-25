@@ -7,11 +7,10 @@ never touched.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
-
-import asyncio
 
 from flowly.agent.tools.board import (
     BoardAddTool,
@@ -21,7 +20,7 @@ from flowly.agent.tools.board import (
     BoardUpdateTool,
     build_board_tools,
 )
-from flowly.board.store import BoardStore, STATUS_DONE, STATUS_IN_PROGRESS
+from flowly.board.store import STATUS_DONE, STATUS_IN_PROGRESS, BoardStore
 
 
 @pytest.fixture
@@ -106,6 +105,32 @@ async def test_update_done_with_result(store):
     res = await _run(tool, card_id=card.id, status=STATUS_DONE, result="shipped")
     assert res["card"]["status"] == STATUS_DONE
     assert res["card"]["result"] == "shipped"
+
+
+@pytest.mark.asyncio
+async def test_update_note_and_unassign_are_both_applied(store):
+    card = store.add_card(
+        "task",
+        assignee_profile="writer",
+        assignee_bot_id="bot-writer",
+    )
+
+    class _AssignmentOrchestrator:
+        def unassign_card(self, card_id, **kwargs):
+            return store.unassign_card(card_id, **kwargs)
+
+    tool = BoardUpdateTool(store, _AssignmentOrchestrator())
+    res = await _run(
+        tool,
+        card_id=card.id,
+        note="handoff paused",
+        unassign=True,
+        expected_revision=card.revision,
+    )
+
+    assert res["ok"] is True
+    assert res["card"]["assigneeProfile"] == ""
+    assert any(note["text"] == "handoff paused" for note in res["card"]["notes"])
 
 
 @pytest.mark.asyncio

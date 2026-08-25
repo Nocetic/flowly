@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 
 import pytest
 
 from flowly.board.store import (
-    BoardError,
-    BoardStore,
-    STATUS_CANCELLED,
+    STATUS_BLOCKED,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
+    STATUS_READY,
+    STATUS_REVIEW,
     STATUS_TODO,
     STATUS_WAITING,
+    BoardError,
+    BoardStore,
 )
 
 
@@ -179,7 +182,13 @@ def test_snapshot_shape(store):
 
     snap = store.snapshot()
     assert [col["status"] for col in snap["columns"]] == [
-        STATUS_TODO, STATUS_IN_PROGRESS, STATUS_WAITING, STATUS_DONE
+        STATUS_TODO,
+        STATUS_READY,
+        STATUS_IN_PROGRESS,
+        STATUS_WAITING,
+        STATUS_REVIEW,
+        STATUS_BLOCKED,
+        STATUS_DONE,
     ]
     assert snap["counts"][STATUS_TODO] == 1
     assert snap["counts"][STATUS_IN_PROGRESS] == 1
@@ -221,3 +230,169 @@ def test_concurrent_add_is_consistent(store):
     cards = store.list_cards(limit=1000)
     assert len(cards) == n
     assert len({c.id for c in cards}) == n  # all ids unique
+
+
+def test_idempotent_add_returns_original_card(store):
+    first = store.add_card("task", idempotency_key="request-1")
+    second = store.add_card("different title", idempotency_key="request-1")
+
+    assert second.id == first.id
+    assert second.title == "task"
+    assert store.snapshot()["total"] == 1
+
+
+def test_assignment_uses_revision_cas(store):
+    card = store.add_card("task")
+    assigned = store.assign_card(
+        card.id,
+        profile="research",
+        bot_id="bot-1",
+        expected_revision=card.revision,
+    )
+
+    assert assigned.status == STATUS_READY
+    assert assigned.assignee_profile == "research"
+    assert assigned.assignee_bot_id == "bot-1"
+    with pytest.raises(BoardError, match="changed"):
+        store.assign_card(
+            card.id,
+            profile="writer",
+            bot_id="bot-2",
+            expected_revision=card.revision,
+        )
+
+
+def test_claim_heartbeat_retry_and_stale_completion(store):
+    card = store.add_card(
+        "task",
+        assignee_profile="research",
+        assignee_bot_id="bot-1",
+        status=STATUS_READY,
+        max_attempts=2,
+    )
+    claimed = store.claim_card(card.id, worker="research", lease_seconds=30)
+    assert claimed is not None and claimed.claim_token
+    assert claimed.status == STATUS_IN_PROGRESS
+    assert store.heartbeat_claim(card.id, claimed.claim_token, lease_seconds=30)
+
+    retry = store.finish_claim(
+        card.id,
+        claimed.claim_token,
+        outcome="failed",
+        error="temporary",
+    )
+    assert retry.status == STATUS_READY
+    assert retry.attempt_count == 1
+    with pytest.raises(BoardError, match="stale"):
+        store.finish_claim(card.id, claimed.claim_token, outcome="done", result="late")
+
+    claimed_again = store.claim_card(card.id, worker="research", lease_seconds=30)
+    assert claimed_again is not None and claimed_again.claim_token
+    blocked = store.finish_claim(
+        card.id,
+        claimed_again.claim_token,
+        outcome="failed",
+        error="permanent",
+    )
+    assert blocked.status == STATUS_BLOCKED
+    assert len(store.get_runs(card.id)) == 2
+    assert any(item["kind"] == "run_finished" for item in store.get_events(card.id))
+
+
+def test_dependency_blocks_dispatch_until_parent_done(store):
+    parent = store.add_card("parent")
+    child = store.add_card(
+        "child",
+        status=STATUS_READY,
+        assignee_profile="research",
+        assignee_bot_id="bot-1",
+    )
+    store.link_cards(parent.id, child.id)
+
+    assert store.list_dispatchable() == []
+    store.set_status(parent.id, STATUS_DONE)
+    assert [card.id for card in store.list_dispatchable()] == [child.id]
+
+
+def test_dependencies_reject_cycles_and_duplicate_audit(store):
+    first = store.add_card("first")
+    second = store.add_card("second")
+    third = store.add_card("third")
+
+    store.link_cards(first.id, second.id)
+    store.link_cards(second.id, third.id)
+    with pytest.raises(BoardError, match="cycle"):
+        store.link_cards(third.id, first.id)
+
+    before = len(store.get_events(second.id))
+    store.link_cards(first.id, second.id)
+    assert len(store.get_events(second.id)) == before
+
+
+def test_dispatchable_returns_at_most_one_card_per_profile(store):
+    for title in ("first", "second"):
+        store.add_card(
+            title,
+            status=STATUS_READY,
+            assignee_profile="research",
+            assignee_bot_id="bot-research",
+        )
+    writer = store.add_card(
+        "writer",
+        status=STATUS_READY,
+        assignee_profile="writer",
+        assignee_bot_id="bot-writer",
+    )
+
+    dispatchable = store.list_dispatchable()
+
+    assert len(dispatchable) == 2
+    assert {card.assignee_profile for card in dispatchable} == {"research", "writer"}
+    assert store.list_dispatchable(exclude_profiles=("research",)) == [writer]
+
+
+@pytest.mark.parametrize("scheduled_at", [float("nan"), float("inf"), float("-inf")])
+def test_add_card_rejects_non_finite_schedule(store, scheduled_at):
+    with pytest.raises(BoardError, match="scheduled time"):
+        store.add_card("scheduled", scheduled_at=scheduled_at)
+
+
+def test_existing_board_schema_migrates_without_data_loss(tmp_path):
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE cards (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL, origin_channel TEXT NOT NULL DEFAULT '',
+            origin_chat_id TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT 'user',
+            run_id TEXT, parent_id TEXT, result TEXT, error TEXT,
+            created_at REAL NOT NULL, updated_at REAL NOT NULL
+        );
+        CREATE TABLE card_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+            author TEXT NOT NULL, text TEXT NOT NULL, created_at REAL NOT NULL
+        );
+        INSERT INTO cards VALUES (
+            'c_legacy', 'legacy task', '', 'todo', '', '', 'user',
+            NULL, NULL, NULL, NULL, 1.0, 1.0
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+    migrated = BoardStore(path)
+    try:
+        card = migrated.get_card("c_legacy")
+        assert card is not None
+        assert card.title == "legacy task"
+        assert card.revision == 0
+        assert card.max_attempts == 2
+        assigned = migrated.assign_card(
+            card.id,
+            profile="research",
+            bot_id="bot-1",
+        )
+        assert assigned.status == STATUS_READY
+    finally:
+        migrated.close()

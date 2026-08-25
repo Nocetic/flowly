@@ -95,6 +95,7 @@ async def test_remote_session_directory_hides_internal_collaboration(profile_roo
         "sessions": [
             {"key": "ios:visible"},
             {"key": "desktop:profile-inbox:writer:source"},
+            {"key": "desktop:profile-task:private"},
             {"key": "cron:internal"},
             {"key": 123},
         ],
@@ -103,6 +104,54 @@ async def test_remote_session_directory_hides_internal_collaboration(profile_roo
     result = await host.rpc("writer", "sessions.list", {})
 
     assert result == {"sessions": [{"key": "ios:visible"}]}
+
+
+@pytest.mark.asyncio
+async def test_internal_board_task_is_scoped_and_hidden_from_public_contract(
+    profile_roots,
+) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    public_events = []
+
+    async def on_event(event):
+        public_events.append(event)
+
+    host = ProfileHost(on_event=on_event)
+    sent = {}
+
+    async def target_rpc(target, method, params, timeout):
+        assert target == "writer"
+        if method == "chat.send":
+            sent.update(params)
+            run_id = "task-run-1"
+            await host._handle_profile_event("writer", "chat", {
+                "runId": run_id,
+                "sessionKey": params["sessionKey"],
+                "state": "final",
+                "message": {"content": "Completed with evidence"},
+            })
+            return {"runId": run_id}
+        raise AssertionError(f"unexpected method: {method}")
+
+    host._target_rpc = target_rpc  # type: ignore[method-assign]
+    result = await host.run_task(
+        "writer",
+        task_id="c_task-1",
+        prompt="Prepare the report",
+        idempotency_key="claim-1",
+    )
+
+    assert result == {"runId": "task-run-1", "response": "Completed with evidence"}
+    assert sent["sessionKey"].startswith("desktop:profile-task:")
+    assert sent["turnOrigin"] == "task"
+    assert "message_profile" in sent["disabledTools"]
+    assert "spawn" in sent["disabledTools"]
+    assert "allowedTools" not in sent
+    assert public_events == []
+
+    with pytest.raises(ProfileHostError) as public:
+        await host.dispatch("profiles.task.run", {})
+    assert public.value.code == "METHOD_NOT_ALLOWED"
 
 
 @pytest.mark.asyncio

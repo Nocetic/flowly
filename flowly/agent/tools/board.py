@@ -24,17 +24,18 @@ from loguru import logger
 
 from flowly.agent.tools.base import Tool
 from flowly.board.store import (
+    VALID_STATUSES,
     BoardError,
     BoardStore,
-    VALID_STATUSES,
 )
 
 
 class _BoardToolBase(Tool):
     """Shared context + store for board tools."""
 
-    def __init__(self, store: BoardStore):
+    def __init__(self, store: BoardStore, orchestrator: Any | None = None):
         self._store = store
+        self._orchestrator = orchestrator
         self._channel = ""
         self._chat_id = ""
 
@@ -70,6 +71,30 @@ class BoardAddTool(_BoardToolBase):
                     "type": "string",
                     "description": "Optional longer description or context.",
                 },
+                "assignee_profile": {
+                    "type": "string",
+                    "description": (
+                        "Optional stable profile id of the bot that should execute "
+                        "the task. Assignment validates the live bot directory and "
+                        "queues the card automatically."
+                    ),
+                },
+                "priority": {
+                    "type": "integer",
+                    "minimum": -100,
+                    "maximum": 100,
+                    "description": "Dispatch priority; higher cards run first.",
+                },
+                "scheduled_at": {
+                    "type": "number",
+                    "description": "Optional Unix timestamp; the assigned bot waits until then.",
+                },
+                "max_attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Maximum worker attempts before the card blocks.",
+                },
             },
             "required": ["title"],
         }
@@ -77,6 +102,7 @@ class BoardAddTool(_BoardToolBase):
     async def execute(self, **kwargs: Any) -> str:
         title = kwargs.get("title", "")
         body = kwargs.get("body", "") or ""
+        assignee = str(kwargs.get("assignee_profile") or "").strip()
         try:
             card = self._store.add_card(
                 title,
@@ -84,7 +110,19 @@ class BoardAddTool(_BoardToolBase):
                 origin_channel=self._channel,
                 origin_chat_id=self._chat_id,
                 created_by="user",
+                priority=kwargs.get("priority", 0),
+                scheduled_at=kwargs.get("scheduled_at"),
+                max_attempts=kwargs.get("max_attempts", 2),
             )
+            if assignee:
+                if self._orchestrator is None:
+                    self._store.delete_card(card.id)
+                    return self._err("bot assignment is not available")
+                try:
+                    card = self._orchestrator.assign_card(card.id, assignee, actor="agent")
+                except Exception:
+                    self._store.delete_card(card.id)
+                    raise
         except BoardError as e:
             return self._err(str(e))
         except Exception as e:  # pragma: no cover - defensive
@@ -97,7 +135,8 @@ class BoardListTool(_BoardToolBase):
     name = "board_list"
     description = (
         "List cards on the user's task board. Optionally filter by status "
-        "(todo, in_progress, waiting, done, cancelled). Returns cards as JSON."
+        "(todo, ready, in_progress, waiting, review, blocked, done, cancelled, "
+        "archived). Returns cards as JSON."
     )
 
     @property
@@ -110,13 +149,20 @@ class BoardListTool(_BoardToolBase):
                     "enum": sorted(VALID_STATUSES),
                     "description": "Filter to one status. Omit for all cards.",
                 },
+                "assignee_profile": {
+                    "type": "string",
+                    "description": "Filter to cards assigned to one profile id.",
+                },
             },
         }
 
     async def execute(self, **kwargs: Any) -> str:
         status = kwargs.get("status")
         try:
-            cards = self._store.list_cards(status=status)
+            cards = self._store.list_cards(
+                status=status,
+                assignee_profile=kwargs.get("assignee_profile"),
+            )
         except BoardError as e:
             return self._err(str(e))
         return json.dumps(
@@ -167,10 +213,39 @@ class BoardUpdateTool(_BoardToolBase):
                 },
                 "title": {"type": "string", "description": "New title."},
                 "body": {"type": "string", "description": "New body/description."},
+                "priority": {
+                    "type": "integer",
+                    "minimum": -100,
+                    "maximum": 100,
+                    "description": "Dispatch priority; higher cards run first.",
+                },
+                "scheduled_at": {
+                    "anyOf": [{"type": "number"}, {"type": "null"}],
+                    "description": "Unix timestamp to delay dispatch, or null to clear it.",
+                },
+                "max_attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Maximum worker attempts before the card blocks.",
+                },
                 "note": {"type": "string", "description": "Append a note to the card."},
                 "result": {
                     "type": "string",
                     "description": "Result summary (typically set when moving to done).",
+                },
+                "assignee_profile": {
+                    "type": "string",
+                    "description": "Assign the card to this live profile id.",
+                },
+                "unassign": {
+                    "type": "boolean",
+                    "description": "Remove the current bot assignment.",
+                },
+                "expected_revision": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional optimistic-concurrency revision.",
                 },
             },
             "required": ["card_id"],
@@ -181,23 +256,90 @@ class BoardUpdateTool(_BoardToolBase):
         status = kwargs.get("status")
         title = kwargs.get("title")
         body = kwargs.get("body")
+        priority = kwargs.get("priority")
+        scheduled_present = "scheduled_at" in kwargs
+        scheduled_at = kwargs.get("scheduled_at")
+        max_attempts = kwargs.get("max_attempts")
         note = kwargs.get("note")
         result = kwargs.get("result")
+        assignee = str(kwargs.get("assignee_profile") or "").strip()
+        unassign = bool(kwargs.get("unassign", False))
+        expected_revision = kwargs.get("expected_revision")
+
+        if assignee and unassign:
+            return self._err("assignee_profile and unassign are mutually exclusive")
 
         if self._store.get_card(card_id) is None:
             return self._err(f"card not found: {card_id}")
 
         try:
-            if title is not None or body is not None:
-                self._store.update_card(card_id, title=title, body=body)
+            card = self._store.get_card(card_id)
+            assert card is not None
+
+            def next_revision() -> int | None:
+                return card.revision if expected_revision is not None else None
+
+            if assignee:
+                if self._orchestrator is None:
+                    return self._err("bot assignment is not available")
+                card = self._orchestrator.assign_card(
+                    card_id,
+                    assignee,
+                    actor="agent",
+                    expected_revision=next_revision(),
+                )
+            if (
+                title is not None
+                or body is not None
+                or priority is not None
+                or scheduled_present
+                or max_attempts is not None
+            ):
+                update_kwargs = {
+                    "title": title,
+                    "body": body,
+                    "priority": priority,
+                    "max_attempts": max_attempts,
+                    "expected_revision": next_revision(),
+                    "actor": "agent",
+                }
+                if scheduled_present:
+                    update_kwargs["scheduled_at"] = scheduled_at
+                card = self._store.update_card(card_id, **update_kwargs)
             if note:
-                self._store.add_note(card_id, author="agent", text=note)
+                self._store.add_note(
+                    card_id,
+                    author="agent",
+                    text=note,
+                    expected_revision=next_revision(),
+                )
+                card = self._store.get_card(card_id)
+                assert card is not None
+            if unassign:
+                if self._orchestrator is None:
+                    return self._err("bot assignment is not available")
+                card = self._orchestrator.unassign_card(
+                    card_id,
+                    actor="agent",
+                    expected_revision=next_revision(),
+                )
             if status is not None:
-                self._store.set_status(card_id, status, result=result)
+                card = self._store.set_status(
+                    card_id,
+                    status,
+                    result=result,
+                    expected_revision=next_revision(),
+                    actor="agent",
+                )
             elif result is not None:
                 # result without a status change — record it as a note
-                self._store.add_note(card_id, author="agent", text=f"result: {result}")
-            card = self._store.get_card(card_id)
+                self._store.add_note(
+                    card_id,
+                    author="agent",
+                    text=f"result: {result}",
+                    expected_revision=next_revision(),
+                )
+                card = self._store.get_card(card_id)
         except BoardError as e:
             return self._err(str(e))
         except Exception as e:  # pragma: no cover - defensive
@@ -220,7 +362,7 @@ class BoardRunTool(_BoardToolBase):
     )
 
     def __init__(self, store: BoardStore, orchestrator: Any):
-        super().__init__(store)
+        super().__init__(store, orchestrator)
         self._orch = orchestrator
         self._is_subagent = False
 
@@ -332,10 +474,10 @@ def build_board_tools(
     a way to execute work).
     """
     tools: list[_BoardToolBase] = [
-        BoardAddTool(store),
-        BoardListTool(store),
-        BoardGetTool(store),
-        BoardUpdateTool(store),
+        BoardAddTool(store, orchestrator),
+        BoardListTool(store, orchestrator),
+        BoardGetTool(store, orchestrator),
+        BoardUpdateTool(store, orchestrator),
     ]
     if orchestrator is not None:
         tools.append(BoardRunTool(store, orchestrator))

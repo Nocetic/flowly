@@ -26,13 +26,12 @@ from typing import Any, Awaitable, Callable, Optional
 from loguru import logger
 
 from flowly.board.store import (
-    BoardError,
-    BoardStore,
     STATUS_CANCELLED,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
-    STATUS_TODO,
     TERMINAL_STATUSES,
+    BoardError,
+    BoardStore,
 )
 
 # A spawn function: run the given task to completion, return its result text.
@@ -57,6 +56,10 @@ def _summarize(result: Optional[str]) -> str:
 
 class BoardOrchestrator:
     MAX_PARALLEL = 5
+    MAX_PER_PROFILE = 1
+    LEASE_SECONDS = 60.0
+    HEARTBEAT_SECONDS = 20.0
+    RECOVERY_SECONDS = 15.0
 
     def __init__(
         self,
@@ -78,6 +81,12 @@ class BoardOrchestrator:
         self._sem = asyncio.Semaphore(self.MAX_PARALLEL)
         # card_id -> the asyncio task running its spawn (for cancellation)
         self._tasks: dict[str, asyncio.Task] = {}
+        self._profile_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._cancel_requests: set[str] = set()
+        self._dispatch_tasks: dict[str, asyncio.Task] = {}
+        self._dispatch_wake = asyncio.Event()
+        self._dispatcher_task: asyncio.Task | None = None
+        self._stopping = False
 
     # -- helpers ------------------------------------------------------------
 
@@ -107,6 +116,28 @@ class BoardOrchestrator:
         t = self._tasks.get(card_id)
         return t is not None and not t.done()
 
+    def _profile_semaphore(self, profile: str) -> asyncio.Semaphore:
+        key = profile or "default"
+        semaphore = self._profile_semaphores.get(key)
+        if semaphore is None:
+            limit = self.MAX_PARALLEL if key == "default" else self.MAX_PER_PROFILE
+            semaphore = asyncio.Semaphore(limit)
+            self._profile_semaphores[key] = semaphore
+        return semaphore
+
+    async def _heartbeat(self, card_id: str, claim_token: str) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.HEARTBEAT_SECONDS)
+                if not self._store.heartbeat_claim(
+                    card_id,
+                    claim_token,
+                    lease_seconds=self.LEASE_SECONDS,
+                ):
+                    return
+        except asyncio.CancelledError:
+            raise
+
     # -- core execution -----------------------------------------------------
 
     async def _execute(self, card_id: str) -> tuple[str, Optional[str]]:
@@ -123,32 +154,74 @@ class BoardOrchestrator:
             if card.status == STATUS_CANCELLED:
                 return ("cancelled", None)
 
-            self._store.set_status(card_id, STATUS_IN_PROGRESS)
-            task: asyncio.Task = asyncio.ensure_future(
-                self._spawn(
-                    self._task_text(card),
-                    label=card.id,
-                    origin_channel=card.origin_channel,
-                    origin_chat_id=card.origin_chat_id,
-                    model=self._model,
+            worker = card.assignee_profile or "default"
+            async with self._profile_semaphore(worker):
+                claimed = self._store.claim_card(
+                    card_id,
+                    worker=worker,
+                    lease_seconds=self.LEASE_SECONDS,
                 )
-            )
-            self._tasks[card_id] = task
-            try:
-                result = await task
-                self._store.set_status(card_id, STATUS_DONE, result=_summarize(result))
-                return ("done", _summarize(result))
-            except asyncio.CancelledError:
-                self._store.set_status(card_id, STATUS_CANCELLED, error="cancelled")
-                return ("cancelled", None)
-            except Exception as exc:
-                # Failure is retryable: send the card back to todo with the
-                # error recorded, rather than burying it in a terminal state.
-                self._store.add_note(card_id, "system", f"run failed: {exc}")
-                self._store.set_status(card_id, STATUS_TODO, error=str(exc), clear_run_id=True)
-                return ("failed", str(exc))
-            finally:
-                self._tasks.pop(card_id, None)
+                if claimed is None or not claimed.claim_token:
+                    return ("failed", "card is not eligible to run")
+                spawn_kwargs = {
+                    "label": claimed.id,
+                    "origin_channel": claimed.origin_channel,
+                    "origin_chat_id": claimed.origin_chat_id,
+                    "model": self._model,
+                }
+                if claimed.assignee_profile:
+                    spawn_kwargs.update({
+                        "profile": claimed.assignee_profile,
+                        "task_id": claimed.id,
+                        "claim_token": claimed.claim_token,
+                    })
+                task: asyncio.Task = asyncio.ensure_future(
+                    self._spawn(self._task_text(claimed), **spawn_kwargs)
+                )
+                heartbeat = asyncio.create_task(
+                    self._heartbeat(claimed.id, claimed.claim_token),
+                    name=f"board-heartbeat:{claimed.id}",
+                )
+                self._tasks[card_id] = task
+                try:
+                    result = await task
+                    self._store.finish_claim(
+                        card_id,
+                        claimed.claim_token,
+                        outcome="done",
+                        result=_summarize(result),
+                        actor=worker,
+                    )
+                    return ("done", _summarize(result))
+                except asyncio.CancelledError:
+                    user_cancelled = card_id in self._cancel_requests
+                    outcome = "cancelled" if user_cancelled else "failed"
+                    message = "cancelled" if user_cancelled else "runtime shutting down"
+                    self._store.finish_claim(
+                        card_id,
+                        claimed.claim_token,
+                        outcome=outcome,
+                        error=message,
+                        actor=worker,
+                    )
+                    return (outcome, None if user_cancelled else message)
+                except Exception as exc:
+                    retry_delay = min(300.0, 5.0 * (2 ** max(0, claimed.attempt_count - 1)))
+                    self._store.finish_claim(
+                        card_id,
+                        claimed.claim_token,
+                        outcome="failed",
+                        error=str(exc),
+                        retry_delay=retry_delay,
+                        actor=worker,
+                    )
+                    return ("failed", str(exc))
+                finally:
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
+                    self._tasks.pop(card_id, None)
+                    self._cancel_requests.discard(card_id)
+                    self.wake_dispatcher()
 
     # -- public API ---------------------------------------------------------
 
@@ -278,6 +351,7 @@ class BoardOrchestrator:
         """
         task = self._tasks.get(card_id)
         if task is not None and not task.done():
+            self._cancel_requests.add(card_id)
             task.cancel()
             try:
                 await task
@@ -292,6 +366,146 @@ class BoardOrchestrator:
             return True
         card = self._store.get_card(card_id)
         if card is not None and card.status not in TERMINAL_STATUSES:
-            self._store.set_status(card_id, STATUS_CANCELLED, error="cancelled")
+            if card.claim_token:
+                self._store.finish_claim(
+                    card_id,
+                    card.claim_token,
+                    outcome="cancelled",
+                    error="cancelled",
+                    actor="user",
+                )
+            else:
+                self._store.set_status(
+                    card_id,
+                    STATUS_CANCELLED,
+                    error="cancelled",
+                    actor="user",
+                )
             return True
         return False
+
+    # -- durable dispatcher ------------------------------------------------
+
+    def wake_dispatcher(self) -> None:
+        self._dispatch_wake.set()
+
+    def assign_card(
+        self,
+        card_id: str,
+        profile: str,
+        *,
+        actor: str = "user",
+        expected_revision: int | None = None,
+    ):
+        """Validate an assignee against the primary profile directory."""
+        from flowly.profile import ensure_profile_bot_id, profile_exists, validate_profile_name
+
+        profile = (profile or "").strip()
+        try:
+            if profile != "default":
+                validate_profile_name(profile)
+        except ValueError as exc:
+            raise BoardError(str(exc)) from exc
+        if not profile_exists(profile):
+            raise BoardError(f"unknown bot: {profile!r}")
+        try:
+            descriptor = ensure_profile_bot_id(profile)
+        except (FileNotFoundError, ValueError) as exc:
+            raise BoardError(f"unknown bot: {profile!r}") from exc
+        card = self._store.assign_card(
+            card_id,
+            profile=profile,
+            bot_id=descriptor.bot_id,
+            actor=actor,
+            ready=True,
+            expected_revision=expected_revision,
+        )
+        self.wake_dispatcher()
+        return card
+
+    def unassign_card(
+        self,
+        card_id: str,
+        *,
+        actor: str = "user",
+        expected_revision: int | None = None,
+    ):
+        card = self._store.unassign_card(
+            card_id,
+            actor=actor,
+            expected_revision=expected_revision,
+        )
+        self.wake_dispatcher()
+        return card
+
+    def start_dispatcher(self) -> None:
+        if self._dispatcher_task is not None and not self._dispatcher_task.done():
+            return
+        self._stopping = False
+        self._dispatcher_task = asyncio.create_task(
+            self._dispatch_loop(),
+            name="board-dispatcher",
+        )
+
+    async def stop_dispatcher(self) -> None:
+        self._stopping = True
+        self._dispatch_wake.set()
+        if self._dispatcher_task is not None:
+            self._dispatcher_task.cancel()
+            await asyncio.gather(self._dispatcher_task, return_exceptions=True)
+            self._dispatcher_task = None
+        running = list(self._dispatch_tasks.values())
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+        self._dispatch_tasks.clear()
+
+    async def dispatch_once(self) -> int:
+        self._store.recover_expired_claims()
+        available = max(0, self.MAX_PARALLEL - len(self._dispatch_tasks))
+        if available == 0:
+            return 0
+        busy_profiles = {
+            card.assignee_profile
+            for card_id in self._dispatch_tasks
+            if (card := self._store.get_card(card_id)) is not None
+            and card.assignee_profile
+        }
+        started = 0
+        for card in self._store.list_dispatchable(
+            limit=available,
+            exclude_profiles=tuple(busy_profiles),
+        ):
+            if card.id in self._dispatch_tasks or self.is_running(card.id):
+                continue
+            task = asyncio.create_task(
+                self.run_card(card.id, deliver=False),
+                name=f"board-dispatch:{card.id}",
+            )
+            self._dispatch_tasks[card.id] = task
+
+            def _done(finished: asyncio.Task, *, card_id: str = card.id) -> None:
+                self._dispatch_tasks.pop(card_id, None)
+                if not finished.cancelled() and finished.exception() is not None:
+                    logger.error(
+                        "[board] dispatched card {} failed: {}",
+                        card_id,
+                        finished.exception(),
+                    )
+                self.wake_dispatcher()
+
+            task.add_done_callback(_done)
+            started += 1
+        return started
+
+    async def _dispatch_loop(self) -> None:
+        while not self._stopping:
+            self._dispatch_wake.clear()
+            await self.dispatch_once()
+            try:
+                await asyncio.wait_for(
+                    self._dispatch_wake.wait(),
+                    timeout=self.RECOVERY_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass

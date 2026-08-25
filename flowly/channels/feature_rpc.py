@@ -3691,9 +3691,7 @@ async def subagents_spawn(params: dict) -> dict:
 
 
 def board_snapshot() -> dict:
-    """The cross-channel task board as columns + counts (Todo / In Progress /
-    Waiting / Done). Read-only — same payload the gateway's HTTP `/api/board`
-    serves, now reachable over relay too.
+    """The shared task board as columns, counts, assignment, and run state.
 
     Wrapped as ``{"snapshot": <data>}`` to match the legacy gateway WS handler
     (`_ws_rpc_board_snapshot`) this method now shadows in FEATURE_METHODS — the
@@ -3705,9 +3703,7 @@ def board_snapshot() -> dict:
 
 
 async def board_action(params: dict) -> dict:
-    """Apply a board action (add / move / update / note / delete / clear / run /
-    cancel) over either transport. Shared single-writer store; ``run``/``cancel``
-    drive the agent's board orchestrator."""
+    """Apply a validated shared-board action over either transport."""
     from flowly.board.actions import apply_board_action
 
     store, orchestrator = _board()
@@ -3755,7 +3751,26 @@ def board_card(params: dict) -> dict:
             "model": rec.model,
             "toolTrace": list(rec.tool_trace or []),
         }
-    return {"card": card.to_dict(), "run": run}
+    attempts = [
+        {
+            "attempt": item["attempt"],
+            "status": item["status"],
+            "startedAt": item["startedAt"],
+            "completedAt": item["completedAt"],
+        }
+        for item in store.get_runs(card_id)
+    ]
+    activity = [
+        {"kind": item["kind"], "createdAt": item["createdAt"]}
+        for item in store.get_events(card_id)
+    ]
+    return {
+        "card": card.to_dict(),
+        "run": run,
+        "attempts": attempts,
+        "activity": activity,
+        "dependencies": store.get_dependencies(card_id),
+    }
 
 
 # ── Cron / scheduled jobs ──────────────────────────────────────────────────
@@ -4173,10 +4188,35 @@ def system_capabilities() -> dict:
     method itself, so its mere presence already signals a capable bot.
     """
     from flowly import __version__
+    from flowly.runtime_capabilities import resolve_runtime_capabilities
+
+    runtime = resolve_runtime_capabilities()
+    methods = [
+        method
+        for method in _DISPATCH
+        if not (
+            method.startswith("board.") and not runtime.owns_shared_board
+        )
+        and not (
+            method.startswith("flowlets.") and not runtime.owns_flowlets
+        )
+    ]
 
     return {
         "version": __version__,
-        "featureMethods": sorted(_DISPATCH),
+        "featureMethods": sorted(methods),
+        "runtime": {
+            "role": runtime.role.value,
+            "profile": runtime.profile_name,
+        },
+        **({
+            "board": {
+                "protocolVersion": 2,
+                "shared": True,
+                "assignment": True,
+                "durableRuns": True,
+            },
+        } if runtime.owns_shared_board else {}),
     }
 
 
