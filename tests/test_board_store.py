@@ -319,8 +319,23 @@ def test_live_claim_repairs_legacy_status_rewrite(store):
     claimed = store.claim_card(card.id, worker="research", lease_seconds=30)
     assert claimed is not None and claimed.claim_token
 
-    # Simulate a pre-lease runtime's startup recovery. It knows only the old
-    # status/run_id columns, so it leaves the authoritative claim intact.
+    # The database itself rejects a pre-lease runtime's startup reset. This is
+    # important during upgrades because that writer may be an older binary
+    # which cannot observe the new Python-side claim checks.
+    with pytest.raises(sqlite3.IntegrityError, match="active board claim"):
+        store._conn.execute(  # noqa: SLF001 - cross-version trigger regression
+            "UPDATE cards SET status = ?, run_id = NULL WHERE id = ?",
+            (STATUS_TODO, card.id),
+        )
+    store._conn.rollback()  # noqa: SLF001
+    protected = store.get_card(card.id)
+    assert protected is not None and protected.status == STATUS_IN_PROGRESS
+
+    # Keep the runtime repair path covered for a database that was corrupted
+    # before this trigger was installed.
+    store._conn.execute(  # noqa: SLF001
+        "DROP TRIGGER trg_cards_preserve_active_claim"
+    )
     store._conn.execute(  # noqa: SLF001 - cross-version recovery regression
         "UPDATE cards SET status = ?, run_id = NULL WHERE id = ?",
         (STATUS_TODO, card.id),
@@ -368,6 +383,9 @@ def test_recovery_restores_unexpired_claim_corrupted_by_legacy_writer(store):
     )
     claimed = store.claim_card(card.id, worker="research", lease_seconds=30)
     assert claimed is not None and claimed.claim_token
+    store._conn.execute(  # noqa: SLF001 - simulate a pre-trigger database
+        "DROP TRIGGER trg_cards_preserve_active_claim"
+    )
     store._conn.execute(  # noqa: SLF001
         "UPDATE cards SET status = ?, run_id = NULL WHERE id = ?",
         (STATUS_TODO, card.id),

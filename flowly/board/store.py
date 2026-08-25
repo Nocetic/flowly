@@ -236,6 +236,20 @@ CREATE INDEX IF NOT EXISTS idx_cards_assignee ON cards(assignee_profile);
 CREATE INDEX IF NOT EXISTS idx_cards_dispatch ON cards(status, scheduled_at, priority);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_idempotency
     ON cards(idempotency_key) WHERE idempotency_key <> '';
+
+-- Cross-version safety: an older primary runtime knows only status/run_id and
+-- may try to reset a live leased card to todo during startup.  Active claim
+-- ownership is authoritative.  Legitimate completion/recovery clears the
+-- token in the same UPDATE, so those transitions remain allowed.
+CREATE TRIGGER IF NOT EXISTS trg_cards_preserve_active_claim
+BEFORE UPDATE OF status ON cards
+FOR EACH ROW
+WHEN OLD.claim_token IS NOT NULL
+    AND NEW.claim_token = OLD.claim_token
+    AND NEW.status <> 'in_progress'
+BEGIN
+    SELECT RAISE(ROLLBACK, 'active board claim must be finished by its token owner');
+END;
 """
 
 _CARD_COLUMNS = (
