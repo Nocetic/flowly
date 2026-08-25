@@ -92,6 +92,10 @@ from flowly.agent.reply_media import extract_reply_media, extract_reply_media_as
 from flowly.media.assets import ASSETS_META_KEY, assets_to_meta
 from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
+from flowly.runtime_capabilities import (
+    RuntimeCapabilities,
+    resolve_runtime_capabilities,
+)
 
 
 def resolve_capability_disabled_tools(
@@ -881,6 +885,7 @@ class AgentLoop:
         state_dir: Path | None = None,
         main_config: Any | None = None,
         goal_provider: LLMProvider | None = None,
+        runtime_capabilities: RuntimeCapabilities | None = None,
     ):
         self.bus = bus
         self.provider = provider
@@ -1020,6 +1025,9 @@ class AgentLoop:
         # Memory search config
         self._memory_search_config = memory_search_config or MemorySearchConfig()
         self._main_config = main_config
+        self.runtime_capabilities = (
+            runtime_capabilities or resolve_runtime_capabilities()
+        )
         self._memory_manager: Any | None = None  # lazy-initialized
 
         # Local semantic routing is a separate derived index over static tool
@@ -2490,15 +2498,18 @@ class AgentLoop:
         else:
             self._artifact_store = None
 
-        # Flowlet tool — agent-generated dynamic screens (enabled by default).
-        try:
-            from flowly.agent.tools.flowlet import FlowletTool
-            from flowly.flowlets.store import get_store as get_flowlet_store
-            self._flowlet_store = get_flowlet_store(self._state_dir)
-            self.tools.register(FlowletTool(store=self._flowlet_store))
-        except Exception as exc:  # noqa: BLE001 — never block agent startup
-            logger.debug("Flowlet tool unavailable: {}", exc)
-            self._flowlet_store = None
+        # Flowlets belong to the installation's primary runtime. Named profile
+        # homes remain isolated agent state and must never create a parallel
+        # mini-app store or background source/watch loop.
+        self._flowlet_store = None
+        if self.runtime_capabilities.owns_flowlets:
+            try:
+                from flowly.agent.tools.flowlet import FlowletTool
+                from flowly.flowlets.store import get_store as get_flowlet_store
+                self._flowlet_store = get_flowlet_store(self._state_dir)
+                self.tools.register(FlowletTool(store=self._flowlet_store))
+            except Exception as exc:  # noqa: BLE001 — never block agent startup
+                logger.debug("Flowlet tool unavailable: {}", exc)
 
         # Plan tool — general, session-level plan mode (always available).
         # The proposing turn blocks on the user's approval; steps then sync to
@@ -2592,88 +2603,85 @@ class AgentLoop:
         from flowly.agent.tools.knowledge_graph import KnowledgeGraphTool
         self.tools.register(KnowledgeGraphTool(state_dir=self._state_dir))
 
-        # Board — cross-channel task board. Lives at a profile-aware shared
-        # location (``get_flowly_home()/board.db``) so it's the same board
-        # across every session/channel and respects FLOWLY_PROFILE isolation.
-        try:
-            from flowly.profile import get_flowly_home as _get_flowly_home_board
-            from flowly.board.store import BoardStore
-            from flowly.board.orchestrator import BoardOrchestrator
-            from flowly.agent.tools.board import build_board_tools
-            from flowly.bus.events import InboundMessage as _BoardInbound
-
-            self._board_store = BoardStore(_get_flowly_home_board() / "board.db")
-
-            async def _board_spawn(task, *, label=None, origin_channel="",
-                                   origin_chat_id="", model=None):
-                # Run a full agent turn on the card text and return its result.
-                # wait=True executes inline and returns the child's final text;
-                # silent=True suppresses the per-child parent announce (the
-                # orchestrator sends ONE consolidated notify instead).
-                result = await self.subagents.spawn(
-                    task=task,
-                    label=label,
-                    origin_channel=origin_channel or "board",
-                    origin_chat_id=origin_chat_id or "board",
-                    model=model,
-                    wait=True,
-                    silent=True,
-                )
-                # Link the finished run to the card (label == card.id) so the
-                # task-detail/audit view can surface its tool_trace + timing.
-                # Best-effort: a missing card or registry never affects the run.
-                try:
-                    if label:
-                        rec = self.subagents.registry.latest_by_label(label)
-                        if rec is not None:
-                            self._board_store.set_run_id(label, rec.run_id)
-                except Exception:
-                    pass
-                return result
-
-            async def _board_notify(channel: str, chat_id: str, text: str) -> None:
-                # Wake the agent (relay turn) to deliver the finished result:
-                # the result re-enters as a system message, the agent replies
-                # to the user naturally and in context (persona, conversation).
-                # Its reply then reaches the right surface — Telegram/etc via
-                # their adapter, TUI/desktop via the gateway's local push (see
-                # _process_system_message). Same pattern as subagent announces.
-                if not channel or channel == "board":
-                    return
-                session_key = f"{channel}:{chat_id}"
-                await self.bus.publish_inbound(_BoardInbound(
-                    channel="system",
-                    sender_id="board",
-                    chat_id=session_key,
-                    content=text,
-                ))
-
-            async def _board_on_finished(card, outcome: str) -> None:
-                # APNs/FCM wake when a board card hits a terminal state, so a
-                # UI-run task's result reaches the phone even when the app is
-                # closed. No-op when no device registered push (e.g. relay-only
-                # users without the anonymous push path). Banner-only (no chat).
-                from flowly.push.board_push import notify_board_finished
-
-                await notify_board_finished(card, outcome)
-
-            self._board_orchestrator = BoardOrchestrator(
-                self._board_store, _board_spawn,
-                notify=_board_notify, on_finished=_board_on_finished, model=self.model,
-            )
-            # Crash recovery: reset cards left 'in_progress' by a prior run
-            # whose worker is gone (in-process tasks don't survive a restart).
+        # The shared Board is owned by the primary runtime. Named profiles act
+        # as scoped workers through the authenticated profile broker; opening
+        # their own profile-local database would silently fork the board.
+        self._board_store = None
+        self._board_orchestrator = None
+        if self.runtime_capabilities.owns_shared_board:
             try:
-                self._board_store.reset_orphaned(live_run_ids=set())
-            except Exception as exc:  # pragma: no cover
-                logger.warning(f"[board] crash recovery skipped: {exc}")
+                from flowly.profile import get_flowly_home as _get_flowly_home_board
+                from flowly.board.store import BoardStore
+                from flowly.board.orchestrator import BoardOrchestrator
+                from flowly.agent.tools.board import build_board_tools
+                from flowly.bus.events import InboundMessage as _BoardInbound
 
-            for _board_tool in build_board_tools(self._board_store, self._board_orchestrator):
-                self.tools.register(_board_tool)
-        except Exception as exc:  # pragma: no cover - never block boot on board
-            self._board_store = None
-            self._board_orchestrator = None
-            logger.warning(f"[board] tools unavailable: {exc}")
+                self._board_store = BoardStore(_get_flowly_home_board() / "board.db")
+
+                async def _board_spawn(task, *, label=None, origin_channel="",
+                                       origin_chat_id="", model=None):
+                    # Run a full agent turn on the card text and return its
+                    # result. wait=True executes inline; silent=True suppresses
+                    # the per-child parent announce because the orchestrator
+                    # sends one consolidated notification.
+                    result = await self.subagents.spawn(
+                        task=task,
+                        label=label,
+                        origin_channel=origin_channel or "board",
+                        origin_chat_id=origin_chat_id or "board",
+                        model=model,
+                        wait=True,
+                        silent=True,
+                    )
+                    # Link the finished run to the card so the detail view can
+                    # surface its tool trace and timing. This remains best
+                    # effort: audit linking never changes the task outcome.
+                    try:
+                        if label:
+                            rec = self.subagents.registry.latest_by_label(label)
+                            if rec is not None:
+                                self._board_store.set_run_id(label, rec.run_id)
+                    except Exception:
+                        pass
+                    return result
+
+                async def _board_notify(channel: str, chat_id: str, text: str) -> None:
+                    # Re-enter the result as a system message so delivery keeps
+                    # the originating conversation's persona and transport.
+                    if not channel or channel == "board":
+                        return
+                    session_key = f"{channel}:{chat_id}"
+                    await self.bus.publish_inbound(_BoardInbound(
+                        channel="system",
+                        sender_id="board",
+                        chat_id=session_key,
+                        content=text,
+                    ))
+
+                async def _board_on_finished(card, outcome: str) -> None:
+                    # Wake registered mobile clients when a card reaches a
+                    # terminal state. This is a banner event, not a chat write.
+                    from flowly.push.board_push import notify_board_finished
+
+                    await notify_board_finished(card, outcome)
+
+                self._board_orchestrator = BoardOrchestrator(
+                    self._board_store, _board_spawn,
+                    notify=_board_notify, on_finished=_board_on_finished, model=self.model,
+                )
+                # In-process tasks do not survive a restart, so recover cards
+                # left running by a previous primary runtime.
+                try:
+                    self._board_store.reset_orphaned(live_run_ids=set())
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"[board] crash recovery skipped: {exc}")
+
+                for _board_tool in build_board_tools(self._board_store, self._board_orchestrator):
+                    self.tools.register(_board_tool)
+            except Exception as exc:  # pragma: no cover - never block boot on board
+                self._board_store = None
+                self._board_orchestrator = None
+                logger.warning(f"[board] tools unavailable: {exc}")
 
         # MCP servers — discovered in a BACKGROUND thread so a slow or
         # unreachable server (e.g. one awaiting an OAuth login, or a dead

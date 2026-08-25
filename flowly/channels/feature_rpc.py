@@ -4438,6 +4438,11 @@ _DISPATCH: dict[str, tuple] = {
 #: Every method this module serves. Transports gate on membership.
 FEATURE_METHODS = frozenset(_DISPATCH)
 
+# These surfaces are installation-wide and are owned exclusively by the
+# primary/default runtime. Named profile processes consume scoped task work
+# through the profile broker; they never expose a second Board or Flowlet API.
+_PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.")
+
 # These methods may legitimately wait for a human/browser or a slow server.
 # WebSocket transports dispatch them in tracked background tasks so their
 # receive loops keep processing control frames, pings, and unrelated RPCs.
@@ -4466,6 +4471,20 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
     entry = _DISPATCH.get(method)
     if entry is None:
         raise FeatureRpcError("UNKNOWN_METHOD", f"unknown feature method: {method}")
+    if method.startswith(_PRIMARY_RUNTIME_METHOD_PREFIXES):
+        from flowly.runtime_capabilities import resolve_runtime_capabilities
+
+        capabilities = resolve_runtime_capabilities()
+        owns_surface = (
+            capabilities.owns_shared_board
+            if method.startswith("board.")
+            else capabilities.owns_flowlets
+        )
+        if not owns_surface:
+            raise FeatureRpcError(
+                "UNAVAILABLE",
+                "This feature is owned by the primary Flowly runtime.",
+            )
     fn, wants_params, restart = entry
     result = fn(params) if wants_params else fn()
     if _inspect.isawaitable(result):

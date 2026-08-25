@@ -1914,34 +1914,41 @@ Respond to the user now:"""
 
     try:
         from flowly.channels import feature_rpc as _frpc_flowlet
-        _frpc_flowlet.set_flowlet_broadcast(_broadcast_flowlet)
-        _frpc_flowlet.set_flowlet_agent_runner(_flowlet_agent_runner)
         _flowlet_tool = agent.tools.get("flowlet")
-        if _flowlet_tool and hasattr(_flowlet_tool, "set_on_change"):
-            _flowlet_tool.set_on_change(_broadcast_flowlet)
+        if _flowlet_tool is None:
+            # Setter state is process-global. Clear it explicitly so tests and
+            # embedded runtimes cannot inherit callbacks from an earlier
+            # primary AgentLoop in the same interpreter.
+            _frpc_flowlet.set_flowlet_broadcast(None)
+            _frpc_flowlet.set_flowlet_agent_runner(None)
+            _frpc_flowlet.set_flowlet_watch_hook(None)
+            _frpc_flowlet.set_flowlet_refresh_hook(None)
+            _frpc_flowlet.set_flowlet_vision_runner(None)
+        else:
+            _frpc_flowlet.set_flowlet_broadcast(_broadcast_flowlet)
+            _frpc_flowlet.set_flowlet_agent_runner(_flowlet_agent_runner)
+            if hasattr(_flowlet_tool, "set_on_change"):
+                _flowlet_tool.set_on_change(_broadcast_flowlet)
 
-        # Build the watch engine on the tool's store (falls back to the shared
-        # singleton) and wire the immediate-eval hooks on both mutation paths:
-        # client taps (feature_rpc) and agent-driven state changes (the tool).
-        from flowly.flowlets.store import get_store as _get_flowlet_store
-        from flowly.flowlets.watches import WatchEngine
-        _fl_store = getattr(_flowlet_tool, "_store", None) or _get_flowlet_store()
-        _watch_engine = WatchEngine(
-            _fl_store, notify=_watch_notify, agent_runner=_flowlet_agent_runner,
-        )
-        _frpc_flowlet.set_flowlet_watch_hook(_watch_hook)
-        if _flowlet_tool and hasattr(_flowlet_tool, "set_watch_hook"):
-            _flowlet_tool.set_watch_hook(_watch_hook)
+            # Build the engines on the tool's primary-runtime store. Named
+            # profile runtimes never import or open the shared Flowlet store.
+            from flowly.flowlets.watches import WatchEngine
+            _fl_store = getattr(_flowlet_tool, "_store")
+            _watch_engine = WatchEngine(
+                _fl_store, notify=_watch_notify, agent_runner=_flowlet_agent_runner,
+            )
+            _frpc_flowlet.set_flowlet_watch_hook(_watch_hook)
+            if hasattr(_flowlet_tool, "set_watch_hook"):
+                _flowlet_tool.set_watch_hook(_watch_hook)
 
-        # Live data sources — same store; refreshed on a slower heartbeat and on
-        # demand (screen open / pull-to-refresh via feature_rpc).
-        from flowly.flowlets.sources import SourceEngine
-        _source_engine = SourceEngine(
-            _fl_store, broadcast=_broadcast_flowlet, agent_runner=_flowlet_source_runner,
-        )
-        _frpc_flowlet.set_flowlet_refresh_hook(_flowlet_refresh)
-        # Photo capture → vision turn (same isolated-session pattern as sources).
-        _frpc_flowlet.set_flowlet_vision_runner(_flowlet_vision_runner)
+            from flowly.flowlets.sources import SourceEngine
+            _source_engine = SourceEngine(
+                _fl_store,
+                broadcast=_broadcast_flowlet,
+                agent_runner=_flowlet_source_runner,
+            )
+            _frpc_flowlet.set_flowlet_refresh_hook(_flowlet_refresh)
+            _frpc_flowlet.set_flowlet_vision_runner(_flowlet_vision_runner)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Flowlet wiring skipped: {}", exc)
 
