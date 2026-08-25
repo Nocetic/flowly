@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from flowly.board.store import STATUS_DONE, STATUS_IN_PROGRESS, BoardStore
+from flowly.channels import feature_rpc
 from flowly.gateway.server import GatewayServer
 
 
@@ -195,16 +196,15 @@ async def test_action_cancel_calls_subagent_manager(store):
 
 @pytest.mark.asyncio
 async def test_action_run_invokes_orchestrator(store):
-    import asyncio
-
     card = store.add_card("do it")
 
     class _Orch:
         def __init__(self):
             self.ran = []
 
-        async def run_card(self, card_id, *, deliver=True):
+        def start_card(self, card_id, *, deliver=True):
             self.ran.append(card_id)
+            return store.get_card(card_id)
 
     orch = _Orch()
     server = _server(store)
@@ -213,7 +213,6 @@ async def test_action_run_invokes_orchestrator(store):
     resp = await server._handle_board_action(_Req({"action": "run", "cardId": card.id}))
     data = _body(resp)
     assert data["ok"] is True and data["status"] == "started"
-    await asyncio.sleep(0)  # let the backgrounded run_card execute
     assert orch.ran == [card.id]
 
 
@@ -223,6 +222,50 @@ async def test_action_run_without_orchestrator(store):
     card = store.add_card("x")
     resp = await server._handle_board_action(_Req({"action": "run", "cardId": card.id}))
     assert resp.status == 400
+
+
+def test_board_card_uses_private_named_worker_audit(store, monkeypatch):
+    card = store.add_card(
+        "named task",
+        status="ready",
+        assignee_profile="writer",
+        assignee_bot_id="bot-writer",
+    )
+    claimed = store.claim_card(card.id, worker="writer", lease_seconds=30)
+    assert claimed is not None and claimed.claim_token
+    assert store.set_worker_run_id(card.id, claimed.claim_token, "profile-run-1")
+
+    monkeypatch.setattr(feature_rpc, "_board_provider", lambda: (store, None))
+    monkeypatch.setattr(feature_rpc, "_registry_provider", lambda: None)
+    monkeypatch.setattr(
+        feature_rpc,
+        "_board_worker_audit_provider",
+        lambda profile, run_id: {
+            "runId": run_id,
+            "startedAt": 1,
+            "endedAt": None,
+            "outcome": None,
+            "error": None,
+            "model": "model-1",
+            "toolTrace": [{"tool": "read_file", "status": "running"}],
+        }
+        if (profile, run_id) == ("writer", "profile-run-1")
+        else None,
+    )
+
+    detail = feature_rpc.board_card({"cardId": card.id})
+
+    assert detail["run"]["runId"] == "profile-run-1"
+    assert detail["run"]["toolTrace"] == [
+        {"tool": "read_file", "status": "running"}
+    ]
+    assert detail["attempts"] == [{
+        "attempt": 1,
+        "status": "running",
+        "startedAt": detail["attempts"][0]["startedAt"],
+        "completedAt": None,
+    }]
+    assert "workerRunId" not in detail["attempts"][0]
 
 
 @pytest.mark.asyncio

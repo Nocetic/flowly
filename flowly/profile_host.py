@@ -52,6 +52,7 @@ from flowly.profile_host_contract import (
 ProfileEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 PrimaryRpcCallback = Callable[[str, dict[str, Any], float], Awaitable[Any]]
 PrimaryEventLeaseCallback = Callable[[bool], None]
+TaskStartedCallback = Callable[[str], Awaitable[None] | None]
 
 _READY_PREFIX = "FLOWLY_LOCAL_RUNTIME_READY "
 _START_TIMEOUT_SECONDS = 90
@@ -239,6 +240,11 @@ class ProfileHost:
         self._broker_target_locks: dict[str, asyncio.Lock] = {}
         self._task_target_locks: dict[str, asyncio.Lock] = {}
         self._broker_sessions: dict[tuple[str, str], str] = {}
+        # Private, bounded audit state for hidden Board worker turns.  These
+        # events never enter public profile streams or session lists; the
+        # primary Board may query a sanitized projection by opaque run id.
+        self._task_audits: dict[tuple[str, str], dict[str, Any]] = {}
+        self._task_audit_sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._capacity_lock = asyncio.Lock()
         self._closed = False
@@ -598,6 +604,7 @@ class ProfileHost:
         prompt: str,
         idempotency_key: str,
         timeout: float = 1800.0,
+        on_started: TaskStartedCallback | None = None,
     ) -> dict[str, Any]:
         """Run one dispatcher-owned task in a hidden named-profile session.
 
@@ -644,6 +651,20 @@ class ProfileHost:
 
         async with self._task_target_locks.setdefault(name, asyncio.Lock()):
             self._broker_sessions[(name, session_key)] = correlation_id
+            try:
+                model = str(_public_settings(name).get("model") or "") or None
+            except Exception:
+                model = None
+            audit: dict[str, Any] = {
+                "runId": "",
+                "startedAt": time.time(),
+                "endedAt": None,
+                "outcome": None,
+                "error": None,
+                "model": model,
+                "toolTrace": [],
+            }
+            self._task_audit_sessions[(name, session_key)] = audit
             run_id = ""
             try:
                 accepted = await self._target_rpc(name, "chat.send", {
@@ -663,6 +684,25 @@ class ProfileHost:
                         "The assigned bot did not accept the task.",
                         retryable=True,
                     )
+                audit["runId"] = run_id
+                self._task_audits[(name, run_id)] = audit
+                while len(self._task_audits) > 256:
+                    self._task_audits.pop(next(iter(self._task_audits)))
+                if on_started is not None:
+                    try:
+                        started_result = on_started(run_id)
+                        if asyncio.iscoroutine(started_result):
+                            await started_result
+                    except Exception as exc:
+                        # Audit linkage is best-effort and must never abort an
+                        # already accepted worker turn. The completion path
+                        # performs the same link again as a fallback.
+                        logger.warning(
+                            "Could not link Board task {} to worker run {}: {}",
+                            task_id,
+                            run_id,
+                            exc,
+                        )
                 key = (name, run_id)
                 terminal = self._terminal_events.pop(key, None)
                 if terminal is None:
@@ -696,6 +736,22 @@ class ProfileHost:
                 raise
             finally:
                 self._broker_sessions.pop((name, session_key), None)
+                self._task_audit_sessions.pop((name, session_key), None)
+
+    def task_audit(self, profile: str, run_id: str) -> dict[str, Any] | None:
+        """Return the content-free audit projection for one hidden Board run."""
+        audit = self._task_audits.get((profile, run_id))
+        if audit is None:
+            return None
+        return {
+            "runId": audit.get("runId"),
+            "startedAt": audit.get("startedAt"),
+            "endedAt": audit.get("endedAt"),
+            "outcome": audit.get("outcome"),
+            "error": audit.get("error"),
+            "model": audit.get("model"),
+            "toolTrace": [dict(item) for item in audit.get("toolTrace", [])],
+        }
 
     async def shutdown(self) -> None:
         if self._closed:
@@ -714,6 +770,8 @@ class ProfileHost:
                 ))
         self._broker_waiters.clear()
         self._broker_sessions.clear()
+        self._task_audits.clear()
+        self._task_audit_sessions.clear()
         self._default_event_leases.clear()
         if self._primary_event_lease is not None:
             self._primary_event_lease(False)
@@ -1118,6 +1176,10 @@ class ProfileHost:
     ) -> None:
         payload = data if isinstance(data, dict) else {}
         run_id = str(payload.get("runId") or "")
+        session_key = str(payload.get("sessionKey") or "")
+        internal_turn = bool(self._broker_sessions.get((profile, session_key)))
+        if internal_turn:
+            self._capture_task_audit_event(profile, session_key, event, payload)
         if runtime is not None and event == "agent" and run_id:
             runtime.active_runs.add(run_id)
         if event == "chat" and run_id:
@@ -1126,7 +1188,6 @@ class ProfileHost:
                     runtime.active_runs.discard(run_id)
                 key = (profile, run_id)
                 waiter = self._broker_waiters.get(key)
-                session_key = str(payload.get("sessionKey") or "")
                 if waiter is not None or (profile, session_key) in self._broker_sessions:
                     self._terminal_events[key] = payload
                     if len(self._terminal_events) > 256:
@@ -1143,8 +1204,6 @@ class ProfileHost:
                 runtime.active_runs.add(run_id)
         if runtime is not None:
             runtime.last_used_at = time.time()
-        session_key = str(payload.get("sessionKey") or "")
-        internal_turn = bool(self._broker_sessions.get((profile, session_key)))
         if event == "exec.approval.requested" and payload.get("id"):
             if internal_turn:
                 self._spawn_background(self._resolve_internal_prompt(
@@ -1172,6 +1231,59 @@ class ProfileHost:
         # durable task state and completion notification instead.
         if not internal_turn:
             await self._emit(profile, event, payload)
+
+    def _capture_task_audit_event(
+        self,
+        profile: str,
+        session_key: str,
+        event: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Accumulate sanitized lifecycle metadata for a hidden Board turn."""
+        audit = self._task_audit_sessions.get((profile, session_key))
+        if audit is None:
+            return
+        if event == "chat" and payload.get("state") in ("final", "aborted", "error"):
+            state = str(payload.get("state") or "error")
+            audit["endedAt"] = time.time()
+            audit["outcome"] = "ok" if state == "final" else state
+            if state != "final":
+                audit["error"] = "The assigned agent run ended before completion."
+            return
+        if event not in ("tool.start", "tool.complete"):
+            return
+        tool_call_id = str(payload.get("toolCallId") or "")
+        trace = audit.setdefault("toolTrace", [])
+        if event == "tool.start":
+            args = payload.get("args")
+            try:
+                args_bytes = len(json.dumps(args, separators=(",", ":")).encode())
+            except (TypeError, ValueError):
+                args_bytes = None
+            trace.append({
+                "id": tool_call_id,
+                "tool": str(payload.get("name") or "") or None,
+                "args_bytes": args_bytes,
+                "status": "running",
+                "duration_ms": None,
+            })
+            if len(trace) > 256:
+                del trace[:-256]
+            return
+        entry = next(
+            (item for item in reversed(trace) if item.get("id") == tool_call_id),
+            None,
+        )
+        if entry is None:
+            entry = {
+                "id": tool_call_id,
+                "tool": str(payload.get("name") or "") or None,
+                "args_bytes": None,
+            }
+            trace.append(entry)
+        entry["status"] = "ok" if payload.get("success") else "error"
+        duration = payload.get("durationMs")
+        entry["duration_ms"] = duration if isinstance(duration, int) else None
 
     def _spawn_background(self, coroutine: Awaitable[Any], *, name: str) -> None:
         task = asyncio.create_task(coroutine, name=name)

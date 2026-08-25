@@ -29,6 +29,9 @@ from flowly.board.store import (
     STATUS_CANCELLED,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
+    STATUS_READY,
+    STATUS_TODO,
+    STATUS_WAITING,
     TERMINAL_STATUSES,
     BoardError,
     BoardStore,
@@ -81,6 +84,10 @@ class BoardOrchestrator:
         self._sem = asyncio.Semaphore(self.MAX_PARALLEL)
         # card_id -> the asyncio task running its spawn (for cancellation)
         self._tasks: dict[str, asyncio.Task] = {}
+        # Explicit UI runs are reserved before their coroutine is scheduled.
+        # Without this tiny handshake two fast Run clicks both received
+        # "started" while neither task had reached ``claim_card`` yet.
+        self._manual_tasks: dict[str, asyncio.Task] = {}
         self._profile_semaphores: dict[str, asyncio.Semaphore] = {}
         self._cancel_requests: set[str] = set()
         self._dispatch_tasks: dict[str, asyncio.Task] = {}
@@ -140,7 +147,12 @@ class BoardOrchestrator:
 
     # -- core execution -----------------------------------------------------
 
-    async def _execute(self, card_id: str) -> tuple[str, Optional[str]]:
+    async def _execute(
+        self,
+        card_id: str,
+        *,
+        ignore_schedule: bool = False,
+    ) -> tuple[str, Optional[str]]:
         """Run one card to a terminal state. Returns (outcome, payload).
 
         outcome ∈ {"done", "failed", "cancelled"}. The orchestrator is the
@@ -160,6 +172,7 @@ class BoardOrchestrator:
                     card_id,
                     worker=worker,
                     lease_seconds=self.LEASE_SECONDS,
+                    ignore_schedule=ignore_schedule,
                 )
                 if claimed is None or not claimed.claim_token:
                     return ("failed", "card is not eligible to run")
@@ -225,7 +238,62 @@ class BoardOrchestrator:
 
     # -- public API ---------------------------------------------------------
 
-    async def run_card(self, card_id: str, *, deliver: bool = True) -> dict[str, Any]:
+    def _validate_run(self, card_id: str) -> Any:
+        card = self._store.get_card(card_id)
+        if card is None:
+            raise BoardError(f"card not found: {card_id!r}")
+        dispatch_task = self._dispatch_tasks.get(card_id)
+        if (
+            card.claim_token
+            or self.is_running(card_id)
+            or card_id in self._manual_tasks
+            or (dispatch_task is not None and not dispatch_task.done())
+        ):
+            raise BoardError(f"card already running: {card_id!r}")
+        if card.status in TERMINAL_STATUSES:
+            raise BoardError(f"card is {card.status}, nothing to run")
+        if card.status not in {STATUS_TODO, STATUS_READY, STATUS_WAITING}:
+            raise BoardError(f"card is {card.status}, not eligible to run")
+        return card
+
+    def start_card(self, card_id: str, *, deliver: bool = False) -> Any:
+        """Reserve and start an explicit UI run, returning only if accepted.
+
+        The old action handler returned ``started`` before the coroutine had
+        checked the card.  A stale claim or a double click therefore failed
+        only in a background log.  Reserving synchronously restores the
+        original Board contract: success means this process accepted exactly
+        one run; validation errors reach the caller immediately.
+        """
+        card = self._validate_run(card_id)
+
+        async def _run() -> dict[str, Any]:
+            return await self.run_card(
+                card_id,
+                deliver=deliver,
+                ignore_schedule=True,
+                _prevalidated=True,
+            )
+
+        task = asyncio.create_task(_run(), name=f"board-manual:{card_id}")
+        self._manual_tasks[card_id] = task
+
+        def _done(finished: asyncio.Task) -> None:
+            self._manual_tasks.pop(card_id, None)
+            if not finished.cancelled() and finished.exception() is not None:
+                logger.error("[board] explicit card {} failed: {}", card_id, finished.exception())
+
+        task.add_done_callback(_done)
+        return card
+
+    async def run_card(
+        self,
+        card_id: str,
+        *,
+        deliver: bool = True,
+        ignore_schedule: bool = False,
+        _prevalidated: bool = False,
+    ) -> dict[str, Any]:
         """Run a single existing card sequentially.
 
         ``deliver=True`` (the default, used by async/desktop-initiated runs)
@@ -235,15 +303,11 @@ class BoardOrchestrator:
         the agent incorporates it in the same turn (no second turn, no
         "please don't call tools" prompt).
         """
-        card = self._store.get_card(card_id)
+        card = self._store.get_card(card_id) if _prevalidated else self._validate_run(card_id)
         if card is None:
             raise BoardError(f"card not found: {card_id!r}")
-        if self.is_running(card_id):
-            raise BoardError(f"card already running: {card_id!r}")
-        if card.status in TERMINAL_STATUSES:
-            raise BoardError(f"card is {card.status}, nothing to run")
 
-        outcome, payload = await self._execute(card_id)
+        outcome, payload = await self._execute(card_id, ignore_schedule=ignore_schedule)
         card = self._store.get_card(card_id)
         title = card.title if card else card_id
         # Out-of-band finish hook (push, etc.) — fires regardless of deliver, so
@@ -349,7 +413,7 @@ class BoardOrchestrator:
         card is written to ``cancelled`` before this returns — callers (e.g.
         the gateway) can then read back an accurate status immediately.
         """
-        task = self._tasks.get(card_id)
+        task = self._manual_tasks.get(card_id) or self._tasks.get(card_id)
         if task is not None and not task.done():
             self._cancel_requests.add(card_id)
             task.cancel()
@@ -417,10 +481,12 @@ class BoardOrchestrator:
             profile=profile,
             bot_id=descriptor.bot_id,
             actor=actor,
-            ready=True,
+            # Assignment is metadata, not consent to execute.  Keep the
+            # existing Board UX: a newly assigned card remains in Backlog
+            # until the user explicitly presses Run or moves it to Ready.
+            ready=False,
             expected_revision=expected_revision,
         )
-        self.wake_dispatcher()
         return card
 
     def unassign_card(
@@ -459,6 +525,11 @@ class BoardOrchestrator:
             task.cancel()
         await asyncio.gather(*running, return_exceptions=True)
         self._dispatch_tasks.clear()
+        manual = list(self._manual_tasks.values())
+        for task in manual:
+            task.cancel()
+        await asyncio.gather(*manual, return_exceptions=True)
+        self._manual_tasks.clear()
 
     async def dispatch_once(self) -> int:
         self._store.recover_expired_claims()
@@ -476,10 +547,14 @@ class BoardOrchestrator:
             limit=available,
             exclude_profiles=tuple(busy_profiles),
         ):
-            if card.id in self._dispatch_tasks or self.is_running(card.id):
+            if (
+                card.id in self._dispatch_tasks
+                or card.id in self._manual_tasks
+                or self.is_running(card.id)
+            ):
                 continue
             task = asyncio.create_task(
-                self.run_card(card.id, deliver=False),
+                self.run_card(card.id, deliver=False, _prevalidated=True),
                 name=f"board-dispatch:{card.id}",
             )
             self._dispatch_tasks[card.id] = task

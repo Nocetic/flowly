@@ -735,7 +735,7 @@ class BoardStore:
         profile: str,
         bot_id: str,
         actor: str = "user",
-        ready: bool = True,
+        ready: bool = False,
         expected_revision: int | None = None,
     ) -> Card:
         """Assign a card using both route identity and rename-safe bot id."""
@@ -748,7 +748,7 @@ class BoardStore:
             existing = self._get_card_locked(card_id)
             if existing is None:
                 raise BoardError(f"card not found: {card_id!r}")
-            if existing.status == STATUS_IN_PROGRESS:
+            if existing.claim_token or existing.status == STATUS_IN_PROGRESS:
                 raise BoardError("a running card cannot be reassigned")
             if expected_revision is not None and existing.revision != expected_revision:
                 raise BoardError("card changed; refresh and try again")
@@ -791,7 +791,7 @@ class BoardStore:
             existing = self._get_card_locked(card_id)
             if existing is None:
                 raise BoardError(f"card not found: {card_id!r}")
-            if existing.status == STATUS_IN_PROGRESS:
+            if existing.claim_token or existing.status == STATUS_IN_PROGRESS:
                 raise BoardError("a running card cannot be unassigned")
             if expected_revision is not None and existing.revision != expected_revision:
                 raise BoardError("card changed; refresh and try again")
@@ -857,6 +857,7 @@ class BoardStore:
         *,
         worker: str,
         lease_seconds: float = 60.0,
+        ignore_schedule: bool = False,
     ) -> Card | None:
         """Atomically claim an eligible card and open an auditable run."""
         worker = (worker or "").strip()
@@ -872,9 +873,15 @@ class BoardStore:
             existing = self._get_card_locked(card_id)
             if existing is None:
                 raise BoardError(f"card not found: {card_id!r}")
+            if existing.claim_token:
+                return None
             if existing.status not in {STATUS_TODO, STATUS_READY, STATUS_WAITING}:
                 return None
-            if existing.scheduled_at is not None and existing.scheduled_at > now:
+            if (
+                not ignore_schedule
+                and existing.scheduled_at is not None
+                and existing.scheduled_at > now
+            ):
                 return None
             blocked_parent = self._conn.execute(
                 "SELECT 1 FROM card_links l JOIN cards p ON p.id = l.parent_id "
@@ -888,7 +895,8 @@ class BoardStore:
                 "UPDATE cards SET status = ?, run_id = ?, claim_token = ?, "
                 "lease_expires_at = ?, heartbeat_at = ?, attempt_count = ?, "
                 "updated_at = ?, revision = revision + 1 "
-                "WHERE id = ? AND revision = ? AND status = ?",
+                "WHERE id = ? AND revision = ? AND status = ? "
+                "AND claim_token IS NULL",
                 (
                     STATUS_IN_PROGRESS,
                     run_id,
@@ -929,19 +937,32 @@ class BoardStore:
     ) -> bool:
         now = time.time()
         with self._lock:
+            existing = self._get_card_locked(card_id)
+            if existing is None or existing.claim_token != claim_token:
+                return False
+            repaired = existing.status != STATUS_IN_PROGRESS
             cur = self._conn.execute(
-                "UPDATE cards SET heartbeat_at = ?, lease_expires_at = ?, "
-                "updated_at = ? WHERE id = ? AND claim_token = ? "
-                "AND status = ?",
+                "UPDATE cards SET status = ?, heartbeat_at = ?, lease_expires_at = ?, "
+                "updated_at = ?, revision = revision + ? "
+                "WHERE id = ? AND claim_token = ?",
                 (
+                    STATUS_IN_PROGRESS,
                     now,
                     now + float(lease_seconds),
                     now,
+                    1 if repaired else 0,
                     card_id,
                     claim_token,
-                    STATUS_IN_PROGRESS,
                 ),
             )
+            if repaired and cur.rowcount == 1:
+                self._record_event_locked(
+                    card_id,
+                    "claim_state_repaired",
+                    "worker",
+                    {"from": existing.status, "to": STATUS_IN_PROGRESS},
+                    now=now,
+                )
             self._conn.commit()
             return cur.rowcount == 1
 
@@ -957,10 +978,21 @@ class BoardStore:
             raise BoardError("worker run identity is invalid")
         now = time.time()
         with self._lock:
+            existing = self._get_card_locked(card_id)
+            if existing is None or existing.claim_token != claim_token:
+                return False
+            repaired = existing.status != STATUS_IN_PROGRESS
             cur = self._conn.execute(
-                "UPDATE cards SET run_id = ?, updated_at = ? WHERE id = ? "
-                "AND claim_token = ? AND status = ?",
-                (worker_run_id, now, card_id, claim_token, STATUS_IN_PROGRESS),
+                "UPDATE cards SET status = ?, run_id = ?, updated_at = ?, "
+                "revision = revision + ? WHERE id = ? AND claim_token = ?",
+                (
+                    STATUS_IN_PROGRESS,
+                    worker_run_id,
+                    now,
+                    1 if repaired else 0,
+                    card_id,
+                    claim_token,
+                ),
             )
             if cur.rowcount != 1:
                 return False
@@ -969,6 +1001,14 @@ class BoardStore:
                 "AND claim_token = ?",
                 (worker_run_id, card_id, claim_token),
             )
+            if repaired:
+                self._record_event_locked(
+                    card_id,
+                    "claim_state_repaired",
+                    "worker",
+                    {"from": existing.status, "to": STATUS_IN_PROGRESS},
+                    now=now,
+                )
             self._conn.commit()
             return True
 
@@ -993,7 +1033,7 @@ class BoardStore:
             existing = self._get_card_locked(card_id)
             if existing is None:
                 raise BoardError(f"card not found: {card_id!r}")
-            if existing.status != STATUS_IN_PROGRESS or existing.claim_token != claim_token:
+            if existing.claim_token != claim_token:
                 raise BoardError("task claim is stale")
 
             if outcome == "done":
@@ -1057,17 +1097,57 @@ class BoardStore:
         return card
 
     def recover_expired_claims(self, *, now: float | None = None) -> int:
-        """Requeue expired worker leases without accepting stale completions."""
+        """Repair live claims and requeue expired leases.
+
+        A pre-lease runtime can still share this database during an upgrade.
+        Its legacy startup recovery only knows ``status``/``run_id`` and may
+        move a live claimed card back to ``todo`` without clearing the newer
+        claim fields.  The claim token remains authoritative: restore such a
+        card to ``in_progress`` while its lease is live, and expire it only
+        after the lease deadline.
+        """
         current = time.time() if now is None else float(now)
         recovered = 0
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT {_CARD_COLUMNS} FROM cards WHERE status = ? "
-                "AND claim_token IS NOT NULL AND lease_expires_at <= ?",
+                f"SELECT {_CARD_COLUMNS} FROM cards WHERE claim_token IS NOT NULL "
+                "AND (status <> ? OR lease_expires_at IS NULL OR lease_expires_at <= ?)",
                 (STATUS_IN_PROGRESS, current),
             ).fetchall()
             for row in rows:
                 card = self._row_to_card(row)
+                if card.lease_expires_at is not None and card.lease_expires_at > current:
+                    run = self._conn.execute(
+                        "SELECT id, worker_run_id FROM card_runs "
+                        "WHERE card_id = ? AND claim_token = ? "
+                        "ORDER BY attempt DESC LIMIT 1",
+                        (card.id, card.claim_token),
+                    ).fetchone()
+                    restored_run_id = (
+                        (run["worker_run_id"] or run["id"])
+                        if run is not None
+                        else card.run_id
+                    )
+                    self._conn.execute(
+                        "UPDATE cards SET status = ?, run_id = ?, updated_at = ?, "
+                        "revision = revision + 1 WHERE id = ? AND claim_token = ?",
+                        (
+                            STATUS_IN_PROGRESS,
+                            restored_run_id,
+                            current,
+                            card.id,
+                            card.claim_token,
+                        ),
+                    )
+                    self._record_event_locked(
+                        card.id,
+                        "claim_state_repaired",
+                        "system",
+                        {"from": card.status, "to": STATUS_IN_PROGRESS},
+                        now=current,
+                    )
+                    recovered += 1
+                    continue
                 next_status = (
                     STATUS_BLOCKED
                     if card.attempt_count >= card.max_attempts
@@ -1106,7 +1186,9 @@ class BoardStore:
     def delete_card(self, card_id: str) -> bool:
         with self._lock:
             existing = self._get_card_locked(card_id)
-            if existing is not None and existing.status == STATUS_IN_PROGRESS:
+            if existing is not None and (
+                existing.claim_token or existing.status == STATUS_IN_PROGRESS
+            ):
                 raise BoardError("cancel a running card before deleting it")
             cur = self._conn.execute("DELETE FROM cards WHERE id = ?", (card_id,))
             self._conn.commit()
@@ -1119,7 +1201,16 @@ class BoardStore:
         if status == STATUS_IN_PROGRESS:
             raise BoardError("running cards cannot be cleared")
         with self._lock:
-            cur = self._conn.execute("DELETE FROM cards WHERE status = ?", (status,))
+            claimed = self._conn.execute(
+                "SELECT 1 FROM cards WHERE status = ? AND claim_token IS NOT NULL LIMIT 1",
+                (status,),
+            ).fetchone()
+            if claimed is not None:
+                raise BoardError("running cards cannot be cleared")
+            cur = self._conn.execute(
+                "DELETE FROM cards WHERE status = ? AND claim_token IS NULL",
+                (status,),
+            )
             self._conn.commit()
             return cur.rowcount
 
@@ -1142,6 +1233,15 @@ class BoardStore:
                 card = self._row_to_card(r)
                 rid = card.run_id
                 if rid and rid in live_run_ids:
+                    continue
+                if (
+                    card.claim_token
+                    and card.lease_expires_at is not None
+                    and card.lease_expires_at > now
+                ):
+                    # Lease ownership supersedes the legacy in-process run
+                    # registry: an isolated profile worker may be alive even
+                    # though its opaque run id is not present in this process.
                     continue
                 next_status = (
                     STATUS_BLOCKED

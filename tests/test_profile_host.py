@@ -118,12 +118,27 @@ async def test_internal_board_task_is_scoped_and_hidden_from_public_contract(
 
     host = ProfileHost(on_event=on_event)
     sent = {}
+    started = []
 
     async def target_rpc(target, method, params, timeout):
         assert target == "writer"
         if method == "chat.send":
             sent.update(params)
             run_id = "task-run-1"
+            await host._handle_profile_event("writer", "tool.start", {
+                "toolCallId": "tool-1",
+                "name": "read_file",
+                "args": {"path": "/private/path"},
+                "sessionKey": params["sessionKey"],
+            })
+            await host._handle_profile_event("writer", "tool.complete", {
+                "toolCallId": "tool-1",
+                "name": "read_file",
+                "success": True,
+                "durationMs": 12,
+                "preview": "private result",
+                "sessionKey": params["sessionKey"],
+            })
             await host._handle_profile_event("writer", "chat", {
                 "runId": run_id,
                 "sessionKey": params["sessionKey"],
@@ -139,6 +154,7 @@ async def test_internal_board_task_is_scoped_and_hidden_from_public_contract(
         task_id="c_task-1",
         prompt="Prepare the report",
         idempotency_key="claim-1",
+        on_started=started.append,
     )
 
     assert result == {"runId": "task-run-1", "response": "Completed with evidence"}
@@ -148,6 +164,18 @@ async def test_internal_board_task_is_scoped_and_hidden_from_public_contract(
     assert "spawn" in sent["disabledTools"]
     assert "allowedTools" not in sent
     assert public_events == []
+    assert started == ["task-run-1"]
+    audit = host.task_audit("writer", "task-run-1")
+    assert audit is not None
+    assert audit["outcome"] == "ok"
+    assert audit["toolTrace"] == [{
+        "id": "tool-1",
+        "tool": "read_file",
+        "args_bytes": 24,
+        "status": "ok",
+        "duration_ms": 12,
+    }]
+    assert "preview" not in audit["toolTrace"][0]
 
     with pytest.raises(ProfileHostError) as public:
         await host.dispatch("profiles.task.run", {})

@@ -158,8 +158,8 @@ class _FakeOrch:
     def __init__(self):
         self.calls: list = []
 
-    async def run_card(self, card_id):
-        self.calls.append(("card", card_id))
+    def start_card(self, card_id, *, deliver=False):
+        self.calls.append(("card", card_id, deliver))
 
     async def run_goal(self, goal, subtasks, *, origin_channel="", origin_chat_id=""):
         self.calls.append(("goal", goal, list(subtasks), origin_channel, origin_chat_id))
@@ -176,8 +176,7 @@ async def test_run_single_card(store):
     tool = BoardRunTool(store, orch)
     res = await _run(tool, card_id=card.id)
     assert res["ok"] is True and res["mode"] == "single"
-    await asyncio.sleep(0)  # let the backgrounded coro run
-    assert orch.calls == [("card", card.id)]
+    assert orch.calls == [("card", card.id, True)]
 
 
 @pytest.mark.asyncio

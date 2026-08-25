@@ -9,7 +9,6 @@ from any client, relay or gateway.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from loguru import logger
@@ -154,23 +153,13 @@ async def apply_board_action(store: Any, orchestrator: Any, body: dict) -> tuple
         if action == "run":
             if orchestrator is None:
                 return {"ok": False, "error": "board execution not available"}, 400
-            card = store.get_card(card_id)
-            if card is None:
-                return {"ok": False, "error": "card not found"}, 404
-
-            def _log_done(t: "asyncio.Task") -> None:
-                if not t.cancelled() and t.exception() is not None:
-                    logger.error(f"[board] run_card {card_id} failed: {t.exception()}")
-
             # deliver=False: a UI-initiated run only updates the card (its result
             # lands on the card itself, shown in the board detail). We do NOT push
             # the result back into the origin conversation — otherwise running a
             # card from the desktop/iOS board would post the answer as a chat
             # message on the relay. Chat-originated background tasks still relay,
             # because the agent runs those through its board_run tool in-turn.
-            asyncio.ensure_future(
-                orchestrator.run_card(card_id, deliver=False)
-            ).add_done_callback(_log_done)
+            card = orchestrator.start_card(card_id, deliver=False)
             return {"ok": True, "status": "started", "card": card.to_dict()}, 200
 
         if action == "cancel":

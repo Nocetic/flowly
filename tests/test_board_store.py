@@ -139,17 +139,26 @@ def test_reset_orphaned(store):
     live = store.add_card("live")
     dead = store.add_card("dead")
     never = store.add_card("never-claimed")
+    leased = store.add_card(
+        "leased profile worker",
+        status=STATUS_READY,
+        assignee_profile="research",
+        assignee_bot_id="bot-1",
+    )
     store.set_status(live.id, STATUS_IN_PROGRESS)
     store.set_run_id(live.id, "run-live")
     store.set_status(dead.id, STATUS_IN_PROGRESS)
     store.set_run_id(dead.id, "run-dead")
     store.set_status(never.id, STATUS_IN_PROGRESS)  # null run_id
+    claimed = store.claim_card(leased.id, worker="research", lease_seconds=30)
+    assert claimed is not None and claimed.claim_token
 
     reset = store.reset_orphaned(live_run_ids={"run-live"})
     assert reset == 2  # dead + never
     assert store.get_card(live.id).status == STATUS_IN_PROGRESS
     assert store.get_card(dead.id).status == STATUS_TODO
     assert store.get_card(never.id).status == STATUS_TODO
+    assert store.get_card(leased.id).status == STATUS_IN_PROGRESS
     # explanatory note added
     assert any("restart" in n.text for n in store.get_card(dead.id).notes)
 
@@ -250,7 +259,8 @@ def test_assignment_uses_revision_cas(store):
         expected_revision=card.revision,
     )
 
-    assert assigned.status == STATUS_READY
+    # Assignment chooses the worker; it does not start or queue the card.
+    assert assigned.status == STATUS_TODO
     assert assigned.assignee_profile == "research"
     assert assigned.assignee_bot_id == "bot-1"
     with pytest.raises(BoardError, match="changed"):
@@ -297,6 +307,78 @@ def test_claim_heartbeat_retry_and_stale_completion(store):
     assert blocked.status == STATUS_BLOCKED
     assert len(store.get_runs(card.id)) == 2
     assert any(item["kind"] == "run_finished" for item in store.get_events(card.id))
+
+
+def test_live_claim_repairs_legacy_status_rewrite(store):
+    card = store.add_card(
+        "task",
+        assignee_profile="research",
+        assignee_bot_id="bot-1",
+        status=STATUS_READY,
+    )
+    claimed = store.claim_card(card.id, worker="research", lease_seconds=30)
+    assert claimed is not None and claimed.claim_token
+
+    # Simulate a pre-lease runtime's startup recovery. It knows only the old
+    # status/run_id columns, so it leaves the authoritative claim intact.
+    store._conn.execute(  # noqa: SLF001 - cross-version recovery regression
+        "UPDATE cards SET status = ?, run_id = NULL WHERE id = ?",
+        (STATUS_TODO, card.id),
+    )
+    store._conn.commit()  # noqa: SLF001
+
+    assert store.claim_card(card.id, worker="research", lease_seconds=30) is None
+    with pytest.raises(BoardError, match="running card"):
+        store.assign_card(card.id, profile="writer", bot_id="bot-2")
+    with pytest.raises(BoardError, match="running card"):
+        store.delete_card(card.id)
+    with pytest.raises(BoardError, match="running cards"):
+        store.delete_by_status(STATUS_TODO)
+    assert store.heartbeat_claim(card.id, claimed.claim_token, lease_seconds=30)
+    repaired = store.get_card(card.id)
+    assert repaired is not None and repaired.status == STATUS_IN_PROGRESS
+    assert any(
+        item["kind"] == "claim_state_repaired"
+        for item in store.get_events(card.id)
+    )
+
+    # A matching claim token remains authoritative even if the legacy writer
+    # races once more just before the worker completes.
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE cards SET status = ?, run_id = NULL WHERE id = ?",
+        (STATUS_TODO, card.id),
+    )
+    store._conn.commit()  # noqa: SLF001
+    done = store.finish_claim(
+        card.id,
+        claimed.claim_token,
+        outcome="done",
+        result="finished",
+    )
+    assert done.status == STATUS_DONE
+    assert done.result == "finished"
+
+
+def test_recovery_restores_unexpired_claim_corrupted_by_legacy_writer(store):
+    card = store.add_card(
+        "task",
+        assignee_profile="research",
+        assignee_bot_id="bot-1",
+        status=STATUS_READY,
+    )
+    claimed = store.claim_card(card.id, worker="research", lease_seconds=30)
+    assert claimed is not None and claimed.claim_token
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE cards SET status = ?, run_id = NULL WHERE id = ?",
+        (STATUS_TODO, card.id),
+    )
+    store._conn.commit()  # noqa: SLF001
+
+    assert store.recover_expired_claims(now=claimed.heartbeat_at + 1) == 1
+    repaired = store.get_card(card.id)
+    assert repaired is not None
+    assert repaired.status == STATUS_IN_PROGRESS
+    assert repaired.run_id is not None
 
 
 def test_dependency_blocks_dispatch_until_parent_done(store):
@@ -393,6 +475,6 @@ def test_existing_board_schema_migrates_without_data_loss(tmp_path):
             profile="research",
             bot_id="bot-1",
         )
-        assert assigned.status == STATUS_READY
+        assert assigned.status == STATUS_TODO
     finally:
         migrated.close()

@@ -8,6 +8,7 @@ worker only returns a string, mirroring the production invariant.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -215,6 +216,78 @@ async def test_spawn_fn_never_receives_store(store):
     await orch.run_card(card.id)
     assert set(seen_kwargs) == {"label", "origin_channel", "origin_chat_id", "model"}
     assert "store" not in seen_kwargs
+
+
+@pytest.mark.asyncio
+async def test_explicit_start_reserves_card_before_background_task_runs(store):
+    release = asyncio.Event()
+
+    async def spawn_fn(task, **kwargs):
+        await release.wait()
+        return "done"
+
+    card = store.add_card("manual task")
+    orch = BoardOrchestrator(store, spawn_fn)
+
+    accepted = orch.start_card(card.id)
+    assert accepted.id == card.id
+    with pytest.raises(BoardError, match="already running"):
+        orch.start_card(card.id)
+
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if store.get_card(card.id).status == "in_progress":
+            break
+    assert store.get_card(card.id).status == "in_progress"
+
+    release.set()
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if card.id not in orch._manual_tasks:
+            break
+    assert store.get_card(card.id).status == STATUS_DONE
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_cannot_race_an_explicit_run_reservation(store):
+    release = asyncio.Event()
+
+    async def spawn_fn(task, **kwargs):
+        await release.wait()
+        return "done"
+
+    card = store.add_card("ready manual task")
+    store.set_status(card.id, STATUS_READY)
+    orch = BoardOrchestrator(store, spawn_fn)
+
+    orch.start_card(card.id)
+    assert await orch.dispatch_once() == 0
+
+    release.set()
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if store.get_card(card.id).status == STATUS_DONE:
+            break
+    assert store.get_card(card.id).status == STATUS_DONE
+
+
+def test_assignment_does_not_queue_or_dispatch_card(store, monkeypatch):
+    from flowly import profile as profile_module
+
+    monkeypatch.setattr(profile_module, "profile_exists", lambda name: name == "research")
+    monkeypatch.setattr(
+        profile_module,
+        "ensure_profile_bot_id",
+        lambda name: SimpleNamespace(bot_id=f"bot-{name}"),
+    )
+    card = store.add_card("assigned later")
+    orch = BoardOrchestrator(store, make_spawn())
+
+    assigned = orch.assign_card(card.id, "research")
+
+    assert assigned.assignee_profile == "research"
+    assert assigned.status == STATUS_TODO
+    assert store.list_dispatchable() == []
 
 
 @pytest.mark.asyncio

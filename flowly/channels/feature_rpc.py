@@ -1461,6 +1461,26 @@ def _registry():
         return None
 
 
+# Returns a sanitized audit projection for a hidden named-profile Board run.
+# The provider never exposes the worker session or profile RPC publicly; it is
+# queried only while serving an already-authorized board.card request.
+_board_worker_audit_provider = None
+
+
+def set_board_worker_audit_provider(provider) -> None:
+    global _board_worker_audit_provider
+    _board_worker_audit_provider = provider
+
+
+def _board_worker_audit(profile: str, run_id: str):
+    if _board_worker_audit_provider is None:
+        return None
+    try:
+        return _board_worker_audit_provider(profile, run_id)
+    except Exception:
+        return None
+
+
 # Returns the agent's ``SubagentManager`` — used by ``subagents.spawn`` to
 # launch a manual background subagent whose async result is announced back to
 # the origin session. Wired at startup (gateway only; the relay has no live
@@ -3731,6 +3751,7 @@ def board_card(params: dict) -> dict:
     if card is None:
         return {"card": None, "run": None}
 
+    raw_attempts = store.get_runs(card_id)
     run = None
     reg = _registry()
     rec = None
@@ -3751,6 +3772,12 @@ def board_card(params: dict) -> dict:
             "model": rec.model,
             "toolTrace": list(rec.tool_trace or []),
         }
+    if run is None and raw_attempts:
+        latest = raw_attempts[-1]
+        profile = str(latest.get("profile") or "")
+        worker_run_id = str(latest.get("workerRunId") or "")
+        if profile and profile != "default" and worker_run_id:
+            run = _board_worker_audit(profile, worker_run_id)
     attempts = [
         {
             "attempt": item["attempt"],
@@ -3758,7 +3785,7 @@ def board_card(params: dict) -> dict:
             "startedAt": item["startedAt"],
             "completedAt": item["completedAt"],
         }
-        for item in store.get_runs(card_id)
+        for item in raw_attempts
     ]
     activity = [
         {"kind": item["kind"], "createdAt": item["createdAt"]}

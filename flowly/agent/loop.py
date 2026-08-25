@@ -2646,13 +2646,25 @@ class AgentLoop:
                         )
                         if profile_host is None:
                             raise RuntimeError("The assigned bot runtime host is unavailable.")
+
+                        def _worker_started(worker_run_id: str) -> None:
+                            if label and claim_token and worker_run_id:
+                                self._board_store.set_worker_run_id(
+                                    label,
+                                    str(claim_token),
+                                    worker_run_id,
+                                )
+
                         task_result = await profile_host.run_task(
                             profile,
                             task_id=str(task_id or label or ""),
                             prompt=task,
                             idempotency_key=str(claim_token or ""),
+                            on_started=_worker_started,
                         )
                         worker_run_id = str(task_result.get("runId") or "")
+                        # Compatibility fallback for a custom ProfileHost that
+                        # predates the start callback.
                         if label and claim_token and worker_run_id:
                             self._board_store.set_worker_run_id(
                                 label,
@@ -2708,12 +2720,10 @@ class AgentLoop:
                     self._board_store, _board_spawn,
                     notify=_board_notify, on_finished=_board_on_finished, model=self.model,
                 )
-                # In-process tasks do not survive a restart, so recover cards
-                # left running by a previous primary runtime.
-                try:
-                    self._board_store.reset_orphaned(live_run_ids=set())
-                except Exception as exc:  # pragma: no cover
-                    logger.warning(f"[board] crash recovery skipped: {exc}")
+                # Claimed work is lease-owned and may be running in an
+                # isolated profile process.  The dispatcher recovers only
+                # expired leases; the legacy registry-based reset cannot
+                # distinguish those workers and would corrupt live cards.
 
                 for _board_tool in build_board_tools(self._board_store, self._board_orchestrator):
                     self.tools.register(_board_tool)

@@ -74,9 +74,9 @@ class BoardAddTool(_BoardToolBase):
                 "assignee_profile": {
                     "type": "string",
                     "description": (
-                        "Optional stable profile id of the bot that should execute "
-                        "the task. Assignment validates the live bot directory and "
-                        "queues the card automatically."
+                        "Optional stable profile id of the agent that should execute "
+                        "the task. Assignment validates the live agent directory but "
+                        "does not start the card; move it to ready or run it explicitly."
                     ),
                 },
                 "priority": {
@@ -412,7 +412,10 @@ class BoardRunTool(_BoardToolBase):
             # straight to the origin channel (deliver=True) — TUI, Telegram,
             # etc. — the same way a chat reply is delivered. No second agent
             # turn, no relay prompt.
-            self._spawn_bg(self._orch.run_card(card_id), f"run_card {card_id}")
+            try:
+                self._orch.start_card(card_id, deliver=True)
+            except BoardError as exc:
+                return self._err(str(exc))
             return json.dumps({
                 "ok": True,
                 "status": "started",

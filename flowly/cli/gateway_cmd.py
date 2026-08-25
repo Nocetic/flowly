@@ -1667,6 +1667,13 @@ Respond to the user now:"""
         _feature_rpc.set_registry_provider(
             lambda: getattr(getattr(agent, "subagents", None), "registry", None)
         )
+
+        def _board_worker_audit(profile: str, run_id: str):
+            server = getattr(agent, "_gateway_server", None)
+            host = getattr(server, "profile_host", None)
+            return host.task_audit(profile, run_id) if host is not None else None
+
+        _feature_rpc.set_board_worker_audit_provider(_board_worker_audit)
         _feature_rpc.set_semantic_tool_metrics_provider(
             agent.semantic_tool_routing_metrics
         )
