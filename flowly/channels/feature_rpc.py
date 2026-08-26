@@ -754,7 +754,18 @@ async def _goal_control(params: dict, action: str) -> dict:
         raise FeatureRpcError("INVALID_PARAMS", "sessionKey is required")
     if len(session_key) > 2_000:
         raise FeatureRpcError("INVALID_PARAMS", "sessionKey is too long")
-    return await _goal_control_cb(session_key, action)
+    from flowly.goals.manager import GoalNotFoundError
+
+    try:
+        return await _goal_control_cb(session_key, action)
+    except GoalNotFoundError as exc:
+        # A stale client can legitimately race a clear performed on another
+        # surface. Keep that domain outcome on the structured RPC path so the
+        # client can reconcile its chip without the gateway logging a crash.
+        raise FeatureRpcError(
+            "GOAL_NOT_FOUND",
+            "No standing goal exists for this conversation.",
+        ) from exc
 
 
 async def goal_pause(params: dict) -> dict:

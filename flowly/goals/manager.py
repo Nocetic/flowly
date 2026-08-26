@@ -41,6 +41,10 @@ class _ContractSupersededError(RuntimeError):
     """The goal changed while its contract was being drafted."""
 
 
+class GoalNotFoundError(RuntimeError):
+    """A control targeted a conversation without a live standing goal."""
+
+
 class GoalManager:
     def __init__(
         self,
@@ -86,7 +90,7 @@ class GoalManager:
         def mutate(state: GoalState | None) -> GoalState:
             state = _require_goal(state)
             if state.status is GoalStatus.CLEARED:
-                raise RuntimeError("no goal to pause")
+                raise GoalNotFoundError("no goal to pause")
             state.status = GoalStatus.PAUSED
             state.paused_reason = reason
             state.clear_wait()
@@ -98,7 +102,7 @@ class GoalManager:
         def mutate(state: GoalState | None) -> GoalState:
             state = _require_goal(state)
             if state.status is GoalStatus.CLEARED:
-                raise RuntimeError("no goal to resume")
+                raise GoalNotFoundError("no goal to resume")
             state.status = GoalStatus.ACTIVE
             state.turns_used = 0
             state.paused_reason = None
@@ -607,14 +611,14 @@ class GoalManager:
 
 def _require_goal(state: GoalState | None) -> GoalState:
     if state is None:
-        raise RuntimeError("no goal is set")
+        raise GoalNotFoundError("no goal is set")
     return state
 
 
 def _require_live_goal(state: GoalState | None) -> GoalState:
     state = _require_goal(state)
     if state.status is GoalStatus.CLEARED:
-        raise RuntimeError("no goal is set")
+        raise GoalNotFoundError("no goal is set")
     return state
 
 

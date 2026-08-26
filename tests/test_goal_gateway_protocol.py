@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -14,14 +14,17 @@ from flowly.channels import feature_rpc
 from flowly.channels.web import WebChannel
 from flowly.config.schema import WebChannelConfig
 from flowly.gateway.server import GatewayServer
+from flowly.goals.manager import GoalNotFoundError
 from flowly.goals.models import GoalState
 
 
 @pytest.fixture(autouse=True)
 def _reset_goal_provider():
     feature_rpc.set_goal_state_provider(None)
+    feature_rpc.set_goal_control_callback(None)
     yield
     feature_rpc.set_goal_state_provider(None)
+    feature_rpc.set_goal_control_callback(None)
 
 
 @pytest.mark.asyncio
@@ -48,6 +51,19 @@ async def test_goal_get_requires_a_session_key() -> None:
     assert exc_info.value.code == "INVALID_PARAMS"
 
 
+@pytest.mark.asyncio
+async def test_missing_goal_control_uses_a_structured_non_crash_error() -> None:
+    control = AsyncMock(side_effect=GoalNotFoundError("no goal to resume"))
+    feature_rpc.set_goal_control_callback(control)
+
+    with pytest.raises(feature_rpc.FeatureRpcError) as exc_info:
+        await feature_rpc.dispatch("goal.resume", {"sessionKey": "web:cleared"})
+
+    assert exc_info.value.code == "GOAL_NOT_FOUND"
+    assert exc_info.value.message == "No standing goal exists for this conversation."
+    control.assert_awaited_once_with("web:cleared", "resume")
+
+
 class _FakeWS:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
@@ -55,6 +71,36 @@ class _FakeWS:
 
     async def send_json(self, data: dict[str, Any]) -> None:
         self.sent.append(data)
+
+
+@pytest.mark.asyncio
+async def test_gateway_does_not_log_missing_goal_control_as_a_crash(monkeypatch) -> None:
+    feature_rpc.set_goal_control_callback(
+        AsyncMock(side_effect=GoalNotFoundError("no goal to resume"))
+    )
+    gateway_logger = Mock()
+    monkeypatch.setattr("flowly.gateway.server.logger", gateway_logger)
+    server = GatewayServer(host="127.0.0.1", port=0, on_chat_message=AsyncMock())
+    ws = _FakeWS()
+
+    await server._handle_feature_rpc(
+        ws,
+        "rpc-1",
+        "goal.resume",
+        {"sessionKey": "web:cleared"},
+    )
+
+    assert ws.sent == [
+        {
+            "type": "rpc",
+            "id": "rpc-1",
+            "error": {
+                "code": "GOAL_NOT_FOUND",
+                "message": "No standing goal exists for this conversation.",
+            },
+        }
+    ]
+    gateway_logger.exception.assert_not_called()
 
 
 @pytest.mark.asyncio
