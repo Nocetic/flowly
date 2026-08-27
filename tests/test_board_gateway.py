@@ -266,6 +266,15 @@ def test_board_card_uses_private_named_worker_audit(store, monkeypatch):
         "completedAt": None,
     }]
     assert "workerRunId" not in detail["attempts"][0]
+    assert detail["activity"][0]["kind"] == "created"
+    assert detail["activity"][0]["actor"] == "user"
+    assert detail["activity"][0]["payload"] == {
+        "status": "ready",
+        "assigneeProfile": "writer",
+    }
+    assert detail["activity"][1]["kind"] == "claimed"
+    assert detail["activity"][1]["actor"] == "writer"
+    assert detail["activity"][1]["payload"]["attempt"] == 1
 
 
 @pytest.mark.asyncio

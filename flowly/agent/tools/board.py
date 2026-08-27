@@ -38,11 +38,34 @@ class _BoardToolBase(Tool):
         self._orchestrator = orchestrator
         self._channel = ""
         self._chat_id = ""
+        self._actor = "agent"
+        self._created_by = "user"
+        self._idempotency_key = ""
 
     def set_context(self, channel: str, chat_id: str) -> None:
         """Record the active channel/chat so captured cards remember origin."""
         self._channel = channel or ""
         self._chat_id = chat_id or ""
+
+    def set_identity(
+        self,
+        actor: str,
+        *,
+        created_by: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        """Bind an authenticated caller identity for one tool instance.
+
+        Normal in-process agent tools retain their historical ``agent`` /
+        ``user`` attribution.  Reverse-RPC adapters create fresh instances and
+        replace it with ``profile:<id>`` so shared Board writes remain
+        auditable without trusting model-authored parameters.
+        """
+        identity = str(actor or "").strip()
+        if identity:
+            self._actor = identity[:128]
+            self._created_by = str(created_by or identity)[:128]
+        self._idempotency_key = str(request_id or "")[:128]
 
     @staticmethod
     def _err(message: str) -> str:
@@ -109,9 +132,10 @@ class BoardAddTool(_BoardToolBase):
                 body=body,
                 origin_channel=self._channel,
                 origin_chat_id=self._chat_id,
-                created_by="user",
+                created_by=self._created_by,
                 priority=kwargs.get("priority", 0),
                 scheduled_at=kwargs.get("scheduled_at"),
+                idempotency_key=self._idempotency_key,
                 max_attempts=kwargs.get("max_attempts", 2),
             )
             if assignee:
@@ -119,7 +143,11 @@ class BoardAddTool(_BoardToolBase):
                     self._store.delete_card(card.id)
                     return self._err("bot assignment is not available")
                 try:
-                    card = self._orchestrator.assign_card(card.id, assignee, actor="agent")
+                    card = self._orchestrator.assign_card(
+                        card.id,
+                        assignee,
+                        actor=self._actor,
+                    )
                 except Exception:
                     self._store.delete_card(card.id)
                     raise
@@ -285,7 +313,7 @@ class BoardUpdateTool(_BoardToolBase):
                 card = self._orchestrator.assign_card(
                     card_id,
                     assignee,
-                    actor="agent",
+                    actor=self._actor,
                     expected_revision=next_revision(),
                 )
             if (
@@ -301,7 +329,7 @@ class BoardUpdateTool(_BoardToolBase):
                     "priority": priority,
                     "max_attempts": max_attempts,
                     "expected_revision": next_revision(),
-                    "actor": "agent",
+                    "actor": self._actor,
                 }
                 if scheduled_present:
                     update_kwargs["scheduled_at"] = scheduled_at
@@ -309,7 +337,7 @@ class BoardUpdateTool(_BoardToolBase):
             if note:
                 self._store.add_note(
                     card_id,
-                    author="agent",
+                    author=self._actor,
                     text=note,
                     expected_revision=next_revision(),
                 )
@@ -320,7 +348,7 @@ class BoardUpdateTool(_BoardToolBase):
                     return self._err("bot assignment is not available")
                 card = self._orchestrator.unassign_card(
                     card_id,
-                    actor="agent",
+                    actor=self._actor,
                     expected_revision=next_revision(),
                 )
             if status is not None:
@@ -329,13 +357,13 @@ class BoardUpdateTool(_BoardToolBase):
                     status,
                     result=result,
                     expected_revision=next_revision(),
-                    actor="agent",
+                    actor=self._actor,
                 )
             elif result is not None:
                 # result without a status change — record it as a note
                 self._store.add_note(
                     card_id,
-                    author="agent",
+                    author=self._actor,
                     text=f"result: {result}",
                     expected_revision=next_revision(),
                 )
@@ -365,10 +393,20 @@ class BoardRunTool(_BoardToolBase):
         super().__init__(store, orchestrator)
         self._orch = orchestrator
         self._is_subagent = False
+        self._deliver = True
 
     def set_context(self, channel: str, chat_id: str, is_subagent: bool = False) -> None:
         super().set_context(channel, chat_id)
         self._is_subagent = is_subagent
+
+    def set_delivery(self, deliver: bool) -> None:
+        """Choose whether completed work is posted back into an origin chat.
+
+        Shared profile conversations have their own isolated transcript.  The
+        primary Board still sends its normal completion push, but posting the
+        result into the primary chat would cross that isolation boundary.
+        """
+        self._deliver = bool(deliver)
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -413,7 +451,7 @@ class BoardRunTool(_BoardToolBase):
             # etc. — the same way a chat reply is delivered. No second agent
             # turn, no relay prompt.
             try:
-                self._orch.start_card(card_id, deliver=True)
+                self._orch.start_card(card_id, deliver=self._deliver)
             except BoardError as exc:
                 return self._err(str(exc))
             return json.dumps({
@@ -435,8 +473,8 @@ class BoardRunTool(_BoardToolBase):
                 self._orch.run_goal(
                     goal,
                     list(subtasks),
-                    origin_channel=self._channel,
-                    origin_chat_id=self._chat_id,
+                    origin_channel=self._channel if self._deliver else "",
+                    origin_chat_id=self._chat_id if self._deliver else "",
                 ),
                 f"run_goal {goal[:30]}",
             )

@@ -2,6 +2,7 @@
 
 import asyncio
 import html
+import logging
 import mimetypes
 import re
 from pathlib import Path
@@ -38,6 +39,30 @@ TELEGRAM_TEXT_LIMIT = 4000
 # Telegram only delivers update types listed here. Inline keyboard clicks arrive
 # as callback_query updates, so approvals must include it explicitly.
 TELEGRAM_ALLOWED_UPDATES = ["message", "callback_query"]
+
+# ``python-telegram-bot`` performs one final, non-long-polling ``getUpdates``
+# request while stopping so already-fetched updates are acknowledged.  Its
+# default request read timeout is five seconds and, if the network is gone,
+# the library logs a full ERROR traceback even though it catches and suppresses
+# the failure itself.  Keep the polling safety margin small enough for a quick
+# shutdown; the Bot adds the long-poll timeout on top of this value for normal
+# polling requests.
+TELEGRAM_GET_UPDATES_READ_TIMEOUT = 1.0
+
+_TELEGRAM_UPDATER_LOGGER = "telegram.ext.Updater"
+_TELEGRAM_CLEANUP_ERROR_PREFIX = (
+    "Error while calling `get_updates` one more time to mark all fetched updates."
+)
+
+
+class _TelegramCleanupErrorFilter(logging.Filter):
+    """Hide only PTB's known, already-suppressed shutdown cleanup traceback."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.name == _TELEGRAM_UPDATER_LOGGER
+            and record.getMessage().startswith(_TELEGRAM_CLEANUP_ERROR_PREFIX)
+        )
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -157,6 +182,16 @@ class TelegramChannel(BaseChannel):
         self._compact_callback: callable | None = None  # Set by gateway
         self._typing_tasks: dict[int, asyncio.Task] = {}  # Active typing indicators per chat
         self._groq_api_key = groq_api_key  # For voice transcription
+        self._stop_lock = asyncio.Lock()
+
+    def _build_application(self) -> Application:
+        """Build Telegram's application with shutdown-safe polling timeouts."""
+        return (
+            Application.builder()
+            .token(self.config.token)
+            .get_updates_read_timeout(TELEGRAM_GET_UPDATES_READ_TIMEOUT)
+            .build()
+        )
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -167,11 +202,7 @@ class TelegramChannel(BaseChannel):
         self._running = True
 
         # Build the application
-        self._app = (
-            Application.builder()
-            .token(self.config.token)
-            .build()
-        )
+        self._app = self._build_application()
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -250,18 +281,33 @@ class TelegramChannel(BaseChannel):
 
     async def stop(self) -> None:
         """Stop the Telegram bot."""
-        self._running = False
+        async with self._stop_lock:
+            self._running = False
 
-        # Cancel all typing indicator tasks
-        for chat_id in list(self._typing_tasks.keys()):
-            await self._stop_typing(chat_id)
+            # Cancel all typing indicator tasks before closing the Bot client.
+            for chat_id in list(self._typing_tasks.keys()):
+                await self._stop_typing(chat_id)
 
-        if self._app:
-            logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
+            app = self._app
+            if app is None:
+                return
+
+            # Detach first so repeated shutdown signals and concurrent sends do
+            # not try to use or close the same Application twice.
             self._app = None
+            logger.info("Stopping Telegram bot...")
+
+            updater_logger = logging.getLogger(_TELEGRAM_UPDATER_LOGGER)
+            cleanup_filter = _TelegramCleanupErrorFilter()
+            updater_logger.addFilter(cleanup_filter)
+            try:
+                if app.updater and app.updater.running:
+                    await app.updater.stop()
+            finally:
+                updater_logger.removeFilter(cleanup_filter)
+
+            await app.stop()
+            await app.shutdown()
 
     async def send(self, msg: OutboundMessage) -> None:
         """

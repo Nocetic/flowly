@@ -106,6 +106,57 @@ async def test_profile_reverse_rpc_accepts_only_owning_socket() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shared_service_reverse_rpc_binds_identity_to_owning_socket() -> None:
+    server = object.__new__(GatewayServer)
+    owner = SimpleNamespace(closed=False)
+    server._ws_clients = {"desktop-owner": owner}
+    server._shared_service_pending = {}
+    server._shared_service_pending_clients = {}
+    server._ws_send = AsyncMock()
+    binding = _ProfileRunBinding(
+        client_id="desktop-owner",
+        session_key="desktop:profile:alpha:one",
+        current_profile="alpha",
+        available_profiles=("alpha", "beta"),
+        correlation_id="chat-run",
+        hop=0,
+        turn_origin="group",
+    )
+    token = _PROFILE_RUN_BINDING.set(binding)
+    try:
+        task = asyncio.create_task(server.send_shared_service_request(
+            "shared-1", "board", "board_list", {"status": "todo"}
+        ))
+        await asyncio.sleep(0)
+        server._handle_shared_service_result(
+            {"id": "shared-1", "result": {"ok": True, "output": "spoofed"}},
+            "another-client",
+        )
+        assert not task.done()
+        server._handle_shared_service_result(
+            {"id": "shared-1", "result": {"ok": True, "output": "verified"}},
+            "desktop-owner",
+        )
+        assert await task == {"ok": True, "output": "verified"}
+        sent = server._ws_send.await_args.args[1]
+        assert sent == {
+            "type": "shared_service_request",
+            "id": "shared-1",
+            "params": {
+                "service": "board",
+                "tool": "board_list",
+                "arguments": {"status": "todo"},
+                "sourceProfile": "alpha",
+                "sourceSessionKey": "desktop:profile:alpha:one",
+                "turnOrigin": "group",
+                "correlationId": "shared-1",
+            },
+        }
+    finally:
+        _PROFILE_RUN_BINDING.reset(token)
+
+
+@pytest.mark.asyncio
 async def test_message_profile_tool_returns_structured_broker_result() -> None:
     gateway = SimpleNamespace(
         send_profile_message_request=AsyncMock(

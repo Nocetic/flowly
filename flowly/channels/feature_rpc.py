@@ -3787,8 +3787,17 @@ def board_card(params: dict) -> dict:
         }
         for item in raw_attempts
     ]
+    # Actor and payload are authenticated Board audit data, not model-authored
+    # display labels. Preserve them over RPC so clients can resolve stable
+    # profile IDs to the current agent directory and explain who performed
+    # each action. Older clients safely ignore the additive fields.
     activity = [
-        {"kind": item["kind"], "createdAt": item["createdAt"]}
+        {
+            "kind": item["kind"],
+            "actor": item["actor"],
+            "payload": item["payload"],
+            "createdAt": item["createdAt"],
+        }
         for item in store.get_events(card_id)
     ]
     return {

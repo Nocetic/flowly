@@ -153,10 +153,19 @@ class SkillsLoader:
     3. Builtin skills (bundled with package)
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        builtin_skills_dir: Path | None = None,
+        managed_skills_dir: Path | None = None,
+    ):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
-        self.managed_skills = _managed_skills_dir()
+        # Profile-directory discovery happens in the host process, where
+        # FLOWLY_HOME intentionally remains bound to the default profile. An
+        # explicit managed directory lets that read-only control plane inspect
+        # another profile without mutating process-global environment state.
+        self.managed_skills = managed_skills_dir or _managed_skills_dir()
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
     
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:

@@ -270,7 +270,9 @@ class ProfileInfo:
     path: Path
     is_default: bool
     has_config: bool = False
-    skill_count: int = 0
+    # None means the directory could not be inspected. Clients must not turn an
+    # unavailable measurement into a convincing but false zero.
+    skill_count: int | None = None
     display_name: str = ""
     description: str = ""
     provider: str = ""
@@ -283,12 +285,11 @@ class ProfileInfo:
 
     def to_dict(self) -> dict:
         """Return the stable, JSON-safe profile descriptor used by clients."""
-        return {
+        value = {
             "name": self.name,
             "path": str(self.path),
             "isDefault": self.is_default,
             "hasConfig": self.has_config,
-            "skillCount": self.skill_count,
             "displayName": self.display_name or self.name,
             "description": self.description,
             "provider": self.provider,
@@ -299,6 +300,10 @@ class ProfileInfo:
             "updatedAt": self.updated_at,
             "botId": self.bot_id,
         }
+        if self.skill_count is not None:
+            value["skillCount"] = self.skill_count
+            value["skillCountVerified"] = True
+        return value
 
     def to_public_dict(self) -> dict:
         """Return the remote-safe profile descriptor.
@@ -488,6 +493,27 @@ def _runtime_summary(profile_dir: Path) -> dict:
     }
 
 
+def _installed_skill_count(profile_dir: Path) -> int | None:
+    """Count the skills the profile runtime will actually enumerate.
+
+    This deliberately mirrors ``SkillsLoader.list_skills(False)`` instead of
+    counting arbitrary child directories. It includes workspace, profile-
+    managed, and bundled skills with the loader's normal name de-duplication.
+    A failed filesystem read is represented as unknown so remote clients never
+    display a fabricated zero.
+    """
+    from flowly.agent.skills import SkillsLoader
+
+    try:
+        loader = SkillsLoader(
+            workspace=profile_dir / "workspace",
+            managed_skills_dir=profile_dir / "skills",
+        )
+        return len(loader.list_skills(filter_unavailable=False))
+    except OSError:
+        return None
+
+
 def list_profiles() -> list[ProfileInfo]:
     """List all profiles (default + named)."""
     profiles = []
@@ -500,6 +526,7 @@ def list_profiles() -> list[ProfileInfo]:
         path=_DEFAULT_HOME,
         is_default=True,
         has_config=(_DEFAULT_HOME / "config.json").exists(),
+        skill_count=_installed_skill_count(_DEFAULT_HOME),
         **default_meta,
         **default_runtime,
     ))
@@ -508,10 +535,6 @@ def list_profiles() -> list[ProfileInfo]:
     if _PROFILES_ROOT.exists():
         for d in sorted(_PROFILES_ROOT.iterdir()):
             if d.is_dir() and not d.is_symlink() and _PROFILE_NAME_RE.match(d.name):
-                skill_count = 0
-                skills_dir = d / "skills"
-                if skills_dir.exists():
-                    skill_count = sum(1 for s in skills_dir.iterdir() if s.is_dir())
                 meta = _metadata_for(d.name, d, is_default=False)
                 runtime = _runtime_summary(d)
                 profiles.append(ProfileInfo(
@@ -519,7 +542,7 @@ def list_profiles() -> list[ProfileInfo]:
                     path=d,
                     is_default=False,
                     has_config=(d / "config.json").exists(),
-                    skill_count=skill_count,
+                    skill_count=_installed_skill_count(d),
                     **meta,
                     **runtime,
                 ))

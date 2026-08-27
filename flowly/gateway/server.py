@@ -181,6 +181,7 @@ class _ProfileRunBinding:
     available_profiles: tuple[str, ...]
     correlation_id: str
     hop: int = 0
+    turn_origin: str = "user"
 
 
 _PROFILE_RUN_BINDING: ContextVar[_ProfileRunBinding | None] = ContextVar(
@@ -606,6 +607,14 @@ class GatewayServer:
         # relay transport.
         self._profile_pending: dict[str, asyncio.Future] = {}
         self._profile_pending_clients: dict[str, str] = {}
+        # Installation-level Board/Artifact calls use a separate, closed
+        # reverse-RPC lane.  Keeping it distinct from profile messaging makes
+        # correlation, disconnect cleanup and audit boundaries explicit.
+        self._shared_service_pending: dict[str, asyncio.Future] = {}
+        self._shared_service_pending_clients: dict[str, str] = {}
+        self._shared_artifact_on_change: (
+            Callable[[str, dict], Awaitable[None]] | None
+        ) = None
         self._profile_host_rpc_pending: dict[str, asyncio.Future[Any]] = {}
         self._profile_host_client_id = f"profile-host-{uuid.uuid4().hex}"
         self._profile_host_socket: _ProfileHostSocket | None = None
@@ -637,6 +646,13 @@ class GatewayServer:
     def profile_host(self) -> Any | None:
         """The authenticated profile manager shared with transport adapters."""
         return self._profile_host
+
+    def set_shared_artifact_on_change(
+        self,
+        callback: Callable[[str, dict], Awaitable[None]] | None,
+    ) -> None:
+        """Use the primary artifact fan-out for profile-originated writes."""
+        self._shared_artifact_on_change = callback
 
     def _create_app(self) -> web.Application:
         """Create the aiohttp application."""
@@ -1244,6 +1260,8 @@ class GatewayServer:
                             )
                     elif msg_type == "profile_message_result":
                         self._handle_profile_message_result(data, client_id)
+                    elif msg_type == "shared_service_result":
+                        self._handle_shared_service_result(data, client_id)
                 elif raw_msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                     break
         except Exception as e:
@@ -1270,6 +1288,17 @@ class GatewayServer:
                         future.set_result({
                             "error": "Desktop disconnected while another profile was responding",
                             "error_code": "PROFILE_BROKER_DISCONNECTED",
+                        })
+                for request_id, expected_client in tuple(
+                    self._shared_service_pending_clients.items()
+                ):
+                    if expected_client != client_id:
+                        continue
+                    future = self._shared_service_pending.get(request_id)
+                    if future is not None and not future.done():
+                        future.set_result({
+                            "error": "Desktop disconnected while a shared service was responding",
+                            "error_code": "SHARED_BROKER_DISCONNECTED",
                         })
             # Drop any session→ws bindings that pointed at this closed socket so
             # we don't hold a dead ref (a live re-entry re-binds via chat.inflight
@@ -1377,6 +1406,12 @@ class GatewayServer:
                 await self._ws_rpc_board_snapshot(ws, rpc_id, params)
             elif method == "board.action":
                 await self._ws_rpc_board_action(ws, rpc_id, params)
+
+            # Authenticated profile-owner broker.  This accepts only the
+            # closed Board/Artifact tool vocabulary validated by
+            # ``flowly.shared_service``; it is not arbitrary RPC forwarding.
+            elif method == "shared.invoke":
+                await self._ws_rpc_shared_invoke(ws, rpc_id, params)
 
             # Artifacts
             elif method == "artifacts.list":
@@ -2989,6 +3024,9 @@ class GatewayServer:
                     (extra_metadata or {}).get("profile_correlation_id") or run_id
                 ),
                 hop=int((extra_metadata or {}).get("profile_hop") or 0),
+                turn_origin=str(
+                    (extra_metadata or {}).get("turn_origin") or "user"
+                ),
             )
             if client_id
             else None
@@ -3925,6 +3963,104 @@ class GatewayServer:
         if future is not None and not future.done():
             future.set_result(result)
 
+    async def send_shared_service_request(
+        self,
+        request_id: str,
+        service: str,
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Invoke one primary-owned service through this run's exact owner."""
+        from flowly.shared_service import (
+            MAX_SHARED_REQUEST_BYTES,
+            SharedServiceError,
+            validate_shared_service_request,
+        )
+
+        binding = _PROFILE_RUN_BINDING.get()
+        if binding is None or not binding.client_id:
+            return {
+                "error": "Shared services require a Desktop-managed profile conversation",
+                "error_code": "SHARED_BROKER_UNAVAILABLE",
+            }
+        canonical = {
+            "service": service,
+            "tool": tool,
+            "arguments": arguments,
+            "sourceProfile": binding.current_profile,
+            "sourceSessionKey": binding.session_key,
+            "turnOrigin": binding.turn_origin,
+            "correlationId": request_id,
+        }
+        try:
+            canonical = validate_shared_service_request(canonical)
+        except SharedServiceError as exc:
+            return {"error": exc.message, "error_code": exc.code}
+        if len(json.dumps(canonical, ensure_ascii=False).encode()) > MAX_SHARED_REQUEST_BYTES:
+            return {
+                "error": "Shared service request is too large",
+                "error_code": "SHARED_REQUEST_TOO_LARGE",
+            }
+        ws = self._ws_clients.get(binding.client_id)
+        if ws is None or ws.closed:
+            return {
+                "error": "Desktop shared-service broker is not connected",
+                "error_code": "SHARED_BROKER_UNAVAILABLE",
+            }
+        if request_id in self._shared_service_pending:
+            return {
+                "error": "Duplicate shared service request",
+                "error_code": "SHARED_REQUEST_DUPLICATE",
+            }
+
+        future = asyncio.get_running_loop().create_future()
+        self._shared_service_pending[request_id] = future
+        self._shared_service_pending_clients[request_id] = binding.client_id
+        try:
+            await self._ws_send(ws, {
+                "type": "shared_service_request",
+                "id": request_id,
+                "params": canonical,
+            })
+            try:
+                return await asyncio.wait_for(future, timeout=600)
+            except asyncio.TimeoutError:
+                return {
+                    "error": "Shared service did not respond in time",
+                    "error_code": "SHARED_RESPONSE_TIMEOUT",
+                }
+        finally:
+            self._shared_service_pending.pop(request_id, None)
+            self._shared_service_pending_clients.pop(request_id, None)
+
+    def _handle_shared_service_result(self, data: dict, client_id: str) -> None:
+        """Resolve a shared reverse RPC only from its authenticated owner."""
+        request_id = str(data.get("id") or "")
+        expected_client = self._shared_service_pending_clients.get(request_id)
+        if not request_id or expected_client != client_id:
+            logger.warning(
+                "[WS] Ignoring shared service result %r from %s; expected %s",
+                request_id,
+                client_id,
+                expected_client,
+            )
+            return
+        result = data.get("result")
+        error = data.get("error")
+        if isinstance(error, dict):
+            result = {
+                "error": str(error.get("message") or "Shared service failed"),
+                "error_code": str(error.get("code") or "SHARED_SERVICE_FAILED"),
+            }
+        elif not isinstance(result, dict):
+            result = {
+                "error": "Desktop returned an invalid shared service result",
+                "error_code": "SHARED_RESULT_INVALID",
+            }
+        future = self._shared_service_pending.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(result)
+
     async def send_extension_tool_request(self, request_id: str, action: str, params: dict) -> dict:
         """Compatibility alias for released agent/browser tool code."""
         return await self.send_browser_tool_request(request_id, action, params)
@@ -4188,6 +4324,38 @@ class GatewayServer:
                 "error": error,
             },
         )
+
+    # ------------------------------------------------------------------
+    # RPC: authenticated shared profile services
+    # ------------------------------------------------------------------
+
+    async def _ws_rpc_shared_invoke(
+        self, ws: web.WebSocketResponse, rpc_id: str, params: dict
+    ) -> None:
+        from flowly.shared_service import SharedServiceError, invoke_shared_service
+
+        # A named runtime must reverse-RPC to its authenticated owner.  Serving
+        # this against its profile-local stores would silently fork user data.
+        from flowly.runtime_capabilities import resolve_runtime_capabilities
+
+        if not resolve_runtime_capabilities().owns_shared_board:
+            return await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "SHARED_SERVICE_NOT_OWNER",
+                "Shared services are available only through the primary runtime.",
+            )
+        try:
+            result = await invoke_shared_service(
+                params,
+                board_store=self.board_store,
+                board_orchestrator=self.board_orchestrator,
+                artifact_store=self.artifact_store,
+                artifact_on_change=self._shared_artifact_on_change,
+            )
+        except SharedServiceError as exc:
+            return await self._ws_rpc_error(ws, rpc_id, exc.code, exc.message)
+        await self._ws_rpc_reply(ws, rpc_id, result)
 
     # ------------------------------------------------------------------
     # RPC: artifacts

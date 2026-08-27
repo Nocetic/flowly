@@ -27,6 +27,7 @@ _LOCAL_RUNTIME_CAPABILITIES = (
     "allowed-tools-v1",
     "manager-lease-v2",
     "profile-cron-v1",
+    "shared-services-v1",
 )
 
 
@@ -1740,6 +1741,22 @@ Respond to the user now:"""
 
     agent.tools.register(MessageProfileTool(gateway_server))
 
+    # Named profiles keep private automatic context artifacts in their own
+    # state directory, while their model-facing Board/Artifact tools operate
+    # on the installation's primary stores through authenticated reverse RPC.
+    # Registering under the same names preserves provider schemas and every
+    # existing prompt/tool-routing path.
+    if current_profile_name() != "default":
+        from flowly.agent.tools.shared_service import build_shared_service_tools
+
+        for shared_tool in build_shared_service_tools(
+            gateway_server,
+            local_artifact_store=getattr(agent, "_artifact_store", None),
+        ):
+            if shared_tool.name == "artifact" and getattr(agent, "_artifact_store", None) is None:
+                continue
+            agent.tools.register(shared_tool)
+
     # A standing goal's turns re-enter through each surface's OWN chat entry,
     # so an autonomous turn is indistinguishable from a typed one: the direct
     # gateway reuses its chat runner, the relay reuses chat.send's machinery.
@@ -1779,6 +1796,7 @@ Respond to the user now:"""
                     except Exception:
                         pass  # Non-critical — relay sync is best-effort
             artifact_tool.set_on_change(_broadcast_artifact)
+            gateway_server.set_shared_artifact_on_change(_broadcast_artifact)
             # Share with SubagentManager so subagent artifacts also sync to S3
             agent.subagents._artifact_on_change = _broadcast_artifact
 

@@ -70,6 +70,11 @@ _SAFE_DELEGATED_TOOLS = (
     "session_search",
     "sessions_list",
     "skill_view",
+    # Internal collaboration has no attached approval UI, so it remains
+    # read-only. Named profiles can still inspect the installation Board via
+    # the authenticated shared-service adapter.
+    "board_list",
+    "board_get",
 )
 _PROFILE_TASK_DISABLED_TOOLS = (
     "message_profile",
@@ -239,6 +244,7 @@ class ProfileHost:
         self._terminal_events: dict[tuple[str, str], dict[str, Any]] = {}
         self._broker_target_locks: dict[str, asyncio.Lock] = {}
         self._task_target_locks: dict[str, asyncio.Lock] = {}
+        self._shared_service_locks: dict[str, asyncio.Lock] = {}
         self._broker_sessions: dict[tuple[str, str], str] = {}
         # Private, bounded audit state for hidden Board worker turns.  These
         # events never enter public profile streams or session lists; the
@@ -1111,6 +1117,11 @@ class ProfileHost:
                         self._handle_broker_request(runtime, frame),
                         name=f"profile-broker:{runtime.profile}",
                     )
+                elif frame.get("type") == "shared_service_request":
+                    self._spawn_background(
+                        self._handle_shared_service_request(runtime, frame),
+                        name=f"shared-service:{runtime.profile}",
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1328,6 +1339,65 @@ class ProfileHost:
                 await source.ws.send_json(response)
         except Exception:
             logger.debug("Profile collaboration result could not return to {}", source.profile)
+
+    async def _handle_shared_service_request(
+        self,
+        source: _Runtime,
+        frame: dict[str, Any],
+    ) -> None:
+        """Forward one closed-vocabulary request to the primary runtime."""
+        from flowly.shared_service import SharedServiceError, validate_shared_service_request
+
+        request_id = str(frame.get("id") or "")
+        params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+        try:
+            if str(params.get("sourceProfile") or "").strip() != source.profile:
+                raise SharedServiceError(
+                    "SHARED_SOURCE_INVALID",
+                    "Shared service source failed validation.",
+                )
+            canonical = validate_shared_service_request(params)
+            if self._primary_rpc is None:
+                raise SharedServiceError(
+                    "SHARED_BROKER_UNAVAILABLE",
+                    "The primary shared-service broker is unavailable.",
+                )
+            async with self._shared_service_locks.setdefault(
+                str(canonical["service"]), asyncio.Lock()
+            ):
+                result = await self._primary_rpc("shared.invoke", canonical, 600)
+            response = {
+                "type": "shared_service_result",
+                "id": request_id,
+                "result": result,
+            }
+        except SharedServiceError as exc:
+            response = {
+                "type": "shared_service_result",
+                "id": request_id,
+                "error": {"code": exc.code, "message": exc.message},
+            }
+        except ProfileHostError as exc:
+            response = {
+                "type": "shared_service_result",
+                "id": request_id,
+                "error": {"code": exc.code, "message": exc.message},
+            }
+        except Exception:
+            logger.exception("Shared service failed for {}", source.profile)
+            response = {
+                "type": "shared_service_result",
+                "id": request_id,
+                "error": {
+                    "code": "SHARED_SERVICE_FAILED",
+                    "message": "The shared service operation could not be completed.",
+                },
+            }
+        try:
+            if not source.ws.closed:
+                await source.ws.send_json(response)
+        except Exception:
+            logger.debug("Shared service result could not return to {}", source.profile)
 
     async def _broker(self, source_profile: str, params: dict[str, Any]) -> dict[str, Any]:
         if str(params.get("sourceProfile") or "").strip() != source_profile:

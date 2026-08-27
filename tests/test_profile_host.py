@@ -383,6 +383,46 @@ async def test_wrapped_default_profile_rpc_uses_primary_gateway(profile_roots) -
 
 
 @pytest.mark.asyncio
+async def test_profile_host_forwards_shared_service_with_runtime_bound_source(
+    profile_roots,
+) -> None:
+    primary = AsyncMock(return_value={"ok": True, "output": '{"ok":true}'})
+    host = ProfileHost(primary_rpc=primary)
+
+    class Socket:
+        closed = False
+
+        def __init__(self) -> None:
+            self.frames: list[dict] = []
+
+        async def send_json(self, frame: dict) -> None:
+            self.frames.append(frame)
+
+    socket = Socket()
+    runtime = SimpleNamespace(profile="writer", ws=socket)
+    params = {
+        "service": "artifacts",
+        "tool": "artifact",
+        "arguments": {"action": "list"},
+        "sourceProfile": "writer",
+        "sourceSessionKey": "ios:writer:one",
+        "turnOrigin": "user",
+        "correlationId": "shared-1",
+    }
+    await host._handle_shared_service_request(  # type: ignore[arg-type]
+        runtime,
+        {"id": "shared-1", "params": params},
+    )
+
+    primary.assert_awaited_once_with("shared.invoke", params, 600)
+    assert socket.frames == [{
+        "type": "shared_service_result",
+        "id": "shared-1",
+        "result": {"ok": True, "output": '{"ok":true}'},
+    }]
+
+
+@pytest.mark.asyncio
 async def test_profile_events_include_host_and_bot_identity(profile_roots) -> None:
     profiles.create_profile("writer", local_runtime=True)
     events: list[dict] = []

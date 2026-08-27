@@ -151,6 +151,39 @@ def test_current_profile_name_follows_process_home_not_sticky_selection(
     assert profiles.current_profile_name() == "default"
 
 
+def test_profile_skill_counts_match_runtime_loader(profile_roots, tmp_path, monkeypatch) -> None:
+    default, root = profile_roots
+    from flowly.agent import skills as skills_module
+
+    builtin = tmp_path / "builtin-skills"
+    for parent, name in [
+        (builtin, "bundled"),
+        (default / "skills", "managed"),
+        (default / "workspace" / "skills", "workspace"),
+    ]:
+        skill = parent / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+    # A folder is not a skill unless the runtime loader can find SKILL.md.
+    (default / "skills" / "not-a-skill").mkdir()
+
+    named = root / "writer"
+    duplicate = named / "skills" / "bundled"
+    duplicate.mkdir(parents=True)
+    (duplicate / "SKILL.md").write_text("# override\n", encoding="utf-8")
+    local = named / "workspace" / "skills" / "writer-only"
+    local.mkdir(parents=True)
+    (local / "SKILL.md").write_text("# writer\n", encoding="utf-8")
+
+    monkeypatch.setattr(skills_module, "BUILTIN_SKILLS_DIR", builtin)
+
+    listed = {item.name: item for item in profiles.list_profiles()}
+    assert listed["default"].skill_count == 3
+    assert listed["writer"].skill_count == 2
+    assert listed["default"].to_public_dict()["skillCount"] == 3
+    assert listed["default"].to_public_dict()["skillCountVerified"] is True
+
+
 def test_clone_all_does_not_copy_machine_or_runtime_identity(profile_roots) -> None:
     default, root = profile_roots
     (default / "sessions").mkdir()

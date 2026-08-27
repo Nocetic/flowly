@@ -380,3 +380,66 @@ def test_telegram_polling_network_error_is_warning_not_traceback() -> None:
 
     levels = [r["level"].name for r in records]
     assert levels == ["WARNING", "ERROR"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_stop_is_idempotent_and_filters_only_cleanup_noise() -> None:
+    """Shutdown closes PTB once and suppresses only its known cleanup traceback."""
+    import logging
+
+    from flowly.channels.telegram import _TELEGRAM_CLEANUP_ERROR_PREFIX
+
+    calls: list[str] = []
+    updater_logger = logging.getLogger("telegram.ext.Updater")
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    class FakeUpdater:
+        running = True
+
+        async def stop(self) -> None:
+            calls.append("updater.stop")
+            self.running = False
+            updater_logger.error(_TELEGRAM_CLEANUP_ERROR_PREFIX + " Suppressed by PTB.")
+            updater_logger.error("A real updater failure")
+
+    class FakeApplication:
+        updater = FakeUpdater()
+
+        async def stop(self) -> None:
+            calls.append("app.stop")
+
+        async def shutdown(self) -> None:
+            calls.append("app.shutdown")
+
+    capture = Capture()
+    updater_logger.addHandler(capture)
+    try:
+        channel = TelegramChannel(TelegramConfig(enabled=True), MessageBus())
+        channel._app = FakeApplication()
+
+        await channel.stop()
+        await channel.stop()
+    finally:
+        updater_logger.removeHandler(capture)
+
+    assert calls == ["updater.stop", "app.stop", "app.shutdown"]
+    assert [record.getMessage() for record in records] == ["A real updater failure"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_uses_short_get_updates_cleanup_timeout() -> None:
+    """Normal long polling adds its timeout; the final cleanup stays prompt."""
+    from flowly.channels.telegram import TELEGRAM_GET_UPDATES_READ_TIMEOUT
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123456:test-token"),
+        MessageBus(),
+    )
+    app = channel._build_application()
+
+    assert app.bot._request[0].read_timeout == TELEGRAM_GET_UPDATES_READ_TIMEOUT
+    await app.bot.shutdown()
