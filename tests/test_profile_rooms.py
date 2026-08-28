@@ -476,6 +476,128 @@ async def test_failed_member_does_not_advance_durable_watermark(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_stop_checkpoints_partial_member_reply_as_aborted_history(tmp_path: Path) -> None:
+    path = tmp_path / "rooms.json"
+    events: list[dict[str, Any]] = []
+
+    async def rpc(profile: str, method: str, _params: dict[str, Any], _timeout: float):
+        if method == "chat.send":
+            return {"runId": f"partial-{profile}"}
+        return {"ok": True}
+
+    service = ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=events.append,
+        store_path=path,
+    )
+    room = await service.create("Council", ["default", "writer"])
+    await service.send(room["id"], "@writer explain this")
+    await _eventually(lambda: bool(service._waiters))
+
+    session_key = f"desktop:profile-room:{room['id']}"
+    await service.handle_profile_event("writer", "agent", {
+        "sessionKey": session_key,
+        "runId": "partial-writer",
+        "stream": "tool",
+        "data": {
+            "phase": "start",
+            "toolCallId": "read-1",
+            "name": "read_file",
+            "argumentsJson": '{"path":"/workspace/report.md"}',
+        },
+    })
+    await service.handle_profile_event("writer", "agent", {
+        "sessionKey": session_key,
+        "runId": "partial-writer",
+        "stream": "assistant",
+        "data": {"text": "Here is the part I finished"},
+    })
+
+    await service.stop(room["id"])
+    settled = (await service.list())[0]
+    reply = settled["messages"][-1]
+    assert reply["role"] == "assistant"
+    assert reply["profile"] == "writer"
+    assert reply["content"] == "Here is the part I finished"
+    assert reply["aborted"] is True
+    assert isinstance(reply["durationMs"], int)
+    assert reply["toolCalls"] == [{
+        "id": "read-1",
+        "name": "read_file",
+        "argumentsJson": '{"path":"/workspace/report.md"}',
+    }]
+    assert settled["running"] is False
+    assert settled["runState"]["state"] == "aborted"
+    assert service._rooms[room["id"]]["watermarks"]["writer"] == 1
+
+    # A terminal frame racing the stop acknowledgement is stale. It must not
+    # erase the checkpoint or append a second copy of the same member turn.
+    await service.handle_profile_event("writer", "chat", {
+        "sessionKey": session_key,
+        "runId": "partial-writer",
+        "state": "aborted",
+        "message": {"content": "Here is the part I finished"},
+    })
+    assert len((await service.list())[0]["messages"]) == 2
+
+    reloaded = ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=None,
+        store_path=path,
+    )
+    durable = (await reloaded.list())[0]["messages"][-1]
+    assert durable["content"] == "Here is the part I finished"
+    assert durable["aborted"] is True
+    assert any(event.get("type") == "run-state" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_stop_keeps_terminal_text_while_member_commit_is_in_flight(tmp_path: Path) -> None:
+    async def rpc(profile: str, method: str, _params: dict[str, Any], _timeout: float):
+        if method == "chat.send":
+            return {"runId": f"terminal-{profile}"}
+        return {"ok": True}
+
+    service = ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=None,
+        store_path=tmp_path / "rooms.json",
+    )
+    room = await service.create("Council", ["default", "writer"])
+
+    commit_entered = asyncio.Event()
+    release_commit = asyncio.Event()
+    original_commit = service._commit_member_terminal
+
+    async def blocked_commit(*args: Any, **kwargs: Any) -> str:
+        commit_entered.set()
+        await release_commit.wait()
+        return await original_commit(*args, **kwargs)
+
+    service._commit_member_terminal = blocked_commit  # type: ignore[method-assign]
+    await service.send(room["id"], "@writer answer")
+    await _eventually(lambda: bool(service._waiters))
+    await service.handle_profile_event("writer", "chat", {
+        "sessionKey": f"desktop:profile-room:{room['id']}",
+        "runId": "terminal-writer",
+        "state": "final",
+        "message": {"content": "The final frame arrived first"},
+    })
+    await asyncio.wait_for(commit_entered.wait(), 1)
+
+    await service.stop(room["id"])
+    release_commit.set()
+    await asyncio.sleep(0)
+
+    reply = (await service.list())[0]["messages"][-1]
+    assert reply["content"] == "The final frame arrived first"
+    assert reply["aborted"] is True
+
+
+@pytest.mark.asyncio
 async def test_restart_marks_interrupted_run_stranded_without_losing_attention(
     tmp_path: Path,
 ) -> None:

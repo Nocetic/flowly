@@ -418,6 +418,11 @@ class ProfileRoomService:
         self._attentions: dict[str, dict[str, dict[str, Any]]] = {}
         self._pending_attachments: dict[str, tuple[int, list[dict[str, str]]]] = {}
         self._epochs: dict[str, int] = {}
+        # Stop is a small transaction: freeze incoming frames, checkpoint the
+        # visible partials, then abort the member runtimes.  Without this gate a
+        # delta can land while the durable checkpoint is being written and be
+        # erased by ``_drop_live`` without ever reaching group history.
+        self._stopping: set[str] = set()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._live_publish_tasks: dict[str, asyncio.Task[None]] = {}
         self._load_lock = asyncio.Lock()
@@ -971,36 +976,78 @@ class ProfileRoomService:
     async def stop(self, raw_id: Any) -> None:
         room_id = _room_id(raw_id)
         await self._load()
-        self._require(room_id)
-        self._epochs[room_id] = self._epochs.get(room_id, 0) + 1
-        self._pending_attachments.pop(room_id, None)
+        room = self._require(room_id)
+        if room_id in self._stopping:
+            return
+
+        previous_epoch = self._epochs.get(room_id)
+        previous_messages = list(room["messages"])
+        previous_watermarks = dict(room["watermarks"])
+        previous_run = json.loads(json.dumps(room.get("run"))) if room.get("run") else None
+        previous_updated_at = room["updatedAt"]
+        previous_pending = self._pending_attachments.get(room_id)
         runs = list(self._runs.get(room_id, {}).items())
-        for profile, run_id in runs:
-            waiter = self._waiters.pop((profile, run_id), None)
-            if waiter and not waiter.done():
-                waiter.set_exception(ProfileHostError("ROOM_STOPPED", "The group response was stopped."))
-        await asyncio.gather(*(
-            self._target_rpc(profile, "chat.abort", {"runId": run_id}, 30)
-            for profile, run_id in runs
-        ), return_exceptions=True)
-        room = self._rooms[room_id]
-        run = room.get("run")
-        if isinstance(run, dict) and run.get("state") == "running":
-            for member in run.get("members", {}).values():
-                if isinstance(member, dict) and member.get("state") in {
-                    "queued", "running", "needs_user",
-                }:
-                    member.update({
-                        "state": "aborted",
-                        "updatedAt": _now(),
-                        "error": "The group response was stopped.",
-                    })
-            run["state"] = "aborted"
-            run["finishedAt"] = _now()
-            room["updatedAt"] = run["finishedAt"]
-            await self._persist()
-        self._drop_live(room_id)
-        await self._emit({"roomId": room_id, "type": "run-state", "room": self._public(self._rooms[room_id])})
+        self._stopping.add(room_id)
+        try:
+            finished_at = _now()
+            self._checkpoint_aborted_messages(room_id, finished_at)
+            self._epochs[room_id] = self._epochs.get(room_id, 0) + 1
+            self._pending_attachments.pop(room_id, None)
+            run = room.get("run")
+            if isinstance(run, dict) and run.get("state") == "running":
+                for member in run.get("members", {}).values():
+                    if isinstance(member, dict) and member.get("state") in {
+                        "queued", "running", "needs_user",
+                    }:
+                        member.update({
+                            "state": "aborted",
+                            "updatedAt": finished_at,
+                            "error": "The group response was stopped.",
+                        })
+                run["state"] = "aborted"
+                run["finishedAt"] = finished_at
+                room["updatedAt"] = finished_at
+            try:
+                await self._persist()
+            except Exception:
+                room["messages"] = previous_messages
+                room["watermarks"] = previous_watermarks
+                if previous_run is None:
+                    room.pop("run", None)
+                else:
+                    room["run"] = previous_run
+                room["updatedAt"] = previous_updated_at
+                if previous_epoch is None:
+                    self._epochs.pop(room_id, None)
+                else:
+                    self._epochs[room_id] = previous_epoch
+                if previous_pending is None:
+                    self._pending_attachments.pop(room_id, None)
+                else:
+                    self._pending_attachments[room_id] = previous_pending
+                raise
+
+            # Only retire waiters after the partial transcript is durable.  A
+            # failed store write therefore leaves the live run recoverable and
+            # the caller receives an honest stop failure instead of silent loss.
+            for profile, run_id in runs:
+                waiter = self._waiters.pop((profile, run_id), None)
+                if waiter and not waiter.done():
+                    waiter.set_exception(ProfileHostError(
+                        "ROOM_STOPPED", "The group response was stopped."
+                    ))
+            await asyncio.gather(*(
+                self._target_rpc(profile, "chat.abort", {"runId": run_id}, 30)
+                for profile, run_id in runs
+            ), return_exceptions=True)
+            self._drop_live(room_id)
+            await self._emit({
+                "roomId": room_id,
+                "type": "run-state",
+                "room": self._public(self._rooms[room_id]),
+            })
+        finally:
+            self._stopping.discard(room_id)
 
     async def stop_for_profile(self, profile: str) -> None:
         await self._load()
@@ -1079,6 +1126,11 @@ class ProfileRoomService:
             run_id = self._runs.get(room_id, {}).get(profile, "")
         if not room_id or room_id not in self._rooms:
             return False
+        if room_id in self._stopping:
+            # The stop transaction already captured the last published prefix.
+            # Frames racing the durable write belong to the cancelled run and
+            # must not resurrect its live bubble or create a duplicate message.
+            return True
         if (
             profile not in self._active.get(room_id, set())
             and self._runs.get(room_id, {}).get(profile) != run_id
@@ -1157,8 +1209,11 @@ class ProfileRoomService:
             return True
         if state not in {"final", "aborted", "error"}:
             return True
-        self._waiters.pop(key, None)
-        self._streams.get(room_id, {}).pop(profile, None)
+        # Keep the terminal and its last published prefix reachable until the
+        # member task durably commits it.  Stop can race the tiny window
+        # between this frame and ``_commit_member_terminal``; removing either
+        # here used to turn an already-visible answer into an empty stopped
+        # row.  ``_finish_member`` owns the cleanup after commit/abort.
         if waiter.done():
             return True
         if state == "final":
@@ -1652,6 +1707,71 @@ class ProfileRoomService:
             key: value for key, value in attentions.items()
             if value["profile"] != profile
         }
+
+    def _checkpoint_aborted_messages(self, room_id: str, finished_at: str) -> None:
+        """Persist each accepted member's visible prefix before clearing live state.
+
+        This mirrors direct chat's abort contract: a stopped assistant turn is
+        still a durable timeline event, tool history stays attached, and the
+        delivery watermark advances only for members that actually accepted the
+        turn.  The method is synchronous so no stream frame can interleave with
+        the snapshot on the event loop.
+        """
+        room = self._rooms[room_id]
+        run = room.get("run") if isinstance(room.get("run"), dict) else {}
+        members = run.get("members") if isinstance(run, dict) else {}
+        started_at = str(run.get("startedAt") or "") if isinstance(run, dict) else ""
+        duration_ms = self._elapsed_ms(started_at, finished_at)
+        accepted = set(self._runs.get(room_id, {}))
+        streams = self._streams.get(room_id, {})
+
+        for profile in room["members"]:
+            member = members.get(profile) if isinstance(members, dict) else None
+            gateway_run_id = str(member.get("gatewayRunId") or "") if isinstance(member, dict) else ""
+            if profile not in accepted and not gateway_run_id:
+                continue
+            content = str(streams.get(profile) or "")
+            run_id = self._runs.get(room_id, {}).get(profile, "")
+            waiter = self._waiters.get((profile, run_id)) if run_id else None
+            if not content and waiter is not None and waiter.done() and not waiter.cancelled():
+                # A final frame may have arrived but not yet reached the
+                # durable commit. Preserve its authoritative text when Stop
+                # wins that race. Failed/aborted futures raise here and simply
+                # fall back to the visible stream prefix.
+                try:
+                    terminal = waiter.result()
+                except Exception:
+                    terminal = None
+                if isinstance(terminal, dict):
+                    content = _final_text(terminal)
+            calls = self._tool_calls(room_id, profile)
+            message: dict[str, Any] = {
+                "id": str(uuid.uuid4()),
+                "role": "assistant",
+                "profile": profile,
+                "content": content,
+                "createdAt": finished_at,
+                "aborted": True,
+            }
+            if duration_ms is not None:
+                message["durationMs"] = duration_ms
+            if calls:
+                message["toolCalls"] = calls
+                message["tools"] = [call["name"] for call in calls]
+            room["messages"].append(message)
+            boundary = int(member.get("boundary", len(room["messages"]))) if isinstance(member, dict) else len(room["messages"])
+            room["watermarks"][profile] = min(boundary, len(room["messages"]))
+
+        self._trim(room)
+
+    @staticmethod
+    def _elapsed_ms(started_at: str, finished_at: str) -> int | None:
+        try:
+            started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            finished = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+        except (AttributeError, ValueError):
+            return None
+        return max(0, min(int((finished - started).total_seconds() * 1000), 2_147_483_647))
 
     def _current(self, room_id: str, epoch: int) -> bool:
         return (
@@ -2431,6 +2551,18 @@ class ProfileRoomService:
                 for tool in tools
             ):
                 raise ValueError("invalid tools")
+            aborted = message.get("aborted", False)
+            if not isinstance(aborted, bool) or (aborted and role != "assistant"):
+                raise ValueError("invalid aborted message state")
+            duration_ms = message.get("durationMs")
+            if duration_ms is not None and (
+                role != "assistant"
+                or isinstance(duration_ms, bool)
+                or not isinstance(duration_ms, int)
+                or duration_ms < 0
+                or duration_ms > 2_147_483_647
+            ):
+                raise ValueError("invalid message duration")
             clean: dict[str, Any] = {
                 "id": message_id,
                 "role": role,
@@ -2445,6 +2577,10 @@ class ProfileRoomService:
                 clean["toolCalls"] = clean_calls
             if tools:
                 clean["tools"] = list(tools)
+            if aborted:
+                clean["aborted"] = True
+            if duration_ms is not None:
+                clean["durationMs"] = duration_ms
             normalized.append(clean)
         messages[:] = normalized
 
