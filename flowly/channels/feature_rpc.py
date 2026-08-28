@@ -469,6 +469,106 @@ def config_set(params: dict) -> dict:
     return {"ok": True, "willRestart": bool(params.get("restart"))}
 
 
+# ── Model tool access (safe settings projection) ───────────────────────────
+
+
+def _tool_access_payload() -> dict:
+    from flowly.agent.tools.routing import ALL_BUILTIN_TOOLSETS
+    from flowly.config.loader import load_config
+
+    cfg = load_config()
+    registry = _tool_access_registry()
+    toolsets: dict[str, str] = {}
+    if registry is not None:
+        try:
+            toolsets = {
+                str(name): str(toolset)
+                for name, toolset in registry.get_toolsets().items()
+                if str(name).strip() and str(toolset).strip()
+            }
+        except Exception:
+            toolsets = {}
+
+    disabled = {
+        str(value).strip().lower()
+        for value in cfg.tools.routing.disabled_toolsets
+        if str(value).strip()
+    }
+    known = set(ALL_BUILTIN_TOOLSETS) | set(toolsets.values()) | disabled
+    groups = []
+    for name in sorted(known):
+        tools = sorted(tool for tool, toolset in toolsets.items() if toolset == name)
+        groups.append({
+            "name": name,
+            "enabled": name not in disabled,
+            "available": bool(tools),
+            "tools": tools,
+        })
+    return {
+        "groups": groups,
+        "disabledToolsets": sorted(disabled),
+    }
+
+
+def tools_access_get() -> dict:
+    """Return the sanitized, live model-tool access policy."""
+    return _tool_access_payload()
+
+
+async def tools_access_set(params: dict) -> dict:
+    """Replace the owner-controlled toolset denylist and apply it live.
+
+    This is intentionally deny-only. Enabling a group merely removes the
+    owner's extra block; it cannot bypass runtime ownership rules, unavailable
+    integrations, per-turn capability grants, or platform safety boundaries.
+    """
+    import inspect
+
+    from flowly.agent.tools.routing import ALL_BUILTIN_TOOLSETS
+    from flowly.config.loader import load_config, save_config
+
+    raw = params.get("disabledToolsets")
+    if not isinstance(raw, list) or any(not isinstance(value, str) for value in raw):
+        raise FeatureRpcError("INVALID", "disabledToolsets must be a list of names")
+
+    registry = _tool_access_registry()
+    live_toolsets: set[str] = set()
+    if registry is not None:
+        try:
+            live_toolsets = {
+                str(value).strip().lower()
+                for value in registry.get_toolsets().values()
+                if str(value).strip()
+            }
+        except Exception:
+            live_toolsets = set()
+    allowed = set(ALL_BUILTIN_TOOLSETS) | live_toolsets
+    disabled = {value.strip().lower() for value in raw if value.strip()}
+    unknown = sorted(disabled - allowed)
+    if unknown:
+        raise FeatureRpcError("INVALID", f"unknown tool groups: {', '.join(unknown)}")
+
+    cfg = load_config()
+    cfg.tools.routing.disabled_toolsets = sorted(disabled)
+    save_config(cfg)
+
+    will_restart = _tool_access_reload_cb is None
+    if _tool_access_reload_cb is not None:
+        try:
+            result = _tool_access_reload_cb()
+            if inspect.isawaitable(result):
+                await result
+            will_restart = False
+        except Exception:
+            will_restart = True
+
+    return {
+        "ok": True,
+        "willRestart": will_restart,
+        **_tool_access_payload(),
+    }
+
+
 # ── Optional local semantic tool routing ───────────────────────────────────
 
 
@@ -1418,6 +1518,31 @@ def set_codex_reload_callback(cb) -> None:
     on_codex_reload)."""
     global _codex_reload_cb
     _codex_reload_cb = cb
+
+
+# The live model-facing tool registry plus a lightweight config refresh hook.
+# ``tools.access.*`` deliberately exposes only tool names/toolset membership
+# and an owner-controlled denylist — never schemas, credentials, paths, or raw
+# config.json. Keeping this purpose-built is important because ``config.get``
+# may contain provider secrets and must not become a renderer settings API.
+_tool_access_provider = None
+_tool_access_reload_cb = None
+
+
+def set_tool_access_provider(provider, reload_cb=None) -> None:
+    """Register the live ``ToolRegistry`` and an optional config reload hook."""
+    global _tool_access_provider, _tool_access_reload_cb
+    _tool_access_provider = provider
+    _tool_access_reload_cb = reload_cb
+
+
+def _tool_access_registry():
+    if _tool_access_provider is None:
+        return None
+    try:
+        return _tool_access_provider()
+    except Exception:
+        return None
 
 
 # Returns ``(board_store, board_orchestrator)`` — the agent's single-writer
@@ -4419,6 +4544,8 @@ _DISPATCH: dict[str, tuple] = {
     "plan.mode.set": (plan_mode_set, True, False),
     "config.get": (config_get, False, False),
     "config.set": (config_set, True, True),
+    "tools.access.get": (tools_access_get, False, False),
+    "tools.access.set": (tools_access_set, True, True),
     "tools.semantic.status": (semantic_tool_routing_status, False, False),
     "tools.semantic.enable": (semantic_tool_routing_enable, True, True),
     "tools.semantic.dismiss": (semantic_tool_routing_dismiss, True, False),

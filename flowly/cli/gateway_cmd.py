@@ -1651,6 +1651,15 @@ Respond to the user now:"""
         # feature_rpc.codex_policy_set avoid a gateway restart.
         return await agent.reload_codex_session_config()
 
+    def on_tool_access_reload() -> None:
+        # Toolset deny rules are evaluated for every model turn and again at
+        # execution. Refreshing the in-memory config is therefore enough to
+        # apply an owner change without reconstructing the tool registry.
+        from flowly.config.loader import load_config
+
+        agent._main_config = load_config()
+        agent.tools.invalidate_availability()
+
     try:
         from flowly.channels import feature_rpc as _feature_rpc
         # chat.compact over the shared surface: relay clients (iOS, Desktop)
@@ -1660,6 +1669,10 @@ Respond to the user now:"""
         # Codex policy (codex.policy.set) applied live — drop warm sessions +
         # re-register the tool so the next turn spawns with the new config.
         _feature_rpc.set_codex_reload_callback(on_codex_reload)
+        _feature_rpc.set_tool_access_provider(
+            lambda: agent.tools,
+            on_tool_access_reload,
+        )
         # Board RPC (board.snapshot / board.action) over relay + gateway.
         _feature_rpc.set_board_provider(
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None))
