@@ -33,6 +33,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from filelock import FileLock
+
 # ── Constants ──────────────────────────────────────────────────────
 
 _ENV_VAR = "FLOWLY_HOME"
@@ -69,14 +71,22 @@ _CLONE_ALL_STRIP = [
 _PROFILE_METADATA_FILE = "profile.json"
 _PROFILE_HOST_FILE = "profile-host.json"
 _RUNTIME_LEASE_FILE = ".desktop-runtime.json"
+_PROFILE_MUTATION_LOCK_FILE = ".profiles.lock"
+MAX_NAMED_PROFILES = 15
 _MAX_SOUL_BYTES = 64 * 1024
 _MAX_MODEL_LENGTH = 256
 _MAX_IMPORT_MEMBERS = 20_000
 _MAX_IMPORT_BYTES = 512 * 1024 * 1024
+_BACKUP_MAGIC = b"FLOWLY-BACKUP\x00\x01"
+_BACKUP_SALT_BYTES = 16
+_BACKUP_NONCE_BYTES = 12
+_BACKUP_TAG_BYTES = 16
+_BACKUP_CHUNK_BYTES = 1024 * 1024
 _PROFILE_MARK_TONES = frozenset({
     "aqua", "violet", "rose", "amber", "lime", "sky", "slate",
 })
 _PROFILE_MARK_COLOR_RE = re.compile(r"^#[0-9a-f]{6}$")
+_NAMED_PROFILE_CREDENTIAL_POLICY = "isolated"
 _LOCAL_RUNTIME_ENV_ALLOW = frozenset({
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -90,6 +100,34 @@ _LOCAL_RUNTIME_ENV_ALLOW = frozenset({
     "ZHIPUAI_API_KEY",
     "VLLM_API_KEY",
 })
+
+
+class ProfileLimitError(ValueError):
+    """Raised when an installation reached its named-profile product limit."""
+
+
+class ProfileIdentityConflictError(ValueError):
+    """Raised when a restore would publish a duplicate stable bot identity."""
+
+
+def _assert_named_profile_capacity() -> None:
+    count = sum(
+        1
+        for candidate in _PROFILES_ROOT.iterdir()
+        if candidate.is_dir()
+        and not candidate.is_symlink()
+        and _PROFILE_NAME_RE.fullmatch(candidate.name)
+    )
+    if count >= MAX_NAMED_PROFILES:
+        raise ProfileLimitError(
+            f"This installation can contain at most {MAX_NAMED_PROFILES} bots. "
+            "Delete one before creating another."
+        )
+
+
+def _profile_mutation_lock() -> FileLock:
+    _PROFILES_ROOT.mkdir(parents=True, exist_ok=True)
+    return FileLock(str(_PROFILES_ROOT / _PROFILE_MUTATION_LOCK_FILE))
 
 
 # ── Path resolution ───────────────────────────────────────────────
@@ -282,6 +320,7 @@ class ProfileInfo:
     created_at: str = ""
     updated_at: str = ""
     bot_id: str = ""
+    credential_policy: str = ""
 
     def to_dict(self) -> dict:
         """Return the stable, JSON-safe profile descriptor used by clients."""
@@ -299,6 +338,7 @@ class ProfileInfo:
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "botId": self.bot_id,
+            "credentialPolicy": self.credential_policy,
         }
         if self.skill_count is not None:
             value["skillCount"] = self.skill_count
@@ -469,6 +509,11 @@ def _metadata_for(name: str, profile_dir: Path, *, is_default: bool) -> dict:
         "created_at": str(meta.get("createdAt") or "").strip(),
         "updated_at": str(meta.get("updatedAt") or "").strip(),
         "bot_id": str(meta.get("botId") or "").strip(),
+        "credential_policy": (
+            "primary"
+            if is_default
+            else _NAMED_PROFILE_CREDENTIAL_POLICY
+        ),
     }
 
 
@@ -578,8 +623,10 @@ def create_profile(
         raise ValueError("Cannot create a profile named 'default'.")
 
     profile_dir = _PROFILES_ROOT / name
-    if profile_dir.exists() or profile_dir.is_symlink():
-        raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
+    with _profile_mutation_lock():
+        if profile_dir.exists() or profile_dir.is_symlink():
+            raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
+        _assert_named_profile_capacity()
 
     # Resolve clone source
     source_dir = None
@@ -670,11 +717,19 @@ def create_profile(
             "createdAt": now,
             "updatedAt": now,
             "localRuntime": bool(local_runtime),
+            "credentialPolicy": _NAMED_PROFILE_CREDENTIAL_POLICY,
         })
 
         # Publishing the completed directory is the commit point. A crash
         # before this line leaves only a hidden temp dir, never a half-profile.
-        os.replace(temp_dir, profile_dir)
+        # Count and publication share a cross-process lock. Desktop and CLI
+        # can both create profiles, so checking only before staging would let
+        # concurrent processes race beyond the installation limit.
+        with _profile_mutation_lock():
+            if profile_dir.exists() or profile_dir.is_symlink():
+                raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
+            _assert_named_profile_capacity()
+            os.replace(temp_dir, profile_dir)
         try:
             profile_dir.chmod(0o700)
         except OSError:
@@ -801,6 +856,9 @@ def ensure_profile_bot_id(name: str) -> ProfileInfo:
             "markTone": str(current.get("markTone") or profile.mark_tone),
             "createdAt": str(current.get("createdAt") or profile.created_at or now),
             "updatedAt": str(current.get("updatedAt") or profile.updated_at or now),
+            "credentialPolicy": (
+                "primary" if profile.is_default else _NAMED_PROFILE_CREDENTIAL_POLICY
+            ),
         })
         _atomic_write_json(profile.path / _PROFILE_METADATA_FILE, current)
         profile = describe_profile(name)
@@ -858,6 +916,9 @@ def update_profile_metadata(
         ),
         "createdAt": str(current.get("createdAt") or profile.created_at or now),
         "updatedAt": now,
+        "credentialPolicy": (
+            "primary" if profile.is_default else _NAMED_PROFILE_CREDENTIAL_POLICY
+        ),
     })
     _atomic_write_json(profile.path / _PROFILE_METADATA_FILE, current)
     return describe_profile(name)
@@ -883,6 +944,9 @@ def read_profile_settings(name: str) -> dict:
         "model": str(defaults.get("model") or "").strip(),
         "soul": soul,
         "workspace": str(profile.path / "workspace"),
+        "credentialPolicy": (
+            "primary" if profile.is_default else _NAMED_PROFILE_CREDENTIAL_POLICY
+        ),
     }
 
 
@@ -1351,7 +1415,7 @@ def delete_profile(name: str) -> None:
 # ── Export / Import ───────────────────────────────────────────────
 
 def export_profile(name: str, output_path: str) -> Path:
-    """Export a profile to an atomically-written portable tar.gz archive.
+    """Export a complete *sensitive* profile to an unencrypted tar archive.
 
     Runtime leases are machine/process credentials, not profile data. The
     default home also owns the named-profile directory and active CLI pointer;
@@ -1359,8 +1423,6 @@ def export_profile(name: str, output_path: str) -> Path:
     rather than dereferenced so an archive can never pull in data from outside
     the isolated profile tree.
     """
-    import tarfile
-
     if name != "default":
         validate_profile_name(name)
     profile_dir = _PROFILES_ROOT / name if name != "default" else _DEFAULT_HOME
@@ -1388,37 +1450,71 @@ def export_profile(name: str, output_path: str) -> Path:
     if name == "default":
         excluded_roots.update({"profiles", "active_profile"})
 
+    return _write_profile_archive(name, profile_dir, target, excluded_roots)
+
+
+def _write_profile_archive(
+    name: str,
+    profile_dir: Path,
+    target: Path,
+    excluded_roots: set[str] | None = None,
+) -> Path:
+    import tarfile
+
+    excluded = excluded_roots or set()
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
     )
     os.close(fd)
     temporary = Path(temporary_name)
     try:
-        with tarfile.open(temporary, "w:gz") as bundle:
-            root_info = tarfile.TarInfo(name)
-            root_info.type = tarfile.DIRTYPE
-            root_info.mode = 0o700
-            root_info.mtime = int(time.time())
-            bundle.addfile(root_info)
-            for candidate in sorted(profile_dir.rglob("*")):
-                relative = candidate.relative_to(profile_dir)
-                if relative.parts[0] in excluded_roots:
-                    continue
-                metadata = candidate.lstat()
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise ValueError(
-                        f"Profile export contains a symbolic link: {relative.as_posix()}"
+        with tempfile.TemporaryDirectory(prefix=".flowly-archive-sqlite-") as raw_stage:
+            sqlite_source = profile_dir / "profile-rooms.sqlite3"
+            sqlite_snapshot: Path | None = None
+            if sqlite_source.exists():
+                if sqlite_source.is_symlink() or not sqlite_source.is_file():
+                    raise ValueError("Profile room database is not a regular file.")
+                from flowly.profile_room_store import SQLiteRoomStore
+
+                sqlite_snapshot = Path(raw_stage) / "profile-rooms.sqlite3"
+                SQLiteRoomStore(sqlite_source).backup_to(sqlite_snapshot)
+            with tarfile.open(temporary, "w:gz") as bundle:
+                root_info = tarfile.TarInfo(name)
+                root_info.type = tarfile.DIRTYPE
+                root_info.mode = 0o700
+                root_info.mtime = int(time.time())
+                bundle.addfile(root_info)
+                for candidate in sorted(profile_dir.rglob("*")):
+                    relative = candidate.relative_to(profile_dir)
+                    if relative.parts[0] in excluded:
+                        continue
+                    if relative.as_posix() in {
+                        "profile-rooms.sqlite3-wal",
+                        "profile-rooms.sqlite3-shm",
+                        ".profile-rooms.sqlite3.migration.lock",
+                    }:
+                        continue
+                    metadata = candidate.lstat()
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise ValueError(
+                            f"Profile export contains a symbolic link: {relative.as_posix()}"
+                        )
+                    if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                        raise ValueError(
+                            f"Profile export contains an unsupported entry: {relative.as_posix()}"
+                        )
+                    archive_source = (
+                        sqlite_snapshot
+                        if relative.as_posix() == "profile-rooms.sqlite3"
+                        and sqlite_snapshot is not None
+                        else candidate
                     )
-                if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
-                    raise ValueError(
-                        f"Profile export contains an unsupported entry: {relative.as_posix()}"
+                    bundle.add(
+                        archive_source,
+                        arcname=(Path(name) / relative).as_posix(),
+                        recursive=False,
+                        filter=lambda info: _portable_profile_tar_info(info),
                     )
-                bundle.add(
-                    candidate,
-                    arcname=(Path(name) / relative).as_posix(),
-                    recursive=False,
-                    filter=lambda info: _portable_profile_tar_info(info),
-                )
         os.replace(temporary, target)
         try:
             target.chmod(0o600)
@@ -1428,6 +1524,257 @@ def export_profile(name: str, output_path: str) -> Path:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+_TEMPLATE_EXCLUDED_ROOTS = frozenset({
+    _RUNTIME_LEASE_FILE,
+    ".env",
+    "credentials",
+    "mcp-tokens",
+    "sessions",
+    "logs",
+    "audit",
+    "trajectories",
+    "subagents",
+    "screenshots",
+    "media",
+    "cron",
+    "session_index.sqlite",
+    "session_index.sqlite-wal",
+    "session_index.sqlite-shm",
+    "profile-rooms.json",
+    "profile-rooms.sqlite3",
+    "profile-rooms.sqlite3-wal",
+    "profile-rooms.sqlite3-shm",
+    ".profile-rooms.sqlite3.migration.lock",
+    "profiles",
+    "active_profile",
+})
+_SECRET_CONFIG_KEY_RE = re.compile(
+    r"(?:api[_-]?key|account[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"auth[_-]?token|token|"
+    r"client[_-]?secret|password|secret|private[_-]?key)$",
+    re.IGNORECASE,
+)
+_TEXT_SECRET_PATTERNS = (
+    re.compile(
+        r"(?im)^([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*)"
+        r"\s*=\s*[^\r\n]+$"
+    ),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\b(?:sk|xai|ghp|github_pat)_[A-Za-z0-9_-]{20,}\b"),
+)
+
+
+def export_profile_template(name: str, output_path: str) -> Path:
+    """Export a credential-free profile template safe for deliberate sharing."""
+    if name != "default":
+        validate_profile_name(name)
+    profile_dir = _PROFILES_ROOT / name if name != "default" else _DEFAULT_HOME
+    if not profile_dir.is_dir() or profile_dir.is_symlink():
+        raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    lease = read_runtime_lease(profile_dir)
+    if lease:
+        raise RuntimeError(
+            f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before export."
+        )
+    raw_output = str(output_path)
+    target = Path(
+        raw_output
+        if raw_output.endswith((".tar.gz", ".tgz"))
+        else f"{raw_output}.flowly-profile.tar.gz"
+    ).expanduser()
+    if not target.parent.is_dir():
+        raise FileNotFoundError(f"Export directory does not exist: {target.parent}")
+    resolved_profile = profile_dir.resolve()
+    resolved_target = target.resolve(strict=False)
+    if resolved_target == resolved_profile or resolved_profile in resolved_target.parents:
+        raise ValueError("Profile exports must be written outside the profile directory.")
+    _assert_tree_no_symlinks(
+        profile_dir,
+        ignored_top_level=set(_TEMPLATE_EXCLUDED_ROOTS),
+    )
+    with tempfile.TemporaryDirectory(prefix=".flowly-template-") as raw_stage:
+        staged = Path(raw_stage) / name
+
+        def ignore(source: str, children: list[str]) -> set[str]:
+            relative = Path(source).relative_to(profile_dir)
+            ignored: set[str] = set()
+            if relative == Path("."):
+                ignored.update(child for child in children if child in _TEMPLATE_EXCLUDED_ROOTS)
+                ignored.update(
+                    child for child in children if child.endswith("-credentials.json")
+                )
+            if relative == Path("workspace"):
+                ignored.update(child for child in children if child in {"memory", "USER.md"})
+            return ignored
+
+        shutil.copytree(profile_dir, staged, ignore=ignore)
+        _sanitize_template_tree(staged)
+        return _write_profile_archive(name, staged, target)
+
+
+def _sanitize_template_tree(root: Path) -> None:
+    config_path = root / "config.json"
+    if config_path.exists():
+        config = _load_config_object(config_path)
+
+        def redact(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: "" if _SECRET_CONFIG_KEY_RE.search(str(key)) else redact(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
+        config = redact(config)
+        channels = config.get("channels")
+        if isinstance(channels, dict):
+            for channel in channels.values():
+                if isinstance(channel, dict):
+                    channel["enabled"] = False
+        gateway = config.get("gateway")
+        if isinstance(gateway, dict):
+            gateway.update({"host": "127.0.0.1", "token": ""})
+        _atomic_write_json(config_path, config)
+    metadata_path = root / _PROFILE_METADATA_FILE
+    if metadata_path.exists():
+        metadata = _profile_metadata(root)
+        metadata.pop("botId", None)
+        metadata["localRuntime"] = True
+        _atomic_write_json(metadata_path, metadata)
+    for candidate in root.rglob("*"):
+        if not candidate.is_file() or candidate in {config_path, metadata_path}:
+            continue
+        try:
+            if candidate.stat().st_size > 5 * 1024 * 1024:
+                continue
+            raw = candidate.read_bytes()
+            if b"\x00" in raw:
+                continue
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        redacted = text
+        for pattern in _TEXT_SECRET_PATTERNS:
+            redacted = pattern.sub(
+                (lambda match: f"{match.group(1)}=" if match.lastindex else "[REDACTED]"),
+                redacted,
+            )
+        if redacted != text:
+            _atomic_write_text(candidate, redacted)
+
+
+def export_profile_backup(name: str, output_path: str, password: str) -> Path:
+    """Export a complete profile as an authenticated encrypted backup.
+
+    The plaintext tar exists only in a private temporary directory and is
+    removed before this function returns. AES-256-GCM authenticates both the
+    payload and versioned header; scrypt derives the key from the user-supplied
+    passphrase without storing it or a verifier.
+    """
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+    if not isinstance(password, str) or len(password) < 12 or len(password) > 1024:
+        raise ValueError("Backup password must contain 12–1,024 characters.")
+    raw_output = str(output_path)
+    target = Path(
+        raw_output if raw_output.endswith(".flowly-backup")
+        else f"{raw_output}.flowly-backup"
+    ).expanduser()
+    if not target.parent.is_dir():
+        raise FileNotFoundError(f"Export directory does not exist: {target.parent}")
+    if name != "default":
+        validate_profile_name(name)
+    profile_dir = _PROFILES_ROOT / name if name != "default" else _DEFAULT_HOME
+    if not profile_dir.is_dir() or profile_dir.is_symlink():
+        raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    resolved_profile = profile_dir.resolve()
+    resolved_target = target.resolve(strict=False)
+    if resolved_target == resolved_profile or resolved_profile in resolved_target.parents:
+        raise ValueError("Profile exports must be written outside the profile directory.")
+
+    salt = os.urandom(_BACKUP_SALT_BYTES)
+    nonce = os.urandom(_BACKUP_NONCE_BYTES)
+    header = _BACKUP_MAGIC + salt + nonce
+    key = Scrypt(salt=salt, length=32, n=2**15, r=8, p=1).derive(
+        password.encode("utf-8")
+    )
+    fd, raw_target = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
+    )
+    os.close(fd)
+    temporary_target = Path(raw_target)
+    try:
+        with tempfile.TemporaryDirectory(prefix=".flowly-backup-") as raw_dir:
+            plaintext = export_profile(name, str(Path(raw_dir) / "profile.tar.gz"))
+            encryptor = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
+            encryptor.authenticate_additional_data(header)
+            with plaintext.open("rb") as source, temporary_target.open("wb") as destination:
+                destination.write(header)
+                while chunk := source.read(_BACKUP_CHUNK_BYTES):
+                    destination.write(encryptor.update(chunk))
+                destination.write(encryptor.finalize())
+                destination.write(encryptor.tag)
+                destination.flush()
+                os.fsync(destination.fileno())
+        temporary_target.chmod(0o600)
+        os.replace(temporary_target, target)
+        return target
+    except BaseException:
+        temporary_target.unlink(missing_ok=True)
+        raise
+
+
+def _decrypt_profile_backup(archive: Path, password: str, output: Path) -> None:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+    if not isinstance(password, str) or len(password) < 12 or len(password) > 1024:
+        raise ValueError("Backup password must contain 12–1,024 characters.")
+    minimum = len(_BACKUP_MAGIC) + _BACKUP_SALT_BYTES + _BACKUP_NONCE_BYTES + _BACKUP_TAG_BYTES
+    size = archive.stat().st_size
+    if size < minimum:
+        raise ValueError("Encrypted profile backup is truncated.")
+    with archive.open("rb") as source:
+        header = source.read(len(_BACKUP_MAGIC) + _BACKUP_SALT_BYTES + _BACKUP_NONCE_BYTES)
+        if not header.startswith(_BACKUP_MAGIC):
+            raise ValueError("Encrypted profile backup header is invalid.")
+        salt_start = len(_BACKUP_MAGIC)
+        salt = header[salt_start:salt_start + _BACKUP_SALT_BYTES]
+        nonce = header[-_BACKUP_NONCE_BYTES:]
+        source.seek(-_BACKUP_TAG_BYTES, os.SEEK_END)
+        tag = source.read(_BACKUP_TAG_BYTES)
+        ciphertext_bytes = size - len(header) - _BACKUP_TAG_BYTES
+        source.seek(len(header))
+        key = Scrypt(salt=salt, length=32, n=2**15, r=8, p=1).derive(
+            password.encode("utf-8")
+        )
+        decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+        decryptor.authenticate_additional_data(header)
+        remaining = ciphertext_bytes
+        try:
+            with output.open("wb") as destination:
+                while remaining:
+                    chunk = source.read(min(_BACKUP_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        raise ValueError("Encrypted profile backup is truncated.")
+                    remaining -= len(chunk)
+                    destination.write(decryptor.update(chunk))
+                destination.write(decryptor.finalize())
+                destination.flush()
+                os.fsync(destination.fileno())
+            output.chmod(0o600)
+        except InvalidTag as exc:
+            output.unlink(missing_ok=True)
+            raise ValueError("Backup password is incorrect or the backup was modified.") from exc
+        except BaseException:
+            output.unlink(missing_ok=True)
+            raise
 
 
 def _portable_profile_tar_info(info: Any) -> Any:
@@ -1447,14 +1794,55 @@ def import_profile(
     name: str | None = None,
     *,
     local_runtime: bool = False,
+    identity: str = "duplicate",
+    password: str | None = None,
 ) -> Path:
-    """Import a profile from a tar.gz archive.
+    """Import a shared template, legacy archive, or encrypted backup."""
+    archive = Path(archive_path)
+    if not archive.exists():
+        raise FileNotFoundError(f"Archive not found: {archive}")
+    encrypted = is_encrypted_profile_backup(archive)
+    if not encrypted:
+        return _import_profile_archive(
+            str(archive), name=name, local_runtime=local_runtime, identity=identity,
+        )
+    if password is None:
+        raise ValueError("This encrypted profile backup requires a password.")
+    with tempfile.TemporaryDirectory(prefix=".flowly-restore-") as raw_stage:
+        decrypted = Path(raw_stage) / "profile.tar.gz"
+        _decrypt_profile_backup(archive, password, decrypted)
+        return _import_profile_archive(
+            str(decrypted), name=name, local_runtime=local_runtime, identity=identity,
+        )
+
+
+def is_encrypted_profile_backup(archive_path: str | Path) -> bool:
+    """Detect the versioned encrypted-backup envelope without parsing payload data."""
+    with Path(archive_path).open("rb") as handle:
+        return handle.read(len(_BACKUP_MAGIC)) == _BACKUP_MAGIC
+
+
+def _import_profile_archive(
+    archive_path: str,
+    name: str | None = None,
+    *,
+    local_runtime: bool = False,
+    identity: str = "duplicate",
+) -> Path:
+    """Validate and atomically publish one plaintext profile archive.
 
     ``local_runtime`` converts the imported profile into a Desktop-managed
     bot before publication: messaging transports and machine relay identity
     are removed while model-provider credentials remain profile-local.
+
+    ``identity="duplicate"`` (the safe default) always assigns a fresh bot
+    UUID. ``identity="restore"`` preserves a valid archived UUID, but refuses
+    to publish it when that identity already exists on this installation.
     """
     import tarfile
+
+    if identity not in {"duplicate", "restore"}:
+        raise ValueError("Profile import identity must be 'duplicate' or 'restore'.")
 
     archive = Path(archive_path)
     if not archive.exists():
@@ -1493,14 +1881,15 @@ def import_profile(
 
     validate_profile_name(inferred)
     profile_dir = _PROFILES_ROOT / inferred
-    if profile_dir.exists():
-        raise FileExistsError(f"Profile '{inferred}' already exists.")
-
     _PROFILES_ROOT.mkdir(parents=True, exist_ok=True)
     try:
         _PROFILES_ROOT.chmod(0o700)
     except OSError:
         pass
+    with _profile_mutation_lock():
+        if profile_dir.exists() or profile_dir.is_symlink():
+            raise FileExistsError(f"Profile '{inferred}' already exists.")
+        _assert_named_profile_capacity()
     staging = Path(tempfile.mkdtemp(prefix=".flowly-import-", dir=_DEFAULT_HOME.parent))
     try:
         with tarfile.open(archive, "r:gz") as tf:
@@ -1515,30 +1904,60 @@ def import_profile(
         _assert_tree_no_symlinks(extracted)
         if local_runtime:
             _sanitize_local_runtime_clone(extracted, profile_dir / "workspace")
-            metadata = _profile_metadata(extracted)
-            now = _utc_now()
-            metadata.update({
-                "version": 1,
-                "displayName": str(metadata.get("displayName") or inferred).strip(),
-                "description": str(metadata.get("description") or "").strip(),
-                "markText": _validate_mark_text(str(metadata.get("markText") or "")),
-                "markTone": _validate_mark_tone(str(metadata.get("markTone") or "")),
-                "createdAt": str(metadata.get("createdAt") or now),
-                "updatedAt": now,
-                "localRuntime": True,
-            })
-            _atomic_write_json(extracted / _PROFILE_METADATA_FILE, metadata)
+        metadata = _profile_metadata(extracted)
+        now = _utc_now()
+        archived_bot_id = str(metadata.get("botId") or "").strip()
+        try:
+            restored_bot_id = str(uuid.UUID(archived_bot_id))
+        except (ValueError, AttributeError):
+            restored_bot_id = str(uuid.uuid4())
+        bot_id = restored_bot_id if identity == "restore" else str(uuid.uuid4())
+        if identity == "restore":
+            existing_ids = {
+                profile.bot_id
+                for profile in list_profiles()[1:]
+                if profile.bot_id
+            }
+            if bot_id in existing_ids:
+                raise ProfileIdentityConflictError(
+                    "This bot identity already exists on this installation. "
+                    "Import it as a duplicate or remove the existing bot first."
+                )
+        metadata.update({
+            "version": 1,
+            "botId": bot_id,
+            "displayName": str(metadata.get("displayName") or inferred).strip(),
+            "description": str(metadata.get("description") or "").strip(),
+            "markText": _validate_mark_text(str(metadata.get("markText") or "")),
+            "markTone": _validate_mark_tone(str(metadata.get("markTone") or "")),
+            "createdAt": str(metadata.get("createdAt") or now),
+            "updatedAt": now,
+            "localRuntime": bool(local_runtime or metadata.get("localRuntime")),
+            "credentialPolicy": _NAMED_PROFILE_CREDENTIAL_POLICY,
+        })
+        _atomic_write_json(extracted / _PROFILE_METADATA_FILE, metadata)
         _harden_profile_tree_permissions(extracted)
-        os.replace(extracted, profile_dir)
+        with _profile_mutation_lock():
+            if profile_dir.exists() or profile_dir.is_symlink():
+                raise FileExistsError(f"Profile '{inferred}' already exists.")
+            _assert_named_profile_capacity()
+            if identity == "restore":
+                existing_ids = {
+                    profile.bot_id
+                    for profile in list_profiles()[1:]
+                    if profile.bot_id
+                }
+                if bot_id in existing_ids:
+                    raise ProfileIdentityConflictError(
+                        "This bot identity already exists on this installation. "
+                        "Import it as a duplicate or remove the existing bot first."
+                    )
+            os.replace(extracted, profile_dir)
         try:
             profile_dir.chmod(0o700)
         except OSError:
             pass
         return profile_dir
-    except BaseException:
-        if profile_dir.exists() and profile_dir.is_dir() and not profile_dir.is_symlink():
-            shutil.rmtree(profile_dir, ignore_errors=True)
-        raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 

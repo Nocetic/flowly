@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 
 import flowly.profile as profiles
 from flowly.cli.profile_cmd import profile_app
+from flowly.profile_room_store import SQLiteRoomStore
 
 
 @pytest.fixture()
@@ -101,6 +102,7 @@ def test_local_runtime_clone_keeps_provider_but_drops_transport_identity(profile
     assert info.to_dict()["path"] == str(created)
     assert str(uuid.UUID(info.bot_id)) == info.bot_id
     assert info.to_public_dict()["botId"] == info.bot_id
+    assert info.to_public_dict()["credentialPolicy"] == "isolated"
     assert "path" not in info.to_public_dict()
 
 
@@ -251,6 +253,7 @@ def test_profile_model_and_soul_are_isolated_and_editable(profile_roots) -> None
         "model": "profile/model",
         "soul": "# Analyst\n\nVerify every claim.\n",
         "workspace": str(created / "workspace"),
+        "credentialPolicy": "isolated",
     }
     updated = profiles.update_profile_settings(
         "analyst",
@@ -751,6 +754,38 @@ def test_profile_import_extracts_atomically(profile_roots, tmp_path: Path) -> No
     assert not list(_default.parent.glob(".flowly-import-*"))
 
 
+def test_profile_creation_enforces_installation_limit(profile_roots) -> None:
+    for index in range(1, profiles.MAX_NAMED_PROFILES + 1):
+        profiles.create_profile(f"worker-{index}", local_runtime=True)
+
+    with pytest.raises(profiles.ProfileLimitError, match="at most 15 bots"):
+        profiles.create_profile("overflow", local_runtime=True)
+
+    assert len(profiles.list_profiles()) == profiles.MAX_NAMED_PROFILES + 1
+
+
+def test_profile_import_enforces_installation_limit_without_partial_publish(
+    profile_roots, tmp_path: Path,
+) -> None:
+    archive = tmp_path / "portable.tar.gz"
+    payload = b'{}'
+    with tarfile.open(archive, "w:gz") as bundle:
+        directory = tarfile.TarInfo("portable")
+        directory.type = tarfile.DIRTYPE
+        bundle.addfile(directory)
+        member = tarfile.TarInfo("portable/config.json")
+        member.size = len(payload)
+        bundle.addfile(member, io.BytesIO(payload))
+    for index in range(1, profiles.MAX_NAMED_PROFILES + 1):
+        profiles.create_profile(f"worker-{index}", local_runtime=True)
+
+    with pytest.raises(profiles.ProfileLimitError, match="at most 15 bots"):
+        profiles.import_profile(str(archive), name="overflow")
+
+    assert not profiles.profile_exists("overflow")
+    assert not list(tmp_path.glob(".flowly-import-*"))
+
+
 def test_profile_export_round_trips_without_runtime_identity(
     profile_roots, tmp_path: Path
 ) -> None:
@@ -776,6 +811,221 @@ def test_profile_export_round_trips_without_runtime_identity(
         "private history"
     )
     assert not (imported / ".desktop-runtime.json").exists()
+    source_id = json.loads((source / "profile.json").read_text(encoding="utf-8"))["botId"]
+    imported_id = json.loads((imported / "profile.json").read_text(encoding="utf-8"))["botId"]
+    assert imported_id != source_id
+
+
+def test_sensitive_export_snapshots_sqlite_rooms_without_wal_sidecars(
+    profile_roots, tmp_path: Path,
+) -> None:
+    default, _root = profile_roots
+    room = {
+        "id": "55fc1b75-0b89-47e6-8974-504eef89249c",
+        "title": "Private council",
+        "members": ["default", "writer"],
+        "mode": "panel",
+        "messages": [],
+        "watermarks": {"default": 0, "writer": 0},
+        "createdAt": "2026-08-27T00:00:00.000Z",
+        "updatedAt": "2026-08-27T00:00:00.000Z",
+    }
+    database = default / "profile-rooms.sqlite3"
+    store = SQLiteRoomStore(database)
+    assert store.initialize_verified({room["id"]: room}) is True
+
+    archive = profiles.export_profile("default", str(tmp_path / "default-backup"))
+
+    with tarfile.open(archive, "r:gz") as bundle:
+        names = set(bundle.getnames())
+        snapshot = bundle.extractfile("default/profile-rooms.sqlite3").read()
+    assert "default/profile-rooms.sqlite3-wal" not in names
+    assert "default/profile-rooms.sqlite3-shm" not in names
+    restored_database = tmp_path / "restored-rooms.sqlite3"
+    restored_database.write_bytes(snapshot)
+    loaded = SQLiteRoomStore(restored_database).load()
+    assert loaded.rooms == [room]
+
+
+def test_profile_restore_preserves_unique_identity_and_rejects_collision(
+    profile_roots, tmp_path: Path,
+) -> None:
+    source = profiles.create_profile("writer", local_runtime=True)
+    source_id = json.loads((source / "profile.json").read_text(encoding="utf-8"))["botId"]
+    archive = profiles.export_profile("writer", str(tmp_path / "writer-backup"))
+
+    with pytest.raises(profiles.ProfileIdentityConflictError, match="already exists"):
+        profiles.import_profile(
+            str(archive), name="writer-restore", identity="restore",
+        )
+    assert not profiles.profile_exists("writer-restore")
+
+    profiles.delete_profile("writer")
+    restored = profiles.import_profile(
+        str(archive), name="writer-restore", identity="restore",
+    )
+    restored_id = json.loads((restored / "profile.json").read_text(encoding="utf-8"))["botId"]
+    assert restored_id == source_id
+
+
+def test_profile_template_excludes_private_state_and_redacts_credentials(
+    profile_roots, tmp_path: Path,
+) -> None:
+    source = profiles.create_profile("writer", local_runtime=True)
+    source_config = {
+        "channels": {
+            "telegram": {"enabled": True, "token": "telegram-secret"},
+        },
+        "gateway": {"host": "0.0.0.0", "token": "gateway-secret"},
+        "providers": {
+            "sample": {
+                "apiKey": "provider-secret",
+                "accountKey": "account-secret",
+                "model": "test/model",
+            },
+        },
+    }
+    (source / "config.json").write_text(json.dumps(source_config), encoding="utf-8")
+    (source / ".env").write_text("OPENAI_API_KEY=private\n", encoding="utf-8")
+    (source / "credentials" / "provider.json").write_text(
+        '{"token":"private"}', encoding="utf-8",
+    )
+    (source / "mcp-tokens").mkdir()
+    (source / "mcp-tokens" / "server.json").write_text(
+        '{"access_token":"private"}', encoding="utf-8",
+    )
+    (source / "gmail-credentials.json").write_text(
+        '{"refresh_token":"private"}', encoding="utf-8",
+    )
+    (source / "sessions" / "chat.jsonl").write_text("private chat", encoding="utf-8")
+    (source / "profile-rooms.json").write_text("private legacy group", encoding="utf-8")
+    (source / "profile-rooms.sqlite3").write_bytes(b"private sqlite group")
+    (source / "profile-rooms.sqlite3-wal").write_bytes(b"private group wal")
+    (source / "profile-rooms.sqlite3-shm").write_bytes(b"private group shm")
+    (source / "workspace" / "memory" / "facts.md").write_text(
+        "private memory", encoding="utf-8",
+    )
+    (source / "workspace" / "USER.md").write_text("private user", encoding="utf-8")
+    (source / "workspace" / "TOOLS.md").write_text(
+        "CUSTOM_API_KEY=private-token-value-1234567890\nReusable instructions",
+        encoding="utf-8",
+    )
+
+    archive = profiles.export_profile_template("writer", str(tmp_path / "writer"))
+
+    with tarfile.open(archive, "r:gz") as bundle:
+        names = set(bundle.getnames())
+        config = json.load(bundle.extractfile("writer/config.json"))
+        metadata = json.load(bundle.extractfile("writer/profile.json"))
+        tools_text = bundle.extractfile("writer/workspace/TOOLS.md").read().decode()
+    assert "writer/.env" not in names
+    assert not any(name.startswith("writer/credentials") for name in names)
+    assert not any(name.startswith("writer/mcp-tokens") for name in names)
+    assert "writer/gmail-credentials.json" not in names
+    assert not any(name.startswith("writer/sessions") for name in names)
+    assert not any("profile-rooms" in name for name in names)
+    assert not any(name.startswith("writer/workspace/memory") for name in names)
+    assert "writer/workspace/USER.md" not in names
+    assert config["channels"]["telegram"] == {"enabled": False, "token": ""}
+    assert config["gateway"] == {"host": "127.0.0.1", "token": ""}
+    assert config["providers"]["sample"]["apiKey"] == ""
+    assert config["providers"]["sample"]["accountKey"] == ""
+    assert "botId" not in metadata
+    assert metadata["localRuntime"] is True
+    assert tools_text == "CUSTOM_API_KEY=\nReusable instructions"
+
+    assert (source / ".env").read_text(encoding="utf-8") == "OPENAI_API_KEY=private\n"
+    assert json.loads((source / "config.json").read_text(encoding="utf-8")) == source_config
+
+
+def test_encrypted_profile_backup_round_trips_private_state_and_identity(
+    profile_roots, tmp_path: Path,
+) -> None:
+    source = profiles.create_profile("writer", local_runtime=True)
+    source_id = json.loads((source / "profile.json").read_text(encoding="utf-8"))["botId"]
+    (source / "sessions" / "chat.jsonl").write_text("private history", encoding="utf-8")
+    password = "correct horse battery staple"
+
+    backup = profiles.export_profile_backup("writer", str(tmp_path / "writer"), password)
+
+    assert backup == tmp_path / "writer.flowly-backup"
+    assert backup.read_bytes().startswith(profiles._BACKUP_MAGIC)
+    assert b"private history" not in backup.read_bytes()
+    assert (backup.stat().st_mode & 0o777) == 0o600
+    profiles.delete_profile("writer")
+    restored = profiles.import_profile(
+        str(backup), name="writer", identity="restore", password=password,
+    )
+    assert (restored / "sessions" / "chat.jsonl").read_text(encoding="utf-8") == (
+        "private history"
+    )
+    restored_id = json.loads((restored / "profile.json").read_text(encoding="utf-8"))["botId"]
+    assert restored_id == source_id
+
+
+def test_encrypted_profile_backup_rejects_output_inside_profile(
+    profile_roots,
+) -> None:
+    source = profiles.create_profile("writer", local_runtime=True)
+
+    with pytest.raises(ValueError, match="outside the profile directory"):
+        profiles.export_profile_backup(
+            "writer", str(source / "unsafe"), "correct horse battery staple",
+        )
+    assert not (source / "unsafe.flowly-backup").exists()
+
+
+def test_encrypted_profile_backup_rejects_wrong_password_and_tampering(
+    profile_roots, tmp_path: Path,
+) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    password = "correct horse battery staple"
+    backup = profiles.export_profile_backup("writer", str(tmp_path / "writer"), password)
+
+    with pytest.raises(ValueError, match="incorrect or the backup was modified"):
+        profiles.import_profile(
+            str(backup), name="wrong-password", password="this password is wrong",
+        )
+    assert not profiles.profile_exists("wrong-password")
+
+    damaged = bytearray(backup.read_bytes())
+    damaged[len(profiles._BACKUP_MAGIC) + profiles._BACKUP_SALT_BYTES + 1] ^= 0x01
+    tampered = tmp_path / "tampered.flowly-backup"
+    tampered.write_bytes(damaged)
+    with pytest.raises(ValueError, match="incorrect or the backup was modified"):
+        profiles.import_profile(str(tampered), name="tampered", password=password)
+    assert not profiles.profile_exists("tampered")
+    assert not list(tmp_path.glob(".flowly-restore-*"))
+
+
+def test_profile_import_race_never_deletes_another_publishers_profile(
+    profile_roots, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _default, root = profile_roots
+    archive = tmp_path / "valid.tar.gz"
+    payload = b'{}'
+    with tarfile.open(archive, "w:gz") as bundle:
+        directory = tarfile.TarInfo("exported")
+        directory.type = tarfile.DIRTYPE
+        bundle.addfile(directory)
+        member = tarfile.TarInfo("exported/config.json")
+        member.size = len(payload)
+        bundle.addfile(member, io.BytesIO(payload))
+
+    original_validate = profiles._assert_tree_no_symlinks
+
+    def publish_competitor(path: Path, *args, **kwargs) -> None:
+        original_validate(path, *args, **kwargs)
+        competing = root / "imported"
+        competing.mkdir()
+        (competing / "sentinel.txt").write_text("owned elsewhere", encoding="utf-8")
+
+    monkeypatch.setattr(profiles, "_assert_tree_no_symlinks", publish_competitor)
+    with pytest.raises(FileExistsError, match="already exists"):
+        profiles.import_profile(str(archive), name="imported")
+    assert (root / "imported" / "sentinel.txt").read_text(encoding="utf-8") == (
+        "owned elsewhere"
+    )
 
 
 def test_default_profile_export_excludes_named_profiles_and_active_pointer(

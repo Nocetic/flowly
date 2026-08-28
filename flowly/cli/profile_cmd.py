@@ -14,9 +14,11 @@ from flowly.profile import (
     create_profile,
     delete_profile,
     describe_profile,
-    export_profile,
+    export_profile_backup,
+    export_profile_template,
     get_active_profile,
     import_profile,
+    is_encrypted_profile_backup,
     list_profiles,
     read_profile_settings,
     update_profile_metadata,
@@ -210,11 +212,28 @@ def profile_delete(
 def profile_export(
     name: str = typer.Argument(..., help="Profile identifier."),
     output: str = typer.Option(..., "--output", help="Destination .tar.gz archive."),
+    backup: bool = typer.Option(
+        False,
+        "--backup",
+        help="Include private state in a password-encrypted .flowly-backup.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
-    """Export one complete isolated profile to a portable archive."""
+    """Export a safe sharing template, or an explicitly encrypted backup."""
     try:
-        archive = export_profile(name, output)
+        archive = (
+            export_profile_backup(
+                name,
+                output,
+                typer.prompt(
+                    "Backup password",
+                    hide_input=True,
+                    confirmation_prompt=True,
+                ),
+            )
+            if backup
+            else export_profile_template(name, output)
+        )
     except (ValueError, FileNotFoundError, FileExistsError, RuntimeError, OSError) as exc:
         _fail(exc)
     _emit({"ok": True, "profile": name, "archive": str(archive)}, json_output)
@@ -229,11 +248,29 @@ def profile_import(
         "--local-only",
         help="Remove messaging transports and relay identity for a managed local bot.",
     ),
+    restore_identity: bool = typer.Option(
+        False,
+        "--restore-identity",
+        help="Preserve the archived bot UUID; fails if it already exists locally.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Import a portable profile archive after validating every entry."""
     try:
-        profile_dir = import_profile(archive, name=name, local_runtime=local_only)
+        password = None
+        try:
+            encrypted = is_encrypted_profile_backup(archive)
+        except OSError:
+            encrypted = False
+        if encrypted:
+            password = typer.prompt("Backup password", hide_input=True)
+        profile_dir = import_profile(
+            archive,
+            name=name,
+            local_runtime=local_only,
+            identity="restore" if restore_identity else "duplicate",
+            password=password,
+        )
         profile = describe_profile(profile_dir.name)
     except (ValueError, FileNotFoundError, FileExistsError, OSError) as exc:
         _fail(exc)

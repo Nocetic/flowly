@@ -28,6 +28,8 @@ from loguru import logger
 
 from flowly.exec.env_scrub import sanitize_subprocess_env
 from flowly.profile import (
+    MAX_NAMED_PROFILES,
+    ProfileLimitError,
     create_profile,
     delete_profile,
     describe_profile,
@@ -46,10 +48,12 @@ from flowly.profile_host_contract import (
     PROFILE_RPC_TIMEOUTS,
     ProfileHostError,
     bounded_timeout,
+    is_internal_profile_session,
     validate_profile_rpc,
 )
 
 ProfileEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+ProfileRoomEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 PrimaryRpcCallback = Callable[[str, dict[str, Any], float], Awaitable[Any]]
 PrimaryEventLeaseCallback = Callable[[bool], None]
 TaskStartedCallback = Callable[[str], Awaitable[None] | None]
@@ -60,6 +64,7 @@ _STOP_TIMEOUT_SECONDS = 8
 _DELETE_CONFIRM_TTL_SECONDS = 60
 _DELETE_CONFIRM_MAX = 128
 _MAX_RUNTIMES = 4
+_CAPACITY_WAIT_SECONDS = 120.0
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _SAFE_DELEGATED_TOOLS = (
     "read_file",
@@ -75,6 +80,10 @@ _SAFE_DELEGATED_TOOLS = (
     # the authenticated shared-service adapter.
     "board_list",
     "board_get",
+    # Correlated follow-ups are safe here: the gateway enforces an explicit
+    # profile directory, self-message denial, per-target serialization and a
+    # hard three-hop ceiling before forwarding another turn.
+    "message_profile",
 )
 _PROFILE_TASK_DISABLED_TOOLS = (
     "message_profile",
@@ -226,6 +235,7 @@ class ProfileHost:
     def __init__(
         self,
         on_event: ProfileEventCallback | None = None,
+        on_room_event: ProfileRoomEventCallback | None = None,
         primary_rpc: PrimaryRpcCallback | None = None,
         primary_event_lease: PrimaryEventLeaseCallback | None = None,
     ):
@@ -238,6 +248,7 @@ class ProfileHost:
         self._default_event_leases: set[str] = set()
         self._runtimes: dict[str, _Runtime] = {}
         self._starting: dict[str, asyncio.Task[_Runtime]] = {}
+        self._closing: dict[str, asyncio.Task[None]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._delete_confirmations: dict[str, tuple[str, float]] = {}
         self._broker_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
@@ -253,12 +264,22 @@ class ProfileHost:
         self._task_audit_sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._capacity_lock = asyncio.Lock()
+        self._capacity_changed = asyncio.Event()
         self._closed = False
         self._manager_instance = str(uuid.uuid4())
+        self._room_event_callback = on_room_event
+        from flowly.profile_rooms import ProfileRoomService
+
+        self._rooms = ProfileRoomService(
+            target_rpc=self._target_rpc,
+            profile_directory=lambda: [profile.name for profile in list_profiles()],
+            on_event=self._emit_room,
+        )
 
     def capabilities(self) -> dict[str, Any]:
+        room_capabilities = self._rooms.capabilities()
         return {
-            "version": 1,
+            "version": 2,
             "hostId": self.host_id,
             "methods": [
                 "profiles.capabilities",
@@ -272,14 +293,50 @@ class ProfileHost:
                 "profiles.connect",
                 "profiles.stop",
                 "profiles.rpc",
+                *self._rooms.methods,
             ],
             "profileRpcMethods": sorted(PROFILE_RPC_TIMEOUTS),
-            "events": ["profile.event"],
+            "events": ["profile.event", "profile.room"],
             "storageMode": "profile-local",
             "processIsolation": "per-profile-gateway",
             "defaultProfileRpc": "direct",
             "wrappedDefaultProfileRpc": True,
             "maxConcurrentRuntimes": _MAX_RUNTIMES,
+            "maxNamedProfiles": MAX_NAMED_PROFILES,
+            "profileReadiness": True,
+            "credentialPolicies": {
+                "namedProfile": "isolated",
+                "supported": ["isolated"],
+                "sharedCredentialBroker": False,
+            },
+            "runtimePolicy": {
+                "strategy": "bounded-lru",
+                "queuesWhileBusy": True,
+                "idleEviction": True,
+                "capacityWaitMs": int(_CAPACITY_WAIT_SECONDS * 1000),
+            },
+            "roomModes": room_capabilities["modes"],
+            "roomLimits": {
+                "maxMembers": room_capabilities["maxMembers"],
+                "councilRounds": room_capabilities["councilRounds"],
+                "councilTurns": room_capabilities["councilTurns"],
+            },
+            "roomStorage": {
+                "engine": room_capabilities["storage"],
+                "legacyMigration": room_capabilities["legacyJsonMigration"],
+            },
+            "profileFeatures": [
+                "isolated-workspace",
+                "isolated-memory",
+                "isolated-sessions",
+                "isolated-skills",
+                "isolated-credentials",
+                "isolated-routines",
+                "shared-board",
+                "shared-artifacts",
+                "profile-messaging",
+                "access-policy",
+            ],
         }
 
     def subscribe_events(self, callback: ProfileEventCallback) -> str:
@@ -353,6 +410,9 @@ class ProfileHost:
                 params.get("params"),
                 params.get("timeoutMs"),
             )
+        if method in self._rooms.methods:
+            result = await self._rooms.dispatch(method, params)
+            return {"hostId": self.host_id, **result}
         raise ProfileHostError(
             "METHOD_NOT_ALLOWED", "This profile-host operation is not available."
         )
@@ -382,6 +442,14 @@ class ProfileHost:
             }
         runtime = self._runtimes.get(name)
         if runtime is None:
+            if name in self._closing:
+                return {
+                    "profile": name,
+                    "botId": bot_id,
+                    "state": "stopping",
+                    "owned": True,
+                    "activeRuns": 0,
+                }
             profile = describe_profile(name)
             external = reconcile_runtime_lease(profile.path, profile_name=name)
             if external:
@@ -411,28 +479,62 @@ class ProfileHost:
     async def create(self, params: dict[str, Any]) -> dict[str, Any]:
         name = _required_string(params, "name").strip()
         validate_profile_name(name)
+        credential_policy = _optional_string(
+            params, "credentialPolicy", "isolated"
+        ).strip()
+        if credential_policy != "isolated":
+            raise ProfileHostError(
+                "CREDENTIAL_POLICY_UNSUPPORTED",
+                "Named bots currently require isolated credentials.",
+            )
         clone_from = params.get("cloneFrom", "default")
         if clone_from is not None:
             if not isinstance(clone_from, str):
                 raise ProfileHostError("INVALID_PARAMS", "cloneFrom must be a bot name or null.")
             clone_from = clone_from.strip()
             _validate_profile_selector(clone_from)
-        create_profile(
-            name,
-            clone_from=clone_from,
-            clone_all=False,
-            display_name=_optional_string(params, "displayName").strip(),
-            description=_optional_string(params, "description").strip(),
-            local_runtime=True,
-            provider=_required_string(params, "provider").strip() if "provider" in params else None,
-            model=_required_string(params, "model").strip() if "model" in params else None,
-            soul=_required_string(params, "soul") if "soul" in params else None,
-            mark_text=_optional_string(params, "markText"),
-            mark_tone=_optional_string(params, "markTone"),
-        )
+        try:
+            create_profile(
+                name,
+                clone_from=clone_from,
+                clone_all=False,
+                display_name=_optional_string(params, "displayName").strip(),
+                description=_optional_string(params, "description").strip(),
+                local_runtime=True,
+                provider=_required_string(params, "provider").strip() if "provider" in params else None,
+                model=_required_string(params, "model").strip() if "model" in params else None,
+                soul=_required_string(params, "soul") if "soul" in params else None,
+                mark_text=_optional_string(params, "markText"),
+                mark_tone=_optional_string(params, "markTone"),
+            )
+        except ProfileLimitError as exc:
+            raise ProfileHostError("PROFILE_LIMIT", str(exc)) from exc
         profile = _public_profile(name)
+        settings = _public_settings(name)
+        provider = str(settings.get("provider") or "").strip()
+        readiness = (
+            {
+                "runnable": False,
+                "authStatus": "login-required",
+                "needsLogin": True,
+                "missingCapabilities": ["provider-auth"],
+                "credentialPolicy": credential_policy,
+            }
+            if provider == "xai_oauth"
+            else {
+                # API-key and account-backed providers are resolved by the
+                # runtime because their cascade may span config, environment
+                # and account state. Do not claim a credential was verified
+                # when creation intentionally performs no provider calls.
+                "runnable": None,
+                "authStatus": "runtime-check-required",
+                "needsLogin": False,
+                "missingCapabilities": [],
+                "credentialPolicy": credential_policy,
+            }
+        )
         await self._emit(name, "directory", {"action": "created", "profile": profile})
-        return {"ok": True, "profile": profile}
+        return {"ok": True, "profile": profile, "readiness": readiness}
 
     async def settings(self, name: str) -> dict[str, Any]:
         _validate_profile_selector(name)
@@ -517,6 +619,7 @@ class ProfileHost:
                 "Bot deletion confirmation expired. Review the bot and try again.",
             )
         await self.stop(name)
+        await self._rooms.remove_profile(name)
         delete_profile(name)
         await self._emit(name, "directory", {"action": "deleted", "botId": current["botId"]})
         return {"ok": True, "deleted": name, "botId": current["botId"]}
@@ -529,8 +632,12 @@ class ProfileHost:
 
     async def stop(self, name: str) -> dict[str, Any]:
         _validate_profile_selector(name)
+        await self._rooms.stop_for_profile(name)
         if name == "default":
             return {"ok": True, "status": self.status(name)}
+        closing = self._closing.get(name)
+        if closing is not None:
+            await asyncio.gather(asyncio.shield(closing), return_exceptions=True)
         async with self._lock(name):
             starting = self._starting.get(name)
             if starting:
@@ -545,6 +652,7 @@ class ProfileHost:
                     )
                 self._runtimes.pop(name, None)
                 await self._close_runtime(runtime)
+                self._capacity_changed.set()
             else:
                 profile = describe_profile(name)
                 if reconcile_runtime_lease(profile.path, profile_name=name):
@@ -594,10 +702,7 @@ class ProfileHost:
                         if isinstance(session, dict)
                         and isinstance(session.get("key"), str)
                         and session["key"].startswith(("desktop:", "web:", "ios:"))
-                        and not session["key"].startswith((
-                            "desktop:profile-inbox:",
-                            "desktop:profile-task:",
-                        ))
+                        and not is_internal_profile_session(session["key"])
                     ],
                 }
         return result
@@ -762,11 +867,15 @@ class ProfileHost:
     async def shutdown(self) -> None:
         if self._closed:
             return
+        await self._rooms.shutdown()
         self._closed = True
         starters = list(self._starting.values())
         for task in starters:
             task.cancel()
         await asyncio.gather(*starters, return_exceptions=True)
+        closers = list(self._closing.values())
+        await asyncio.gather(*closers, return_exceptions=True)
+        self._closing.clear()
         runtimes = list(self._runtimes.values())
         self._runtimes.clear()
         for waiter in self._broker_waiters.values():
@@ -807,37 +916,118 @@ class ProfileHost:
         if pending:
             return await pending
         async with self._lock(name):
-            current = self._runtimes.get(name)
-            if self._runtime_is_open(current):
-                assert current is not None
-                return current
-            pending = self._starting.get(name)
-            if pending is None:
+            while True:
+                current = self._runtimes.get(name)
+                if self._runtime_is_open(current):
+                    assert current is not None
+                    return current
+                closing = self._closing.get(name)
+                if closing is not None:
+                    await asyncio.gather(asyncio.shield(closing), return_exceptions=True)
+                    continue
+                pending = self._starting.get(name)
+                if pending is not None:
+                    break
                 lease = reconcile_runtime_lease(profile.path, profile_name=name)
+                eviction: tuple[str, _Runtime, asyncio.Task[None]] | None = None
+                wait_for_capacity = False
                 async with self._capacity_lock:
-                    allocated = set(self._runtimes) | set(self._starting)
-                    if name not in allocated and len(allocated) >= _MAX_RUNTIMES:
+                    allocated = set(self._runtimes) | set(self._starting) | set(self._closing)
+                    if name in allocated or len(allocated) < _MAX_RUNTIMES:
+                        pending = asyncio.create_task(
+                            self._attach_runtime(name, lease)
+                            if lease
+                            else self._start_runtime(name),
+                            name=f"profile-{'attach' if lease else 'start'}:{name}",
+                        )
+                        self._starting[name] = pending
+                    else:
+                        candidate = self._idle_eviction_candidate(exclude=name)
+                        if candidate is not None:
+                            candidate_name, candidate_runtime = candidate
+                            self._runtimes.pop(candidate_name, None)
+                            candidate_runtime.state = "stopping"
+                            close_task = asyncio.create_task(
+                                self._close_runtime(candidate_runtime),
+                                name=f"profile-idle-stop:{candidate_name}",
+                            )
+                            self._closing[candidate_name] = close_task
+                            eviction = (candidate_name, candidate_runtime, close_task)
+                        else:
+                            self._capacity_changed.clear()
+                            wait_for_capacity = True
+                if eviction is not None:
+                    candidate_name, candidate_runtime, close_task = eviction
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        result = await asyncio.gather(close_task, return_exceptions=True)
+                        async with self._capacity_lock:
+                            if self._closing.get(candidate_name) is close_task:
+                                self._closing.pop(candidate_name, None)
+                            if result and isinstance(result[0], BaseException):
+                                if self._runtime_is_open(candidate_runtime):
+                                    candidate_runtime.state = "connected"
+                                    self._runtimes[candidate_name] = candidate_runtime
+                            self._capacity_changed.set()
+                        raise
+                    except BaseException as exc:
+                        async with self._capacity_lock:
+                            if self._closing.get(candidate_name) is close_task:
+                                self._closing.pop(candidate_name, None)
+                            if self._runtime_is_open(candidate_runtime):
+                                candidate_runtime.state = "connected"
+                                self._runtimes[candidate_name] = candidate_runtime
+                            self._capacity_changed.set()
                         raise ProfileHostError(
                             "PROFILE_CAPACITY",
-                            "Four bots are already running. Stop one and try again.",
+                            "Flowly could not release an idle bot runtime. Try again.",
                             retryable=True,
+                        ) from exc
+                    async with self._capacity_lock:
+                        if self._closing.get(candidate_name) is close_task:
+                            self._closing.pop(candidate_name, None)
+                        self._capacity_changed.set()
+                    await self._emit(
+                        candidate_name,
+                        "connection",
+                        {"state": "stopped", "reason": "idle-capacity"},
+                    )
+                    continue
+                if wait_for_capacity:
+                    try:
+                        await asyncio.wait_for(
+                            self._capacity_changed.wait(), _CAPACITY_WAIT_SECONDS,
                         )
-                    if lease:
-                        pending = asyncio.create_task(
-                            self._attach_runtime(name, lease),
-                            name=f"profile-attach:{name}",
-                        )
-                    else:
-                        pending = asyncio.create_task(
-                            self._start_runtime(name),
-                            name=f"profile-start:{name}",
-                        )
-                    self._starting[name] = pending
+                    except asyncio.TimeoutError as exc:
+                        raise ProfileHostError(
+                            "PROFILE_CAPACITY",
+                            "All bot runtime slots are busy. Try again when an active turn finishes.",
+                            retryable=True,
+                        ) from exc
+                    continue
+                assert pending is not None
+                break
         try:
             return await pending
         finally:
             if self._starting.get(name) is pending:
                 self._starting.pop(name, None)
+                self._capacity_changed.set()
+
+    def _idle_eviction_candidate(self, *, exclude: str) -> tuple[str, _Runtime] | None:
+        candidates = [
+            (profile, runtime)
+            for profile, runtime in self._runtimes.items()
+            if profile != exclude
+            and runtime.owned
+            and self._runtime_is_open(runtime)
+            and not runtime.active_runs
+            and not runtime.pending
+            and not any(owner == profile for owner, _session in self._broker_sessions)
+            and not self._rooms.is_profile_active(profile)
+        ]
+        return min(candidates, key=lambda item: item[1].last_used_at) if candidates else None
 
     @staticmethod
     def _runtime_is_open(runtime: _Runtime | None) -> bool:
@@ -1084,6 +1274,7 @@ class ProfileHost:
     async def _rpc(self, runtime: _Runtime, method: str, params: dict[str, Any], timeout: float) -> Any:
         if runtime.ws.closed:
             raise ProfileHostError("PROFILE_OFFLINE", "The profile runtime is offline.", retryable=True)
+        runtime.last_used_at = time.time()
         request_id = secrets.token_urlsafe(18)
         future = asyncio.get_running_loop().create_future()
         runtime.pending[request_id] = future
@@ -1094,6 +1285,8 @@ class ProfileHost:
             raise ProfileHostError("PROFILE_RPC_TIMEOUT", "The profile operation timed out.", retryable=True) from exc
         finally:
             runtime.pending.pop(request_id, None)
+            runtime.last_used_at = time.time()
+            self._capacity_changed.set()
 
     async def _read_runtime(self, runtime: _Runtime) -> None:
         try:
@@ -1130,6 +1323,7 @@ class ProfileHost:
             owns_runtime = self._runtimes.get(runtime.profile) is runtime
             if owns_runtime:
                 self._runtimes.pop(runtime.profile, None)
+                self._capacity_changed.set()
             if owns_runtime and not self._closed:
                 await self._emit(runtime.profile, "connection", {"state": "error"})
             for future in runtime.pending.values():
@@ -1169,6 +1363,7 @@ class ProfileHost:
                 ("default", session_key) not in self._broker_sessions
                 and ("default", run_id) not in self._broker_waiters
                 and ("default", run_id) not in self._terminal_events
+                and not self._rooms.accepts_event("default", session_key, run_id)
             ):
                 return
             await self._handle_profile_event(
@@ -1197,6 +1392,7 @@ class ProfileHost:
             if payload.get("state") in ("final", "aborted", "error"):
                 if runtime is not None:
                     runtime.active_runs.discard(run_id)
+                    self._capacity_changed.set()
                 key = (profile, run_id)
                 waiter = self._broker_waiters.get(key)
                 if waiter is not None or (profile, session_key) in self._broker_sessions:
@@ -1215,6 +1411,8 @@ class ProfileHost:
                 runtime.active_runs.add(run_id)
         if runtime is not None:
             runtime.last_used_at = time.time()
+        if await self._rooms.handle_profile_event(profile, event, payload):
+            return
         if event == "exec.approval.requested" and payload.get("id"):
             if internal_turn:
                 self._spawn_background(self._resolve_internal_prompt(
@@ -1595,3 +1793,13 @@ class ProfileHost:
                 await callback(envelope)
             except Exception:
                 logger.exception("Profile host event callback failed")
+
+    async def _emit_room(self, data: dict[str, Any]) -> None:
+        """Publish one host-owned group update without profile-session leakage."""
+        callback = self._room_event_callback
+        if callback is None:
+            return
+        try:
+            await callback({"hostId": self.host_id, **data})
+        except Exception:
+            logger.exception("Profile room event callback failed")

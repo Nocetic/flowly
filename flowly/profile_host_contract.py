@@ -35,8 +35,9 @@ _NON_PUBLIC_ATTACHMENT_HOST_SUFFIXES = (
     ".home.arpa",
 )
 
-# Deliberately excludes config/secrets, arbitrary CLI execution, policy
-# mutation, and MCP/skill installation. Those remain on the owning host.
+# Deliberately excludes raw config/secrets, arbitrary CLI execution, and
+# MCP/skill installation. The small access-policy projection below is safe to
+# expose because it accepts only closed enums and a deny-only toolset list.
 PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "provider.list": 30_000,
     "provider.active": 30_000,
@@ -52,6 +53,12 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "media.read": 30_000,
     "exec.approval.list": 30_000,
     "exec.approval.resolve": 30_000,
+    "exec.policy.get": 30_000,
+    "exec.policy.set": 30_000,
+    "codex.policy.get": 30_000,
+    "codex.policy.set": 30_000,
+    "tools.access.get": 30_000,
+    "tools.access.set": 30_000,
     "agent.clarify.list": 30_000,
     "agent.clarify.resolve": 30_000,
     "plan.get": 30_000,
@@ -72,9 +79,23 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "cron.output": 30_000,
 }
 
+_EXEC_SECURITY = {"deny", "allowlist", "full"}
+_EXEC_ASK = {"off", "on-miss", "always"}
+_CODEX_APPROVAL = {"on-request", "never", "auto-review", "granular"}
+_CODEX_SANDBOX = {"read-only", "workspace-write", "full-access"}
+
 
 _REMOTE_SESSION_PREFIXES = ("desktop:", "web:", "ios:")
-_INTERNAL_PROFILE_SESSION_PREFIX = "desktop:profile-inbox:"
+_INTERNAL_PROFILE_SESSION_PREFIXES = (
+    "desktop:profile-inbox:",
+    "desktop:profile-room:",
+    "desktop:profile-task:",
+)
+
+
+def is_internal_profile_session(value: Any) -> bool:
+    """Return whether a session belongs to host-only profile orchestration."""
+    return isinstance(value, str) and value.startswith(_INTERNAL_PROFILE_SESSION_PREFIXES)
 
 
 def _validate_session_key(value: Any, *, required: bool = False) -> None:
@@ -93,7 +114,7 @@ def _validate_session_key(value: Any, *, required: bool = False) -> None:
         )
     if (
         not value.startswith(_REMOTE_SESSION_PREFIXES)
-        or value.startswith(_INTERNAL_PROFILE_SESSION_PREFIX)
+        or is_internal_profile_session(value)
     ):
         raise ProfileHostError(
             "REMOTE_SESSION_DENIED",
@@ -204,6 +225,66 @@ def _sanitize_remote_attachment(value: Any) -> dict[str, Any]:
     return sanitized
 
 
+def _require_exact_keys(value: dict[str, Any], expected: set[str]) -> None:
+    if set(value) != expected:
+        raise ProfileHostError(
+            "INVALID_PARAMS",
+            "Profile policy request parameters are invalid.",
+        )
+
+
+def _validate_access_policy(method: str, value: dict[str, Any]) -> dict[str, Any]:
+    if method in {"tools.access.get", "exec.policy.get", "codex.policy.get"}:
+        _require_exact_keys(value, set())
+        return {}
+    if method == "tools.access.set":
+        _require_exact_keys(value, {"disabledToolsets"})
+        disabled = value.get("disabledToolsets")
+        if (
+            not isinstance(disabled, list)
+            or len(disabled) > 64
+            or any(
+                not isinstance(name, str)
+                or not name
+                or name != name.strip()
+                or len(name) > 64
+                or any(
+                    not (char.isascii() and (char.isalnum() or char in "._-"))
+                    for char in name
+                )
+                for name in disabled
+            )
+        ):
+            raise ProfileHostError(
+                "INVALID_PARAMS",
+                "Tool access policy is invalid.",
+            )
+        return {"disabledToolsets": list(dict.fromkeys(disabled))}
+    if method == "exec.policy.set":
+        _require_exact_keys(value, {"security", "ask"})
+        if value.get("security") not in _EXEC_SECURITY or value.get("ask") not in _EXEC_ASK:
+            raise ProfileHostError(
+                "INVALID_PARAMS",
+                "Execution approval policy is invalid.",
+            )
+        return {"security": value["security"], "ask": value["ask"]}
+    if method == "codex.policy.set":
+        _require_exact_keys(value, {"approvalPolicy", "sandbox"})
+        if (
+            value.get("approvalPolicy") not in _CODEX_APPROVAL
+            or value.get("sandbox") not in _CODEX_SANDBOX
+        ):
+            raise ProfileHostError(
+                "INVALID_PARAMS",
+                "Codex approval policy is invalid.",
+            )
+        return {
+            "approvalPolicy": value["approvalPolicy"],
+            "sandbox": value["sandbox"],
+        }
+    return value
+
+
 def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(method, str) or method not in PROFILE_RPC_TIMEOUTS:
         raise ProfileHostError(
@@ -222,6 +303,7 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
         raise ProfileHostError("INVALID_PARAMS", "Profile request parameters are invalid.") from exc
     if size > MAX_REQUEST_BYTES:
         raise ProfileHostError("REQUEST_TOO_LARGE", "Profile request is too large.")
+    value = _validate_access_policy(method, value)
     session_key_methods = {
         "chat.history",
         "chat.inflight",

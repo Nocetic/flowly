@@ -23,6 +23,12 @@ def test_mobile_profile_rpc_surface_is_bot_scoped() -> None:
         "cron.add",
         "cron.remove",
         "exec.approval.resolve",
+        "exec.policy.get",
+        "exec.policy.set",
+        "codex.policy.get",
+        "codex.policy.set",
+        "tools.access.get",
+        "tools.access.set",
         "plan.resolve",
         "plan.resume",
         "plan.mode.set",
@@ -36,7 +42,6 @@ def test_mobile_profile_rpc_surface_is_bot_scoped() -> None:
         "config.get",
         "config.set",
         "connections.secret.get",
-        "exec.policy.set",
         "mcp.install",
         "skills.install",
         "cli.exec",
@@ -44,6 +49,39 @@ def test_mobile_profile_rpc_surface_is_bot_scoped() -> None:
         with pytest.raises(ProfileHostError) as raised:
             validate_profile_rpc(forbidden, {})
         assert raised.value.code == "METHOD_NOT_ALLOWED"
+
+
+def test_remote_profile_access_policy_is_strictly_bounded() -> None:
+    assert validate_profile_rpc("tools.access.get", None) == ("tools.access.get", {})
+    assert validate_profile_rpc(
+        "tools.access.set",
+        {"disabledToolsets": ["filesystem", "execution", "filesystem"]},
+    ) == (
+        "tools.access.set",
+        {"disabledToolsets": ["filesystem", "execution"]},
+    )
+    assert validate_profile_rpc(
+        "exec.policy.set",
+        {"security": "allowlist", "ask": "on-miss"},
+    )[1] == {"security": "allowlist", "ask": "on-miss"}
+    assert validate_profile_rpc(
+        "codex.policy.set",
+        {"approvalPolicy": "on-request", "sandbox": "workspace-write"},
+    )[1] == {"approvalPolicy": "on-request", "sandbox": "workspace-write"}
+
+    invalid_requests = (
+        ("tools.access.get", {"extra": True}),
+        ("tools.access.set", {"disabledToolsets": ["../filesystem"]}),
+        ("tools.access.set", {"disabledToolsets": "filesystem"}),
+        ("exec.policy.set", {"security": "full", "ask": "sometimes"}),
+        ("exec.policy.set", {"security": "full", "ask": "off", "allowlist": []}),
+        ("codex.policy.set", {"approvalPolicy": "never", "sandbox": "host"}),
+        ("codex.policy.set", {"approvalPolicy": "never"}),
+    )
+    for method, params in invalid_requests:
+        with pytest.raises(ProfileHostError) as raised:
+            validate_profile_rpc(method, params)
+        assert raised.value.code == "INVALID_PARAMS"
 
 
 def test_remote_chat_rejects_host_file_paths_and_invalid_attachments() -> None:
@@ -215,6 +253,14 @@ def test_remote_chat_rejects_malformed_or_oversized_base64(
     [
         ("chat.history", {"sessionKey": "cli:private"}),
         ("chat.inflight", {"sessionKey": "desktop:profile-inbox:writer:source"}),
+        (
+            "chat.history",
+            {"sessionKey": "desktop:profile-room:00000000-0000-0000-0000-000000000001"},
+        ),
+        (
+            "sessions.model.set",
+            {"sessionKey": "desktop:profile-task:private", "model": "test/model"},
+        ),
         ("sessions.model.get", {"sessionKey": "cron:job"}),
         ("sessions.delete", {"key": "desktop:profile-inbox:writer:source"}),
     ],

@@ -181,6 +181,10 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                 capabilities = await rpc("profiles.capabilities")
                 assert "profiles.rpc" in capabilities["methods"]
                 assert "config.get" not in capabilities["profileRpcMethods"]
+                assert "tools.access.get" in capabilities["profileRpcMethods"]
+                assert "tools.access.set" in capabilities["profileRpcMethods"]
+                assert "exec.policy.set" in capabilities["profileRpcMethods"]
+                assert "codex.policy.set" in capabilities["profileRpcMethods"]
                 system = await rpc("system.capabilities")
                 assert system["profileHost"]["hostId"] == capabilities["hostId"]
 
@@ -272,6 +276,41 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                     "params": {},
                 })
                 assert approvals == {"approvals": []}
+                access = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "tools.access.get",
+                    "params": {},
+                })
+                assert "groups" in access
+                updated_access = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "tools.access.set",
+                    "params": {"disabledToolsets": ["filesystem"]},
+                })
+                assert updated_access["disabledToolsets"] == ["filesystem"]
+                execution = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "exec.policy.set",
+                    "params": {"security": "allowlist", "ask": "on-miss"},
+                })
+                assert execution["security"] == "allowlist"
+                assert execution["ask"] == "on-miss"
+                codex = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "codex.policy.set",
+                    "params": {
+                        "approvalPolicy": "on-request",
+                        "sandbox": "workspace-write",
+                    },
+                })
+                assert codex["ok"] is True
+                read_codex = await rpc("profiles.rpc", {
+                    "name": "writer",
+                    "method": "codex.policy.get",
+                    "params": {},
+                })
+                assert read_codex["approvalPolicy"] == "on-request"
+                assert read_codex["sandbox"] == "workspace-write"
                 clarifies = await rpc("profiles.rpc", {
                     "name": "writer",
                     "method": "agent.clarify.list",

@@ -43,11 +43,38 @@ async def test_profile_directory_and_statuses_are_public_and_stable(profile_root
     assert all("path" not in item for item in directory["profiles"])
     assert all(uuid.UUID(item["botId"]) for item in directory["profiles"])
     writer = next(item for item in directory["profiles"] if item["name"] == "writer")
+    primary = next(item for item in directory["profiles"] if item["name"] == "default")
     assert writer["model"] == "openai/gpt-5"
+    assert writer["credentialPolicy"] == "isolated"
+    assert primary["credentialPolicy"] == "primary"
     assert {item["profile"] for item in statuses["statuses"]} == {"default", "writer"}
     assert all(item["botId"] for item in statuses["statuses"])
     assert host.capabilities()["defaultProfileRpc"] == "direct"
     assert host.capabilities()["maxConcurrentRuntimes"] == 4
+    assert host.capabilities()["maxNamedProfiles"] == 15
+    assert host.capabilities()["profileReadiness"] is True
+    assert host.capabilities()["credentialPolicies"] == {
+        "namedProfile": "isolated",
+        "supported": ["isolated"],
+        "sharedCredentialBroker": False,
+    }
+    assert host.capabilities()["runtimePolicy"] == {
+        "strategy": "bounded-lru",
+        "queuesWhileBusy": True,
+        "idleEviction": True,
+        "capacityWaitMs": 120_000,
+    }
+    assert host.capabilities()["roomModes"] == ["panel", "council"]
+    assert host.capabilities()["roomLimits"] == {
+        "maxMembers": 6,
+        "councilRounds": 3,
+        "councilTurns": 10,
+    }
+    assert host.capabilities()["roomStorage"] == {
+        "engine": "sqlite-wal",
+        "legacyMigration": "verified-copy-preserve-source",
+    }
+    assert "shared-board" in host.capabilities()["profileFeatures"]
 
 
 @pytest.mark.asyncio
@@ -96,6 +123,7 @@ async def test_remote_session_directory_hides_internal_collaboration(profile_roo
             {"key": "ios:visible"},
             {"key": "desktop:profile-inbox:writer:source"},
             {"key": "desktop:profile-task:private"},
+            {"key": "desktop:profile-room:00000000-0000-0000-0000-000000000001"},
             {"key": "cron:internal"},
             {"key": 123},
         ],
@@ -215,16 +243,154 @@ async def test_profile_mutations_reject_ambiguous_parameter_types(profile_roots)
 
 
 @pytest.mark.asyncio
-async def test_profile_runtime_capacity_is_bounded(profile_roots) -> None:
+async def test_oauth_profile_creation_reports_isolated_login_requirement(
+    profile_roots,
+) -> None:
+    host = ProfileHost()
+
+    result = await host.create({
+        "name": "grok-reviewer",
+        "provider": "xai_oauth",
+        "model": "xai/grok-4",
+    })
+
+    assert result["ok"] is True
+    assert result["readiness"] == {
+        "runnable": False,
+        "authStatus": "login-required",
+        "needsLogin": True,
+        "missingCapabilities": ["provider-auth"],
+        "credentialPolicy": "isolated",
+    }
+    assert result["profile"]["credentialPolicy"] == "isolated"
+    assert (await host.settings("grok-reviewer"))["settings"]["credentialPolicy"] == "isolated"
+
+
+@pytest.mark.asyncio
+async def test_profile_creation_rejects_unsupported_shared_credentials(
+    profile_roots,
+) -> None:
+    host = ProfileHost()
+
+    with pytest.raises(ProfileHostError) as error:
+        await host.create({
+            "name": "shared-auth",
+            "credentialPolicy": "shared",
+        })
+
+    assert error.value.code == "CREDENTIAL_POLICY_UNSUPPORTED"
+    assert not profiles.profile_exists("shared-auth")
+
+
+@pytest.mark.asyncio
+async def test_profile_creation_limit_is_a_structured_remote_error(profile_roots) -> None:
+    for index in range(1, profiles.MAX_NAMED_PROFILES + 1):
+        profiles.create_profile(f"worker-{index}", local_runtime=True)
+    host = ProfileHost()
+
+    with pytest.raises(ProfileHostError) as error:
+        await host.create({"name": "overflow"})
+
+    assert error.value.code == "PROFILE_LIMIT"
+    assert error.value.message == (
+        "This installation can contain at most 15 bots. "
+        "Delete one before creating another."
+    )
+
+
+@pytest.mark.asyncio
+async def test_profile_runtime_capacity_evicts_lru_idle_runtime(profile_roots) -> None:
     host = ProfileHost()
     for name in ("one", "two", "three", "four", "five"):
         profiles.create_profile(name, local_runtime=True)
-    host._runtimes = {name: object() for name in ("one", "two", "three", "four")}  # type: ignore[assignment]
+    runtimes = {
+        name: SimpleNamespace(
+            profile=name,
+            ws=SimpleNamespace(closed=False),
+            process=None,
+            owned=True,
+            state="connected",
+            active_runs=set(),
+            pending={},
+            last_used_at=float(index),
+        )
+        for index, name in enumerate(("one", "two", "three", "four"), start=1)
+    }
+    oldest = runtimes["one"]
+    host._runtimes = runtimes  # type: ignore[assignment]
+    host._close_runtime = AsyncMock()  # type: ignore[method-assign]
 
-    with pytest.raises(ProfileHostError) as capacity:
-        await host._ensure_runtime("five")
-    assert capacity.value.code == "PROFILE_CAPACITY"
-    assert capacity.value.retryable is True
+    async def start(name: str):
+        runtime = SimpleNamespace(
+            profile=name,
+            ws=SimpleNamespace(closed=False),
+            process=None,
+            owned=True,
+            state="connected",
+            active_runs=set(),
+            pending={},
+            last_used_at=99.0,
+        )
+        host._runtimes[name] = runtime  # type: ignore[assignment]
+        return runtime
+
+    host._start_runtime = start  # type: ignore[method-assign]
+
+    result = await host._ensure_runtime("five")
+
+    assert result.profile == "five"
+    assert set(host._runtimes) == {"two", "three", "four", "five"}
+    host._close_runtime.assert_awaited_once_with(oldest)
+
+
+@pytest.mark.asyncio
+async def test_profile_runtime_capacity_queues_until_a_busy_slot_is_idle(
+    profile_roots,
+) -> None:
+    host = ProfileHost()
+    for name in ("one", "two", "three", "four", "five"):
+        profiles.create_profile(name, local_runtime=True)
+    runtimes = {
+        name: SimpleNamespace(
+            profile=name,
+            ws=SimpleNamespace(closed=False),
+            process=None,
+            owned=True,
+            state="connected",
+            active_runs={f"run-{name}"},
+            pending={},
+            last_used_at=float(index),
+        )
+        for index, name in enumerate(("one", "two", "three", "four"), start=1)
+    }
+    host._runtimes = runtimes  # type: ignore[assignment]
+    host._close_runtime = AsyncMock()  # type: ignore[method-assign]
+
+    async def start(name: str):
+        runtime = SimpleNamespace(
+            profile=name,
+            ws=SimpleNamespace(closed=False),
+            process=None,
+            owned=True,
+            state="connected",
+            active_runs=set(),
+            pending={},
+            last_used_at=99.0,
+        )
+        host._runtimes[name] = runtime  # type: ignore[assignment]
+        return runtime
+
+    host._start_runtime = start  # type: ignore[method-assign]
+    waiting = asyncio.create_task(host._ensure_runtime("five"))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+
+    runtimes["one"].active_runs.clear()
+    host._capacity_changed.set()
+    result = await asyncio.wait_for(waiting, 1)
+
+    assert result.profile == "five"
+    assert set(host._runtimes) == {"two", "three", "four", "five"}
 
 
 @pytest.mark.asyncio
@@ -467,6 +633,45 @@ async def test_internal_broker_serializes_turns_per_target(profile_roots) -> Non
     await asyncio.gather(host._broker("writer", params), host._broker("writer", params))
 
     assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_internal_broker_grants_bounded_profile_follow_up(profile_roots) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    profiles.create_profile("reviewer", local_runtime=True)
+    host = ProfileHost()
+    captured: dict = {}
+
+    async def target_rpc(profile: str, method: str, params: dict, _timeout: float):
+        assert profile == "reviewer"
+        assert method == "chat.send"
+        captured.update(params)
+        run_id = "review-run"
+        async def finish() -> None:
+            await asyncio.sleep(0)
+            await host._handle_profile_event("reviewer", "chat", {
+                "runId": run_id,
+                "sessionKey": params["sessionKey"],
+                "state": "final",
+                "message": {"content": "Reviewed"},
+            })
+
+        asyncio.create_task(finish())
+        return {"runId": run_id}
+
+    host._target_rpc = target_rpc  # type: ignore[method-assign]
+    result = await host._broker("writer", {
+        "sourceProfile": "writer",
+        "sourceSessionKey": "ios:writer-thread",
+        "targetProfile": "reviewer",
+        "message": "Please review this",
+        "correlationId": "correlation-1",
+        "hop": 1,
+    })
+
+    assert result["response"] == "Reviewed"
+    assert "message_profile" in captured["allowedTools"]
+    assert captured["profileMessageContext"]["hop"] == 1
 
 
 def test_profile_runtime_environment_drops_owner_credentials(monkeypatch) -> None:

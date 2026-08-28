@@ -36,6 +36,7 @@ from flowly.gateway.auth import (
 from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
 from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
+from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
 
@@ -209,6 +210,7 @@ class _ProfileClientSubscription:
     """Server-owned profile event scope for one authenticated WebSocket."""
 
     directory: bool = False
+    rooms: bool = False
     profiles: set[str] = field(default_factory=set)
     conversations: set[tuple[str, str]] = field(default_factory=set)
 
@@ -638,6 +640,7 @@ class GatewayServer:
             self._profile_host_socket = _ProfileHostSocket(self)
             self._profile_host = ProfileHost(
                 on_event=self._broadcast_profile_host_event,
+                on_room_event=self._broadcast_profile_room_event,
                 primary_rpc=self._profile_host_primary_rpc,
                 primary_event_lease=self._set_profile_host_primary_event_lease,
             )
@@ -4332,12 +4335,11 @@ class GatewayServer:
     async def _ws_rpc_shared_invoke(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
+        from flowly.runtime_capabilities import resolve_runtime_capabilities
         from flowly.shared_service import SharedServiceError, invoke_shared_service
 
         # A named runtime must reverse-RPC to its authenticated owner.  Serving
         # this against its profile-local stores would silently fork user data.
-        from flowly.runtime_capabilities import resolve_runtime_capabilities
-
         if not resolve_runtime_capabilities().owns_shared_board:
             return await self._ws_rpc_error(
                 ws,
@@ -4550,7 +4552,11 @@ class GatewayServer:
     def _profile_subscription_uses_default(
         subscription: _ProfileClientSubscription,
     ) -> bool:
-        return "default" in subscription.profiles or any(
+        # A host-owned group may include the primary profile. Group RPC is the
+        # authenticated lease that keeps its private in-process event feed
+        # alive; without it the primary response completes in the runtime but
+        # the room remains stuck in ``running`` for remote/iOS clients.
+        return subscription.rooms or "default" in subscription.profiles or any(
             profile == "default" for profile, _session in subscription.conversations
         )
 
@@ -4599,6 +4605,8 @@ class GatewayServer:
         used_default_before = self._profile_subscription_uses_default(subscription)
         if method in {"profiles.capabilities", "profiles.list", "profiles.statuses"}:
             subscription.directory = True
+        if method in PROFILE_ROOM_METHODS:
+            subscription.rooms = True
 
         if not isinstance(params, dict):
             return
@@ -4693,6 +4701,16 @@ class GatewayServer:
             and event_data.get("state") in {"final", "aborted", "error"}
         ):
             self._profile_run_subscriptions.pop((profile, run_id), None)
+
+    async def _broadcast_profile_room_event(self, data: dict[str, Any]) -> None:
+        """Forward groups only to authenticated clients that opened the surface."""
+        event = {"type": "event", "event": "profile.room", "data": data}
+        for client_id, subscription in tuple(self._profile_client_subscriptions.items()):
+            if not subscription.rooms:
+                continue
+            ws = self._ws_clients.get(client_id)
+            if ws is not None:
+                await self._ws_send(ws, event)
 
     async def _handle_profile_host_internal_frame(self, frame: dict[str, Any]) -> None:
         """Resolve private default-profile RPCs or forward their live events."""
