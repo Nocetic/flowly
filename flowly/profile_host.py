@@ -63,7 +63,7 @@ _START_TIMEOUT_SECONDS = 90
 _STOP_TIMEOUT_SECONDS = 8
 _DELETE_CONFIRM_TTL_SECONDS = 60
 _DELETE_CONFIRM_MAX = 128
-_MAX_RUNTIMES = 4
+_MAX_RUNTIMES = 6
 _CAPACITY_WAIT_SECONDS = 120.0
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _SAFE_DELEGATED_TOOLS = (
@@ -272,6 +272,7 @@ class ProfileHost:
 
         self._rooms = ProfileRoomService(
             target_rpc=self._target_rpc,
+            target_prepare=self.connect,
             profile_directory=lambda: [profile.name for profile in list_profiles()],
             on_event=self._emit_room,
         )
@@ -325,6 +326,7 @@ class ProfileHost:
                 "engine": room_capabilities["storage"],
                 "legacyMigration": room_capabilities["legacyJsonMigration"],
             },
+            "roomPrewarm": True,
             "profileFeatures": [
                 "isolated-workspace",
                 "isolated-memory",
@@ -626,7 +628,14 @@ class ProfileHost:
 
     async def connect(self, name: str) -> dict[str, Any]:
         _validate_profile_selector(name)
-        if name != "default":
+        if name == "default":
+            if self._primary_rpc is None:
+                raise ProfileHostError(
+                    "DEFAULT_PROFILE_UNAVAILABLE",
+                    "The default profile is not available right now.",
+                    retryable=True,
+                )
+        else:
             await self._ensure_runtime(name)
         return {"status": self.status(name)}
 

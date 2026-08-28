@@ -113,6 +113,57 @@ async def test_room_store_is_owner_only_and_round_trips(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_room_prepare_warms_members_once_and_reports_partial_readiness(
+    tmp_path: Path,
+) -> None:
+    events: list[dict[str, Any]] = []
+    calls: list[str] = []
+    gate = asyncio.Event()
+
+    async def rpc(*_args, **_kwargs):
+        return {"ok": True}
+
+    async def prepare(profile: str):
+        calls.append(profile)
+        await gate.wait()
+        if profile == "writer":
+            raise ProfileHostError(
+                "PROFILE_START_FAILED",
+                "Writer needs provider authentication.",
+                retryable=True,
+            )
+        return {"status": {"profile": profile, "state": "connected"}}
+
+    service = ProfileRoomService(
+        target_rpc=rpc,
+        target_prepare=prepare,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=events.append,
+        store_path=tmp_path / "rooms.json",
+    )
+    room = await service.create("Council", ["default", "writer"])
+    first = asyncio.create_task(service.prepare(room["id"]))
+    second = asyncio.create_task(service.prepare(room["id"]))
+    await _eventually(lambda: len(calls) == 2)
+
+    starting = (await service.list())[0]["readiness"]
+    assert starting["default"]["state"] == "starting"
+    assert starting["writer"]["state"] == "starting"
+    gate.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert sorted(calls) == ["default", "writer"]
+    assert first_result == second_result
+    assert first_result["readiness"]["default"]["state"] == "ready"
+    assert first_result["readiness"]["writer"] == {
+        "state": "error",
+        "updatedAt": first_result["readiness"]["writer"]["updatedAt"],
+        "error": "Writer needs provider authentication.",
+    }
+    assert any(event.get("type") == "readiness" for event in events)
+
+
+@pytest.mark.asyncio
 async def test_legacy_json_migrates_by_verified_copy_and_remains_untouched(
     tmp_path: Path,
 ) -> None:

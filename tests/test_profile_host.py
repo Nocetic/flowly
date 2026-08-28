@@ -50,7 +50,7 @@ async def test_profile_directory_and_statuses_are_public_and_stable(profile_root
     assert {item["profile"] for item in statuses["statuses"]} == {"default", "writer"}
     assert all(item["botId"] for item in statuses["statuses"])
     assert host.capabilities()["defaultProfileRpc"] == "direct"
-    assert host.capabilities()["maxConcurrentRuntimes"] == 4
+    assert host.capabilities()["maxConcurrentRuntimes"] == 6
     assert host.capabilities()["maxNamedProfiles"] == 15
     assert host.capabilities()["profileReadiness"] is True
     assert host.capabilities()["credentialPolicies"] == {
@@ -74,6 +74,7 @@ async def test_profile_directory_and_statuses_are_public_and_stable(profile_root
         "engine": "sqlite-wal",
         "legacyMigration": "verified-copy-preserve-source",
     }
+    assert host.capabilities()["roomPrewarm"] is True
     assert "shared-board" in host.capabilities()["profileFeatures"]
 
 
@@ -301,7 +302,7 @@ async def test_profile_creation_limit_is_a_structured_remote_error(profile_roots
 @pytest.mark.asyncio
 async def test_profile_runtime_capacity_evicts_lru_idle_runtime(profile_roots) -> None:
     host = ProfileHost()
-    for name in ("one", "two", "three", "four", "five"):
+    for name in ("one", "two", "three", "four", "five", "six", "seven"):
         profiles.create_profile(name, local_runtime=True)
     runtimes = {
         name: SimpleNamespace(
@@ -314,7 +315,9 @@ async def test_profile_runtime_capacity_evicts_lru_idle_runtime(profile_roots) -
             pending={},
             last_used_at=float(index),
         )
-        for index, name in enumerate(("one", "two", "three", "four"), start=1)
+        for index, name in enumerate(
+            ("one", "two", "three", "four", "five", "six"), start=1
+        )
     }
     oldest = runtimes["one"]
     host._runtimes = runtimes  # type: ignore[assignment]
@@ -336,10 +339,10 @@ async def test_profile_runtime_capacity_evicts_lru_idle_runtime(profile_roots) -
 
     host._start_runtime = start  # type: ignore[method-assign]
 
-    result = await host._ensure_runtime("five")
+    result = await host._ensure_runtime("seven")
 
-    assert result.profile == "five"
-    assert set(host._runtimes) == {"two", "three", "four", "five"}
+    assert result.profile == "seven"
+    assert set(host._runtimes) == {"two", "three", "four", "five", "six", "seven"}
     host._close_runtime.assert_awaited_once_with(oldest)
 
 
@@ -348,7 +351,7 @@ async def test_profile_runtime_capacity_queues_until_a_busy_slot_is_idle(
     profile_roots,
 ) -> None:
     host = ProfileHost()
-    for name in ("one", "two", "three", "four", "five"):
+    for name in ("one", "two", "three", "four", "five", "six", "seven"):
         profiles.create_profile(name, local_runtime=True)
     runtimes = {
         name: SimpleNamespace(
@@ -361,7 +364,9 @@ async def test_profile_runtime_capacity_queues_until_a_busy_slot_is_idle(
             pending={},
             last_used_at=float(index),
         )
-        for index, name in enumerate(("one", "two", "three", "four"), start=1)
+        for index, name in enumerate(
+            ("one", "two", "three", "four", "five", "six"), start=1
+        )
     }
     host._runtimes = runtimes  # type: ignore[assignment]
     host._close_runtime = AsyncMock()  # type: ignore[method-assign]
@@ -381,7 +386,7 @@ async def test_profile_runtime_capacity_queues_until_a_busy_slot_is_idle(
         return runtime
 
     host._start_runtime = start  # type: ignore[method-assign]
-    waiting = asyncio.create_task(host._ensure_runtime("five"))
+    waiting = asyncio.create_task(host._ensure_runtime("seven"))
     await asyncio.sleep(0)
     assert not waiting.done()
 
@@ -389,8 +394,8 @@ async def test_profile_runtime_capacity_queues_until_a_busy_slot_is_idle(
     host._capacity_changed.set()
     result = await asyncio.wait_for(waiting, 1)
 
-    assert result.profile == "five"
-    assert set(host._runtimes) == {"two", "three", "four", "five"}
+    assert result.profile == "seven"
+    assert set(host._runtimes) == {"two", "three", "four", "five", "six", "seven"}
 
 
 @pytest.mark.asyncio

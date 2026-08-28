@@ -35,6 +35,7 @@ from flowly.profile_room_store import (
 )
 
 TargetRpc = Callable[[str, str, dict[str, Any], float], Awaitable[Any]]
+TargetPrepare = Callable[[str], Awaitable[Any]]
 ProfileDirectory = Callable[[], list[str]]
 RoomEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -65,6 +66,7 @@ PROFILE_ROOM_METHODS = (
     "profiles.rooms.create",
     "profiles.rooms.update",
     "profiles.rooms.delete",
+    "profiles.rooms.prepare",
     "profiles.rooms.send",
     "profiles.rooms.stop",
     "profiles.rooms.approval.resolve",
@@ -387,12 +389,14 @@ class ProfileRoomService:
         self,
         *,
         target_rpc: TargetRpc,
+        target_prepare: TargetPrepare | None = None,
         profile_directory: ProfileDirectory,
         on_event: RoomEventCallback | None,
         store_path: Path | None = None,
         member_timeout: float = _MEMBER_TIMEOUT_SECONDS,
     ) -> None:
         self._target_rpc = target_rpc
+        self._target_prepare = target_prepare
         self._profile_directory = profile_directory
         self._on_event = on_event
         requested_store = store_path or (default_home() / "profile-rooms.sqlite3")
@@ -416,6 +420,8 @@ class ProfileRoomService:
         self._streams: dict[str, dict[str, str]] = {}
         self._activities: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
         self._attentions: dict[str, dict[str, dict[str, Any]]] = {}
+        self._readiness: dict[str, dict[str, dict[str, str]]] = {}
+        self._prepare_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._pending_attachments: dict[str, tuple[int, list[dict[str, str]]]] = {}
         self._epochs: dict[str, int] = {}
         # Stop is a small transaction: freeze incoming frames, checkpoint the
@@ -694,6 +700,8 @@ class ProfileRoomService:
         if method == "profiles.rooms.delete":
             await self.delete(params.get("roomId"))
             return {"ok": True}
+        if method == "profiles.rooms.prepare":
+            return {"room": await self.prepare(params.get("roomId"))}
         if method == "profiles.rooms.send":
             return {"room": await self.send(
                 params.get("roomId"), params.get("content"), params.get("attachments")
@@ -714,6 +722,81 @@ class ProfileRoomService:
         return [self._public(room) for room in sorted(
             self._rooms.values(), key=lambda item: item["updatedAt"], reverse=True
         )]
+
+    async def prepare(self, raw_id: Any) -> dict[str, Any]:
+        """Warm every member runtime without making room availability all-or-nothing."""
+        room_id = _room_id(raw_id)
+        await self._load()
+        room = self._require(room_id)
+        if self._closed:
+            raise ProfileHostError("HOST_STOPPED", "The profile host is shutting down.")
+
+        tasks: list[asyncio.Task[None]] = []
+        changed = False
+        readiness = self._readiness.setdefault(room_id, {})
+        for profile in room["members"]:
+            key = (room_id, profile)
+            task = self._prepare_tasks.get(key)
+            if task is None:
+                current = readiness.get(profile)
+                if not isinstance(current, dict) or current.get("state") != "ready":
+                    readiness[profile] = {
+                        "state": "starting",
+                        "updatedAt": _now(),
+                        "error": "",
+                    }
+                    changed = True
+                task = asyncio.create_task(
+                    self._prepare_member(room_id, profile),
+                    name=f"profile-room-prepare:{room_id}:{profile}",
+                )
+                self._prepare_tasks[key] = task
+                task.add_done_callback(
+                    lambda completed, member_key=key: self._prepare_tasks.pop(member_key, None)
+                    if self._prepare_tasks.get(member_key) is completed else None
+                )
+            tasks.append(task)
+
+        if changed:
+            await self._emit({
+                "roomId": room_id,
+                "type": "readiness",
+                "room": self._public(room),
+            })
+        if tasks:
+            await asyncio.gather(*(asyncio.shield(task) for task in tasks))
+        return self._public(self._require(room_id))
+
+    async def _prepare_member(self, room_id: str, profile: str) -> None:
+        try:
+            if self._target_prepare is not None:
+                await self._target_prepare(profile)
+            else:
+                await self._target_rpc(profile, "sessions.list", {}, 30)
+            state = "ready"
+            error = ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            state = "error"
+            error = (
+                exc.message if isinstance(exc, ProfileHostError) else str(exc)
+            )[:500] or "This group member could not start."
+
+        room = self._rooms.get(room_id)
+        if room is None or profile not in room["members"]:
+            return
+        self._readiness.setdefault(room_id, {})[profile] = {
+            "state": state,
+            "updatedAt": _now(),
+            "error": error,
+        }
+        await self._emit({
+            "roomId": room_id,
+            "type": "readiness",
+            "profile": profile,
+            "room": self._public(room),
+        })
 
     async def import_rooms(self, value: Any) -> dict[str, Any]:
         """Import the legacy Desktop-owned room store exactly once.
@@ -832,6 +915,10 @@ class ProfileRoomService:
             "mode": room.get("mode", "panel"),
             "updatedAt": room["updatedAt"],
         }
+        previous_readiness = {
+            member: dict(value)
+            for member, value in self._readiness.get(room_id, {}).items()
+        }
         old_members = set(room["members"])
         room["title"] = clean_title
         room["members"] = clean_members
@@ -840,11 +927,21 @@ class ProfileRoomService:
             member: min(int(room["watermarks"].get(member, 0)), len(room["messages"]))
             if member in old_members else 0 for member in clean_members
         }
+        readiness = self._readiness.get(room_id)
+        if readiness is not None:
+            self._readiness[room_id] = {
+                member: value for member, value in readiness.items()
+                if member in clean_members
+            }
         room["updatedAt"] = _now()
         try:
             await self._persist()
         except Exception:
             room.update(previous)
+            if previous_readiness:
+                self._readiness[room_id] = previous_readiness
+            else:
+                self._readiness.pop(room_id, None)
             raise
         public = self._public(room)
         await self._emit({"roomId": room_id, "type": "updated", "room": public})
@@ -857,7 +954,9 @@ class ProfileRoomService:
         if self._room_is_running(room):
             raise ProfileHostError("ROOM_BUSY", "Stop the active group response before deleting it.")
         previous_epoch = self._epochs.get(room_id)
+        previous_readiness = self._readiness.get(room_id)
         self._rooms.pop(room_id)
+        self._readiness.pop(room_id, None)
         self._epochs[room_id] = self._epochs.get(room_id, 0) + 1
         self._pending_attachments.pop(room_id, None)
         self._drop_live(room_id)
@@ -865,6 +964,8 @@ class ProfileRoomService:
             await self._persist()
         except Exception:
             self._rooms[room_id] = room
+            if previous_readiness is not None:
+                self._readiness[room_id] = previous_readiness
             if previous_epoch is None:
                 self._epochs.pop(room_id, None)
             else:
@@ -904,6 +1005,10 @@ class ProfileRoomService:
         previous_run = room.get("run")
         previous_updated_at = room["updatedAt"]
         previous_epoch = self._epochs.get(room_id)
+        previous_readiness = {
+            profile: dict(value)
+            for profile, value in self._readiness.get(room_id, {}).items()
+        }
         timestamp = _now()
         message: dict[str, Any] = {
             "id": str(uuid.uuid4()), "role": "user", "content": clean, "createdAt": timestamp,
@@ -919,6 +1024,14 @@ class ProfileRoomService:
         else:
             self._pending_attachments.pop(room_id, None)
         self._active[room_id] = set(responders)
+        readiness = self._readiness.setdefault(room_id, {})
+        for profile in responders:
+            if readiness.get(profile, {}).get("state") != "ready":
+                readiness[profile] = {
+                    "state": "starting",
+                    "updatedAt": timestamp,
+                    "error": "",
+                }
         boundary = len(room["messages"])
         group_run_id = str(uuid.uuid4())
         room["run"] = {
@@ -961,6 +1074,10 @@ class ProfileRoomService:
                 self._epochs.pop(room_id, None)
             else:
                 self._epochs[room_id] = previous_epoch
+            if previous_readiness:
+                self._readiness[room_id] = previous_readiness
+            else:
+                self._readiness.pop(room_id, None)
             raise
         public = self._public(room)
         await self._emit({"roomId": room_id, "type": "updated", "room": public})
@@ -1076,10 +1193,12 @@ class ProfileRoomService:
             members = [member for member in room["members"] if member != profile]
             if len(members) < 2:
                 self._rooms.pop(room_id)
+                self._readiness.pop(room_id, None)
                 self._drop_live(room_id)
                 await self._emit({"roomId": room_id, "type": "deleted"})
                 continue
             room["members"] = members
+            self._readiness.get(room_id, {}).pop(profile, None)
             room["watermarks"].pop(profile, None)
             room["updatedAt"] = _now()
             await self._emit({
@@ -1234,6 +1353,11 @@ class ProfileRoomService:
             if self._room_is_running(room):
                 await self.stop(room_id)
         self._closed = True
+        prepare_tasks = list(self._prepare_tasks.values())
+        for task in prepare_tasks:
+            task.cancel()
+        await asyncio.gather(*prepare_tasks, return_exceptions=True)
+        self._prepare_tasks.clear()
         tasks = list(self._tasks)
         for task in tasks:
             task.cancel()
@@ -1301,6 +1425,7 @@ class ProfileRoomService:
                         "A group member did not accept the response.",
                         retryable=True,
                     )
+                await self._set_member_readiness(room_id, profile, "ready")
                 self._runs.setdefault(room_id, {})[profile] = run_id
                 if member is not None:
                     member.update({
@@ -1339,6 +1464,10 @@ class ProfileRoomService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if not run_id:
+                    await self._set_member_readiness(
+                        room_id, profile, "error", str(exc)[:500]
+                    )
                 await self._member_error(room_id, profile, str(exc)[:500], epoch)
             finally:
                 self._waiters.pop((profile, run_id), None)
@@ -1440,6 +1569,7 @@ class ProfileRoomService:
                         "A group member did not accept the response.",
                         retryable=True,
                     )
+                await self._set_member_readiness(room_id, profile, "ready")
                 self._runs.setdefault(room_id, {})[profile] = run_id
                 member.update({
                     "state": "running",
@@ -1476,6 +1606,10 @@ class ProfileRoomService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if not run_id:
+                    await self._set_member_readiness(
+                        room_id, profile, "error", str(exc)[:500]
+                    )
                 await self._member_error(room_id, profile, str(exc)[:500], epoch)
             finally:
                 self._waiters.pop((profile, run_id), None)
@@ -1600,6 +1734,28 @@ class ProfileRoomService:
                 path.unlink(missing_ok=True)
             raise
         return response if substantive else ""
+
+    async def _set_member_readiness(
+        self,
+        room_id: str,
+        profile: str,
+        state: str,
+        error: str = "",
+    ) -> None:
+        room = self._rooms.get(room_id)
+        if room is None or profile not in room["members"]:
+            return
+        self._readiness.setdefault(room_id, {})[profile] = {
+            "state": state,
+            "updatedAt": _now(),
+            "error": (error or "")[:500],
+        }
+        await self._emit({
+            "roomId": room_id,
+            "type": "readiness",
+            "profile": profile,
+            "room": self._public(room),
+        })
 
     async def _member_error(
         self,
@@ -1944,6 +2100,17 @@ class ProfileRoomService:
             "needsUser": bool(attentions) or self._needs_user(room),
             "attentions": attentions,
             "runState": self._public_run(room),
+            "readiness": {
+                profile: {
+                    "state": str(value.get("state") or "idle"),
+                    "updatedAt": str(value.get("updatedAt") or ""),
+                    "error": str(value.get("error") or ""),
+                }
+                for profile in room["members"]
+                for value in [self._readiness.get(room_id, {}).get(profile, {
+                    "state": "idle", "updatedAt": "", "error": "",
+                })]
+            },
         }
 
     @staticmethod
