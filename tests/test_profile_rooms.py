@@ -1552,6 +1552,11 @@ async def test_history_outlives_the_live_window(
 ) -> None:
     """Leaving the window must not mean leaving the group."""
     monkeypatch.setattr(rooms_module, "_MAX_MESSAGES", 10)
+    # The window is spent in bytes now, with a floor of recent messages the
+    # budget cannot take away. Both have to come down for a ten-message
+    # window to be reachable in a test.
+    monkeypatch.setattr(rooms_module, "_MIN_RESIDENT_MESSAGES", 1)
+    monkeypatch.setattr(rooms_module, "_RESIDENT_WINDOW_BYTES", 10 * 1024 * 1024)
 
     async def rpc(*_args, **_kwargs):
         return {"ok": True}
@@ -1992,3 +1997,80 @@ async def test_a_cancelled_turn_cannot_desynchronise_the_store(
     # The next unrelated write must still be accepted.
     await service.create("Second", ["default", "writer"])
     assert len(service._rooms) == 2
+
+
+def _weighed(content: str, *, tool_arguments: str = "") -> dict[str, Any]:
+    message: dict[str, Any] = {
+        "id": str(uuid.uuid4()),
+        "role": "user",
+        "content": content,
+        "createdAt": "2026-08-27T00:00:00.000Z",
+    }
+    if tool_arguments:
+        message["role"] = "assistant"
+        message["profile"] = "writer"
+        message["toolCalls"] = [{
+            "id": "call-1", "name": "read_file", "argumentsJson": tool_arguments,
+        }]
+    return message
+
+
+def test_a_heavy_room_is_trimmed_long_before_a_thousand_messages() -> None:
+    """The window is a residency budget, so it is spent in bytes.
+
+    Counting messages is the wrong measure and quietly so: a thousand short
+    replies and a thousand carrying file listings are the same number and
+    nowhere near the same room. The window is deep-copied into every snapshot
+    and carried in every full update, so the heavy room has to give way first.
+    """
+    light = [_weighed("ok") for _ in range(200)]
+    heavy = [_weighed("here is the tree", tool_arguments="x" * 100_000) for _ in range(200)]
+
+    # Two hundred one-word replies are nothing; nothing leaves.
+    assert rooms_module._resident_trim_count(light) == 0
+    # The same number of file listings is twenty megabytes; most must leave.
+    trimmed = rooms_module._resident_trim_count(heavy)
+    assert trimmed > 150
+    assert len(heavy) - trimmed >= rooms_module._MIN_RESIDENT_MESSAGES
+
+
+def test_the_current_turn_survives_however_heavy_it_is() -> None:
+    """A floor the budget cannot take away.
+
+    A room whose last turns are each larger than the whole budget would
+    otherwise trim itself down to nothing and show the reader an empty
+    transcript for the conversation they are having.
+    """
+    enormous = [
+        _weighed("dump", tool_arguments="x" * (rooms_module._RESIDENT_WINDOW_BYTES + 1))
+        for _ in range(50)
+    ]
+    kept = len(enormous) - rooms_module._resident_trim_count(enormous)
+    assert kept == rooms_module._MIN_RESIDENT_MESSAGES
+
+
+def test_the_message_ceiling_still_holds() -> None:
+    """Weight replaced the count as the measure, not as the limit.
+
+    The durable store refuses to load a room carrying more than this many
+    resident rows, so the window must never hand it one.
+    """
+    featherweight = [_weighed("") for _ in range(rooms_module._MAX_MESSAGES + 250)]
+    kept = len(featherweight) - rooms_module._resident_trim_count(featherweight)
+    assert kept == rooms_module._MAX_MESSAGES
+
+
+def test_weight_counts_what_actually_varies() -> None:
+    """Content, tool arguments and inline thumbnails; not the envelope."""
+    base = rooms_module._message_weight(_weighed(""))
+    assert base == rooms_module._MESSAGE_WEIGHT_OVERHEAD
+    assert rooms_module._message_weight(_weighed("x" * 500)) == base + 500
+    assert rooms_module._message_weight(
+        _weighed("hi", tool_arguments="y" * 400)
+    ) == base + 2 + 400
+
+    with_thumbnail = _weighed("hi")
+    with_thumbnail["attachments"] = [{
+        "fileName": "a.png", "mimeType": "image/png", "thumbnail": "z" * 900,
+    }]
+    assert rooms_module._message_weight(with_thumbnail) == base + 2 + 900

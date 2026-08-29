@@ -46,6 +46,16 @@ _STORE_VERSION = 1
 _MAX_ROOMS = 200
 _MAX_MEMBERS = 6
 _MAX_MESSAGES = 1_000
+# What the live window costs to hold, rather than how many rows it has. The
+# window is deep-copied into every snapshot and carried in every full update,
+# so its weight — not its length — is what a room actually spends.
+_RESIDENT_WINDOW_BYTES = 2 * 1024 * 1024
+# Kept however heavy they are: a room whose last turns are enormous must still
+# show the turn the reader is having.
+_MIN_RESIDENT_MESSAGES = 30
+# Charged per message for identity, timestamps and role — the parts that do
+# not vary enough to be worth measuring.
+_MESSAGE_WEIGHT_OVERHEAD = 256
 _MAX_CONTEXT_MESSAGES = 40
 _DEFAULT_HISTORY_PAGE = 50
 _MAX_HISTORY_PAGE = 100
@@ -114,6 +124,49 @@ def _consume_abandoned_commit(commit: "asyncio.Future[None]") -> None:
     exc = commit.exception()
     if exc is not None:
         logger.warning("Abandoned room commit finished with: {!r}", exc)
+
+
+def _message_weight(message: dict[str, Any]) -> int:
+    """What one message costs to keep resident, in bytes.
+
+    Content and tool arguments are what actually vary — a file listing or a
+    diff is thousands of times heavier than "ok" — so they are measured, and
+    everything else is charged a flat overhead rather than serialized. An
+    attachment's bytes never live in the message, but its inline thumbnail
+    does, which is why that one is counted.
+    """
+    weight = _MESSAGE_WEIGHT_OVERHEAD + len(str(message.get("content") or ""))
+    for call in message.get("toolCalls") or []:
+        if isinstance(call, dict):
+            weight += len(str(call.get("argumentsJson") or ""))
+    for attachment in message.get("attachments") or []:
+        if isinstance(attachment, dict):
+            weight += len(str(attachment.get("thumbnail") or ""))
+    return weight
+
+
+def _resident_trim_count(messages: list[dict[str, Any]]) -> int:
+    """How many of the oldest messages have to leave the live window.
+
+    Counting messages is the wrong measure and quietly so: a thousand short
+    replies and a thousand carrying file listings are the same number and
+    nowhere near the same room. The window is a residency budget — it is
+    copied on every snapshot and carried in every full update — so it is
+    spent in bytes, with a floor of recent messages that is never traded away
+    however heavy they are, and the old count kept as a hard ceiling.
+    """
+    if len(messages) <= _MIN_RESIDENT_MESSAGES:
+        return 0
+    kept = 0
+    weight = 0
+    for message in reversed(messages):
+        weight += _message_weight(message)
+        if kept >= _MIN_RESIDENT_MESSAGES and weight > _RESIDENT_WINDOW_BYTES:
+            break
+        kept += 1
+        if kept >= _MAX_MESSAGES:
+            break
+    return max(0, len(messages) - kept)
 
 
 def _now() -> str:
@@ -2697,9 +2750,9 @@ class ProfileRoomService:
         boundaries index the window, so they still shift by the same amount;
         sequence numbers do not, which is why a cursor survives this.
         """
-        if len(room["messages"]) <= _MAX_MESSAGES:
+        removed = _resident_trim_count(room["messages"])
+        if removed <= 0:
             return
-        removed = len(room["messages"]) - _MAX_MESSAGES
         del room["messages"][:removed]
         room["trimmedCount"] = int(room.get("trimmedCount", 0)) + removed
         room["watermarks"] = {
