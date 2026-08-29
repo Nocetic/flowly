@@ -1793,3 +1793,202 @@ def test_v1_store_migrates_to_the_sequenced_schema(tmp_path: Path) -> None:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == (
             SQLITE_SCHEMA_VERSION
         )
+
+
+async def _seeded_service(path: Path, *, turns: int) -> ProfileRoomService:
+    """A room that has been through a real durable round trip."""
+    async def rpc(*_args, **_kwargs):
+        return {"ok": True}
+
+    service = ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=None,
+        store_path=path,
+    )
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+    for index in range(turns):
+        service._append_message(durable, {
+            "id": str(uuid.uuid4()),
+            "role": "user",
+            "content": f"message {index}",
+            "createdAt": "2026-08-27T00:00:00.000Z",
+        })
+    await service._persist()
+    return service
+
+
+@pytest.mark.asyncio
+async def test_durable_load_preserves_the_coordinates_it_read(tmp_path: Path) -> None:
+    """A load must return the room the store holds, sequences included.
+
+    Message validation rebuilds every record from an allowlist. When that
+    allowlist omitted ``seq`` — and the room rebuild omitted ``nextSeq`` and
+    ``trimmedCount`` — a load silently returned a room with no coordinates at
+    all, and the next write had to invent them from position.
+    """
+    path = tmp_path / "rooms.json"
+    seeded = await _seeded_service(path, turns=6)
+    room_id = next(iter(seeded._rooms))
+
+    async def rpc(*_args, **_kwargs):
+        return {"ok": True}
+
+    reloaded = ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=None,
+        store_path=path,
+    )
+    await reloaded.list(include_messages=False)
+    room = reloaded._rooms[room_id]
+
+    assert [message["seq"] for message in room["messages"]] == list(range(6))
+    assert room["nextSeq"] == 6
+    assert room["trimmedCount"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_send_after_a_durable_load_does_not_collide(tmp_path: Path) -> None:
+    """The reported failure, end to end.
+
+    Losing the sequences on load made the next append reserve ``0`` — a
+    coordinate the store had already given to the room's first message. The
+    write then tried to move every existing message one place up, collided
+    with its own ``UNIQUE (room_id, message_id)``, and surfaced as "the local
+    group database could not commit the change safely".
+    """
+    path = tmp_path / "rooms.json"
+    seeded = await _seeded_service(path, turns=6)
+    room_id = next(iter(seeded._rooms))
+
+    async def rpc(*_args, **_kwargs):
+        return {"ok": True}
+
+    reloaded = ProfileRoomService(
+        target_rpc=rpc,
+        target_prepare=AsyncMock(return_value=None),
+        profile_directory=lambda: ["default", "writer"],
+        on_event=None,
+        store_path=path,
+    )
+    await reloaded.send(room_id, "hello")
+
+    room = reloaded._rooms[room_id]
+    assert [message["seq"] for message in room["messages"]] == list(range(7))
+    assert room["messages"][-1]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_one_unwritable_room_cannot_block_every_other_write(
+    tmp_path: Path,
+) -> None:
+    """A room whose in-memory sequences drifted must not poison the store.
+
+    Rooms are committed in one transaction, so a single room the writer
+    could not place used to fail every unrelated operation in the same
+    process — creating a group stopped working because a different group's
+    window had drifted. The writer now re-keys a message that moved instead
+    of colliding with itself.
+    """
+    path = tmp_path / "rooms.json"
+    service = await _seeded_service(path, turns=4)
+    room_id = next(iter(service._rooms))
+    drifted = service._rooms[room_id]
+    for message in drifted["messages"]:
+        message["seq"] = int(message["seq"]) + 1
+    drifted["nextSeq"] = len(drifted["messages"]) + 1
+
+    await service.create("Second", ["default", "writer"])
+
+    assert len(service._rooms) == 2
+    reloaded_ids = {
+        room["id"] for room in (await ProfileRoomService(
+            target_rpc=AsyncMock(return_value={"ok": True}),
+            profile_directory=lambda: ["default", "writer"],
+            on_event=None,
+            store_path=path,
+        ).list(include_messages=False))
+    }
+    assert reloaded_ids == set(service._rooms)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_write_leaves_memory_untouched(tmp_path: Path) -> None:
+    """A failed commit must not change what the process is holding.
+
+    Sequencing ran against the live rooms before the write, so a refused
+    transaction left those assignments behind. The caller's rollback restored
+    the message list but not the records inside it, and every later write in
+    that process inherited the drift.
+    """
+    path = tmp_path / "rooms.json"
+    service = await _seeded_service(path, turns=3)
+    room_id = next(iter(service._rooms))
+    room = service._rooms[room_id]
+
+    def explode(**_kwargs):
+        raise RoomStoreError("disk went away")
+
+    service._sqlite_store.apply = explode  # type: ignore[method-assign]
+    # A room adopted from an import or a legacy snapshot reaches memory
+    # without coordinates; sequencing is what the write was about to give it.
+    for message in room["messages"]:
+        message.pop("seq", None)
+    room.pop("nextSeq", None)
+    stripped = json.loads(json.dumps(room))
+
+    with pytest.raises(ProfileHostError):
+        await service._persist()
+
+    assert room == stripped
+    assert all("seq" not in message for message in room["messages"])
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_turn_cannot_desynchronise_the_store(
+    tmp_path: Path,
+) -> None:
+    """Cancelling a write must not leave the store ahead of this process.
+
+    A transaction runs on a worker thread and cannot be interrupted once it
+    is under way. Cancelling the coroutine that awaited it — a stopped group
+    turn, a gateway shutting down — abandoned the result: the commit landed,
+    the in-memory revision stayed behind, and the very next write refused
+    itself as a foreign change and cleared every room this process held.
+    """
+    path = tmp_path / "rooms.json"
+    service = await _seeded_service(path, turns=2)
+    room_id = next(iter(service._rooms))
+    room = service._rooms[room_id]
+    released = asyncio.Event()
+    inner = service._sqlite_store.apply
+
+    def slow_apply(**kwargs):
+        released.set()
+        # Long enough that the awaiting coroutine is cancelled while the
+        # transaction is still in flight, exactly as a stopped turn does.
+        import time
+        time.sleep(0.25)
+        return inner(**kwargs)
+
+    service._sqlite_store.apply = slow_apply  # type: ignore[method-assign]
+    service._append_message(room, {
+        "id": str(uuid.uuid4()),
+        "role": "user",
+        "content": "committed under cancellation",
+        "createdAt": "2026-08-27T00:00:00.000Z",
+    })
+
+    writer = asyncio.ensure_future(service._persist())
+    await released.wait()
+    writer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await writer
+    service._sqlite_store.apply = inner  # type: ignore[method-assign]
+    await service.flush_pending_commits()
+
+    # The next unrelated write must still be accepted.
+    await service.create("Second", ["default", "writer"])
+    assert len(service._rooms) == 2

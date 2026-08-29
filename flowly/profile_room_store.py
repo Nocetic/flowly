@@ -419,7 +419,14 @@ class SQLiteRoomStore:
                 connection.rollback()
             except sqlite3.Error:
                 pass
-            raise RoomStoreError("The group database could not commit a transaction.") from exc
+            # Say which kind of refusal this was. A contended database is a
+            # retry; a violated invariant is a bug that must be reported as
+            # one. Collapsing both into a single sentence hid a constraint
+            # violation behind a message that reads like transient trouble.
+            raise RoomStoreError(
+                f"The group database could not commit a transaction "
+                f"({type(exc).__name__}: {exc})."
+            ) from exc
         finally:
             connection.close()
 
@@ -680,14 +687,15 @@ class SQLiteRoomStore:
         # message on every turn, which made a single reply cost one write per
         # message in the room and forced sequence numbers to be re-derived
         # from position — the reason a cursor could never be a sequence.
-        stored: dict[int, str] = {
-            int(seq): str(payload_json)
-            for seq, payload_json in connection.execute(
-                "SELECT seq, payload_json FROM room_messages "
-                "WHERE room_id = ? AND trimmed = 0",
-                (room_id,),
-            )
-        }
+        stored: dict[int, str] = {}
+        stored_seq_by_id: dict[str, int] = {}
+        for seq, message_id, payload_json in connection.execute(
+            "SELECT seq, message_id, payload_json FROM room_messages "
+            "WHERE room_id = ? AND trimmed = 0",
+            (room_id,),
+        ):
+            stored[int(seq)] = str(payload_json)
+            stored_seq_by_id[str(message_id)] = int(seq)
         records: list[tuple[str, int, str, str]] = []
         live_seqs: set[int] = set()
         for message in messages:
@@ -698,6 +706,26 @@ class SQLiteRoomStore:
                 raise RoomStoreLimitError("A group message record exceeds its safe size limit.")
             if stored.get(seq) != payload:
                 records.append((room_id, seq, str(message["id"]), payload))
+        # A message that arrives under a different sequence than the one it
+        # is stored at has MOVED, and the row it left behind is its old
+        # coordinate — not a second copy of the message. Retiring that row
+        # first is what makes the write idempotent: without it the upsert
+        # re-keyed one row into another's identity and tripped
+        # ``UNIQUE (room_id, message_id)``, which failed the whole
+        # transaction and, because rooms commit together, every unrelated
+        # group in the same commit with it. Nothing moves on an ordinary
+        # turn, so this repair costs no statement in the normal path.
+        moved = [
+            (room_id, message_id, seq)
+            for _room, seq, message_id, _payload in records
+            if stored_seq_by_id.get(message_id, seq) != seq
+        ]
+        if moved:
+            connection.executemany(
+                "DELETE FROM room_messages "
+                "WHERE room_id = ? AND message_id = ? AND seq != ?",
+                moved,
+            )
         connection.executemany(
             """
             INSERT INTO room_messages(room_id, seq, message_id, payload_json, trimmed)

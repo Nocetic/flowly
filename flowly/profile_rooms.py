@@ -107,6 +107,15 @@ _TOOL_ARGUMENT_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _consume_abandoned_commit(commit: "asyncio.Future[None]") -> None:
+    """Retrieve the outcome of a write whose caller was cancelled."""
+    if commit.cancelled():
+        return
+    exc = commit.exception()
+    if exc is not None:
+        logger.warning("Abandoned room commit finished with: {!r}", exc)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -484,6 +493,9 @@ class ProfileRoomService:
         self._sqlite_store = SQLiteRoomStore(self._store_path)
         self._storage_mode = "sqlite-wal"
         self._store_revision = 0
+        # Writes whose callers were cancelled. They still own the lock and
+        # the revision bookkeeping, so shutdown must let them finish.
+        self._commits: set[asyncio.Future[None]] = set()
         self._persisted_fingerprints: dict[str, str] = {}
         self._media_dir = self._store_path.parent / "media"
         self._member_timeout = member_timeout
@@ -1576,6 +1588,10 @@ class ProfileRoomService:
                     "HOST_STOPPED", "The profile host is shutting down."
                 ))
         self._waiters.clear()
+        # Cancelling the turns above abandons the writes they were awaiting,
+        # but those writes still hold the store lock and still owe it their
+        # revision. Let them land before the host is considered stopped.
+        await self.flush_pending_commits()
 
     async def _run_room(
         self,
@@ -2848,6 +2864,12 @@ class ProfileRoomService:
                     "createdAt": self._timestamp(room.get("createdAt")),
                     "updatedAt": self._timestamp(room.get("updatedAt")),
                 }
+                # A room's sequence space and its trimmed count describe
+                # history the live window no longer holds. Dropping them
+                # rebased a long-running room onto its window: the next
+                # sequence collided with messages that had already left it,
+                # and the room reported itself shorter than it is.
+                self._adopt_room_counters(parsed[room_id], room, messages)
                 durable_run = self._load_run(
                     room.get("run"), members, len(messages)
                 )
@@ -2956,6 +2978,40 @@ class ProfileRoomService:
             "turnCount": turn_count,
             "members": parsed_members,
         }
+
+    @staticmethod
+    def _adopt_room_counters(
+        parsed: dict[str, Any],
+        source: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Carry a room's sequence space and trimmed count across a load.
+
+        Both are only ever set by a source that already knows them — the
+        durable store, or the sequencer that adopts a snapshot. A record
+        without them is a genuinely unsequenced room, which stays that way
+        here and is numbered when it becomes durable.
+        """
+        highest = max(
+            (
+                int(message["seq"])
+                for message in messages
+                if isinstance(message.get("seq"), int)
+                and not isinstance(message.get("seq"), bool)
+            ),
+            default=-1,
+        )
+        next_seq = source.get("nextSeq")
+        if isinstance(next_seq, bool) or not isinstance(next_seq, int) or next_seq < 0:
+            next_seq = None
+        if next_seq is not None or highest >= 0:
+            # Never hand back a number the room has already used.
+            parsed["nextSeq"] = max(next_seq or 0, highest + 1)
+        trimmed = source.get("trimmedCount")
+        if isinstance(trimmed, bool) or not isinstance(trimmed, int) or trimmed < 0:
+            trimmed = None
+        if trimmed is not None:
+            parsed["trimmedCount"] = trimmed
 
     def _validate_messages(self, messages: list[Any], members: list[str]) -> None:
         normalized: list[dict[str, Any]] = []
@@ -3068,6 +3124,20 @@ class ProfileRoomService:
                 clean["aborted"] = True
             if duration_ms is not None:
                 clean["durationMs"] = duration_ms
+            # The sequence is the message's durable coordinate, not decoration.
+            # Rebuilding a record without it silently discarded what the store
+            # had already assigned, so the next append reserved a number the
+            # room had handed out long ago and the write collided with itself.
+            # A record that genuinely carries none (a legacy snapshot, an
+            # import) still arrives here without one and is numbered later, at
+            # the point the room becomes durable.
+            seq = message.get("seq")
+            if isinstance(seq, bool) or (seq is not None and not isinstance(seq, int)):
+                raise ValueError("invalid message sequence")
+            if isinstance(seq, int):
+                if seq < 0:
+                    raise ValueError("invalid message sequence")
+                clean["seq"] = seq
             normalized.append(clean)
         messages[:] = normalized
 
@@ -3082,12 +3152,37 @@ class ProfileRoomService:
         return value
 
     async def _persist(self) -> None:
+        """Commit the current rooms, atomically with respect to cancellation.
+
+        A transaction runs on a worker thread and cannot be interrupted once
+        it is under way. Cancelling the coroutine that awaited it — a stopped
+        group turn, a gateway shutting down — used to abandon the result: the
+        commit landed, this process' revision stayed behind, and the next
+        write refused itself as a foreign change and cleared every room it
+        was holding. The write, the bookkeeping and the lock that guards them
+        now finish together whatever happens to the caller; only the waiting
+        is cancellable.
+        """
+        commit = asyncio.ensure_future(self._commit())
+        self._commits.add(commit)
+        commit.add_done_callback(self._commits.discard)
+        try:
+            await asyncio.shield(commit)
+        except asyncio.CancelledError:
+            # The commit owns its own outcome from here. Consume whatever it
+            # raises so an abandoned write cannot surface as an unretrieved
+            # task exception long after the turn it belonged to ended.
+            commit.add_done_callback(_consume_abandoned_commit)
+            raise
+
+    async def flush_pending_commits(self) -> None:
+        """Wait for writes whose callers were cancelled to finish."""
+        pending = [commit for commit in self._commits if not commit.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _commit(self) -> None:
         async with self._write_lock:
-            # Every room becomes durable through here, which makes it the one
-            # place that can guarantee sequencing regardless of how the room
-            # entered memory.
-            for room in self._rooms.values():
-                ensure_message_sequences(room)
             # Take the snapshot under the lock. Parallel member completions
             # mutate one shared room; serializing earlier could let an older
             # snapshot overwrite a newer durable response.
@@ -3095,6 +3190,16 @@ class ProfileRoomService:
                 room_id: json.loads(canonical_room_json(room))
                 for room_id, room in self._rooms.items()
             }
+            # Every room becomes durable through here, which makes it the one
+            # place that can guarantee sequencing regardless of how the room
+            # entered memory. Number the SNAPSHOT, not the live rooms: a
+            # refused transaction used to leave its assignments behind, where
+            # the caller's rollback — which restores the message list, not the
+            # records inside it — could not reach them, and every later write
+            # in the process inherited the drift. Memory adopts these numbers
+            # only once the store has accepted them.
+            for room in snapshot.values():
+                ensure_message_sequences(room)
             fingerprints = room_fingerprints(snapshot)
             if self._storage_mode == "legacy-json-fallback":
                 encoded = (
@@ -3147,6 +3252,16 @@ class ProfileRoomService:
                     "The local group database reached its safe size limit.",
                 ) from exc
             except (RoomStoreInvalidError, RoomStoreError, OSError) as exc:
+                # Name the operation and the underlying fault. Collapsing
+                # every storage failure into one opaque sentence is what made
+                # an ordinary constraint violation take a night to find.
+                logger.error(
+                    "Room store commit failed (rooms={}, deleted={}, revision={}): {!r}",
+                    len(changed_rooms),
+                    len(deleted_room_ids),
+                    self._store_revision,
+                    exc,
+                )
                 raise ProfileHostError(
                     "ROOM_STORE_INVALID",
                     "The local group database could not commit the change safely.",
@@ -3154,6 +3269,39 @@ class ProfileRoomService:
                 ) from exc
             self._store_revision = revision
             self._persisted_fingerprints = fingerprints
+            self._adopt_persisted_sequences(snapshot)
+
+    def _adopt_persisted_sequences(self, snapshot: dict[str, dict[str, Any]]) -> None:
+        """Copy the committed coordinates back onto the live rooms.
+
+        Sequencing runs against the snapshot so a refused write cannot change
+        what the process holds. Once the store has accepted it, the live rooms
+        must agree with what is now on disk — matched by message identity,
+        because a member reply may have appended while the write was in
+        flight and that record has a coordinate of its own already.
+        """
+        for room_id, persisted in snapshot.items():
+            room = self._rooms.get(room_id)
+            if room is None:
+                continue
+            sequences = {
+                str(message["id"]): message["seq"]
+                for message in persisted.get("messages", [])
+                if isinstance(message, dict) and isinstance(message.get("seq"), int)
+            }
+            for message in room.get("messages", []):
+                if not isinstance(message, dict) or "seq" in message:
+                    continue
+                seq = sequences.get(str(message.get("id")))
+                if seq is not None:
+                    message["seq"] = seq
+            next_seq = persisted.get("nextSeq")
+            if isinstance(next_seq, int) and not isinstance(next_seq, bool):
+                room["nextSeq"] = max(int(room.get("nextSeq", 0)), next_seq)
+            if "trimmedCount" not in room:
+                trimmed = persisted.get("trimmedCount")
+                if isinstance(trimmed, int) and not isinstance(trimmed, bool):
+                    room["trimmedCount"] = trimmed
 
     def _write_legacy_bytes(self, value: bytes) -> None:
         self._legacy_store_path.parent.mkdir(parents=True, exist_ok=True)
