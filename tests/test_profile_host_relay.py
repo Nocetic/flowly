@@ -198,3 +198,80 @@ async def test_rejected_internal_session_is_not_bound_to_relay(profile_roots) ->
 
     assert socket.messages[0]["error"]["code"] == "REMOTE_SESSION_DENIED"
     assert channel._profile_bindings_by_relay == {}
+
+
+@pytest.mark.asyncio
+async def test_relay_walks_group_history_to_the_first_message(
+    profile_roots, tmp_path
+) -> None:
+    """Replay iOS's exact relay frames against a real host and room store.
+
+    The observed field failure — a transcript stuck at "couldn't load
+    earlier messages" over the relay while the same pages served fine over a
+    direct socket — kept pointing suspicion at this envelope. Pin the whole
+    walk: a 45-message room paged at the client's limit of 10 must answer
+    every request, chain cursors to the very first message, and never leave
+    a frame unanswered (a silent drop is a 20-second client timeout).
+    """
+    host = ProfileHost()
+    rooms = host._rooms
+    profiles.create_profile("writer", local_runtime=True)
+    created = await rooms.create("Buddies", ["default", "writer"], "panel")
+    room_id = created["id"]
+    room = rooms._rooms[room_id]
+    for index in range(45):
+        rooms._append_message(room, {
+            "id": str(__import__("uuid").uuid4()),
+            "role": "user" if index % 3 == 0 else "assistant",
+            **({} if index % 3 == 0 else {"profile": "writer"}),
+            "content": f"message {index}",
+            "createdAt": "2026-08-26T01:00:00.000Z",
+        })
+    await rooms._persist()
+
+    channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
+    channel.set_profile_host(host)
+    socket = _Socket()
+
+    await channel._handle_rpc(socket, {
+        "type": "rpc",
+        "id": "rpc-1",
+        "sessionId": "phone-room",
+        "method": "profiles.rooms.list",
+        "params": {"includeMessages": False, "eventMode": "delta-v1"},
+    })
+    listing = socket.messages[-1]
+    assert listing["id"] == "rpc-1"
+    listed = next(r for r in listing["result"]["rooms"] if r["id"] == room_id)
+    assert listed["messageCount"] == 45
+
+    cursor: str | None = None
+    seen: list[int] = []
+    for page_number in range(2, 12):
+        params = {"roomId": room_id, "limit": 10, "eventMode": "delta-v1"}
+        if cursor:
+            params["cursor"] = cursor
+        await channel._handle_rpc(socket, {
+            "type": "rpc",
+            "id": f"rpc-{page_number}",
+            "sessionId": "phone-room",
+            "method": "profiles.rooms.history",
+            "params": params,
+        })
+        reply = socket.messages[-1]
+        # Every request is answered on the socket it arrived on — the relay
+        # cannot deliver a reply the channel never sent.
+        assert reply["id"] == f"rpc-{page_number}", reply
+        assert reply["sessionId"] == "phone-room"
+        assert "error" not in reply, reply
+        page = reply["result"]
+        assert page["totalCount"] == 45
+        assert page["hasMore"] == (page["nextCursor"] is not None)
+        seen = [m["seq"] for m in page["messages"]] + seen
+        cursor = page["nextCursor"]
+        if cursor is None:
+            break
+
+    # The last page closes the walk at the room's first message.
+    assert cursor is None
+    assert seen == list(range(45))
