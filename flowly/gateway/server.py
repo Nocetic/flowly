@@ -113,6 +113,7 @@ ChatCallback = Callable[
 ]
 AbortCallback = Callable[[str], bool]
 ChatDeliveredCallback = Callable[[str, str, dict[str, Any]], Any]
+ManagedRuntimeStopCallback = Callable[[], None]
 
 
 # Per-file attachment cap for the direct gateway's base64-over-WS upload path.
@@ -211,6 +212,7 @@ class _ProfileClientSubscription:
 
     directory: bool = False
     rooms: bool = False
+    room_event_mode: str = "full-v1"
     profiles: set[str] = field(default_factory=set)
     conversations: set[tuple[str, str]] = field(default_factory=set)
 
@@ -576,6 +578,14 @@ class GatewayServer:
         # Track active WebSocket clients and their running tasks for abort support.
         self._ws_clients: dict[str, web.WebSocketResponse] = {}
         self._active_tasks: dict[str, asyncio.Task] = {}
+        # Named profile gateways may be shared by two authenticated managers
+        # (Desktop and the primary Gateway).  Only the runtime itself can
+        # safely arbitrate a cross-manager stop without guessing which parent
+        # process owns it.  The CLI installs this control only for an
+        # authenticated, loopback-only managed runtime.
+        self._managed_runtime_instance_id = ""
+        self._managed_runtime_stop: ManagedRuntimeStopCallback | None = None
+        self._managed_runtime_stopping = False
         # session_key -> the WS that should currently receive this session's live
         # stream (deltas / iteration_step / final). A run streams to the socket
         # that STARTED it, but if the client leaves and re-enters mid-stream it
@@ -656,6 +666,30 @@ class GatewayServer:
     ) -> None:
         """Use the primary artifact fan-out for profile-originated writes."""
         self._shared_artifact_on_change = callback
+
+    def set_managed_runtime_control(
+        self,
+        instance_id: str,
+        stop_callback: ManagedRuntimeStopCallback,
+    ) -> None:
+        """Enable the authenticated cooperative-stop RPC for one named runtime.
+
+        This is deliberately unavailable on the primary gateway.  The
+        instance id binds a request to the exact lease the caller inspected,
+        so a delayed stop can never terminate a replacement process.
+        """
+        if (
+            not self._require_auth
+            or not is_loopback_host(self.host)
+            or not isinstance(instance_id, str)
+            or not instance_id
+            or len(instance_id) > 128
+            or "\x00" in instance_id
+        ):
+            raise ValueError("Managed runtime control requires an authenticated loopback instance.")
+        self._managed_runtime_instance_id = instance_id
+        self._managed_runtime_stop = stop_callback
+        self._managed_runtime_stopping = False
 
     def _create_app(self) -> web.Application:
         """Create the aiohttp application."""
@@ -1341,6 +1375,9 @@ class GatewayServer:
         try:
             if method == "health":
                 await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
+
+            elif method == "runtime.stop":
+                await self._ws_rpc_runtime_stop(ws, rpc_id, params)
 
             elif method.startswith("profiles."):
                 await self._handle_profile_host_rpc(
@@ -3265,6 +3302,89 @@ class GatewayServer:
                 cancelled = True
         await self._ws_rpc_reply(ws, rpc_id, {"ok": True, "cancelled": cancelled})
 
+    async def _ws_rpc_runtime_stop(
+        self,
+        ws: web.WebSocketResponse,
+        rpc_id: str,
+        params: Any,
+    ) -> None:
+        """Stop this exact managed profile runtime after acknowledging safely.
+
+        The caller already authenticated with the per-runtime bearer token.
+        Requiring the lease instance id adds compare-and-stop semantics: a
+        stale manager cannot reconnect to a replacement and stop the wrong
+        process.  Active turns fail closed; profile mutations must never cut a
+        live response in half merely to acquire lifecycle ownership.
+        """
+        callback = self._managed_runtime_stop
+        instance_id = self._managed_runtime_instance_id
+        if callback is None or not instance_id:
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "RUNTIME_CONTROL_UNAVAILABLE",
+                "This gateway is not a managed bot runtime.",
+            )
+            return
+        if not isinstance(params, dict):
+            await self._ws_rpc_error(
+                ws, rpc_id, "INVALID_PARAMS", "Managed runtime stop parameters are invalid."
+            )
+            return
+        expected = params.get("instanceId")
+        if not isinstance(expected, str) or not secrets.compare_digest(expected, instance_id):
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "RUNTIME_INSTANCE_CHANGED",
+                "The bot runtime changed before it could be stopped. Refresh and try again.",
+                retryable=True,
+            )
+            return
+        reason = params.get("reason", "user")
+        if (
+            not isinstance(reason, str)
+            or not reason
+            or len(reason) > 64
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in reason)
+        ):
+            await self._ws_rpc_error(
+                ws, rpc_id, "INVALID_PARAMS", "Managed runtime stop reason is invalid."
+            )
+            return
+        active = [task for task in self._active_tasks.values() if not task.done()]
+        if active:
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "RUNTIME_BUSY",
+                "Finish or stop the active turn before changing this bot.",
+                retryable=True,
+            )
+            return
+        if self._managed_runtime_stopping:
+            await self._ws_rpc_reply(
+                ws,
+                rpc_id,
+                {"ok": True, "stopping": True, "instanceId": instance_id},
+            )
+            return
+
+        self._managed_runtime_stopping = True
+        await self._ws_rpc_reply(
+            ws,
+            rpc_id,
+            {"ok": True, "stopping": True, "instanceId": instance_id},
+        )
+
+        # Yield once after the awaited WS send so the transport can flush the
+        # acknowledgement before shutdown closes every client.  Keep this in
+        # the request task instead of spawning an untracked shutdown task: the
+        # callback is synchronous/non-blocking and must not be lost if the
+        # server begins cancelling background work immediately afterwards.
+        await asyncio.sleep(0)
+        callback()
+
     # ------------------------------------------------------------------
     # RPC: chat.compact / chat.clear
     # ------------------------------------------------------------------
@@ -4610,6 +4730,10 @@ class GatewayServer:
 
         if not isinstance(params, dict):
             return
+        if method in PROFILE_ROOM_METHODS:
+            event_mode = params.get("eventMode")
+            if event_mode in {"full-v1", "delta-v1"}:
+                subscription.room_event_mode = event_mode
         profile = str(params.get("name") or "").strip()
         if profile != "default" and not _valid_profile_id(profile):
             return
@@ -4704,12 +4828,25 @@ class GatewayServer:
 
     async def _broadcast_profile_room_event(self, data: dict[str, Any]) -> None:
         """Forward groups only to authenticated clients that opened the surface."""
-        event = {"type": "event", "event": "profile.room", "data": data}
         for client_id, subscription in tuple(self._profile_client_subscriptions.items()):
             if not subscription.rooms:
                 continue
             ws = self._ws_clients.get(client_id)
             if ws is not None:
+                payload = data
+                if subscription.room_event_mode == "delta-v1":
+                    payload = dict(data)
+                    room = data.get("room")
+                    if isinstance(room, dict):
+                        compact_room = dict(room)
+                        messages = compact_room.pop("messages", None)
+                        if isinstance(messages, list):
+                            compact_room.setdefault("messageCount", len(messages))
+                            compact_room.setdefault(
+                                "latestMessage", messages[-1] if messages else None
+                            )
+                        payload["room"] = compact_room
+                event = {"type": "event", "event": "profile.room", "data": payload}
                 await self._ws_send(ws, event)
 
     async def _handle_profile_host_internal_frame(self, frame: dict[str, Any]) -> None:

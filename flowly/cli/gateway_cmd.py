@@ -26,6 +26,7 @@ _LOCAL_RUNTIME_CAPABILITIES = (
     "profile-rpc-v2",
     "allowed-tools-v1",
     "manager-lease-v2",
+    "cooperative-stop-v1",
     "profile-cron-v1",
     "shared-services-v1",
 )
@@ -2231,6 +2232,11 @@ Respond to the user now:"""
         _manager_task: asyncio.Task | None = None
         _board_orchestrator = getattr(agent, "_board_orchestrator", None)
         try:
+            if local_runtime:
+                gateway_server.set_managed_runtime_control(
+                    _local_runtime_instance,
+                    shutdown_event.set,
+                )
             await gateway_server.start()
             if _board_orchestrator is not None:
                 _board_orchestrator.start_dispatcher()
@@ -2248,6 +2254,7 @@ Respond to the user now:"""
                     _local_runtime_instance,
                     port=gateway_server.port,
                     auth_token=auth_token,
+                    capabilities=_LOCAL_RUNTIME_CAPABILITIES,
                 )
                 typer.echo(
                     "FLOWLY_LOCAL_RUNTIME_READY "

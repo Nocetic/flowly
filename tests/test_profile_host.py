@@ -321,6 +321,7 @@ async def test_profile_runtime_capacity_evicts_lru_idle_runtime(profile_roots) -
     }
     oldest = runtimes["one"]
     host._runtimes = runtimes  # type: ignore[assignment]
+    host._request_runtime_stop = AsyncMock()  # type: ignore[method-assign]
     host._close_runtime = AsyncMock()  # type: ignore[method-assign]
 
     async def start(name: str):
@@ -343,6 +344,7 @@ async def test_profile_runtime_capacity_evicts_lru_idle_runtime(profile_roots) -
 
     assert result.profile == "seven"
     assert set(host._runtimes) == {"two", "three", "four", "five", "six", "seven"}
+    host._request_runtime_stop.assert_awaited_once_with(oldest)
     host._close_runtime.assert_awaited_once_with(oldest)
 
 
@@ -369,6 +371,7 @@ async def test_profile_runtime_capacity_queues_until_a_busy_slot_is_idle(
         )
     }
     host._runtimes = runtimes  # type: ignore[assignment]
+    host._request_runtime_stop = AsyncMock()  # type: ignore[method-assign]
     host._close_runtime = AsyncMock()  # type: ignore[method-assign]
 
     async def start(name: str):
@@ -416,6 +419,76 @@ async def test_external_runtime_is_visible_but_not_stopped(profile_roots, monkey
     with pytest.raises(ProfileHostError) as connect_conflict:
         await host.connect("writer")
     assert connect_conflict.value.code == "PROFILE_OWNERSHIP_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_attached_runtime_cooperatively_stops_exact_lease(
+    profile_roots,
+    monkeypatch,
+) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    host = ProfileHost()
+    runtime = SimpleNamespace(
+        profile="writer",
+        owned=False,
+        active_runs=set(),
+        capabilities=frozenset({"cooperative-stop-v1"}),
+        instance_id="runtime-one",
+    )
+    host._runtimes["writer"] = runtime  # type: ignore[assignment]
+    host._rpc = AsyncMock(return_value={
+        "ok": True, "stopping": True, "instanceId": "runtime-one",
+    })  # type: ignore[method-assign]
+    host._close_runtime = AsyncMock()  # type: ignore[method-assign]
+    monkeypatch.setattr(profile_host_module, "reconcile_runtime_lease", lambda *_a, **_k: None)
+
+    result = await host.stop("writer")
+
+    assert result["ok"] is True
+    host._rpc.assert_awaited_once_with(
+        runtime,
+        "runtime.stop",
+        {"instanceId": "runtime-one", "reason": "profile-mutation"},
+        15,
+    )
+    host._close_runtime.assert_awaited_once_with(runtime)
+    assert "writer" not in host._runtimes
+
+
+@pytest.mark.asyncio
+async def test_managed_runtime_stop_is_instance_bound_and_refuses_active_turns() -> None:
+    stopped = asyncio.Event()
+    server = GatewayServer(
+        host="127.0.0.1",
+        auth_token="s" * 48,
+        require_loopback_auth=True,
+    )
+    server.set_managed_runtime_control("runtime-one", stopped.set)
+    ws = SimpleNamespace(messages=[], closed=False)
+
+    async def send_json(payload):
+        ws.messages.append(payload)
+
+    ws.send_json = send_json
+    await server._ws_rpc_runtime_stop(ws, "stale", {"instanceId": "runtime-two"})
+    assert ws.messages[-1]["error"]["code"] == "RUNTIME_INSTANCE_CHANGED"
+
+    active = asyncio.create_task(asyncio.sleep(10))
+    server._active_tasks["run-one"] = active
+    await server._ws_rpc_runtime_stop(ws, "busy", {"instanceId": "runtime-one"})
+    assert ws.messages[-1]["error"]["code"] == "RUNTIME_BUSY"
+    active.cancel()
+    await asyncio.gather(active, return_exceptions=True)
+    server._active_tasks.clear()
+
+    await server._ws_rpc_runtime_stop(ws, "stop", {
+        "instanceId": "runtime-one", "reason": "delete",
+    })
+    await asyncio.sleep(0)
+    assert ws.messages[-1]["result"] == {
+        "ok": True, "stopping": True, "instanceId": "runtime-one",
+    }
+    assert stopped.is_set()
 
 
 @pytest.mark.asyncio

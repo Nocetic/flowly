@@ -55,6 +55,7 @@ def test_local_runtime_handshake_advertises_required_security_contract() -> None
         "profile-rpc-v2",
         "allowed-tools-v1",
         "manager-lease-v2",
+        "cooperative-stop-v1",
         "profile-cron-v1",
         "shared-services-v1",
     }

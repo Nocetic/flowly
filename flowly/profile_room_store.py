@@ -16,7 +16,8 @@ from typing import Any
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-SQLITE_SCHEMA_VERSION = 1
+SQLITE_SCHEMA_VERSION = 2
+SQLITE_SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 SQLITE_APPLICATION_ID = 0x464C5952  # ``FLYR`` — Flowly room store.
 MAX_SQLITE_STORE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ROOM_METADATA_BYTES = 256 * 1024
@@ -55,6 +56,65 @@ def canonical_room_json(room: dict[str, Any]) -> str:
     )
 
 
+def assign_message_sequences(room: dict[str, Any]) -> None:
+    """Give every message in ``room`` a sequence number, in place.
+
+    Used when adopting a snapshot that predates sequencing (a legacy JSON
+    store, or an imported room). Position is the only ordering information
+    such a snapshot carries, so it becomes the initial sequence; from then on
+    sequences are only ever handed out by ``next_room_sequence`` and are never
+    reused, which is what lets a pagination cursor name one.
+    """
+    messages = room.get("messages") or []
+    for ordinal, message in enumerate(messages):
+        message["seq"] = ordinal
+    room["nextSeq"] = len(messages)
+    room["trimmedCount"] = 0
+
+
+def ensure_message_sequences(room: dict[str, Any]) -> None:
+    """Backfill sequences for any message that reached the room without one.
+
+    Rooms enter memory from several places — a durable load, a preserved
+    legacy snapshot, an import — and only the durable load carries sequences.
+    Rather than trusting every one of those paths, this runs once at the point
+    where a room becomes durable, so nothing can be written without the
+    coordinate that history and cursors depend on.
+    """
+    messages = room.get("messages") or []
+    highest = max(
+        (
+            int(message["seq"])
+            for message in messages
+            if isinstance(message.get("seq"), int) and not isinstance(message.get("seq"), bool)
+        ),
+        default=-1,
+    )
+    counter = max(int(room.get("nextSeq", 0)), highest + 1)
+    for message in messages:
+        seq = message.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            continue
+        message["seq"] = counter
+        counter += 1
+    room["nextSeq"] = max(counter, int(room.get("nextSeq", 0)))
+    room.setdefault("trimmedCount", 0)
+
+
+def next_room_sequence(room: dict[str, Any]) -> int:
+    """Reserve the next never-used sequence number for ``room``."""
+    messages = room.get("messages") or []
+    highest = max((int(message.get("seq", -1)) for message in messages), default=-1)
+    seq = max(int(room.get("nextSeq", 0)), highest + 1)
+    room["nextSeq"] = seq + 1
+    return seq
+
+
+def _room_next_seq(room: dict[str, Any], messages: list[dict[str, Any]]) -> int:
+    highest = max((int(message.get("seq", -1)) for message in messages), default=-1)
+    return max(int(room.get("nextSeq", 0)), highest + 1, 0)
+
+
 def room_fingerprints(rooms: dict[str, dict[str, Any]]) -> dict[str, str]:
     return {
         room_id: hashlib.sha256(canonical_room_json(room).encode("utf-8")).hexdigest()
@@ -81,7 +141,147 @@ class SQLiteRoomStore:
     def load(self) -> LoadedRoomStore:
         if not self.path.is_file():
             raise FileNotFoundError(self.path)
+        self._migrate_if_needed()
         return self._load_path(self.path, journal_mode="WAL")
+
+    def history_page(
+        self,
+        room_id: str,
+        *,
+        before_seq: int | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int | None, bool, int]:
+        """Read one page of durable history, oldest-first within the page.
+
+        Keyset paging on ``(room_id, seq)`` — the table's primary key — so a
+        page seek costs an index descent rather than a scan of everything
+        newer than the cursor. Returns
+        ``(messages, next_before_seq, has_more, total_count)``.
+        """
+        if limit < 1:
+            raise ValueError("history limit must be positive")
+        connection = self._connect(self.path, journal_mode="WAL")
+        try:
+            if before_seq is None:
+                rows = connection.execute(
+                    """
+                    SELECT seq, payload_json FROM room_messages
+                    WHERE room_id = ?
+                    ORDER BY seq DESC LIMIT ?
+                    """,
+                    (room_id, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT seq, payload_json FROM room_messages
+                    WHERE room_id = ? AND seq < ?
+                    ORDER BY seq DESC LIMIT ?
+                    """,
+                    (room_id, before_seq, limit),
+                ).fetchall()
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM room_messages WHERE room_id = ?",
+                    (room_id,),
+                ).fetchone()[0]
+            )
+            messages: list[dict[str, Any]] = []
+            for seq, payload_json in reversed(rows):
+                if len(payload_json.encode("utf-8")) > MAX_MESSAGE_RECORD_BYTES:
+                    raise RoomStoreLimitError(
+                        "A group message record exceeds its safe size limit."
+                    )
+                payload = json.loads(payload_json)
+                if not isinstance(payload, dict):
+                    raise RoomStoreInvalidError("A group message record is invalid.")
+                payload["seq"] = int(seq)
+                messages.append(payload)
+            if not messages:
+                return [], None, False, total
+            oldest = int(messages[0]["seq"])
+            has_more = (
+                connection.execute(
+                    "SELECT 1 FROM room_messages WHERE room_id = ? AND seq < ? LIMIT 1",
+                    (room_id, oldest),
+                ).fetchone()
+                is not None
+            )
+            return messages, (oldest if has_more else None), has_more, total
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RoomStoreInvalidError("The group database contains invalid records.") from exc
+        except sqlite3.DatabaseError as exc:
+            raise RoomStoreInvalidError("The group history could not be read safely.") from exc
+        finally:
+            connection.close()
+
+    def _migrate_if_needed(self) -> None:
+        """Bring a v1 database up to the sequenced, retain-on-trim schema.
+
+        v1 numbered messages by position and re-derived every number on each
+        write, so the numbers were only meaningful inside one snapshot. They
+        are still a correct total order for the snapshot being migrated, which
+        is exactly what makes them usable as the initial sequences here.
+        """
+        connection = self._connect(self.path, journal_mode="WAL")
+        try:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+        finally:
+            connection.close()
+        if version == SQLITE_SCHEMA_VERSION:
+            return
+        if application_id != SQLITE_APPLICATION_ID or version not in SQLITE_SUPPORTED_SCHEMA_VERSIONS:
+            # Leave it alone; the load below reports the unrecognised schema.
+            return
+        with self._migration_lock():
+            connection = self._connect(self.path, journal_mode="WAL")
+            try:
+                if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 1:
+                    return
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                connection.executescript(
+                    """
+                    ALTER TABLE rooms ADD COLUMN next_seq INTEGER NOT NULL DEFAULT 0;
+                    CREATE TABLE room_messages_v2 (
+                        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                        seq INTEGER NOT NULL,
+                        message_id TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        trimmed INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (room_id, seq),
+                        UNIQUE (room_id, message_id)
+                    ) WITHOUT ROWID;
+                    INSERT INTO room_messages_v2(
+                        room_id, seq, message_id, payload_json, trimmed
+                    )
+                    SELECT room_id, ordinal, message_id, payload_json, 0
+                    FROM room_messages;
+                    DROP TABLE room_messages;
+                    ALTER TABLE room_messages_v2 RENAME TO room_messages;
+                    CREATE INDEX room_messages_id_idx ON room_messages(message_id);
+                    CREATE INDEX room_messages_live_idx
+                        ON room_messages(room_id, trimmed, seq);
+                    UPDATE rooms SET next_seq = COALESCE(
+                        (SELECT MAX(seq) + 1 FROM room_messages
+                         WHERE room_messages.room_id = rooms.id), 0
+                    );
+                    """
+                )
+                connection.execute(f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION}")
+                connection.commit()
+            except sqlite3.Error as exc:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+                raise RoomStoreError(
+                    "The group database could not be upgraded to the sequenced schema."
+                ) from exc
+            finally:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.close()
 
     def initialize_verified(
         self,
@@ -274,7 +474,7 @@ class SQLiteRoomStore:
             rows = connection.execute(
                 """
                 SELECT id, title, mode, members_json, watermarks_json, run_json,
-                       created_at, updated_at
+                       created_at, updated_at, next_seq
                 FROM rooms
                 ORDER BY updated_at DESC, id ASC
                 """
@@ -289,19 +489,22 @@ class SQLiteRoomStore:
                 )
                 if metadata_size > MAX_ROOM_METADATA_BYTES:
                     raise RoomStoreLimitError("A group record exceeds its safe size limit.")
+                # Only the live window is resident. Trimmed rows stay on disk
+                # and are reached by paging, so startup cost no longer grows
+                # with a group's lifetime history.
                 messages = connection.execute(
                     """
-                    SELECT payload_json
+                    SELECT seq, payload_json
                     FROM room_messages
-                    WHERE room_id = ?
-                    ORDER BY ordinal ASC
+                    WHERE room_id = ? AND trimmed = 0
+                    ORDER BY seq ASC
                     """,
                     (row[0],),
                 ).fetchall()
                 if len(messages) > 1_000:
                     raise RoomStoreLimitError("A group contains too many messages.")
                 payloads: list[dict[str, Any]] = []
-                for (payload_json,) in messages:
+                for seq, payload_json in messages:
                     if len(payload_json.encode("utf-8")) > MAX_MESSAGE_RECORD_BYTES:
                         raise RoomStoreLimitError(
                             "A group message record exceeds its safe size limit."
@@ -309,7 +512,15 @@ class SQLiteRoomStore:
                     payload = json.loads(payload_json)
                     if not isinstance(payload, dict):
                         raise RoomStoreInvalidError("A group message record is invalid.")
+                    payload["seq"] = int(seq)
                     payloads.append(payload)
+                trimmed_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM room_messages "
+                        "WHERE room_id = ? AND trimmed = 1",
+                        (row[0],),
+                    ).fetchone()[0]
+                )
                 room: dict[str, Any] = {
                     "id": row[0],
                     "title": row[1],
@@ -319,6 +530,8 @@ class SQLiteRoomStore:
                     "messages": payloads,
                     "createdAt": row[6],
                     "updatedAt": row[7],
+                    "nextSeq": int(row[8]),
+                    "trimmedCount": trimmed_count,
                 }
                 if row[5] is not None:
                     room["run"] = json.loads(row[5])
@@ -375,18 +588,22 @@ class SQLiteRoomStore:
                 run_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                row_revision INTEGER NOT NULL
+                row_revision INTEGER NOT NULL,
+                next_seq INTEGER NOT NULL DEFAULT 0
             ) WITHOUT ROWID;
             CREATE TABLE room_messages (
                 room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-                ordinal INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
                 message_id TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
-                PRIMARY KEY (room_id, ordinal),
+                trimmed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (room_id, seq),
                 UNIQUE (room_id, message_id)
             ) WITHOUT ROWID;
             CREATE INDEX room_messages_id_idx
                 ON room_messages(message_id);
+            CREATE INDEX room_messages_live_idx
+                ON room_messages(room_id, trimmed, seq);
             INSERT INTO room_store_meta(key, value) VALUES('revision', '0');
             """
         )
@@ -400,6 +617,12 @@ class SQLiteRoomStore:
     ) -> None:
         connection.execute("DELETE FROM rooms")
         for room in rooms.values():
+            # Staging a store from a legacy snapshot is the one place where
+            # sequence numbers do not exist yet. Assign them from position and
+            # write them back onto the caller's dicts: the round-trip
+            # verification below compares against these very objects, and the
+            # service adopts them as its live window.
+            assign_message_sequences(room)
             self._upsert_room(connection, room, row_revision=revision)
 
     def _upsert_room(
@@ -420,12 +643,14 @@ class SQLiteRoomStore:
         if metadata_size > MAX_ROOM_METADATA_BYTES:
             raise RoomStoreLimitError("A group record exceeds its safe size limit.")
         room_id = str(room["id"])
+        messages = list(room.get("messages", []))
+        next_seq = _room_next_seq(room, messages)
         connection.execute(
             """
             INSERT INTO rooms(
                 id, title, mode, members_json, watermarks_json, run_json,
-                created_at, updated_at, row_revision
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, row_revision, next_seq
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 mode = excluded.mode,
@@ -434,7 +659,8 @@ class SQLiteRoomStore:
                 run_json = excluded.run_json,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at,
-                row_revision = excluded.row_revision
+                row_revision = excluded.row_revision,
+                next_seq = MAX(rooms.next_seq, excluded.next_seq)
             """,
             (
                 room_id,
@@ -446,21 +672,50 @@ class SQLiteRoomStore:
                 str(room["createdAt"]),
                 str(room["updatedAt"]),
                 row_revision,
+                next_seq,
             ),
         )
-        connection.execute("DELETE FROM room_messages WHERE room_id = ?", (room_id,))
+        # Only the live window is rewritten, and only where it actually
+        # differs. The previous implementation deleted and re-inserted every
+        # message on every turn, which made a single reply cost one write per
+        # message in the room and forced sequence numbers to be re-derived
+        # from position — the reason a cursor could never be a sequence.
+        stored: dict[int, str] = {
+            int(seq): str(payload_json)
+            for seq, payload_json in connection.execute(
+                "SELECT seq, payload_json FROM room_messages "
+                "WHERE room_id = ? AND trimmed = 0",
+                (room_id,),
+            )
+        }
         records: list[tuple[str, int, str, str]] = []
-        for ordinal, message in enumerate(room.get("messages", [])):
+        live_seqs: set[int] = set()
+        for message in messages:
+            seq = int(message["seq"])
+            live_seqs.add(seq)
             payload = self._json(message)
             if len(payload.encode("utf-8")) > MAX_MESSAGE_RECORD_BYTES:
                 raise RoomStoreLimitError("A group message record exceeds its safe size limit.")
-            records.append((room_id, ordinal, str(message["id"]), payload))
+            if stored.get(seq) != payload:
+                records.append((room_id, seq, str(message["id"]), payload))
         connection.executemany(
             """
-            INSERT INTO room_messages(room_id, ordinal, message_id, payload_json)
-            VALUES(?, ?, ?, ?)
+            INSERT INTO room_messages(room_id, seq, message_id, payload_json, trimmed)
+            VALUES(?, ?, ?, ?, 0)
+            ON CONFLICT(room_id, seq) DO UPDATE SET
+                message_id = excluded.message_id,
+                payload_json = excluded.payload_json,
+                trimmed = 0
             """,
             records,
+        )
+        # Rows that left the live window are flagged, never deleted. History
+        # pages straight back into them, so a long-running group no longer
+        # loses its opening turns the moment it crosses the window size.
+        evicted = [(room_id, seq) for seq in stored if seq not in live_seqs]
+        connection.executemany(
+            "UPDATE room_messages SET trimmed = 1 WHERE room_id = ? AND seq = ?",
+            evicted,
         )
 
     @staticmethod

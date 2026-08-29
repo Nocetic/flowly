@@ -219,6 +219,7 @@ class _Runtime:
     session: aiohttp.ClientSession
     ws: aiohttp.ClientWebSocketResponse
     instance_id: str
+    capabilities: frozenset[str] = frozenset()
     owned: bool = True
     state: str = "connected"
     active_runs: set[str] = field(default_factory=set)
@@ -644,6 +645,13 @@ class ProfileHost:
         await self._rooms.stop_for_profile(name)
         if name == "default":
             return {"ok": True, "status": self.status(name)}
+        if name not in self._runtimes:
+            profile = describe_profile(name)
+            if reconcile_runtime_lease(profile.path, profile_name=name):
+                # Attach through the authenticated lease first.  This gives us
+                # compare-and-stop semantics instead of signalling an
+                # unverified PID from a second manager.
+                await self._ensure_runtime(name)
         closing = self._closing.get(name)
         if closing is not None:
             await asyncio.gather(asyncio.shield(closing), return_exceptions=True)
@@ -654,23 +662,84 @@ class ProfileHost:
                 await asyncio.gather(starting, return_exceptions=True)
             runtime = self._runtimes.get(name)
             if runtime is not None:
-                if not runtime.owned:
+                if runtime.active_runs:
                     raise ProfileHostError(
-                        "PROFILE_OWNERSHIP_CONFLICT",
-                        "This bot is owned by another Flowly process and cannot be stopped here.",
+                        "PROFILE_BUSY",
+                        "Finish or stop the active turn before changing this bot.",
+                        retryable=True,
                     )
+                # Even the process owner can miss a turn started by another
+                # authenticated manager.  Ask the runtime itself before every
+                # mutation/explicit stop; its active-task registry is the only
+                # complete authority across all connected clients.
+                await self._request_runtime_stop(runtime)
                 self._runtimes.pop(name, None)
                 await self._close_runtime(runtime)
+                if not runtime.owned:
+                    await self._wait_for_runtime_release(name, runtime.instance_id)
                 self._capacity_changed.set()
             else:
                 profile = describe_profile(name)
                 if reconcile_runtime_lease(profile.path, profile_name=name):
                     raise ProfileHostError(
-                        "PROFILE_OWNERSHIP_CONFLICT",
-                        "This bot is running under another Flowly process and cannot be stopped here.",
+                        "PROFILE_RUNTIME_CHANGED",
+                        "The bot runtime changed while Flowly was preparing to stop it. Try again.",
+                        retryable=True,
                     )
         await self._emit(name, "connection", {"state": "stopped"})
         return {"ok": True, "status": self.status(name)}
+
+    async def _request_runtime_stop(self, runtime: _Runtime) -> None:
+        """Ask the exact runtime to stop itself after an authenticated ACK."""
+        if "cooperative-stop-v1" not in runtime.capabilities:
+            raise ProfileHostError(
+                "PROFILE_RUNTIME_UPGRADE_REQUIRED",
+                "Restart this bot with the latest Flowly Desktop before changing it.",
+            )
+        result = await self._rpc(
+            runtime,
+            "runtime.stop",
+            {"instanceId": runtime.instance_id, "reason": "profile-mutation"},
+            15,
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("ok") is not True
+            or result.get("stopping") is not True
+            or str(result.get("instanceId") or "") != runtime.instance_id
+        ):
+            raise ProfileHostError(
+                "PROFILE_STOP_UNCONFIRMED",
+                "The bot did not confirm a safe runtime stop.",
+                retryable=True,
+            )
+
+    async def _cooperative_close_runtime(self, runtime: _Runtime) -> None:
+        """Release an owner slot without interrupting another manager's turn."""
+        await self._request_runtime_stop(runtime)
+        await self._close_runtime(runtime)
+
+    async def _wait_for_runtime_release(self, name: str, instance_id: str) -> None:
+        """Wait for the acknowledged process to release its lease, fail closed on replacement."""
+        profile = describe_profile(name)
+        deadline = asyncio.get_running_loop().time() + 15
+        while True:
+            lease = reconcile_runtime_lease(profile.path, profile_name=name)
+            if lease is None:
+                return
+            if str(lease.get("instanceId") or "") != instance_id:
+                raise ProfileHostError(
+                    "PROFILE_RUNTIME_CHANGED",
+                    "The bot restarted while Flowly was preparing the change. Try again.",
+                    retryable=True,
+                )
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ProfileHostError(
+                    "PROFILE_STOP_TIMEOUT",
+                    "The bot did not stop in time. Try again.",
+                    retryable=True,
+                )
+            await asyncio.sleep(0.05)
 
     async def rpc(
         self,
@@ -957,7 +1026,7 @@ class ProfileHost:
                             self._runtimes.pop(candidate_name, None)
                             candidate_runtime.state = "stopping"
                             close_task = asyncio.create_task(
-                                self._close_runtime(candidate_runtime),
+                                self._cooperative_close_runtime(candidate_runtime),
                                 name=f"profile-idle-stop:{candidate_name}",
                             )
                             self._closing[candidate_name] = close_task
@@ -1086,6 +1155,12 @@ class ProfileHost:
         await self._emit(name, "connection", {"state": "starting"})
         instance_id = str(lease.get("instanceId") or "")
         token = str(lease.get("authToken") or "")
+        raw_capabilities = lease.get("capabilities")
+        capabilities = frozenset(
+            capability
+            for capability in raw_capabilities
+            if isinstance(capability, str) and capability
+        ) if isinstance(raw_capabilities, list) and len(raw_capabilities) <= 64 else frozenset()
         try:
             port = int(lease.get("port") or 0)
         except (TypeError, ValueError):
@@ -1131,6 +1206,7 @@ class ProfileHost:
                 session=session,
                 ws=ws,
                 instance_id=instance_id,
+                capabilities=capabilities,
                 owned=False,
             )
             runtime.reader_task = asyncio.create_task(
@@ -1213,6 +1289,11 @@ class ProfileHost:
                 session=session,
                 ws=ws,
                 instance_id=str(ready.get("instanceId") or ""),
+                capabilities=frozenset(
+                    capability
+                    for capability in ready.get("capabilities", [])
+                    if isinstance(capability, str) and capability
+                ) if isinstance(ready.get("capabilities"), list) else frozenset(),
                 stderr_task=stderr_task,
             )
             runtime.stdout_task = asyncio.create_task(

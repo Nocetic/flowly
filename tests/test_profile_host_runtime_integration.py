@@ -58,7 +58,7 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.name == "nt", reason="managed process-group lifecycle is POSIX-specific")
-async def test_second_manager_attaches_to_desktop_owned_profile_runtime(
+async def test_second_manager_cooperatively_stops_desktop_owned_profile_runtime(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,15 +92,16 @@ async def test_second_manager_attaches_to_desktop_owned_profile_runtime(
         assert remote_status["status"]["state"] == "connected"
         assert remote_status["status"]["owned"] is False
         assert await remote_manager.rpc("writer", "sessions.list", {}) == {"sessions": []}
+        owned_lease = profiles.read_runtime_lease(root / "writer")
+        assert owned_lease is not None
+        assert "cooperative-stop-v1" in owned_lease["capabilities"]
 
-        with pytest.raises(ProfileHostError) as stop_conflict:
-            await remote_manager.stop("writer")
-        assert stop_conflict.value.code == "PROFILE_OWNERSHIP_CONFLICT"
-
-        await remote_manager.shutdown()
-        assert await desktop_owner.rpc("writer", "sessions.list", {}) == {"sessions": []}
-        stopped = await desktop_owner.stop("writer")
+        stopped = await remote_manager.stop("writer")
         assert stopped["status"]["state"] == "stopped"
+        assert profiles.read_runtime_lease(root / "writer") is None
+        with pytest.raises(ProfileHostError) as owner_closed:
+            await desktop_owner.rpc("writer", "sessions.list", {})
+        assert owner_closed.value.code in {"PROFILE_OFFLINE", "PROFILE_STOPPED"}
     finally:
         await remote_manager.shutdown()
         await desktop_owner.shutdown()

@@ -1345,7 +1345,13 @@ def claim_runtime_lease(instance_id: str) -> Path:
     return path
 
 
-def update_runtime_lease(instance_id: str, *, port: int, auth_token: str) -> None:
+def update_runtime_lease(
+    instance_id: str,
+    *,
+    port: int,
+    auth_token: str,
+    capabilities: tuple[str, ...] | list[str] = (),
+) -> None:
     """Publish the owner-only endpoint used by sibling Flowly managers.
 
     Desktop and the primary gateway can coexist in separate processes.  The
@@ -1363,12 +1369,25 @@ def update_runtime_lease(instance_id: str, *, port: int, auth_token: str) -> Non
         or any(ord(char) < 0x21 or ord(char) == 0x7F for char in token)
     ):
         raise ValueError("Profile runtime endpoint is invalid.")
+    capability_list = list(dict.fromkeys(capabilities))
+    if (
+        len(capability_list) > 64
+        or any(
+            not isinstance(capability, str)
+            or not capability
+            or len(capability) > 128
+            or "\x00" in capability
+            for capability in capability_list
+        )
+    ):
+        raise ValueError("Profile runtime capabilities are invalid.")
     path = get_flowly_home() / _RUNTIME_LEASE_FILE
     lease = read_runtime_lease(path.parent)
     if not lease or lease.get("instanceId") != instance_id or lease.get("pid") != os.getpid():
         raise RuntimeError("Profile runtime lease ownership was lost.")
     lease["port"] = port
     lease["authToken"] = token
+    lease["capabilities"] = capability_list
     lease["readyAt"] = _utc_now()
     _atomic_write_json(path, lease)
 

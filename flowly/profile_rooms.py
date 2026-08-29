@@ -30,7 +30,10 @@ from flowly.profile_room_store import (
     RoomStoreInvalidError,
     RoomStoreLimitError,
     SQLiteRoomStore,
+    assign_message_sequences,
     canonical_room_json,
+    ensure_message_sequences,
+    next_room_sequence,
     room_fingerprints,
 )
 
@@ -44,6 +47,10 @@ _MAX_ROOMS = 200
 _MAX_MEMBERS = 6
 _MAX_MESSAGES = 1_000
 _MAX_CONTEXT_MESSAGES = 40
+_DEFAULT_HISTORY_PAGE = 50
+_MAX_HISTORY_PAGE = 100
+_MAX_HISTORY_CURSOR_CHARS = 512
+_MAX_SUMMARY_CONTENT_CHARS = 512
 _MAX_LEGACY_STORE_BYTES = 16 * 1024 * 1024
 _MAX_TOOL_CALLS = 8
 _MAX_ATTACHMENTS = 10
@@ -59,9 +66,12 @@ _SESSION_PREFIX = "desktop:profile-room:"
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _MENTION_RE = re.compile(r"(^|[\s([{])@([a-z0-9][a-z0-9._-]*)", re.IGNORECASE)
 _CODE_RE = re.compile(r"```[\s\S]*?```|`[^`\n]*`")
+_HISTORY_CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _GROUP_NON_EXECUTOR_DISABLED_TOOLS = ["board_add", "board_update", "board_run"]
 PROFILE_ROOM_METHODS = (
     "profiles.rooms.list",
+    "profiles.rooms.get",
+    "profiles.rooms.history",
     "profiles.rooms.import",
     "profiles.rooms.create",
     "profiles.rooms.update",
@@ -121,6 +131,71 @@ def _room_id(value: Any) -> str:
         return str(uuid.UUID(value))
     except ValueError as exc:
         raise ProfileHostError("ROOM_INVALID", "The group identity is invalid.") from exc
+
+
+def _include_messages(params: dict[str, Any]) -> bool:
+    value = params.get("includeMessages", True)
+    if not isinstance(value, bool):
+        raise ProfileHostError("INVALID_PARAMS", "includeMessages must be a boolean.")
+    return value
+
+
+def _history_limit(value: Any) -> int:
+    if value is None:
+        return _DEFAULT_HISTORY_PAGE
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_HISTORY_PAGE:
+        raise ProfileHostError(
+            "INVALID_PARAMS",
+            f"Group history limit must be between 1 and {_MAX_HISTORY_PAGE}.",
+        )
+    return value
+
+
+def _encode_history_cursor(room_id: str, before_seq: int) -> str:
+    """Name a boundary by sequence rather than by the message sitting on it.
+
+    A message-id boundary stops resolving the moment that message leaves the
+    window, which made every deep scroll one retention pass away from an
+    unrecoverable error. A sequence is a coordinate in a space that only ever
+    grows, so ``seq < before`` keeps answering the same question forever.
+    """
+    payload = json.dumps(
+        {"v": 2, "r": room_id, "s": int(before_seq)},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_history_cursor(value: Any, room_id: str) -> int | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_HISTORY_CURSOR_CHARS
+        or not _HISTORY_CURSOR_RE.fullmatch(value)
+    ):
+        raise ProfileHostError("ROOM_CURSOR_INVALID", "The group history cursor is invalid.")
+    try:
+        padding = "=" * (-len(value) % 4)
+        decoded = base64.urlsafe_b64decode(value + padding)
+        if len(decoded) > 256:
+            raise ValueError("oversized cursor")
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError, binascii.Error) as exc:
+        raise ProfileHostError("ROOM_CURSOR_INVALID", "The group history cursor is invalid.") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != 2
+        or payload.get("r") != room_id
+        or set(payload) != {"v", "r", "s"}
+    ):
+        raise ProfileHostError("ROOM_CURSOR_INVALID", "The group history cursor is invalid.")
+    before_seq = payload.get("s")
+    if isinstance(before_seq, bool) or not isinstance(before_seq, int) or before_seq < 0:
+        raise ProfileHostError("ROOM_CURSOR_INVALID", "The group history cursor is invalid.")
+    return before_seq
 
 
 def _bounded_text(value: Any, *, label: str, maximum: int, empty: bool = False) -> str:
@@ -424,6 +499,10 @@ class ProfileRoomService:
         self._prepare_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._pending_attachments: dict[str, tuple[int, list[dict[str, str]]]] = {}
         self._epochs: dict[str, int] = {}
+        # Highest message sequence already published for each room. This
+        # is what makes a snapshot event able to say what it added rather
+        # than only that something changed.
+        self._emitted_seq: dict[str, int] = {}
         # Stop is a small transaction: freeze incoming frames, checkpoint the
         # visible partials, then abort the member runtimes.  Without this gate a
         # delta can land while the durable checkpoint is being written and be
@@ -657,6 +736,22 @@ class ProfileRoomService:
             "maxMembers": _MAX_MEMBERS,
             "councilRounds": _MAX_COUNCIL_ROUNDS,
             "councilTurns": _MAX_COUNCIL_TURNS,
+            "summaries": True,
+            "historyPagination": {
+                "defaultPageSize": _DEFAULT_HISTORY_PAGE,
+                "maxPageSize": _MAX_HISTORY_PAGE,
+                "cursor": "opaque-v2",
+            },
+            # Every bound a client would otherwise have to guess. The live
+            # window is what a room carries in memory and in a snapshot
+            # payload; durable history is not bounded by it, so a client must
+            # not treat the window size as the number of messages that exist.
+            "retention": {
+                "model": "retain-beyond-window",
+                "liveWindow": _MAX_MESSAGES,
+                "durableHistory": True,
+            },
+            "roomEvents": ["full-v1", "delta-v1"],
             "storage": "sqlite-wal",
             "legacyJsonMigration": "verified-copy-preserve-source",
         }
@@ -685,26 +780,38 @@ class ProfileRoomService:
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "profiles.rooms.list":
-            return {"rooms": await self.list()}
+            return {"rooms": await self.list(include_messages=_include_messages(params))}
+        if method == "profiles.rooms.get":
+            return {"room": await self.get(
+                params.get("roomId"), include_messages=_include_messages(params),
+            )}
+        if method == "profiles.rooms.history":
+            return await self.history(
+                params.get("roomId"), params.get("cursor"), params.get("limit"),
+            )
         if method == "profiles.rooms.import":
             return await self.import_rooms(params.get("rooms"))
         if method == "profiles.rooms.create":
             return {"room": await self.create(
                 params.get("title"), params.get("members"), params.get("mode"),
+                include_messages=_include_messages(params),
             )}
         if method == "profiles.rooms.update":
             return {"room": await self.update(
                 params.get("roomId"), params.get("title"), params.get("members"),
-                params.get("mode"),
+                params.get("mode"), include_messages=_include_messages(params),
             )}
         if method == "profiles.rooms.delete":
             await self.delete(params.get("roomId"))
             return {"ok": True}
         if method == "profiles.rooms.prepare":
-            return {"room": await self.prepare(params.get("roomId"))}
+            return {"room": await self.prepare(
+                params.get("roomId"), include_messages=_include_messages(params),
+            )}
         if method == "profiles.rooms.send":
             return {"room": await self.send(
-                params.get("roomId"), params.get("content"), params.get("attachments")
+                params.get("roomId"), params.get("content"), params.get("attachments"),
+                include_messages=_include_messages(params),
             )}
         if method == "profiles.rooms.stop":
             await self.stop(params.get("roomId"))
@@ -717,13 +824,91 @@ class ProfileRoomService:
             return {"ok": True}
         raise ProfileHostError("METHOD_NOT_ALLOWED", "This group operation is not available.")
 
-    async def list(self) -> list[dict[str, Any]]:
+    async def list(self, *, include_messages: bool = True) -> list[dict[str, Any]]:
         await self._load()
-        return [self._public(room) for room in sorted(
+        return [self._public(room, include_messages=include_messages) for room in sorted(
             self._rooms.values(), key=lambda item: item["updatedAt"], reverse=True
         )]
 
-    async def prepare(self, raw_id: Any) -> dict[str, Any]:
+    async def get(self, raw_id: Any, *, include_messages: bool = True) -> dict[str, Any]:
+        room_id = _room_id(raw_id)
+        await self._load()
+        return self._public(self._require(room_id), include_messages=include_messages)
+
+    async def history(
+        self,
+        raw_id: Any,
+        cursor: Any = None,
+        limit: Any = None,
+    ) -> dict[str, Any]:
+        """Return one stable, newest-first page boundary in chronological order."""
+        room_id = _room_id(raw_id)
+        page_limit = _history_limit(limit)
+        before_seq = _decode_history_cursor(cursor, room_id)
+        await self._load()
+        room = self._require(room_id)
+        if self._storage_mode == "sqlite-wal" and self._sqlite_store.exists():
+            # The durable store is the pager. Reading a page is an index
+            # descent on (room_id, seq); it does not depend on how much of the
+            # room happens to be resident, so a group keeps its whole history
+            # reachable while memory stays bounded to the live window.
+            try:
+                page, next_seq, has_more, total = await asyncio.to_thread(
+                    self._sqlite_store.history_page,
+                    room_id,
+                    before_seq=before_seq,
+                    limit=page_limit,
+                )
+            except RoomStoreError as exc:
+                raise ProfileHostError(
+                    "ROOM_HISTORY_UNAVAILABLE",
+                    "The group history could not be read.",
+                    retryable=True,
+                ) from exc
+        else:
+            page, next_seq, has_more, total = self._history_page_in_memory(
+                room, before_seq=before_seq, limit=page_limit
+            )
+        return {
+            "roomId": room_id,
+            "messages": page,
+            "nextCursor": (
+                _encode_history_cursor(room_id, next_seq) if next_seq is not None else None
+            ),
+            "hasMore": has_more,
+            "totalCount": total,
+        }
+
+    @staticmethod
+    def _history_page_in_memory(
+        room: dict[str, Any],
+        *,
+        before_seq: int | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int | None, bool, int]:
+        """Page the resident window when no SQLite authority is available.
+
+        Only reachable in the preserved-legacy-JSON fallback, where the whole
+        room is resident anyway. Same contract as the durable pager so the
+        wire response is identical either way.
+        """
+        messages = room["messages"]
+        eligible = [
+            message for message in messages
+            if before_seq is None or int(message.get("seq", 0)) < before_seq
+        ]
+        window = eligible[-limit:] if limit < len(eligible) else eligible
+        page = json.loads(json.dumps(window))
+        has_more = len(window) < len(eligible)
+        next_seq = int(window[0]["seq"]) if has_more and window else None
+        return page, next_seq, has_more, len(messages)
+
+    async def prepare(
+        self,
+        raw_id: Any,
+        *,
+        include_messages: bool = True,
+    ) -> dict[str, Any]:
         """Warm every member runtime without making room availability all-or-nothing."""
         room_id = _room_id(raw_id)
         await self._load()
@@ -765,7 +950,7 @@ class ProfileRoomService:
             })
         if tasks:
             await asyncio.gather(*(asyncio.shield(task) for task in tasks))
-        return self._public(self._require(room_id))
+        return self._public(self._require(room_id), include_messages=include_messages)
 
     async def _prepare_member(self, room_id: str, profile: str) -> None:
         try:
@@ -870,6 +1055,8 @@ class ProfileRoomService:
         title: Any,
         members: Any,
         mode: Any = None,
+        *,
+        include_messages: bool = True,
     ) -> dict[str, Any]:
         await self._load()
         if len(self._rooms) >= _MAX_ROOMS:
@@ -883,6 +1070,7 @@ class ProfileRoomService:
             "mode": clean_mode,
             "messages": [], "watermarks": {member: 0 for member in clean_members},
             "createdAt": timestamp, "updatedAt": timestamp,
+            "nextSeq": 0, "trimmedCount": 0,
         }
         self._rooms[room_id] = room
         try:
@@ -892,7 +1080,7 @@ class ProfileRoomService:
             raise
         public = self._public(room)
         await self._emit({"roomId": room_id, "type": "updated", "room": public})
-        return public
+        return self._public(room, include_messages=include_messages)
 
     async def update(
         self,
@@ -900,6 +1088,8 @@ class ProfileRoomService:
         title: Any,
         members: Any,
         mode: Any = None,
+        *,
+        include_messages: bool = True,
     ) -> dict[str, Any]:
         room_id = _room_id(raw_id)
         await self._load()
@@ -945,7 +1135,7 @@ class ProfileRoomService:
             raise
         public = self._public(room)
         await self._emit({"roomId": room_id, "type": "updated", "room": public})
-        return public
+        return self._public(room, include_messages=include_messages)
 
     async def delete(self, raw_id: Any) -> None:
         room_id = _room_id(raw_id)
@@ -956,6 +1146,7 @@ class ProfileRoomService:
         previous_epoch = self._epochs.get(room_id)
         previous_readiness = self._readiness.get(room_id)
         self._rooms.pop(room_id)
+        self._emitted_seq.pop(room_id, None)
         self._readiness.pop(room_id, None)
         self._epochs[room_id] = self._epochs.get(room_id, 0) + 1
         self._pending_attachments.pop(room_id, None)
@@ -978,7 +1169,14 @@ class ProfileRoomService:
             for member in room["members"]
         ), return_exceptions=True)
 
-    async def send(self, raw_id: Any, content: Any, attachments: Any = None) -> dict[str, Any]:
+    async def send(
+        self,
+        raw_id: Any,
+        content: Any,
+        attachments: Any = None,
+        *,
+        include_messages: bool = True,
+    ) -> dict[str, Any]:
         room_id = _room_id(raw_id)
         clean_attachments = _sanitize_attachments(attachments)
         clean = _bounded_text(
@@ -1001,6 +1199,7 @@ class ProfileRoomService:
             member for member in room["members"] if member in selected
         ]
         previous_messages = list(room["messages"])
+        previous_trimmed = int(room.get("trimmedCount", 0))
         previous_watermarks = dict(room["watermarks"])
         previous_run = room.get("run")
         previous_updated_at = room["updatedAt"]
@@ -1015,7 +1214,7 @@ class ProfileRoomService:
         }
         if durable_attachments:
             message["attachments"] = durable_attachments
-        room["messages"].append(message)
+        self._append_message(room, message)
         self._trim(room)
         epoch = self._epochs.get(room_id, 0) + 1
         self._epochs[room_id] = epoch
@@ -1060,6 +1259,7 @@ class ProfileRoomService:
             for path in created_media:
                 path.unlink(missing_ok=True)
             room["messages"] = previous_messages
+            room["trimmedCount"] = previous_trimmed
             room["watermarks"] = previous_watermarks
             if previous_run is None:
                 room.pop("run", None)
@@ -1088,7 +1288,7 @@ class ProfileRoomService:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        return public
+        return self._public(room, include_messages=include_messages)
 
     async def stop(self, raw_id: Any) -> None:
         room_id = _room_id(raw_id)
@@ -1099,6 +1299,7 @@ class ProfileRoomService:
 
         previous_epoch = self._epochs.get(room_id)
         previous_messages = list(room["messages"])
+        previous_trimmed = int(room.get("trimmedCount", 0))
         previous_watermarks = dict(room["watermarks"])
         previous_run = json.loads(json.dumps(room.get("run"))) if room.get("run") else None
         previous_updated_at = room["updatedAt"]
@@ -1128,6 +1329,7 @@ class ProfileRoomService:
                 await self._persist()
             except Exception:
                 room["messages"] = previous_messages
+                room["trimmedCount"] = previous_trimmed
                 room["watermarks"] = previous_watermarks
                 if previous_run is None:
                     room.pop("run", None)
@@ -1193,6 +1395,7 @@ class ProfileRoomService:
             members = [member for member in room["members"] if member != profile]
             if len(members) < 2:
                 self._rooms.pop(room_id)
+                self._emitted_seq.pop(room_id, None)
                 self._readiness.pop(room_id, None)
                 self._drop_live(room_id)
                 await self._emit({"roomId": room_id, "type": "deleted"})
@@ -1705,7 +1908,7 @@ class ProfileRoomService:
             if calls:
                 message["toolCalls"] = calls
                 message["tools"] = [call["name"] for call in calls]
-            room["messages"].append(message)
+            self._append_message(room, message)
             self._trim(room)
         elif created_media:
             for path in created_media:
@@ -1914,7 +2117,7 @@ class ProfileRoomService:
             if calls:
                 message["toolCalls"] = calls
                 message["tools"] = [call["name"] for call in calls]
-            room["messages"].append(message)
+            self._append_message(room, message)
             boundary = int(member.get("boundary", len(room["messages"]))) if isinstance(member, dict) else len(room["messages"])
             room["watermarks"][profile] = min(boundary, len(room["messages"]))
 
@@ -2042,7 +2245,7 @@ class ProfileRoomService:
             updated_at = self._timestamp(value.get("updatedAt"))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ProfileHostError("INVALID_PARAMS", "An imported group is invalid.") from exc
-        return {
+        imported = {
             "id": room_id,
             "title": title,
             "members": members,
@@ -2052,6 +2255,11 @@ class ProfileRoomService:
             "createdAt": created_at,
             "updatedAt": updated_at,
         }
+        # An import carries positions, not sequences. Position is a correct
+        # total order for the snapshot being imported, so it seeds the room's
+        # sequence space.
+        assign_message_sequences(imported)
+        return imported
 
     @staticmethod
     def _contains_import(current: dict[str, Any], imported: dict[str, Any]) -> bool:
@@ -2062,9 +2270,27 @@ class ProfileRoomService:
         imported_messages = imported.get("messages", [])
         if len(current_messages) < len(imported_messages):
             return False
-        return current_messages[:len(imported_messages)] == imported_messages
+        # Sequences are assigned by the destination, so a retry against a room
+        # that has since trimmed its window carries different numbers for the
+        # same content. Identity here is the message itself, not where it sits
+        # in this room's sequence space.
+        def without_seq(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {key: value for key, value in message.items() if key != "seq"}
+                for message in messages
+            ]
 
-    def _public(self, room: dict[str, Any]) -> dict[str, Any]:
+        return (
+            without_seq(current_messages[:len(imported_messages)])
+            == without_seq(imported_messages)
+        )
+
+    def _public(
+        self,
+        room: dict[str, Any],
+        *,
+        include_messages: bool = True,
+    ) -> dict[str, Any]:
         room_id = room["id"]
         active = self._active.get(room_id, set())
         active_profiles = [profile for profile in room["members"] if profile in active]
@@ -2081,12 +2307,20 @@ class ProfileRoomService:
             }
             for attention in self._attentions.get(room_id, {}).values()
         ]
-        return {
+        messages = room["messages"]
+        result = {
             "id": room_id,
             "title": room["title"],
             "members": list(room["members"]),
             "mode": str(room.get("mode") or "panel"),
-            "messages": json.loads(json.dumps(room["messages"])),
+            # How many messages the group HAS, which is no longer how many it
+            # is carrying: the window bounds residency, not history. A client
+            # that conflated the two would report a group as shorter than it
+            # is the moment it outgrew the window.
+            "messageCount": int(room.get("trimmedCount", 0)) + len(messages),
+            "latestMessage": (
+                self._message_summary(messages[-1]) if messages else None
+            ),
             "createdAt": room["createdAt"],
             "updatedAt": room["updatedAt"],
             "running": bool(active_profiles) or self._room_is_running(room),
@@ -2112,6 +2346,26 @@ class ProfileRoomService:
                 })]
             },
         }
+        if include_messages:
+            result["messages"] = json.loads(json.dumps(messages))
+        return result
+
+    @staticmethod
+    def _message_summary(message: dict[str, Any]) -> dict[str, Any]:
+        """Return a bounded identity/preview, never attachment or tool payloads."""
+        summary: dict[str, Any] = {
+            "id": message["id"],
+            "role": message["role"],
+            "content": str(message.get("content") or "")[:_MAX_SUMMARY_CONTENT_CHARS],
+            "createdAt": message["createdAt"],
+        }
+        if message.get("role") == "assistant":
+            summary["profile"] = message["profile"]
+            if message.get("aborted") is True:
+                summary["aborted"] = True
+            if isinstance(message.get("durationMs"), int):
+                summary["durationMs"] = message["durationMs"]
+        return summary
 
     @staticmethod
     def _public_run(room: dict[str, Any]) -> dict[str, Any] | None:
@@ -2343,12 +2597,57 @@ class ProfileRoomService:
     async def _emit(self, event: dict[str, Any]) -> None:
         if self._on_event is None:
             return
+        event = self._with_room_delta(event)
         try:
             result = self._on_event(event)
             if inspect.isawaitable(result):
                 await result
         except Exception:
             logger.exception("Profile room event callback failed")
+
+    def _with_room_delta(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Attach the messages this event actually adds.
+
+        Stripping ``messages`` from a snapshot event bounds the payload but
+        leaves the receiver knowing only that *something* changed, so it has
+        to ask for a page back to learn one new line — trading bytes for round
+        trips during exactly the turn where latency is visible. Carrying the
+        appended rows, plus the sequence range they cover, lets a receiver
+        apply the change directly and fall back to a fetch only when the range
+        does not meet what it already holds.
+        """
+        room = event.get("room")
+        if not isinstance(room, dict):
+            return event
+        room_id = str(event.get("roomId") or room.get("id") or "")
+        messages = room.get("messages")
+        if not room_id or not isinstance(messages, list):
+            return event
+        sequences = [
+            int(message["seq"])
+            for message in messages
+            if isinstance(message, dict) and isinstance(message.get("seq"), int)
+        ]
+        if len(sequences) != len(messages):
+            return event
+        enriched = dict(event)
+        if sequences:
+            enriched["windowFirstSeq"] = sequences[0]
+            enriched["lastSeq"] = sequences[-1]
+        # An empty room still establishes a baseline (-1), so the very first
+        # message it receives arrives as a delta rather than forcing a fetch.
+        established = room_id in self._emitted_seq
+        previous = self._emitted_seq.get(room_id, -1)
+        appended = [
+            message for message, seq in zip(messages, sequences)
+            if not established or seq > previous
+        ]
+        # A receiver that is further behind than one page is cheaper to let
+        # fetch than to catch up inline; omitting the field is the signal.
+        if established and len(appended) <= _MAX_HISTORY_PAGE:
+            enriched["appended"] = json.loads(json.dumps(appended))
+        self._emitted_seq[room_id] = sequences[-1] if sequences else previous
+        return enriched
 
     def _drop_live(self, room_id: str) -> None:
         publisher = self._live_publish_tasks.pop(room_id, None)
@@ -2361,11 +2660,32 @@ class ProfileRoomService:
         self._attentions.pop(room_id, None)
 
     @staticmethod
+    def _append_message(room: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
+        """Append one durable message, stamping it with a fresh sequence.
+
+        The sequence is the room's only stable message ordinate: it is handed
+        out once, never reused, and never shifts when older messages leave the
+        live window. Pagination cursors and delivery watermarks can therefore
+        name a position that keeps meaning something.
+        """
+        message["seq"] = next_room_sequence(room)
+        room["messages"].append(message)
+        return message
+
+    @staticmethod
     def _trim(room: dict[str, Any]) -> None:
+        """Bound what the room keeps resident — not what it keeps.
+
+        Messages leaving here leave the *window*: the durable store flags them
+        and history pages straight back into them. Watermarks and run
+        boundaries index the window, so they still shift by the same amount;
+        sequence numbers do not, which is why a cursor survives this.
+        """
         if len(room["messages"]) <= _MAX_MESSAGES:
             return
         removed = len(room["messages"]) - _MAX_MESSAGES
         del room["messages"][:removed]
+        room["trimmedCount"] = int(room.get("trimmedCount", 0)) + removed
         room["watermarks"] = {
             key: max(0, int(value) - removed)
             for key, value in room["watermarks"].items()
@@ -2763,6 +3083,11 @@ class ProfileRoomService:
 
     async def _persist(self) -> None:
         async with self._write_lock:
+            # Every room becomes durable through here, which makes it the one
+            # place that can guarantee sequencing regardless of how the room
+            # entered memory.
+            for room in self._rooms.values():
+                ensure_message_sequences(room)
             # Take the snapshot under the lock. Parallel member completions
             # mutate one shared room; serializing earlier could let an older
             # snapshot overwrite a newer durable response.

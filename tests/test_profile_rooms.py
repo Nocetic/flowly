@@ -15,13 +15,16 @@ import pytest
 from filelock import FileLock
 
 import flowly.profile_room_store as room_store_module
+import flowly.profile_rooms as rooms_module
 from flowly.gateway.server import GatewayServer
 from flowly.profile_host import ProfileHost
 from flowly.profile_host_contract import ProfileHostError
 from flowly.profile_room_store import (
     SQLITE_APPLICATION_ID,
+    SQLITE_SCHEMA_VERSION,
     RoomStoreError,
     SQLiteRoomStore,
+    assign_message_sequences,
 )
 from flowly.profile_rooms import ProfileRoomService
 
@@ -35,7 +38,7 @@ def _sqlite_message_payloads(legacy_path: Path) -> list[str]:
         return [
             str(row[0])
             for row in connection.execute(
-                "SELECT payload_json FROM room_messages ORDER BY room_id, ordinal"
+                "SELECT payload_json FROM room_messages ORDER BY room_id, seq"
             )
         ]
 
@@ -110,6 +113,102 @@ async def test_room_store_is_owner_only_and_round_trips(tmp_path: Path) -> None:
     rooms = await reloaded.list()
     assert [room["id"] for room in rooms] == [created["id"]]
     assert rooms[0]["messages"] == []
+
+
+@pytest.mark.asyncio
+async def test_room_summaries_and_cursor_history_are_bounded_and_stable(
+    tmp_path: Path,
+) -> None:
+    async def rpc(*_args, **_kwargs):
+        return {"ok": True}
+
+    service = ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=None,
+        store_path=tmp_path / "rooms.json",
+    )
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+    durable["messages"] = [
+        {
+            "id": str(uuid.uuid4()),
+            "role": "user",
+            "content": f"message-{index}",
+            "createdAt": f"2026-08-27T00:{index // 60:02d}:{index % 60:02d}.000Z",
+        }
+        for index in range(125)
+    ]
+    durable["messages"][-1]["content"] = "x" * 700
+    durable["messages"][-1]["attachments"] = [{
+        "fileName": "brief.pdf",
+        "mimeType": "application/pdf",
+        "mediaId": "group-brief.pdf",
+        "kind": "file",
+        "size": 42,
+        "status": "ready",
+    }]
+
+    compact = await service.dispatch("profiles.rooms.list", {"includeMessages": False})
+    assert "messages" not in compact["rooms"][0]
+    assert compact["rooms"][0]["messageCount"] == 125
+    assert compact["rooms"][0]["latestMessage"]["content"] == "x" * 512
+    assert "attachments" not in compact["rooms"][0]["latestMessage"]
+
+    durable["messages"][-1]["content"] = "message-124"
+    durable["messages"][-1].pop("attachments")
+
+    # History is served by the durable store, not by slicing the resident
+    # window, so a directly-seeded room has to be committed before it can be
+    # paged. Production reaches this state through ``send``/``_run_room``,
+    # which persist before any client can observe the new message.
+    assign_message_sequences(durable)
+    await service._persist()
+
+    legacy = await service.dispatch("profiles.rooms.list", {})
+    assert len(legacy["rooms"][0]["messages"]) == 125
+
+    newest = await service.dispatch("profiles.rooms.history", {
+        "roomId": room["id"], "limit": 50,
+    })
+    assert [message["content"] for message in newest["messages"]] == [
+        f"message-{index}" for index in range(75, 125)
+    ]
+    assert newest["hasMore"] is True
+    assert newest["totalCount"] == 125
+
+    middle = await service.dispatch("profiles.rooms.history", {
+        "roomId": room["id"], "cursor": newest["nextCursor"], "limit": 50,
+    })
+    assert [message["content"] for message in middle["messages"]] == [
+        f"message-{index}" for index in range(25, 75)
+    ]
+    oldest = await service.dispatch("profiles.rooms.history", {
+        "roomId": room["id"], "cursor": middle["nextCursor"], "limit": 50,
+    })
+    assert [message["content"] for message in oldest["messages"]] == [
+        f"message-{index}" for index in range(25)
+    ]
+    assert oldest["nextCursor"] is None
+    assert oldest["hasMore"] is False
+
+    with pytest.raises(ProfileHostError) as wrong_room:
+        await service.history(str(uuid.uuid4()), newest["nextCursor"], 50)
+    assert wrong_room.value.code in {"ROOM_NOT_FOUND", "ROOM_CURSOR_INVALID"}
+
+    # A cursor names a coordinate, not a message. Losing the message that
+    # happened to sit on the boundary must not strand a reader mid-scroll:
+    # the same cursor still answers "everything before this point".
+    boundary_id = durable["messages"][75]["id"]
+    durable["messages"] = [
+        message for message in durable["messages"] if message["id"] != boundary_id
+    ]
+    await service._persist()
+    survived = await service.history(room["id"], newest["nextCursor"], 50)
+    assert [message["content"] for message in survived["messages"]] == [
+        f"message-{index}" for index in range(25, 75)
+    ]
+    assert survived["hasMore"] is True
 
 
 @pytest.mark.asyncio
@@ -192,7 +291,9 @@ async def test_legacy_json_migrates_by_verified_copy_and_remains_untouched(
         assert connection.execute("PRAGMA application_id").fetchone()[0] == (
             SQLITE_APPLICATION_ID
         )
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == (
+            SQLITE_SCHEMA_VERSION
+        )
         assert connection.execute(
             "SELECT value FROM room_store_meta WHERE key = 'legacy_sha256'"
         ).fetchone()[0]
@@ -1371,22 +1472,40 @@ async def test_profile_room_events_are_scoped_to_room_subscribers() -> None:
         return ws
 
     rooms = socket()
+    compact_rooms = socket()
     directory = socket()
-    server._ws_clients.update({"rooms": rooms, "directory": directory})
+    server._ws_clients.update({
+        "rooms": rooms, "compact": compact_rooms, "directory": directory,
+    })
     server._bind_profile_client_request("rooms", "profiles.rooms.list", {})
+    server._bind_profile_client_request(
+        "compact", "profiles.rooms.list", {"eventMode": "delta-v1"}
+    )
     server._bind_profile_client_request("directory", "profiles.list", {})
     assert server._profile_subscription_uses_default(
         server._profile_client_subscriptions["rooms"]
     ) is True
 
-    await server._broadcast_profile_room_event({
+    payload = {
         "hostId": "host", "roomId": "room", "type": "updated",
-    })
+        "room": {
+            "id": "room",
+            "messages": [{"id": "message-1"}],
+            "messageCount": 1,
+            "latestMessage": {"id": "message-1"},
+        },
+    }
+    await server._broadcast_profile_room_event(payload)
     assert rooms.messages == [{
         "type": "event",
         "event": "profile.room",
-        "data": {"hostId": "host", "roomId": "room", "type": "updated"},
+        "data": payload,
     }]
+    assert compact_rooms.messages[0]["data"]["room"] == {
+        "id": "room",
+        "messageCount": 1,
+        "latestMessage": {"id": "message-1"},
+    }
     assert directory.messages == []
     await server.stop()
 
@@ -1425,3 +1544,252 @@ async def test_profile_host_room_contract_includes_host_identity() -> None:
     host._rooms = Rooms()
     result = await host.dispatch("profiles.rooms.list", {})
     assert result == {"hostId": "host-1", "rooms": []}
+
+
+@pytest.mark.asyncio
+async def test_history_outlives_the_live_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving the window must not mean leaving the group."""
+    monkeypatch.setattr(rooms_module, "_MAX_MESSAGES", 10)
+
+    async def rpc(*_args, **_kwargs):
+        return {"ok": True}
+
+    service = ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=None,
+        store_path=tmp_path / "rooms.json",
+    )
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+    for index in range(25):
+        service._append_message(durable, {
+            "id": str(uuid.uuid4()),
+            "role": "user",
+            "content": f"m{index}",
+            "createdAt": f"2026-08-27T00:00:{index:02d}.000Z",
+        })
+        service._trim(durable)
+        await service._persist()
+
+    # Memory is bounded by the window...
+    assert len(durable["messages"]) == 10
+    assert [message["content"] for message in durable["messages"]] == [
+        f"m{index}" for index in range(15, 25)
+    ]
+    # ...while the group still reports, and can serve, everything it has.
+    assert service._public(durable, include_messages=False)["messageCount"] == 25
+
+    collected: list[str] = []
+    cursor = None
+    while True:
+        page = await service.history(room["id"], cursor, 10)
+        assert page["totalCount"] == 25
+        collected = [message["content"] for message in page["messages"]] + collected
+        cursor = page["nextCursor"]
+        if cursor is None:
+            assert page["hasMore"] is False
+            break
+    assert collected == [f"m{index}" for index in range(25)]
+
+    # Sequences are handed out once and never reused, so the numbering has no
+    # gaps and no repeats across the window boundary.
+    with sqlite3.connect(_sqlite_path(tmp_path / "rooms.json")) as connection:
+        sequences = [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT seq FROM room_messages ORDER BY seq"
+            )
+        ]
+        trimmed = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM room_messages WHERE trimmed = 1"
+            ).fetchone()[0]
+        )
+    assert sequences == list(range(25))
+    assert trimmed == 15
+
+
+@pytest.mark.asyncio
+async def test_persisting_one_reply_does_not_rewrite_the_whole_room(
+    tmp_path: Path,
+) -> None:
+    """A turn should cost one row, not one row per message in the group."""
+    async def rpc(*_args, **_kwargs):
+        return {"ok": True}
+
+    service = ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=None,
+        store_path=tmp_path / "rooms.json",
+    )
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+    for index in range(40):
+        service._append_message(durable, {
+            "id": str(uuid.uuid4()),
+            "role": "user",
+            "content": f"m{index}",
+            "createdAt": "2026-08-27T00:00:00.000Z",
+        })
+    await service._persist()
+
+    statements: list[str] = []
+    original_connect = SQLiteRoomStore._connect
+
+    def tracing_connect(path: Path, *, journal_mode: str):
+        connection = original_connect(path, journal_mode=journal_mode)
+        connection.set_trace_callback(lambda sql: statements.append(" ".join(sql.split())))
+        return connection
+
+    monkeypatched = pytest.MonkeyPatch()
+    monkeypatched.setattr(SQLiteRoomStore, "_connect", staticmethod(tracing_connect))
+    try:
+        service._append_message(durable, {
+            "id": str(uuid.uuid4()),
+            "role": "assistant",
+            "profile": "writer",
+            "content": "the reply",
+            "createdAt": "2026-08-27T00:01:00.000Z",
+        })
+        await service._persist()
+    finally:
+        monkeypatched.undo()
+
+    # The room is no longer cleared and rebuilt on every turn — that is what
+    # made a reply cost a write per message, and what forced sequences to be
+    # re-derived from position on each save.
+    assert not [sql for sql in statements if sql.startswith("DELETE FROM room_messages")]
+    assert [sql for sql in statements if sql.startswith("INSERT INTO room_messages")]
+
+    database = _sqlite_path(tmp_path / "rooms.json")
+    with sqlite3.connect(database) as connection:
+        total = int(
+            connection.execute("SELECT COUNT(*) FROM room_messages").fetchone()[0]
+        )
+        contents = [
+            json.loads(row[0])["content"]
+            for row in connection.execute(
+                "SELECT payload_json FROM room_messages ORDER BY seq"
+            )
+        ]
+    assert total == 41
+    assert contents[-1] == "the reply"
+
+
+@pytest.mark.asyncio
+async def test_room_events_carry_the_messages_they_add(tmp_path: Path) -> None:
+    """A snapshot event should let a receiver apply the change, not refetch."""
+    events: list[dict[str, Any]] = []
+
+    async def rpc(*_args, **_kwargs):
+        return {"ok": True}
+
+    async def on_event(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    service = ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer"],
+        on_event=on_event,
+        store_path=tmp_path / "rooms.json",
+    )
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+
+    # The first snapshot a receiver sees establishes its baseline, so it
+    # carries no delta — there is nothing yet to be a delta against.
+    assert "appended" not in events[-1]
+
+    service._append_message(durable, {
+        "id": str(uuid.uuid4()),
+        "role": "user",
+        "content": "first",
+        "createdAt": "2026-08-27T00:00:00.000Z",
+    })
+    await service._persist()
+    await service._emit({
+        "roomId": room["id"], "type": "updated", "room": service._public(durable),
+    })
+    assert [message["content"] for message in events[-1]["appended"]] == ["first"]
+    assert events[-1]["lastSeq"] == 0
+
+    service._append_message(durable, {
+        "id": str(uuid.uuid4()),
+        "role": "assistant",
+        "profile": "writer",
+        "content": "second",
+        "createdAt": "2026-08-27T00:00:01.000Z",
+    })
+    await service._persist()
+    await service._emit({
+        "roomId": room["id"], "type": "updated", "room": service._public(durable),
+    })
+    assert [message["content"] for message in events[-1]["appended"]] == ["second"]
+    assert events[-1]["windowFirstSeq"] == 0
+    assert events[-1]["lastSeq"] == 1
+
+
+def test_v1_store_migrates_to_the_sequenced_schema(tmp_path: Path) -> None:
+    """A database written before sequencing keeps every message and its order."""
+    path = tmp_path / "rooms.sqlite3"
+    timestamp = "2026-08-27T00:00:00.000Z"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            f"""
+            PRAGMA application_id = {SQLITE_APPLICATION_ID};
+            PRAGMA user_version = 1;
+            CREATE TABLE room_store_meta (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE rooms (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, mode TEXT NOT NULL,
+                members_json TEXT NOT NULL, watermarks_json TEXT NOT NULL,
+                run_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                row_revision INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE room_messages (
+                room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL, message_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (room_id, ordinal), UNIQUE (room_id, message_id)
+            ) WITHOUT ROWID;
+            INSERT INTO room_store_meta(key, value) VALUES('revision', '3');
+            """
+        )
+        connection.execute(
+            "INSERT INTO rooms VALUES(?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+            (
+                "55fc1b75-0b89-47e6-8974-504eef89249c", "Legacy", "panel",
+                '["default","writer"]', '{"default":0,"writer":0}',
+                timestamp, timestamp, 3,
+            ),
+        )
+        for ordinal in range(3):
+            connection.execute(
+                "INSERT INTO room_messages VALUES(?, ?, ?, ?)",
+                (
+                    "55fc1b75-0b89-47e6-8974-504eef89249c", ordinal, f"msg-{ordinal}",
+                    json.dumps({
+                        "id": f"msg-{ordinal}", "role": "user",
+                        "content": f"m{ordinal}", "createdAt": timestamp,
+                    }),
+                ),
+            )
+
+    loaded = SQLiteRoomStore(path).load()
+
+    assert loaded.revision == 3
+    assert [message["seq"] for message in loaded.rooms[0]["messages"]] == [0, 1, 2]
+    assert [message["content"] for message in loaded.rooms[0]["messages"]] == [
+        "m0", "m1", "m2",
+    ]
+    assert loaded.rooms[0]["nextSeq"] == 3
+    assert loaded.rooms[0]["trimmedCount"] == 0
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == (
+            SQLITE_SCHEMA_VERSION
+        )
