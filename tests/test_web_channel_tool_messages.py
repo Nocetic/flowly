@@ -386,3 +386,28 @@ async def test_approval_closed_reaches_relay(channel) -> None:
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_unknown_rpc_method_is_answered_not_dropped(channel) -> None:
+    """Version skew must fail fast. A silently dropped RPC leaves the client
+    waiting out its full timeout — on iOS that read as a hung group and a
+    Retry that never helped — where an immediate METHOD_NOT_FOUND names the
+    real situation: this host doesn't speak that method yet."""
+    ws = AsyncMock()
+
+    await channel._handle_rpc(ws, {
+        "type": "rpc",
+        "id": "rpc-unknown",
+        "sessionId": "sess-1",
+        "method": "transcript.timetravel",
+        "params": {},
+    })
+
+    assert ws.send.await_count == 1
+    reply = json.loads(ws.send.await_args.args[0])
+    assert reply["type"] == "rpc"
+    assert reply["id"] == "rpc-unknown"
+    assert reply["sessionId"] == "sess-1"
+    assert reply["error"]["code"] == "METHOD_NOT_FOUND"
+    assert reply["error"]["retryable"] is False

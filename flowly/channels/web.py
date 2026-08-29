@@ -1802,7 +1802,21 @@ class WebChannel(BaseChannel):
             await self._handle_feature_rpc(ws, rpc_id, session_id, method, params)
 
         else:
+            # Answer, never just log. A silent drop leaves the client waiting
+            # out its full RPC timeout — version skew between an app and its
+            # bot then reads as a hung connection instead of a clean,
+            # immediate "this host doesn't speak that yet".
             logger.warning(f"[WebChannel] Unknown RPC method: {method}")
+            await ws.send(json.dumps({
+                "type": "rpc",
+                "id": rpc_id,
+                "sessionId": session_id,
+                "error": {
+                    "code": "METHOD_NOT_FOUND",
+                    "message": "This Flowly does not support this operation. It may need an update.",
+                    "retryable": False,
+                },
+            }))
 
     async def _handle_feature_rpc(
         self, ws, rpc_id: str, session_id: str, method: str, params: dict
