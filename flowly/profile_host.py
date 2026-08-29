@@ -528,6 +528,7 @@ class ProfileHost:
                 soul=_required_string(params, "soul") if "soul" in params else None,
                 mark_text=_optional_string(params, "markText"),
                 mark_tone=_optional_string(params, "markTone"),
+                mark_seed=params.get("markSeed"),
             )
         except ProfileLimitError as exc:
             raise ProfileHostError("PROFILE_LIMIT", str(exc)) from exc
@@ -593,13 +594,17 @@ class ProfileHost:
                 model=params["model"].strip() if "model" in params else None,
                 soul=params["soul"] if "soul" in params else None,
             )
-        if any(field in params for field in ("displayName", "description", "markText", "markTone")):
+        if any(
+            field in params
+            for field in ("displayName", "description", "markText", "markTone", "markSeed")
+        ):
             update_profile_metadata(
                 name,
                 display_name=params["displayName"] if "displayName" in params else None,
                 description=params["description"] if "description" in params else None,
                 mark_text=params["markText"] if "markText" in params else None,
                 mark_tone=params["markTone"] if "markTone" in params else None,
+                mark_seed=params["markSeed"] if "markSeed" in params else None,
             )
         profile = _public_profile(name)
         await self._emit(name, "directory", {"action": "updated", "profile": profile})

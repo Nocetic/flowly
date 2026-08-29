@@ -1123,3 +1123,133 @@ def test_local_profile_import_strips_transport_identity(profile_roots, tmp_path:
     assert json.loads((imported / "profile.json").read_text(encoding="utf-8"))[
         "localRuntime"
     ] is True
+
+
+def test_mark_seeds_are_allocated_in_creation_order(profile_roots) -> None:
+    """Seeds are what let a roster spread colour and silhouette evenly, so the
+    runtime — not any one client — owns the counter."""
+    profiles.create_profile("alpha", local_runtime=True)
+    profiles.create_profile("beta", local_runtime=True)
+    profiles.create_profile("gamma", local_runtime=True)
+
+    seeds = {
+        name: profiles.describe_profile(name).mark_seed
+        for name in ("alpha", "beta", "gamma")
+    }
+    assert sorted(seeds.values()) == [0, 1, 2]
+    assert seeds["alpha"] < seeds["beta"] < seeds["gamma"]
+    assert profiles.describe_profile("alpha").to_dict()["markSeed"] == 0
+
+
+def test_deleting_a_profile_never_renumbers_the_survivors(profile_roots) -> None:
+    """A seed is identity for life. Compacting the range on delete would
+    repaint every bot created after the deleted one."""
+    profiles.create_profile("alpha", local_runtime=True)
+    profiles.create_profile("beta", local_runtime=True)
+    profiles.create_profile("gamma", local_runtime=True)
+    before = profiles.describe_profile("gamma").mark_seed
+
+    profiles.delete_profile("beta")
+
+    assert profiles.describe_profile("gamma").mark_seed == before
+    profiles.create_profile("delta", local_runtime=True)
+    # The gap left by beta stays a gap; delta continues past the maximum.
+    assert profiles.describe_profile("delta").mark_seed == before + 1
+
+
+def test_a_pinned_seed_is_honoured_and_survives_unrelated_edits(profile_roots) -> None:
+    profiles.create_profile("pinned", local_runtime=True, mark_seed=41)
+    assert profiles.describe_profile("pinned").mark_seed == 41
+
+    profiles.update_profile_metadata("pinned", display_name="Renamed")
+    info = profiles.describe_profile("pinned")
+    assert info.display_name == "Renamed"
+    assert info.mark_seed == 41, "an edit that never mentions the seed must not clear it"
+
+    profiles.update_profile_metadata("pinned", mark_seed=7)
+    assert profiles.describe_profile("pinned").mark_seed == 7
+
+
+def test_rejects_seeds_that_are_not_whole_numbers(profile_roots) -> None:
+    for bad in (-1, "abc", 1.5, True, 10**9):
+        with pytest.raises(ValueError):
+            profiles.create_profile(f"bad-{abs(hash(str(bad))) % 9999}", local_runtime=True, mark_seed=bad)
+
+
+def test_a_corrupt_seed_degrades_instead_of_breaking_the_roster(profile_roots) -> None:
+    """Reads must tolerate what writes reject: a hand-edited metadata file
+    should cost one bot its spread, not make every bot unlistable."""
+    profiles.create_profile("research", local_runtime=True)
+    metadata_path = profiles.describe_profile("research").path / profiles._PROFILE_METADATA_FILE
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["markSeed"] = "not-a-number"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    info = profiles.describe_profile("research")
+    assert info.mark_seed is None
+    assert info.to_dict()["markSeed"] is None
+    assert any(profile.name == "research" for profile in profiles.list_profiles())
+
+
+def test_backfill_seeds_seedless_profiles_oldest_first(profile_roots) -> None:
+    profiles.create_profile("older", local_runtime=True)
+    profiles.create_profile("newer", local_runtime=True)
+
+    # Simulate profiles created before marks were generated.
+    for name, created_at in (("older", "2024-01-01T00:00:00Z"), ("newer", "2025-06-01T00:00:00Z")):
+        path = profiles.describe_profile(name).path / profiles._PROFILE_METADATA_FILE
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        metadata.pop("markSeed", None)
+        metadata["createdAt"] = created_at
+        path.write_text(json.dumps(metadata), encoding="utf-8")
+    assert profiles.describe_profile("older").mark_seed is None
+
+    assigned = profiles.backfill_mark_seeds()
+
+    assert assigned["older"] < assigned["newer"]
+    assert profiles.describe_profile("older").mark_seed == assigned["older"]
+    assert profiles.describe_profile("newer").mark_seed == assigned["newer"]
+    # Running it again is a no-op: already-seeded profiles are left alone.
+    assert profiles.backfill_mark_seeds() == {}
+
+
+def test_backfill_does_not_collide_with_already_seeded_profiles(profile_roots) -> None:
+    profiles.create_profile("kept", local_runtime=True, mark_seed=5)
+    profiles.create_profile("legacy", local_runtime=True)
+    path = profiles.describe_profile("legacy").path / profiles._PROFILE_METADATA_FILE
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    metadata.pop("markSeed", None)
+    path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    assigned = profiles.backfill_mark_seeds()
+
+    assert assigned["legacy"] == 6
+    assert profiles.describe_profile("kept").mark_seed == 5
+
+
+def test_backfill_marks_cli_reports_what_it_assigned(profile_roots) -> None:
+    profiles.create_profile("legacy", local_runtime=True)
+    path = profiles.describe_profile("legacy").path / profiles._PROFILE_METADATA_FILE
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    metadata.pop("markSeed", None)
+    path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = CliRunner().invoke(profile_app, ["backfill-marks", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["assigned"]["legacy"] == 0
+    assert profiles.describe_profile("legacy").mark_seed == 0
+
+    # Idempotent: a second run has nothing left to do.
+    again = json.loads(CliRunner().invoke(profile_app, ["backfill-marks", "--json"]).output)
+    assert again["assigned"] == {}
+
+
+def test_create_cli_accepts_a_pinned_seed(profile_roots) -> None:
+    result = CliRunner().invoke(
+        profile_app, ["create", "pinned", "--local-only", "--mark-seed", "12", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["profile"]["markSeed"] == 12

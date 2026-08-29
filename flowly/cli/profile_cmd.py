@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 
 from flowly.profile import (
+    backfill_mark_seeds,
     create_profile,
     delete_profile,
     describe_profile,
@@ -105,6 +106,10 @@ def profile_create(
     soul_file: str | None = typer.Option(None, "--soul-file", hidden=True),
     mark_text: str = typer.Option("", "--mark-text", help="One or two characters shown in Desktop."),
     mark_tone: str = typer.Option("", "--mark-tone", help="Desktop signature color."),
+    mark_seed: int | None = typer.Option(
+        None, "--mark-seed",
+        help="Creation-order seed behind the generated mark. Allocated automatically when omitted.",
+    ),
     local_only: bool = typer.Option(
         False,
         "--local-only",
@@ -127,6 +132,7 @@ def profile_create(
             soul=_resolve_soul_option(soul, soul_file),
             mark_text=mark_text,
             mark_tone=mark_tone,
+            mark_seed=mark_seed,
         )
         profile = describe_profile(name)
     except (ValueError, FileExistsError, FileNotFoundError, OSError) as exc:
@@ -145,12 +151,18 @@ def profile_configure(
     soul_file: str | None = typer.Option(None, "--soul-file", hidden=True),
     mark_text: str | None = typer.Option(None, "--mark-text", help="One or two characters shown in Desktop."),
     mark_tone: str | None = typer.Option(None, "--mark-tone", help="Desktop signature color."),
+    mark_seed: int | None = typer.Option(
+        None, "--mark-seed", help="Creation-order seed behind the generated mark.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Update profile metadata and isolated runtime settings."""
     if all(
         value is None
-        for value in (display_name, description, provider, model, soul, soul_file, mark_text, mark_tone)
+        for value in (
+            display_name, description, provider, model, soul, soul_file,
+            mark_text, mark_tone, mark_seed,
+        )
     ):
         raise typer.BadParameter("at least one field is required")
     try:
@@ -158,13 +170,17 @@ def profile_configure(
         resolved_soul = _resolve_soul_option(soul, soul_file)
         if provider is not None or model is not None or resolved_soul is not None:
             settings = update_profile_settings(name, provider=provider, model=model, soul=resolved_soul)
-        if display_name is not None or description is not None or mark_text is not None or mark_tone is not None:
+        if (
+            display_name is not None or description is not None
+            or mark_text is not None or mark_tone is not None or mark_seed is not None
+        ):
             profile = update_profile_metadata(
                 name,
                 display_name=display_name,
                 description=description,
                 mark_text=mark_text,
                 mark_tone=mark_tone,
+                mark_seed=mark_seed,
             )
         else:
             profile = describe_profile(name)
@@ -174,6 +190,22 @@ def profile_configure(
     if settings is not None:
         payload["settings"] = settings
     _emit(payload, json_output)
+
+
+@profile_app.command("backfill-marks")
+def backfill_marks(
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Give profiles created before generated marks a creation-order seed.
+
+    Idempotent: profiles that already carry a seed are left untouched, so a
+    client can call this whenever it notices a seedless profile.
+    """
+    try:
+        assigned = backfill_mark_seeds()
+    except (ValueError, OSError) as exc:
+        _fail(exc)
+    _emit({"ok": True, "assigned": assigned}, json_output)
 
 
 @profile_app.command("settings")

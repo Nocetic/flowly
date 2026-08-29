@@ -317,6 +317,9 @@ class ProfileInfo:
     model: str = ""
     mark_text: str = ""
     mark_tone: str = ""
+    # Creation-order seed behind the profile's generated mark. None means a
+    # profile older than the seed, which clients render from its name instead.
+    mark_seed: int | None = None
     created_at: str = ""
     updated_at: str = ""
     bot_id: str = ""
@@ -335,6 +338,7 @@ class ProfileInfo:
             "model": self.model,
             "markText": self.mark_text,
             "markTone": self.mark_tone,
+            "markSeed": self.mark_seed,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "botId": self.bot_id,
@@ -455,6 +459,47 @@ def _validate_mark_tone(mark_tone: str) -> str:
     return value
 
 
+_MARK_SEED_MAX = 1_000_000
+
+
+def _validate_mark_seed(mark_seed: object) -> int | None:
+    """Strict check for a seed arriving from a client.
+
+    Writes are validated; reads are not (see ``_read_mark_seed``). A caller
+    handing us a bad seed should hear about it, but a hand-edited metadata
+    file must never make a profile unlistable.
+    """
+    if mark_seed is None:
+        return None
+    # bool is a subclass of int, and True would silently become seed 1.
+    if isinstance(mark_seed, bool):
+        raise ValueError("Profile mark seed must be a whole number.")
+    if isinstance(mark_seed, str):
+        text = mark_seed.strip()
+        if not text:
+            return None
+        if not text.isdigit():
+            raise ValueError("Profile mark seed must be a whole number.")
+        value = int(text)
+    elif isinstance(mark_seed, int):
+        value = mark_seed
+    else:
+        raise ValueError("Profile mark seed must be a whole number.")
+    if value < 0 or value > _MARK_SEED_MAX:
+        raise ValueError(
+            f"Profile mark seed must be between 0 and {_MARK_SEED_MAX}."
+        )
+    return value
+
+
+def _read_mark_seed(value: object) -> int | None:
+    """Lenient read: anything unusable degrades to 'no seed assigned'."""
+    try:
+        return _validate_mark_seed(value)
+    except ValueError:
+        return None
+
+
 def _load_config_object(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -506,6 +551,7 @@ def _metadata_for(name: str, profile_dir: Path, *, is_default: bool) -> dict:
         "description": str(meta.get("description") or "").strip(),
         "mark_text": str(meta.get("markText") or "").strip(),
         "mark_tone": str(meta.get("markTone") or "").strip(),
+        "mark_seed": _read_mark_seed(meta.get("markSeed")),
         "created_at": str(meta.get("createdAt") or "").strip(),
         "updated_at": str(meta.get("updatedAt") or "").strip(),
         "bot_id": str(meta.get("botId") or "").strip(),
@@ -597,6 +643,58 @@ def list_profiles() -> list[ProfileInfo]:
 
 # ── CRUD ──────────────────────────────────────────────────────────
 
+def _allocate_mark_seed() -> int:
+    """Next free creation-order seed.
+
+    Must be called while holding ``_profile_mutation_lock``: two processes
+    creating a bot at once would otherwise read the same maximum and hand out
+    the same seed, collapsing two bots onto one colour and one silhouette.
+
+    Deleting a bot deliberately leaves a gap rather than renumbering. A seed is
+    a profile's identity for life; compacting the range would repaint every bot
+    that happened to be created after the deleted one.
+    """
+    highest = -1
+    for profile in list_profiles():
+        if profile.mark_seed is not None:
+            highest = max(highest, profile.mark_seed)
+    seed = highest + 1
+    if seed > _MARK_SEED_MAX:
+        # Only reachable if a client pinned an absurd seed by hand. Clamping
+        # would hand the same seed out twice, so fail instead.
+        raise ValueError("Profile mark seeds are exhausted.")
+    return seed
+
+
+def backfill_mark_seeds() -> dict[str, int]:
+    """Give every seedless profile a seed, oldest first.
+
+    Profiles created before marks were generated have no seed and fall back to
+    a name hash, which spreads no better than chance. Assigning in ``createdAt``
+    order reproduces the sequence they would have had, so the roster lands on
+    the same evenly separated palette a fresh install gets.
+
+    Returns the seeds assigned, keyed by profile name. Already-seeded profiles
+    are left exactly as they are.
+    """
+    assigned: dict[str, int] = {}
+    with _profile_mutation_lock():
+        pending = [
+            profile for profile in list_profiles()
+            if profile.mark_seed is None
+        ]
+        # Undated profiles sort last but keep a stable order among themselves.
+        pending.sort(key=lambda profile: (not profile.created_at, profile.created_at, profile.name))
+        for profile in pending:
+            seed = _allocate_mark_seed()
+            metadata_path = profile.path / _PROFILE_METADATA_FILE
+            current = _profile_metadata(profile.path)
+            current["markSeed"] = seed
+            _atomic_write_json(metadata_path, current)
+            assigned[profile.name] = seed
+    return assigned
+
+
 def create_profile(
     name: str,
     clone_from: str | None = None,
@@ -610,6 +708,7 @@ def create_profile(
     soul: str | None = None,
     mark_text: str = "",
     mark_tone: str = "",
+    mark_seed: int | None = None,
 ) -> Path:
     """Create a new profile directory.
 
@@ -621,6 +720,7 @@ def create_profile(
     validate_profile_name(name)
     if name == "default":
         raise ValueError("Cannot create a profile named 'default'.")
+    requested_seed = _validate_mark_seed(mark_seed)
 
     profile_dir = _PROFILES_ROOT / name
     with _profile_mutation_lock():
@@ -714,6 +814,8 @@ def create_profile(
             "description": description.strip(),
             "markText": _validate_mark_text(mark_text),
             "markTone": _validate_mark_tone(mark_tone),
+            # markSeed is written under the mutation lock below, so allocation
+            # and publication are one atomic step.
             "createdAt": now,
             "updatedAt": now,
             "localRuntime": bool(local_runtime),
@@ -729,6 +831,14 @@ def create_profile(
             if profile_dir.exists() or profile_dir.is_symlink():
                 raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
             _assert_named_profile_capacity()
+            staged_metadata_path = temp_dir / _PROFILE_METADATA_FILE
+            staged_metadata = json.loads(
+                staged_metadata_path.read_text(encoding="utf-8")
+            )
+            staged_metadata["markSeed"] = (
+                requested_seed if requested_seed is not None else _allocate_mark_seed()
+            )
+            _atomic_write_json(staged_metadata_path, staged_metadata)
             os.replace(temp_dir, profile_dir)
         try:
             profile_dir.chmod(0o700)
@@ -890,6 +1000,7 @@ def update_profile_metadata(
     description: str | None = None,
     mark_text: str | None = None,
     mark_tone: str | None = None,
+    mark_seed: int | None = None,
 ) -> ProfileInfo:
     """Atomically update renderer-facing metadata for one profile."""
     profile = describe_profile(name)
@@ -913,6 +1024,12 @@ def update_profile_metadata(
         "markTone": (
             _validate_mark_tone(mark_tone) if mark_tone is not None
             else _validate_mark_tone(str(current.get("markTone") or profile.mark_tone))
+        ),
+        # A seed is identity: once assigned it is never cleared by an edit that
+        # simply does not mention it.
+        "markSeed": (
+            _validate_mark_seed(mark_seed) if mark_seed is not None
+            else _read_mark_seed(current.get("markSeed"))
         ),
         "createdAt": str(current.get("createdAt") or profile.created_at or now),
         "updatedAt": now,
