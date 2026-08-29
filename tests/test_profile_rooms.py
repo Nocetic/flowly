@@ -2074,3 +2074,122 @@ def test_weight_counts_what_actually_varies() -> None:
         "fileName": "a.png", "mimeType": "image/png", "thumbnail": "z" * 900,
     }]
     assert rooms_module._message_weight(with_thumbnail) == base + 2 + 900
+
+
+def _room_service(tmp_path: Path, calls: list, *, running: set[str] | None = None):
+    async def rpc(profile: str, method: str, params: dict, _timeout: float):
+        calls.append((profile, method, params))
+        if method == "sessions.list":
+            return {"sessions": [
+                {"key": f"desktop:profile-room:{room}"} for room in _SEEDED_SESSIONS
+            ] + [{"key": "web:ordinary-chat"}]}
+        return {"ok": True}
+
+    return ProfileRoomService(
+        target_rpc=rpc,
+        profile_directory=lambda: ["default", "writer", "reviewer"],
+        on_event=None,
+        store_path=tmp_path / "rooms.json",
+        target_is_running=(lambda name: name in running) if running is not None else None,
+    )
+
+
+_SEEDED_SESSIONS: list[str] = []
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_member_keeps_nothing_of_the_group(tmp_path: Path) -> None:
+    """Removing somebody from a group removes the group from them.
+
+    Their watermark is reset, so a re-add starts clean either way; leaving
+    the transcript behind only hid it from view — the room session prefix is
+    filtered out of every session list.
+    """
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer", "reviewer"])
+
+    calls.clear()
+    await service.update(room["id"], "Council", ["default", "writer"])
+
+    deletes = [call for call in calls if call[1] == "sessions.delete"]
+    assert [call[0] for call in deletes] == ["reviewer"]
+    assert deletes[0][2]["sessionKey"] == f"desktop:profile-room:{room['id']}"
+
+
+@pytest.mark.asyncio
+async def test_tidying_a_group_never_starts_a_bot(tmp_path: Path) -> None:
+    """A cold member is left alone; its leftovers wait for its own next run.
+
+    Deleting a group used to reach every member through the path that starts
+    one, so tidying up could spin up a process per member — minutes of work,
+    and processes the reader never asked for.
+    """
+    calls: list = []
+    service = _room_service(tmp_path, calls, running={"default"})
+    room = await service.create("Council", ["default", "writer"])
+
+    calls.clear()
+    await service.delete(room["id"])
+
+    deletes = [call for call in calls if call[1] == "sessions.delete"]
+    assert [call[0] for call in deletes] == ["default"]
+
+
+@pytest.mark.asyncio
+async def test_a_running_bot_settles_what_groups_left_on_it(tmp_path: Path) -> None:
+    """The reconciliation that closes what a cascade cannot reach."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    live = await service.create("Council", ["default", "writer"])
+    gone = "9f1d4d70-58c3-4a53-9d0a-3b6b6a2f4f21"
+    _SEEDED_SESSIONS[:] = [live["id"], gone]
+
+    calls.clear()
+    retired = await service.retire_orphaned_sessions("writer")
+
+    assert retired == 1
+    deleted = [
+        call[2]["sessionKey"] for call in calls if call[1] == "sessions.delete"
+    ]
+    # The dead group goes; the live one, and ordinary chats, are untouched.
+    assert deleted == [f"desktop:profile-room:{gone}"]
+
+
+@pytest.mark.asyncio
+async def test_a_bot_that_left_a_live_group_is_settled_too(tmp_path: Path) -> None:
+    """A membership lost while the bot was stopped is still a leftover."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    _SEEDED_SESSIONS[:] = [room["id"]]
+
+    calls.clear()
+    # "reviewer" is not a member of any group, so its copy answers to nothing.
+    assert await service.retire_orphaned_sessions("reviewer") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_store_that_will_not_load_sweeps_nothing(tmp_path: Path) -> None:
+    """The failure mode that would delete every group transcript in reach.
+
+    An unreadable store leaves no rooms in memory, and an empty live set
+    reads as "no group owns anything". Sweeping against it would retire every
+    session it could see, so it must refuse instead.
+    """
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    _SEEDED_SESSIONS[:] = [room["id"], "9f1d4d70-58c3-4a53-9d0a-3b6b6a2f4f21"]
+
+    # A fresh service that cannot read the store must not conclude anything.
+    broken = _room_service(tmp_path, calls)
+
+    async def explode() -> None:
+        raise ProfileHostError("ROOM_STORE_INVALID", "unreadable")
+
+    broken._load = explode  # type: ignore[method-assign]
+    calls.clear()
+
+    assert await broken.retire_orphaned_sessions("writer") == 0
+    assert not [call for call in calls if call[1] == "sessions.delete"]

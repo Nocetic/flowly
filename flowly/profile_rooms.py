@@ -40,6 +40,7 @@ from flowly.profile_room_store import (
 TargetRpc = Callable[[str, str, dict[str, Any], float], Awaitable[Any]]
 TargetPrepare = Callable[[str], Awaitable[Any]]
 ProfileDirectory = Callable[[], list[str]]
+TargetIsRunning = Callable[[str], bool]
 RoomEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 _STORE_VERSION = 1
@@ -531,8 +532,13 @@ class ProfileRoomService:
         on_event: RoomEventCallback | None,
         store_path: Path | None = None,
         member_timeout: float = _MEMBER_TIMEOUT_SECONDS,
+        target_is_running: TargetIsRunning | None = None,
     ) -> None:
         self._target_rpc = target_rpc
+        # Whether a member is already up. Tidying a group must never be a
+        # reason to start a bot: a cold member's leftovers are reconciled the
+        # next time it runs for a reason of its own.
+        self._target_is_running = target_is_running
         self._target_prepare = target_prepare
         self._profile_directory = profile_directory
         self._on_event = on_event
@@ -1200,6 +1206,12 @@ class ProfileRoomService:
             raise
         public = self._public(room)
         await self._emit({"roomId": room_id, "type": "updated", "room": public})
+        # Dropped members keep no memory of a group they are no longer in —
+        # their watermark was reset above, so a re-add starts clean either
+        # way, and leaving the transcript behind only hides it from view.
+        dropped = [member for member in old_members if member not in clean_members]
+        if dropped:
+            await self._retire_member_sessions(room_id, dropped)
         return self._public(room, include_messages=include_messages)
 
     async def delete(self, raw_id: Any) -> None:
@@ -1229,10 +1241,7 @@ class ProfileRoomService:
             raise
         self._delete_room_media(room)
         await self._emit({"roomId": room_id, "type": "deleted"})
-        await asyncio.gather(*(
-            self._target_rpc(member, "sessions.delete", {"sessionKey": _session_key(room_id)}, 30)
-            for member in room["members"]
-        ), return_exceptions=True)
+        await self._retire_member_sessions(room_id, list(room["members"]))
 
     async def send(
         self,
@@ -1453,6 +1462,7 @@ class ProfileRoomService:
     async def remove_profile(self, profile: str) -> None:
         await self._load()
         changed = False
+        retired_rooms: list[tuple[str, list[str]]] = []
         for room_id, room in list(self._rooms.items()):
             if profile not in room["members"]:
                 continue
@@ -1463,7 +1473,12 @@ class ProfileRoomService:
                 self._emitted_seq.pop(room_id, None)
                 self._readiness.pop(room_id, None)
                 self._drop_live(room_id)
+                # The group is gone here as surely as through delete(), so
+                # its attachments go with it rather than outliving every
+                # reference to them.
+                self._delete_room_media(room)
                 await self._emit({"roomId": room_id, "type": "deleted"})
+                retired_rooms.append((room_id, members))
                 continue
             room["members"] = members
             self._readiness.get(room_id, {}).pop(profile, None)
@@ -1474,6 +1489,85 @@ class ProfileRoomService:
             })
         if changed:
             await self._persist()
+        for room_id, survivors in retired_rooms:
+            await self._retire_member_sessions(room_id, survivors)
+
+    async def _retire_member_sessions(
+        self, room_id: str, members: list[str], *, cold_ok: bool = False
+    ) -> None:
+        """Drop a group's session from members it no longer belongs to.
+
+        Skips members that are not already running unless told otherwise:
+        deleting a group should not start six bots to tidy up after it, and
+        anything skipped here is caught by ``retire_orphaned_sessions`` the
+        next time that bot runs for a reason of its own. Failures are the
+        same — a leftover session is a cleanup to retry, never a reason to
+        fail the operation the reader asked for.
+        """
+        session_key = _session_key(room_id)
+        targets = [
+            member for member in members
+            if cold_ok
+            or self._target_is_running is None
+            or self._target_is_running(member)
+        ]
+        if not targets:
+            return
+        await asyncio.gather(*(
+            self._target_rpc(member, "sessions.delete", {"sessionKey": session_key}, 30)
+            for member in targets
+        ), return_exceptions=True)
+
+    async def retire_orphaned_sessions(self, profile: str) -> int:
+        """Retire this bot's group sessions that no group answers for.
+
+        Called when a runtime is already up, so it costs nothing to start and
+        needs no schedule. It is what closes every path a cascade cannot: a
+        member removed while its bot was stopped, a group deleted the same
+        way, or a crash between the two halves of a delete.
+
+        Deliberately conservative. The live set is only trustworthy once the
+        store has actually been read, so a store that will not load sweeps
+        nothing at all — the alternative is an empty set that reads as "no
+        group owns anything" and deletes every transcript in reach.
+        """
+        try:
+            await self._load()
+        except Exception:
+            return 0
+        if not self._loaded:
+            return 0
+        try:
+            listing = await self._target_rpc(profile, "sessions.list", {}, 30)
+        except Exception:
+            return 0
+        sessions = (listing or {}).get("sessions") if isinstance(listing, dict) else None
+        if not isinstance(sessions, list):
+            return 0
+
+        orphans: list[str] = []
+        for session in sessions:
+            key = session.get("key") if isinstance(session, dict) else None
+            room_id = _room_id_from_session(key)
+            if not room_id:
+                continue
+            room = self._rooms.get(room_id)
+            # Gone, or kept by a group this bot is no longer part of.
+            if room is None or profile not in room["members"]:
+                orphans.append(str(key))
+        if not orphans:
+            return 0
+
+        results = await asyncio.gather(*(
+            self._target_rpc(profile, "sessions.delete", {"sessionKey": key}, 30)
+            for key in orphans
+        ), return_exceptions=True)
+        retired = sum(1 for result in results if not isinstance(result, BaseException))
+        if retired:
+            logger.info(
+                "Retired {} orphaned group session(s) for profile {}", retired, profile
+            )
+        return retired
 
     async def resolve_approval(self, raw_id: Any, request_id: Any, decision: Any) -> None:
         room_id = _room_id(raw_id)

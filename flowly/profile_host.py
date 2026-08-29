@@ -281,6 +281,9 @@ class ProfileHost:
             target_prepare=self.connect,
             profile_directory=lambda: [profile.name for profile in list_profiles()],
             on_event=self._emit_room,
+            target_is_running=lambda name: self._runtime_is_open(
+                self._runtimes.get(name)
+            ),
         )
 
     def capabilities(self) -> dict[str, Any]:
@@ -1238,6 +1241,14 @@ class ProfileHost:
             )
             self._runtimes[name] = runtime
             await self._emit(name, "connection", {"state": "connected"})
+            # This bot is up for its own reasons, which makes it the free
+            # moment to settle what groups left behind on it — a membership
+            # it lost while stopped, a group deleted the same way, a delete
+            # that only got half done. Never a reason to fail the start.
+            self._spawn_background(
+                self._rooms.retire_orphaned_sessions(name),
+                name=f"profile-room-sweep:{name}",
+            )
             return runtime
         except BaseException as exc:
             if ws is not None:
@@ -1328,6 +1339,14 @@ class ProfileHost:
             )
             self._runtimes[name] = runtime
             await self._emit(name, "connection", {"state": "connected"})
+            # This bot is up for its own reasons, which makes it the free
+            # moment to settle what groups left behind on it — a membership
+            # it lost while stopped, a group deleted the same way, a delete
+            # that only got half done. Never a reason to fail the start.
+            self._spawn_background(
+                self._rooms.retire_orphaned_sessions(name),
+                name=f"profile-room-sweep:{name}",
+            )
             return runtime
         except BaseException as exc:
             await self._terminate_process(process)
