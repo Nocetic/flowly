@@ -275,3 +275,107 @@ async def test_relay_walks_group_history_to_the_first_message(
     # The last page closes the walk at the room's first message.
     assert cursor is None
     assert seen == list(range(45))
+
+
+@pytest.mark.asyncio
+async def test_relay_carries_group_updates_only_to_sessions_that_opened_groups(
+    profile_roots,
+) -> None:
+    """Groups reach a phone the way single-bot chat already does.
+
+    Without this bridge the relay carried no group updates at all, so a
+    phone could only ask what had changed and a reply being written arrived
+    in poll-sized steps. The gate matters as much as the delivery: a session
+    that never opened the group surface must not be told what is being said
+    in it.
+    """
+    host = ProfileHost()
+    host.dispatch = AsyncMock(return_value={"hostId": host.host_id, "rooms": []})  # type: ignore[method-assign]
+    channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
+    forwarded: list[dict] = []
+
+    async def capture(payload: str) -> None:
+        forwarded.append(json.loads(payload))
+
+    channel._send_or_queue = capture  # type: ignore[method-assign]
+    channel.set_profile_host(host)
+    socket = _Socket()
+
+    # A session that only ever asked about the directory.
+    await channel._handle_rpc(socket, {
+        "type": "rpc", "id": "rpc-dir", "sessionId": "browser-only",
+        "method": "profiles.list", "params": {},
+    })
+    await host._emit_room({"roomId": "room-1", "type": "updated", "room": {"id": "room-1"}})
+    assert forwarded == []
+
+    # A session that opened the group surface.
+    await channel._handle_rpc(socket, {
+        "type": "rpc", "id": "rpc-rooms", "sessionId": "phone",
+        "method": "profiles.rooms.list",
+        "params": {"includeMessages": False, "eventMode": "delta-v1"},
+    })
+    forwarded.clear()
+    await host._emit_room({"roomId": "room-1", "type": "updated", "room": {"id": "room-1"}})
+
+    assert len(forwarded) == 1
+    assert forwarded[0]["event"] == "profile.room"
+    assert forwarded[0]["data"]["roomId"] == "room-1"
+    assert forwarded[0]["data"]["hostId"] == host.host_id
+
+    # Leaving stops the delivery.
+    await channel._handle_relay_message(object(), {
+        "type": "browser-disconnected", "sessionId": "phone",
+    })
+    forwarded.clear()
+    await host._emit_room({"roomId": "room-1", "type": "updated", "room": {"id": "room-1"}})
+    assert forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_relay_group_updates_honour_the_delta_the_client_asked_for(
+    profile_roots,
+) -> None:
+    """A delta client is not sent the window it already holds.
+
+    A snapshot carries every resident message on every reply. Over a phone
+    connection that is the difference between a group being live and being
+    expensive, and the client has the appended rows already.
+    """
+    host = ProfileHost()
+    host.dispatch = AsyncMock(return_value={"hostId": host.host_id, "rooms": []})  # type: ignore[method-assign]
+    channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
+    forwarded: list[dict] = []
+
+    async def capture(payload: str) -> None:
+        forwarded.append(json.loads(payload))
+
+    channel._send_or_queue = capture  # type: ignore[method-assign]
+    channel.set_profile_host(host)
+    socket = _Socket()
+
+    for session_id, mode in (("phone", "delta-v1"), ("desktop-web", "full-v1")):
+        await channel._handle_rpc(socket, {
+            "type": "rpc", "id": f"rpc-{session_id}", "sessionId": session_id,
+            "method": "profiles.rooms.list",
+            "params": {"includeMessages": False, "eventMode": mode},
+        })
+
+    forwarded.clear()
+    messages = [{"id": "m1", "seq": 0}, {"id": "m2", "seq": 1}]
+    await host._emit_room({
+        "roomId": "room-1",
+        "type": "updated",
+        "room": {"id": "room-1", "title": "Buddies", "messages": messages},
+        "appended": [messages[-1]],
+    })
+
+    rooms = [frame["data"]["room"] for frame in forwarded]
+    assert len(rooms) == 2
+    compact = next(room for room in rooms if "messages" not in room)
+    whole = next(room for room in rooms if "messages" in room)
+    # The delta client keeps what it needs to place the update…
+    assert compact["messageCount"] == 2
+    assert compact["latestMessage"] == messages[-1]
+    # …and the client that asked for everything still gets everything.
+    assert whole["messages"] == messages

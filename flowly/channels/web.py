@@ -26,6 +26,7 @@ from flowly.channels.base import BaseChannel
 from flowly.config.schema import WebChannelConfig
 from flowly.profile import get_flowly_home
 from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
+from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
 
 # ─── Transport limits ──────────────────────────────────────────────────────
@@ -294,6 +295,12 @@ class WebChannel(BaseChannel):
         self._profile_host: Any | None = None
         self._profile_event_token: str | None = None
         self._profile_directory_sessions: dict[str, float] = {}
+        # Relay sessions that have opened the group surface, with the moment
+        # they last touched it. A session hears about groups only after it
+        # asks about them — the same gate the gateway applies.
+        self._profile_room_sessions: dict[str, float] = {}
+        self._profile_room_event_modes: dict[str, str] = {}
+        self._profile_room_token: str | None = None
         self._profile_conversation_sessions: dict[
             tuple[str, str], dict[str, float]
         ] = {}
@@ -337,12 +344,24 @@ class WebChannel(BaseChannel):
         """Attach the primary gateway's authenticated isolated-profile host."""
         if self._profile_host is host:
             return
-        if self._profile_host is not None and self._profile_event_token:
-            self._profile_host.unsubscribe_events(self._profile_event_token)
+        if self._profile_host is not None:
+            if self._profile_event_token:
+                self._profile_host.unsubscribe_events(self._profile_event_token)
+            if self._profile_room_token:
+                self._profile_host.unsubscribe_room_events(self._profile_room_token)
         self._clear_profile_subscriptions()
         self._profile_host = host
         self._profile_event_token = (
             host.subscribe_events(self._forward_profile_event)
+            if host is not None
+            else None
+        )
+        # Groups reach the relay the same way single-bot chat already does.
+        # Without this a phone could only ever ask what changed, so a reply
+        # being written arrived in poll-sized steps instead of as it was
+        # written.
+        self._profile_room_token = (
+            host.subscribe_room_events(self._forward_profile_room_event)
             if host is not None
             else None
         )
@@ -376,6 +395,71 @@ class WebChannel(BaseChannel):
                     key=self._profile_directory_sessions.__getitem__,
                 )
                 self._profile_directory_sessions.pop(oldest, None)
+
+    def _bind_profile_rooms(self, session_id: str, event_mode: Any) -> None:
+        """Open the group surface for one relay session.
+
+        Called only from an authenticated group RPC, so a session hears about
+        groups exactly when it has shown an interest in them and never
+        before — the gateway gates its own clients the same way.
+        """
+        if not session_id or len(session_id) > 256:
+            return
+        now = time.monotonic()
+        self._profile_room_sessions[session_id] = now
+        if event_mode in {"full-v1", "delta-v1"}:
+            self._profile_room_event_modes[session_id] = event_mode
+        self._prune_profile_bindings(now)
+        while len(self._profile_room_sessions) > _PROFILE_DIRECTORY_BINDING_LIMIT:
+            oldest = min(
+                self._profile_room_sessions,
+                key=self._profile_room_sessions.__getitem__,
+            )
+            self._profile_room_sessions.pop(oldest, None)
+            self._profile_room_event_modes.pop(oldest, None)
+
+    async def _forward_profile_room_event(self, envelope: dict[str, Any]) -> None:
+        """Deliver one group update to the sessions watching groups."""
+        if not self._profile_room_sessions:
+            return
+        compact: str | None = None
+        verbatim = json.dumps({
+            "type": "event", "event": "profile.room", "data": envelope,
+        })
+        for session_id in sorted(self._profile_room_sessions):
+            if self._profile_room_event_modes.get(session_id) == "delta-v1":
+                if compact is None:
+                    compact = json.dumps({
+                        "type": "event",
+                        "event": "profile.room",
+                        "data": self._compact_room_event(envelope),
+                    })
+                await self._send_or_queue(compact)
+            else:
+                await self._send_or_queue(verbatim)
+
+    @staticmethod
+    def _compact_room_event(envelope: dict[str, Any]) -> dict[str, Any]:
+        """Drop the resident window from an update that already names its delta.
+
+        A snapshot carries every message the room is holding, which is the
+        whole live window on every reply. Clients that asked for deltas have
+        the appended rows and the sequence range they cover, so the window is
+        bytes they would only throw away — and over a phone connection those
+        bytes are the difference between a group being live and being
+        expensive.
+        """
+        room = envelope.get("room")
+        if not isinstance(room, dict):
+            return envelope
+        compact_room = dict(room)
+        messages = compact_room.pop("messages", None)
+        if isinstance(messages, list):
+            compact_room.setdefault("messageCount", len(messages))
+            compact_room.setdefault(
+                "latestMessage", messages[-1] if messages else None
+            )
+        return {**envelope, "room": compact_room}
 
     def _bind_profile_conversation(
         self, profile: str, session_key: str, session_id: str
@@ -430,6 +514,8 @@ class WebChannel(BaseChannel):
 
     def _remove_profile_relay_session(self, session_id: str) -> None:
         self._profile_directory_sessions.pop(session_id, None)
+        self._profile_room_sessions.pop(session_id, None)
+        self._profile_room_event_modes.pop(session_id, None)
         for profile, session_key in tuple(
             self._profile_bindings_by_relay.get(session_id, set())
         ):
@@ -439,6 +525,8 @@ class WebChannel(BaseChannel):
         for session_id in tuple(self._profile_bindings_by_relay):
             self._remove_profile_relay_session(session_id)
         self._profile_directory_sessions.clear()
+        self._profile_room_sessions.clear()
+        self._profile_room_event_modes.clear()
         self._profile_conversation_sessions.clear()
         self._profile_bindings_by_relay.clear()
         self._profile_run_bindings.clear()
@@ -449,6 +537,10 @@ class WebChannel(BaseChannel):
         for session_id, touched_at in tuple(self._profile_directory_sessions.items()):
             if touched_at < cutoff:
                 self._profile_directory_sessions.pop(session_id, None)
+        for session_id, touched_at in tuple(self._profile_room_sessions.items()):
+            if touched_at < cutoff:
+                self._profile_room_sessions.pop(session_id, None)
+                self._profile_room_event_modes.pop(session_id, None)
         all_bindings = sorted(
             (
                 (touched_at, profile, session_key, session_id)
@@ -553,6 +645,11 @@ class WebChannel(BaseChannel):
             return
 
         self._bind_profile_directory(session_id)
+        if method in PROFILE_ROOM_METHODS:
+            self._bind_profile_rooms(
+                session_id,
+                params.get("eventMode") if isinstance(params, dict) else None,
+            )
         profile = ""
         inner_method = ""
         inner_session_key = ""

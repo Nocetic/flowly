@@ -268,7 +268,12 @@ class ProfileHost:
         self._capacity_changed = asyncio.Event()
         self._closed = False
         self._manager_instance = str(uuid.uuid4())
-        self._room_event_callback = on_room_event
+        # Room updates fan out to every attached transport. The constructor
+        # slot stays as the owning gateway's subscription so nothing has to
+        # register itself twice; other transports add their own.
+        self._room_event_subscribers: dict[str, ProfileRoomEventCallback] = {}
+        if on_room_event is not None:
+            self._room_event_subscribers["owner"] = on_room_event
         from flowly.profile_rooms import ProfileRoomService
 
         self._rooms = ProfileRoomService(
@@ -350,6 +355,20 @@ class ProfileHost:
 
     def unsubscribe_events(self, token: str) -> None:
         self._event_subscribers.pop(token, None)
+
+    def subscribe_room_events(self, callback: ProfileRoomEventCallback) -> str:
+        """Register a transport that carries group updates, by lease id.
+
+        Groups are watched from more than one place at once — a desktop on
+        the gateway socket, a phone on the relay — so every attached
+        transport gets its own subscription rather than competing for one.
+        """
+        token = secrets.token_urlsafe(18)
+        self._room_event_subscribers[token] = callback
+        return token
+
+    def unsubscribe_room_events(self, token: str) -> None:
+        self._room_event_subscribers.pop(token, None)
 
     def retain_default_events(self, owner: str) -> None:
         """Keep the private primary-profile event sink alive for one consumer.
@@ -1885,11 +1904,17 @@ class ProfileHost:
                 logger.exception("Profile host event callback failed")
 
     async def _emit_room(self, data: dict[str, Any]) -> None:
-        """Publish one host-owned group update without profile-session leakage."""
-        callback = self._room_event_callback
-        if callback is None:
-            return
-        try:
-            await callback({"hostId": self.host_id, **data})
-        except Exception:
-            logger.exception("Profile room event callback failed")
+        """Publish one host-owned group update to every attached transport.
+
+        A group is reachable over more than one transport at once — a desktop
+        on the gateway socket and a phone on the relay are ordinary — so this
+        is a fan-out rather than a single sink. One consumer raising must not
+        cost the others their update, which is why each is called in its own
+        try.
+        """
+        envelope = {"hostId": self.host_id, **data}
+        for callback in list(self._room_event_subscribers.values()):
+            try:
+                await callback(envelope)
+            except Exception:
+                logger.exception("Profile room event callback failed")
