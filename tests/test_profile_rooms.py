@@ -2193,3 +2193,110 @@ async def test_a_store_that_will_not_load_sweeps_nothing(tmp_path: Path) -> None
 
     assert await broken.retire_orphaned_sessions("writer") == 0
     assert not [call for call in calls if call[1] == "sessions.delete"]
+
+
+def _seed_media(service: ProfileRoomService, *names: str) -> Path:
+    service._media_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (service._media_dir / name).write_bytes(b"bytes")
+    return service._media_dir
+
+
+def _attach(service: ProfileRoomService, room_id: str, media_id: str) -> None:
+    service._rooms[room_id]["messages"] = [{
+        "id": str(uuid.uuid4()),
+        "role": "user",
+        "content": "Review the attached files.",
+        "createdAt": "2026-08-27T00:00:00.000Z",
+        "attachments": [{
+            "fileName": "brief.pdf",
+            "mimeType": "application/pdf",
+            "mediaId": media_id,
+            "kind": "file",
+            "size": 5,
+            "status": "ready",
+        }],
+    }]
+
+
+@pytest.mark.asyncio
+async def test_an_attachment_no_message_points_at_is_swept(tmp_path: Path) -> None:
+    """The other half of taking group files out of the age sweeper's reach.
+
+    That sweeper used to clear crash leftovers as a side effect of pruning by
+    age — the same pass that deleted attachments transcripts still pointed at.
+    Now that it leaves the prefix alone, the group has to collect its own.
+    """
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    kept = f"group-{room['id'][:8]}-kept.pdf"
+    media = _seed_media(
+        service,
+        kept,
+        f"group-{room['id'][:8]}-stranded.pdf",
+        "vid-generated.mp4",
+    )
+    _attach(service, room["id"], kept)
+
+    assert await service.retire_orphaned_media() == 1
+
+    # The referenced one stays; so does everything that is not ours to judge.
+    assert {path.name for path in media.iterdir()} == {kept, "vid-generated.mp4"}
+
+
+@pytest.mark.asyncio
+async def test_an_attachment_of_another_group_is_not_stranded(tmp_path: Path) -> None:
+    """Reference, not room ownership, is what keeps a file.
+
+    The prefix carries a room id, so a sweep that matched on it would delete
+    every attachment belonging to a room that happens not to be loaded.
+    """
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    first = await service.create("Council", ["default", "writer"])
+    second = await service.create("Panel", ["default", "reviewer"])
+    borrowed = f"group-{second['id'][:8]}-shared.pdf"
+    media = _seed_media(service, borrowed)
+    _attach(service, first["id"], borrowed)
+
+    assert await service.retire_orphaned_media() == 0
+    assert {path.name for path in media.iterdir()} == {borrowed}
+
+
+@pytest.mark.asyncio
+async def test_a_store_that_will_not_load_sweeps_no_media(tmp_path: Path) -> None:
+    """An unreadable store means an empty referenced set, which reads as
+    "no message points at anything" — and would clear the folder."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    media = _seed_media(service, f"group-{room['id'][:8]}-kept.pdf")
+
+    broken = _room_service(tmp_path, calls)
+
+    async def explode() -> None:
+        raise ProfileHostError("ROOM_STORE_INVALID", "unreadable")
+
+    broken._load = explode  # type: ignore[method-assign]
+
+    assert await broken.retire_orphaned_media() == 0
+    assert len(list(media.iterdir())) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_media_sweep_takes_only_one_turn(tmp_path: Path) -> None:
+    """Once per process, because a crash is the only thing that strands a
+    file and a crash is what runs this again. Six bots coming up must not
+    walk the folder six times."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    media = _seed_media(service, f"group-{room['id'][:8]}-stranded.pdf")
+
+    assert await service.retire_orphaned_media() == 1
+
+    later = f"group-{room['id'][:8]}-later.pdf"
+    _seed_media(service, later)
+    assert await service.retire_orphaned_media() == 0
+    assert {path.name for path in media.iterdir()} == {later}

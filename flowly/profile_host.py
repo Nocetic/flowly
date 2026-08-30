@@ -1249,6 +1249,10 @@ class ProfileHost:
                 self._rooms.retire_orphaned_sessions(name),
                 name=f"profile-room-sweep:{name}",
             )
+            self._spawn_background(
+                self._rooms.retire_orphaned_media(),
+                name="profile-room-media-sweep",
+            )
             return runtime
         except BaseException as exc:
             if ws is not None:
@@ -1346,6 +1350,10 @@ class ProfileHost:
             self._spawn_background(
                 self._rooms.retire_orphaned_sessions(name),
                 name=f"profile-room-sweep:{name}",
+            )
+            self._spawn_background(
+                self._rooms.retire_orphaned_media(),
+                name="profile-room-media-sweep",
             )
             return runtime
         except BaseException as exc:

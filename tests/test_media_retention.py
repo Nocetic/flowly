@@ -308,3 +308,64 @@ def test_config_round_trips_through_camel_case_on_disk():
     parsed = Config(**convert_keys(on_disk))
     assert parsed.media.retention.enabled is False
     assert parsed.media.retention.video_max_size_mb == 10
+
+
+# ── files another subsystem owns ────────────────────────────────────────────
+
+
+def test_a_group_attachment_outlives_the_age_cap(tmp_path):
+    """The bug this rule exists for.
+
+    Group attachments live in this folder so they are servable and browsable,
+    but their life is the life of the message carrying them. Pruning them by
+    age deleted the file while the transcript still pointed at it, leaving a
+    thumbnail that opened onto nothing.
+    """
+    _write(tmp_path / "group-84b2ff6e-a1.png", age_days=90)
+    _write(tmp_path / "old.png", age_days=90)
+
+    prune_media(tmp_path, retention_days=30, owned_elsewhere=("group-",))
+
+    assert _names(tmp_path) == {"group-84b2ff6e-a1.png"}
+
+
+def test_a_group_attachment_is_not_spending_a_budget_it_does_not_own(tmp_path):
+    """Not merely protected — invisible.
+
+    A protected file still counts against its budget and so still evicts
+    others. A borrowed one must not: sharing a large PDF in a group is not a
+    reason for the image budget to start deleting screenshots.
+    """
+    _write(tmp_path / "group-84b2ff6e-huge.png", size_mb=8)
+    keep = _write(tmp_path / "shot.png", size_mb=1, age_days=1)
+
+    summary = prune_media(
+        tmp_path, retention_days=-1, image_max_size_mb=5, owned_elsewhere=("group-",)
+    )
+
+    assert _names(tmp_path) == {"group-84b2ff6e-huge.png", keep.name}
+    assert summary["deleted_units"] == 0
+    # The summary describes what this module manages, not what is on disk.
+    assert summary["remaining_bytes"] == keep.stat().st_size
+
+
+def test_ownership_covers_the_whole_unit(tmp_path):
+    """One borrowed file makes the unit off limits, poster included."""
+    _write(tmp_path / "group-84b2ff6e-clip.mp4", size_mb=1, age_days=90)
+    _write(tmp_path / "group-84b2ff6e-clip.jpg", size_mb=0.1, age_days=90)
+
+    prune_media(tmp_path, retention_days=30, owned_elsewhere=("group-",))
+
+    assert _names(tmp_path) == {
+        "group-84b2ff6e-clip.mp4",
+        "group-84b2ff6e-clip.jpg",
+    }
+
+
+def test_naming_no_prefix_prunes_everything_as_before(tmp_path):
+    """The default is unchanged, so no existing caller prunes differently."""
+    _write(tmp_path / "group-84b2ff6e-a1.png", age_days=90)
+
+    prune_media(tmp_path, retention_days=30)
+
+    assert _names(tmp_path) == set()

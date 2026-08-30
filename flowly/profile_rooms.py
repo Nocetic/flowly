@@ -69,7 +69,12 @@ _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 _MAX_ATTACHMENT_B64_CHARS = ((_MAX_ATTACHMENT_BYTES + 2) // 3) * 4
 _MAX_THUMBNAIL_BYTES = 256 * 1024
 _MEDIA_READ_CHUNK_BYTES = 1024 * 1024
-_GROUP_MEDIA_PREFIX = "group-"
+#: Marks the files in the shared media directory that belong to a group rather
+#: than to media generation. Public because the generated-media sweeper has to
+#: be told to leave them alone: it prunes by age and by budget, and a group
+#: attachment's life is the life of the message carrying it, which no clock can
+#: infer. See ``flowly.media.retention.prune_media(owned_elsewhere=…)``.
+GROUP_MEDIA_PREFIX = "group-"
 _MAX_COUNCIL_ROUNDS = 3
 _MAX_COUNCIL_TURNS = 10
 _MEMBER_TIMEOUT_SECONDS = 600.0
@@ -467,7 +472,7 @@ def _durable_attachment(value: Any) -> dict[str, Any]:
     if media_id is not None:
         if (
             not isinstance(media_id, str)
-            or not media_id.startswith(_GROUP_MEDIA_PREFIX)
+            or not media_id.startswith(GROUP_MEDIA_PREFIX)
             or len(media_id) > 255
             or media_id != Path(media_id).name
             or "\x00" in media_id
@@ -557,6 +562,10 @@ class ProfileRoomService:
         self._commits: set[asyncio.Future[None]] = set()
         self._persisted_fingerprints: dict[str, str] = {}
         self._media_dir = self._store_path.parent / "media"
+        # Whether the once-per-process orphan sweep has already claimed its
+        # turn. Set before the sweep runs, so two runtimes coming up together
+        # do not both walk the folder.
+        self._swept_media = False
         self._member_timeout = member_timeout
         self._rooms: dict[str, dict[str, Any]] = {}
         self._active: dict[str, set[str]] = {}
@@ -612,7 +621,7 @@ class ProfileRoomService:
                 data = base64.b64decode(attachment["content"], validate=True)
                 self._media_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 media_id = (
-                    f"{_GROUP_MEDIA_PREFIX}{room_id[:8]}-{uuid.uuid4().hex}"
+                    f"{GROUP_MEDIA_PREFIX}{room_id[:8]}-{uuid.uuid4().hex}"
                     f"{_safe_attachment_suffix(file_name, mime_type)}"
                 )
                 destination = self._media_dir / media_id
@@ -647,7 +656,7 @@ class ProfileRoomService:
                 media_id = attachment.get("mediaId") if isinstance(attachment, dict) else None
                 if (
                     isinstance(media_id, str)
-                    and media_id.startswith(_GROUP_MEDIA_PREFIX)
+                    and media_id.startswith(GROUP_MEDIA_PREFIX)
                     and media_id == Path(media_id).name
                 ):
                     (self._media_dir / media_id).unlink(missing_ok=True)
@@ -1567,6 +1576,71 @@ class ProfileRoomService:
             logger.info(
                 "Retired {} orphaned group session(s) for profile {}", retired, profile
             )
+        return retired
+
+    async def retire_orphaned_media(self) -> int:
+        """Delete group attachments on disk that no message points at.
+
+        Writing an attachment and committing the message that carries it are
+        two steps, and every failure between them is already undone inline —
+        so the only way to strand a file is to die between them. That makes
+        this a once-per-process sweep by construction: a crash is what creates
+        the work, and a crash is what runs this again.
+
+        It exists because the generated-media sweeper no longer reaches these
+        files. That sweeper deleted strays as a side effect of pruning by age,
+        which also deleted attachments messages still referenced; taking the
+        files out of its reach fixed that and left this behind to do.
+
+        Conservative in the same way as :meth:`retire_orphaned_sessions`: the
+        referenced set is only meaningful once the store has actually been
+        read, so a store that will not load sweeps nothing. An empty set would
+        read as "no message references anything" and clear the folder.
+        """
+        if self._swept_media:
+            return 0
+        try:
+            await self._load()
+        except Exception:
+            return 0
+        if not self._loaded:
+            return 0
+        self._swept_media = True
+
+        referenced: set[str] = set()
+        for room in self._rooms.values():
+            for message in room.get("messages", []):
+                for attachment in message.get("attachments", []) or []:
+                    if isinstance(attachment, dict):
+                        media_id = attachment.get("mediaId")
+                        if isinstance(media_id, str):
+                            referenced.add(media_id)
+
+        def _sweep() -> int:
+            removed = 0
+            try:
+                entries = list(self._media_dir.iterdir())
+            except OSError:
+                return 0
+            for path in entries:
+                # Ours to judge only if it is a file, carries our prefix, and
+                # is not referenced. Anything else in here has another owner.
+                if path.name in referenced or not path.name.startswith(GROUP_MEDIA_PREFIX):
+                    continue
+                try:
+                    if not path.is_file():
+                        continue
+                    path.unlink()
+                except OSError:
+                    continue
+                removed += 1
+            return removed
+
+        # Directory work is blocking, and the folder can hold thousands of
+        # files. Keep it off the loop that is also serving the group.
+        retired = await asyncio.to_thread(_sweep)
+        if retired:
+            logger.info("Retired {} orphaned group attachment(s)", retired)
         return retired
 
     async def resolve_approval(self, raw_id: Any, request_id: Any, decision: Any) -> None:

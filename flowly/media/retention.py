@@ -24,6 +24,14 @@ would quietly evict months of screenshots.
 pass the new files as ``protect``, so a clip larger than its own budget fails
 loudly at the quota rather than vanishing the moment it lands.
 
+**Not every file here is generated media.** The folder is also where the
+delivery path serves from, so other subsystems land attachments in it to make
+them servable and browsable. Those files have an owner with its own lifecycle —
+a group attachment lives as long as the message that carries it, which no age
+cap can know — and this module must not outlive-guess them. Callers name such
+files by prefix in ``owned_elsewhere``; they are then invisible here, neither
+deleted nor counted against a budget they are not spending.
+
 Every cap is best-effort and never raises — pruning must not block startup or a
 reply. ``retention_days=-1`` disables the age cap; a size budget of ``0``
 disables that budget. Only regular files directly inside the media dir are
@@ -177,6 +185,7 @@ def prune_media(
     video_max_size_mb: int = DEFAULT_VIDEO_MAX_SIZE_MB,
     protect: Iterable[Path] = (),
     audio_max_size_mb: int = DEFAULT_AUDIO_MAX_SIZE_MB,
+    owned_elsewhere: Iterable[str] = (),
 ) -> dict:
     """Trim old / oversized generated media. Never raises.
 
@@ -185,6 +194,14 @@ def prune_media(
     rescanning the whole directory. ``protect`` names files that must survive
     regardless — what a caller just produced, so pruning immediately after a
     generation can never delete the thing that triggered it.
+
+    ``owned_elsewhere`` names FILENAME PREFIXES belonging to another
+    subsystem's lifecycle. It differs from ``protect`` in more than shape:
+    protected files are still generated media, so they still count against
+    their budget and still evict others. Files owned elsewhere are not this
+    module's to account for at all — they drop out before the age cap and
+    never enter a total, so a large shared attachment cannot evict the
+    screenshots this module does own.
 
     ``audio_max_size_mb`` sits after ``protect`` on purpose: callers already
     pass the first four arguments positionally, and moving ``protect`` would
@@ -210,6 +227,18 @@ def prune_media(
         _logger.debug("[Media] retention: scan failed for {}: {}", media_dir, exc)
         summary["skipped"] = True
         return summary
+
+    # Drop what another subsystem owns before anything measures or deletes it.
+    # Checked against every path in the unit, not just the primary: a unit is
+    # deleted whole, so one borrowed file in it makes the whole unit off
+    # limits rather than a poster we are allowed to orphan.
+    prefixes = tuple(owned_elsewhere)
+    if prefixes:
+        units = [
+            unit for unit in units
+            if not any(path.name.startswith(prefixes) for path in unit.paths)
+        ]
+
     if not units:
         return summary
 

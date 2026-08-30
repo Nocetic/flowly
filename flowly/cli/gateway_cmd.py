@@ -574,6 +574,7 @@ def gateway(
         try:
             from flowly.media.retention import prune_media
             from flowly.profile import get_flowly_home
+            from flowly.profile_rooms import GROUP_MEDIA_PREFIX
 
             def _media_env_int(name: str, default: int) -> int:
                 try:
@@ -596,6 +597,12 @@ def gateway(
                 audio_max_size_mb=_media_env_int(
                     "FLOWLY_MEDIA_AUDIO_MAX_SIZE_MB", retention.audio_max_size_mb
                 ),
+                # Group attachments share this folder so they are servable and
+                # browsable, but they are not generated media and no age cap
+                # applies to them: the room decides when a message dies, and
+                # the file dies with it. Pruning them here deleted attachments
+                # that transcripts still pointed at.
+                owned_elsewhere=(GROUP_MEDIA_PREFIX,),
             )
         except Exception as e:
             logger.debug(f"[Gateway] Media retention skipped: {e}")
