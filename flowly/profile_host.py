@@ -1253,6 +1253,10 @@ class ProfileHost:
                 self._rooms.retire_orphaned_media(),
                 name="profile-room-media-sweep",
             )
+            self._spawn_background(
+                self._rooms.reclaim_store_space(),
+                name="profile-room-space-reclaim",
+            )
             return runtime
         except BaseException as exc:
             if ws is not None:
@@ -1354,6 +1358,10 @@ class ProfileHost:
             self._spawn_background(
                 self._rooms.retire_orphaned_media(),
                 name="profile-room-media-sweep",
+            )
+            self._spawn_background(
+                self._rooms.reclaim_store_space(),
+                name="profile-room-space-reclaim",
             )
             return runtime
         except BaseException as exc:

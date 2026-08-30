@@ -2568,3 +2568,203 @@ async def test_a_frame_with_no_counts_in_either_place_folds_nothing(
     frame = {"state": "final", "model": "m/one", "message": {"content": []}}
     assert service._fold_usage(durable, "writer", frame) is None
     assert durable["usage"]["turns"] == 0
+
+
+# ── giving the disk back ─────────────────────────────────────────────────────
+
+
+def _bulky_store(tmp_path: Path, rooms: int = 6, messages: int = 400) -> SQLiteRoomStore:
+    """A store big enough that deleting from it leaves real free pages."""
+    store = SQLiteRoomStore(tmp_path / "rooms.sqlite3")
+    payload = {
+        str(uuid.uuid4()): {
+            "id": str(uuid.uuid4()), "title": f"Room {index}", "mode": "panel",
+            "members": ["default", "writer"], "watermarks": {"default": 0, "writer": 0},
+            "messages": [
+                {
+                    "id": str(uuid.uuid4()), "role": "user",
+                    "content": "x" * 512,
+                    "createdAt": "2026-08-01T00:00:00.000Z",
+                }
+                for _ in range(messages)
+            ],
+            "createdAt": "2026-08-01T00:00:00.000Z",
+            "updatedAt": "2026-08-01T00:00:00.000Z",
+        }
+        for index in range(rooms)
+    }
+    payload = {room["id"]: room for room in payload.values()}
+    store.initialize_verified(payload)
+    return store
+
+
+def _free_pages(path: Path) -> tuple[int, int]:
+    with sqlite3.connect(path) as connection:
+        free = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+        total = int(connection.execute("PRAGMA page_count").fetchone()[0])
+    return free, total
+
+
+def test_space_is_reclaimed_once_a_deletion_has_left_enough_behind(
+    tmp_path: Path,
+) -> None:
+    """SQLite keeps a deleted room's pages for reuse and never shrinks the
+    file on its own. Nothing else here would ever hand them back."""
+    store = _bulky_store(tmp_path)
+    loaded = store.load()
+    keep = loaded.rooms[0]
+    store.apply(
+        expected_revision=loaded.revision,
+        changed_rooms=[],
+        deleted_room_ids=[room["id"] for room in loaded.rooms[1:]],
+    )
+    before = store.path.stat().st_size
+    free_before, _total = _free_pages(store.path)
+    assert free_before > 0
+
+    report = store.reclaim_space(min_free_bytes=1, min_free_ratio=0.0)
+
+    assert report["vacuumed"] is True
+    assert report["freedBytes"] > 0
+    assert store.path.stat().st_size < before
+    # The room that stayed is still readable afterwards.
+    assert [room["id"] for room in store.load().rooms] == [keep["id"]]
+
+
+def test_a_store_with_little_to_reclaim_is_left_alone(tmp_path: Path) -> None:
+    """VACUUM holds an exclusive lock for a full rewrite. A quarter of a tiny
+    database is not worth that, which is why there is a floor as well as a
+    ratio."""
+    store = _bulky_store(tmp_path, rooms=1, messages=5)
+
+    report = store.reclaim_space()
+
+    assert report["vacuumed"] is False
+    assert report["skipped"] == "not-worth-it"
+
+
+def test_reclaiming_is_throttled_across_processes(tmp_path: Path) -> None:
+    """The last run is recorded in the store's own meta table, so a second
+    Flowly sharing the database throttles against the same mark rather than
+    keeping private bookkeeping."""
+    store = _bulky_store(tmp_path)
+    loaded = store.load()
+    store.apply(
+        expected_revision=loaded.revision,
+        changed_rooms=[],
+        deleted_room_ids=[room["id"] for room in loaded.rooms[1:]],
+    )
+    assert store.reclaim_space(min_free_bytes=1, min_free_ratio=0.0)["vacuumed"] is True
+
+    # Reclaiming leaves nothing to reclaim, so a second call would stop at
+    # "not worth it" before the throttle was ever consulted. Free more pages
+    # so the throttle is what actually holds it back.
+    remaining = store.load()
+    store.apply(
+        expected_revision=remaining.revision,
+        changed_rooms=[],
+        deleted_room_ids=[room["id"] for room in remaining.rooms],
+    )
+
+    # A different object over the same file is a different process, as far as
+    # anything that is not written down is concerned.
+    again = SQLiteRoomStore(store.path).reclaim_space(min_free_bytes=1, min_free_ratio=0.0)
+
+    assert again["vacuumed"] is False
+    assert again["skipped"] == "throttled"
+
+
+def test_a_corrupt_mark_reads_as_never_reclaimed(tmp_path: Path) -> None:
+    """Unparseable bookkeeping must not freeze maintenance forever."""
+    store = _bulky_store(tmp_path)
+    loaded = store.load()
+    store.apply(
+        expected_revision=loaded.revision,
+        changed_rooms=[],
+        deleted_room_ids=[room["id"] for room in loaded.rooms[1:]],
+    )
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO room_store_meta(key, value) VALUES('last_vacuum', 'soon')"
+        )
+
+    assert store.reclaim_space(min_free_bytes=1, min_free_ratio=0.0)["vacuumed"] is True
+
+
+def test_a_missing_store_is_not_an_error(tmp_path: Path) -> None:
+    """Maintenance must never be the reason something else fails."""
+    report = SQLiteRoomStore(tmp_path / "absent.sqlite3").reclaim_space()
+    assert report == {"vacuumed": False, "freedBytes": 0, "skipped": "absent"}
+
+
+@pytest.mark.asyncio
+async def test_the_service_reclaims_at_most_once_a_process(tmp_path: Path) -> None:
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    await service.create("Council", ["default", "writer"])
+
+    first = await service.reclaim_store_space()
+    second = await service.reclaim_store_space()
+
+    assert first["skipped"] != "already"
+    assert second["skipped"] == "already"
+
+
+@pytest.mark.asyncio
+async def test_storage_is_reported_per_group_and_deletes_nothing(
+    tmp_path: Path,
+) -> None:
+    """A plan, not an action. Files somebody put in a conversation are theirs;
+    the useful thing to do with them is notice, not tidy."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    media = service._media_dir
+    media.mkdir(parents=True, exist_ok=True)
+    (media / f"group-{room['id'][:8]}-a.png").write_bytes(b"x" * 2_048)
+    (media / f"group-{room['id'][:8]}-b.png").write_bytes(b"x" * 1_024)
+    (media / "vid-generated.mp4").write_bytes(b"x" * 9_999)
+
+    report = await service.storage_report()
+
+    assert report["rooms"] == [{
+        "roomId": room["id"],
+        "title": "Council",
+        "mediaBytes": 3_072,
+        "overNotice": False,
+    }]
+    # Generated media is somebody else's accounting.
+    assert report["totalBytes"] == 3_072
+    assert len(list(media.iterdir())) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_group_over_the_notice_says_so_without_acting(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    calls: list = []
+    monkeypatch.setattr(rooms_module, "_ROOM_MEDIA_NOTICE_BYTES", 1_000)
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    service._media_dir.mkdir(parents=True, exist_ok=True)
+    kept = service._media_dir / f"group-{room['id'][:8]}-big.png"
+    kept.write_bytes(b"x" * 4_096)
+
+    report = await service.storage_report()
+
+    assert report["rooms"][0]["overNotice"] is True
+    assert report["noticeBytes"] == 1_000
+    assert kept.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_store_that_will_not_load_reports_nothing(tmp_path: Path) -> None:
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+
+    async def explode() -> None:
+        raise ProfileHostError("ROOM_STORE_INVALID", "unreadable")
+
+    service._load = explode  # type: ignore[method-assign]
+
+    assert (await service.storage_report())["rooms"] == []

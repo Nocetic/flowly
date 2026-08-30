@@ -79,6 +79,12 @@ GROUP_MEDIA_PREFIX = "group-"
 # so this is headroom for a roster that churns rather than a policy anybody
 # should feel. Room-wide totals are counted separately and never capped, so a
 # room's cost stays complete even once its breakdown stops taking new names.
+# What one room's attachments may reach before the owner is told. Not a cap:
+# nothing is deleted at this line, or at any line. Files somebody put in a
+# conversation are theirs, and a product that says a memory of your world is
+# not one that quietly throws parts of it away — but neither should it let a
+# disk fill without ever mentioning it.
+_ROOM_MEDIA_NOTICE_BYTES = 500 * 1024 * 1024
 _MAX_USAGE_MEMBERS = 24
 # Cumulative counters saturate instead of overflowing. These numbers cross the
 # wire as JSON and land in a browser and a phone, where they become doubles —
@@ -115,6 +121,7 @@ PROFILE_ROOM_METHODS = (
     "profiles.rooms.stop",
     "profiles.rooms.approval.resolve",
     "profiles.rooms.clarify.resolve",
+    "profiles.rooms.storage",
 )
 _TOOL_ARGUMENT_KEYS: dict[str, tuple[str, ...]] = {
     "exec": ("command", "cmd", "cwd"),
@@ -692,6 +699,7 @@ class ProfileRoomService:
         # turn. Set before the sweep runs, so two runtimes coming up together
         # do not both walk the folder.
         self._swept_media = False
+        self._reclaimed_space = False
         self._member_timeout = member_timeout
         self._rooms: dict[str, dict[str, Any]] = {}
         self._active: dict[str, set[str]] = {}
@@ -1030,6 +1038,8 @@ class ProfileRoomService:
         if method == "profiles.rooms.stop":
             await self.stop(params.get("roomId"))
             return {"ok": True}
+        if method == "profiles.rooms.storage":
+            return await self.storage_report()
         if method == "profiles.rooms.approval.resolve":
             await self.resolve_approval(params.get("roomId"), params.get("id"), params.get("decision"))
             return {"ok": True}
@@ -1776,6 +1786,87 @@ class ProfileRoomService:
         if retired:
             logger.info("Retired {} orphaned group attachment(s)", retired)
         return retired
+
+    async def reclaim_store_space(self) -> dict[str, Any]:
+        """Hand back the disk that deleted groups left behind.
+
+        Once per process, for the same reason the orphan sweep is: the work
+        is created by deletions that have already happened, and a startup is
+        when nothing is waiting on the answer. The store decides whether it
+        is worth doing at all — this only picks the moment.
+
+        Off the event loop, because VACUUM rewrites the whole file under an
+        exclusive lock and a group must not stop answering while it runs.
+        """
+        if self._reclaimed_space:
+            return {"vacuumed": False, "freedBytes": 0, "skipped": "already"}
+        self._reclaimed_space = True
+        if self._storage_mode != "sqlite-wal":
+            return {"vacuumed": False, "freedBytes": 0, "skipped": "legacy-store"}
+        report = await asyncio.to_thread(self._sqlite_store.reclaim_space)
+        if report.get("vacuumed"):
+            logger.info(
+                "Reclaimed {} bytes of group database", report.get("freedBytes", 0)
+            )
+        return report
+
+    async def storage_report(self) -> dict[str, Any]:
+        """What each group is keeping on disk. Deletes nothing, ever.
+
+        Deliberately shaped like a plan rather than an action: it says what
+        is large and leaves every decision to whoever asked. The files belong
+        to the person who put them in a conversation, and the useful thing a
+        product can do with somebody else's data is notice, not tidy.
+
+        Sized from the media directory rather than by walking transcripts.
+        A room's attachments carry its id in their name, so the folder can be
+        grouped without loading history that the live window no longer holds
+        — the reading is O(files) instead of O(every message ever sent).
+        """
+        try:
+            await self._load()
+        except Exception:
+            return {"rooms": [], "totalBytes": 0, "noticeBytes": _ROOM_MEDIA_NOTICE_BYTES}
+
+        def _measure() -> dict[str, int]:
+            sizes: dict[str, int] = {}
+            try:
+                entries = list(self._media_dir.iterdir())
+            except OSError:
+                return sizes
+            for path in entries:
+                if not path.name.startswith(GROUP_MEDIA_PREFIX):
+                    continue
+                # ``group-<roomId[:8]>-<uuid><ext>``
+                parts = path.name[len(GROUP_MEDIA_PREFIX):].split("-", 1)
+                if len(parts) != 2 or not parts[0]:
+                    continue
+                try:
+                    if not path.is_file():
+                        continue
+                    sizes[parts[0]] = sizes.get(parts[0], 0) + path.stat().st_size
+                except OSError:
+                    continue
+            return sizes
+
+        sizes = await asyncio.to_thread(_measure)
+        rooms = [
+            {
+                "roomId": room_id,
+                "title": str(room.get("title") or ""),
+                "mediaBytes": sizes.get(room_id[:8], 0),
+                "overNotice": sizes.get(room_id[:8], 0) >= _ROOM_MEDIA_NOTICE_BYTES,
+            }
+            for room_id, room in self._rooms.items()
+        ]
+        rooms.sort(key=lambda entry: -entry["mediaBytes"])
+        return {
+            "rooms": rooms,
+            # Everything the prefix accounts for, including groups that have
+            # since been deleted but whose files a failed cleanup left behind.
+            "totalBytes": sum(sizes.values()),
+            "noticeBytes": _ROOM_MEDIA_NOTICE_BYTES,
+        }
 
     async def resolve_approval(self, raw_id: Any, request_id: Any, decision: Any) -> None:
         room_id = _room_id(raw_id)

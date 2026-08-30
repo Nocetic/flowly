@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from typing import Any
 
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
+from loguru import logger
 
 SQLITE_SCHEMA_VERSION = 3
 SQLITE_SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3)
@@ -461,6 +463,97 @@ class SQLiteRoomStore:
             ) from exc
         finally:
             connection.close()
+
+    def reclaim_space(
+        self,
+        *,
+        min_interval_days: int = 30,
+        min_free_ratio: float = 0.25,
+        min_free_bytes: int = 4 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Give the disk back the pages deleted rooms left behind. Never raises.
+
+        SQLite does not shrink a file when rows go; the pages join a freelist
+        and are reused by later writes. That is the right default — reusing a
+        page is free and rewriting a file is not — but a store that held rooms
+        it no longer holds keeps their footprint forever, and nothing else
+        here would ever hand it back.
+
+        Three conditions, all of which must hold:
+
+        **There is something to reclaim.** Measured from the freelist rather
+        than inferred from "a room was deleted recently": the freelist is the
+        exact quantity VACUUM recovers, so it cannot be fooled by a delete
+        that freed almost nothing, nor miss one that freed a great deal. Both
+        a ratio and a floor, because 25% of a tiny database is not worth an
+        exclusive lock.
+
+        **It has been long enough.** VACUUM rewrites the whole file under an
+        exclusive lock. The last run is recorded in the store's own meta
+        table rather than in memory or a sidecar, so several Flowly processes
+        sharing one database throttle each other rather than each keeping
+        private bookkeeping.
+
+        **Nothing else is mid-write.** An ordinary busy timeout applies; a
+        VACUUM that cannot get the lock is simply skipped and tried later.
+
+        Returns what happened so a caller can log it. An unreadable or busy
+        database is not an error worth surfacing: maintenance must never be
+        the reason something else fails.
+        """
+        report: dict[str, Any] = {
+            "vacuumed": False, "freedBytes": 0, "skipped": "",
+        }
+        if not self.path.is_file():
+            report["skipped"] = "absent"
+            return report
+        try:
+            before = self.path.stat().st_size
+            connection = self._connect(self.path, journal_mode="WAL")
+            try:
+                page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+                page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+                free_pages = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+                free_bytes = free_pages * page_size
+                ratio = (free_pages / page_count) if page_count else 0.0
+                if free_bytes < min_free_bytes or ratio < min_free_ratio:
+                    report["skipped"] = "not-worth-it"
+                    return report
+
+                row = connection.execute(
+                    "SELECT value FROM room_store_meta WHERE key = 'last_vacuum'"
+                ).fetchone()
+                if row is not None:
+                    try:
+                        elapsed = time.time() - float(row[0])
+                    except (TypeError, ValueError):
+                        elapsed = None  # corrupt meta reads as "never run"
+                    if elapsed is not None and elapsed < min_interval_days * 86_400:
+                        report["skipped"] = "throttled"
+                        return report
+
+                # Recorded BEFORE the rewrite. A VACUUM that dies partway
+                # leaves the database intact but must not invite the next
+                # startup to try again immediately on a file that may be
+                # large enough to be the reason it died.
+                connection.execute(
+                    "INSERT OR REPLACE INTO room_store_meta(key, value) VALUES(?, ?)",
+                    ("last_vacuum", str(time.time())),
+                )
+                connection.execute("VACUUM")
+                # In WAL mode the rebuilt database arrives through the log,
+                # so the file on disk is still the old size until the log is
+                # folded back into it. Without this the space is promised and
+                # not returned until some later write happens to checkpoint.
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                report["vacuumed"] = True
+            finally:
+                connection.close()
+            report["freedBytes"] = max(0, before - self.path.stat().st_size)
+        except (sqlite3.Error, RoomStoreError, OSError) as exc:
+            report["skipped"] = "failed"
+            logger.debug("[Rooms] space could not be reclaimed: {}", exc)
+        return report
 
     def backup_to(self, destination: Path) -> None:
         """Create a transactionally consistent, single-file SQLite backup."""
