@@ -79,9 +79,17 @@ def test_local_runtime_clone_keeps_provider_but_drops_transport_identity(profile
     )
 
     assert created == root / "research"
-    config = json.loads((created / "config.json").read_text(encoding="utf-8"))
-    assert config["channels"]["telegram"]["enabled"] is False
-    assert config["channels"]["web"] == {"enabled": False}
+    raw = (created / "config.json").read_text(encoding="utf-8")
+    config = json.loads(raw)
+    # The section is GONE, not merely switched off. Disabling it left every
+    # token on disk in as many copies as there were bots, one command away
+    # from being enabled again — and rotating the original reached none of
+    # them. Every channel defaults to off, so absence is the stricter state.
+    assert "channels" not in config
+    # Said against the file rather than the parsed object: a secret that
+    # survived under a key nobody thought to check is still a secret on disk.
+    for leaked in ("telegram-secret", "relay-secret", "wss://relay.example", "srv_shared"):
+        assert leaked not in raw
     assert config["gateway"] == {"host": "127.0.0.1", "port": 19999, "token": ""}
     assert config["agents"]["defaults"]["workspace"] == str(created / "workspace")
     assert config["providers"]["flowlyHosted"]["accountKey"] == "flw_account"
@@ -104,6 +112,62 @@ def test_local_runtime_clone_keeps_provider_but_drops_transport_identity(profile
     assert info.to_public_dict()["botId"] == info.bot_id
     assert info.to_public_dict()["credentialPolicy"] == "isolated"
     assert "path" not in info.to_public_dict()
+
+
+def test_a_clone_never_inherits_transport_identity_however_it_is_made(
+    profile_roots,
+) -> None:
+    """The path this used to miss entirely.
+
+    Stripping only ran for Desktop-managed profiles, so ``flowly profile
+    create --clone`` produced a copy holding the account's channel tokens,
+    gateway token and relay registration. There is no kind of profile that
+    legitimately needs the identity of the one it was copied from, so the
+    rule does not depend on who is managing it.
+    """
+    default, root = profile_roots
+    (default / "config.json").write_text(
+        json.dumps({
+            "channels": {"telegram": {"enabled": True, "token": "telegram-secret"}},
+            "gateway": {"host": "0.0.0.0", "port": 19999, "token": "gateway-secret"},
+            "providers": {
+                "flowlyHosted": {"accountKey": "flw_account", "authToken": "relay-secret"},
+            },
+        }),
+        encoding="utf-8",
+    )
+    (default / ".env").write_text(
+        "OPENAI_API_KEY=keep\n"
+        # Nested env can carry a channel just as well as the config can.
+        "FLOWLY_CHANNELS__TELEGRAM__BOT_TOKEN=drop\n",
+        encoding="utf-8",
+    )
+
+    created = profiles.create_profile("standalone", clone_from="default")
+
+    raw = (created / "config.json").read_text(encoding="utf-8")
+    config = json.loads(raw)
+    assert "channels" not in config
+    assert config["gateway"]["token"] == ""
+    assert "authToken" not in config["providers"]["flowlyHosted"]
+    assert config["providers"]["flowlyHosted"]["accountKey"] == "flw_account"
+    for leaked in ("telegram-secret", "gateway-secret", "relay-secret"):
+        assert leaked not in raw
+    assert (created / ".env").read_text(encoding="utf-8") == "OPENAI_API_KEY=keep\n"
+    # Not a managed runtime, so its host is left as the owner set it.
+    assert config["gateway"]["host"] == "0.0.0.0"
+
+
+def test_a_clone_with_nothing_to_strip_is_left_byte_for_byte(profile_roots) -> None:
+    """Rewriting a config that was already clean would reformat a file the
+    owner brought with them, for no reason anybody could point at."""
+    default, root = profile_roots
+    payload = '{"agents":{"defaults":{"model":"test/model"}}}'
+    (default / "config.json").write_text(payload, encoding="utf-8")
+
+    created = profiles.create_profile("untouched", clone_from="default")
+
+    assert (created / "config.json").read_text(encoding="utf-8") == payload
 
 
 def test_legacy_profile_and_host_ids_are_backfilled_once(profile_roots) -> None:
@@ -1109,9 +1173,13 @@ def test_local_profile_import_strips_transport_identity(profile_roots, tmp_path:
         str(archive), name="safe-copy", local_runtime=True,
     )
 
-    imported_config = json.loads((imported / "config.json").read_text(encoding="utf-8"))
-    assert imported_config["channels"]["telegram"]["enabled"] is False
-    assert imported_config["channels"]["web"] == {"enabled": False}
+    imported_raw = (imported / "config.json").read_text(encoding="utf-8")
+    imported_config = json.loads(imported_raw)
+    # An archive may have been written on another machine by another person,
+    # so its transport identity is even less ours than a local copy's.
+    assert "channels" not in imported_config
+    for leaked in ("secret", "wss://relay.example"):
+        assert leaked not in imported_raw.replace("gateway-secret", "")
     assert imported_config["gateway"]["host"] == "127.0.0.1"
     assert imported_config["gateway"]["token"] == ""
     assert imported_config["agents"]["defaults"]["workspace"] == str(

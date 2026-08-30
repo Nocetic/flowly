@@ -87,7 +87,12 @@ _PROFILE_MARK_TONES = frozenset({
 })
 _PROFILE_MARK_COLOR_RE = re.compile(r"^#[0-9a-f]{6}$")
 _NAMED_PROFILE_CREDENTIAL_POLICY = "isolated"
-_LOCAL_RUNTIME_ENV_ALLOW = frozenset({
+# The only secrets a clone may inherit. Everything else in a parent's ``.env``
+# is dropped, because ``.env`` is where identity lives and there is no way to
+# tell an unknown key from a credential — ``FLOWLY_CHANNELS__TELEGRAM__BOT_TOKEN``
+# is a perfectly ordinary-looking variable. Provider keys are the deliberate
+# exception: a new bot has to be able to answer with the model it was given.
+_CLONED_ENV_ALLOW = frozenset({
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
@@ -791,8 +796,11 @@ def create_profile(
                     dst_personas = temp_dir / "workspace" / "personas"
                     shutil.copytree(src_personas, dst_personas, dirs_exist_ok=True)
 
+        # A clone never inherits who the source was, whoever manages it.
+        if source_dir:
+            _strip_inherited_identity(temp_dir)
         if local_runtime:
-            _sanitize_local_runtime_clone(temp_dir, profile_dir / "workspace")
+            _bind_local_runtime(temp_dir, profile_dir / "workspace")
 
         if provider is not None or model is not None:
             config_path = temp_dir / "config.json"
@@ -868,13 +876,25 @@ def _assert_tree_no_symlinks(
                 raise ValueError(f"Cannot clone symbolic link: {candidate}")
 
 
-def _sanitize_local_runtime_clone(profile_dir: Path, workspace: Path) -> None:
-    """Remove transport identity from a Desktop-managed local profile clone.
+def _strip_inherited_identity(profile_dir: Path) -> None:
+    """Remove the source profile's identity from a clone.
 
-    Provider credentials stay intact so the new profile can use the selected
-    model immediately. Messaging-channel credentials are not copied into the
-    runnable config, and legacy hosted-provider relay credentials are removed;
-    the account-scoped provider key remains valid without a relay registration.
+    A clone inherits a setup, never a self. Transport credentials are the
+    clearest case: a bot that starts life holding a copy of the account's
+    Telegram token is one command away from answering as the account —
+    ``flowly --profile <name> gateway`` boots that config with channels
+    enabled, and two processes then reply to the same message.
+
+    Channel sections are DROPPED rather than disabled. They were only
+    disabled before, which left every token on disk in as many copies as
+    there were bots: rotating the original reached none of them, and the
+    runtime's own safety boundary had to say out loud that it was covering
+    for a config it could not clean. Every channel defaults to off, so
+    removing the section is both stricter and simpler than rewriting it.
+
+    Runs for every clone, not only Desktop-managed ones. There is no kind of
+    profile that legitimately needs the identity of the one it was copied
+    from.
     """
     config_path = profile_dir / "config.json"
     if config_path.exists():
@@ -883,18 +903,14 @@ def _sanitize_local_runtime_clone(profile_dir: Path, workspace: Path) -> None:
         except ValueError as exc:
             raise ValueError(str(exc).replace("Invalid profile", "Cannot clone invalid")) from exc
 
-        channels = raw.get("channels")
-        if isinstance(channels, dict):
-            for channel in channels.values():
-                if isinstance(channel, dict):
-                    channel["enabled"] = False
-            channels["web"] = {"enabled": False}
+        removed = raw.pop("channels", None) is not None
 
         gateway = raw.get("gateway")
-        if not isinstance(gateway, dict):
-            gateway = {}
-            raw["gateway"] = gateway
-        gateway.update({"host": "127.0.0.1", "token": ""})
+        if isinstance(gateway, dict) and gateway.get("token"):
+            # Two gateways answering to one token is not a shared secret, it
+            # is two processes each believing they are the installation.
+            gateway["token"] = ""
+            removed = True
 
         providers = raw.get("providers")
         if isinstance(providers, dict):
@@ -902,17 +918,16 @@ def _sanitize_local_runtime_clone(profile_dir: Path, workspace: Path) -> None:
             if not isinstance(hosted, dict):
                 hosted = providers.get("flowly_hosted")
             if isinstance(hosted, dict):
-                hosted.pop("serverId", None)
-                hosted.pop("server_id", None)
-                hosted.pop("authToken", None)
-                hosted.pop("auth_token", None)
+                # A relay registration names one install. The account-scoped
+                # provider key keeps working without it.
+                for key in ("serverId", "server_id", "authToken", "auth_token"):
+                    removed = hosted.pop(key, None) is not None or removed
 
-        _set_profile_workspace(raw, workspace)
-        _atomic_write_json(config_path, raw)
-    else:
-        raw = {}
-        _set_profile_workspace(raw, workspace)
-        _atomic_write_json(config_path, raw)
+        # Nothing to strip means nothing to write. An import that rewrote a
+        # config it had not changed would reformat a file the owner brought
+        # with them, for no reason anybody could point at.
+        if removed:
+            _atomic_write_json(config_path, raw)
 
     env_path = profile_dir / ".env"
     if env_path.exists():
@@ -920,12 +935,39 @@ def _sanitize_local_runtime_clone(profile_dir: Path, workspace: Path) -> None:
             lines = env_path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError) as exc:
             raise ValueError(f"Cannot clone invalid .env: {exc}") from exc
-        retained = []
-        for line in lines:
-            key = line.split("=", 1)[0].strip() if "=" in line else ""
-            if key in _LOCAL_RUNTIME_ENV_ALLOW:
-                retained.append(line)
-        _atomic_write_text(env_path, "\n".join(retained) + ("\n" if retained else ""))
+        retained = [
+            line for line in lines
+            if (line.split("=", 1)[0].strip() if "=" in line else "") in _CLONED_ENV_ALLOW
+        ]
+        if len(retained) != len(lines):
+            _atomic_write_text(env_path, "\n".join(retained) + ("\n" if retained else ""))
+
+
+def _bind_local_runtime(profile_dir: Path, workspace: Path) -> None:
+    """Point a Desktop-managed profile at its own workspace, on loopback.
+
+    Identity stripping is :func:`_strip_inherited_identity`'s job and happens
+    for every clone. What is left here is what makes a profile a MANAGED
+    runtime rather than an installation: it answers on loopback, and it works
+    in its own directory. A profile created from nothing still needs both,
+    which is why this also runs when there was no config to clone.
+    """
+    config_path = profile_dir / "config.json"
+    raw: dict = {}
+    if config_path.exists():
+        try:
+            raw = _load_config_object(config_path)
+        except ValueError as exc:
+            raise ValueError(str(exc).replace("Invalid profile", "Cannot clone invalid")) from exc
+
+    gateway = raw.get("gateway")
+    if not isinstance(gateway, dict):
+        gateway = {}
+        raw["gateway"] = gateway
+    gateway.update({"host": "127.0.0.1", "token": ""})
+
+    _set_profile_workspace(raw, workspace)
+    _atomic_write_json(config_path, raw)
 
 
 def describe_profile(name: str) -> ProfileInfo:
@@ -2038,8 +2080,12 @@ def _import_profile_archive(
         if not extracted.is_dir() or extracted.is_symlink():
             raise ValueError("Profile archive must contain one profile directory.")
         _assert_tree_no_symlinks(extracted)
+        # An archive is a clone that travelled. It may have been written on
+        # another machine by another person, so the identity in it is even
+        # less this installation's than a local copy's would be.
+        _strip_inherited_identity(extracted)
         if local_runtime:
-            _sanitize_local_runtime_clone(extracted, profile_dir / "workspace")
+            _bind_local_runtime(extracted, profile_dir / "workspace")
         metadata = _profile_metadata(extracted)
         now = _utc_now()
         archived_bot_id = str(metadata.get("botId") or "").strip()

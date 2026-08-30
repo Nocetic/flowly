@@ -97,7 +97,14 @@ def profile_create(
     name: str = typer.Argument(..., help="Lowercase profile identifier."),
     clone: bool = typer.Option(False, "--clone", help="Copy the active profile's configuration."),
     clone_from: str = typer.Option("", "--clone-from", help="Profile whose configuration should be copied."),
-    clone_all: bool = typer.Option(False, "--clone-all", help="Also copy sessions and memory."),
+    clone_all: bool = typer.Option(
+        False,
+        "--clone-all",
+        help=(
+            "Also copy sessions, memory, generated media and the audit log. "
+            "Credentials are never copied."
+        ),
+    ),
     display_name: str = typer.Option("", "--display-name", help="Name shown in clients."),
     description: str = typer.Option("", "--description", help="Short purpose shown in clients."),
     provider: str | None = typer.Option(None, "--provider", help="Profile-local active model provider."),
