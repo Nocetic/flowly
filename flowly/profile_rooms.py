@@ -569,7 +569,15 @@ def _terminal_usage(terminal: Any) -> tuple[dict[str, int], str] | None:
     """
     if not isinstance(terminal, dict):
         return None
+    # TWO SHAPES, both real. A gateway nests the counts inside the assistant
+    # message it is delivering; the relay bridge lifts them to the top of the
+    # frame so a browser can read them without unwrapping. A group member can
+    # be reached either way, and reading only one of them is how this shipped
+    # counting nothing at all.
     raw = terminal.get("usage")
+    if not isinstance(raw, dict):
+        message = terminal.get("message")
+        raw = message.get("usage") if isinstance(message, dict) else None
     if not isinstance(raw, dict):
         return None
     counts = {name: _usage_int(raw.get(wire)) for name, wire in _USAGE_FIELDS}

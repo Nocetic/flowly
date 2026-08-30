@@ -2305,19 +2305,32 @@ async def test_the_media_sweep_takes_only_one_turn(tmp_path: Path) -> None:
 # ── what a group has spent ──────────────────────────────────────────────────
 
 
-def _terminal(*, prompt=0, completion=0, cache_read=0, cache_write=0, model="m/one"):
-    """A member's final frame, shaped the way the gateway forwards it."""
+def _usage_block(prompt, completion, cache_read, cache_write):
     return {
-        "state": "final",
-        "model": model,
-        "message": {"content": [{"type": "text", "text": "done"}]},
-        "usage": {
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "cache_read_tokens": cache_read,
-            "cache_write_tokens": cache_write,
-        },
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
     }
+
+
+def _terminal(
+    *, prompt=0, completion=0, cache_read=0, cache_write=0, model="m/one", nested=True
+):
+    """A member's final frame.
+
+    ``nested`` picks which of the two real shapes to send: a gateway puts the
+    counts inside the assistant message, the relay bridge lifts them to the
+    top of the frame. Both reach a room, so both are exercised.
+    """
+    usage = _usage_block(prompt, completion, cache_read, cache_write)
+    message = {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+    frame = {"state": "final", "model": model, "message": message}
+    if nested:
+        message["usage"] = usage
+    else:
+        frame["usage"] = usage
+    return frame
 
 
 def _priced(model="m/one", *, pricing_in=10.0, pricing_out=20.0, cache=1.0):
@@ -2511,3 +2524,47 @@ def test_the_store_upgrades_a_v2_database_in_place(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(rooms)")
         }
     assert "usage_json" in columns
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_frame_carries_its_counts_inside_the_message(
+    tmp_path: Path,
+) -> None:
+    """The shape this shipped blind to.
+
+    A gateway nests usage inside the assistant message; only the relay bridge
+    lifts it to the top of the frame. Reading just the top level meant every
+    group served by a gateway — which is every desktop group — counted
+    nothing, and the header stayed empty with no error to show for it.
+    """
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+
+    service._fold_usage(
+        durable, "writer", _terminal(prompt=900, completion=90, nested=True)
+    )
+    service._fold_usage(
+        durable, "default", _terminal(prompt=100, completion=10, nested=False)
+    )
+
+    usage = durable["usage"]
+    assert usage["turns"] == 2
+    assert usage["inputTokens"] == 1_000
+    assert usage["members"]["writer"]["inputTokens"] == 900
+    assert usage["members"]["default"]["inputTokens"] == 100
+
+
+@pytest.mark.asyncio
+async def test_a_frame_with_no_counts_in_either_place_folds_nothing(
+    tmp_path: Path,
+) -> None:
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+
+    frame = {"state": "final", "model": "m/one", "message": {"content": []}}
+    assert service._fold_usage(durable, "writer", frame) is None
+    assert durable["usage"]["turns"] == 0
