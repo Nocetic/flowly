@@ -142,3 +142,108 @@ async def test_composer_usage_replaces_input_row():
         await pilot.pause()
 
         assert not composer.has_class("usage-open")
+
+
+# ── cached input is not billed at the input price ────────────────────────────
+
+
+def _cost_of(*, tin, tout, cread, model="anthropic/claude-opus-4.8"):
+    """Run one turn through the real accumulator and return the estimate."""
+    from flowly.tui.app import FlowlyTUI
+
+    app = FlowlyTUI.__new__(FlowlyTUI)
+    app._usage_totals = {
+        "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+        "turns": 0, "cost_usd": 0.0, "cost_known": 0,
+    }
+    app.query_one = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no UI"))
+    app._accumulate_usage(tin, tout, cread, 0, model)
+    return app._usage_totals
+
+
+def test_a_cache_hit_is_billed_at_the_cache_price():
+    """The defect this exists for.
+
+    ``prompt_tokens`` counts cached bytes at full weight, so pricing all of
+    it as fresh input overstates every conversation with a stable prefix.
+    """
+    mc._CACHE["test"] = [Model(
+        id="anthropic/claude-opus-4.8", name="Opus", context_window=200_000,
+        pricing_in=5.0, pricing_out=25.0, pricing_cache_read=0.5)]
+    try:
+        # 1M input of which 800K was cached, no output.
+        totals = _cost_of(tin=1_000_000, tout=0, cread=800_000)
+        # 200K fresh @ $5 + 800K cached @ $0.50 = $1.00 + $0.40
+        assert totals["cost_usd"] == pytest.approx(1.40)
+        # What the old formula charged, for the size of the gap: $5.00.
+        assert totals["cost_known"] == 1
+    finally:
+        mc._CACHE.pop("test", None)
+
+
+def test_an_unquoted_cache_price_stays_at_the_input_price():
+    """No quote is not a discount. The estimate stays high rather than
+    inventing a saving the catalog never reported."""
+    mc._CACHE["test"] = [Model(
+        id="anthropic/claude-opus-4.8", name="Opus", context_window=200_000,
+        pricing_in=5.0, pricing_out=25.0)]
+    try:
+        totals = _cost_of(tin=1_000_000, tout=0, cread=800_000)
+        assert totals["cost_usd"] == pytest.approx(5.00)
+    finally:
+        mc._CACHE.pop("test", None)
+
+
+def test_a_cache_count_larger_than_the_input_cannot_pay_negative():
+    """Providers disagree about whether cached tokens sit inside
+    ``prompt_tokens``. One that reports them alongside must not drive the
+    fresh remainder below zero and refund the turn."""
+    mc._CACHE["test"] = [Model(
+        id="anthropic/claude-opus-4.8", name="Opus", context_window=200_000,
+        pricing_in=5.0, pricing_out=25.0, pricing_cache_read=0.5)]
+    try:
+        totals = _cost_of(tin=100_000, tout=0, cread=900_000)
+        # Everything billed as cached, nothing negative.
+        assert totals["cost_usd"] == pytest.approx(0.05)
+    finally:
+        mc._CACHE.pop("test", None)
+
+
+def test_output_only_pricing_does_not_crash_on_a_cache_hit():
+    """``get_pricing`` answers when EITHER side is known, so the input price
+    can be None while a cache count is present."""
+    mc._CACHE["test"] = [Model(
+        id="byok/native", name="Native", pricing_out=25.0)]
+    try:
+        totals = _cost_of(tin=1_000, tout=100, cread=900, model="byok/native")
+        assert totals["cost_usd"] == pytest.approx(100 * 25.0 / 1_000_000)
+    finally:
+        mc._CACHE.pop("test", None)
+
+
+def test_cache_price_survives_the_dated_snapshot_suffix():
+    """The id a provider pins on a call carries a date the catalogue's entry
+    does not — the exact shape in real logs (``…-v4-flash-0731``)."""
+    mc._CACHE["test"] = [Model(
+        id="deepseek/deepseek-v4-flash", name="Flash",
+        pricing_in=1.0, pricing_out=2.0, pricing_cache_read=0.1)]
+    try:
+        assert mc.get_cache_read_pricing("deepseek/deepseek-v4-flash-0731") == 0.1
+        assert mc.get_cache_read_pricing("unknown/model") is None
+    finally:
+        mc._CACHE.pop("test", None)
+
+
+def test_a_priceless_duplicate_does_not_mask_a_priced_entry():
+    """The same id can sit in two cached catalogues — a BYOK list that omits
+    pricing and the proxy list that has it. The silent one must not answer."""
+    mc._CACHE["byok"] = [Model(id="shared/model", name="Shared")]
+    mc._CACHE["proxy"] = [Model(
+        id="shared/model", name="Shared",
+        pricing_in=3.0, pricing_out=6.0, pricing_cache_read=0.3)]
+    try:
+        assert mc.get_pricing("shared/model") == (3.0, 6.0)
+        assert mc.get_cache_read_pricing("shared/model") == 0.3
+    finally:
+        mc._CACHE.pop("byok", None)
+        mc._CACHE.pop("proxy", None)

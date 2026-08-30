@@ -40,6 +40,14 @@ class Model:
     context_window: int | None = None    # tokens, if reported
     pricing_in: float | None = None      # USD per 1M input tokens, if reported
     pricing_out: float | None = None     # USD per 1M output tokens
+    # USD per 1M input tokens that came from the provider's prompt cache.
+    # A cache hit is typically a tenth of a miss, and ``prompt_tokens`` counts
+    # cached bytes at full weight, so pricing input alone overstates any
+    # conversation with a stable prefix — which is every long chat and, most of
+    # all, a group room where six members re-send the same room preamble.
+    # ``None`` means the catalog didn't say; bill those tokens at input price
+    # rather than inventing a discount.
+    pricing_cache_read: float | None = None
     tags: list[str] = dc_field(default_factory=list)
     # Tri-state capability: True/False only when the upstream catalog states
     # it explicitly; None means unknown and must never be used to block a call.
@@ -191,13 +199,41 @@ def get_pricing(model_id: str) -> tuple[float | None, float | None] | None:
     pricing (e.g. BYOK native providers whose catalog omits it) — the caller
     then shows tokens without a cost estimate.
     """
+    priced = _priced_model(model_id)
+    return None if priced is None else (priced.pricing_in, priced.pricing_out)
+
+
+def get_cache_read_pricing(model_id: str) -> float | None:
+    """USD per 1M input tokens served from the provider's prompt cache.
+
+    Separate from :func:`get_pricing` rather than widening its tuple: the
+    picker renders that pair as "$in/$out per 1M" and a third number there
+    would be noise. Cost arithmetic is the only caller that needs this.
+
+    ``None`` means the catalog did not report a cache price — NOT that
+    caching is free. A caller must then bill cached tokens at the input
+    price, which is what every caller did before this existed; the estimate
+    stays too high rather than becoming too low.
+    """
+    priced = _priced_model(model_id)
+    return None if priced is None else priced.pricing_cache_read
+
+
+def _priced_model(model_id: str) -> Model | None:
+    """First cached catalog entry for ``model_id`` that carries any price.
+
+    Skipping price-less entries matters: the same id can appear in two cached
+    catalogs (a BYOK provider list that omits pricing and the proxy list that
+    has it), and answering from the silent one would drop the estimate for a
+    model we can in fact price.
+    """
     if not model_id:
         return None
     candidates = _id_candidates(model_id)
     for models in _CACHE.values():
         for m in models:
             if m.id in candidates and (m.pricing_in is not None or m.pricing_out is not None):
-                return (m.pricing_in, m.pricing_out)
+                return m
     return None
 
 
@@ -344,6 +380,7 @@ async def _fetch_openrouter() -> list[Model]:
             context_window=int(ctx) if isinstance(ctx, int) and ctx > 0 else None,
             pricing_in=_per_million(pricing.get("prompt")),
             pricing_out=_per_million(pricing.get("completion")),
+            pricing_cache_read=_per_million(pricing.get("input_cache_read")),
             tags=_openrouter_tags(item, pricing),
             supports_vision=vision,
         ))
@@ -441,6 +478,7 @@ async def _fetch_flowly_hosted() -> list[Model]:
             context_window=int(ctx) if isinstance(ctx, int) else None,
             pricing_in=_per_million(pricing.get("prompt")),
             pricing_out=_per_million(pricing.get("completion")),
+            pricing_cache_read=_per_million(pricing.get("input_cache_read")),
             tags=tags,
             supports_vision=vision,
         ))

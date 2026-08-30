@@ -780,7 +780,17 @@ class FlowlyTUI(App[None]):
         estimate its cost from the catalog price of ``model``. Feeds the live
         cost badge and backs the /usage screen. Cost is billed per-turn (each
         turn pays for its full input), so input is summed across turns — unlike
-        the context-window bar, which shows only the latest turn's occupancy."""
+        the context-window bar, which shows only the latest turn's occupancy.
+
+        ``tin`` COUNTS CACHED TOKENS. Every endpoint this client reaches is
+        OpenAI-shaped, where ``prompt_tokens`` is the full input and the cached
+        part is reported separately as a subset (see the note in
+        ``openrouter_provider``). Billing all of it at the input price is what
+        this did originally, and it overstates by a lot on the conversations
+        people actually have: a long chat re-sends a stable prefix, and a cache
+        hit runs about a tenth of a miss. Measured on real logs it read ~1.2x
+        high for ordinary chat and ~1.9x high in group rooms, where six members
+        replay the same room preamble every turn."""
         t = self._usage_totals
         t["input"] += tin
         t["output"] += tout
@@ -788,13 +798,26 @@ class FlowlyTUI(App[None]):
         t["cache_write"] += cwrite
         t["turns"] += 1
         try:
-            from flowly.integrations.model_catalog import get_pricing
+            from flowly.integrations.model_catalog import (
+                get_cache_read_pricing,
+                get_pricing,
+            )
             pricing = get_pricing(model)
+            pcache = get_cache_read_pricing(model)
         except Exception:
             pricing = None
+            pcache = None
         if pricing is not None:
             pin, pout = pricing
-            t["cost_usd"] += (tin * (pin or 0) + tout * (pout or 0)) / 1_000_000
+            # An unknown cache price bills at the input price — the old
+            # behaviour. Too high beats a discount nobody quoted us.
+            cached = max(0, min(cread, tin))
+            fresh = tin - cached
+            t["cost_usd"] += (
+                fresh * (pin or 0)
+                + cached * ((pin or 0) if pcache is None else pcache)
+                + tout * (pout or 0)
+            ) / 1_000_000
             t["cost_known"] += 1
             try:
                 self.query_one(StatusBar).cost_usd = t["cost_usd"]

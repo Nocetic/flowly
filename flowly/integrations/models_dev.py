@@ -164,6 +164,10 @@ async def fetch_provider_models(provider_key: str) -> list[Model]:
             context_window=int(ctx) if isinstance(ctx, (int, float)) and ctx > 0 else None,
             pricing_in=float(cost["input"]) if isinstance(cost.get("input"), (int, float)) else None,
             pricing_out=float(cost["output"]) if isinstance(cost.get("output"), (int, float)) else None,
+            pricing_cache_read=(
+                float(cost["cache_read"])
+                if isinstance(cost.get("cache_read"), (int, float)) else None
+            ),
             tags=tags,
             supports_vision=bool(raw.get("attachment")),
         ))
