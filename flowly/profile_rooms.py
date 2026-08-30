@@ -108,6 +108,48 @@ _MENTION_RE = re.compile(r"(^|[\s([{])@([a-z0-9][a-z0-9._-]*)", re.IGNORECASE)
 _CODE_RE = re.compile(r"```[\s\S]*?```|`[^`\n]*`")
 _HISTORY_CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _GROUP_NON_EXECUTOR_DISABLED_TOOLS = ["board_add", "board_update", "board_run"]
+#: Group failures a PERSON can cause and will read. Clients translate by code
+#: and show the server's own sentence underneath as detail, so a code needs a
+#: good translation rather than a unique message — the seven ways a store can
+#: be unreadable are one sentence to whoever is holding the phone, and seven
+#: to whoever is reading a log.
+#:
+#: Everything not listed here is a malformed payload: it means a client sent
+#: something wrong, the person who sees it is the one debugging the client,
+#: and English is the right language for that.
+#:
+#: ``test_every_group_error_is_placed`` fails when a new code appears in
+#: neither list, so the decision cannot be skipped by accident.
+ROOM_ERROR_CODES: tuple[str, ...] = (
+    "HOST_STOPPED",
+    "METHOD_NOT_ALLOWED",
+    "PROFILE_NOT_FOUND",
+    "ROOM_ATTACHMENT_TOO_LARGE",
+    "ROOM_BUSY",
+    "ROOM_BUSY_DELETE",
+    "ROOM_BUSY_MEMBERS",
+    "ROOM_CURSOR_INVALID",
+    "ROOM_HISTORY_UNAVAILABLE",
+    "ROOM_INVALID",
+    "ROOM_LIMIT",
+    "ROOM_LIMIT_IMPORT",
+    "ROOM_MEMBERS_INVALID",
+    "ROOM_MEMBERS_TOO_FEW",
+    "ROOM_MEMBER_FAILED",
+    "ROOM_NOT_FOUND",
+    "ROOM_REQUEST_CLOSED",
+    "ROOM_START_FAILED",
+    "ROOM_STOPPED",
+    "ROOM_STORE_CONFLICT",
+    "ROOM_STORE_INVALID",
+    "ROOM_STORE_LIMIT",
+)
+
+#: Codes that only a wrong request produces. Left in English deliberately.
+ROOM_DEVELOPER_ERROR_CODES: tuple[str, ...] = (
+    "INVALID_PARAMS",
+)
+
 PROFILE_ROOM_METHODS = (
     "profiles.rooms.list",
     "profiles.rooms.get",
@@ -399,7 +441,7 @@ def _sanitize_attachments(value: Any) -> list[dict[str, str]]:
             if content.startswith("data:") and "," in content:
                 encoded = content.split(",", 1)[1]
             if len(encoded) > _MAX_ATTACHMENT_B64_CHARS:
-                raise ProfileHostError("INVALID_PARAMS", "A group attachment is too large.")
+                raise ProfileHostError("ROOM_ATTACHMENT_TOO_LARGE", "A group attachment is too large.")
             try:
                 decoded = base64.b64decode(encoded, validate=True)
             except (binascii.Error, ValueError) as exc:
@@ -973,6 +1015,8 @@ class ProfileRoomService:
                 "cost": "catalog-priced",
                 "memberBreakdown": _MAX_USAGE_MEMBERS,
             },
+            # A client translates by code; this is the list it must cover.
+            "errorCodes": list(ROOM_ERROR_CODES),
             "roomEvents": ["full-v1", "delta-v1"],
             "storage": "sqlite-wal",
             "legacyJsonMigration": "verified-copy-preserve-source",
@@ -1254,7 +1298,7 @@ class ProfileRoomService:
                 "conflicts": conflicts,
             }
         if len(self._rooms) + len(imported) > _MAX_ROOMS:
-            raise ProfileHostError("ROOM_LIMIT", "Delete a group before importing another one.")
+            raise ProfileHostError("ROOM_LIMIT_IMPORT", "Delete a group before importing another one.")
 
         previous = self._rooms
         self._rooms = {**previous, **{room["id"]: room for room in imported}}
@@ -1319,7 +1363,7 @@ class ProfileRoomService:
         await self._load()
         room = self._require(room_id)
         if self._room_is_running(room):
-            raise ProfileHostError("ROOM_BUSY", "Stop the active group response before changing its members.")
+            raise ProfileHostError("ROOM_BUSY_MEMBERS", "Stop the active group response before changing its members.")
         clean_title, clean_members = self._definition(title, members)
         clean_mode = self._room_mode(mode, default=str(room.get("mode") or "panel"))
         previous = {
@@ -1372,7 +1416,7 @@ class ProfileRoomService:
         await self._load()
         room = self._require(room_id)
         if self._room_is_running(room):
-            raise ProfileHostError("ROOM_BUSY", "Stop the active group response before deleting it.")
+            raise ProfileHostError("ROOM_BUSY_DELETE", "Stop the active group response before deleting it.")
         previous_epoch = self._epochs.get(room_id)
         previous_readiness = self._readiness.get(room_id)
         self._rooms.pop(room_id)
@@ -2689,16 +2733,16 @@ class ProfileRoomService:
     def _definition(self, title: Any, members: Any) -> tuple[str, list[str]]:
         clean_title = _bounded_text(title, label="Group name", maximum=80)
         if not isinstance(members, list):
-            raise ProfileHostError("INVALID_PARAMS", "Group members are invalid.")
+            raise ProfileHostError("ROOM_MEMBERS_INVALID", "Group members are invalid.")
         clean_members: list[str] = []
         for value in members:
             member = _bounded_text(value, label="Group member", maximum=64)
             if not _PROFILE_RE.fullmatch(member):
-                raise ProfileHostError("INVALID_PARAMS", "Group members are invalid.")
+                raise ProfileHostError("ROOM_MEMBERS_INVALID", "Group members are invalid.")
             if member not in clean_members:
                 clean_members.append(member)
         if len(clean_members) < 2:
-            raise ProfileHostError("INVALID_PARAMS", "Choose at least two agents for a group.")
+            raise ProfileHostError("ROOM_MEMBERS_TOO_FEW", "Choose at least two agents for a group.")
         if len(clean_members) > _MAX_MEMBERS:
             raise ProfileHostError(
                 "INVALID_PARAMS", f"A group can include at most {_MAX_MEMBERS} agents."

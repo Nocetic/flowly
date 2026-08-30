@@ -2768,3 +2768,43 @@ async def test_a_store_that_will_not_load_reports_nothing(tmp_path: Path) -> Non
     service._load = explode  # type: ignore[method-assign]
 
     assert (await service.storage_report())["rooms"] == []
+
+
+def test_every_group_error_is_placed() -> None:
+    """A new failure has to say who reads it.
+
+    Clients translate a group failure by its code, so a code nobody
+    classified reaches somebody in English through a table that never heard
+    of it. This is the one check that cannot be satisfied by being careful:
+    adding an error without deciding whether a person or a client author is
+    the one who sees it fails here.
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(rooms_module)
+    used = set(re.findall(r'ProfileHostError\(\s*"([A-Z_]+)"', source))
+    used |= set(re.findall(r'FeatureRpcError\(\s*"([A-Z_]+)"', source))
+    placed = set(rooms_module.ROOM_ERROR_CODES) | set(
+        rooms_module.ROOM_DEVELOPER_ERROR_CODES
+    )
+
+    assert not (used - placed), (
+        f"unplaced group error codes: {sorted(used - placed)} — add each to "
+        "ROOM_ERROR_CODES (a person reads it) or ROOM_DEVELOPER_ERROR_CODES "
+        "(only a wrong request produces it)"
+    )
+
+
+def test_the_error_codes_a_client_must_cover_are_advertised() -> None:
+    """A client cannot translate what it was never told about."""
+    advertised = rooms_module.ProfileRoomService.capabilities()["errorCodes"]
+    assert advertised == list(rooms_module.ROOM_ERROR_CODES)
+    assert advertised == sorted(advertised), "keep the list sorted so diffs read"
+
+
+def test_no_user_facing_code_is_only_a_developer_code() -> None:
+    """The two lists are a partition, not two opinions."""
+    assert not set(rooms_module.ROOM_ERROR_CODES) & set(
+        rooms_module.ROOM_DEVELOPER_ERROR_CODES
+    )
