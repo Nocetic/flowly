@@ -16,8 +16,8 @@ from typing import Any
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-SQLITE_SCHEMA_VERSION = 2
-SQLITE_SUPPORTED_SCHEMA_VERSIONS = (1, 2)
+SQLITE_SCHEMA_VERSION = 3
+SQLITE_SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3)
 SQLITE_APPLICATION_ID = 0x464C5952  # ``FLYR`` — Flowly room store.
 MAX_SQLITE_STORE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ROOM_METADATA_BYTES = 256 * 1024
@@ -216,12 +216,22 @@ class SQLiteRoomStore:
             connection.close()
 
     def _migrate_if_needed(self) -> None:
-        """Bring a v1 database up to the sequenced, retain-on-trim schema.
+        """Bring an older database up to the current schema, one step at a time.
 
-        v1 numbered messages by position and re-derived every number on each
-        write, so the numbers were only meaningful inside one snapshot. They
-        are still a correct total order for the snapshot being migrated, which
-        is exactly what makes them usable as the initial sequences here.
+        Steps are applied in order from whatever version is on disk, so a
+        database that skipped a release still arrives here correctly. The
+        alternative — one branch per source version — needs a new branch for
+        every pair and gets one of them wrong eventually.
+
+        v1 → v2 gave messages durable sequences. v1 numbered them by position
+        and re-derived every number on each write, so the numbers were only
+        meaningful inside one snapshot; they are still a correct total order
+        for the snapshot being migrated, which is what makes them usable as
+        the initial sequences.
+
+        v2 → v3 added the per-room usage meter. Nothing reads it before it is
+        written, so the column arrives null and every room simply starts
+        counting from its next turn.
         """
         connection = self._connect(self.path, journal_mode="WAL")
         try:
@@ -237,39 +247,24 @@ class SQLiteRoomStore:
         with self._migration_lock():
             connection = self._connect(self.path, journal_mode="WAL")
             try:
-                if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 1:
+                # Re-read under the lock: another process may have finished
+                # the whole chain while this one waited for it.
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                if version >= SQLITE_SCHEMA_VERSION:
                     return
                 connection.execute("PRAGMA foreign_keys = OFF")
-                connection.execute("BEGIN IMMEDIATE")
-                connection.executescript(
-                    """
-                    ALTER TABLE rooms ADD COLUMN next_seq INTEGER NOT NULL DEFAULT 0;
-                    CREATE TABLE room_messages_v2 (
-                        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-                        seq INTEGER NOT NULL,
-                        message_id TEXT NOT NULL,
-                        payload_json TEXT NOT NULL,
-                        trimmed INTEGER NOT NULL DEFAULT 0,
-                        PRIMARY KEY (room_id, seq),
-                        UNIQUE (room_id, message_id)
-                    ) WITHOUT ROWID;
-                    INSERT INTO room_messages_v2(
-                        room_id, seq, message_id, payload_json, trimmed
-                    )
-                    SELECT room_id, ordinal, message_id, payload_json, 0
-                    FROM room_messages;
-                    DROP TABLE room_messages;
-                    ALTER TABLE room_messages_v2 RENAME TO room_messages;
-                    CREATE INDEX room_messages_id_idx ON room_messages(message_id);
-                    CREATE INDEX room_messages_live_idx
-                        ON room_messages(room_id, trimmed, seq);
-                    UPDATE rooms SET next_seq = COALESCE(
-                        (SELECT MAX(seq) + 1 FROM room_messages
-                         WHERE room_messages.room_id = rooms.id), 0
-                    );
-                    """
-                )
-                connection.execute(f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION}")
+                # Each step stamps its own version before the next begins.
+                # ``executescript`` commits whatever is open before it runs, so
+                # a chain cannot be one transaction however it is written — and
+                # a crash between two steps must not leave finished work behind
+                # an unchanged version number, where the next attempt would
+                # replay it and fail on a column that already exists.
+                for target, upgrade in (
+                    (2, self._upgrade_to_v2), (3, self._upgrade_to_v3),
+                ):
+                    if version < target:
+                        upgrade(connection)
+                        connection.execute(f"PRAGMA user_version = {target}")
                 connection.commit()
             except sqlite3.Error as exc:
                 try:
@@ -282,6 +277,43 @@ class SQLiteRoomStore:
             finally:
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.close()
+
+    @staticmethod
+    def _upgrade_to_v3(connection: sqlite3.Connection) -> None:
+        """Add the per-room usage meter. Null until the room's next turn."""
+        connection.execute("ALTER TABLE rooms ADD COLUMN usage_json TEXT")
+
+    @staticmethod
+    def _upgrade_to_v2(connection: sqlite3.Connection) -> None:
+        """Give messages sequences that outlive the snapshot they came from."""
+        connection.executescript(
+            """
+            ALTER TABLE rooms ADD COLUMN next_seq INTEGER NOT NULL DEFAULT 0;
+            CREATE TABLE room_messages_v2 (
+                room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                trimmed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (room_id, seq),
+                UNIQUE (room_id, message_id)
+            ) WITHOUT ROWID;
+            INSERT INTO room_messages_v2(
+                room_id, seq, message_id, payload_json, trimmed
+            )
+            SELECT room_id, ordinal, message_id, payload_json, 0
+            FROM room_messages;
+            DROP TABLE room_messages;
+            ALTER TABLE room_messages_v2 RENAME TO room_messages;
+            CREATE INDEX room_messages_id_idx ON room_messages(message_id);
+            CREATE INDEX room_messages_live_idx
+                ON room_messages(room_id, trimmed, seq);
+            UPDATE rooms SET next_seq = COALESCE(
+                (SELECT MAX(seq) + 1 FROM room_messages
+                 WHERE room_messages.room_id = rooms.id), 0
+            );
+            """
+        )
 
     def initialize_verified(
         self,
@@ -481,7 +513,7 @@ class SQLiteRoomStore:
             rows = connection.execute(
                 """
                 SELECT id, title, mode, members_json, watermarks_json, run_json,
-                       created_at, updated_at, next_seq
+                       created_at, updated_at, next_seq, usage_json
                 FROM rooms
                 ORDER BY updated_at DESC, id ASC
                 """
@@ -542,6 +574,8 @@ class SQLiteRoomStore:
                 }
                 if row[5] is not None:
                     room["run"] = json.loads(row[5])
+                if row[9] is not None:
+                    room["usage"] = json.loads(row[9])
                 rooms.append(room)
             return LoadedRoomStore(rooms=rooms, revision=revision)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -596,7 +630,8 @@ class SQLiteRoomStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 row_revision INTEGER NOT NULL,
-                next_seq INTEGER NOT NULL DEFAULT 0
+                next_seq INTEGER NOT NULL DEFAULT 0,
+                usage_json TEXT
             ) WITHOUT ROWID;
             CREATE TABLE room_messages (
                 room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -650,14 +685,16 @@ class SQLiteRoomStore:
         if metadata_size > MAX_ROOM_METADATA_BYTES:
             raise RoomStoreLimitError("A group record exceeds its safe size limit.")
         room_id = str(room["id"])
+        usage = room.get("usage")
+        usage_json = self._json(usage) if isinstance(usage, dict) else None
         messages = list(room.get("messages", []))
         next_seq = _room_next_seq(room, messages)
         connection.execute(
             """
             INSERT INTO rooms(
                 id, title, mode, members_json, watermarks_json, run_json,
-                created_at, updated_at, row_revision, next_seq
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, row_revision, next_seq, usage_json
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 mode = excluded.mode,
@@ -667,7 +704,8 @@ class SQLiteRoomStore:
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at,
                 row_revision = excluded.row_revision,
-                next_seq = MAX(rooms.next_seq, excluded.next_seq)
+                next_seq = MAX(rooms.next_seq, excluded.next_seq),
+                usage_json = excluded.usage_json
             """,
             (
                 room_id,
@@ -680,6 +718,7 @@ class SQLiteRoomStore:
                 str(room["updatedAt"]),
                 row_revision,
                 next_seq,
+                usage_json,
             ),
         )
         # Only the live window is rewritten, and only where it actually

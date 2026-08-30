@@ -75,6 +75,24 @@ _MEDIA_READ_CHUNK_BYTES = 1024 * 1024
 #: attachment's life is the life of the message carrying it, which no clock can
 #: infer. See ``flowly.media.retention.prune_media(owned_elsewhere=…)``.
 GROUP_MEDIA_PREFIX = "group-"
+# Per-member usage rows one room keeps. A room holds six members at a time,
+# so this is headroom for a roster that churns rather than a policy anybody
+# should feel. Room-wide totals are counted separately and never capped, so a
+# room's cost stays complete even once its breakdown stops taking new names.
+_MAX_USAGE_MEMBERS = 24
+# Cumulative counters saturate instead of overflowing. These numbers cross the
+# wire as JSON and land in a browser and a phone, where they become doubles —
+# staying inside 2**53 keeps a total that the other side can still add up.
+_MAX_USAGE_TOKENS = 2**53 - 1
+# Room-side name ← the provider dialect the terminal frame speaks. Kept as one
+# table so the fold, the validator, and the projection cannot drift apart.
+_USAGE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("inputTokens", "prompt_tokens"),
+    ("outputTokens", "completion_tokens"),
+    ("cacheReadTokens", "cache_read_tokens"),
+    ("cacheWriteTokens", "cache_write_tokens"),
+)
+_MAX_USAGE_MODEL_CHARS = 200
 _MAX_COUNCIL_ROUNDS = 3
 _MAX_COUNCIL_TURNS = 10
 _MEMBER_TIMEOUT_SECONDS = 600.0
@@ -527,6 +545,106 @@ def _durable_attachment(value: Any) -> dict[str, Any]:
     return clean
 
 
+def _usage_int(value: Any) -> int:
+    """One stored counter, or zero. Never raises, never negative."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return min(value, _MAX_USAGE_TOKENS)
+
+
+def _empty_usage() -> dict[str, Any]:
+    return {"turns": 0, "members": {}, **{name: 0 for name, _wire in _USAGE_FIELDS}}
+
+
+def _terminal_usage(terminal: Any) -> tuple[dict[str, int], str] | None:
+    """The token counts a member's final frame carried, if it carried any.
+
+    The frame arrives in the provider's dialect (``prompt_tokens``) because it
+    is forwarded verbatim from the gateway, while a room speaks camelCase
+    everywhere else. ``prompt_tokens`` INCLUDES whatever came from cache — the
+    provider adapter is explicit about this — so the two land side by side
+    rather than summed, and pricing subtracts one from the other. A frame with
+    nothing but zeros folds nothing: it means the provider stayed silent, not
+    that a turn was free.
+    """
+    if not isinstance(terminal, dict):
+        return None
+    raw = terminal.get("usage")
+    if not isinstance(raw, dict):
+        return None
+    counts = {name: _usage_int(raw.get(wire)) for name, wire in _USAGE_FIELDS}
+    if not any(counts.values()):
+        return None
+    model = terminal.get("model")
+    return counts, model[:_MAX_USAGE_MODEL_CHARS] if isinstance(model, str) else ""
+
+
+def _load_usage(value: Any) -> dict[str, Any]:
+    """Read a room's stored usage. Never raises.
+
+    Every other loader here refuses a malformed record, and rightly — a
+    transcript that cannot be trusted must not be shown. A cost meter is not
+    that. Nothing about a group depends on it, so a counter that will not
+    parse restarts at zero rather than making an intact room unopenable.
+    """
+    usage = _empty_usage()
+    if not isinstance(value, dict):
+        return usage
+    usage["turns"] = _usage_int(value.get("turns"))
+    for name, _wire in _USAGE_FIELDS:
+        usage[name] = _usage_int(value.get(name))
+    members = value.get("members")
+    if isinstance(members, dict):
+        for profile, raw in list(members.items())[:_MAX_USAGE_MEMBERS]:
+            if not isinstance(profile, str) or not _PROFILE_RE.match(profile):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            model = raw.get("model")
+            usage["members"][profile] = {
+                "calls": _usage_int(raw.get("calls")),
+                "model": model[:_MAX_USAGE_MODEL_CHARS] if isinstance(model, str) else "",
+                **{name: _usage_int(raw.get(name)) for name, _wire in _USAGE_FIELDS},
+            }
+    return usage
+
+
+def _model_cost(model: str, row: dict[str, Any]) -> float | None:
+    """USD for one member's tokens, or ``None`` when the model has no price.
+
+    Cached input is billed at the cache price when the catalogue quotes one
+    and at the input price when it does not — no quote is not a discount, and
+    an estimate that stays high is the safe direction to be wrong in. The
+    arithmetic deliberately mirrors the TUI's per-turn estimate: two surfaces
+    describing the same conversation must not disagree about what it cost.
+
+    The catalogue is a cache that may be cold, which is exactly why nothing
+    here is ever stored. An unpriced room becomes priced the moment the
+    catalogue warms, without a single stored number changing.
+    """
+    if not model:
+        return None
+    try:
+        from flowly.integrations.model_catalog import (
+            get_cache_read_pricing,
+            get_pricing,
+        )
+        pricing = get_pricing(model)
+        cache_price = get_cache_read_pricing(model)
+    except Exception:
+        return None
+    if pricing is None:
+        return None
+    price_in, price_out = pricing
+    total_input = _usage_int(row.get("inputTokens"))
+    cached = min(_usage_int(row.get("cacheReadTokens")), total_input)
+    return (
+        (total_input - cached) * (price_in or 0)
+        + cached * ((price_in or 0) if cache_price is None else cache_price)
+        + _usage_int(row.get("outputTokens")) * (price_out or 0)
+    ) / 1_000_000
+
+
 class ProfileRoomService:
     def __init__(
         self,
@@ -830,6 +948,14 @@ class ProfileRoomService:
                 "model": "retain-beyond-window",
                 "liveWindow": _MAX_MESSAGES,
                 "durableHistory": True,
+            },
+            # Tokens are counted for every room; money appears only when the
+            # model catalogue can price the models involved, so a client must
+            # be ready to render a room that reports tokens and no cost.
+            "usage": {
+                "tokens": True,
+                "cost": "catalog-priced",
+                "memberBreakdown": _MAX_USAGE_MEMBERS,
             },
             "roomEvents": ["full-v1", "delta-v1"],
             "storage": "sqlite-wal",
@@ -1150,7 +1276,7 @@ class ProfileRoomService:
             "mode": clean_mode,
             "messages": [], "watermarks": {member: 0 for member in clean_members},
             "createdAt": timestamp, "updatedAt": timestamp,
-            "nextSeq": 0, "trimmedCount": 0,
+            "nextSeq": 0, "trimmedCount": 0, "usage": _empty_usage(),
         }
         self._rooms[room_id] = room
         try:
@@ -2164,16 +2290,67 @@ class ProfileRoomService:
                 "error": "",
             })
             member.pop("attention", None)
+        # Folded whether or not the reply was substantive: a member that
+        # answered "(pass)" still spent the tokens it took to decide that.
+        undo_usage = self._fold_usage(room, profile, terminal)
         room["updatedAt"] = _now()
         try:
             await self._persist()
         except Exception:
             if message is not None and message in room["messages"]:
                 room["messages"].remove(message)
+            if undo_usage is not None:
+                room["usage"] = undo_usage
             for path in created_media:
                 path.unlink(missing_ok=True)
             raise
         return response if substantive else ""
+
+    @staticmethod
+    def _fold_usage(
+        room: dict[str, Any], profile: str, terminal: Any
+    ) -> dict[str, Any] | None:
+        """Add one member turn's tokens to the room's running totals.
+
+        Returns what to put back should the commit that follows not land, or
+        ``None`` when the frame carried nothing to fold — a counter that
+        counted a turn the transcript then rejected would drift for good,
+        because nothing ever recomputes it from the messages.
+
+        When the breakdown is full the room totals still take the tokens. A
+        cost that stops being complete is worse than a breakdown that stops
+        naming everybody, and the projection says which of the two happened.
+        """
+        read = _terminal_usage(terminal)
+        if read is None:
+            return None
+        counts, model = read
+        usage = room.get("usage")
+        if not isinstance(usage, dict):
+            usage = _empty_usage()
+            room["usage"] = usage
+        undo = {
+            **usage,
+            "members": {name: dict(row) for name, row in usage["members"].items()},
+        }
+        usage["turns"] = min(usage["turns"] + 1, _MAX_USAGE_TOKENS)
+        for name, _wire in _USAGE_FIELDS:
+            usage[name] = min(usage[name] + counts[name], _MAX_USAGE_TOKENS)
+        row = usage["members"].get(profile)
+        if row is None:
+            if len(usage["members"]) >= _MAX_USAGE_MEMBERS:
+                return undo
+            row = {
+                "calls": 0, "model": "",
+                **{name: 0 for name, _wire in _USAGE_FIELDS},
+            }
+            usage["members"][profile] = row
+        row["calls"] = min(row["calls"] + 1, _MAX_USAGE_TOKENS)
+        for name, _wire in _USAGE_FIELDS:
+            row[name] = min(row[name] + counts[name], _MAX_USAGE_TOKENS)
+        if model:
+            row["model"] = model
+        return undo
 
     async def _set_member_readiness(
         self,
@@ -2491,6 +2668,7 @@ class ProfileRoomService:
             "watermarks": watermarks,
             "createdAt": created_at,
             "updatedAt": updated_at,
+            "usage": _load_usage(value.get("usage")),
         }
         # An import carries positions, not sequences. Position is a correct
         # total order for the snapshot being imported, so it seeds the room's
@@ -2571,6 +2749,7 @@ class ProfileRoomService:
             "needsUser": bool(attentions) or self._needs_user(room),
             "attentions": attentions,
             "runState": self._public_run(room),
+            "usage": self._public_usage(room),
             "readiness": {
                 profile: {
                     "state": str(value.get("state") or "idle"),
@@ -2603,6 +2782,60 @@ class ProfileRoomService:
             if isinstance(message.get("durationMs"), int):
                 summary["durationMs"] = message["durationMs"]
         return summary
+
+    @staticmethod
+    def _public_usage(room: dict[str, Any]) -> dict[str, Any] | None:
+        """What this room has spent, priced at the moment somebody asks.
+
+        ``None`` until a turn has actually been counted, so a new group shows
+        nothing rather than a confident zero.
+
+        ``costUsd`` appears only when at least one member could be priced, and
+        ``costPartial`` says the figure is a floor rather than a total —
+        either because a member's model has no catalogue price, or because the
+        breakdown filled up and some tokens are in the room totals without a
+        name attached. A number that quietly means "some of it" is worse than
+        no number; one that says so is useful.
+        """
+        usage = room.get("usage")
+        if not isinstance(usage, dict) or not _usage_int(usage.get("turns")):
+            return None
+        rows = usage.get("members")
+        rows = rows if isinstance(rows, dict) else {}
+        members: list[dict[str, Any]] = []
+        total = 0.0
+        named_input = 0
+        priced_every_member = True
+        for profile in sorted(rows):
+            row = rows[profile]
+            if not isinstance(row, dict):
+                continue
+            model = str(row.get("model") or "")
+            entry: dict[str, Any] = {
+                "profile": profile,
+                "model": model,
+                "calls": _usage_int(row.get("calls")),
+                **{name: _usage_int(row.get(name)) for name, _wire in _USAGE_FIELDS},
+            }
+            named_input += entry["inputTokens"]
+            cost = _model_cost(model, row)
+            if cost is None:
+                priced_every_member = False
+            else:
+                entry["costUsd"] = round(cost, 6)
+                total += cost
+            members.append(entry)
+        result: dict[str, Any] = {
+            "turns": _usage_int(usage.get("turns")),
+            **{name: _usage_int(usage.get(name)) for name, _wire in _USAGE_FIELDS},
+            "members": members,
+        }
+        if any("costUsd" in entry for entry in members):
+            result["costUsd"] = round(total, 6)
+            result["costPartial"] = (
+                not priced_every_member or named_input < result["inputTokens"]
+            )
+        return result
 
     @staticmethod
     def _public_run(room: dict[str, Any]) -> dict[str, Any] | None:
@@ -3084,6 +3317,7 @@ class ProfileRoomService:
                     },
                     "createdAt": self._timestamp(room.get("createdAt")),
                     "updatedAt": self._timestamp(room.get("updatedAt")),
+                    "usage": _load_usage(room.get("usage")),
                 }
                 # A room's sequence space and its trimmed count describe
                 # history the live window no longer holds. Dropping them

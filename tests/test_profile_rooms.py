@@ -2300,3 +2300,214 @@ async def test_the_media_sweep_takes_only_one_turn(tmp_path: Path) -> None:
     _seed_media(service, later)
     assert await service.retire_orphaned_media() == 0
     assert {path.name for path in media.iterdir()} == {later}
+
+
+# ── what a group has spent ──────────────────────────────────────────────────
+
+
+def _terminal(*, prompt=0, completion=0, cache_read=0, cache_write=0, model="m/one"):
+    """A member's final frame, shaped the way the gateway forwards it."""
+    return {
+        "state": "final",
+        "model": model,
+        "message": {"content": [{"type": "text", "text": "done"}]},
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+        },
+    }
+
+
+def _priced(model="m/one", *, pricing_in=10.0, pricing_out=20.0, cache=1.0):
+    from flowly.integrations import model_catalog as mc
+    from flowly.integrations.model_catalog import Model
+
+    mc._CACHE["rooms-test"] = [Model(
+        id=model, name=model, pricing_in=pricing_in,
+        pricing_out=pricing_out, pricing_cache_read=cache,
+    )]
+
+
+def _unprice():
+    from flowly.integrations import model_catalog as mc
+
+    mc._CACHE.pop("rooms-test", None)
+
+
+@pytest.mark.asyncio
+async def test_a_group_counts_what_each_member_spent(tmp_path: Path) -> None:
+    """Tokens are stored per member; the model comes from the same frame."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+
+    service._fold_usage(durable, "writer", _terminal(prompt=1_000, completion=100))
+    service._fold_usage(durable, "writer", _terminal(prompt=500, completion=50))
+    service._fold_usage(durable, "default", _terminal(prompt=200, completion=20))
+
+    usage = durable["usage"]
+    assert usage["turns"] == 3
+    assert usage["inputTokens"] == 1_700
+    assert usage["outputTokens"] == 170
+    assert usage["members"]["writer"] == {
+        "calls": 2, "model": "m/one", "inputTokens": 1_500,
+        "outputTokens": 150, "cacheReadTokens": 0, "cacheWriteTokens": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_frame_without_usage_counts_nothing(tmp_path: Path) -> None:
+    """All-zero means the provider stayed silent, not that a turn was free —
+    counting it would inflate the turn count with turns nobody can price."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+
+    assert service._fold_usage(durable, "writer", {"state": "final"}) is None
+    assert service._fold_usage(durable, "writer", _terminal()) is None
+    assert durable["usage"]["turns"] == 0
+    assert service._public_usage(durable) is None
+
+
+@pytest.mark.asyncio
+async def test_a_room_is_priced_when_asked_not_when_counted(tmp_path: Path) -> None:
+    """The catalogue is a cache that can be cold when a turn lands and warm an
+    hour later. Nothing about the stored room changes in between."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+    service._fold_usage(
+        durable, "writer", _terminal(prompt=1_000_000, completion=0, cache_read=800_000)
+    )
+
+    _unprice()
+    cold = service._public_usage(durable)
+    assert cold is not None and "costUsd" not in cold
+    assert cold["inputTokens"] == 1_000_000       # tokens are reported regardless
+
+    try:
+        _priced()
+        warm = service._public_usage(durable)
+        # 200K fresh @ $10 + 800K cached @ $1 = $2.00 + $0.80
+        assert warm["costUsd"] == pytest.approx(2.80)
+        assert warm["costPartial"] is False
+        assert warm["members"][0]["costUsd"] == pytest.approx(2.80)
+    finally:
+        _unprice()
+
+
+@pytest.mark.asyncio
+async def test_one_unpriced_member_makes_the_total_a_floor(tmp_path: Path) -> None:
+    """A partial total that says so beats both a wrong total and no total."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+    service._fold_usage(durable, "writer", _terminal(prompt=1_000, model="m/one"))
+    service._fold_usage(durable, "default", _terminal(prompt=1_000, model="m/unknown"))
+
+    try:
+        _priced()
+        usage = service._public_usage(durable)
+        assert usage["costUsd"] == pytest.approx(1_000 * 10.0 / 1_000_000)
+        assert usage["costPartial"] is True
+    finally:
+        _unprice()
+
+
+@pytest.mark.asyncio
+async def test_a_full_breakdown_still_counts_the_room_total(tmp_path: Path) -> None:
+    """A cost that stops being complete is worse than a breakdown that stops
+    naming everybody — and the projection has to admit which happened."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    durable = service._rooms[room["id"]]
+    for index in range(rooms_module._MAX_USAGE_MEMBERS):
+        service._fold_usage(durable, f"bot{index}", _terminal(prompt=100))
+    service._fold_usage(durable, "latecomer", _terminal(prompt=100))
+
+    assert len(durable["usage"]["members"]) == rooms_module._MAX_USAGE_MEMBERS
+    assert "latecomer" not in durable["usage"]["members"]
+    assert durable["usage"]["inputTokens"] == 2_500      # every turn counted
+    try:
+        _priced()
+        assert service._public_usage(durable)["costPartial"] is True
+    finally:
+        _unprice()
+
+
+@pytest.mark.asyncio
+async def test_a_meter_survives_a_reload(tmp_path: Path) -> None:
+    """The counter is durable, so it is the room's life and not the process's."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    service._fold_usage(
+        service._rooms[room["id"]], "writer", _terminal(prompt=1_234, completion=56)
+    )
+    await service._persist()
+
+    reloaded = _room_service(tmp_path, calls)
+    listed = await reloaded.list(include_messages=False)
+    usage = listed[0]["usage"]
+    assert usage["turns"] == 1
+    assert usage["inputTokens"] == 1_234
+    assert usage["members"][0]["profile"] == "writer"
+
+
+@pytest.mark.asyncio
+async def test_a_broken_meter_never_costs_a_room(tmp_path: Path) -> None:
+    """Every other loader refuses a malformed record, and rightly. A cost
+    meter is not one: nothing depends on it, so it restarts at zero rather
+    than making an intact transcript unopenable."""
+    calls: list = []
+    service = _room_service(tmp_path, calls)
+    room = await service.create("Council", ["default", "writer"])
+    service._fold_usage(service._rooms[room["id"]], "writer", _terminal(prompt=10))
+    await service._persist()
+
+    path = _sqlite_path(tmp_path / "rooms.json")
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE rooms SET usage_json = ?", ('{"turns": "lots"}',))
+
+    reloaded = _room_service(tmp_path, calls)
+    listed = await reloaded.list(include_messages=False)
+    assert listed[0]["title"] == "Council"          # the room still opens
+    assert listed[0]["usage"] is None               # the meter simply restarts
+
+
+def test_the_store_upgrades_a_v2_database_in_place(tmp_path: Path) -> None:
+    """A database that predates the meter gains the column and keeps its
+    rooms. The chain applies steps in order, so a v1 install that skipped a
+    release still lands on the current schema."""
+    path = tmp_path / "rooms.sqlite3"
+    store = SQLiteRoomStore(path)
+    room_id = "0f8fad5b-d9cb-469f-a165-70867728950e"
+    store.initialize_verified({room_id: {
+        "id": room_id, "title": "Old",
+        "mode": "panel", "members": ["default"], "watermarks": {"default": 0},
+        "messages": [], "createdAt": "2026-08-01T00:00:00.000Z",
+        "updatedAt": "2026-08-01T00:00:00.000Z",
+    }})
+    # Pose as the previous schema, column and all.
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE rooms DROP COLUMN usage_json")
+        connection.execute("PRAGMA user_version = 2")
+
+    loaded = store.load()
+
+    assert [room["title"] for room in loaded.rooms] == ["Old"]
+    with sqlite3.connect(path) as connection:
+        assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == (
+            SQLITE_SCHEMA_VERSION
+        )
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(rooms)")
+        }
+    assert "usage_json" in columns
