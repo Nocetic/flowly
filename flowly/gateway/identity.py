@@ -27,6 +27,16 @@ GATEWAY_SERVICE_ID = "ai.flowly.gateway"
 #: it looks like an answer.
 VALID_OWNERS = ("desktop", "cli", "manual")
 
+#: Where Desktop keeps its bundled runtime. macOS wraps it in a sub-bundle;
+#: Windows and Linux ship it loose under the app's resources, and on neither
+#: of those does Desktop set the environment variable — the macOS service
+#: manager is the only thing that does. Without these markers a packaged
+#: Desktop runtime on Windows or Linux would be described as something else.
+_DESKTOP_MARKERS = (
+    ".app/contents/",
+    "/resources/flowly-runtime/",
+)
+
 #: Where a CLI installation puts its executables. Mirrors the classification
 #: Desktop applies to a process command line, so the two agree about the same
 #: process whichever way it is asked.
@@ -37,6 +47,9 @@ _CLI_MARKERS = (
     "/.local/",
     "/usr/local/bin/",
     "/opt/homebrew/bin/",
+    # Windows keeps a virtual environment's executables here; the separator is
+    # normalised before matching, so one spelling covers every platform.
+    "/appdata/roaming/uv/",
 )
 
 
@@ -71,14 +84,23 @@ def runtime_owner(
         return declared
 
     path = (executable if executable is not None else sys.argv[0] or sys.executable) or ""
-    lowered = path.lower()
+    # Windows spells the same path with backslashes. Normalising once means the
+    # markers are written a single way instead of twice, and a Windows CLI
+    # install stops reading as something hand-started.
+    lowered = path.replace("\\", "/").lower()
     if not lowered:
         return None
-    if ".app/contents/" in lowered:
+    if any(marker in lowered for marker in _DESKTOP_MARKERS):
         return "desktop"
     if any(marker in lowered for marker in _CLI_MARKERS):
         return "cli"
-    return "manual"
+    # Deliberately not "manual". From in here an unrecognised path is a layout
+    # this build has not been taught, which is not the same thing as somebody
+    # running the gateway by hand — and Desktop treats "manual" as eligible for
+    # takeover, so guessing it could have Desktop offering to take over its own
+    # gateway on a platform whose layout was missing. Saying nothing leaves the
+    # reader with its own classification, which knows where it put things.
+    return None
 
 
 def gateway_version() -> str | None:

@@ -40,15 +40,48 @@ def test_a_declared_owner_nobody_understands_is_not_passed_on():
     assert runtime_owner(env={"FLOWLY_SERVICE_OWNER": ""}, executable="/x/.venv/bin/flowly") == "cli"
 
 
-def test_the_path_says_the_rest():
+def test_the_path_says_the_rest_on_macos():
     assert runtime_owner(env={}, executable="/Applications/Flowly.app/Contents/MacOS/flowly-agent") == "desktop"
     assert runtime_owner(env={}, executable="/Users/x/.local/bin/flowly") == "cli"
     assert runtime_owner(env={}, executable="/Users/x/.local/share/uv/tools/flowly-ai/bin/flowly") == "cli"
     assert runtime_owner(env={}, executable="/opt/homebrew/bin/flowly") == "cli"
     assert runtime_owner(env={}, executable="/Users/x/repo/.venv/bin/flowly") == "cli"
-    # Anything else is somebody running it by hand, which is a real state
-    # Desktop shows differently from an installation.
-    assert runtime_owner(env={}, executable="/tmp/build/flowly") == "manual"
+
+
+def test_windows_paths_are_read_the_same_way():
+    """Only the macOS service manager sets the environment variable.
+
+    On Windows the path is the whole answer, and it is spelled with
+    backslashes — which the POSIX-shaped markers would have missed, describing
+    an ordinary CLI install as something hand-started.
+    """
+    assert runtime_owner(
+        env={}, executable=r"C:\Users\x\AppData\Roaming\Flowly\resources\flowly-runtime\flowly-bin.exe"
+    ) == "desktop"
+    assert runtime_owner(env={}, executable=r"C:\proj\.venv\Scripts\flowly.exe") == "cli"
+    assert runtime_owner(
+        env={}, executable=r"C:\Users\x\AppData\Roaming\uv\tools\flowly-ai\Scripts\flowly.exe"
+    ) == "cli"
+
+
+def test_linux_paths_are_read_the_same_way():
+    # Desktop ships the runtime loose under its resources here, with no
+    # sub-bundle to recognise it by.
+    assert runtime_owner(env={}, executable="/opt/Flowly/resources/flowly-runtime/flowly-bin") == "desktop"
+    assert runtime_owner(env={}, executable="/home/x/.local/bin/flowly") == "cli"
+    assert runtime_owner(env={}, executable="/usr/local/bin/flowly") == "cli"
+
+
+def test_an_unrecognised_layout_says_nothing_rather_than_manual():
+    """"Manual" is a claim, and from in here an unverifiable one.
+
+    A path this build has not been taught is not the same thing as somebody
+    running the gateway by hand — and Desktop treats "manual" as eligible for
+    takeover, so guessing it could have Desktop offering to take over its own
+    gateway on a platform whose layout was simply missing here.
+    """
+    assert runtime_owner(env={}, executable="/tmp/build/flowly") is None
+    assert runtime_owner(env={}, executable=r"D:\somewhere\flowly.exe") is None
 
 
 def test_nothing_is_claimed_when_there_is_nothing_to_go_on():
@@ -59,7 +92,8 @@ def test_owner_is_always_a_word_the_reader_accepts():
     for executable in (
         "/Applications/Flowly.app/Contents/MacOS/flowly-agent",
         "/Users/x/.local/bin/flowly",
-        "/tmp/build/flowly",
+        "/opt/Flowly/resources/flowly-runtime/flowly-bin",
+        r"C:\proj\.venv\Scripts\flowly.exe",
     ):
         assert runtime_owner(env={}, executable=executable) in VALID_OWNERS
 
