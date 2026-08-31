@@ -13,6 +13,11 @@ Flowly is a full agent, not just a chat box. These features work together across
 - **[Memory](memory.md)** — durable, self-maintaining notes plus a searchable index; it learns across sessions ("dreaming") and queues uncertain facts for your review.
 - **[Knowledge graph](knowledge-graph.md)** — a temporal store of entities and facts.
 
+## More than one agent
+
+- **[Bots](bots.md)** — separate agents on one machine, each with its own keys, memory, skills and permissions. Nothing one learns reaches another.
+- **[Bot groups](bot-groups.md)** — two to six bots in one conversation, with per-member control over who answers and who waits to be called.
+
 ## Automation
 
 - **[Standing goals](goals.md)** — an objective the agent keeps working toward across turns, judged after every turn.

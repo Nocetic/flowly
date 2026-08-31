@@ -13,6 +13,9 @@ Under the hood there is exactly one mechanism: the `FLOWLY_HOME` directory. Ever
 > [!NOTE]
 > Profiles are about **isolation on one machine**, not multi-user accounts. Each profile is its own data directory; they never read each other's config, keys, sessions, or memory.
 
+> [!TIP]
+> This is the same mechanism Desktop and iOS present as **[Bots](/docs/features/bots)** — named, coloured agents you can talk to and put in [groups](/docs/features/bot-groups). The CLI selects between them with `--profile`; the apps show them as bots. One mechanism, two ways of looking at it.
+
 ## Default vs named profiles
 
 There are two kinds of profile:
