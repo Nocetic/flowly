@@ -49,8 +49,15 @@ Every bot gets its own directory under `~/.flowly/profiles/<name>/`, holding:
 | `audit/` | What it did, recorded |
 | `logs/`, `trajectories/`, `subagents/`, `screenshots/`, `media/`, `cron/` | Its runtime state, files and schedules |
 
+Its settings, its search index, its memory store and its knowledge graph sit
+alongside those as files in the same directory.
+
 Nothing in that list is shared. Two bots on the same machine cannot read each
 other's conversations, keys or memory.
+
+> [!NOTE]
+> [Profiles](/docs/using-flowly/profiles#whats-isolated-per-profile) carries the
+> full list with the exact path of every file, if you need to find one on disk.
 
 ## Naming
 
