@@ -18,8 +18,8 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 from loguru import logger
 
-SQLITE_SCHEMA_VERSION = 3
-SQLITE_SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3)
+SQLITE_SCHEMA_VERSION = 4
+SQLITE_SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4)
 SQLITE_APPLICATION_ID = 0x464C5952  # ``FLYR`` — Flowly room store.
 MAX_SQLITE_STORE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ROOM_METADATA_BYTES = 256 * 1024
@@ -263,6 +263,7 @@ class SQLiteRoomStore:
                 # replay it and fail on a column that already exists.
                 for target, upgrade in (
                     (2, self._upgrade_to_v2), (3, self._upgrade_to_v3),
+                    (4, self._upgrade_to_v4),
                 ):
                     if version < target:
                         upgrade(connection)
@@ -279,6 +280,11 @@ class SQLiteRoomStore:
             finally:
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.close()
+
+    @staticmethod
+    def _upgrade_to_v4(connection: sqlite3.Connection) -> None:
+        """Add per-member reply policies. Null means every member answers."""
+        connection.execute("ALTER TABLE rooms ADD COLUMN member_policies_json TEXT")
 
     @staticmethod
     def _upgrade_to_v3(connection: sqlite3.Connection) -> None:
@@ -606,7 +612,8 @@ class SQLiteRoomStore:
             rows = connection.execute(
                 """
                 SELECT id, title, mode, members_json, watermarks_json, run_json,
-                       created_at, updated_at, next_seq, usage_json
+                       created_at, updated_at, next_seq, usage_json,
+                       member_policies_json
                 FROM rooms
                 ORDER BY updated_at DESC, id ASC
                 """
@@ -669,6 +676,8 @@ class SQLiteRoomStore:
                     room["run"] = json.loads(row[5])
                 if row[9] is not None:
                     room["usage"] = json.loads(row[9])
+                if row[10] is not None:
+                    room["memberPolicies"] = json.loads(row[10])
                 rooms.append(room)
             return LoadedRoomStore(rooms=rooms, revision=revision)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -724,7 +733,8 @@ class SQLiteRoomStore:
                 updated_at TEXT NOT NULL,
                 row_revision INTEGER NOT NULL,
                 next_seq INTEGER NOT NULL DEFAULT 0,
-                usage_json TEXT
+                usage_json TEXT,
+                member_policies_json TEXT
             ) WITHOUT ROWID;
             CREATE TABLE room_messages (
                 room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -771,9 +781,13 @@ class SQLiteRoomStore:
         watermarks_json = self._json(room.get("watermarks", {}))
         run = room.get("run")
         run_json = self._json(run) if isinstance(run, dict) else None
+        policies = room.get("memberPolicies")
+        policies_json = self._json(policies) if isinstance(policies, dict) else None
         metadata_size = sum(
             len(value.encode("utf-8"))
-            for value in (members_json, watermarks_json, run_json or "")
+            for value in (
+                members_json, watermarks_json, run_json or "", policies_json or ""
+            )
         )
         if metadata_size > MAX_ROOM_METADATA_BYTES:
             raise RoomStoreLimitError("A group record exceeds its safe size limit.")
@@ -786,8 +800,9 @@ class SQLiteRoomStore:
             """
             INSERT INTO rooms(
                 id, title, mode, members_json, watermarks_json, run_json,
-                created_at, updated_at, row_revision, next_seq, usage_json
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, row_revision, next_seq, usage_json,
+                member_policies_json
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 mode = excluded.mode,
@@ -798,7 +813,8 @@ class SQLiteRoomStore:
                 updated_at = excluded.updated_at,
                 row_revision = excluded.row_revision,
                 next_seq = MAX(rooms.next_seq, excluded.next_seq),
-                usage_json = excluded.usage_json
+                usage_json = excluded.usage_json,
+                member_policies_json = excluded.member_policies_json
             """,
             (
                 room_id,
@@ -812,6 +828,7 @@ class SQLiteRoomStore:
                 row_revision,
                 next_seq,
                 usage_json,
+                policies_json,
             ),
         )
         # Only the live window is rewritten, and only where it actually

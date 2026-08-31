@@ -2508,8 +2508,11 @@ def test_the_store_upgrades_a_v2_database_in_place(tmp_path: Path) -> None:
         "messages": [], "createdAt": "2026-08-01T00:00:00.000Z",
         "updatedAt": "2026-08-01T00:00:00.000Z",
     }})
-    # Pose as the previous schema, column and all.
+    # Pose as v2, which had neither column that came after it. Dropping only
+    # one would leave the chain replaying a step onto a column that already
+    # exists — the failure the version stamping exists to prevent.
     with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE rooms DROP COLUMN member_policies_json")
         connection.execute("ALTER TABLE rooms DROP COLUMN usage_json")
         connection.execute("PRAGMA user_version = 2")
 
@@ -2523,7 +2526,7 @@ def test_the_store_upgrades_a_v2_database_in_place(tmp_path: Path) -> None:
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(rooms)")
         }
-    assert "usage_json" in columns
+    assert {"usage_json", "member_policies_json"} <= columns
 
 
 @pytest.mark.asyncio

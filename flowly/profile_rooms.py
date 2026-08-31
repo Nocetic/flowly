@@ -387,6 +387,68 @@ def _project_arguments(name: str, raw: Any) -> str:
     return json.dumps(projected, ensure_ascii=False, separators=(",", ":"))[:8192]
 
 
+MEMBER_POLICY_ALWAYS = "always"
+MEMBER_POLICY_MENTIONED = "mentioned"
+MEMBER_POLICIES = (MEMBER_POLICY_ALWAYS, MEMBER_POLICY_MENTIONED)
+
+
+def _member_policies(members: list[str], raw: Any) -> dict[str, str]:
+    """Every member's reply policy, keyed by name — always the full set.
+
+    Lenient by design, and the only place the shape is decided. Four callers
+    have to keep policies agreed with membership (create, update, import, and
+    a profile being deleted out from under a group); each of them getting the
+    pruning right independently is how the two drift apart. Building the map
+    from ``members`` every time makes the agreement structural instead: a
+    policy for somebody who is not in the group cannot survive, and a member
+    without one cannot go missing.
+
+    Anything unrecognised reads as ``always``, which is what a group did
+    before policies existed. A store somebody edited by hand is a group that
+    answers, not a group that fails to open.
+    """
+    source = raw if isinstance(raw, dict) else {}
+    policies: dict[str, str] = {}
+    for member in members:
+        value = source.get(member)
+        policies[member] = (
+            value if isinstance(value, str) and value in MEMBER_POLICIES
+            else MEMBER_POLICY_ALWAYS
+        )
+    return policies
+
+
+def _clean_member_policies(members: list[str], raw: Any) -> dict[str, str]:
+    """What a client sent, refused rather than quietly reinterpreted.
+
+    The lenient reading above is right for data already stored and wrong for
+    a request: a client that sends ``"whenever"`` has a bug, and answering
+    every message instead of saying so hides it. Delegates once validated, so
+    there is still only one place that decides the shape.
+
+    A policy naming somebody who is not a member is not an error — an editor
+    that removes a member and rewrites the policies in one call is doing
+    exactly that, and it means nothing more than the member being gone.
+    """
+    if raw is not None:
+        if not isinstance(raw, dict):
+            raise ProfileHostError(
+                "INVALID_PARAMS", "Group reply settings are invalid."
+            )
+        for key, value in raw.items():
+            if not isinstance(key, str):
+                raise ProfileHostError(
+                    "INVALID_PARAMS", "Group reply settings are invalid."
+                )
+            if key in members and (
+                not isinstance(value, str) or value not in MEMBER_POLICIES
+            ):
+                raise ProfileHostError(
+                    "INVALID_PARAMS", "Group reply settings are invalid."
+                )
+    return _member_policies(members, raw)
+
+
 def _parse_mentions(text: str, members: list[str]) -> tuple[bool, set[str]]:
     aliases: dict[str, str] = {}
     for member in members:
@@ -1015,6 +1077,20 @@ class ProfileRoomService:
                 "cost": "catalog-priced",
                 "memberBreakdown": _MAX_USAGE_MEMBERS,
             },
+            # Who answers an unaddressed message. `always` is the default and
+            # what every group did before this existed, so a client that does
+            # not know the field still describes its groups correctly.
+            "memberPolicies": {
+                "values": list(MEMBER_POLICIES),
+                "default": MEMBER_POLICY_ALWAYS,
+                # An explicit `@everyone` reaches members who are otherwise
+                # only on call.
+                "everyoneOverrides": True,
+                # A group where nobody is `always` records an unaddressed
+                # message and starts no run. Clients should say so rather
+                # than leave somebody waiting for a reply that is not coming.
+                "silentWhenNoneAlways": True,
+            },
             # A client translates by code; this is the list it must cover.
             "errorCodes": list(ROOM_ERROR_CODES),
             "roomEvents": ["full-v1", "delta-v1"],
@@ -1060,12 +1136,14 @@ class ProfileRoomService:
         if method == "profiles.rooms.create":
             return {"room": await self.create(
                 params.get("title"), params.get("members"), params.get("mode"),
+                params.get("memberPolicies"),
                 include_messages=_include_messages(params),
             )}
         if method == "profiles.rooms.update":
             return {"room": await self.update(
                 params.get("roomId"), params.get("title"), params.get("members"),
-                params.get("mode"), include_messages=_include_messages(params),
+                params.get("mode"), params.get("memberPolicies"),
+                include_messages=_include_messages(params),
             )}
         if method == "profiles.rooms.delete":
             await self.delete(params.get("roomId"))
@@ -1323,6 +1401,7 @@ class ProfileRoomService:
         title: Any,
         members: Any,
         mode: Any = None,
+        policies: Any = None,
         *,
         include_messages: bool = True,
     ) -> dict[str, Any]:
@@ -1336,6 +1415,7 @@ class ProfileRoomService:
         room = {
             "id": room_id, "title": clean_title, "members": clean_members,
             "mode": clean_mode,
+            "memberPolicies": _clean_member_policies(clean_members, policies),
             "messages": [], "watermarks": {member: 0 for member in clean_members},
             "createdAt": timestamp, "updatedAt": timestamp,
             "nextSeq": 0, "trimmedCount": 0, "usage": _empty_usage(),
@@ -1356,6 +1436,7 @@ class ProfileRoomService:
         title: Any,
         members: Any,
         mode: Any = None,
+        policies: Any = None,
         *,
         include_messages: bool = True,
     ) -> dict[str, Any]:
@@ -1366,11 +1447,18 @@ class ProfileRoomService:
             raise ProfileHostError("ROOM_BUSY_MEMBERS", "Stop the active group response before changing its members.")
         clean_title, clean_members = self._definition(title, members)
         clean_mode = self._room_mode(mode, default=str(room.get("mode") or "panel"))
+        # A caller that sends no policies is not clearing them: an older
+        # client updating a title must not silently make every member answer
+        # again. Absent means unchanged; the map is rebuilt against the new
+        # membership either way.
+        source = room.get("memberPolicies") if policies is None else policies
+        clean_policies = _clean_member_policies(clean_members, source)
         previous = {
             "title": room["title"],
             "members": list(room["members"]),
             "watermarks": dict(room["watermarks"]),
             "mode": room.get("mode", "panel"),
+            "memberPolicies": dict(room.get("memberPolicies") or {}),
             "updatedAt": room["updatedAt"],
         }
         previous_readiness = {
@@ -1381,6 +1469,7 @@ class ProfileRoomService:
         room["title"] = clean_title
         room["members"] = clean_members
         room["mode"] = clean_mode
+        room["memberPolicies"] = clean_policies
         room["watermarks"] = {
             member: min(int(room["watermarks"].get(member, 0)), len(room["messages"]))
             if member in old_members else 0 for member in clean_members
@@ -1466,9 +1555,19 @@ class ProfileRoomService:
             room_id, clean_attachments
         ) if clean_attachments else ([], [])
         everyone, selected = _parse_mentions(clean, room["members"])
-        responders = list(room["members"]) if everyone or not selected else [
-            member for member in room["members"] if member in selected
-        ]
+        policies = _member_policies(room["members"], room.get("memberPolicies"))
+        if selected and not everyone:
+            responders = [
+                member for member in room["members"] if member in selected
+            ]
+        else:
+            # `@everyone` is an explicit summons and overrides the setting;
+            # a member who only answers when called has just been called.
+            # Without that the word would not mean what it says.
+            responders = [
+                member for member in room["members"]
+                if everyone or policies[member] == MEMBER_POLICY_ALWAYS
+            ]
         previous_messages = list(room["messages"])
         previous_trimmed = int(room.get("trimmedCount", 0))
         previous_watermarks = dict(room["watermarks"])
@@ -1489,11 +1588,20 @@ class ProfileRoomService:
         self._trim(room)
         epoch = self._epochs.get(room_id, 0) + 1
         self._epochs[room_id] = epoch
-        if clean_attachments:
+        if clean_attachments and responders:
             self._pending_attachments[room_id] = (epoch, clean_attachments)
         else:
             self._pending_attachments.pop(room_id, None)
-        self._active[room_id] = set(responders)
+        if responders:
+            self._active[room_id] = set(responders)
+        else:
+            # Nobody answers this one: every member is on call and none was
+            # called. The message is still the group's — it is recorded, and
+            # the next mention will be read with it in view — but no run
+            # opens. Opening one for an empty membership would leave the group
+            # reporting itself as responding with nothing to finish it, and
+            # `_run_room` picks its executor with `responders[0]`.
+            self._active.pop(room_id, None)
         readiness = self._readiness.setdefault(room_id, {})
         for profile in responders:
             if readiness.get(profile, {}).get("state") != "ready":
@@ -1504,7 +1612,7 @@ class ProfileRoomService:
                 }
         boundary = len(room["messages"])
         group_run_id = str(uuid.uuid4())
-        room["run"] = {
+        run_record = {
             "id": group_run_id,
             "mode": str(room.get("mode") or "panel"),
             "state": "running",
@@ -1523,6 +1631,11 @@ class ProfileRoomService:
                 for profile in responders
             },
         }
+        # An unanswered turn leaves the previous run on the record, because
+        # that is the last one that happened. Replacing it with an empty run
+        # would erase what the group actually did.
+        if responders:
+            room["run"] = run_record
         room["updatedAt"] = timestamp
         try:
             await self._persist()
@@ -1552,6 +1665,8 @@ class ProfileRoomService:
             raise
         public = self._public(room)
         await self._emit({"roomId": room_id, "type": "updated", "room": public})
+        if not responders:
+            return self._public(room, include_messages=include_messages)
         runner = self._run_council if room.get("mode") == "council" else self._run_room
         task = asyncio.create_task(
             runner(room_id, epoch, responders, bool(selected and not everyone)),
@@ -1678,6 +1793,9 @@ class ProfileRoomService:
                 retired_rooms.append((room_id, members))
                 continue
             room["members"] = members
+            room["memberPolicies"] = _member_policies(
+                members, room.get("memberPolicies")
+            )
             self._readiness.get(room_id, {}).pop(profile, None)
             room["watermarks"].pop(profile, None)
             room["updatedAt"] = _now()
@@ -2807,6 +2925,9 @@ class ProfileRoomService:
             "title": title,
             "members": members,
             "mode": self._room_mode(value.get("mode")),
+            "memberPolicies": _clean_member_policies(
+                members, value.get("memberPolicies")
+            ),
             "messages": copied_messages,
             "watermarks": watermarks,
             "createdAt": created_at,
@@ -2870,6 +2991,9 @@ class ProfileRoomService:
             "id": room_id,
             "title": room["title"],
             "members": list(room["members"]),
+            "memberPolicies": _member_policies(
+                room["members"], room.get("memberPolicies")
+            ),
             "mode": str(room.get("mode") or "panel"),
             # How many messages the group HAS, which is no longer how many it
             # is carrying: the window bounds residency, not history. A client
@@ -3449,6 +3573,9 @@ class ProfileRoomService:
                     "id": room_id,
                     "title": title,
                     "members": members,
+                    "memberPolicies": _member_policies(
+                        members, room.get("memberPolicies")
+                    ),
                     "mode": self._room_mode(room.get("mode")),
                     "messages": messages,
                     "watermarks": {
