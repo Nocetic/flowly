@@ -12,7 +12,7 @@ from flowly.goals.judge import (
     GoalJudgeTransportError,
     parse_judge_result,
 )
-from flowly.goals.manager import GoalManager
+from flowly.goals.manager import GoalManager, GoalNotFoundError
 from flowly.goals.models import (
     GoalContract,
     GoalStatus,
@@ -389,6 +389,22 @@ def test_clear_invalidates_generation_and_removes_goal_payload(tmp_path: Path) -
     assert cleared.subgoals == [] and cleared.gates == []
     assert cleared.conversation_epoch == 9
     assert not manager.is_generation_active("s", active.goal_id)
+
+
+def test_pause_and_resume_report_a_missing_or_cleared_goal_as_domain_state(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path, ScriptedProvider("unused"))
+
+    with pytest.raises(GoalNotFoundError, match="no goal is set"):
+        manager.resume("missing")
+
+    manager.set("cleared", "ship")
+    manager.clear("cleared")
+    with pytest.raises(GoalNotFoundError, match="no goal to pause"):
+        manager.pause("cleared")
+    with pytest.raises(GoalNotFoundError, match="no goal to resume"):
+        manager.resume("cleared")
 
 
 def test_a_slow_judge_warns_once_with_the_setting_to_change(caplog):

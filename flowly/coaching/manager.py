@@ -265,6 +265,20 @@ Stages:
 """
 
 
+@dataclass(frozen=True)
+class _LLMRuntime:
+    """One immutable provider/model generation used by a complete LLM task.
+
+    Provider hot-reload replaces this object in one assignment. Callers take a
+    local snapshot before a multi-stage evaluation, so a reload between gate1
+    and gate2 cannot mix providers or model ids inside the same decision.
+    """
+
+    provider: LLMProvider
+    gate_model: str
+    summary_model: str
+
+
 # ── Manager ───────────────────────────────────────────────────────────────────
 
 
@@ -289,9 +303,11 @@ class CoachingManager:
         max_concurrent_sessions: int = MAX_CONCURRENT_SESSIONS,
         max_session_seconds: int = MAX_SESSION_SECONDS,
     ):
-        self.llm = llm_provider
-        self.gate_model = gate_model
-        self.summary_model = summary_model
+        self._llm_runtime = _LLMRuntime(
+            provider=llm_provider,
+            gate_model=gate_model,
+            summary_model=summary_model,
+        )
         self.knowledge_graph = knowledge_graph
         self.memory_path = memory_path
         self.artifact_store = artifact_store
@@ -305,6 +321,46 @@ class CoachingManager:
         self._pending_tasks: set[asyncio.Task] = set()
         # Global watchdog — auto-stops stale sessions
         self._watchdog_task: asyncio.Task | None = None
+
+    @property
+    def llm(self) -> LLMProvider:
+        """Current provider, retained as a read-only compatibility surface."""
+        return self._llm_runtime.provider
+
+    @property
+    def gate_model(self) -> str:
+        return self._llm_runtime.gate_model
+
+    @property
+    def summary_model(self) -> str:
+        return self._llm_runtime.summary_model
+
+    def reconfigure_llm(
+        self,
+        llm_provider: LLMProvider,
+        *,
+        gate_model: str,
+        summary_model: str | None = None,
+    ) -> None:
+        """Atomically apply a provider/model hot-reload to Meeting Coach.
+
+        In-flight work keeps the runtime snapshot it started with. Every new
+        gate, manual tip, or finalization task observes this generation.
+        """
+        if not isinstance(gate_model, str) or not gate_model.strip():
+            raise ValueError("gate_model must be a non-empty string")
+        resolved_summary = summary_model if summary_model is not None else gate_model
+        if not isinstance(resolved_summary, str) or not resolved_summary.strip():
+            raise ValueError("summary_model must be a non-empty string")
+        self._llm_runtime = _LLMRuntime(
+            provider=llm_provider,
+            gate_model=gate_model.strip(),
+            summary_model=resolved_summary.strip(),
+        )
+        logger.info(
+            f"[Coach] LLM runtime reconfigured → "
+            f"provider={type(llm_provider).__name__} model={gate_model.strip()}"
+        )
 
     # ── Callback wiring ───────────────────────────────────────────────────────
 
@@ -784,10 +840,11 @@ class CoachingManager:
         )
 
         gate2_t = time.time()
+        llm_runtime = self._llm_runtime
         try:
             tip_text = await gate_pipeline.generate_tip(
-                self.llm,
-                self.gate_model,
+                llm_runtime.provider,
+                llm_runtime.gate_model,
                 conversation,
                 session.user_context,
                 kg_context,
@@ -902,6 +959,7 @@ class CoachingManager:
 
             t0 = time.time()
             session.metrics.gate_evaluations += 1
+            llm_runtime = self._llm_runtime
 
             # Recent tips passed to both gates so the LLM can avoid
             # repeating itself across turns. 5 covers the typical
@@ -940,7 +998,7 @@ class CoachingManager:
             )
 
             ok, score, reason = await gate_pipeline.relevance_gate(
-                self.llm, self.gate_model,
+                llm_runtime.provider, llm_runtime.gate_model,
                 conversation, session.user_context, kg_context, threshold,
                 mode=mode,
                 recent_tips=recent_tip_texts,
@@ -965,13 +1023,28 @@ class CoachingManager:
 
             # Stage 2: generate
             gate2_t = time.time()
-            tip_text = await gate_pipeline.generate_tip(
-                self.llm, self.gate_model,
-                conversation, session.user_context, kg_context,
-                language=session.language,
-                recent_tips=recent_tip_texts,
-                screenshot_b64=screenshot_for_eval,
-            )
+            try:
+                tip_text = await gate_pipeline.generate_tip(
+                    llm_runtime.provider, llm_runtime.gate_model,
+                    conversation, session.user_context, kg_context,
+                    language=session.language,
+                    recent_tips=recent_tip_texts,
+                    screenshot_b64=screenshot_for_eval,
+                )
+            except gate_pipeline.CoachingProviderError:
+                gate2_latency_ms = (time.time() - gate2_t) * 1000
+                await self._emit_gate_decision(
+                    session,
+                    "gate2",
+                    passed=False,
+                    reason="provider_error",
+                    latency_ms=gate2_latency_ms,
+                )
+                session.metrics.gate_latency_total_s += time.time() - t0
+                logger.warning(
+                    f"[Coach] gate2 provider failure session={session.session_id}"
+                )
+                return None
             gate2_latency_ms = (time.time() - gate2_t) * 1000
             await self._emit_gate_decision(
                 session, "gate2", passed=bool(tip_text),
@@ -988,7 +1061,7 @@ class CoachingManager:
             if self.use_critic:
                 critic_t = time.time()
                 is_useful = await gate_pipeline.critic(
-                    self.llm, self.gate_model,
+                    llm_runtime.provider, llm_runtime.gate_model,
                     tip_text, conversation, session.user_context,
                 )
                 critic_latency_ms = (time.time() - critic_t) * 1000
@@ -1065,11 +1138,15 @@ class CoachingManager:
             "errors": [],
         }
         transcript = self._assemble_transcript(session)
+        llm_runtime = self._llm_runtime
 
         # 1. Summary (best-effort)
         try:
             result["summary"] = await gate_pipeline.summarize_meeting(
-                self.llm, self.summary_model, transcript, session.user_context
+                llm_runtime.provider,
+                llm_runtime.summary_model,
+                transcript,
+                session.user_context,
             ) or ""
         except Exception as e:
             msg = f"summarize_failed: {e}"
@@ -1080,7 +1157,9 @@ class CoachingManager:
         if result["summary"] and self.knowledge_graph is not None:
             try:
                 entities = await gate_pipeline.extract_entities(
-                    self.llm, self.summary_model, result["summary"]
+                    llm_runtime.provider,
+                    llm_runtime.summary_model,
+                    result["summary"],
                 )
                 added = 0
                 for e in entities:

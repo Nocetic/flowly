@@ -13,6 +13,11 @@ from loguru import logger
 
 from ..providers.base import LLMProvider
 
+
+class CoachingProviderError(RuntimeError):
+    """A provider failure returned through the normal LLM response contract."""
+
+
 FREQUENCY_THRESHOLDS: dict[str, float] = {
     "selective": 0.80,   # only when genuinely useful
     "moderate": 0.60,    # balanced — default
@@ -599,7 +604,10 @@ async def generate_tip(
             timeout=15.0,
             purpose="coaching",
         )
-        tip = (response.content or "").strip().strip('"').strip("'")
+        content = (response.content or "").strip()
+        if response.finish_reason == "error" or content.startswith("Error calling LLM:"):
+            raise CoachingProviderError("provider returned an error response")
+        tip = content.strip('"').strip("'")
         # Strip leading "Tip:" / "Note:" style prefixes, in any language
         tip = re.sub(
             r"^(tip|note|suggestion|ipucu|not|öneri)[:\-–]\s*",
@@ -614,6 +622,8 @@ async def generate_tip(
             return None
         logger.debug(f"[Coach.gate2] tip='{tip}'")
         return tip
+    except CoachingProviderError:
+        raise
     except Exception as e:
         logger.warning(f"[Coach.gate2] failed: {e}")
         return None
@@ -750,7 +760,15 @@ async def summarize_meeting(
             timeout=60.0,
             purpose="coaching",
         )
-        return (response.content or "").strip()
+        content = (response.content or "").strip()
+        # Providers intentionally surface many failures as an LLMResponse so
+        # callers can route them without exceptions. That error text is not a
+        # meeting takeaway and must never reach MEMORY.md or an artifact's
+        # summary field.
+        if response.finish_reason == "error" or content.startswith("Error calling LLM:"):
+            logger.warning("[Coach.summarize] provider returned an error response")
+            return ""
+        return content
     except Exception as e:
         logger.warning(f"[Coach.summarize] failed: {e}")
         return ""
@@ -858,4 +876,3 @@ async def extract_entities(
     except Exception as e:
         logger.warning(f"[Coach.extract_entities] failed: {e}")
         return []
-
