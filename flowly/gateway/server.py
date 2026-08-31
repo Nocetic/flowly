@@ -33,6 +33,7 @@ from flowly.gateway.auth import (
     loopback_ws_allowed,
     token_matches,
 )
+from flowly.gateway.identity import health_identity
 from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
 from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
@@ -820,6 +821,13 @@ class GatewayServer:
         return web.json_response(
             {
                 "status": "ok",
+                # Who this gateway is and who started it. Desktop reads these
+                # to decide whether to take the local service over, and was
+                # otherwise reconstructing both from a launchd plist and a
+                # `--version` call — a chain that breaks on healthy machines
+                # and leaves it saying it "could not compare the versions".
+                # Each field is omitted rather than guessed when unknown.
+                **health_identity(),
                 # The public handshake the desktop probes to decide whether to
                 # prompt for a token before connecting (the /api/status handshake).
                 "auth_required": self._require_auth,

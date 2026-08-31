@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.table import Table
 
 from flowly import __version__, __logo__
+from flowly.gateway.identity import GATEWAY_SERVICE_ID
 
 console = Console()
 
@@ -241,6 +242,35 @@ def _installed_service_unit():
     return None
 
 
+def _gateway_identity(port: int) -> dict:
+    """Ask whoever holds *port* who they are. Never raises, never hangs.
+
+    The alternative is inference from the outside — look for a plist, scrape a
+    process command line — and that is exactly the chain that fails on a
+    healthy machine and leaves the CLI naming the wrong culprit. A gateway
+    states this about itself on an endpoint that needs no token.
+
+    Trusted only when the answer identifies itself as Flowly's gateway.
+    Anything else on that port gets no say in what this command tells the
+    reader about it.
+    """
+    import json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/health", timeout=1.5
+        ) as response:
+            payload = json.loads(response.read(64 * 1024).decode("utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("service_id") != GATEWAY_SERVICE_ID:
+        return {}
+    return payload
+
+
 def _port_in_use(port: int) -> bool:
     import socket
 
@@ -279,6 +309,20 @@ def take_over_port(port: int) -> bool:
     """
     if not _port_in_use(port):
         return False
+
+    # Desktop's gateway is registered through SMAppService with KeepAlive, so
+    # stopping it from here does not stick — launchd restarts it within
+    # seconds — and unregistering it is something only the signed app can do.
+    # Naming the one place that works beats offering a handover that cannot
+    # complete, and beats the old advice of `flowly service stop`, which does
+    # nothing at all when Desktop owns the port.
+    if _gateway_identity(port).get("runtime_owner") == "desktop":
+        console.print(
+            f"[yellow]Port {port} is served by Flowly Desktop.[/]\n"
+            "  Stop it there — Dashboard → [bold]Stop[/bold] — then run this again."
+        )
+        raise typer.Exit(code=1)
+
     if _installed_service_unit() is None:
         return False
 
