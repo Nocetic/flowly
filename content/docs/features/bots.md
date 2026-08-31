@@ -102,9 +102,9 @@ and of your main agent. One can run on a fast, cheap model while another runs
 on the most capable one you have access to.
 
 > [!NOTE]
-> Changing a bot's **provider** switches it to that provider's default model,
-> and Flowly tells you it did. Nothing else silently rewrites the model you
-> chose.
+> The model you choose for a bot is not rewritten behind your back. If Flowly
+> cannot confirm a model against its catalogue, it leaves your choice alone
+> rather than replacing it with one it recognises.
 
 ## What a bot can do on its own
 
@@ -176,6 +176,55 @@ half-made bot.
 Deleting one is two steps — prepare, then commit — so a bot is never removed
 while it is mid-answer, and a delete that fails partway does not leave a bot
 that half exists.
+
+## Backing it up, sharing it, moving it
+
+A bot can be written out to a file. There are three ways to do it, and the
+difference between them is **what goes in the file** — so choosing the wrong
+one is how a private key ends up somewhere it should not be.
+
+| | What it contains | Use it to |
+|---|---|---|
+| **Backup** | Everything, **encrypted with a password** | Keep a copy, or move a bot to another machine |
+| **Template** | Everything **except credentials** | Give your setup to somebody else |
+| **Plain archive** | Everything, **not encrypted** | Only where you control the file completely |
+
+**A backup** is locked with a password you choose, between 12 and 1,024
+characters. The password is never stored, not even in a form that could check
+it — lose it and the backup cannot be opened by anyone, including you. The
+unencrypted copy exists only for a moment in a private temporary folder and is
+removed before the file is handed to you, and the finished file is readable
+only by your user account. Backups end in `.flowly-backup`.
+
+**A template** is what to send someone. It carries the setup — persona,
+skills, model choice — and none of the keys. This is the only one of the three
+that is safe to share.
+
+**A plain archive** contains working credentials in readable form. It exists
+for moving a bot somewhere yourself; treat the file as you would treat the
+keys inside it.
+
+> [!NOTE]
+> A bot must be stopped before it can be exported. An archive taken from a
+> running bot could catch it mid-write.
+
+Two things never travel. The note of which process currently holds the bot
+stays behind, because it describes this machine and not the bot. And a
+shortcut pointing outside the bot's own folder is refused rather than
+followed, so an archive can never quietly pick up data from elsewhere on your
+disk.
+
+### Bringing one back
+
+Importing accepts all three kinds of file, and asks which of two things you
+mean:
+
+- **As a new bot** (the default) — it gets a fresh identity. Use this when you
+  are adding a copy alongside the original, so the two never get mistaken for
+  each other.
+- **As a restore** — it keeps its original identity. Use this when you are
+  putting back the bot you had. If a bot with that identity already exists,
+  the import is refused rather than creating two bots claiming to be one.
 
 ## Talking to several at once
 

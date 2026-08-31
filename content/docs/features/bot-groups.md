@@ -94,29 +94,60 @@ Groups run in one of two shapes:
   before their turn. Bounded at **3 rounds** and **10 turns** in total, so a
   discussion cannot run away.
 
+## While a turn is running
+
+You can watch it happen. Each member shows what it is doing — thinking,
+reaching for a tool, writing — and its answer appears as it is written rather
+than all at once at the end. You can stop a turn at any point; an answer that
+was stopped is marked as stopped, so a half answer never reads as a whole one.
+
+### When a member needs you
+
+A member can pause and ask you something before it carries on:
+
+- **Approval** — it wants to run a command and is waiting for you to allow it.
+  Whether it has to ask depends on what you set for that bot in
+  [its permissions](/docs/features/bots#permissions).
+- **A question** — it needs something only you know before it can continue.
+
+The group marks itself as needing you, so you can tell at a glance which of
+your groups is waiting on you and which is simply working. You answer in the
+group; the member picks up where it left off.
+
+### If Flowly stops mid-turn
+
+A turn interrupted by a quit or a restart is not left looking like it is still
+running. When Flowly comes back, that turn is recorded as interrupted and the
+group is idle again — so you never watch a spinner for an answer that stopped
+being written yesterday.
+
 ## Attachments
 
 You can attach up to **10 files** to a message, each up to **25 MB**. Images
 get a thumbnail so the transcript stays readable.
 
-Attachments belong to the group. They are stored once, referenced by the
-message that carries them, and are never swept away by the ordinary media
-cleanup that ages out generated pictures — a file a message still points at
-stays as long as the message does.
+Attachments belong to the group. Each file is stored once and belongs to the
+message you sent it with.
+
+Flowly clears out old generated pictures over time, but it never touches
+these. A file a message still points at stays for as long as that message
+does.
 
 ## History
 
-A group keeps two things, and the difference matters:
+Nothing you say in a group is ever thrown away. But a group does not hand you
+its entire past every time you open it, so there are two things to know about:
 
-- **The live window** — what the group carries in memory and hands to a client
-  in one payload. Bounded at **1,000 messages**, and further bounded by size:
-  about 2 MB of text, never fewer than 30 messages.
-- **Durable history** — everything the group has ever said. Not bounded by the
-  window. Messages that leave the window are marked as trimmed, not deleted.
+- **What opens with the group** — the most recent part of the conversation,
+  up to **1,000 messages** and about 2 MB of text, and never fewer than 30
+  messages however long they are.
+- **Everything else** — the rest of the conversation, kept on disk. Older
+  messages move out of the part that opens with the group; they are not
+  deleted.
 
-Scrolling back fetches pages of **50 messages** by default, up to **100** per
-page. So a group that has outgrown its window still has all of its past; the
-window only decides what arrives without asking.
+Scroll up and the older messages are fetched, **50** at a time by default and
+at most **100**. So a long group still has all of its past — the limit above
+only decides how much arrives without you asking for it.
 
 Each member is given at most **40 messages** of context per turn, which is
 what keeps a long group from growing more expensive every time you write.
@@ -147,27 +178,28 @@ can hold — a member that left still shows what it spent while it was there.
 ## Taking the transcript with you
 
 A group can be exported as Markdown, from the three-dot menu beside it. The
-export names each speaker the way you know them, keeps the time each message
-was sent, notes which tools were used and which files were attached, and says
-plainly when an answer was stopped before it finished.
+export names each speaker the way you know them and keeps the time each
+message was sent. It notes which tools were used and which files were
+attached. And it says plainly when an answer was stopped before it finished,
+so a half answer never reads as a whole one.
 
-The file bytes stay where they are: an export is a document, not a folder. If
+Attached files stay where they are — an export is a document, not a folder. If
 the group is longer than the export could reach, the file says how many of how
 many messages it contains rather than leaving you to count.
 
 ## Storage
 
-Groups live in a single SQLite database under your Flowly home, written
-ahead-of-log so Desktop and the CLI can both use it safely.
+Every group you have lives in one file on your machine, which the app and the
+command line can both use at the same time without getting in each other's
+way.
 
-Space is given back on its own. Deleted groups leave pages behind; Flowly
-reclaims them at most **once every 30 days**, and only when there is a
-worthwhile amount to reclaim. Orphaned attachments — files stranded by a crash
-between writing the file and committing the message — are swept once per
-process start.
+Space comes back on its own. A deleted group leaves a gap behind, and Flowly
+tidies those up **at most once every 30 days** — and only when there is enough
+to be worth doing. A file left behind by a crash, written but never attached
+to a message, is cleaned up the next time Flowly starts.
 
-You can see what groups are using at any time. Flowly also raises a notice
-once group media passes **500 MB**.
+You can see what your groups are using whenever you like, and Flowly tells you
+once group files pass **500 MB**.
 
 ## Limits
 
