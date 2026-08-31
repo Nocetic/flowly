@@ -20,6 +20,22 @@ nothing connected at all.
 > can name, colour and talk to; the CLI presents it as `--profile`. They are
 > the same thing seen from two sides.
 
+## What a bot is not
+
+Flowly uses the word *agent* for three different things, and only one of them
+is a bot. They are easy to mix up because Desktop puts two of them under the
+same tab.
+
+| | What it is | Lives for |
+|---|---|---|
+| **A bot** | A second Flowly, with its own keys, memory and permissions | As long as you keep it |
+| **A subagent** | A helper the agent spawns inside itself for one focused task | One task |
+| **A CLI agent** | An external coding tool — Claude Code, Codex, Gemini — that Flowly hands work to | One job |
+
+A bot is the only one of the three that is yours to name, configure and talk
+to. The other two are things an agent reaches for while it works; see
+[Delegation](/docs/features/delegation) for those.
+
 ## What a bot has of its own
 
 Every bot gets its own directory under `~/.flowly/profiles/<name>/`, holding:
@@ -188,6 +204,11 @@ half-made bot.
 Deleting one is two steps — prepare, then commit — so a bot is never removed
 while it is mid-answer, and a delete that fails partway does not leave a bot
 that half exists.
+
+Deleting a bot also reaches the [groups](/docs/features/bot-groups) it was in.
+A group of three loses that member and carries on. A group of **two** is
+deleted with it, transcript and attachments included, because a group needs
+two members to exist.
 
 ## Backing it up, sharing it, moving it
 

@@ -235,6 +235,23 @@ Manages two unrelated features that share the "Codex" name: the `codex_session` 
 
 `login` options: `--device` (headless code-entry flow instead of a browser), `--no-browser`, `--manual-paste`, `--no-set-active`, `--timeout <seconds>`.
 
+## flowly profile
+
+Manage bots. A bot and a profile are the same thing — see
+[Bots](/docs/features/bots) for what each of these does and why.
+
+| Subcommand | What it does |
+|---|---|
+| `list` | List every bot on this machine. |
+| `describe` | Show one bot's details. |
+| `settings` | Show what a bot is configured with. |
+| `create` | Create a bot, optionally cloning another's setup. |
+| `configure` | Change a bot's provider, model, name or description. |
+| `delete` | Delete a bot permanently (`--yes` to confirm). |
+| `export` | Write a bot to a file — a credential-free template, or `--backup` for a password-encrypted copy. |
+| `import` | Bring a bot back from a template or backup. |
+| `backfill-marks` | Give a generated mark to bots made before marks existed. |
+
 ## flowly persona
 
 | Subcommand | What it does |

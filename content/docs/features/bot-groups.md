@@ -201,6 +201,20 @@ to a message, is cleaned up the next time Flowly starts.
 You can see what your groups are using whenever you like, and Flowly tells you
 once group files pass **500 MB**.
 
+## Deleting
+
+Deleting a group removes its conversation, its attachments, and the private
+session each member kept for it. Nothing of it is left on any member.
+
+Removing a **member** from a group is different: the group carries on without
+it, and that member keeps nothing of the group.
+
+> [!WARNING]
+> A group needs two members. If you delete a **bot** that is in a group of two,
+> the group goes with it — along with its transcript and its attachments —
+> because a group of one is not a group. A group of three loses only that
+> member and continues.
+
 ## Limits
 
 | | |
