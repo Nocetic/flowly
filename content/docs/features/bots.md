@@ -84,6 +84,18 @@ removes the things that would make two agents claim to be the same one:
 This runs for **every** clone, from any surface. There is no kind of bot that
 legitimately needs the identity of the one it was copied from.
 
+### What a clone does not copy either
+
+By default a clone takes the **setup** and nothing that happened. The original
+bot's conversations, its memory, the pictures it made and its record of what it
+did all stay where they are. The new bot starts with your settings and no past.
+
+You can ask for the past as well — `--clone-all` on the command line copies
+sessions, memory, generated media and the audit log too. Credentials are still
+never copied. Worth thinking about before you use it: the copy then knows
+everything the original knew, including anything private that ended up in its
+memory.
+
 > [!WARNING]
 > Because channels are removed, a cloned bot cannot answer on Telegram or any
 > other channel until you connect it yourself. That is deliberate: without it,
@@ -179,15 +191,17 @@ that half exists.
 
 ## Backing it up, sharing it, moving it
 
-A bot can be written out to a file. There are three ways to do it, and the
-difference between them is **what goes in the file** — so choosing the wrong
-one is how a private key ends up somewhere it should not be.
+A bot can be written out to a file, and there are two kinds of file. The
+difference is **whether your keys are in it**.
 
 | | What it contains | Use it to |
 |---|---|---|
+| **Template** *(default)* | Everything **except credentials** | Give your setup to somebody else |
 | **Backup** | Everything, **encrypted with a password** | Keep a copy, or move a bot to another machine |
-| **Template** | Everything **except credentials** | Give your setup to somebody else |
-| **Plain archive** | Everything, **not encrypted** | Only where you control the file completely |
+
+**A template** is what to send someone. It carries the setup — persona,
+skills, model choice — and none of your keys. It is the safe one to share, and
+it is what you get unless you ask for a backup.
 
 **A backup** is locked with a password you choose, between 12 and 1,024
 characters. The password is never stored, not even in a form that could check
@@ -196,13 +210,10 @@ unencrypted copy exists only for a moment in a private temporary folder and is
 removed before the file is handed to you, and the finished file is readable
 only by your user account. Backups end in `.flowly-backup`.
 
-**A template** is what to send someone. It carries the setup — persona,
-skills, model choice — and none of the keys. This is the only one of the three
-that is safe to share.
-
-**A plain archive** contains working credentials in readable form. It exists
-for moving a bot somewhere yourself; treat the file as you would treat the
-keys inside it.
+> [!NOTE]
+> Flowly never hands you a complete copy of a bot in the clear. A file with
+> your keys in it is always encrypted first; the plaintext exists only inside
+> the export, for as long as it takes to encrypt it.
 
 > [!NOTE]
 > A bot must be stopped before it can be exported. An archive taken from a
@@ -225,6 +236,88 @@ mean:
 - **As a restore** — it keeps its original identity. Use this when you are
   putting back the bot you had. If a bot with that identity already exists,
   the import is refused rather than creating two bots claiming to be one.
+
+## From the command line
+
+Everything above is available without the app. Bots are `profile` subcommands,
+because a bot and a profile are the same thing (see
+[Profiles](/docs/using-flowly/profiles)).
+
+```bash
+flowly profile list                    # every bot on this machine
+flowly profile describe work           # one bot's details
+flowly profile settings work           # what it is configured with
+```
+
+Every command takes `--json` when you want to read the output from a script
+rather than with your eyes.
+
+There is one maintenance command you are unlikely to need:
+`flowly profile backfill-marks` gives a generated mark to bots made before
+marks existed. Those bots draw a mark from their name instead, which spreads
+colour no better than chance; this gives them a proper one. It is safe to run
+at any time and does nothing when there is nothing to fix.
+
+### Making one
+
+```bash
+# Empty
+flowly profile create work --display-name "Work"
+
+# Copy an existing bot's setup
+flowly profile create work --clone-from personal --display-name "Work"
+
+# Choose its brain up front
+flowly profile create work --provider anthropic --model claude-haiku-4.5
+
+# Give it a character
+flowly profile create work --soul "You draft in a formal register."
+```
+
+Useful flags:
+
+| Flag | Does |
+|---|---|
+| `--clone-from <bot>` | Copy that bot's setup — never its credentials |
+| `--clone` | Copy the bot you are currently using |
+| `--clone-all` | Also copy sessions, memory, generated media and the audit log |
+| `--display-name`, `--description` | What clients show |
+| `--provider`, `--model` | Its provider and default model |
+| `--soul` | Its character, as text |
+| `--mark-text`, `--mark-tone` | Override the generated mark and colour |
+| `--local-only` | Strip messaging transports and relay identity, for a bot managed on this machine |
+| `--json` | Machine-readable output |
+
+### Changing and removing one
+
+```bash
+flowly profile configure work --model claude-sonnet-5
+flowly profile delete work --yes
+```
+
+Deleting asks for `--yes` because it is permanent.
+
+### Backing up and moving
+
+```bash
+# Shareable template — credentials removed. This is what you get by default.
+flowly profile export work --output ~/work-template
+
+# Complete and encrypted. Asks for a password, then asks again to confirm it.
+flowly profile export work --output ~/work --backup
+
+# Bring one back
+flowly profile import ~/work.flowly-backup
+flowly profile import ~/work-template.tar.gz --name work2
+flowly profile import ~/work.flowly-backup --restore-identity
+```
+
+`--restore-identity` keeps the archived bot's original identity, and fails if a
+bot with that identity already exists — so a restore can never produce two bots
+claiming to be one. Without it, the import arrives as a new bot.
+
+Add `--local-only` to an import to strip messaging transports from whatever
+you are bringing in.
 
 ## Talking to several at once
 
