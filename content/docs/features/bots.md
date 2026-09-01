@@ -20,22 +20,6 @@ nothing connected at all.
 > can name, colour and talk to; the CLI presents it as `--profile`. They are
 > the same thing seen from two sides.
 
-## What a bot is not
-
-Flowly uses the word *agent* for three different things, and only one of them
-is a bot. They are easy to mix up because Desktop puts two of them under the
-same tab.
-
-| | What it is | Lives for |
-|---|---|---|
-| **A bot** | A second Flowly, with its own keys, memory and permissions | As long as you keep it |
-| **A subagent** | A helper the agent spawns inside itself for one focused task | One task |
-| **A CLI agent** | An external coding tool — Claude Code, Codex, Gemini — that Flowly hands work to | One job |
-
-A bot is the only one of the three that is yours to name, configure and talk
-to. The other two are things an agent reaches for while it works; see
-[Delegation](/docs/features/delegation) for those.
-
 ## What a bot has of its own
 
 Every bot gets its own directory under `~/.flowly/profiles/<name>/`, holding:
@@ -58,6 +42,22 @@ other's conversations, keys or memory.
 > [!NOTE]
 > [Profiles](/docs/using-flowly/profiles#whats-isolated-per-profile) carries the
 > full list with the exact path of every file, if you need to find one on disk.
+
+## What a bot is not
+
+Flowly uses the word *agent* for three different things, and only one of them
+is a bot. They are easy to mix up because Desktop puts two of them under the
+same tab.
+
+| | What it is | Lives for |
+|---|---|---|
+| **A bot** | A second Flowly, with its own keys, memory and permissions | As long as you keep it |
+| **A subagent** | A helper the agent spawns inside itself for one focused task | One task |
+| **A CLI agent** | An external coding tool — Claude Code, Codex, Gemini — that Flowly hands work to | One job |
+
+A bot is the only one of the three that is yours to name, configure and talk
+to. The other two are things an agent reaches for while it works; see
+[Delegation](/docs/features/delegation) for those.
 
 ## Naming
 
@@ -205,19 +205,7 @@ active turn cannot be reconfigured or deleted until that turn finishes or is
 stopped — the app says so rather than changing settings underneath a running
 answer.
 
-## Limits
-
-| | |
-|---|---|
-| Bots per installation | 15, beside your main agent |
-| Name | Lowercase letters, digits, `-` and `_`; 1–64 characters |
-| Reserved names | `flowly`, `default`, `test`, `tmp`, `root`, `sudo` |
-
-When you reach the cap, creating another asks you to delete one first rather
-than failing silently. Counting and creating happen under one lock shared
-across processes, so Desktop and the CLI cannot race past the limit together.
-
-## Where a bot comes from and where it goes
+## Creating and deleting, safely
 
 A bot is built in a hidden temporary directory and published in one step. A
 crash before that step leaves the temporary directory behind and never a
@@ -231,6 +219,18 @@ Deleting a bot also reaches the [groups](/docs/features/bot-groups) it was in.
 A group of three loses that member and carries on. A group of **two** is
 deleted with it, transcript and attachments included, because a group needs
 two members to exist.
+
+## Limits
+
+| | |
+|---|---|
+| Bots per installation | 15, beside your main agent |
+| Name | Lowercase letters, digits, `-` and `_`; 1–64 characters |
+| Reserved names | `flowly`, `default`, `test`, `tmp`, `root`, `sudo` |
+
+When you reach the cap, creating another asks you to delete one first rather
+than failing silently. Counting and creating happen under one lock shared
+across processes, so Desktop and the CLI cannot race past the limit together.
 
 ## Backing it up, sharing it, moving it
 

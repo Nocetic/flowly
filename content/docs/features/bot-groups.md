@@ -86,13 +86,19 @@ address: `mail@jarvis` addresses nobody.
 
 ## How members answer
 
-Groups run in one of two shapes:
+Everyone answers **at the same time**. The members you addressed each get your
+message and each write their own reply, in parallel. They do not see each
+other's answers while they are writing, so what you get back are independent
+takes rather than a discussion.
 
-- **Panel** — every selected member answers the same message at the same time,
-  in parallel. They do not see each other's answers for that turn.
-- **Council** — members answer in sequence and can see what was contributed
-  before their turn. Bounded at **3 rounds** and **10 turns** in total, so a
-  discussion cannot run away.
+That is what a group does today, and there is no setting to change it.
+
+> [!NOTE]
+> Flowly also has a **council** shape, where members answer one after another
+> and can read what was said before their turn, bounded at 3 rounds and 10
+> turns. It works, but no app offers it yet — so nothing you create in Desktop
+> or on your phone will use it. It is here because you may see it named in the
+> host's capabilities; do not go looking for a switch.
 
 ## While a turn is running
 
@@ -178,7 +184,8 @@ can hold — a member that left still shows what it spent while it was there.
 
 ## Taking the transcript with you
 
-A group can be exported as Markdown, from the three-dot menu beside it. The
+In Flowly Desktop, a group can be exported as Markdown from the three-dot menu
+beside it. (There is no export on the phone yet.) The
 export names each speaker the way you know them and keeps the time each
 message was sent. It notes which tools were used and which files were
 attached. And it says plainly when an answer was stopped before it finished,

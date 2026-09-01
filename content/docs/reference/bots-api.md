@@ -106,6 +106,10 @@ from a version number:
 }
 ```
 
+`modes` advertises both shapes the host can run, but no shipped client sends
+`mode` — every group Desktop or iOS creates is a `panel`. A client that wants
+`council` has to ask for it.
+
 Two of these deserve reading twice:
 
 - **`retention.liveWindow` is not how many messages exist.** It is what the
