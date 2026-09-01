@@ -71,10 +71,10 @@ app is its **display name**, which you can change whenever you like.
 
 ## What a bot looks like
 
-Each bot carries a generated mark — a woven knot drawn from its name and a
-seed allocated when it was created — and a colour. The mark is unique to that
-bot and stays with it, which is what lets you tell two bots apart at a glance
-in a group, in the sidebar, or beside a message.
+Every bot gets its own little woven symbol and its own colour. Flowly draws
+the symbol from the bot's name and the moment you made it, so no two bots get
+the same one. It never changes, which is how you tell two bots apart at a
+glance — in a group, in the sidebar, or next to a message.
 
 Your main agent is the exception: it wears the Flowly symbol rather than a
 generated knot.
@@ -86,26 +86,37 @@ its provider, model, persona and skills.
 
 ### What a clone never inherits
 
-A clone inherits a **setup**, never a **self**. When you copy a bot, Flowly
-removes the things that would make two agents claim to be the same one:
+A copy gets the **setup**, not the **identity**. Flowly removes the things
+that would let two bots pretend to be the same one.
 
-- **Channel connections are removed entirely.** Telegram, Discord, Slack and
-  the rest are dropped from the copy, not merely switched off. Leaving the
-  tokens on disk would put a copy of your account's credentials in every bot
-  you ever made, and rotating the original would reach none of them.
-- **The gateway token is cleared.** Two gateways answering to one token are not
-  sharing a secret; they are two processes each believing they are the
-  installation.
-- **The hosted-relay registration is removed.** A relay registration names one
-  install. Your account-scoped provider key keeps working without it.
-- **`.env` is filtered.** Only provider API keys survive the copy:
-  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
-  `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`,
-  `ZAI_API_KEY`, `ZHIPU_API_KEY`, `ZHIPUAI_API_KEY`, `VLLM_API_KEY`.
-  Everything else is dropped.
+**Its connections to Telegram, Discord, Slack and the rest are removed** — not
+switched off, removed. If they were only switched off, the passwords for those
+accounts would sit inside every bot you ever copied. Change the password in
+the original later and none of the copies would know, and each of them would
+still be holding the old one.
 
-This runs for **every** clone, from any surface. There is no kind of bot that
-legitimately needs the identity of the one it was copied from.
+**Its key for talking to your other devices is cleared.** That key is how your
+phone and your desktop know they are reaching *your* Flowly. Two bots holding
+the same one is not sharing — it is two bots each answering as if it were the
+only one.
+
+**Its registration with the Flowly relay is removed.** That registration
+names one installation, and a copy is not that installation. Your Flowly
+account key is unaffected and keeps working.
+
+**Its `.env` file is emptied of everything but model keys.** `.env` is a file
+where you can put secrets by hand. Only the keys for talking to model
+providers survive the copy:
+
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
+`GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`,
+`ZAI_API_KEY`, `ZHIPU_API_KEY`, `ZHIPUAI_API_KEY`, `VLLM_API_KEY`
+
+Anything else in that file is left out of the copy.
+
+This happens on every copy, whether you make it in the app or from the
+terminal. No bot has a good reason to carry the identity of the one it was
+copied from.
 
 ### What a clone does not copy either
 
@@ -126,9 +137,11 @@ memory.
 
 ## Credentials
 
-A named bot is created with an **isolated** credential policy: it uses its own
-keys, kept in its own `credentials/` folder. Your main agent keeps the
-`primary` policy and its own separate set.
+A bot you create uses **its own** keys, kept in its own folder. Your main
+agent keeps its own, separately. Neither can reach the other's.
+
+That is why a bot you have just made cannot talk to a model until you give it
+a key, or point it at your Flowly account.
 
 ## Model and provider
 
@@ -137,9 +150,9 @@ and of your main agent. One can run on a fast, cheap model while another runs
 on the most capable one you have access to.
 
 > [!NOTE]
-> The model you choose for a bot is not rewritten behind your back. If Flowly
-> cannot confirm a model against its catalogue, it leaves your choice alone
-> rather than replacing it with one it recognises.
+> The model you pick is never changed behind your back. Flowly keeps a list of
+> models it knows about, and if yours is not on it, Flowly leaves your choice
+> alone rather than swapping in one it recognises.
 
 ## What a bot can do on its own
 
@@ -175,9 +188,11 @@ What a bot may do is decided per bot, not once for the whole installation.
 **When it asks you first**: never, only when a command is not on the
 allowlist, or every single time.
 
-**Codex execution** has its own approval setting — ask on request, never ask,
-auto-review, or granular — and its own sandbox: read-only, write inside the
-workspace, or full access.
+**Codex**, the coding tool Flowly can hand programming work to, is set up
+separately. You choose when it checks with you: only when it asks, never,
+after reviewing its own work, or step by step. And you choose how much of your
+disk it can touch: read only, write only inside its own working folder, or
+anywhere.
 
 A bot you made for drafting text can be left with nothing but the model. A bot
 you made for real work on your machine can be given more, without that
@@ -208,9 +223,9 @@ A bot is built in a hidden temporary directory and published in one step. A
 crash before that step leaves the temporary directory behind and never a
 half-made bot.
 
-Deleting one is two steps — prepare, then commit — so a bot is never removed
-while it is mid-answer, and a delete that fails partway does not leave a bot
-that half exists.
+Deleting happens in two stages, which is why a bot is never removed while it
+is in the middle of an answer, and why a delete that fails halfway does not
+leave you with half a bot.
 
 Deleting a bot also reaches the [groups](/docs/features/bot-groups) it was in.
 A group of three loses that member and carries on. A group of **two** is
@@ -280,11 +295,11 @@ flowly profile settings work           # what it is configured with
 Every command takes `--json` when you want to read the output from a script
 rather than with your eyes.
 
-There is one maintenance command you are unlikely to need:
-`flowly profile backfill-marks` gives a generated mark to bots made before
-marks existed. Those bots draw a mark from their name instead, which spreads
-colour no better than chance; this gives them a proper one. It is safe to run
-at any time and does nothing when there is nothing to fix.
+One command you are unlikely to need: `flowly profile backfill-marks` gives a
+proper symbol to bots you made before symbols existed. Until you run it, those
+bots make do with one guessed from their name, which often leaves two of them
+looking almost the same. It is safe to run at any time, and does nothing when
+there is nothing to fix.
 
 ### Making one
 

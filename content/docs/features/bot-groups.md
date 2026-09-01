@@ -69,8 +69,8 @@ being called.
 
 ### Writing a mention
 
-Type `@` and the members appear above the composer; pick one and it is
-inserted. You mention a bot by the **name you gave it** — `@Flowly`,
+Type `@` in the message box and the members appear above it. Pick one and it
+is added to what you are writing. You mention a bot by the **name you gave it** — `@Flowly`,
 `@Jarvis` — not by the identifier it has on disk. The translation happens when
 the message is sent, so what you wrote and what you read back are the same
 words.
@@ -163,14 +163,15 @@ and for each member separately:
 - Cache-write tokens
 - How many turns have run
 
-Money appears alongside the tokens only when the model catalogue can price the
-models involved. A group that reports tokens and no cost is not broken — it
-means Flowly does not have a price for that model, and would rather show you
-nothing than a number it guessed.
+You will see a cost in money too, but only when Flowly knows the price of the
+models involved. If a group shows you tokens and no cost, nothing is wrong —
+Flowly simply does not have a price for that model, and would rather show you
+nothing than a made-up number.
 
 > [!NOTE]
-> Providers report prompt tokens **including** cache reads. The meter splits
-> them so a cached turn does not read as a full-price one.
+> Some of what a bot reads has been read before, and providers charge less for
+> it. They report it mixed in with everything else; Flowly separates it, so a
+> cheap turn does not look like an expensive one.
 
 Per-member figures are kept for up to 24 members, which is more than a group
 can hold — a member that left still shows what it spent while it was there.
