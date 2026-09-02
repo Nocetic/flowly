@@ -2798,12 +2798,17 @@ class GatewayServer:
                 return
             profile_hop = raw_hop
 
-        from flowly.profile import current_profile_name
+        from flowly.profile import current_profile_name, profile_display_names
 
         current_profile = current_profile_name()
         collaboration_metadata: dict[str, Any] = {
             "profile_current": current_profile,
             "profile_directory": profile_directory,
+            # The ids above are what the wire carries and what a target must be
+            # addressed by. They are also the one name the user never sees, so
+            # send the labels alongside them — otherwise the model is asked to
+            # honour "message Friday" while holding a list that says `dqwdqwd`.
+            "profile_display_names": profile_display_names(profile_directory),
             "profile_mentions": profile_mentions,
             "profile_correlation_id": correlation_id,
             "profile_hop": profile_hop,

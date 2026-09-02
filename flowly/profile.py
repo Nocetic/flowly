@@ -970,6 +970,53 @@ def _bind_local_runtime(profile_dir: Path, workspace: Path) -> None:
     _atomic_write_json(config_path, raw)
 
 
+def profile_display_names(names: list[str] | None = None) -> dict[str, str]:
+    """Map profile ids to the names their owner actually reads.
+
+    A bot is created with an id it keeps forever and a display name its owner
+    changes at will, and every surface shows the second one. So the id is the
+    one name nobody recognises — which is fine until something has to be told
+    which bot to talk to, and the only name it was ever given is the one it
+    cannot resolve.
+
+    Ids without a display name, or whose display name is just the id again,
+    are left out: there is nothing to add for those.
+    """
+    wanted = set(names) if names is not None else None
+    mapping: dict[str, str] = {}
+    for profile in list_profiles():
+        if wanted is not None and profile.name not in wanted:
+            continue
+        label = (profile.display_name or "").strip()
+        if label and label != profile.name:
+            mapping[profile.name] = label
+    return mapping
+
+
+def resolve_profile_reference(reference: str) -> str | None:
+    """Resolve an id or a display name to a profile id, or None.
+
+    Display names are not unique — nothing stops two bots being called Friday —
+    so a name matching more than one profile resolves to nothing rather than to
+    a coin flip. Messaging the wrong bot is worse than saying the name was
+    ambiguous.
+    """
+    candidate = str(reference or "").strip()
+    if not candidate:
+        return None
+    profiles = list_profiles()
+    for profile in profiles:
+        if profile.name == candidate:
+            return profile.name
+    folded = candidate.casefold()
+    matches = {
+        profile.name
+        for profile in profiles
+        if (profile.display_name or "").strip().casefold() == folded
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def describe_profile(name: str) -> ProfileInfo:
     """Return one profile descriptor or raise ``FileNotFoundError``."""
     if name == "default":

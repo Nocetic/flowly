@@ -8032,14 +8032,30 @@ class AgentLoop:
             ]
             source_profile = str(msg.metadata.get("profile_message_source") or "")
             if targets or source_profile:
+                # Address by id, but show the name the user knows. Every
+                # surface renders a bot by its display name, so the id is the
+                # one label nobody types — and a list of ids alone left the
+                # model unable to honour "ask Friday" for a bot whose id is
+                # `dqwdqwd`. It would say, correctly from what it had been
+                # given, that no such bot existed.
+                raw_labels = msg.metadata.get("profile_display_names")
+                labels = raw_labels if isinstance(raw_labels, dict) else {}
+                def _describe(profile_id: str) -> str:
+                    label = labels.get(profile_id)
+                    label = str(label).strip() if isinstance(label, str) else ""
+                    return f"{profile_id} ({label})" if label and label != profile_id else profile_id
+
                 lines = [
                     "<profile_collaboration transport=\"desktop-local\">",
                     f"Current profile id: {current_profile}",
-                    "Available target profile ids: " + (", ".join(targets) or "none"),
+                    "Available target profiles, as id (name): "
+                    + (", ".join(_describe(value) for value in targets) or "none"),
+                    "Address message_profile by the id, never the name.",
                 ]
                 if mentions:
                     lines.append(
-                        "The user explicitly mentioned: " + ", ".join(mentions)
+                        "The user explicitly mentioned: "
+                        + ", ".join(_describe(value) for value in mentions)
                         + ". Use message_profile when their response is relevant."
                     )
                 if source_profile:

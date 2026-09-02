@@ -876,3 +876,65 @@ def test_rejected_internal_session_is_not_bound_to_direct_client(profile_roots) 
 
     assert server._profile_client_subscriptions["ios"].conversations == set()
     server._remove_profile_client_subscription("ios")
+
+
+@pytest.mark.asyncio
+async def test_broker_accepts_the_name_the_user_says(profile_roots) -> None:
+    """The model is told to send an id, and may still send the name it heard.
+
+    Asked to message Friday, a model holding only ids either says no such bot
+    exists or forwards the word the user used. The second is recoverable, so it
+    is recovered — as long as exactly one bot answers to that name.
+    """
+    profiles.create_profile("dqwdqwd", local_runtime=True, display_name="Friday")
+
+    async def on_chat(
+        _session_key, _message, _run_id, stream_callback, _media,
+        _voice_mode, _iteration_callback, _render_capabilities, _metadata,
+    ):
+        await stream_callback("Hello from Friday")
+        return "Hello from Friday", {}
+
+    server = GatewayServer(host="127.0.0.1", on_chat_message=on_chat, enable_profile_host=True)
+    host = server._profile_host
+    assert host is not None
+
+    captured: dict[str, str] = {}
+
+    async def run_turn(**kwargs):
+        captured["target"] = kwargs["target"]
+        return {"ok": True, "targetProfile": kwargs["target"]}
+
+    host._run_broker_turn = run_turn  # type: ignore[method-assign]
+
+    result = await host._broker("default", {
+        "sourceProfile": "default",
+        "sourceSessionKey": "desktop:thread",
+        "targetProfile": "Friday",
+        "message": "Say hello",
+        "correlationId": "c1",
+        "hop": 1,
+    })
+
+    # Resolved to the id, not passed through as the label.
+    assert captured["target"] == "dqwdqwd"
+    assert result["targetProfile"] == "dqwdqwd"
+
+
+@pytest.mark.asyncio
+async def test_broker_still_refuses_a_name_that_identifies_nobody(profile_roots) -> None:
+    profiles.create_profile("dqwdqwd", local_runtime=True, display_name="Friday")
+    server = GatewayServer(host="127.0.0.1", enable_profile_host=True)
+    host = server._profile_host
+    assert host is not None
+
+    with pytest.raises(ProfileHostError) as error:
+        await host._broker("default", {
+            "sourceProfile": "default",
+            "sourceSessionKey": "desktop:thread",
+            "targetProfile": "Gandalf",
+            "message": "Say hello",
+            "correlationId": "c1",
+            "hop": 1,
+        })
+    assert error.value.code == "PROFILE_NOT_FOUND"

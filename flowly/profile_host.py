@@ -38,6 +38,7 @@ from flowly.profile import (
     list_profiles,
     read_profile_settings,
     reconcile_runtime_lease,
+    resolve_profile_reference,
     update_profile_metadata,
     update_profile_settings,
     validate_profile_name,
@@ -1759,7 +1760,15 @@ class ProfileHost:
         correlation_id = str(params.get("correlationId") or uuid.uuid4())
         available = {profile.name for profile in list_profiles()}
         if target not in available:
-            raise ProfileHostError("PROFILE_NOT_FOUND", f"Unknown profile '{target}'.")
+            # The caller was asked for an id and may still arrive with the name
+            # the user said. Accept it when exactly one bot answers to it —
+            # display names are not unique, and two bots called Friday must
+            # produce an error rather than a coin flip about which one gets the
+            # message.
+            resolved = resolve_profile_reference(target)
+            if resolved is None:
+                raise ProfileHostError("PROFILE_NOT_FOUND", f"Unknown profile '{target}'.")
+            target = resolved
         if target == source_profile:
             raise ProfileHostError("PROFILE_SELF_MESSAGE", "A profile cannot message itself.")
         if not message or len(message) > MAX_PROFILE_MESSAGE_CHARS:
