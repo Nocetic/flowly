@@ -36,6 +36,13 @@ from flowly.mcp.security import sanitize_error
 logger = logging.getLogger(__name__)
 
 
+def _mcp_attr(obj: Any, snake_name: str, wire_name: str, default: Any = None) -> Any:
+    """Read an SDK field across snake_case Python and wire-name models."""
+    if hasattr(obj, snake_name):
+        return getattr(obj, snake_name)
+    return getattr(obj, wire_name, default)
+
+
 def _exc_text(exc: BaseException) -> str:
     """Return non-empty text for exceptions whose ``str`` is empty."""
     text = str(exc).strip()
@@ -155,7 +162,7 @@ class MCPTool(Tool):
             or f"MCP tool {remote_tool.name} from server '{server_task.name}'"
         )
         self._parameters = normalize_mcp_input_schema(
-            getattr(remote_tool, "inputSchema", None)
+            _mcp_attr(remote_tool, "input_schema", "inputSchema")
         )
 
     @property
@@ -209,7 +216,7 @@ class MCPTool(Tool):
 
     def _format_result(self, result: Any) -> str:
         """Render an MCP ``CallToolResult`` into the agent's JSON envelope."""
-        is_error = getattr(result, "isError", False)
+        is_error = bool(_mcp_attr(result, "is_error", "isError", False))
         content_blocks = getattr(result, "content", None) or []
 
         if is_error:
@@ -238,7 +245,7 @@ class MCPTool(Tool):
 
         text_result = "\n".join(text_parts)
 
-        structured = getattr(result, "structuredContent", None)
+        structured = _mcp_attr(result, "structured_content", "structuredContent")
         if structured is not None:
             envelope: dict[str, Any] = {"result": text_result or structured}
             if text_result and structured:
@@ -319,8 +326,9 @@ class MCPListResourcesTool(_MCPUtilityTool):
                     entry["name"] = r.name
                 if getattr(r, "description", None):
                     entry["description"] = r.description
-                if getattr(r, "mimeType", None):
-                    entry["mimeType"] = r.mimeType
+                mime_type = _mcp_attr(r, "mime_type", "mimeType")
+                if mime_type:
+                    entry["mimeType"] = mime_type
                 resources.append(entry)
             return json.dumps({"resources": resources}, ensure_ascii=False, default=str)
 

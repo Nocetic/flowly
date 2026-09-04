@@ -1,6 +1,6 @@
 """Integration tests for resource/prompt utility tools (D9).
 
-Spins up a FastMCP server that exposes a tool, a resource, and a
+Spins up an MCP server that exposes a tool, a resource, and a
 prompt, then verifies:
 
 * With ``tools.resources``/``tools.prompts`` enabled AND the server
@@ -33,9 +33,9 @@ pytestmark = pytest.mark.skipif(not MCP_AVAILABLE, reason="mcp SDK not installed
 
 
 _RESOURCE_SERVER = """
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("flowly-rp")
+mcp = MCPServer("flowly-rp")
 
 @mcp.tool()
 def ping() -> str:
@@ -145,8 +145,8 @@ def test_capability_gate_drops_unadvertised(monkeypatch):
     """Unit test: a server that advertises NO resources/prompts capability
     gets its utility tools gated out even when config asks for them.
 
-    We exercise the gate directly rather than via FastMCP, because
-    FastMCP always advertises (and implements) empty resource/prompt
+    We exercise the gate directly rather than via a live server, because
+    the SDK always advertises (and implements) empty resource/prompt
     capabilities — it can't model a genuinely tools-only server like the
     spec-compliant Context7 (which advertises only ``tools``).
     """

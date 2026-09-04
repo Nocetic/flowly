@@ -40,6 +40,7 @@ import logging
 import math
 import threading
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlparse
 
@@ -71,21 +72,19 @@ _MCP_HTTP_AVAILABLE = False
 _MCP_SSE_AVAILABLE = False
 _MCP_NOTIFICATIONS = False
 _MCP_MESSAGE_HANDLER = False
-# Fallback if mcp.types.LATEST_PROTOCOL_VERSION isn't exported by this SDK
-# build. Streamable HTTP was introduced in 2025-03-26 so this is a safe
-# floor for the HTTP transport path even on older SDKs.
-LATEST_PROTOCOL_VERSION = "2025-03-26"
-
+_MCP_UNIFIED_CLIENT = False
 try:
-    from mcp import ClientSession, StdioServerParameters  # type: ignore
+    from mcp import Client, ClientSession, StdioServerParameters  # type: ignore
     from mcp.client.stdio import stdio_client  # type: ignore
 
     _MCP_AVAILABLE = True
+    _MCP_UNIFIED_CLIENT = True
     try:
-        from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+        from mcp.client.streamable_http import streamable_http_client  # type: ignore
 
         _MCP_HTTP_AVAILABLE = True
     except ImportError:
+        streamable_http_client = None  # type: ignore
         _MCP_HTTP_AVAILABLE = False
     # SSE transport (T3) — older HTTP-style servers. Optional.
     try:
@@ -95,10 +94,6 @@ try:
     except ImportError:
         sse_client = None  # type: ignore
         _MCP_SSE_AVAILABLE = False
-    try:
-        from mcp.types import LATEST_PROTOCOL_VERSION  # type: ignore # noqa: F811
-    except ImportError:
-        pass
     # Notification types power tools/list_changed hot reload (D8). Older
     # SDKs may not export them; we degrade to static discovery.
     try:
@@ -118,6 +113,7 @@ try:
     except (TypeError, ValueError):
         _MCP_MESSAGE_HANDLER = False
 except ImportError:
+    Client = None  # type: ignore
     logger.debug("mcp SDK not installed — MCP discovery disabled")
 
 
@@ -337,6 +333,8 @@ class MCPServerTask:
         self._last_error = ""
         self._last_failure_at: float | None = None
         self._state_changed_at = time.time()
+        self._protocol_version = ""
+        self._protocol_era = ""
         self.state = MCPConnectionState.IDLE
 
     def is_http(self) -> bool:
@@ -356,7 +354,7 @@ class MCPServerTask:
         self.state = state
         self._state_changed_at = time.time()
 
-    def _mark_connected(self) -> None:
+    def _mark_connected(self, session: Any | None = None) -> None:
         """Record a completed handshake and wake the initial caller."""
         if self._ever_connected:
             self._reconnect_count += 1
@@ -364,6 +362,11 @@ class MCPServerTask:
         self._connection_generation += 1
         self._connected_monotonic = time.monotonic()
         self._consecutive_failures = 0
+        if session is not None:
+            self._protocol_version = str(getattr(session, "protocol_version", "") or "")
+            self._protocol_era = (
+                "modern" if getattr(session, "discover_result", None) is not None else "legacy"
+            )
         self._set_state(MCPConnectionState.CONNECTED)
         _reset_server_error(self.name)
         if self.ready is not None:
@@ -380,6 +383,9 @@ class MCPServerTask:
             "lastError": self._last_error,
             "lastFailureAt": self._last_failure_at,
             "stateChangedAt": self._state_changed_at,
+            "protocolMode": self._protocol_mode() if self._config else "auto",
+            "protocolEra": self._protocol_era,
+            "protocolVersion": self._protocol_version,
         }
 
     def report_transport_failure(
@@ -620,7 +626,7 @@ class MCPServerTask:
         return kwargs
 
     async def _run_stdio(self) -> None:
-        if not _MCP_AVAILABLE:
+        if not (_MCP_AVAILABLE and _MCP_UNIFIED_CLIENT):
             raise ImportError("mcp SDK is not installed")
 
         command = self._config.get("command") or ""
@@ -659,20 +665,22 @@ class MCPServerTask:
         reap = bool(self._config.get("reap_orphans"))
         try:
             if not reap:
-                async with stdio_client(server_params, errlog=errlog) as (read, write):
-                    async with ClientSession(read, write, **self._session_kwargs()) as session:
-                        await self._serve(session)
+                await self._run_client_transport(stdio_client(server_params, errlog=errlog))
                 return
 
             from flowly.mcp.proc import reap_pids, snapshot_child_pids
 
             before = snapshot_child_pids()
             spawned: set[int] = set()
+
+            @asynccontextmanager
+            async def _tracked_stdio_transport():
+                async with stdio_client(server_params, errlog=errlog) as streams:
+                    spawned.update(snapshot_child_pids() - before)
+                    yield streams
+
             try:
-                async with stdio_client(server_params, errlog=errlog) as (read, write):
-                    spawned = snapshot_child_pids() - before
-                    async with ClientSession(read, write, **self._session_kwargs()) as session:
-                        await self._serve(session)
+                await self._run_client_transport(_tracked_stdio_transport())
             finally:
                 # Runs on clean exit, error, and cancellation. If the SDK's
                 # own teardown already reaped the child, reap_pids is a no-op.
@@ -693,11 +701,11 @@ class MCPServerTask:
 
     async def _run_http(self) -> None:
         url = _validate_http_url(self.name, self._config.get("url"))
-        headers = dict(self._config.get("headers") or {})
-        # Some servers require the MCP-Protocol-Version header on the
-        # initial POST. Inject as a default; preserve user casing.
-        if not any(k.lower() == "mcp-protocol-version" for k in headers):
-            headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
+        headers = {
+            str(key): str(value)
+            for key, value in (self._config.get("headers") or {}).items()
+            if str(key).lower() not in {"mcp-protocol-version", "mcp-method", "mcp-name"}
+        }
 
         # OAuth 2.1 / PKCE (Faz 2b): when configured, attach the SDK's
         # OAuthClientProvider as the httpx auth flow. It transparently
@@ -719,16 +727,14 @@ class MCPServerTask:
                     "mcp.client.auth — upgrade the package."
                 )
 
-        # mTLS / custom CA (Faz 2c): only build a custom httpx factory
-        # when the config actually sets a TLS knob, so the default path
-        # keeps using the SDK's own factory.
+        # mTLS / custom CA. The 2.x transport accepts an already-configured
+        # httpx2 client so auth, headers, and TLS policy share one owner.
         from flowly.mcp.tls import make_http_client_factory, needs_custom_tls
 
-        client_factory = None
-        if needs_custom_tls(self._config):
-            client_factory = make_http_client_factory(self.name, self._config)
-
         if self._use_sse():
+            client_factory = None
+            if needs_custom_tls(self._config):
+                client_factory = make_http_client_factory(self.name, self._config)
             await self._run_sse(url, headers, auth, client_factory)
             return
 
@@ -737,12 +743,11 @@ class MCPServerTask:
                 "HTTP MCP transport unavailable — upgrade the 'mcp' package "
                 "to a version that exports mcp.client.streamable_http."
             )
-        kwargs: dict[str, Any] = {"headers": headers, "auth": auth}
-        if client_factory is not None:
-            kwargs["httpx_client_factory"] = client_factory
-        async with streamablehttp_client(url, **kwargs) as (read, write, _):
-            async with ClientSession(read, write, **self._session_kwargs()) as session:
-                await self._serve(session)
+        client_factory = make_http_client_factory(self.name, self._config)
+        http_client = client_factory(headers=headers, timeout=None, auth=auth)
+        async with http_client:
+            transport = streamable_http_client(url, http_client=http_client)
+            await self._run_client_transport(transport)
 
     async def _run_sse(self, url, headers, auth, client_factory) -> None:
         if not _MCP_SSE_AVAILABLE or sse_client is None:
@@ -753,12 +758,45 @@ class MCPServerTask:
         kwargs: dict[str, Any] = {"headers": headers, "auth": auth}
         if client_factory is not None:
             kwargs["httpx_client_factory"] = client_factory
-        async with sse_client(url, **kwargs) as (read, write):
-            async with ClientSession(read, write, **self._session_kwargs()) as session:
-                await self._serve(session)
+        await self._run_client_transport(sse_client(url, **kwargs), force_legacy=True)
+
+    def _protocol_mode(self) -> str:
+        mode = str(self._config.get("protocol") or "auto").lower()
+        if mode not in {"auto", "stateless", "legacy"}:
+            raise ValueError(
+                f"MCP server '{self.name}': protocol must be auto, stateless, or legacy"
+            )
+        return mode
+
+    async def _run_client_transport(self, transport: Any, *, force_legacy: bool = False) -> None:
+        """Negotiate one SDK transport and serve its connected session."""
+        mode = "legacy" if force_legacy else self._protocol_mode()
+        session_kwargs = self._session_kwargs()
+
+        if mode == "stateless":
+            async with transport as (read, write):
+                async with ClientSession(read, write, **session_kwargs) as session:
+                    await asyncio.wait_for(session.discover(), timeout=self.connect_timeout)
+                    await self._serve_connected(session)
+            return
+
+        assert Client is not None
+        async with Client(transport, mode=mode, **session_kwargs) as connected:
+            await self._serve_connected(connected.session)
 
     async def _serve(self, session: Any) -> None:
-        """Initialize, discover, signal ready, then serve until shutdown.
+        """Serve an already-created legacy session (also used by unit fixtures)."""
+        init_result = await asyncio.wait_for(
+            session.initialize(),
+            timeout=self.connect_timeout,
+        )
+        await self._serve_connected(
+            session,
+            capabilities=getattr(init_result, "capabilities", None),
+        )
+
+    async def _serve_connected(self, session: Any, capabilities: Any = None) -> None:
+        """Discover tools and supervise a negotiated session until it ends.
 
         Shared by all transports. A keepalive failure or a transport error
         reported by an in-flight tool call is propagated to the connection
@@ -767,16 +805,12 @@ class MCPServerTask:
         assert self.connection_failed_event is not None
         self.connection_failed_event.clear()
         self._connection_failure = None
-        init_result = await asyncio.wait_for(
-            session.initialize(),
-            timeout=self.connect_timeout,
-        )
-        self.capabilities = getattr(init_result, "capabilities", None)
+        self.capabilities = capabilities or getattr(session, "server_capabilities", None)
         self.session = session
         await self._discover()
         if self._registry is not None:
             _reregister_server_tools(self)
-        self._mark_connected()
+        self._mark_connected(session)
 
         assert self.shutdown_event is not None
         shutdown_wait = asyncio.create_task(self.shutdown_event.wait())
@@ -853,6 +887,10 @@ class MCPServerTask:
         async def _handler(message: Any) -> None:
             try:
                 if isinstance(message, Exception):
+                    from flowly.mcp.lifecycle import is_transport_failure
+
+                    if is_transport_failure(message):
+                        self.report_transport_failure(message, self.session)
                     return
                 if not (_MCP_NOTIFICATIONS and isinstance(message, ServerNotification)):
                     return

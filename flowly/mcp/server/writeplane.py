@@ -79,7 +79,7 @@ def _request(method: str, path: str, payload: dict | None = None) -> dict:
 
 
 def register_write_tools(mcp: Any, dumps: Callable[[Any], str]) -> None:
-    """Register the gateway-backed write tools on the FastMCP server."""
+    """Register the gateway-backed write tools on the MCP server."""
 
     @mcp.tool()
     def messages_send(target: str, message: str) -> str:

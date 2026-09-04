@@ -1,4 +1,4 @@
-"""FastMCP server wiring for ``flowly mcp serve``.
+"""MCP server wiring for ``flowly mcp serve``.
 
 Registers the read-plane tools (always) and, when ``allow_writes`` is set,
 the gateway-backed write tools (Faz 3c). Runs on stdio.
@@ -11,13 +11,12 @@ import logging
 import sys
 from typing import Any
 
-
 logger = logging.getLogger(__name__)
 
 
 _MCP_SERVER_AVAILABLE = False
 try:
-    from mcp.server.fastmcp import FastMCP  # type: ignore
+    from mcp.server.mcpserver import MCPServer  # type: ignore
     _MCP_SERVER_AVAILABLE = True
 except ImportError:
     pass
@@ -28,7 +27,7 @@ def _dumps(obj: Any) -> str:
 
 
 def create_server(*, allow_writes: bool = False) -> Any:
-    """Build the Flowly FastMCP server with read (and optional write) tools."""
+    """Build the Flowly MCP server with read (and optional write) tools."""
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
             "MCP server mode requires the 'mcp' package. "
@@ -36,11 +35,13 @@ def create_server(*, allow_writes: bool = False) -> Any:
         )
 
     from flowly.mcp.server.readplane import (
-        get_session_reader,
         channels_list as _channels_list,
     )
+    from flowly.mcp.server.readplane import (
+        get_session_reader,
+    )
 
-    mcp = FastMCP(
+    mcp = MCPServer(
         "flowly",
         instructions=(
             "Flowly conversation bridge. Read conversation history across "

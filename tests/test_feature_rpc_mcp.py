@@ -88,6 +88,9 @@ def test_list_shape_is_camelcase(isolated_home):
         "lastError",
         "lastFailureAt",
         "stateChangedAt",
+        "protocolMode",
+        "protocolEra",
+        "protocolVersion",
     ):
         assert key in demo
     assert demo["source"] == "configured"

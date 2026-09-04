@@ -190,3 +190,14 @@ def test_runtime_health_snapshot_is_public_and_credential_free(monkeypatch):
     assert health["state"] == "parked"
     assert "config" not in health
     assert "secret" not in str(health)
+
+
+@pytest.mark.asyncio
+async def test_transport_exception_notification_wakes_supervisor():
+    task = client.MCPServerTask("notified")
+    task.connection_failed_event = asyncio.Event()
+    task.session = object()
+
+    await task._make_message_handler()(ConnectionError("stream closed"))
+
+    assert task.connection_failed_event.is_set() is True

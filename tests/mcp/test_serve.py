@@ -123,7 +123,7 @@ def test_server_builds_with_read_tools(home_with_sessions):
 
 
 def test_registered_tools_are_callable(home_with_sessions):
-    """Regression: invoke each read tool THROUGH the FastMCP wrapper, not
+    """Regression: invoke each read tool through the SDK wrapper, not
     just the readplane helper. Catches name-collision bugs like a tool
     function shadowing its imported helper (channels_list → infinite
     recursion), which create_server() alone wouldn't surface.
@@ -136,10 +136,9 @@ def test_registered_tools_are_callable(home_with_sessions):
     from flowly.mcp.server.serve import create_server
 
     server = create_server(allow_writes=False)
-    mgr = server._tool_manager
 
     async def _call(name, args):
-        return await mgr.call_tool(name, args)
+        return await server.call_tool(name, args)
 
     # channels_list previously self-recursed; assert it returns real data.
     out = asyncio.run(_call("channels_list", {}))

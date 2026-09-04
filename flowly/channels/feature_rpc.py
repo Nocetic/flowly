@@ -266,6 +266,9 @@ def _mcp_entry_dict(e) -> dict:
         "lastError": e.last_error,
         "lastFailureAt": e.last_failure_at,
         "stateChangedAt": e.state_changed_at,
+        "protocolMode": e.protocol_mode,
+        "protocolEra": e.protocol_era,
+        "protocolVersion": e.protocol_version,
     }
 
 

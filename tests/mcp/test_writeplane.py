@@ -176,13 +176,13 @@ def test_api_file_roundtrip_and_perms(isolated_home):
 
 def test_register_write_tools_adds_three():
     try:
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
     except ImportError:
         pytest.skip("mcp SDK not installed")
     import json
-    mcp = FastMCP("t")
+    mcp = MCPServer("t")
     writeplane.register_write_tools(mcp, lambda o: json.dumps(o))
-    # FastMCP stores tools; confirm our three are present.
+    # The SDK stores tools; confirm our three are present.
     names = set()
     mgr = getattr(mcp, "_tool_manager", None)
     if mgr and hasattr(mgr, "list_tools"):

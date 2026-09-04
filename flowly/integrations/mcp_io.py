@@ -58,6 +58,9 @@ class MCPServerEntry:
     last_error: str | None = None
     last_failure_at: float | None = None
     state_changed_at: float | None = None
+    protocol_mode: str | None = None
+    protocol_era: str | None = None
+    protocol_version: str | None = None
 
     @property
     def needs_secrets(self) -> bool:
@@ -155,6 +158,9 @@ def list_mcp_servers() -> list[MCPServerEntry]:
             last_error=runtime_error,
             last_failure_at=runtime.get("lastFailureAt"),
             state_changed_at=runtime.get("stateChangedAt"),
+            protocol_mode=runtime.get("protocolMode"),
+            protocol_era=runtime.get("protocolEra"),
+            protocol_version=runtime.get("protocolVersion"),
         ))
 
     # Catalog rows for entries not already configured.

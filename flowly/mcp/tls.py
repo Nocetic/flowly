@@ -9,7 +9,7 @@ Two config knobs, both optional:
   Accepts a single combined PEM path, separate cert + key paths, or a
   ``[cert, key]`` / ``[cert, key, password]`` list form.
 
-:func:`make_http_client_factory` returns an ``httpx`` client factory
+:func:`make_http_client_factory` returns an ``httpx2`` client factory
 matching the MCP SDK's ``McpHttpClientFactory`` signature, with the
 resolved ``cert`` / ``verify`` baked in. It mirrors the SDK's defaults
 (``follow_redirects=True``, 30s/300s timeouts) so behavior only differs
@@ -123,7 +123,7 @@ def make_http_client_factory(server_name: str, cfg: dict) -> Any:
     ``(headers, timeout, auth) -> httpx.AsyncClient`` and mirrors the
     SDK's defaults so only the TLS behavior differs.
     """
-    import httpx
+    import httpx2
 
     cert = resolve_client_cert(server_name, cfg)
     verify = resolve_verify(server_name, cfg)
@@ -133,13 +133,13 @@ def make_http_client_factory(server_name: str, cfg: dict) -> Any:
         if cert is not None:
             kwargs["cert"] = cert
         if timeout is None:
-            kwargs["timeout"] = httpx.Timeout(30.0, read=300.0)
+            kwargs["timeout"] = httpx2.Timeout(30.0, read=300.0)
         else:
             kwargs["timeout"] = timeout
         if headers is not None:
             kwargs["headers"] = headers
         if auth is not None:
             kwargs["auth"] = auth
-        return httpx.AsyncClient(**kwargs)
+        return httpx2.AsyncClient(**kwargs)
 
     return _factory

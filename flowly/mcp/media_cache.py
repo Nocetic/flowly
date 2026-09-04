@@ -19,7 +19,6 @@ import mimetypes
 import secrets
 from pathlib import Path
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -44,7 +43,9 @@ def cache_image_block(block: object) -> str | None:
     MIME, decode failure). Never raises.
     """
     data = getattr(block, "data", None)
-    mime_type = getattr(block, "mimeType", None)
+    mime_type = getattr(block, "mime_type", None)
+    if mime_type is None:
+        mime_type = getattr(block, "mimeType", None)
     normalized = str(mime_type or "").split(";", 1)[0].strip().lower()
     if data is None or not normalized.startswith("image/"):
         return None

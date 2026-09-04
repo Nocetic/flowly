@@ -111,10 +111,10 @@ def test_needs_custom_tls_when_cert_set():
 
 
 def test_factory_builds_client_with_verify_off():
-    import httpx
+    import httpx2
     factory = make_http_client_factory("srv", {"ssl_verify": False})
     client = factory(headers={"X": "1"}, timeout=None, auth=None)
-    assert isinstance(client, httpx.AsyncClient)
+    assert isinstance(client, httpx2.AsyncClient)
 
 
 def test_factory_with_cert_is_callable(cert_files):

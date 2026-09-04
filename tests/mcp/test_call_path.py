@@ -10,7 +10,6 @@ Skipped if the ``mcp`` SDK isn't installed.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import sys
 from pathlib import Path
@@ -33,11 +32,10 @@ _PNG_B64 = (
 )
 
 _IMAGE_SERVER = f"""
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.utilities.types import Image
+from mcp.server.mcpserver import Image, MCPServer
 import base64
 
-mcp = FastMCP("flowly-img")
+mcp = MCPServer("flowly-img")
 
 @mcp.tool()
 def shot() -> Image:
@@ -177,3 +175,49 @@ def test_legit_error_keyed_data_does_not_trip_breaker(tmp_path, isolated_home):
         # The error-keyed payload comes back as tool data, not a failure.
         assert "result" in out
     assert client._server_error_counts.get("img", 0) == 0
+
+
+def test_auto_mode_negotiates_current_stateless_protocol(tmp_path, isolated_home):
+    reg = _discover(tmp_path, isolated_home)
+    server_task = reg.tools["mcp_img_shot"]._server_task
+    health = server_task.health_snapshot()
+
+    assert health["protocolMode"] == "auto"
+    assert health["protocolEra"] == "modern"
+    assert health["protocolVersion"] == "2026-07-28"
+
+
+def test_explicit_legacy_mode_preserves_older_servers(tmp_path, isolated_home):
+    from flowly.mcp import discover_mcp_tools
+
+    script = tmp_path / "legacy.py"
+    script.write_text(_IMAGE_SERVER)
+    config = _cfg(script)
+    config["protocol"] = "legacy"
+    reg = _Registry()
+
+    discover_mcp_tools(servers={"legacy": config}, tool_registry=reg)
+
+    server_task = reg.tools["mcp_legacy_shot"]._server_task
+    health = server_task.health_snapshot()
+    assert health["protocolMode"] == "legacy"
+    assert health["protocolEra"] == "legacy"
+    assert health["protocolVersion"] == "2025-11-25"
+
+
+def test_strict_stateless_mode_requires_modern_discovery(tmp_path, isolated_home):
+    from flowly.mcp import discover_mcp_tools
+
+    script = tmp_path / "stateless.py"
+    script.write_text(_IMAGE_SERVER)
+    config = _cfg(script)
+    config["protocol"] = "stateless"
+    reg = _Registry()
+
+    discover_mcp_tools(servers={"stateless": config}, tool_registry=reg)
+
+    server_task = reg.tools["mcp_stateless_shot"]._server_task
+    health = server_task.health_snapshot()
+    assert health["protocolMode"] == "stateless"
+    assert health["protocolEra"] == "modern"
+    assert health["protocolVersion"] == "2026-07-28"

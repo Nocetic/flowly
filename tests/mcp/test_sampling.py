@@ -118,3 +118,28 @@ def test_provider_error_returns_errordata(monkeypatch):
     h = sampling.SamplingHandler("srv", {"enabled": True, "model": "x/y"})
     result = asyncio.run(h(None, _params([("user", "hi")])))
     assert "LLM call failed" in getattr(result, "message", "")
+
+
+def test_current_sdk_snake_case_request_fields(patched_provider):
+    from mcp.types import CreateMessageRequestParams, SamplingMessage, TextContent
+
+    params = CreateMessageRequestParams(
+        messages=[
+            SamplingMessage(
+                role="user",
+                content=TextContent(type="text", text="hello from current SDK"),
+            ),
+        ],
+        max_tokens=321,
+        system_prompt="system context",
+    )
+    handler = sampling.SamplingHandler("srv", {"enabled": True, "model": "x/y"})
+
+    result = asyncio.run(handler(None, params))
+
+    assert result.content.text == "sampled reply"
+    assert patched_provider.calls[0]["max_tokens"] == 321
+    assert patched_provider.calls[0]["messages"] == [
+        {"role": "system", "content": "system context"},
+        {"role": "user", "content": "hello from current SDK"},
+    ]

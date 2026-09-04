@@ -2,7 +2,7 @@
 
 The MCP Python SDK's ``stdio_client(server, errlog=...)`` parameter
 defaults to ``sys.stderr``, which means anything the subprocess writes
-to its stderr stream (FastMCP startup banners, JSON debug logs from
+to its stderr stream (MCP startup banners, JSON debug logs from
 non-spec-compliant servers, npm warnings, etc.) lands directly on the
 parent terminal. Inside the Textual TUI, that corrupts the screen and
 can wedge the input loop.

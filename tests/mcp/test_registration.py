@@ -1,7 +1,7 @@
 """Tests for MCP-tool registration into Flowly's ``ToolRegistry``.
 
 This is an integration test that spins up an actual stdio MCP server
-implemented with FastMCP, runs discovery, and verifies:
+implemented with the SDK server, runs discovery, and verifies:
 
 * Tools are registered under the ``mcp_{server}_{tool}`` naming scheme.
 * The OpenAI function-schema returned by the registry has the
@@ -41,9 +41,9 @@ pytestmark = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 _FAKE_SERVER_SOURCE = """
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("flowly-test")
+mcp = MCPServer("flowly-test")
 
 @mcp.tool()
 def echo(message: str) -> str:

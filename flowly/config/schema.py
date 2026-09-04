@@ -1149,7 +1149,9 @@ class MCPServerConfig(BaseModel):
     timeout: float = 120.0  # per-tool-call timeout in seconds
     connect_timeout: float = 60.0  # initial connection timeout
     tools: MCPServerToolsFilter = Field(default_factory=MCPServerToolsFilter)
-    # Declared now so users can pre-populate; Faz 2 reads them.
+    # ``auto`` probes modern discovery then falls back to the legacy handshake.
+    # ``stateless`` requires modern discovery; ``legacy`` forces initialize.
+    protocol: Literal["auto", "stateless", "legacy"] = "auto"
     transport: Literal["auto", "stdio", "http", "sse"] = "auto"
     auth: Literal["", "oauth"] = ""
     scope: str = ""  # optional OAuth scope string (space-separated)

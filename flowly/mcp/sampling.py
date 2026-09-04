@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _SAMPLING_TYPES = False
 try:
-    from mcp.types import CreateMessageResult, TextContent, ErrorData  # type: ignore
+    from mcp.types import CreateMessageResult, ErrorData, TextContent  # type: ignore
     _SAMPLING_TYPES = True
 except ImportError:  # pragma: no cover
     pass
@@ -38,6 +38,12 @@ def _safe_int(value: Any, default: int, minimum: int = 0) -> int:
         return max(int(value), minimum)
     except (TypeError, ValueError):
         return default
+
+
+def _field(obj: Any, snake_name: str, wire_name: str, default: Any = None) -> Any:
+    if hasattr(obj, snake_name):
+        return getattr(obj, snake_name)
+    return getattr(obj, wire_name, default)
 
 
 class SamplingHandler:
@@ -69,7 +75,7 @@ class SamplingHandler:
     def _resolve_model(self, params: Any) -> str | None:
         if self.model_override:
             return self.model_override
-        prefs = getattr(params, "modelPreferences", None)
+        prefs = _field(params, "model_preferences", "modelPreferences")
         hints = getattr(prefs, "hints", None) if prefs else None
         if hints:
             for hint in hints:
@@ -83,7 +89,7 @@ class SamplingHandler:
     @staticmethod
     def _to_provider_messages(params: Any) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
-        system = getattr(params, "systemPrompt", None)
+        system = _field(params, "system_prompt", "systemPrompt")
         if system:
             messages.append({"role": "system", "content": str(system)})
         for msg in getattr(params, "messages", []) or []:
@@ -120,7 +126,7 @@ class SamplingHandler:
             )
 
         max_tokens = min(
-            _safe_int(getattr(params, "maxTokens", self.max_tokens_cap),
+            _safe_int(_field(params, "max_tokens", "maxTokens", self.max_tokens_cap),
                       self.max_tokens_cap, minimum=1),
             self.max_tokens_cap,
         )
@@ -147,25 +153,27 @@ class SamplingHandler:
             role="assistant",
             content=TextContent(type="text", text=text),
             model=model or "flowly",
-            stopReason="endTurn",
+            stop_reason="endTurn",
         )
 
 
 def _build_provider(model: str | None) -> Any:
-    """Build an OpenRouter provider from the active Flowly config."""
+    """Build the user's active provider without rewriting their model."""
     from flowly.config.loader import load_config
-    from flowly.providers.openrouter_provider import OpenRouterProvider
+    from flowly.integrations.active_provider import resolve_active_provider
+    from flowly.providers.factory import build_provider
 
     config = load_config()
-    api_key = config.get_api_key()
-    if not api_key:
-        raise RuntimeError("no API key configured")
-    return OpenRouterProvider(
-        api_key=api_key,
-        api_base=config.get_api_base(),
+    active = resolve_active_provider(config)
+    if active is None:
+        raise RuntimeError("no active provider configured")
+    provider_cfg = getattr(config.providers, active.key, None)
+    fallback_keys = list(getattr(provider_cfg, "fallback_keys", []) or [])
+    return build_provider(
+        active,
         default_model=model or config.agents.defaults.model,
-        fallback_keys=config.get_fallback_keys(),
-        provider_name=config.get_active_provider_name(),
+        fallback_keys=fallback_keys,
+        config=config,
     )
 
 

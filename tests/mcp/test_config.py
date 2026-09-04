@@ -198,6 +198,19 @@ def test_lifecycle_policy_defaults_are_safe_and_round_trip(isolated_home: Path):
     assert load_config().mcp_servers["durable"].lifecycle.parked_probe_interval == 120.0
 
 
+@pytest.mark.parametrize("protocol", ["auto", "stateless", "legacy"])
+def test_protocol_mode_round_trips(protocol, isolated_home: Path):
+    cfg = Config()
+    cfg.mcp_servers = {"mode": MCPServerConfig(command="x", protocol=protocol)}
+    save_config(cfg)
+    assert load_config().mcp_servers["mode"].protocol == protocol
+
+
+def test_unknown_protocol_mode_is_rejected():
+    with pytest.raises(ValueError):
+        MCPServerConfig(command="x", protocol="guess")
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

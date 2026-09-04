@@ -2,7 +2,7 @@
 
 These functions open the JSONL sessions, the SQLite FTS index, and the
 config directly — no running gateway required. They return plain
-JSON-serializable dicts so the FastMCP layer (and tests) can use them
+JSON-serializable dicts so the MCP server layer (and tests) can use them
 without any MCP dependency.
 
 Session keys are ``channel:chat_id`` (e.g. ``telegram:123``). "platform"
