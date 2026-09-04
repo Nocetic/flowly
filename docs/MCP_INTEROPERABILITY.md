@@ -12,7 +12,7 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
   messages, without arbitrary filesystem access or losing archive history.
 - [x] External clients can discover known channel targets with exact session
   addresses and configured enabled state (not a promise of live delivery).
-- [ ] The coding-agent tool bridge exposes browser, vision/image, speech, and
+- [ ] The coding-agent tool bridge exposes vision/image, speech, and
   task-board capabilities where available, preserving authoritative schemas and
   execution permissions. Stateful tools reach the owning live runtime.
 - [x] MCP server requests for user input/consent reach the owning surface;
@@ -28,6 +28,13 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
 - [ ] Real transport tests exercise the public client/server paths, permission
   boundaries, concurrency and lifecycle failures. The full regression suite
   passes and each acceptance item links to its evidence.
+
+## Explicit scope exclusions
+
+Per the user's scope decision, browser automation through the external-agent
+MCP bridge is excluded from this goal. Existing built-in browser functionality
+is unchanged. Web search/retrieval and non-browser image analysis/generation,
+speech and task-board interoperability remain in scope.
 
 ## Verification record
 
