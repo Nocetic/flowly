@@ -1618,6 +1618,7 @@ class SessionManager:
                 # Write metadata first
                 metadata_line = {
                     "_type": "metadata",
+                    "session_key": session.key,
                     "created_at": session.created_at.isoformat(),
                     "updated_at": session.updated_at.isoformat(),
                     "metadata": session.metadata
@@ -1732,7 +1733,7 @@ class SessionManager:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
                             sessions.append({
-                                "key": path.stem.replace("_", ":"),
+                                "key": data.get("session_key") or path.stem.replace("_", ":", 1),
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
                                 # Auto-generated descriptive title (see

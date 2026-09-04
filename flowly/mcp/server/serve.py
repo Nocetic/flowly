@@ -154,6 +154,14 @@ def create_server(
         **server_kwargs,
     )
     reader = get_session_reader()
+    # Construct on first use, so listing tools alone does not create state.
+    from functools import lru_cache
+
+    @lru_cache(maxsize=1)
+    def event_journal():
+        from flowly.mcp.server.events import EventJournal
+        return EventJournal(reader)
+
     read_annotations = mcp_types.ToolAnnotations(
         readOnlyHint=True,
         destructiveHint=False,
@@ -219,6 +227,37 @@ def create_server(
     def channels_list(platform: str | None = None) -> Any:
         """List configured channels and whether each is enabled."""
         return _result(_channels_list(platform))
+
+    @mcp.tool(annotations=read_annotations, structured_output=False)
+    def attachments_fetch(session_key: str, message_id: str) -> Any:
+        """Describe a message's attachments using its message_id from messages_read.
+
+        Returns metadata only; local paths and raw file bytes are not exposed.
+        """
+        return _result(reader.attachments_fetch(session_key, message_id))
+
+    @mcp.tool(annotations=read_annotations, structured_output=False)
+    def events_poll(
+        after_cursor: str | None = None, session_key: str | None = None, limit: int = 20,
+    ) -> Any:
+        """Poll conversation events after an opaque cursor. Omit cursor to start now.
+
+        Keep next_cursor for the next poll, including across reconnects. Use the
+        same session filter. CURSOR_EXPIRED means retained events were lost:
+        refresh history before resuming with the returned cursor.
+        """
+        return _result(event_journal().poll(after_cursor, session_key, limit))
+
+    @mcp.tool(annotations=read_annotations, structured_output=False)
+    async def events_wait(
+        after_cursor: str | None = None, session_key: str | None = None, timeout_ms: int = 30_000,
+    ) -> Any:
+        """Wait for conversation events, at most five minutes. Cancellation stops waiting.
+
+        Shares cursor semantics with events_poll. Omit cursor to wait for new
+        events from now. A timeout returns the cursor to resume from.
+        """
+        return _result(await event_journal().wait(after_cursor, session_key, timeout_ms))
 
     # -- write plane (Faz 3c) -------------------------------------------
     if allow_writes:

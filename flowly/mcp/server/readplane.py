@@ -17,13 +17,11 @@ import json
 import logging
 import threading
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
-
 
 logger = logging.getLogger(__name__)
 
-# Per-message content cap so a serve client can't pull unbounded text.
-_CONTENT_CAP = 4000
 _MAX_CONVERSATION_LIMIT = 200
 _MAX_MESSAGE_LIMIT = 200
 _MAX_SEARCH_LIMIT = 100
@@ -128,6 +126,8 @@ class SessionReader:
     def __init__(self) -> None:
         self._manager: Any | None = None
         self._indexer: Any | None = None
+        self._indexed_sources: dict[str, tuple] = {}
+        self._public_metadata: dict[str, dict] = {}
         # MCPServer executes synchronous tools in a worker pool. The SQLite
         # connection therefore permits cross-thread use, while this lock keeps
         # each compound read/rebuild operation serialized.
@@ -146,13 +146,59 @@ class SessionReader:
             home = get_flowly_home()
             self._manager = SessionManager(workspace=home)
             try:
-                indexer = SessionIndexer(check_same_thread=False)
-                indexer.rebuild_from_sessions_dir(self._manager.sessions_dir)
-                self._manager._indexer = indexer
-                self._indexer = indexer
+                # A public-only index must not mutate the agent's shared index
+                # or retain withdrawn/internal rows from an earlier snapshot.
+                self._indexer = SessionIndexer(Path(":memory:"), check_same_thread=False)
             except Exception as exc:  # FTS optional — degrade to manager-only
                 logger.debug("MCP serve: session indexer unavailable: %s", exc)
                 self._indexer = None
+
+    def _refresh_index(self) -> None:
+        """Reconcile changed archives, including writers in other processes.
+
+        Called under the reader lock. Only the metadata/stat pass repeats for
+        unchanged sessions; full archives are projected on actual changes.
+        """
+        self._ensure()
+        if self._indexer is None:
+            return
+        current = {row["key"]: row for row in self._manager.list_sessions()}
+        for key in self._indexed_sources.keys() - current.keys():
+            self._indexer.delete_session(key)
+            del self._indexed_sources[key]
+            self._public_metadata.pop(key, None)
+        for key in current:
+            signature = self.source_signature(key)
+            if self._indexed_sources.get(key) == signature:
+                continue
+            messages = self.read_messages(key, content_limit=None)
+            if messages is None or signature != self.source_signature(key):
+                # Do not return old data while an archive is being rewritten.
+                self._indexer.delete_session(key)
+                self._indexed_sources.pop(key, None)
+                self._public_metadata.pop(key, None)
+                continue
+            self._indexer.delete_session(key)
+            rows = [dict(message, _event_id=message["message_id"], _event_seq=i + 1)
+                    for i, message in enumerate(messages)]
+            self._indexer.index_archive(key, rows)
+            self._indexed_sources[key] = signature
+            self._public_metadata[key] = {
+                "key": key, "created_at": current[key].get("created_at") or "",
+                "updated_at": current[key].get("updated_at") or "",
+                "msg_count": len(messages),
+                "preview": next((m["content"][:200] for m in messages if m["role"] == "user"), ""),
+            }
+
+    def source_signature(self, key: str) -> tuple:
+        parts = []
+        for path in (self._manager._get_session_path(key), self._manager._get_full_path(key)):
+            try:
+                stat = path.stat()
+                parts.append((stat.st_ino, stat.st_mtime_ns, stat.st_size))
+            except FileNotFoundError:
+                parts.append(None)
+        return tuple(parts)
 
     # -- tools ----------------------------------------------------------
 
@@ -182,10 +228,10 @@ class SessionReader:
         assert offset is not None
 
         with self._lock:
-            self._ensure()
+            self._refresh_index()
             rows: list[dict[str, Any]]
             if self._indexer is not None:
-                rows = self._indexer.list_recent(limit=_MAX_CONVERSATION_SCAN)
+                rows = list(self._public_metadata.values())
             else:
                 rows = self._manager.list_sessions()  # type: ignore[union-attr]
 
@@ -228,10 +274,10 @@ class SessionReader:
         if key is None:
             return {"error": "session_key is required and must be a valid string"}
         with self._lock:
-            self._ensure()
+            self._refresh_index()
             meta = None
             if self._indexer is not None:
-                meta = self._indexer.get_session_meta(key)
+                meta = self._public_metadata.get(key)
             if meta is None:
                 session = self._manager._load(key)  # type: ignore[union-attr]
                 if session is None:
@@ -266,30 +312,9 @@ class SessionReader:
 
         with self._lock:
             self._ensure()
-            session = self._manager._load(key)  # type: ignore[union-attr]
-        if session is None:
+            rendered = self.read_messages(key)
+        if rendered is None:
             return {"error": f"Conversation not found: {key}"}
-
-        rendered: list[dict[str, Any]] = []
-        for idx, msg in enumerate(session.messages):
-            role = msg.get("role", "")
-            if role not in {"user", "assistant"}:
-                continue
-            text = _extract_text(msg.get("content"))
-            if not text:
-                continue
-            entry = {
-                "index": idx,
-                "role": role,
-                "content": text[:_CONTENT_CAP],
-                "timestamp": msg.get("timestamp", ""),
-            }
-            if len(text) > _CONTENT_CAP:
-                entry["contentTruncated"] = True
-                entry["originalChars"] = len(text)
-            if msg.get("event_id"):
-                entry["eventId"] = msg["event_id"]
-            rendered.append(entry)
 
         total = len(rendered)
         end = max(0, total - offset)
@@ -313,6 +338,43 @@ class SessionReader:
             "pagination": pagination,
         }
 
+    def read_messages(
+        self, key: str, *, content_limit: int | None = 4000,
+    ) -> list[dict[str, Any]] | None:
+        """Read durable visible history afresh, bypassing stale process caches."""
+        from flowly.mcp.server.projection import messages_from_rows
+
+        with self._lock:
+            self._ensure()
+            path = self._manager._get_session_path(key)
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    metadata = json.loads(handle.readline())
+                canonical_key = metadata.get("session_key") or path.stem.replace("_", ":", 1)
+                if canonical_key != key:
+                    return None
+            except (OSError, ValueError, AttributeError):
+                return None
+            session = self._manager._load(key)
+            if session is None:
+                return None
+            rows = self._manager._read_full_rows(key)
+            return messages_from_rows(rows if rows else session.messages, content_limit=content_limit)
+
+    def attachments_fetch(self, session_key: str, message_id: str) -> dict:
+        key = _valid_session_key(session_key)
+        if key is None or not isinstance(message_id, str) or not message_id:
+            return {"error": "session_key and message_id are required"}
+        messages = self.read_messages(key)
+        if messages is None:
+            return {"error": f"Conversation not found: {key}"}
+        message = next((m for m in messages if m["message_id"] == message_id), None)
+        if message is None:
+            return {"error": "Message not found in this conversation"}
+        media = message.get("attachments", [])
+        return {"session_key": key, "message_id": message_id,
+                "count": len(media), "attachments": media}
+
     def messages_search(
         self,
         query: str,
@@ -335,7 +397,7 @@ class SessionReader:
         assert offset is not None
 
         with self._lock:
-            self._ensure()
+            self._refresh_index()
             if self._indexer is None:
                 return {"error": "Full-text search unavailable (indexer not initialized)"}
             hits = self._indexer.search(normalized_query, limit=offset + bounded + 1)
@@ -382,7 +444,7 @@ def get_session_reader() -> SessionReader:
 
 
 def channels_list(platform: str | None = None) -> dict:
-    """Enumerate configured channels from config (no gateway needed)."""
+    """Enumerate channel configuration and known addressable conversations."""
     from flowly.config.loader import load_config
 
     config = load_config()
@@ -395,4 +457,15 @@ def channels_list(platform: str | None = None) -> dict:
         if platform and name.lower() != platform.lower():
             continue
         out.append({"platform": name, "enabled": bool(getattr(cfg, "enabled", False))})
-    return {"count": len(out), "channels": out}
+    reader = get_session_reader()
+    reader._ensure()
+    enabled = {entry["platform"]: entry["enabled"] for entry in out}
+    targets = []
+    for row in reader._manager.list_sessions():
+        key = row["key"]
+        plat = _platform_of(key)
+        if plat not in enabled:
+            continue
+        targets.append({"target": key, "platform": plat, "enabled": enabled[plat],
+                        "name": row.get("title") or key.split(":", 1)[-1]})
+    return {"count": len(out), "channels": out, "targets": targets}

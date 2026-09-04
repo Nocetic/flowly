@@ -90,7 +90,7 @@ def test_http_requires_bearer_auth(authenticated_flowly_server):
 
 
 def test_current_client_discovers_and_calls_flowly_over_http(
-    authenticated_flowly_server,
+    authenticated_flowly_server, tmp_path,
 ) -> None:
     from flowly.mcp import discover_mcp_tools, get_mcp_server_health
 
@@ -110,8 +110,23 @@ def test_current_client_discovers_and_calls_flowly_over_http(
         tool_registry=registry,
     )
 
-    assert len(names) == 5
+    assert {"mcp_bridge_events_poll", "mcp_bridge_events_wait", "mcp_bridge_attachments_fetch"} <= set(names)
     assert "mcp_bridge_channels_list" in names
     result = json.loads(asyncio.run(registry.tools["mcp_bridge_channels_list"].execute()))
     assert result["structuredContent"]["count"] >= 1
     assert get_mcp_server_health()["bridge"]["protocolEra"] == "modern"
+    from flowly.session.manager import SessionManager
+
+    async def events_round_trip():
+        head = json.loads(await registry.tools["mcp_bridge_events_poll"].execute())["structuredContent"]
+        waiter = asyncio.create_task(registry.tools["mcp_bridge_events_wait"].execute(
+            after_cursor=head["next_cursor"], timeout_ms=3000,
+        ))
+        manager = SessionManager(tmp_path)
+        session = manager.get_or_create("web:http_events")
+        session.add_message("user", "HTTP live event")
+        manager.save(session)
+        result = json.loads(await asyncio.wait_for(waiter, 5))
+        assert result["structuredContent"]["events"][0]["content"] == "HTTP live event"
+
+    asyncio.run(events_round_trip())

@@ -233,7 +233,7 @@ def test_read_tools_advertise_safety_annotations(home_with_sessions):
     from flowly.mcp.server.serve import create_server
 
     tools = asyncio.run(create_server(allow_writes=False).list_tools())
-    assert len(tools) == 5
+    assert {"events_poll", "events_wait", "attachments_fetch"} <= {tool.name for tool in tools}
     for tool in tools:
         assert tool.annotations is not None
         assert tool.annotations.read_only_hint is True
