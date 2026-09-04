@@ -1797,7 +1797,15 @@ Respond to the user now:"""
     except Exception:
         pass
 
-    from flowly.profile import current_profile_name
+    from flowly.profile import current_profile_name, refresh_roster_index
+
+    # Only the primary can read every profile, so it is the only one that can
+    # publish what each bot is called. Do it on the way up as well as on every
+    # change: an install that predates the index would otherwise have to wait
+    # for somebody to create or rename a bot before its bots could address one
+    # another by name.
+    if current_profile_name() == "default":
+        refresh_roster_index()
 
     gateway_server = GatewayServer(
         host=effective_host,
