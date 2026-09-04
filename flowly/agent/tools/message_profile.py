@@ -68,9 +68,16 @@ class MessageProfileTool(Tool):
             return "Error: message is required."
         if len(content) > 32_000:
             return "Error: profile message exceeds 32,000 characters."
+        # The reader asked for "Friday", so the model will say "Friday". Take
+        # the name and carry the id, rather than failing a correct request on
+        # the one name nobody outside this process uses. A target we cannot
+        # place is passed through untouched: Desktop is the authority on who
+        # may be reached, and inventing a refusal here would only hide its
+        # answer.
+        resolved = _resolve_target(target) or target
         result = await self._gateway.send_profile_message_request(
             request_id=str(uuid.uuid4()),
-            target_profile=target,
+            target_profile=resolved,
             message=content,
         )
         if not isinstance(result, dict):
@@ -79,3 +86,10 @@ class MessageProfileTool(Tool):
             code = str(result.get("error_code") or "PROFILE_MESSAGE_FAILED")
             return f"Error ({code}): {result['error']}"
         return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def _resolve_target(target: str) -> str | None:
+    """The id meant by *target*, which may be an id or a display name."""
+    from flowly.profile import resolve_profile_reference
+
+    return resolve_profile_reference(target)

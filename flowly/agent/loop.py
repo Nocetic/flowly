@@ -8050,7 +8050,8 @@ class AgentLoop:
                     f"Current profile id: {current_profile}",
                     "Available target profiles, as id (name): "
                     + (", ".join(_describe(value) for value in targets) or "none"),
-                    "Address message_profile by the id, never the name.",
+                    "Address message_profile by the id. A display name is "
+                    "accepted and resolved, but an id is never ambiguous.",
                 ]
                 if mentions:
                     lines.append(
