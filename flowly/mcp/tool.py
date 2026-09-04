@@ -71,6 +71,7 @@ async def _run_on_mcp_loop(
     """
     from flowly.mcp.client import (
         _bump_server_error,
+        _release_server_probe,
         _reset_server_error,
         get_mcp_loop,
     )
@@ -79,6 +80,7 @@ async def _run_on_mcp_loop(
 
     loop = get_mcp_loop()
     if loop is None:
+        _bump_server_error(server_name)
         return _error_envelope(
             f"MCP loop is not running (server '{server_name}')"
         )
@@ -99,8 +101,10 @@ async def _run_on_mcp_loop(
         # Caller is cancelling us; cancel the underlying MCP work too so
         # the server isn't left holding the call, then propagate.
         future.cancel()
+        _release_server_probe(server_name)
         raise
     except on_interrupt:
+        _release_server_probe(server_name)
         return _error_envelope("MCP call interrupted: user sent a new message")
     except Exception as exc:
         # A failed request is often the first signal that a long-idle stream
@@ -205,7 +209,9 @@ class MCPTool(Tool):
 
         async def _call(session: Any) -> str:
             timeout = self._server_task.tool_timeout
-            async with self._server_task.rpc_lock:
+            slot = getattr(self._server_task, "tool_call_slot", None)
+            guard = slot() if callable(slot) else self._server_task.rpc_lock
+            async with guard:
                 result = await asyncio.wait_for(
                     session.call_tool(self._remote_name, arguments=kwargs),
                     timeout=timeout,

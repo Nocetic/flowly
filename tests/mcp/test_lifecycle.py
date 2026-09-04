@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -64,6 +65,24 @@ def test_transport_failures_are_classified(exc):
 def test_protocol_application_errors_do_not_force_reconnect():
     assert is_transport_failure(ValueError("invalid tool arguments")) is False
     assert is_transport_failure(RuntimeError("tool execution failed")) is False
+
+
+def test_half_open_breaker_allows_exactly_one_recovery_probe():
+    name = "half-open"
+    client._server_error_counts[name] = client._CIRCUIT_BREAKER_THRESHOLD
+    client._server_breaker_opened_at[name] = (
+        time.monotonic() - client._CIRCUIT_BREAKER_COOLDOWN_SEC - 1
+    )
+    client._server_breaker_probe_inflight.discard(name)
+    try:
+        assert client.circuit_breaker_block_reason(name) is None
+        assert "probe is already in progress" in client.circuit_breaker_block_reason(name)
+        client._release_server_probe(name)
+        assert client.circuit_breaker_block_reason(name) is None
+    finally:
+        client._server_error_counts.pop(name, None)
+        client._server_breaker_opened_at.pop(name, None)
+        client._server_breaker_probe_inflight.discard(name)
 
 
 @pytest.mark.asyncio
@@ -201,3 +220,30 @@ async def test_transport_exception_notification_wakes_supervisor():
     await task._make_message_handler()(ConnectionError("stream closed"))
 
     assert task.connection_failed_event.is_set() is True
+
+
+@pytest.mark.parametrize(("parallel", "expected_peak"), [(False, 1), (True, 2)])
+@pytest.mark.asyncio
+async def test_tool_call_slot_enforces_declared_concurrency(parallel, expected_peak):
+    task = client.MCPServerTask("concurrency")
+    task.rpc_lock = asyncio.Lock()
+    task.tool_call_semaphore = asyncio.Semaphore(2)
+    task.supports_parallel_tool_calls = parallel
+    task.max_parallel_tool_calls = 2
+    active = 0
+    observed_peak = 0
+
+    async def _worker():
+        nonlocal active, observed_peak
+        async with task.tool_call_slot():
+            active += 1
+            observed_peak = max(observed_peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+
+    await asyncio.gather(_worker(), _worker(), _worker())
+    assert observed_peak == expected_peak
+    health = task.health_snapshot()
+    assert health["peakInflightToolCalls"] == expected_peak
+    assert health["inflightToolCalls"] == 0
+    assert health["maxParallelToolCalls"] == expected_peak

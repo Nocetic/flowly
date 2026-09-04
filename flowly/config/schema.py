@@ -1171,6 +1171,7 @@ class MCPServerConfig(BaseModel):
     auth: Literal["", "oauth"] = ""
     scope: str = ""  # optional OAuth scope string (space-separated)
     supports_parallel_tool_calls: bool = False
+    max_parallel_tool_calls: int = Field(default=8, ge=1, le=256)
     # Opt-in (default off): force-kill stdio child processes that appear
     # during this server's spawn and survive teardown. Only useful on
     # Linux where setsid() children can escape cleanup on cancellation.

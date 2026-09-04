@@ -83,7 +83,7 @@ def _quote_key(key: str) -> str:
 # Flowly MCPServerConfig keys with no codex equivalent (dropped, warned).
 _MCP_DROPPED_KEYS = (
     "ssl_verify", "client_cert", "client_key", "transport", "auth", "scope",
-    "supports_parallel_tool_calls", "reap_orphans", "osv_check", "sampling",
+    "supports_parallel_tool_calls", "max_parallel_tool_calls", "reap_orphans", "osv_check", "sampling",
     "tools",
 )
 

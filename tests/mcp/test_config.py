@@ -219,6 +219,29 @@ def test_content_and_pagination_bounds_round_trip(isolated_home: Path):
     assert server["content"]["maxBinaryBytes"] == 2 * 1024 * 1024
 
 
+def test_parallel_call_bounds_round_trip(isolated_home: Path):
+    cfg = Config()
+    cfg.mcp_servers = {
+        "parallel": MCPServerConfig(
+            command="x",
+            supports_parallel_tool_calls=True,
+            max_parallel_tool_calls=16,
+        ),
+    }
+    save_config(cfg)
+    server = json.loads((isolated_home / "config.json").read_text())["mcpServers"]["parallel"]
+    assert server["supportsParallelToolCalls"] is True
+    assert server["maxParallelToolCalls"] == 16
+    reloaded = load_config().mcp_servers["parallel"]
+    assert reloaded.max_parallel_tool_calls == 16
+
+
+@pytest.mark.parametrize("value", [0, 257])
+def test_invalid_parallel_call_bound_is_rejected(value):
+    with pytest.raises(ValueError):
+        MCPServerConfig(command="x", max_parallel_tool_calls=value)
+
+
 @pytest.mark.parametrize("protocol", ["auto", "stateless", "legacy"])
 def test_protocol_mode_round_trips(protocol, isolated_home: Path):
     cfg = Config()

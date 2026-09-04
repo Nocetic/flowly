@@ -146,11 +146,13 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 _breaker_lock = threading.Lock()
 _server_error_counts: dict[str, int] = {}
 _server_breaker_opened_at: dict[str, float] = {}
+_server_breaker_probe_inflight: set[str] = set()
 
 def _bump_server_error(server_name: str) -> None:
     import time
 
     with _breaker_lock:
+        _server_breaker_probe_inflight.discard(server_name)
         count = _server_error_counts.get(server_name, 0) + 1
         _server_error_counts[server_name] = count
         if count >= _CIRCUIT_BREAKER_THRESHOLD:
@@ -159,8 +161,15 @@ def _bump_server_error(server_name: str) -> None:
 
 def _reset_server_error(server_name: str) -> None:
     with _breaker_lock:
+        _server_breaker_probe_inflight.discard(server_name)
         _server_error_counts.pop(server_name, None)
         _server_breaker_opened_at.pop(server_name, None)
+
+
+def _release_server_probe(server_name: str) -> None:
+    """Release a half-open probe without changing breaker accounting."""
+    with _breaker_lock:
+        _server_breaker_probe_inflight.discard(server_name)
 
 
 def circuit_breaker_block_reason(server_name: str) -> str | None:
@@ -179,7 +188,13 @@ def circuit_breaker_block_reason(server_name: str) -> str | None:
         opened_at = _server_breaker_opened_at.get(server_name, 0.0)
         age = time.monotonic() - opened_at
         if age >= _CIRCUIT_BREAKER_COOLDOWN_SEC:
-            return None  # half-open: allow a probe
+            if server_name in _server_breaker_probe_inflight:
+                return (
+                    f"MCP server '{server_name}' recovery probe is already in progress. "
+                    "Do NOT retry this tool yet."
+                )
+            _server_breaker_probe_inflight.add(server_name)
+            return None  # half-open: allow exactly one probe
         remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
     return (
         f"MCP server '{server_name}' is unreachable after {count} consecutive "
@@ -307,6 +322,8 @@ class MCPServerTask:
         self.max_binary_bytes: int = DEFAULT_MAX_BINARY_BYTES
         self.pagination_max_pages: int = 100
         self.pagination_max_items: int = 10_000
+        self.supports_parallel_tool_calls: bool = False
+        self.max_parallel_tool_calls: int = 8
         self.capabilities: Any | None = None
         # When True, an HTTP server configured for OAuth may launch the
         # interactive browser flow. False (agent boot) restricts OAuth to
@@ -319,6 +336,7 @@ class MCPServerTask:
         self.ready: asyncio.Event | None = None
         self.shutdown_event: asyncio.Event | None = None
         self.rpc_lock: asyncio.Lock | None = None
+        self.tool_call_semaphore: asyncio.Semaphore | None = None
         self.error: BaseException | None = None
         # Set by the discovery layer so dynamic tools/list_changed
         # refreshes (D8) can re-register into the live registry.
@@ -341,6 +359,8 @@ class MCPServerTask:
         self._protocol_version = ""
         self._protocol_era = ""
         self._tool_pagination = MCPPageCollection(items=(), pages=0)
+        self._inflight_tool_calls = 0
+        self._peak_inflight_tool_calls = 0
         self.state = MCPConnectionState.IDLE
 
     def is_http(self) -> bool:
@@ -394,6 +414,12 @@ class MCPServerTask:
             "protocolVersion": self._protocol_version,
             "discoveredToolCount": len(self.tools),
             "toolPagination": self._tool_pagination.metadata(),
+            "parallelToolCalls": self.supports_parallel_tool_calls,
+            "maxParallelToolCalls": (
+                self.max_parallel_tool_calls if self.supports_parallel_tool_calls else 1
+            ),
+            "inflightToolCalls": self._inflight_tool_calls,
+            "peakInflightToolCalls": self._peak_inflight_tool_calls,
         }
 
     def report_transport_failure(
@@ -425,6 +451,14 @@ class MCPServerTask:
         )
         self.pagination_max_pages = int(pagination_cfg.get("max_pages", 100))
         self.pagination_max_items = int(pagination_cfg.get("max_items", 10_000))
+        self.supports_parallel_tool_calls = bool(
+            config.get("supports_parallel_tool_calls", False)
+        )
+        self.max_parallel_tool_calls = int(config.get("max_parallel_tool_calls", 8))
+        if not 1 <= self.max_parallel_tool_calls <= 256:
+            raise ValueError(
+                f"MCP server '{self.name}': max_parallel_tool_calls must be between 1 and 256"
+            )
         if not math.isfinite(self.tool_timeout) or self.tool_timeout <= 0:
             raise ValueError(f"MCP server '{self.name}': timeout must be a positive finite number")
         if not math.isfinite(self.connect_timeout) or self.connect_timeout <= 0:
@@ -435,6 +469,7 @@ class MCPServerTask:
         self.shutdown_event = asyncio.Event()
         self.connection_failed_event = asyncio.Event()
         self.rpc_lock = asyncio.Lock()
+        self.tool_call_semaphore = asyncio.Semaphore(self.max_parallel_tool_calls)
         self._refresh_lock = asyncio.Lock()
         self.error = None
         self._set_state(MCPConnectionState.CONNECTING)
@@ -486,6 +521,23 @@ class MCPServerTask:
         raise asyncio.TimeoutError(
             f"MCP server '{self.name}' connect timed out after {self.connect_timeout:.0f}s"
         )
+
+    @asynccontextmanager
+    async def tool_call_slot(self):
+        """Apply the server's declared tool-call concurrency contract."""
+        if self.rpc_lock is None or self.tool_call_semaphore is None:
+            raise RuntimeError(f"MCP server '{self.name}' has not started")
+        guard = self.tool_call_semaphore if self.supports_parallel_tool_calls else self.rpc_lock
+        async with guard:
+            self._inflight_tool_calls += 1
+            self._peak_inflight_tool_calls = max(
+                self._peak_inflight_tool_calls,
+                self._inflight_tool_calls,
+            )
+            try:
+                yield
+            finally:
+                self._inflight_tool_calls = max(0, self._inflight_tool_calls - 1)
 
     async def _cancel_run_task(self) -> None:
         """Cancel and join the transport task on its owning event loop."""

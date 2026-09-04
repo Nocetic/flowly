@@ -33,7 +33,9 @@ _PNG_B64 = (
 
 _IMAGE_SERVER = f"""
 from mcp.server.mcpserver import Image, MCPServer
+import asyncio
 import base64
+import time
 
 mcp = MCPServer("flowly-img")
 
@@ -51,6 +53,13 @@ def boom() -> str:
 def errorish() -> dict:
     \"\"\"Return legit data that happens to contain an 'error' key.\"\"\"
     return {{"error": "this is data, not a failure", "ok": True}}
+
+@mcp.tool()
+async def timed(label: str) -> dict:
+    \"\"\"Return a monotonic interval after a short asynchronous wait.\"\"\"
+    started = time.monotonic()
+    await asyncio.sleep(0.15)
+    return {{"label": label, "started": started, "ended": time.monotonic()}}
 
 if __name__ == "__main__":
     mcp.run()
@@ -83,6 +92,7 @@ def reset_mcp():
     import flowly.mcp.client as client
     client._server_error_counts.clear()
     client._server_breaker_opened_at.clear()
+    client._server_breaker_probe_inflight.clear()
     yield
     from flowly.mcp import shutdown_mcp_servers
     try:
@@ -91,6 +101,7 @@ def reset_mcp():
         pass
     client._server_error_counts.clear()
     client._server_breaker_opened_at.clear()
+    client._server_breaker_probe_inflight.clear()
 
 
 def _cfg(script: Path) -> dict:
@@ -221,3 +232,33 @@ def test_strict_stateless_mode_requires_modern_discovery(tmp_path, isolated_home
     assert health["protocolMode"] == "stateless"
     assert health["protocolEra"] == "modern"
     assert health["protocolVersion"] == "2026-07-28"
+
+
+def test_parallel_server_calls_overlap_on_the_wire(tmp_path, isolated_home):
+    from flowly.mcp import discover_mcp_tools
+
+    script = tmp_path / "parallel.py"
+    script.write_text(_IMAGE_SERVER)
+    config = _cfg(script)
+    config["supports_parallel_tool_calls"] = True
+    config["max_parallel_tool_calls"] = 2
+    registry = _Registry()
+    discover_mcp_tools(servers={"parallel": config}, tool_registry=registry)
+    tool = registry.tools["mcp_parallel_timed"]
+
+    async def _run():
+        return await asyncio.gather(tool.execute(label="a"), tool.execute(label="b"))
+
+    raw_a, raw_b = asyncio.run(_run())
+    def _interval(raw):
+        value = json.loads(raw)["result"]
+        return json.loads(value) if isinstance(value, str) else value
+
+    interval_a = _interval(raw_a)
+    interval_b = _interval(raw_b)
+    assert max(interval_a["started"], interval_b["started"]) < min(
+        interval_a["ended"], interval_b["ended"]
+    )
+    health = tool._server_task.health_snapshot()
+    assert health["parallelToolCalls"] is True
+    assert health["peakInflightToolCalls"] == 2
