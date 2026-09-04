@@ -449,6 +449,20 @@ def _clean_member_policies(members: list[str], raw: Any) -> dict[str, str]:
     return _member_policies(members, raw)
 
 
+def _member_failure_text(exc: BaseException, fallback: str) -> str:
+    """What a reader is told when a member fails.
+
+    A named failure carries a sentence written for the person reading it.
+    Anything else carries a Python exception, and putting that on screen is how
+    somebody was shown an errno and an absolute path at the moment they most
+    needed something they could act on. The detail belongs in the log, beside
+    the member it happened to.
+    """
+    if isinstance(exc, ProfileHostError):
+        return exc.message[:500] or fallback
+    return fallback
+
+
 def _parse_mentions(
     text: str,
     members: list[str],
@@ -1349,9 +1363,19 @@ class ProfileRoomService:
             raise
         except Exception as exc:
             state = "error"
-            error = (
-                exc.message if isinstance(exc, ProfileHostError) else str(exc)
-            )[:500] or "This group member could not start."
+            # A named failure carries a sentence written for the person reading
+            # it. Anything else carries a Python exception, and putting that on
+            # screen is how a reader was shown
+            # `[Errno 1] Operation not permitted: '/Users/…/.flowly/config.json'`
+            # — an absolute path and an errno, at the moment they most needed
+            # something they could act on. The detail is not lost, it is logged
+            # with the member it belongs to, which is where somebody diagnosing
+            # this can use it.
+            if not isinstance(exc, ProfileHostError):
+                logger.exception(
+                    "Group member {} failed to start in room {}", profile, room_id
+                )
+            error = _member_failure_text(exc, "This group member could not start.")
 
         room = self._rooms.get(room_id)
         if room is None or profile not in room["members"]:
@@ -2330,11 +2354,13 @@ class ProfileRoomService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                logger.exception(
+                    "Group member {} failed mid-turn in room {}", profile, room_id
+                )
+                reason = _member_failure_text(exc, "This group member could not answer.")
                 if not run_id:
-                    await self._set_member_readiness(
-                        room_id, profile, "error", str(exc)[:500]
-                    )
-                await self._member_error(room_id, profile, str(exc)[:500], epoch)
+                    await self._set_member_readiness(room_id, profile, "error", reason)
+                await self._member_error(room_id, profile, reason, epoch)
             finally:
                 self._waiters.pop((profile, run_id), None)
                 if self._runs.get(room_id, {}).get(profile) == run_id:
@@ -2472,11 +2498,13 @@ class ProfileRoomService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                logger.exception(
+                    "Group member {} failed mid-turn in room {}", profile, room_id
+                )
+                reason = _member_failure_text(exc, "This group member could not answer.")
                 if not run_id:
-                    await self._set_member_readiness(
-                        room_id, profile, "error", str(exc)[:500]
-                    )
-                await self._member_error(room_id, profile, str(exc)[:500], epoch)
+                    await self._set_member_readiness(room_id, profile, "error", reason)
+                await self._member_error(room_id, profile, reason, epoch)
             finally:
                 self._waiters.pop((profile, run_id), None)
                 if self._runs.get(room_id, {}).get(profile) == run_id:
