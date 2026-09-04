@@ -106,9 +106,11 @@ from a version number:
 }
 ```
 
-`modes` advertises both shapes the host can run, but no shipped client sends
-`mode` — every group Desktop or iOS creates is a `panel`. A client that wants
-`council` has to ask for it.
+`modes` advertises both shapes the host can run, and clients send `mode` on
+create and update. A payload without it means `panel`, which is what every
+group did before the field existed — so a client that does not know it still
+creates groups that behave correctly, and an update that omits it leaves the
+shape alone rather than resetting it.
 
 Two of these deserve reading twice:
 
