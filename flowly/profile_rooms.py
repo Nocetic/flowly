@@ -449,12 +449,47 @@ def _clean_member_policies(members: list[str], raw: Any) -> dict[str, str]:
     return _member_policies(members, raw)
 
 
-def _parse_mentions(text: str, members: list[str]) -> tuple[bool, set[str]]:
+def _parse_mentions(
+    text: str,
+    members: list[str],
+    labels: dict[str, str] | None = None,
+) -> tuple[bool, set[str]]:
+    """Who a message addressed, by id or by the name its owner reads.
+
+    Members are addressed by id on the wire, and every client's composer turns
+    the name somebody typed into one before sending. A bot writing inside the
+    group has no composer: it sees the transcript and writes what it sees. So
+    the label has to resolve too, or a member naming another member is simply
+    not heard — which is the whole of how a sequential group hands off.
+
+    A label two members answer to resolves to neither. Ids are unique and
+    display names are not, and pulling the wrong bot into a turn is worse than
+    not hearing the mention.
+    """
     aliases: dict[str, str] = {}
+    ambiguous: set[str] = set()
+
+    def offer(handle: str, member: str) -> None:
+        key = handle.strip().lower()
+        if not key or key in ambiguous:
+            return
+        existing = aliases.get(key)
+        if existing is not None and existing != member:
+            aliases.pop(key, None)
+            ambiguous.add(key)
+            return
+        aliases[key] = member
+
     for member in members:
-        lower = member.lower()
-        aliases[lower] = member
-        aliases[re.sub(r"[._-]+", "", lower)] = member
+        for label in {(labels or {}).get(member, ""), member}:
+            if not label:
+                continue
+            lowered = label.lower()
+            offer(lowered, member)
+            offer(re.sub(r"[._-]+", "", lowered), member)
+            # Display names carry spaces; a mention cannot, so "Chief of Staff"
+            # is reachable as @chiefofstaff the way an id with dashes is.
+            offer(re.sub(r"[\s._-]+", "", lowered), member)
     everyone = False
     selected: set[str] = set()
     for match in _MENTION_RE.finditer(_CODE_RE.sub(" ", text)):
@@ -771,6 +806,7 @@ class ProfileRoomService:
         target_rpc: TargetRpc,
         target_prepare: TargetPrepare | None = None,
         profile_directory: ProfileDirectory,
+        profile_labels: Callable[[], dict[str, str]] | None = None,
         on_event: RoomEventCallback | None,
         store_path: Path | None = None,
         member_timeout: float = _MEMBER_TIMEOUT_SECONDS,
@@ -783,6 +819,9 @@ class ProfileRoomService:
         self._target_is_running = target_is_running
         self._target_prepare = target_prepare
         self._profile_directory = profile_directory
+        # Ids identify a member; labels are what its owner reads. The room
+        # speaks ids to the host and labels to the models.
+        self._profile_labels = profile_labels or (lambda: {})
         self._on_event = on_event
         requested_store = store_path or (default_home() / "profile-rooms.sqlite3")
         if requested_store.suffix.lower() == ".json":
@@ -1554,7 +1593,7 @@ class ProfileRoomService:
         durable_attachments, created_media = self._materialize_attachments(
             room_id, clean_attachments
         ) if clean_attachments else ([], [])
-        everyone, selected = _parse_mentions(clean, room["members"])
+        everyone, selected = _parse_mentions(clean, room["members"], self._profile_labels())
         policies = _member_policies(room["members"], room.get("memberPolicies"))
         if selected and not everyone:
             responders = [
@@ -2474,7 +2513,7 @@ class ProfileRoomService:
                     if response:
                         if not directed:
                             next_profiles.add(profile)
-                        _everyone, mentions = _parse_mentions(response, room["members"])
+                        _everyone, mentions = _parse_mentions(response, room["members"], self._profile_labels())
                         next_profiles.update(mentions)
                 current = [
                     profile for profile in room["members"] if profile in next_profiles
@@ -2820,14 +2859,25 @@ class ProfileRoomService:
         profile: str,
         messages: list[dict[str, Any]],
     ) -> str:
+        # Speak to a model the way its owner speaks. Labelling the transcript
+        # with ids taught every member to call Friday `dqwdqwd`, because that
+        # is the only name it had ever been shown.
+        labels = self._profile_labels()
+        def _speaker(item: dict[str, Any]) -> str:
+            if item["role"] == "user":
+                return "User"
+            name = str(item.get("profile") or "")
+            return labels.get(name) or name or "Member"
+
         transcript = "\n\n".join(
-            f"{'User' if item['role'] == 'user' else item.get('profile', 'Member')}: "
+            f"{_speaker(item)}: "
             f"{item['content']}{self._attachment_note(item)}"
             for item in messages
         )
+        speaking_as = labels.get(profile) or profile
         if room.get("mode") == "council":
             return "\n".join((
-                f"You are {profile}, participating in the local group \"{room['title']}\".",
+                f"You are {speaking_as}, participating in the local group \"{room['title']}\".",
                 "This is a bounded, sequential council. You can see contributions made before your turn.",
                 "Add only new, useful information. If you have nothing material to add, reply exactly (pass).",
                 "You may mention another visible group member by @name when their next-round review is genuinely useful.",
@@ -2838,7 +2888,7 @@ class ProfileRoomService:
                 transcript or "(No new text.)",
             ))
         return "\n".join((
-            f"You are {profile}, participating in the local group \"{room['title']}\".",
+            f"You are {speaking_as}, participating in the local group \"{room['title']}\".",
             "This is one independent response in a shared group conversation. Other selected members may be composing responses to the same user turn in parallel.",
             "Reply to the group directly and conversationally. Build on the visible history, contribute your own useful perspective, and avoid restating points already present.",
             "Mention @user only when you genuinely need the user to decide or clarify something. Always return one real response for a turn you were selected for.",
