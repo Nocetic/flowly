@@ -25,10 +25,12 @@ from __future__ import annotations
 
 from flowly.mcp.client import (
     discover_mcp_tools,
+    get_mcp_server_health,
     shutdown_mcp_servers,
 )
 
 __all__ = [
     "discover_mcp_tools",
+    "get_mcp_server_health",
     "shutdown_mcp_servers",
 ]

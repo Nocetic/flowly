@@ -51,6 +51,13 @@ class MCPServerEntry:
     # connect until the user completes ``mcp login``. This is what lets the UI
     # avoid showing "enabled" (config flag) as if it meant "connected".
     authorized: bool | None = None
+    runtime_state: str | None = None
+    connected: bool | None = None
+    reconnect_count: int = 0
+    consecutive_failures: int = 0
+    last_error: str | None = None
+    last_failure_at: float | None = None
+    state_changed_at: float | None = None
 
     @property
     def needs_secrets(self) -> bool:
@@ -96,6 +103,12 @@ def list_mcp_servers() -> list[MCPServerEntry]:
         servers = {}
 
     out: list[MCPServerEntry] = []
+    try:
+        from flowly.mcp.client import get_mcp_server_health
+
+        runtime_health = get_mcp_server_health()
+    except Exception:
+        runtime_health = {}
     for name in sorted(servers):
         cfg = servers[name] if isinstance(servers[name], dict) else {}
         has_transport = bool(cfg.get("url") or cfg.get("command"))
@@ -114,6 +127,14 @@ def list_mcp_servers() -> list[MCPServerEntry]:
                 authorized = has_tokens(name)
             except Exception:
                 authorized = None
+        runtime = runtime_health.get(name) or {}
+        runtime_state = runtime.get("state")
+        runtime_error = str(runtime.get("lastError") or "") or None
+        current_error = (
+            runtime_error
+            if runtime_state in {"degraded", "reconnecting", "parked", "failed"}
+            else None
+        )
         out.append(MCPServerEntry(
             name=name,
             transport=_transport_summary_from_cfg(cfg),
@@ -125,8 +146,15 @@ def list_mcp_servers() -> list[MCPServerEntry]:
             status=status,  # type: ignore[arg-type]
             needs_oauth=False,
             secret_fields=None,
-            error=None if has_transport else "no command or url",
+            error=("no command or url" if not has_transport else current_error),
             authorized=authorized,
+            runtime_state=runtime_state,
+            connected=runtime.get("connected"),
+            reconnect_count=int(runtime.get("reconnectCount") or 0),
+            consecutive_failures=int(runtime.get("consecutiveFailures") or 0),
+            last_error=runtime_error,
+            last_failure_at=runtime.get("lastFailureAt"),
+            state_changed_at=runtime.get("stateChangedAt"),
         ))
 
     # Catalog rows for entries not already configured.

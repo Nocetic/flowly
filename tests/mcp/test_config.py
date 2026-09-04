@@ -170,3 +170,46 @@ def test_reap_orphans_defaults_off_and_round_trips(isolated_home: Path):
     cfg.mcp_servers = {"r": MCPServerConfig(command="x", reap_orphans=True)}
     save_config(cfg)
     assert load_config().mcp_servers["r"].reap_orphans is True
+
+
+def test_lifecycle_policy_defaults_are_safe_and_round_trip(isolated_home: Path):
+    entry = MCPServerConfig(command="x")
+    assert entry.lifecycle.reconnect_enabled is True
+    assert entry.lifecycle.park_after_attempts == 8
+    assert entry.lifecycle.keepalive_interval == 180.0
+
+    cfg = Config()
+    cfg.mcp_servers = {
+        "durable": MCPServerConfig(
+            command="x",
+            lifecycle={
+                "reconnect_base_delay": 2.0,
+                "park_after_attempts": 4,
+                "parked_probe_interval": 120.0,
+            },
+        ),
+    }
+    save_config(cfg)
+
+    on_disk = json.loads((isolated_home / "config.json").read_text())
+    lifecycle = on_disk["mcpServers"]["durable"]["lifecycle"]
+    assert lifecycle["reconnectBaseDelay"] == 2.0
+    assert lifecycle["parkAfterAttempts"] == 4
+    assert load_config().mcp_servers["durable"].lifecycle.parked_probe_interval == 120.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reconnect_base_delay", 0),
+        ("reconnect_max_delay", float("inf")),
+        ("reconnect_jitter", 1.1),
+        ("park_after_attempts", 0),
+        ("parked_probe_interval", -1),
+        ("keepalive_interval", 0),
+        ("keepalive_timeout", float("nan")),
+    ],
+)
+def test_invalid_lifecycle_policy_is_rejected(field, value):
+    with pytest.raises(ValueError):
+        MCPServerConfig(command="x", lifecycle={field: value})

@@ -59,6 +59,53 @@ def test_configured_server_status(isolated_home):
     assert rows["broken"].error
 
 
+def test_configured_server_includes_live_runtime_health(isolated_home, monkeypatch):
+    cfg = Config()
+    cfg.mcp_servers = {"on": MCPServerConfig(command="echo")}
+    save_config(cfg)
+    monkeypatch.setattr(
+        "flowly.mcp.client.get_mcp_server_health",
+        lambda: {
+            "on": {
+                "state": "reconnecting",
+                "connected": False,
+                "reconnectCount": 2,
+                "consecutiveFailures": 1,
+                "lastError": "connection reset",
+                "lastFailureAt": 123.0,
+                "stateChangedAt": 124.0,
+            },
+        },
+    )
+
+    row = next(r for r in mcp_io.list_mcp_servers() if r.name == "on")
+    assert row.runtime_state == "reconnecting"
+    assert row.connected is False
+    assert row.reconnect_count == 2
+    assert row.error == "connection reset"
+    assert row.last_error == "connection reset"
+
+
+def test_recovered_server_does_not_present_stale_failure_as_current(isolated_home, monkeypatch):
+    cfg = Config()
+    cfg.mcp_servers = {"on": MCPServerConfig(command="echo")}
+    save_config(cfg)
+    monkeypatch.setattr(
+        "flowly.mcp.client.get_mcp_server_health",
+        lambda: {
+            "on": {
+                "state": "connected",
+                "connected": True,
+                "lastError": "old disconnect",
+            },
+        },
+    )
+
+    row = next(r for r in mcp_io.list_mcp_servers() if r.name == "on")
+    assert row.error is None
+    assert row.last_error == "old disconnect"
+
+
 def test_configured_hides_catalog_duplicate(isolated_home):
     cfg = Config()
     cfg.mcp_servers = {"context7": MCPServerConfig(command="npx")}

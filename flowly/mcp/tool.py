@@ -95,6 +95,18 @@ async def _run_on_mcp_loop(
     except on_interrupt:
         return _error_envelope("MCP call interrupted: user sent a new message")
     except Exception as exc:
+        # A failed request is often the first signal that a long-idle stream
+        # has died. Wake the connection supervisor immediately instead of
+        # waiting for the next keepalive. Application/protocol errors are
+        # deliberately excluded so a bad argument never churns the session.
+        from flowly.mcp.lifecycle import is_transport_failure
+
+        if is_transport_failure(exc):
+            loop.call_soon_threadsafe(
+                server_task.report_transport_failure,
+                exc,
+                session,
+            )
         _bump_server_error(server_name)
         logger.error("MCP tool %s call failed: %s", tool_name, exc)
         return _error_envelope(

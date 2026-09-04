@@ -1,5 +1,6 @@
 """Configuration schema using Pydantic."""
 
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -1089,6 +1090,42 @@ class MCPServerToolsFilter(BaseModel):
     prompts: bool = False
 
 
+class MCPServerLifecycleConfig(BaseModel):
+    """Connection recovery policy for one MCP server.
+
+    Fast failures use bounded exponential backoff. After the burst budget is
+    exhausted the server remains configured but parks itself, probing at a
+    slower cadence until it is healthy again.
+    """
+
+    reconnect_enabled: bool = True
+    reconnect_base_delay: float = Field(default=1.0, gt=0)
+    reconnect_max_delay: float = Field(default=30.0, gt=0)
+    reconnect_jitter: float = Field(default=0.2, ge=0, le=1)
+    park_after_attempts: int = Field(default=8, ge=1)
+    parked_probe_interval: float = Field(default=300.0, gt=0)
+    keepalive_interval: float = Field(default=180.0, gt=0)
+    keepalive_timeout: float = Field(default=30.0, gt=0)
+    stable_connection_seconds: float = Field(default=30.0, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_delay_bounds(self) -> "MCPServerLifecycleConfig":
+        values = (
+            self.reconnect_base_delay,
+            self.reconnect_max_delay,
+            self.reconnect_jitter,
+            self.parked_probe_interval,
+            self.keepalive_interval,
+            self.keepalive_timeout,
+            self.stable_connection_seconds,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("MCP lifecycle values must be finite")
+        if self.reconnect_max_delay < self.reconnect_base_delay:
+            raise ValueError("reconnectMaxDelay must be >= reconnectBaseDelay")
+        return self
+
+
 class MCPServerConfig(BaseModel):
     """One MCP server entry under top-level ``mcpServers``.
 
@@ -1129,6 +1166,7 @@ class MCPServerConfig(BaseModel):
     osv_check: bool = True
     # Server-initiated LLM (sampling/createMessage). Off by default.
     sampling: MCPSamplingConfig = Field(default_factory=MCPSamplingConfig)
+    lifecycle: MCPServerLifecycleConfig = Field(default_factory=MCPServerLifecycleConfig)
 
 
 class PetDisplayConfig(BaseModel):

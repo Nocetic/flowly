@@ -76,7 +76,19 @@ def test_list_shape_is_camelcase(isolated_home):
     result, _ = _dispatch("mcp.list")
     demo = next(s for s in result["servers"] if s["name"] == "demo")
     # Wire keys are camelCase, not the dataclass snake_case.
-    for key in ("toolFilter", "needsOauth", "needsSecrets", "secretFields"):
+    for key in (
+        "toolFilter",
+        "needsOauth",
+        "needsSecrets",
+        "secretFields",
+        "runtimeState",
+        "connected",
+        "reconnectCount",
+        "consecutiveFailures",
+        "lastError",
+        "lastFailureAt",
+        "stateChangedAt",
+    ):
         assert key in demo
     assert demo["source"] == "configured"
     assert demo["status"] == "enabled"

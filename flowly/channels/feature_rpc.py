@@ -259,6 +259,13 @@ def _mcp_entry_dict(e) -> dict:
         ],
         "error": e.error,
         "authorized": e.authorized,
+        "runtimeState": e.runtime_state,
+        "connected": e.connected,
+        "reconnectCount": e.reconnect_count,
+        "consecutiveFailures": e.consecutive_failures,
+        "lastError": e.last_error,
+        "lastFailureAt": e.last_failure_at,
+        "stateChangedAt": e.state_changed_at,
     }
 
 

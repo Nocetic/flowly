@@ -39,12 +39,12 @@ import json
 import logging
 import math
 import threading
+import time
 from typing import Any
 from urllib.parse import urlparse
 
-from flowly.mcp.schema import (
-    sanitize_mcp_name_component,
-)
+from flowly.mcp.lifecycle import MCPConnectionState, MCPRetryPolicy
+from flowly.mcp.schema import sanitize_mcp_name_component
 from flowly.mcp.security import (
     build_safe_env,
     interpolate_env_vars,
@@ -129,6 +129,7 @@ _loop: asyncio.AbstractEventLoop | None = None
 _loop_thread: threading.Thread | None = None
 _loop_lock = threading.Lock()
 _servers: dict[str, "MCPServerTask"] = {}
+_servers_lock = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -147,11 +148,6 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 _breaker_lock = threading.Lock()
 _server_error_counts: dict[str, int] = {}
 _server_breaker_opened_at: dict[str, float] = {}
-
-# Keepalive interval (T8). Must be shorter than typical LB / NAT idle
-# timeouts (commonly 300-600s) so long-idle HTTP connections stay warm.
-_KEEPALIVE_INTERVAL_SEC = 180.0
-
 
 def _bump_server_error(server_name: str) -> None:
     import time
@@ -202,6 +198,13 @@ class MCPCallInterrupted(Exception):
 def get_mcp_loop() -> asyncio.AbstractEventLoop | None:
     """Return the running MCP background loop, or ``None`` if not started."""
     return _loop
+
+
+def get_mcp_server_health() -> dict[str, dict[str, Any]]:
+    """Return runtime health for configured servers connected in this process."""
+    with _servers_lock:
+        servers = list(_servers.items())
+    return {name: server.health_snapshot() for name, server in servers}
 
 
 def _ensure_loop() -> asyncio.AbstractEventLoop:
@@ -323,6 +326,18 @@ class MCPServerTask:
         self._registered_names: list[str] = []
         self._refresh_lock: asyncio.Lock | None = None
         self._pending_refreshes: set[asyncio.Task[Any]] = set()
+        self.connection_failed_event: asyncio.Event | None = None
+        self._connection_failure: BaseException | None = None
+        self._retry_policy = MCPRetryPolicy()
+        self._ever_connected = False
+        self._connection_generation = 0
+        self._connected_monotonic: float | None = None
+        self._reconnect_count = 0
+        self._consecutive_failures = 0
+        self._last_error = ""
+        self._last_failure_at: float | None = None
+        self._state_changed_at = time.time()
+        self.state = MCPConnectionState.IDLE
 
     def is_http(self) -> bool:
         return bool(self._config.get("url"))
@@ -335,9 +350,58 @@ class MCPServerTask:
     def set_registered_names(self, names: list[str]) -> None:
         self._registered_names = list(names)
 
+    def _set_state(self, state: MCPConnectionState) -> None:
+        if self.state is state:
+            return
+        self.state = state
+        self._state_changed_at = time.time()
+
+    def _mark_connected(self) -> None:
+        """Record a completed handshake and wake the initial caller."""
+        if self._ever_connected:
+            self._reconnect_count += 1
+        self._ever_connected = True
+        self._connection_generation += 1
+        self._connected_monotonic = time.monotonic()
+        self._consecutive_failures = 0
+        self._set_state(MCPConnectionState.CONNECTED)
+        _reset_server_error(self.name)
+        if self.ready is not None:
+            self.ready.set()
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return a stable, credential-free lifecycle snapshot for UIs."""
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "connected": self.session is not None and self.state is MCPConnectionState.CONNECTED,
+            "reconnectCount": self._reconnect_count,
+            "consecutiveFailures": self._consecutive_failures,
+            "lastError": self._last_error,
+            "lastFailureAt": self._last_failure_at,
+            "stateChangedAt": self._state_changed_at,
+        }
+
+    def report_transport_failure(
+        self,
+        exc: BaseException,
+        failed_session: Any | None = None,
+    ) -> None:
+        """Ask the supervisor to recycle the currently active session.
+
+        ``failed_session`` prevents a late exception from an old request from
+        tearing down a freshly reconnected session.
+        """
+        if failed_session is not None and failed_session is not self.session:
+            return
+        self._connection_failure = exc
+        if self.connection_failed_event is not None:
+            self.connection_failed_event.set()
+
     async def start(self, config: dict[str, Any]) -> None:
         """Spawn the run-task on the current loop and wait for readiness."""
         self._config = config
+        self._retry_policy = MCPRetryPolicy.from_server_config(config)
         self.tool_timeout = float(config.get("timeout", 120.0))
         self.connect_timeout = float(config.get("connect_timeout", 60.0))
         if not math.isfinite(self.tool_timeout) or self.tool_timeout <= 0:
@@ -348,8 +412,11 @@ class MCPServerTask:
             )
         self.ready = asyncio.Event()
         self.shutdown_event = asyncio.Event()
+        self.connection_failed_event = asyncio.Event()
         self.rpc_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
+        self.error = None
+        self._set_state(MCPConnectionState.CONNECTING)
 
         self._task = asyncio.create_task(self._run(), name=f"mcp-{self.name}")
 
@@ -412,6 +479,7 @@ class MCPServerTask:
 
     async def shutdown(self) -> None:
         """Ask the run-task to exit, then wait for it."""
+        self._set_state(MCPConnectionState.STOPPING)
         if self.shutdown_event is not None:
             self.shutdown_event.set()
         if self._task is not None:
@@ -420,27 +488,118 @@ class MCPServerTask:
                     self._task.result()
                 except (asyncio.CancelledError, Exception):
                     pass
+                self.session = None
+                self._set_state(MCPConnectionState.STOPPED)
                 return
             try:
                 await asyncio.wait_for(self._task, timeout=10)
             except asyncio.TimeoutError:
                 await self._cancel_run_task()
+        self.session = None
+        self._set_state(MCPConnectionState.STOPPED)
 
     async def _run(self) -> None:
+        reconnect_attempt = 0
         try:
-            if self.is_http():
-                await self._run_http()
-            else:
-                await self._run_stdio()
+            while self.shutdown_event is not None and not self.shutdown_event.is_set():
+                generation_before = self._connection_generation
+                if self._ever_connected:
+                    self._set_state(self._retry_policy.state_for(max(1, reconnect_attempt)))
+                else:
+                    self._set_state(MCPConnectionState.CONNECTING)
+
+                try:
+                    await self._run_transport()
+                    if self.shutdown_event.is_set():
+                        break
+                    if not self._ever_connected:
+                        raise RuntimeError(
+                            f"MCP server '{self.name}' exited before initialization"
+                        )
+                    raise ConnectionError("MCP transport exited unexpectedly")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.session = None
+                    self.error = exc
+                    self._last_error = sanitize_error(str(exc) or repr(exc))
+                    self._last_failure_at = time.time()
+
+                    if not self._ever_connected:
+                        self._set_state(MCPConnectionState.FAILED)
+                        logger.warning(
+                            "MCP server '%s' initial connection failed: %s",
+                            self.name,
+                            self._last_error,
+                        )
+                        return
+
+                    if not self._retry_policy.reconnect_enabled:
+                        self._set_state(MCPConnectionState.FAILED)
+                        logger.warning(
+                            "MCP server '%s' connection failed; reconnect is disabled: %s",
+                            self.name,
+                            self._last_error,
+                        )
+                        return
+
+                    connected_during_attempt = self._connection_generation > generation_before
+                    stable_for = (
+                        time.monotonic() - self._connected_monotonic
+                        if self._connected_monotonic is not None
+                        else 0.0
+                    )
+                    if (
+                        connected_during_attempt
+                        and stable_for >= self._retry_policy.stable_connection_seconds
+                    ):
+                        reconnect_attempt = 0
+                    reconnect_attempt += 1
+                    self._consecutive_failures = reconnect_attempt
+                    retry_state = self._retry_policy.state_for(reconnect_attempt)
+                    self._set_state(MCPConnectionState.DEGRADED)
+                    delay = self._retry_policy.delay_for(reconnect_attempt)
+                    action = (
+                        "probing parked server"
+                        if retry_state is MCPConnectionState.PARKED
+                        else "reconnecting"
+                    )
+                    logger.warning(
+                        "MCP server '%s' disconnected: %s; %s in %.1fs",
+                        self.name,
+                        self._last_error,
+                        action,
+                        delay,
+                    )
+                    self._set_state(retry_state)
+                    if await self._wait_for_shutdown(delay):
+                        break
         except asyncio.CancelledError:
+            if self.shutdown_event is not None and self.shutdown_event.is_set():
+                self._set_state(MCPConnectionState.STOPPED)
+            else:
+                self._set_state(MCPConnectionState.FAILED)
             raise
-        except Exception as exc:
-            self.error = exc
-            logger.warning(
-                "MCP server '%s' run failed: %s",
-                self.name,
-                sanitize_error(str(exc)),
-            )
+        finally:
+            self.session = None
+            if self.shutdown_event is not None and self.shutdown_event.is_set():
+                self._set_state(MCPConnectionState.STOPPED)
+
+    async def _run_transport(self) -> None:
+        """Run one transport lifetime; split out for supervision and tests."""
+        if self.is_http():
+            await self._run_http()
+        else:
+            await self._run_stdio()
+
+    async def _wait_for_shutdown(self, delay: float) -> bool:
+        """Sleep interruptibly. Return True when shutdown won the race."""
+        assert self.shutdown_event is not None
+        try:
+            await asyncio.wait_for(self.shutdown_event.wait(), timeout=delay)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def _session_kwargs(self) -> dict[str, Any]:
         """Build ClientSession kwargs — list_changed handler + sampling."""
@@ -601,9 +760,13 @@ class MCPServerTask:
     async def _serve(self, session: Any) -> None:
         """Initialize, discover, signal ready, then serve until shutdown.
 
-        Shared by both transports. Runs a keepalive loop concurrently
-        with the shutdown wait so long-idle connections stay warm (T8).
+        Shared by all transports. A keepalive failure or a transport error
+        reported by an in-flight tool call is propagated to the connection
+        supervisor, which closes this transport context before reconnecting.
         """
+        assert self.connection_failed_event is not None
+        self.connection_failed_event.clear()
+        self._connection_failure = None
         init_result = await asyncio.wait_for(
             session.initialize(),
             timeout=self.connect_timeout,
@@ -611,20 +774,43 @@ class MCPServerTask:
         self.capabilities = getattr(init_result, "capabilities", None)
         self.session = session
         await self._discover()
-        assert self.ready is not None
-        self.ready.set()
+        if self._registry is not None:
+            _reregister_server_tools(self)
+        self._mark_connected()
 
         assert self.shutdown_event is not None
         shutdown_wait = asyncio.create_task(self.shutdown_event.wait())
+        connection_failed_wait = asyncio.create_task(self.connection_failed_event.wait())
         keepalive = asyncio.create_task(self._keepalive_loop())
         try:
-            await shutdown_wait
+            done, _ = await asyncio.wait(
+                {shutdown_wait, connection_failed_wait, keepalive},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if shutdown_wait in done:
+                return
+            if connection_failed_wait in done:
+                failure = self._connection_failure
+                if failure is not None:
+                    raise failure
+                raise ConnectionError("MCP connection was reported unhealthy")
+            # Keepalive is expected to live for the full connection lifetime.
+            # Its clean exit is just as suspicious as an exception.
+            failure = keepalive.exception()
+            if failure is not None:
+                raise failure
+            raise ConnectionError("MCP keepalive stopped unexpectedly")
         finally:
             # Cancel AND await the background tasks so they unwind inside
             # this still-open transport context (avoids "Task was
             # destroyed but it is pending" warnings and ensures any
             # in-flight refresh RPC is torn down cleanly).
-            pending = [keepalive, *list(self._pending_refreshes)]
+            pending = [
+                shutdown_wait,
+                connection_failed_wait,
+                keepalive,
+                *list(self._pending_refreshes),
+            ]
             for task in pending:
                 if not task.done():
                     task.cancel()
@@ -633,33 +819,20 @@ class MCPServerTask:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+            if self.session is session:
+                self.session = None
 
     async def _keepalive_loop(self) -> None:
-        """Ping ``list_tools`` periodically to keep the transport warm.
-
-        On failure we log and stop pinging — the connection is already
-        dead, and the next real tool call surfaces the error through the
-        circuit breaker. Full reconnect is a later phase.
-        """
+        """Ping periodically; transport failures propagate to the supervisor."""
         while True:
-            try:
-                await asyncio.sleep(_KEEPALIVE_INTERVAL_SEC)
-            except asyncio.CancelledError:
-                raise
+            await asyncio.sleep(self._retry_policy.keepalive_interval)
             if self.session is None or self.rpc_lock is None:
                 continue
-            try:
-                async with self.rpc_lock:
-                    await asyncio.wait_for(self.session.list_tools(), timeout=30)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.debug(
-                    "MCP server '%s' keepalive ping failed: %s",
-                    self.name,
-                    sanitize_error(str(exc) or repr(exc)),
+            async with self.rpc_lock:
+                await asyncio.wait_for(
+                    self.session.list_tools(),
+                    timeout=self._retry_policy.keepalive_timeout,
                 )
-                return
 
     async def _discover(self) -> None:
         assert self.session is not None
@@ -995,7 +1168,9 @@ def discover_mcp_tools(
             logger.warning("MCP server name %r sanitizes to empty; skipping", name)
             continue
         resolved = interpolate_env_vars(cfg)
-        if name in _servers:
+        with _servers_lock:
+            existing_server = _servers.get(name)
+        if existing_server is not None:
             # A live server already exists in this process (e.g. a second
             # AgentLoop with a fresh registry). Don't reconnect — just
             # re-register its existing tools into the new registry so it
@@ -1008,7 +1183,8 @@ def discover_mcp_tools(
 
     # Re-register tools of already-connected servers into THIS registry.
     for name, cfg in already_connected.items():
-        server = _servers.get(name)
+        with _servers_lock:
+            server = _servers.get(name)
         if server is None:
             continue
         registered.extend(
@@ -1059,7 +1235,8 @@ def discover_mcp_tools(
                 sanitize_error(str(result) or repr(result)),
             )
             continue
-        _servers[name] = result
+        with _servers_lock:
+            _servers[name] = result
         registered.extend(
             _register_tools_for_server(
                 server_task=result,
@@ -1085,12 +1262,14 @@ def discover_mcp_tools(
 
 def shutdown_mcp_servers(timeout: float = 10.0) -> None:
     """Tear down all registered MCP servers. Best-effort."""
-    if _loop is None or not _servers:
+    with _servers_lock:
+        servers = list(_servers.values())
+    if _loop is None or not servers:
         return
 
     async def _shutdown_all() -> None:
         await asyncio.gather(
-            *(srv.shutdown() for srv in _servers.values()),
+            *(srv.shutdown() for srv in servers),
             return_exceptions=True,
         )
 
@@ -1100,5 +1279,6 @@ def shutdown_mcp_servers(timeout: float = 10.0) -> None:
     except Exception as exc:
         logger.debug("MCP shutdown errors (ignored): %s", exc)
 
-    _servers.clear()
+    with _servers_lock:
+        _servers.clear()
     _stop_loop()
