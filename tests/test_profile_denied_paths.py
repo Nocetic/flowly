@@ -101,3 +101,23 @@ def test_denied_config_is_not_reported_as_malformed(profile_roots, deny_read):
 def test_missing_config_still_reads_as_empty(profile_roots):
     default, _ = profile_roots
     assert profiles._load_config_object(default / "nope.json") == {}
+
+
+def test_listing_skips_a_sibling_it_may_not_examine(profile_roots, deny_read):
+    _, root = profile_roots
+    # A bot is denied its siblings outright: stat on the directory fails, so
+    # is_dir() raises where it would normally answer.
+    deny_read(root / "testbot")
+
+    listed = profiles.list_profiles()
+
+    # Nothing true can be said about a sibling we cannot read, so it is left
+    # out — and the listing still answers for everything else.
+    assert [p.name for p in listed] == ["default"]
+
+
+def test_display_names_survive_a_denied_sibling(profile_roots, deny_read):
+    _, root = profile_roots
+    deny_read(root / "testbot")
+
+    assert profiles.profile_display_names(["testbot"]) == {}

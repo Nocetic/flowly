@@ -631,6 +631,21 @@ def _installed_skill_count(profile_dir: Path) -> int | None:
         return None
 
 
+def _is_describable_profile_dir(path: Path) -> bool:
+    """Whether *path* is a profile directory we are allowed to look at.
+
+    A bot is denied its siblings, and that denial arrives as ``EPERM``
+    from ``stat`` rather than as an answer, so ``is_dir()`` raises where
+    it would normally say False. A sibling we may not examine is left out
+    of the listing: nothing true can be said about a directory we cannot
+    read, and a policy refusing us is not a failure of the listing.
+    """
+    try:
+        return path.is_dir() and not path.is_symlink()
+    except OSError:
+        return False
+
+
 def list_profiles() -> list[ProfileInfo]:
     """List all profiles (default + named)."""
     profiles = []
@@ -649,9 +664,12 @@ def list_profiles() -> list[ProfileInfo]:
     ))
 
     # Named profiles
-    if _PROFILES_ROOT.exists():
-        for d in sorted(_PROFILES_ROOT.iterdir()):
-            if d.is_dir() and not d.is_symlink() and _PROFILE_NAME_RE.match(d.name):
+    try:
+        entries = sorted(_PROFILES_ROOT.iterdir())
+    except OSError:
+        entries = []
+    for d in entries:
+        if _is_describable_profile_dir(d) and _PROFILE_NAME_RE.match(d.name):
                 meta = _metadata_for(d.name, d, is_default=False)
                 runtime = _runtime_summary(d)
                 profiles.append(ProfileInfo(
