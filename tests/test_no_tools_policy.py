@@ -8,6 +8,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from flowly.agent.loop import AgentLoop
+from flowly.agent.tool_policy import (
+    resolve_exclusive_tool_scope,
+    resolve_turn_tool_policy,
+)
 from flowly.agent.tools.base import Tool
 from flowly.bus.events import InboundMessage, OutboundMessage
 from flowly.bus.queue import MessageBus
@@ -44,6 +48,126 @@ def test_unrelated_tool_words_do_not_disable_execution(content):
     assert AgentLoop._turn_tools_allowed({}, content) is True
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        (
+            "Context7 MCP sunucusundaki bir aracı tam bir kez çağırarak "
+            "React Query kimliğini çöz. Başka hiçbir araç kullanma."
+        ),
+        "Run tool Context7 and do not use any other tools.",
+        "Invoke the Context7 MCP server without calling any other tools.",
+        "Use the Context7 tool; use no other tools.",
+    ],
+)
+def test_scoped_exclusion_keeps_requested_tool_execution_enabled(content):
+    decision = resolve_turn_tool_policy({}, content)
+    assert decision.allowed is True
+    assert decision.source == "content_scoped_exclusion"
+    assert AgentLoop._is_action_turn(object.__new__(AgentLoop), "cli", content) is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Use the Context7 tool, but do not use any tools.",
+        "Context7 MCP aracını çağır fakat hiçbir araç kullanma.",
+        "Başka hiçbir araç kullanma.",
+        "Do not use any other tools.",
+        "Use no other tools.",
+    ],
+)
+def test_global_or_ambiguous_deny_remains_fail_closed(content):
+    decision = resolve_turn_tool_policy({}, content)
+    assert decision.allowed is False
+    assert decision.source == "content_global_deny"
+
+
+def test_structured_deny_wins_over_scoped_plain_language():
+    content = "Run tool Context7 and do not use any other tools."
+    decision = resolve_turn_tool_policy(
+        {"tools_allowed": True, "tool_policy": "none"},
+        content,
+    )
+    assert decision.allowed is False
+    assert decision.source == "structured_deny"
+
+
+def test_structured_allow_is_not_reinterpreted_from_plain_language():
+    decision = resolve_turn_tool_policy(
+        {"tools_allowed": True},
+        "Answer without using tools.",
+    )
+    assert decision.allowed is True
+    assert decision.source == "structured_allow"
+
+
+def test_exclusive_scope_resolves_an_mcp_server_family():
+    tools = [
+        ("mcp_context7_resolve_library_id", "context7"),
+        ("mcp_context7_query_docs", "context7"),
+        ("web_search", "builtin"),
+    ]
+
+    scope = resolve_exclusive_tool_scope(
+        (
+            "Context7 MCP sunucusundaki bir aracı tam bir kez çağırarak "
+            "React Query kimliğini çöz. Başka hiçbir araç kullanma."
+        ),
+        tools,
+    )
+
+    assert scope == frozenset({
+        "mcp_context7_resolve_library_id",
+        "mcp_context7_query_docs",
+    })
+
+
+def test_exclusive_scope_prefers_an_exact_remote_tool_name():
+    tools = [
+        ("mcp_context7_resolve_library_id", "context7"),
+        ("mcp_context7_query_docs", "context7"),
+    ]
+
+    scope = resolve_exclusive_tool_scope(
+        "Use resolve-library-id and do not use any other tools.",
+        tools,
+    )
+
+    assert scope == frozenset({"mcp_context7_resolve_library_id"})
+
+
+def test_named_tool_with_scoped_exclusion_is_an_enforced_action_turn():
+    content = "Use resolve-library-id and do not use any other tools."
+
+    decision = resolve_turn_tool_policy({}, content)
+
+    assert decision.allowed is True
+    assert decision.exclusive is True
+    assert AgentLoop._is_action_turn(object.__new__(AgentLoop), "cli", content) is True
+
+
+def test_exclusive_scope_fails_closed_for_an_unknown_target():
+    scope = resolve_exclusive_tool_scope(
+        "Run MissingServer MCP and do not use any other tools.",
+        [("mcp_context7_query_docs", "context7")],
+    )
+
+    assert scope == frozenset()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Explain how tool calling works.",
+        "Bu aracın kullanımını anlat.",
+        "MCP araçlarının nasıl çalıştığını açıkla.",
+    ],
+)
+def test_tool_discussion_does_not_force_an_action_turn(content):
+    assert AgentLoop._is_action_turn(object.__new__(AgentLoop), "cli", content) is False
+
+
 class _TripwireTool(Tool):
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -63,6 +187,33 @@ class _TripwireTool(Tool):
     async def execute(self, **kwargs: Any) -> str:
         self.calls.append(kwargs)
         return "EXECUTED"
+
+
+class _ScopedTool(Tool):
+    def __init__(self, name: str, source: str) -> None:
+        self._name = name
+        self._source = source
+        self.calls: list[dict[str, Any]] = []
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return f"Test capability from {self._source}."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    @property
+    def discovery_source(self) -> str:
+        return self._source
+
+    async def execute(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        return "SCOPED_EXECUTED"
 
 
 class _HallucinatingProvider(LLMProvider):
@@ -103,6 +254,41 @@ class _PlainProvider(LLMProvider):
     async def chat(self, *args: Any, **kwargs: Any) -> LLMResponse:
         self.calls.append(kwargs)
         return LLMResponse(content="Local answer.")
+
+
+class _ScopedProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__(api_key="test")
+        self.calls: list[dict[str, Any]] = []
+
+    def get_default_model(self) -> str:
+        return "test/model"
+
+    async def chat(self, *args: Any, **kwargs: Any) -> LLMResponse:
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            return LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="out-of-scope-1",
+                        name="mcp_other_dangerous_action",
+                        arguments={},
+                    )
+                ],
+            )
+        if len(self.calls) == 2:
+            return LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="scoped-2",
+                        name="mcp_context7_resolve_library_id",
+                        arguments={},
+                    )
+                ],
+            )
+        return LLMResponse(content="MCP_LIVE_OK")
 
 
 @pytest.mark.asyncio
@@ -160,6 +346,59 @@ async def test_executor_blocks_hallucinated_call_even_with_no_schemas(
         and "backend-enforced no-tools policy" in str(message.get("content"))
         for message in messages
     )
+
+
+@pytest.mark.asyncio
+async def test_scoped_exclusion_filters_schemas_and_executor_end_to_end(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    provider = _ScopedProvider()
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        main_config=Config(),
+        max_iterations=3,
+        soft_warn_at_iteration=0,
+    )
+    resolve_tool = _ScopedTool(
+        "mcp_context7_resolve_library_id",
+        "context7",
+    )
+    query_tool = _ScopedTool("mcp_context7_query_docs", "context7")
+    unrelated_tool = _ScopedTool("mcp_other_dangerous_action", "other")
+    loop.tools.register(resolve_tool, toolset="mcp")
+    loop.tools.register(query_tool, toolset="mcp")
+    loop.tools.register(unrelated_tool, toolset="mcp")
+    session = loop.sessions.get_or_create("web:exclusive")
+    session.metadata["title"] = "Existing title"
+    loop.sessions.save(session)
+
+    try:
+        result = await loop.process_direct(
+            (
+                "Context7 MCP sunucusundaki bir aracı tam bir kez çağırarak "
+                "React Query kimliğini çöz. Başka hiçbir araç kullanma."
+            ),
+            session_key="web:exclusive",
+        )
+    finally:
+        loop.stop()
+
+    first_schema_names = {
+        tool["function"]["name"]
+        for tool in provider.calls[0]["tools"]
+    }
+    assert result == "MCP_LIVE_OK"
+    assert first_schema_names == {
+        "mcp_context7_resolve_library_id",
+        "mcp_context7_query_docs",
+    }
+    assert provider.calls[0]["tool_choice"] == "auto"
+    assert resolve_tool.calls == [{}]
+    assert query_tool.calls == []
+    assert unrelated_tool.calls == []
 
 
 @pytest.mark.asyncio

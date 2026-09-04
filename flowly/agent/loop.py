@@ -48,7 +48,11 @@ from flowly.agent.tools.process import ProcessTool
 from flowly.exec.process_registry import get_registry as _get_process_registry
 from flowly.exec.process_checkpoint import ProcessCheckpoint
 from flowly.agent.subagent import SubagentManager
-from flowly.session.manager import SessionManager
+from flowly.session.manager import (
+    ConcurrentSessionWriteError,
+    SessionBusyError,
+    SessionManager,
+)
 from flowly.session.archive import (
     ARCHIVE_STATE_KEY,
     ARCHIVE_SUMMARY_KEY,
@@ -92,6 +96,11 @@ from flowly.agent.reply_media import extract_reply_media, extract_reply_media_as
 from flowly.media.assets import ASSETS_META_KEY, assets_to_meta
 from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
+from flowly.agent.tool_policy import (
+    has_explicit_tool_invocation_intent,
+    resolve_exclusive_tool_scope,
+    resolve_turn_tool_policy,
+)
 from flowly.runtime_capabilities import (
     RuntimeCapabilities,
     resolve_runtime_capabilities,
@@ -1152,7 +1161,7 @@ class AgentLoop:
         # reference to a bare create_task() result, so without this the title
         # coroutine can be garbage-collected mid-flight and silently never
         # finish — exactly the "no title on the server" failure mode.
-        self._title_tasks: set[asyncio.Task] = set()
+        self._title_tasks: dict[str, asyncio.Task[Any]] = {}
 
         # One in-flight post-turn compaction per session (strong refs, same
         # GC rationale as _title_tasks). Keyed by session_key so a turn that
@@ -1956,6 +1965,9 @@ class AgentLoop:
             if user_turns > 1:
                 return  # only the opening exchange
             key = getattr(session, "key", "")
+            existing = self._title_tasks.get(key)
+            if existing is not None and not existing.done():
+                return
             logger.info(f"[title] scheduling auto-title for {key!r}")
             task = asyncio.create_task(
                 self._autotitle_session(session, user_content, final_content)
@@ -1963,10 +1975,11 @@ class AgentLoop:
             # Hold a strong ref until the task settles (anti-GC), and surface
             # any failure at INFO so a server operator can see when titling
             # breaks instead of it dying silently in the background.
-            self._title_tasks.add(task)
+            self._title_tasks[key] = task
 
             def _on_title_done(t: asyncio.Task, _key: str = key) -> None:
-                self._title_tasks.discard(t)
+                if self._title_tasks.get(_key) is t:
+                    self._title_tasks.pop(_key, None)
                 exc = t.exception() if not t.cancelled() else None
                 if exc is not None:
                     logger.warning(f"[title] task for {_key!r} failed: {exc!r}")
@@ -1989,10 +2002,19 @@ class AgentLoop:
         # (first-message placeholder) is meant to be replaced, so don't bail on it.
         if session.metadata.get("title") and not session.metadata.get("title_provisional"):
             return
+        if not self.sessions.exists(key):
+            logger.debug("[title] skipped deleted session {!r}", key)
+            return
         session.metadata["title"] = title
         session.metadata.pop("title_provisional", None)  # settled now
         try:
             self.sessions.save(session)
+        except ConcurrentSessionWriteError as exc:
+            if not self.sessions.exists(key):
+                logger.debug("[title] skipped concurrently deleted session {!r}", key)
+                return
+            logger.warning(f"[title] save failed for {key!r}: {exc}")
+            return
         except Exception as e:
             logger.warning(f"[title] save failed for {key!r}: {e}")
             return
@@ -2006,6 +2028,41 @@ class AgentLoop:
                 await self._on_session_titled(key, title)
             except Exception as e:
                 logger.debug(f"[title] notify callback failed for {key!r}: {e}")
+
+    async def delete_session(self, session_key: str) -> bool:
+        """Cancel background writers, then durably delete one conversation."""
+
+        if not hasattr(self, "_session_turn_locks"):
+            self._session_turn_locks = {}
+        lock = self._session_turn_locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            # The gateway checks this before dispatch for a fast error.  Repeat
+            # it inside the same lock that serializes turns so delete versus a
+            # newly-arrived chat has one deterministic linearization point.
+            from flowly.agent import inflight
+
+            if inflight.get(session_key) is not None:
+                raise SessionBusyError(session_key)
+
+            pending: list[asyncio.Task[Any]] = []
+            title_task = self._title_tasks.pop(session_key, None)
+            if title_task is not None and not title_task.done():
+                title_task.cancel()
+                pending.append(title_task)
+            compaction_task = self._post_turn_compaction_tasks.pop(session_key, None)
+            if compaction_task is not None and not compaction_task.done():
+                compaction_task.cancel()
+                pending.append(compaction_task)
+
+            # No await occurs between the busy check and the filesystem
+            # transaction. A later chat therefore observes a cleanly deleted
+            # session and may create a fresh one, never a half-deleted history.
+            deleted = self.sessions.delete(session_key)
+            self._last_turn_total_tokens.pop(session_key, None)
+            self._started_sessions.discard(session_key)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            return deleted
 
     def _should_save_trajectories(self) -> bool:
         """Check if trajectory saving is enabled in config."""
@@ -4298,29 +4355,8 @@ class AgentLoop:
         metadata: dict[str, Any] | None,
         content: str,
     ) -> bool:
-        """Resolve the backend-enforced tool policy for one user turn.
-
-        Structured transport metadata is preferred, while a deliberately
-        narrow multilingual grammar supports ordinary chat instructions. The
-        result is carried to schema disclosure *and* the executor gate; hiding
-        schemas alone is not a security boundary because a model can still
-        hallucinate a structured call.
-        """
-        metadata = metadata or {}
-        if metadata.get("tools_allowed") is False:
-            return False
-        policy = str(metadata.get("tool_policy") or "").strip().casefold()
-        if policy in {"none", "disabled", "deny", "no_tools", "no-tools"}:
-            return False
-        text = str(content or "").casefold()
-        patterns = (
-            r"\b(?:do\s+not|don't|dont|never)\s+(?:use|call|invoke)\s+(?:any\s+)?tools?\b",
-            r"\bwithout\s+(?:using|calling|invoking)\s+(?:any\s+)?tools?\b",
-            r"^\s*(?:please[,:]?\s*)?no[\s-]?tools?(?:\s+(?:please|for\s+this\s+turn))?[.!]?\s*$",
-            r"\b(?:hiçbir\s+)?(?:tool|araç)\s+kullanma(?:dan)?\b",
-            r"\b(?:tool|araç)\s+(?:çağırma|çalıştırma)\b",
-        )
-        return not any(re.search(pattern, text) for pattern in patterns)
+        """Compatibility wrapper around the structured policy resolver."""
+        return resolve_turn_tool_policy(metadata, content).allowed
 
     def _is_action_turn(self, channel: str, content: str) -> bool:
         """Detect whether this turn is an action request that should execute tools strictly."""
@@ -4329,6 +4365,8 @@ class AgentLoop:
             return True
 
         intent_text = self._extract_action_intent_text(content)
+        if has_explicit_tool_invocation_intent(intent_text):
+            return True
         action_patterns = (
             # Call / phone
             r"\bcall\b",
@@ -7858,10 +7896,44 @@ class AgentLoop:
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
         display_content = str(msg.metadata.get("_display_content") or msg.content)
-        tools_allowed = self._turn_tools_allowed(msg.metadata, display_content)
+        tool_policy = resolve_turn_tool_policy(msg.metadata, display_content)
+        tools_allowed = tool_policy.allowed
         # Carry the resolved policy through background post-turn work. This is
         # private turn metadata, not a persisted client protocol requirement.
         msg.metadata["_effective_tools_allowed"] = tools_allowed
+        msg.metadata["_effective_tool_policy_source"] = tool_policy.source
+        if tool_policy.source != "default":
+            logger.info(
+                "Turn tool policy resolved: source={} allowed={}",
+                tool_policy.source,
+                tools_allowed,
+            )
+        if tool_policy.exclusive:
+            tool_catalog: list[tuple[str, str]] = []
+            for tool_name in self.tools.tool_names:
+                tool = self.tools.get(tool_name)
+                source = str(getattr(tool, "discovery_source", "") or "")
+                tool_catalog.append((tool_name, source))
+            exclusive_scope = set(
+                resolve_exclusive_tool_scope(display_content, tool_catalog)
+            )
+            existing_allowlist = msg.metadata.get("allowed_tools")
+            if isinstance(existing_allowlist, (list, tuple, set)):
+                exclusive_scope.intersection_update(
+                    value
+                    for value in existing_allowlist
+                    if isinstance(value, str)
+                )
+            # An unresolved exclusive target fails closed with an empty positive
+            # grant.  The ordinary no-tools policy remains distinct: this turn
+            # asked for tool execution, but none may run unless the named scope
+            # resolves to a registered capability.
+            msg.metadata["allowed_tools"] = sorted(exclusive_scope)
+            logger.info(
+                "Exclusive turn tool scope resolved: tool_count={} target_found={}",
+                len(exclusive_scope),
+                bool(exclusive_scope),
+            )
 
         # Passive channel context (Slack/Discord "listen" mode): render any
         # messages observed since the last reply into a block we prepend ONLY to

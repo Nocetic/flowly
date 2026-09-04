@@ -1825,6 +1825,7 @@ Respond to the user now:"""
         on_chat_message=on_chat_message,
         on_chat_abort=agent.mark_aborted,
         on_chat_delivered=agent.goal_after_direct_delivery,
+        on_session_delete=agent.delete_session,
         sessions=agent.sessions,
         subagent_registry=agent._subagent_registry,
         artifact_store=artifact_store,

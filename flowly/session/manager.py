@@ -67,6 +67,10 @@ class ConcurrentSessionWriteError(RuntimeError):
     """A stale process tried to overwrite a newer canonical session."""
 
 
+class SessionBusyError(RuntimeError):
+    """A destructive lifecycle operation raced with an active session turn."""
+
+
 @dataclass(frozen=True)
 class _CompactionCommitGuard:
     """Save capability valid while SessionManager holds the write lock."""
@@ -856,6 +860,11 @@ class SessionManager:
     def _get_write_lock_path(self, key: str) -> Path:
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / ".locks" / f"{safe_key}.lock"
+
+    def exists(self, key: str) -> bool:
+        """Return whether the canonical session still exists on disk."""
+
+        return self._get_session_path(key).is_file()
 
     @contextmanager
     def _session_write_lock(self, key: str) -> Iterator[None]:
@@ -1675,24 +1684,35 @@ class SessionManager:
                 logger.debug("Session index update failed: {}", e)
 
     def delete(self, key: str) -> bool:
-        """
-        Delete a session.
+        """Delete a session, its display transcript, and derived index rows.
 
         Args:
             key: Session key.
 
         Returns:
             True if deleted, False if not found.
-        """
-        # Remove from cache
-        self._cache.pop(key, None)
 
-        # Remove file
-        path = self._get_session_path(key)
-        if path.exists():
-            path.unlink()
-            return True
-        return False
+        The same inter-process lock used by saves makes deletion a transaction
+        boundary: an already-running stale writer cannot pass its revision
+        check and recreate the conversation after this method returns.
+        """
+
+        with self._session_write_lock(key):
+            self._cache.pop(key, None)
+            canonical = self._get_session_path(key)
+            display = self._get_full_path(key)
+            existed = canonical.exists() or display.exists()
+            canonical.unlink(missing_ok=True)
+            display.unlink(missing_ok=True)
+
+            if self._indexer is not None:
+                try:
+                    self._indexer.delete_session(key)
+                except Exception as exc:
+                    # The index is rebuildable derived state.  A cleanup error
+                    # must not resurrect or fail deletion of canonical data.
+                    logger.debug("Session index cleanup failed for {}: {}", key, exc)
+            return existed
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """

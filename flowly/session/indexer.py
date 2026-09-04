@@ -331,6 +331,29 @@ class SessionIndexer:
         except Exception as e:
             logger.debug("Session archive index failed for {}: {}", key, e)
 
+    def delete_session(self, key: str) -> bool:
+        """Remove one session and all of its FTS rows atomically.
+
+        The index is derived state, but leaving deleted conversations searchable
+        until the next full rebuild violates the session-delete contract.  The
+        existing FTS delete trigger removes shadow-table rows with the message
+        records, so one transaction keeps every index view consistent.
+        """
+
+        try:
+            with self._conn:
+                existed = self._conn.execute(
+                    "SELECT 1 FROM sessions WHERE key = ?", (key,)
+                ).fetchone() is not None
+                self._conn.execute(
+                    "DELETE FROM messages WHERE session_key = ?", (key,)
+                )
+                self._conn.execute("DELETE FROM sessions WHERE key = ?", (key,))
+            return existed
+        except Exception as exc:
+            logger.debug("Session index delete failed for {}: {}", key, exc)
+            return False
+
     @staticmethod
     def _parse_ts(msg: dict[str, Any], fallback: float) -> float:
         """Message timestamp as epoch seconds, or ``fallback`` if unparseable."""

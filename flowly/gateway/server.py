@@ -114,6 +114,7 @@ ChatCallback = Callable[
 ]
 AbortCallback = Callable[[str], bool]
 ChatDeliveredCallback = Callable[[str, str, dict[str, Any]], Any]
+SessionDeleteCallback = Callable[[str], Awaitable[bool]]
 ManagedRuntimeStopCallback = Callable[[], None]
 
 
@@ -525,6 +526,9 @@ class GatewayServer:
         # Child profile gateways disable this so runtimes never recursively
         # start or control sibling runtimes.
         enable_profile_host: bool = False,
+        # Lets the owning agent cancel background title/compaction writers
+        # before the session files are removed.
+        on_session_delete: SessionDeleteCallback | None = None,
     ):
         self.host = host
         self.port = port
@@ -561,6 +565,7 @@ class GatewayServer:
         self.on_chat_message = on_chat_message
         self.on_chat_abort = on_chat_abort
         self.on_chat_delivered = on_chat_delivered
+        self.on_session_delete = on_session_delete
         self.sessions = sessions
         self.subagent_registry = subagent_registry
         self._delegate_tool: Any | None = None
@@ -2551,7 +2556,35 @@ class GatewayServer:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "sessionKey is required")
             return
 
-        deleted = self.sessions.delete(session_key)
+        from flowly.agent import inflight
+
+        if inflight.get(session_key) is not None:
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "SESSION_BUSY",
+                "Finish or stop the active turn before deleting this session.",
+            )
+            return
+
+        delete_callback = getattr(self, "on_session_delete", None)
+        if delete_callback is not None:
+            from flowly.session.manager import SessionBusyError
+
+            try:
+                deleted = await delete_callback(session_key)
+            except SessionBusyError:
+                # A chat may arrive after the fast check above. The owning
+                # agent rechecks at the turn-lock boundary, closing that race.
+                await self._ws_rpc_error(
+                    ws,
+                    rpc_id,
+                    "SESSION_BUSY",
+                    "Finish or stop the active turn before deleting this session.",
+                )
+                return
+        else:
+            deleted = self.sessions.delete(session_key)
         # Drop the per-session cwd pin too — otherwise a future session
         # that happens to reuse this session_key would inherit the
         # deleted conversation's working directory.
