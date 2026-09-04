@@ -14,6 +14,7 @@ transport crash.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 from typing import Any, Callable
@@ -21,6 +22,7 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 15.0
+_MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 def _control_base() -> tuple[str, str] | None:
@@ -34,7 +36,18 @@ def _control_base() -> tuple[str, str] | None:
     token = info.get("token")
     if not port or not token:
         return None
-    return f"http://{host}:{port}/control", str(token)
+    host = str(host).strip()
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    try:
+        is_loopback = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        logger.warning("MCP control advertisement rejected non-loopback host")
+        return None
+    url_host = f"[{host}]" if ":" in host else host
+    return f"http://{url_host}:{port}/control", str(token)
 
 
 def _request(method: str, path: str, payload: dict | None = None) -> dict:
@@ -48,8 +61,8 @@ def _request(method: str, path: str, payload: dict | None = None) -> dict:
     base_url, token = base
     url = f"{base_url}{path}"
 
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     data = json.dumps(payload or {}).encode("utf-8") if method == "POST" else None
     req = urllib.request.Request(
@@ -63,10 +76,18 @@ def _request(method: str, path: str, payload: dict | None = None) -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
-            return json.loads(resp.read())
+            raw = resp.read(_MAX_CONTROL_RESPONSE_BYTES + 1)
+            if len(raw) > _MAX_CONTROL_RESPONSE_BYTES:
+                return {"error": "control response exceeded the size limit"}
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {"error": "invalid control response"}
     except urllib.error.HTTPError as exc:
         try:
-            return json.loads(exc.read())
+            raw = exc.read(_MAX_CONTROL_RESPONSE_BYTES + 1)
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {
+                "error": f"control endpoint returned HTTP {exc.code}",
+            }
         except Exception:
             return {"error": f"control endpoint returned HTTP {exc.code}"}
     except urllib.error.URLError as exc:
@@ -78,11 +99,35 @@ def _request(method: str, path: str, payload: dict | None = None) -> dict:
         return {"error": f"control request failed: {exc}"}
 
 
-def register_write_tools(mcp: Any, dumps: Callable[[Any], str]) -> None:
+def register_write_tools(mcp: Any, render: Callable[[dict[str, Any]], Any]) -> None:
     """Register the gateway-backed write tools on the MCP server."""
+    from mcp import types as mcp_types
 
-    @mcp.tool()
-    def messages_send(target: str, message: str) -> str:
+    send_annotations = mcp_types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+    approval_read_annotations = mcp_types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+    approval_write_annotations = mcp_types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+
+    @mcp.tool(annotations=send_annotations, structured_output=False)
+    def messages_send(
+        target: str,
+        message: str,
+        idempotency_key: str | None = None,
+    ) -> Any:
         """Send a message to a channel conversation.
 
         Requires the Flowly gateway to be running.
@@ -90,22 +135,25 @@ def register_write_tools(mcp: Any, dumps: Callable[[Any], str]) -> None:
         Args:
             target: 'channel:chat_id' (e.g. 'telegram:123456789')
             message: the text to send
+            idempotency_key: optional unique key that makes retries safe
         """
-        return dumps(_request("POST", "/messages/send",
-                              {"target": target, "message": message}))
+        payload = {"target": target, "message": message}
+        if idempotency_key:
+            payload["idempotency_key"] = idempotency_key
+        return render(_request("POST", "/messages/send", payload))
 
-    @mcp.tool()
-    def approvals_list() -> str:
+    @mcp.tool(annotations=approval_read_annotations, structured_output=False)
+    def approvals_list() -> Any:
         """List pending exec approval requests (requires a running gateway)."""
-        return dumps(_request("GET", "/approvals"))
+        return render(_request("GET", "/approvals"))
 
-    @mcp.tool()
-    def approvals_resolve(id: str, decision: str) -> str:
+    @mcp.tool(annotations=approval_write_annotations, structured_output=False)
+    def approvals_resolve(id: str, decision: str) -> Any:
         """Resolve a pending approval (requires a running gateway).
 
         Args:
             id: the approval id from approvals_list
             decision: one of 'allow-once', 'allow-always', 'deny'
         """
-        return dumps(_request("POST", "/approvals/resolve",
-                              {"id": id, "decision": decision}))
+        return render(_request("POST", "/approvals/resolve",
+                               {"id": id, "decision": decision}))

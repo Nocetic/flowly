@@ -127,7 +127,42 @@ def test_list_shows_added_servers(isolated_home: Path):
     runner.invoke(mcp_app, ["add", "shown", "--command", "echo", "--no-probe"])
     result = runner.invoke(mcp_app, ["list"])
     assert "shown" in result.stdout
-    assert "stdio" in result.stdout
+
+
+def test_serve_http_forwards_secure_transport_settings(isolated_home, monkeypatch):
+    captured = {}
+    monkeypatch.setenv("TEST_FLOWLY_MCP_TOKEN", "secret")
+
+    def _run_server(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("flowly.mcp.server.run_server", _run_server)
+    result = CliRunner().invoke(mcp_app, [
+        "serve",
+        "--transport", "http",
+        "--host", "127.0.0.1",
+        "--port", "9876",
+        "--path", "/bridge",
+        "--stateless",
+        "--auth-token-env", "TEST_FLOWLY_MCP_TOKEN",
+    ])
+
+    assert result.exit_code == 0
+    assert captured["transport"] == "http"
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 9876
+    assert captured["path"] == "/bridge"
+    assert captured["stateless"] is True
+    assert captured["auth_token"] == "secret"
+    assert captured["tls_cert"] == ""
+    assert captured["tls_key"] == ""
+
+
+def test_serve_rejects_unknown_transport_before_start(isolated_home):
+    result = CliRunner().invoke(mcp_app, ["serve", "--transport", "socket"])
+    assert result.exit_code != 0
+    assert "stdio" in result.output
+    assert "http" in result.output
 
 
 def test_remove_unknown_server_fails(isolated_home: Path):

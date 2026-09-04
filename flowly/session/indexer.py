@@ -119,10 +119,19 @@ def _sanitize_fts5_query(query: str) -> str:
 class SessionIndexer:
     """SQLite FTS5 index over session messages."""
 
-    def __init__(self, db_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        check_same_thread: bool = True,
+    ) -> None:
         self._path = db_path or _default_db_path()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._path), timeout=5)
+        self._conn = sqlite3.connect(
+            str(self._path),
+            timeout=5,
+            check_same_thread=check_same_thread,
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")

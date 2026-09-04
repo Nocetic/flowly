@@ -6,7 +6,9 @@ hand-written JSONL sessions — no gateway, no network.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -94,10 +96,85 @@ def test_messages_read_limit(home_with_sessions):
     assert out["messages"][0]["role"] == "assistant"
 
 
+def test_conversation_and_message_cursors_are_complete(home_with_sessions):
+    first = _reader().conversations_list(limit=1)
+    assert first["count"] == 1
+    assert first["total"] == 2
+    assert first["pagination"]["hasMore"] is True
+
+    second = _reader().conversations_list(
+        limit=1,
+        cursor=first["pagination"]["nextCursor"],
+    )
+    assert second["count"] == 1
+    assert second["pagination"]["hasMore"] is False
+    assert first["conversations"][0]["session_key"] != second["conversations"][0]["session_key"]
+
+    newest = _reader().messages_read("telegram:123", limit=1)
+    assert newest["messages"][0]["role"] == "assistant"
+    older = _reader().messages_read(
+        "telegram:123",
+        limit=1,
+        cursor=newest["pagination"]["nextCursor"],
+    )
+    assert older["messages"][0]["role"] == "user"
+    assert older["pagination"]["hasMore"] is False
+
+
+def test_cursor_is_bound_to_original_filters(home_with_sessions):
+    first = _reader().conversations_list(limit=1)
+    cursor = first["pagination"]["nextCursor"]
+    out = _reader().conversations_list(limit=1, platform="telegram", cursor=cursor)
+    assert "different query" in out["error"]
+
+
+@pytest.mark.parametrize("method", ["conversations", "messages", "search"])
+def test_invalid_limits_return_protocol_errors(home_with_sessions, method):
+    if method == "conversations":
+        out = _reader().conversations_list(limit=0)
+    elif method == "messages":
+        out = _reader().messages_read("telegram:123", limit=-1)
+    else:
+        out = _reader().messages_search("pizza", limit="many")
+    assert "limit" in out["error"]
+
+
+def test_content_truncation_is_explicit(home_with_sessions):
+    path = home_with_sessions / "sessions" / "long_1.jsonl"
+    content = "x" * 5000
+    path.write_text("\n".join([
+        json.dumps({
+            "_type": "metadata",
+            "created_at": "2026-05-30T10:00:00",
+            "updated_at": "2026-05-30T10:00:00",
+            "metadata": {},
+        }),
+        json.dumps({"role": "user", "content": content}),
+    ]))
+    from flowly.mcp.server import readplane
+
+    readplane.get_session_reader.cache_clear()
+    message = _reader().messages_read("long:1")["messages"][0]
+    assert len(message["content"]) == 4000
+    assert message["contentTruncated"] is True
+    assert message["originalChars"] == 5000
+
+
+def test_reader_is_safe_across_sdk_worker_threads(home_with_sessions):
+    reader = _reader()
+    assert reader.conversations_list()["count"] == 2
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(reader.conversations_list) for _ in range(8)]
+    assert all(future.result()["count"] == 2 for future in futures)
+
+
 def test_messages_search_fts(home_with_sessions):
     out = _reader().messages_search("pizza")
     assert out["count"] >= 1
     assert any(r["session_key"] == "discord:999" for r in out["results"])
+    hit = next(r for r in out["results"] if r["session_key"] == "discord:999")
+    assert "context" in hit
 
 
 def test_messages_search_empty_query(home_with_sessions):
@@ -132,7 +209,6 @@ def test_registered_tools_are_callable(home_with_sessions):
         import mcp  # noqa: F401
     except ImportError:
         pytest.skip("mcp SDK not installed")
-    import asyncio
     from flowly.mcp.server.serve import create_server
 
     server = create_server(allow_writes=False)
@@ -143,9 +219,59 @@ def test_registered_tools_are_callable(home_with_sessions):
     # channels_list previously self-recursed; assert it returns real data.
     out = asyncio.run(_call("channels_list", {}))
     assert "telegram" in str(out)
+    assert out.is_error is False
+    assert out.structured_content["count"] >= 1
 
     out = asyncio.run(_call("conversations_list", {"limit": 5}))
     assert "telegram:123" in str(out)
 
     out = asyncio.run(_call("messages_search", {"query": "pizza"}))
     assert "discord:999" in str(out)
+
+
+def test_read_tools_advertise_safety_annotations(home_with_sessions):
+    from flowly.mcp.server.serve import create_server
+
+    tools = asyncio.run(create_server(allow_writes=False).list_tools())
+    assert len(tools) == 5
+    for tool in tools:
+        assert tool.annotations is not None
+        assert tool.annotations.read_only_hint is True
+        assert tool.annotations.destructive_hint is False
+        assert tool.annotations.idempotent_hint is True
+        assert tool.annotations.open_world_hint is False
+
+
+def test_server_errors_use_mcp_is_error(home_with_sessions):
+    from flowly.mcp.server.serve import create_server
+
+    out = asyncio.run(create_server().call_tool(
+        "conversation_get", {"session_key": "telegram:missing"}
+    ))
+    assert out.is_error is True
+    assert "not found" in out.structured_content["error"].lower()
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({"host": "0.0.0.0", "port": 8765, "path": "/mcp", "auth_token": ""},
+         "requires a bearer token"),
+        ({"host": "127.0.0.1", "port": 0, "path": "/mcp", "auth_token": ""},
+         "port"),
+        ({"host": "127.0.0.1", "port": 8765, "path": "mcp", "auth_token": ""},
+         "path"),
+        ({"host": "0.0.0.0", "port": 8765, "path": "/mcp", "auth_token": "s" * 32},
+         "requires TLS"),
+        ({"host": "127.0.0.1", "port": 8765, "path": "/mcp", "auth_token": "short"},
+         "at least 32"),
+        ({"host": "127.0.0.1", "port": 8765, "path": "/mcp", "auth_token": "",
+          "tls_cert": "missing.pem", "tls_key": ""},
+         "both a certificate"),
+    ],
+)
+def test_http_settings_fail_closed(settings, message):
+    from flowly.mcp.server.serve import _validate_http_settings
+
+    with pytest.raises(ValueError, match=message):
+        _validate_http_settings(**settings)

@@ -164,14 +164,80 @@ def test_graceful_degradation_no_gateway(isolated_home):
 
 def test_api_file_roundtrip_and_perms(isolated_home):
     import stat
-    control.write_api_file("127.0.0.1", 18790, "tok123")
+    token = "t" * 32
+    control.write_api_file("127.0.0.1", 18790, token)
     info = control.read_api_file()
     assert info["port"] == 18790
-    assert info["token"] == "tok123"
+    assert info["token"] == token
     path = isolated_home / "gateway-api.json"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     control.remove_api_file()
     assert control.read_api_file() is None
+
+
+@pytest.mark.asyncio
+async def test_message_send_idempotency_prevents_duplicate_delivery(
+    isolated_home, monkeypatch,
+):
+    sent: list[tuple[str, str]] = []
+
+    async def _on_send(target, message):
+        sent.append((target, message))
+        return True
+
+    token = control.generate_token()
+    runner, port, _ = await _start_control_app(token, _on_send, monkeypatch)
+    try:
+        control.write_api_file("127.0.0.1", port, token)
+        payload = {
+            "target": "telegram:123",
+            "message": "once",
+            "idempotency_key": "send-123",
+        }
+        first = await asyncio.to_thread(
+            writeplane._request, "POST", "/messages/send", payload,
+        )
+        second = await asyncio.to_thread(
+            writeplane._request, "POST", "/messages/send", payload,
+        )
+        assert first["duplicate"] is False
+        assert second["duplicate"] is True
+        assert sent == [("telegram:123", "once")]
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_cannot_be_reused_for_different_message(
+    isolated_home, monkeypatch,
+):
+    async def _on_send(target, message):
+        return True
+
+    token = control.generate_token()
+    runner, port, _ = await _start_control_app(token, _on_send, monkeypatch)
+    try:
+        control.write_api_file("127.0.0.1", port, token)
+        await asyncio.to_thread(
+            writeplane._request,
+            "POST",
+            "/messages/send",
+            {"target": "telegram:1", "message": "one", "idempotency_key": "same"},
+        )
+        conflict = await asyncio.to_thread(
+            writeplane._request,
+            "POST",
+            "/messages/send",
+            {"target": "telegram:1", "message": "two", "idempotency_key": "same"},
+        )
+        assert "different message" in conflict["error"]
+    finally:
+        await runner.cleanup()
+
+
+def test_control_advertisement_rejects_non_loopback_host(isolated_home):
+    control.write_api_file("example.invalid", 18790, "t" * 32)
+    assert writeplane._control_base() is None
 
 
 def test_register_write_tools_adds_three():
@@ -188,3 +254,16 @@ def test_register_write_tools_adds_three():
     if mgr and hasattr(mgr, "list_tools"):
         names = {t.name for t in mgr.list_tools()}
     assert {"messages_send", "approvals_list", "approvals_resolve"} <= names
+
+
+def test_write_tools_advertise_side_effect_annotations():
+    from mcp.server.mcpserver import MCPServer
+
+    mcp = MCPServer("t")
+    writeplane.register_write_tools(mcp, lambda value: value)
+    tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
+
+    assert tools["messages_send"].annotations.open_world_hint is True
+    assert tools["messages_send"].annotations.idempotent_hint is False
+    assert tools["approvals_list"].annotations.read_only_hint is True
+    assert tools["approvals_resolve"].annotations.destructive_hint is True

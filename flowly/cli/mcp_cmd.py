@@ -443,18 +443,61 @@ def serve(
         help="Expose send + approval-resolve tools (needs a running gateway)",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug logging"),
+    transport: str = typer.Option(
+        "stdio", "--transport", help="Server transport: stdio or http",
+    ),
+    host: str = typer.Option(
+        "127.0.0.1", "--host", help="HTTP bind host",
+    ),
+    port: int = typer.Option(8765, "--port", help="HTTP bind port"),
+    path: str = typer.Option("/mcp", "--path", help="HTTP MCP endpoint path"),
+    stateless: bool = typer.Option(
+        False, "--stateless", help="Use independent stateless HTTP requests",
+    ),
+    auth_token_env: str = typer.Option(
+        "FLOWLY_MCP_TOKEN",
+        "--auth-token-env",
+        help="Environment variable containing the HTTP bearer token",
+    ),
+    tls_cert: str = typer.Option(
+        "", "--tls-cert", help="PEM certificate for HTTPS",
+    ),
+    tls_key: str = typer.Option(
+        "", "--tls-key", help="PEM private key for HTTPS",
+    ),
 ) -> None:
-    """Run Flowly as an MCP server on stdio.
+    """Run Flowly as an MCP server on stdio or Streamable HTTP.
 
     External MCP clients (Claude Desktop, Cursor, another agent) can read
     your Flowly conversation history. Read tools work standalone; write
     tools (--allow-writes) require the gateway to be running.
 
-    This serves on stdio — point your MCP client at:
+    The default is stdio — point a local MCP client at:
         flowly mcp serve
+
+    For Streamable HTTP on localhost:
+        flowly mcp serve --transport http --port 8765
     """
+    normalized_transport = transport.strip().lower()
+    if normalized_transport not in {"stdio", "http"}:
+        raise typer.BadParameter("--transport must be 'stdio' or 'http'")
+    auth_token = os.environ.get(auth_token_env, "") if normalized_transport == "http" else ""
     from flowly.mcp.server import run_server
-    run_server(allow_writes=allow_writes, verbose=verbose)
+    try:
+        run_server(
+            allow_writes=allow_writes,
+            verbose=verbose,
+            transport=normalized_transport,
+            host=host,
+            port=port,
+            path=path,
+            stateless=stateless,
+            auth_token=auth_token,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,7 @@ when the write plane is disabled.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 _API_FILENAME = "gateway-api.json"
 _CONTROL_PREFIX = "/control"
+_MAX_API_FILE_BYTES = 64 * 1024
+_MAX_TARGET_CHARS = 512
+_MAX_MESSAGE_CHARS = 100_000
+_MAX_IDEMPOTENCY_KEY_CHARS = 256
+_MAX_SEND_RECEIPTS = 1000
 
 # Callback the gateway supplies to actually enqueue an outbound message.
 SendCallback = Callable[[str, str], Awaitable[bool]]
@@ -50,29 +56,49 @@ def generate_token() -> str:
 def write_api_file(host: str, port: int, token: str) -> None:
     """Advertise the control endpoint (mode 0600). Best-effort."""
     path = _api_path()
+    tmp: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(f".tmp.{secrets.token_hex(4)}")
-        tmp.write_text(
-            json.dumps({"host": host, "port": port, "token": token}),
-            encoding="utf-8",
-        )
+        payload = json.dumps({"host": host, "port": port, "token": token}).encode("utf-8")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(str(tmp), str(path))
         from flowly.utils.file_security import secure_file
         secure_file(path)  # POSIX chmod; real owner-only ACL on Windows
     except OSError as exc:
         logger.warning("MCP control: failed to write %s: %s", _API_FILENAME, exc)
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def read_api_file() -> dict[str, Any] | None:
     path = _api_path()
-    if not path.exists():
+    if not path.exists() or path.is_symlink():
         return None
     try:
+        if path.stat().st_size > _MAX_API_FILE_BYTES:
+            return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and data.get("token") and data.get("port"):
-            return data
-    except (OSError, ValueError):
+        if not isinstance(data, dict):
+            return None
+        host = data.get("host") or "127.0.0.1"
+        port = int(data.get("port"))
+        token = data.get("token")
+        if (
+            isinstance(host, str)
+            and 1 <= port <= 65535
+            and isinstance(token, str)
+            and 16 <= len(token) <= 4096
+        ):
+            return {"host": host, "port": port, "token": token}
+    except (OSError, TypeError, ValueError):
         pass
     return None
 
@@ -99,6 +125,9 @@ def register_control_routes(
     """
     from aiohttp import web
 
+    send_receipts: dict[str, tuple[str, str, bool]] = {}
+    send_receipts_lock = asyncio.Lock()
+
     def _authorized(request: Any) -> bool:
         header = request.headers.get("Authorization", "")
         expected = f"Bearer {token}"
@@ -112,17 +141,57 @@ def register_control_routes(
             body = await request.json()
         except Exception:
             return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "JSON body must be an object"}, status=400)
         target = str(body.get("target", "")).strip()
         message = str(body.get("message", ""))
         if not target or not message:
             return web.json_response(
                 {"error": "both 'target' and 'message' are required"}, status=400,
             )
-        try:
-            ok = await on_send(target, message)
-        except Exception as exc:
-            return web.json_response({"error": f"send failed: {exc}"}, status=500)
-        return web.json_response({"sent": bool(ok), "target": target})
+        if len(target) > _MAX_TARGET_CHARS:
+            return web.json_response({"error": "target is too long"}, status=400)
+        if len(message) > _MAX_MESSAGE_CHARS:
+            return web.json_response({"error": "message is too long"}, status=413)
+        idempotency_key = str(body.get("idempotency_key", "")).strip()
+        if len(idempotency_key) > _MAX_IDEMPOTENCY_KEY_CHARS:
+            return web.json_response({"error": "idempotency_key is too long"}, status=400)
+
+        async def _send_once() -> tuple[dict[str, Any], int]:
+            if idempotency_key:
+                previous = send_receipts.get(idempotency_key)
+                if previous is not None:
+                    previous_target, previous_message, previous_ok = previous
+                    if (previous_target, previous_message) != (target, message):
+                        return {
+                            "error": "idempotency_key was already used for a different message",
+                        }, 409
+                    return {
+                        "sent": previous_ok,
+                        "target": target,
+                        "idempotencyKey": idempotency_key,
+                        "duplicate": True,
+                    }, 200
+            try:
+                ok = await on_send(target, message)
+            except Exception as exc:
+                return {"error": f"send failed: {exc}"}, 500
+            if idempotency_key:
+                send_receipts[idempotency_key] = (target, message, bool(ok))
+                while len(send_receipts) > _MAX_SEND_RECEIPTS:
+                    send_receipts.pop(next(iter(send_receipts)))
+            result: dict[str, Any] = {"sent": bool(ok), "target": target}
+            if idempotency_key:
+                result["idempotencyKey"] = idempotency_key
+                result["duplicate"] = False
+            return result, 200
+
+        if idempotency_key:
+            async with send_receipts_lock:
+                result, status = await _send_once()
+        else:
+            result, status = await _send_once()
+        return web.json_response(result, status=status)
 
     async def _approvals_list(request):
         if not _authorized(request):
@@ -149,6 +218,8 @@ def register_control_routes(
             body = await request.json()
         except Exception:
             return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "JSON body must be an object"}, status=400)
         approval_id = str(body.get("id", "")).strip()
         decision = str(body.get("decision", "")).strip()
         if decision not in {"allow-once", "allow-always", "deny"}:
