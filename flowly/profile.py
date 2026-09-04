@@ -69,6 +69,8 @@ _CLONE_ALL_STRIP = [
 ]
 
 _PROFILE_METADATA_FILE = "profile.json"
+# Published by the primary, read by every bot: see refresh_roster_index.
+_ROSTER_INDEX_FILE = "roster.json"
 _PROFILE_HOST_FILE = "profile-host.json"
 _RUNTIME_LEASE_FILE = ".desktop-runtime.json"
 _PROFILE_MUTATION_LOCK_FILE = ".profiles.lock"
@@ -898,6 +900,7 @@ def create_profile(
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
 
+    refresh_roster_index()
     return profile_dir
 
 
@@ -1012,6 +1015,102 @@ def _bind_local_runtime(profile_dir: Path, workspace: Path) -> None:
     _atomic_write_json(config_path, raw)
 
 
+def roster_index_path() -> Path:
+    """Where the shared id-to-display-name index lives."""
+    return _DEFAULT_HOME / _ROSTER_INDEX_FILE
+
+
+def _profile_ids_on_disk() -> list[str]:
+    """Ids under the profiles root, including ones we may not read into.
+
+    A bot is denied its siblings' contents, but not the knowledge that they
+    exist: listing the directory still works, it is opening what is inside
+    that does not. That is enough to tell a real id from a stale one.
+    """
+    try:
+        entries = sorted(_PROFILES_ROOT.iterdir())
+    except OSError:
+        return []
+    return [entry.name for entry in entries if _PROFILE_NAME_RE.match(entry.name)]
+
+
+def read_roster_index() -> dict[str, str]:
+    """The published id-to-name index, or nothing when there is none.
+
+    Every failure reads as "no index": a bot that cannot find it, or finds
+    it damaged, falls back to naming its siblings by id, which is what it
+    did before the index existed.
+    """
+    try:
+        raw = roster_index_path().read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: label.strip()
+        for key, label in value.items()
+        if isinstance(key, str) and isinstance(label, str) and label.strip()
+    }
+
+
+def refresh_roster_index() -> None:
+    """Republish the one thing a bot cannot learn about its siblings.
+
+    A named bot may not read a sibling's profile.json — that is the
+    isolation doing its job — so the name its owner gave the bot next door
+    is precisely what it cannot discover for itself. The primary can read
+    every profile, so it writes that mapping somewhere a bot is allowed to
+    look.
+
+    Best effort by design: the index is a published copy of what the
+    profile directories already say, so failing to write it must never
+    fail the change that prompted it. A bot with a stale index addresses
+    somebody by an old name; a bot whose creation failed has no name at
+    all.
+    """
+    try:
+        _atomic_write_json(
+            roster_index_path(),
+            {
+                profile.name: profile.display_name
+                for profile in list_profiles()
+                if profile.display_name and profile.display_name != profile.name
+            },
+        )
+    except (OSError, ValueError):
+        return
+
+
+def _profile_labels() -> dict[str, str]:
+    """Every id we can name, paired with the name its owner reads.
+
+    Two sources, in order of authority. A profile we can read states its
+    own name, and that is the truth. For a sibling the policy withholds,
+    the published index is the only place that name survives — trusted
+    only for ids that are really on disk, so an entry left behind by a
+    deleted bot names nobody.
+    """
+    labels: dict[str, str] = {}
+    for profile in list_profiles():
+        label = (profile.display_name or "").strip()
+        if label and label != profile.name:
+            labels[profile.name] = label
+    index = read_roster_index()
+    if index:
+        for profile_id in _profile_ids_on_disk():
+            if profile_id in labels:
+                continue
+            label = index.get(profile_id, "").strip()
+            if label and label != profile_id:
+                labels[profile_id] = label
+    return labels
+
+
 def profile_display_names(names: list[str] | None = None) -> dict[str, str]:
     """Map profile ids to the names their owner actually reads.
 
@@ -1024,15 +1123,15 @@ def profile_display_names(names: list[str] | None = None) -> dict[str, str]:
     Ids without a display name, or whose display name is just the id again,
     are left out: there is nothing to add for those.
     """
-    wanted = set(names) if names is not None else None
-    mapping: dict[str, str] = {}
-    for profile in list_profiles():
-        if wanted is not None and profile.name not in wanted:
-            continue
-        label = (profile.display_name or "").strip()
-        if label and label != profile.name:
-            mapping[profile.name] = label
-    return mapping
+    labels = _profile_labels()
+    if names is None:
+        return labels
+    wanted = set(names)
+    return {
+        profile_id: label
+        for profile_id, label in labels.items()
+        if profile_id in wanted
+    }
 
 
 def resolve_profile_reference(reference: str) -> str | None:
@@ -1046,15 +1145,17 @@ def resolve_profile_reference(reference: str) -> str | None:
     candidate = str(reference or "").strip()
     if not candidate:
         return None
-    profiles = list_profiles()
-    for profile in profiles:
-        if profile.name == candidate:
-            return profile.name
+    # An id resolves to itself even for a sibling we may not read into: the
+    # policy withholds what is inside a profile, not that it is there.
+    known_ids = {"default", *_profile_ids_on_disk()}
+    known_ids.update(profile.name for profile in list_profiles())
+    if candidate in known_ids:
+        return candidate
     folded = candidate.casefold()
     matches = {
-        profile.name
-        for profile in profiles
-        if (profile.display_name or "").strip().casefold() == folded
+        profile_id
+        for profile_id, label in _profile_labels().items()
+        if label.casefold() == folded
     }
     return next(iter(matches)) if len(matches) == 1 else None
 
@@ -1169,6 +1270,7 @@ def update_profile_metadata(
         ),
     })
     _atomic_write_json(profile.path / _PROFILE_METADATA_FILE, current)
+    refresh_roster_index()
     return describe_profile(name)
 
 
@@ -1677,6 +1779,8 @@ def delete_profile(name: str) -> None:
 
     # Remove wrapper script
     remove_wrapper_script(name)
+
+    refresh_roster_index()
 
 
 # ── Export / Import ───────────────────────────────────────────────
@@ -2228,6 +2332,7 @@ def _import_profile_archive(
             profile_dir.chmod(0o700)
         except OSError:
             pass
+        refresh_roster_index()
         return profile_dir
     finally:
         shutil.rmtree(staging, ignore_errors=True)

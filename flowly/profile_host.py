@@ -36,6 +36,7 @@ from flowly.profile import (
     ensure_profile_bot_id,
     get_or_create_profile_host_id,
     list_profiles,
+    profile_display_names,
     read_profile_settings,
     reconcile_runtime_lease,
     resolve_profile_reference,
@@ -281,6 +282,9 @@ class ProfileHost:
             target_rpc=self._target_rpc,
             target_prepare=self.connect,
             profile_directory=lambda: [profile.name for profile in list_profiles()],
+            # The names their owner reads, so a group's members address each
+            # other the way the person watching them does.
+            profile_labels=profile_display_names,
             on_event=self._emit_room,
             target_is_running=lambda name: self._runtime_is_open(
                 self._runtimes.get(name)
