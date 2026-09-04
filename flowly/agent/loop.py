@@ -3219,6 +3219,10 @@ class AgentLoop:
             logger.warning(f"[Memory] Failed to init memory manager: {e}")
             return None
 
+    def set_profile_collaboration_host(self, host) -> None:
+        """Attach the process' host, not a UI client, for queued user turns."""
+        self._profile_collaboration_host = host
+
     def set_channel_directory(self, known_channels) -> None:
         """Tell the message tool which channels can actually be reached.
 
@@ -7289,7 +7293,41 @@ class AgentLoop:
                         await announce(msg.content)
                     except Exception:  # noqa: BLE001 — display, never the turn
                         logger.debug("[goal] user-message announce failed", exc_info=True)
-            return await self._process_message_unlocked(msg)
+            from flowly.profile_collaboration import PROFILE_RUN_BINDING
+
+            binding = PROFILE_RUN_BINDING.get()
+            run_id = str(msg.metadata.get("run_id") or "")
+            if binding is not None and (
+                not binding.is_active
+                or binding.session_key != msg.session_key
+                or (binding.run_id and binding.run_id != run_id)
+            ):
+                binding = None
+            host = getattr(self, "_profile_collaboration_host", None)
+            if (
+                binding is None and host is not None
+                and _is_user_activity_channel(msg.channel)
+                and msg.sender_id not in {"system", "process", "subagent"}
+                and str(msg.metadata.get("turn_origin") or "user") == "user"
+            ):
+                # The bus does not transfer ContextVars between producer and
+                # consumer tasks. Mint authority here from the local host;
+                # scalar directory hints carried by the message cannot grant it.
+                binding = host.collaboration_binding(
+                    "default", msg.session_key, run_id or str(uuid.uuid4()),
+                )
+            token = PROFILE_RUN_BINDING.set(binding)
+            if binding is not None:
+                msg.metadata.update(binding.metadata())
+            else:
+                msg.metadata["profile_directory"] = []
+                msg.metadata.pop("profile_display_names", None)
+            try:
+                return await self._process_message_unlocked(msg)
+            finally:
+                if binding is not None:
+                    binding.close()
+                PROFILE_RUN_BINDING.reset(token)
 
     async def _process_message_unlocked(
         self, msg: InboundMessage

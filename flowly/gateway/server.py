@@ -36,6 +36,10 @@ from flowly.gateway.auth import (
 from flowly.gateway.identity import health_identity
 from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
+from flowly.profile_collaboration import (
+    PROFILE_RUN_BINDING as _PROFILE_RUN_BINDING,
+    ProfileRunBinding as _ProfileRunBinding,
+)
 from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
 from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
@@ -171,24 +175,6 @@ class _BrowserRunBinding:
 
 _BROWSER_RUN_BINDING: ContextVar[_BrowserRunBinding | None] = ContextVar(
     "flowly_browser_run_binding", default=None
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _ProfileRunBinding:
-    """Desktop collaboration authority scoped to one chat coroutine."""
-
-    client_id: str
-    session_key: str
-    current_profile: str
-    available_profiles: tuple[str, ...]
-    correlation_id: str
-    hop: int = 0
-    turn_origin: str = "user"
-
-
-_PROFILE_RUN_BINDING: ContextVar[_ProfileRunBinding | None] = ContextVar(
-    "flowly_profile_run_binding", default=None
 )
 
 
@@ -2758,10 +2744,18 @@ class GatewayServer:
                 self.sessions.get_or_create(session_key).metadata.get("model_override") or ""
             ).strip()
 
-        # Desktop is the directory authority: sibling runtimes do not scan or
-        # start one another. Keep only stable ids and small scalar context on
-        # the agent request; display labels and filesystem paths never cross
-        # this boundary.
+        # A primary host owns the directory. External clients may suggest
+        # mentions, but cannot impersonate another profile or a nested turn.
+        # Private host calls preserve the restrictive grant of group/worker
+        # turns. A managed child still receives its scope from its controller.
+        if self._profile_host is not None:
+            from flowly.profile import list_profiles
+
+            params = dict(params)
+            params["profileDirectory"] = [profile.name for profile in list_profiles()]
+            if ws is not self._profile_host_socket:
+                params.pop("profileMessageContext", None)
+                params["turnOrigin"] = "user"
         raw_directory = params.get("profileDirectory")
         if raw_directory is None:
             raw_directory = []
@@ -3111,28 +3105,35 @@ class GatewayServer:
             )
 
         binding_token = _BROWSER_RUN_BINDING.set(browser_binding)
-        profile_binding_token = _PROFILE_RUN_BINDING.set(
-            _ProfileRunBinding(
-                client_id=client_id,
-                session_key=session_key,
-                current_profile=str((extra_metadata or {}).get("profile_current") or "default"),
-                available_profiles=tuple(
-                    str(value)
-                    for value in ((extra_metadata or {}).get("profile_directory") or [])
-                    if isinstance(value, str)
-                ),
-                correlation_id=str(
-                    (extra_metadata or {}).get("profile_correlation_id") or run_id
-                ),
-                hop=int((extra_metadata or {}).get("profile_hop") or 0),
-                turn_origin=str(
-                    (extra_metadata or {}).get("turn_origin") or "user"
-                ),
-            )
-            if client_id
-            else None
-        )
+        profile_binding = None
+        profile_binding_token = _PROFILE_RUN_BINDING.set(None)
         try:
+            host = getattr(self, "_profile_host", None)
+            if host is not None:
+                profile_binding = host.collaboration_binding(
+                    "default", session_key, run_id,
+                    correlation_id=str((extra_metadata or {}).get("profile_correlation_id") or run_id),
+                    hop=int((extra_metadata or {}).get("profile_hop") or 0),
+                    turn_origin=str((extra_metadata or {}).get("turn_origin") or "user"),
+                )
+            elif client_id:
+                profile_binding = _ProfileRunBinding(
+                    client_id=client_id,
+                    session_key=session_key,
+                    current_profile=str((extra_metadata or {}).get("profile_current") or "default"),
+                    available_profiles=tuple(
+                        str(value)
+                        for value in ((extra_metadata or {}).get("profile_directory") or [])
+                        if isinstance(value, str)
+                    ),
+                    correlation_id=str((extra_metadata or {}).get("profile_correlation_id") or run_id),
+                    hop=int((extra_metadata or {}).get("profile_hop") or 0),
+                    turn_origin=str((extra_metadata or {}).get("turn_origin") or "user"),
+                    run_id=run_id,
+                )
+            if profile_binding is not None:
+                extra_metadata = {**(extra_metadata or {}), **profile_binding.metadata()}
+            _PROFILE_RUN_BINDING.set(profile_binding)
             assert self.on_chat_message is not None
             call_args = (
                 session_key,
@@ -3335,6 +3336,8 @@ class GatewayServer:
                 },
             )
         finally:
+            if profile_binding is not None:
+                profile_binding.close()
             _PROFILE_RUN_BINDING.reset(profile_binding_token)
             _BROWSER_RUN_BINDING.reset(binding_token)
             # Run settled (final / aborted / error) — the partial is no
@@ -4048,16 +4051,16 @@ class GatewayServer:
         target_profile: str,
         message: str,
     ) -> dict:
-        """Ask the owning Desktop client to broker one sibling-profile turn.
+        """Route through the host, or the authenticated controller of a child.
 
-        The gateway never discovers sibling directories and never opens their
-        ports. Desktop validates the target, starts it if necessary, and
-        returns the correlated result on this same authenticated socket.
+        A primary gateway never delegates execution to a UI socket. Managed
+        children retain the reverse-RPC protocol so both a gateway controller
+        and existing local Desktop controllers remain compatible.
         """
         binding = _PROFILE_RUN_BINDING.get()
-        if binding is None or not binding.client_id:
+        if binding is None or not binding.is_active or (binding.broker is None and not binding.client_id):
             return {
-                "error": "Profile messaging is available only in a Desktop-managed conversation",
+                "error": "This run has no connected agent messaging host",
                 "error_code": "PROFILE_BROKER_UNAVAILABLE",
             }
         target = str(target_profile or "").strip()
@@ -4083,10 +4086,23 @@ class GatewayServer:
                 "error": "Profile collaboration reached its three-hop safety limit",
                 "error_code": "PROFILE_HOP_LIMIT",
             }
+        if binding.broker is not None:
+            try:
+                return await binding.broker(binding.current_profile, {
+                    "sourceProfile": binding.current_profile,
+                    "sourceSessionKey": binding.session_key,
+                    "targetProfile": target,
+                    "message": content,
+                    "correlationId": binding.correlation_id,
+                    "hop": binding.hop + 1,
+                    "requestId": request_id,
+                })
+            except ProfileHostError as exc:
+                return {"error": str(exc), "error_code": exc.code, "retryable": exc.retryable}
         ws = self._ws_clients.get(binding.client_id)
         if ws is None or ws.closed:
             return {
-                "error": "Desktop profile broker is not connected",
+                "error": "The agent messaging controller is not connected",
                 "error_code": "PROFILE_BROKER_UNAVAILABLE",
             }
         if request_id in self._profile_pending:

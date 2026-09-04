@@ -291,6 +291,30 @@ class ProfileHost:
             ),
         )
 
+    def collaboration_binding(
+        self,
+        source: str,
+        session_key: str,
+        run_id: str,
+        *,
+        correlation_id: str | None = None,
+        hop: int = 0,
+        turn_origin: str = "user",
+    ):
+        """Mint host authority without relying on the originating application."""
+        from flowly.profile_collaboration import ProfileRunBinding
+
+        if self._closed:
+            raise ProfileHostError("PROFILE_HOST_UNAVAILABLE", "The agent host is stopping.")
+        directory = tuple(profile.name for profile in list_profiles())
+        if source not in directory:
+            raise ProfileHostError("PROFILE_SOURCE_INVALID", "The source profile is not on this host.")
+        return ProfileRunBinding(
+            client_id="", session_key=session_key, current_profile=source,
+            available_profiles=directory, correlation_id=correlation_id or run_id,
+            hop=hop, turn_origin=turn_origin, run_id=run_id, broker=self._broker,
+        )
+
     def capabilities(self) -> dict[str, Any]:
         room_capabilities = self._rooms.capabilities()
         return {
@@ -319,6 +343,7 @@ class ProfileHost:
             "maxConcurrentRuntimes": _MAX_RUNTIMES,
             "maxNamedProfiles": MAX_NAMED_PROFILES,
             "profileReadiness": True,
+            "profileMessaging": {"authority": "gateway", "version": 1},
             "credentialPolicies": {
                 "namedProfile": "isolated",
                 "supported": ["isolated"],
@@ -1668,7 +1693,7 @@ class ProfileHost:
         request_id = str(frame.get("id") or "")
         params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
         try:
-            result = await self._broker(source.profile, params)
+            result = await self._broker(source.profile, {**params, "requestId": request_id})
             response = {"type": "profile_message_result", "id": request_id, "result": result}
         except ProfileHostError as exc:
             response = {
@@ -1752,6 +1777,8 @@ class ProfileHost:
             logger.debug("Shared service result could not return to {}", source.profile)
 
     async def _broker(self, source_profile: str, params: dict[str, Any]) -> dict[str, Any]:
+        if self._closed:
+            raise ProfileHostError("PROFILE_HOST_UNAVAILABLE", "The agent host is stopping.")
         if str(params.get("sourceProfile") or "").strip() != source_profile:
             raise ProfileHostError("PROFILE_SOURCE_INVALID", "Profile message source failed validation.")
         target = str(params.get("targetProfile") or "").strip()
@@ -1788,7 +1815,18 @@ class ProfileHost:
             raise ProfileHostError("PROFILE_CONTEXT_INVALID", "Profile collaboration context is invalid.")
         source_session_id = hashlib.sha256(source_session.encode()).hexdigest()[:16]
         target_session = f"desktop:profile-inbox:{source_profile}:{source_session_id}"
-        async with self._broker_target_locks.setdefault(target, asyncio.Lock()):
+        target_lock = self._broker_target_locks.setdefault(target, asyncio.Lock())
+        if hop > 1 and target_lock.locked():
+            # Nested requests must never wait behind a target that may itself
+            # be waiting for this source. This also breaks cross-run cycles.
+            raise ProfileHostError(
+                "PROFILE_COLLABORATION_BUSY",
+                f"Profile '{target}' is already handling another agent request.",
+                retryable=True,
+            )
+        async with target_lock:
+            if self._closed:
+                raise ProfileHostError("PROFILE_HOST_UNAVAILABLE", "The agent host is stopping.")
             return await self._run_broker_turn(
                 source_profile=source_profile,
                 target=target,
@@ -1797,6 +1835,7 @@ class ProfileHost:
                 correlation_id=correlation_id,
                 hop=hop,
                 available=available,
+                request_id=str(params.get("requestId") or uuid.uuid4()),
             )
 
     async def _run_broker_turn(
@@ -1809,14 +1848,20 @@ class ProfileHost:
         correlation_id: str,
         hop: int,
         available: set[str],
+        request_id: str,
     ) -> dict[str, Any]:
         self._broker_sessions[(target, target_session)] = correlation_id
+        # A correlation describes the parent turn, not one message. Distinct
+        # calls in that turn must not reuse a child's idempotency/run key.
+        run_id = "profile-" + hashlib.sha256(
+            f"{source_profile}:{target_session}:{request_id}".encode()
+        ).hexdigest()[:32]
         try:
             accepted = await self._target_rpc(target, "chat.send", {
                 "sessionKey": target_session,
                 "message": message,
                 "thinking": False,
-                "idempotencyKey": f"profile-{correlation_id}-{hop}",
+                "idempotencyKey": run_id,
                 "profileDirectory": sorted(available),
                 "profileMentions": [],
                 "profileMessageContext": {
@@ -1841,7 +1886,7 @@ class ProfileHost:
                 try:
                     terminal = await asyncio.wait_for(waiter, timeout=600)
                 except asyncio.TimeoutError as exc:
-                    await self._target_rpc(target, "chat.abort", {"runId": run_id}, 30)
+                    await self._abort_broker_turn(target, run_id)
                     raise ProfileHostError(
                         "PROFILE_RESPONSE_TIMEOUT",
                         f"Profile '{target}' did not respond in time.",
@@ -1849,6 +1894,11 @@ class ProfileHost:
                 finally:
                     self._broker_waiters.pop(key, None)
                     self._terminal_events.pop(key, None)
+            if terminal.get("state") != "final":
+                raise ProfileHostError(
+                    "PROFILE_COLLABORATION_FAILED",
+                    f"Profile collaboration ended with {terminal.get('state')}.",
+                )
             response = _profile_reply_text(terminal.get("message"))
             if not response:
                 raise ProfileHostError(
@@ -1863,8 +1913,22 @@ class ProfileHost:
                 "correlationId": correlation_id,
                 "hop": hop,
             }
+        except asyncio.CancelledError:
+            # Also use the requested id if cancellation won the race with the
+            # ACK. The gateway may already have accepted and started that run.
+            await self._abort_broker_turn(target, run_id)
+            raise
         finally:
             self._broker_sessions.pop((target, target_session), None)
+
+    async def _abort_broker_turn(self, target: str, run_id: str) -> None:
+        try:
+            await asyncio.wait_for(
+                self._target_rpc(target, "chat.abort", {"runId": run_id}, 30),
+                timeout=30,
+            )
+        except Exception:
+            logger.debug("Could not abort cancelled profile collaboration {}", run_id)
 
     async def _target_rpc(
         self,
@@ -1881,7 +1945,13 @@ class ProfileHost:
                     retryable=True,
                 )
             return await self._primary_rpc(method, params, timeout)
-        target_runtime = await self._ensure_runtime(target)
+        if method == "chat.abort":
+            target_runtime = self._runtimes.get(target)
+            if not self._runtime_is_open(target_runtime):
+                # Stop is never a reason to start or restart an agent.
+                return {"aborted": False}
+        else:
+            target_runtime = await self._ensure_runtime(target)
         result = await self._rpc(target_runtime, method, params, timeout)
         if method == "chat.send" and isinstance(result, dict):
             run_id = str(result.get("runId") or "")
