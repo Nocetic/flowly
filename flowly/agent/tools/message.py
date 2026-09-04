@@ -36,7 +36,8 @@ class MessageTool(Tool):
         self,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         default_channel: str = "",
-        default_chat_id: str = ""
+        default_chat_id: str = "",
+        known_channels: Callable[[], set[str]] | None = None,
     ):
         """
         Initialize the message tool.
@@ -49,6 +50,16 @@ class MessageTool(Tool):
         self._send_callback = send_callback
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
+        self._known_channels = known_channels
+
+    def set_known_channels(self, known_channels: Callable[[], set[str]] | None) -> None:
+        """Wire the directory of channels that can actually be reached.
+
+        Read through a callable rather than copied: channels start and stop
+        while the agent runs, and a snapshot taken at construction would
+        refuse a channel that has since come up.
+        """
+        self._known_channels = known_channels
 
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the current message context (channel and chat_id)."""
@@ -106,6 +117,38 @@ class MessageTool(Tool):
             "required": ["content"]
         }
 
+    def _unreachable_channel(self, channel: str) -> str | None:
+        """Refuse a channel nothing will deliver, and say what is real.
+
+        The outbound dispatcher looks the channel up long after this tool has
+        returned: an unknown name is logged and the message dropped, while the
+        tool has already reported it sent. So a model that invents a plausible
+        channel — ``agent`` to reach another bot, say — is told the message
+        arrived when it was thrown away, and the reader waits for a reply that
+        was never going to come.
+
+        Only refuse when the directory is known. An unwired tool keeps its old
+        behaviour rather than refusing everything.
+        """
+        if self._known_channels is None:
+            return None
+        try:
+            known = set(self._known_channels())
+        except Exception:
+            return None
+        if not known or channel in known:
+            return None
+        listed = ", ".join(sorted(known))
+        hint = (
+            " To reach another bot, use message_profile."
+            if channel in {"agent", "profile", "bot"}
+            else ""
+        )
+        return (
+            f"Error: there is no '{channel}' channel, so nothing would be "
+            f"delivered. Available channels: {listed}.{hint}"
+        )
+
     async def execute(
         self,
         content: str,
@@ -136,6 +179,10 @@ class MessageTool(Tool):
 
         if not self._send_callback:
             return "Error: Message sending not configured. Internal error."
+
+        unreachable = self._unreachable_channel(channel)
+        if unreachable:
+            return unreachable
 
         # Validate and filter media paths
         validated_media: list[str] = []

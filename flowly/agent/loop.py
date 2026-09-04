@@ -2272,6 +2272,9 @@ class AgentLoop:
         
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
+        # Held so the channel directory can be wired once the manager exists:
+        # the tool is built here, and channels are started later.
+        self._message_tool = message_tool
         self.tools.register(message_tool)
 
         # Screenshot tool
@@ -3215,6 +3218,17 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"[Memory] Failed to init memory manager: {e}")
             return None
+
+    def set_channel_directory(self, known_channels) -> None:
+        """Tell the message tool which channels can actually be reached.
+
+        Without it the tool cannot tell a real channel from an invented one,
+        and the dispatcher's later "Unknown channel" is a warning in a log
+        nobody is reading, long after the agent said the message was sent.
+        """
+        tool = getattr(self, "_message_tool", None)
+        if tool is not None:
+            tool.set_known_channels(known_channels)
 
     def set_gateway_server(self, gateway_server) -> None:
         """Set the gateway server reference for browser_tab tool.

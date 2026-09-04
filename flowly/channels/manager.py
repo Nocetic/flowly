@@ -11,6 +11,13 @@ from flowly.channels.base import BaseChannel
 from flowly.config.schema import Config
 
 
+# Channel names that intentionally have no adapter — their responses are
+# delivered via the gateway's WS final event instead. The dispatcher skips
+# them silently, and anything validating a target counts them as real, so
+# the two cannot disagree about what exists.
+CHANNELS_WITHOUT_ADAPTER = frozenset({"cli", "tui", "desktop"})
+
+
 class ChannelManager:
     """
     Manages chat channels and coordinates message routing.
@@ -158,14 +165,18 @@ class ChannelManager:
             except Exception as e:
                 logger.error(f"Error stopping {name}: {e}")
     
+    def known_channel_names(self) -> set[str]:
+        """Every channel a message can actually reach right now.
+
+        Started adapters plus the ones answered over the gateway. Anything
+        else is a name nobody will deliver, and a caller is better told so
+        than left with a message that was queued and dropped.
+        """
+        return set(self.channels) | set(CHANNELS_WITHOUT_ADAPTER)
+
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
         logger.info("Outbound dispatcher started")
-        # Channel names that intentionally have no adapter — their
-        # responses are delivered via the gateway's WS final event
-        # instead. Listed here so the dispatcher can silently skip them
-        # instead of logging a "Unknown channel" warning per tool call.
-        _EXPECTED_NO_ADAPTER = {"cli", "tui", "desktop"}
         
         while True:
             try:
@@ -180,7 +191,7 @@ class ChannelManager:
                         await channel.send(msg)
                     except Exception as e:
                         logger.error(f"Error sending to {msg.channel}: {e}")
-                elif msg.channel in _EXPECTED_NO_ADAPTER:
+                elif msg.channel in CHANNELS_WITHOUT_ADAPTER:
                     # CLI / TUI / direct WS responses are delivered via
                     # the gateway's final chat event, not a channel
                     # adapter. The agent loop still publishes to the bus

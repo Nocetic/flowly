@@ -1466,6 +1466,10 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
 
+    # The agent builds its message tool before any channel is up, so hand it
+    # the directory now — read live, since channels start and stop.
+    agent.set_channel_directory(channels.known_channel_names)
+
     # Wire cron reconciliation to web channel's on_ready — runs after every
     # handshake with the relay to fix stale `to` fields and re-sync tasks to
     # Firestore. Deferred to here because `channels` only exists now.
