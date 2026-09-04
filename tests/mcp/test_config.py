@@ -198,6 +198,27 @@ def test_lifecycle_policy_defaults_are_safe_and_round_trip(isolated_home: Path):
     assert load_config().mcp_servers["durable"].lifecycle.parked_probe_interval == 120.0
 
 
+def test_content_and_pagination_bounds_round_trip(isolated_home: Path):
+    entry = MCPServerConfig(command="x")
+    assert entry.pagination.max_pages == 100
+    assert entry.pagination.max_items == 10_000
+    assert entry.content.max_binary_bytes == 25 * 1024 * 1024
+
+    cfg = Config()
+    cfg.mcp_servers = {
+        "bounded": MCPServerConfig(
+            command="x",
+            pagination={"max_pages": 8, "max_items": 250},
+            content={"max_binary_bytes": 2 * 1024 * 1024},
+        ),
+    }
+    save_config(cfg)
+    on_disk = json.loads((isolated_home / "config.json").read_text())
+    server = on_disk["mcpServers"]["bounded"]
+    assert server["pagination"] == {"maxPages": 8, "maxItems": 250}
+    assert server["content"]["maxBinaryBytes"] == 2 * 1024 * 1024
+
+
 @pytest.mark.parametrize("protocol", ["auto", "stateless", "legacy"])
 def test_protocol_mode_round_trips(protocol, isolated_home: Path):
     cfg = Config()

@@ -30,17 +30,18 @@ import logging
 from typing import Any
 
 from flowly.agent.tools.base import Tool
+from flowly.mcp.content import (
+    mcp_attr,
+    mcp_wire_value,
+    render_content_blocks,
+    render_resource_contents,
+)
+from flowly.mcp.media_cache import DEFAULT_MAX_BINARY_BYTES
+from flowly.mcp.pagination import collect_mcp_pages
 from flowly.mcp.schema import mcp_tool_name, normalize_mcp_input_schema
 from flowly.mcp.security import sanitize_error
 
 logger = logging.getLogger(__name__)
-
-
-def _mcp_attr(obj: Any, snake_name: str, wire_name: str, default: Any = None) -> Any:
-    """Read an SDK field across snake_case Python and wire-name models."""
-    if hasattr(obj, snake_name):
-        return getattr(obj, snake_name)
-    return getattr(obj, wire_name, default)
 
 
 def _exc_text(exc: BaseException) -> str:
@@ -126,9 +127,8 @@ async def _run_on_mcp_loop(
     # other fields is a healthy call and must not trip the breaker.
     try:
         parsed = json.loads(result)
-        is_error_envelope = (
-            isinstance(parsed, dict)
-            and set(parsed.keys()) == {"error"}
+        is_error_envelope = isinstance(parsed, dict) and (
+            set(parsed.keys()) == {"error"} or parsed.get("isError") is True
         )
     except (json.JSONDecodeError, TypeError):
         is_error_envelope = False
@@ -162,8 +162,14 @@ class MCPTool(Tool):
             or f"MCP tool {remote_tool.name} from server '{server_task.name}'"
         )
         self._parameters = normalize_mcp_input_schema(
-            _mcp_attr(remote_tool, "input_schema", "inputSchema")
+            mcp_attr(remote_tool, "input_schema", "inputSchema")
         )
+        self.title = getattr(remote_tool, "title", None)
+        self.output_schema = mcp_attr(remote_tool, "output_schema", "outputSchema")
+        self.annotations = mcp_wire_value(getattr(remote_tool, "annotations", None))
+        self.execution = mcp_wire_value(getattr(remote_tool, "execution", None))
+        self.icons = mcp_wire_value(getattr(remote_tool, "icons", None))
+        self.mcp_metadata = mcp_wire_value(mcp_attr(remote_tool, "meta", "_meta"))
 
     @property
     def name(self) -> str:
@@ -216,45 +222,39 @@ class MCPTool(Tool):
 
     def _format_result(self, result: Any) -> str:
         """Render an MCP ``CallToolResult`` into the agent's JSON envelope."""
-        is_error = bool(_mcp_attr(result, "is_error", "isError", False))
+        is_error = bool(mcp_attr(result, "is_error", "isError", False))
         content_blocks = getattr(result, "content", None) or []
+        rendered = render_content_blocks(
+            content_blocks,
+            max_binary_bytes=getattr(
+                self._server_task,
+                "max_binary_bytes",
+                DEFAULT_MAX_BINARY_BYTES,
+            ),
+        )
 
         if is_error:
-            text = ""
-            for block in content_blocks:
-                block_text = getattr(block, "text", None)
-                if block_text:
-                    text += block_text
-            return json.dumps({
-                "error": sanitize_error(text or "MCP tool returned an error"),
-            }, ensure_ascii=False)
-
-        from flowly.mcp.media_cache import cache_image_block
-
-        text_parts: list[str] = []
-        for block in content_blocks:
-            block_text = getattr(block, "text", None)
-            if block_text:
-                text_parts.append(block_text)
-                continue
-            # ImageContent → cache to $FLOWLY_HOME/media/mcp/ and emit a
-            # MEDIA: token so messaging adapters render it (E3).
-            media_tag = cache_image_block(block)
-            if media_tag:
-                text_parts.append(media_tag)
-
-        text_result = "\n".join(text_parts)
-
-        structured = _mcp_attr(result, "structured_content", "structuredContent")
-        if structured is not None:
-            envelope: dict[str, Any] = {"result": text_result or structured}
-            if text_result and structured:
-                envelope = {
-                    "result": text_result,
-                    "structuredContent": structured,
-                }
+            envelope: dict[str, Any] = {
+                "error": sanitize_error(rendered.text or "MCP tool returned an error"),
+                "isError": True,
+            }
+            if rendered.rich:
+                envelope["content"] = list(rendered.blocks)
             return json.dumps(envelope, ensure_ascii=False, default=str)
-        return json.dumps({"result": text_result}, ensure_ascii=False)
+
+        structured = mcp_attr(result, "structured_content", "structuredContent")
+        envelope = {"result": rendered.text or structured or ""}
+        if structured is not None and rendered.text:
+            envelope["structuredContent"] = structured
+        if rendered.rich:
+            envelope["content"] = list(rendered.blocks)
+        meta = mcp_attr(result, "meta", "_meta")
+        if meta is not None:
+            envelope["_meta"] = mcp_wire_value(meta)
+        result_type = mcp_attr(result, "result_type", "resultType", "complete")
+        if result_type and result_type != "complete":
+            envelope["resultType"] = str(result_type)
+        return json.dumps(envelope, ensure_ascii=False, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -311,26 +311,35 @@ class MCPListResourcesTool(_MCPUtilityTool):
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return {"type": "object", "properties": {}}
+        return {
+            "type": "object",
+            "properties": {
+                "cursor": {
+                    "type": "string",
+                    "description": "Optional MCP cursor to resume listing from",
+                },
+            },
+        }
 
-    async def execute(self, **kwargs: Any) -> str:
+    async def execute(self, cursor: str = "", **kwargs: Any) -> str:
         async def _call(session: Any) -> str:
+            async def _fetch(page_cursor: str | None) -> Any:
+                if page_cursor is None:
+                    return await session.list_resources()
+                return await session.list_resources(cursor=page_cursor)
+
             async with self._server_task.rpc_lock:
-                result = await session.list_resources()
-            resources = []
-            for r in getattr(result, "resources", []) or []:
-                entry: dict[str, Any] = {}
-                if getattr(r, "uri", None) is not None:
-                    entry["uri"] = str(r.uri)
-                if getattr(r, "name", None):
-                    entry["name"] = r.name
-                if getattr(r, "description", None):
-                    entry["description"] = r.description
-                mime_type = _mcp_attr(r, "mime_type", "mimeType")
-                if mime_type:
-                    entry["mimeType"] = mime_type
-                resources.append(entry)
-            return json.dumps({"resources": resources}, ensure_ascii=False, default=str)
+                pages = await collect_mcp_pages(
+                    _fetch,
+                    "resources",
+                    initial_cursor=cursor or None,
+                    max_pages=getattr(self._server_task, "pagination_max_pages", 100),
+                    max_items=getattr(self._server_task, "pagination_max_items", 10_000),
+                )
+            return json.dumps({
+                "resources": [mcp_wire_value(resource) for resource in pages.items],
+                "pagination": pages.metadata(),
+            }, ensure_ascii=False, default=str)
 
         return await self._run(_call)
 
@@ -359,14 +368,28 @@ class MCPReadResourceTool(_MCPUtilityTool):
         async def _call(session: Any) -> str:
             async with self._server_task.rpc_lock:
                 result = await session.read_resource(uri)
-            parts: list[str] = []
-            for block in getattr(result, "contents", []) or []:
-                block_text = getattr(block, "text", None)
-                if block_text:
-                    parts.append(block_text)
-                elif getattr(block, "blob", None) is not None:
-                    parts.append(f"[binary data, {len(block.blob)} bytes]")
-            return json.dumps({"result": "\n".join(parts)}, ensure_ascii=False, default=str)
+            rendered = render_resource_contents(
+                getattr(result, "contents", None) or [],
+                max_binary_bytes=getattr(
+                    self._server_task,
+                    "max_binary_bytes",
+                    DEFAULT_MAX_BINARY_BYTES,
+                ),
+            )
+            envelope: dict[str, Any] = {
+                "result": rendered.text,
+                "contents": list(rendered.blocks),
+            }
+            for snake, wire in (
+                ("meta", "_meta"),
+                ("ttl_ms", "ttlMs"),
+                ("cache_scope", "cacheScope"),
+                ("result_type", "resultType"),
+            ):
+                value = mcp_attr(result, snake, wire)
+                if value is not None:
+                    envelope[wire] = mcp_wire_value(value)
+            return json.dumps(envelope, ensure_ascii=False, default=str)
 
         return await self._run(_call)
 
@@ -380,33 +403,35 @@ class MCPListPromptsTool(_MCPUtilityTool):
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return {"type": "object", "properties": {}}
+        return {
+            "type": "object",
+            "properties": {
+                "cursor": {
+                    "type": "string",
+                    "description": "Optional MCP cursor to resume listing from",
+                },
+            },
+        }
 
-    async def execute(self, **kwargs: Any) -> str:
+    async def execute(self, cursor: str = "", **kwargs: Any) -> str:
         async def _call(session: Any) -> str:
+            async def _fetch(page_cursor: str | None) -> Any:
+                if page_cursor is None:
+                    return await session.list_prompts()
+                return await session.list_prompts(cursor=page_cursor)
+
             async with self._server_task.rpc_lock:
-                result = await session.list_prompts()
-            prompts = []
-            for p in getattr(result, "prompts", []) or []:
-                entry: dict[str, Any] = {}
-                if getattr(p, "name", None):
-                    entry["name"] = p.name
-                if getattr(p, "description", None):
-                    entry["description"] = p.description
-                args = getattr(p, "arguments", None)
-                if args:
-                    entry["arguments"] = [
-                        {
-                            "name": getattr(a, "name", ""),
-                            **({"description": a.description}
-                               if getattr(a, "description", None) else {}),
-                            **({"required": a.required}
-                               if getattr(a, "required", None) is not None else {}),
-                        }
-                        for a in args
-                    ]
-                prompts.append(entry)
-            return json.dumps({"prompts": prompts}, ensure_ascii=False, default=str)
+                pages = await collect_mcp_pages(
+                    _fetch,
+                    "prompts",
+                    initial_cursor=cursor or None,
+                    max_pages=getattr(self._server_task, "pagination_max_pages", 100),
+                    max_items=getattr(self._server_task, "pagination_max_items", 10_000),
+                )
+            return json.dumps({
+                "prompts": [mcp_wire_value(prompt) for prompt in pages.items],
+                "pagination": pages.metadata(),
+            }, ensure_ascii=False, default=str)
 
         return await self._run(_call)
 
@@ -445,11 +470,33 @@ class MCPGetPromptTool(_MCPUtilityTool):
             for m in getattr(result, "messages", []) or []:
                 role = getattr(m, "role", "")
                 content = getattr(m, "content", None)
-                text = getattr(content, "text", None)
-                messages.append({"role": role, "content": text if text else str(content)})
-            return json.dumps({
+                rendered = render_content_blocks(
+                    [content] if content is not None else [],
+                    max_binary_bytes=getattr(
+                        self._server_task,
+                        "max_binary_bytes",
+                        DEFAULT_MAX_BINARY_BYTES,
+                    ),
+                )
+                messages.append({
+                    "role": role,
+                    "text": rendered.text,
+                    "content": (
+                        rendered.blocks[0]
+                        if len(rendered.blocks) == 1
+                        else list(rendered.blocks)
+                    ),
+                })
+            envelope = {
                 "description": getattr(result, "description", None),
                 "messages": messages,
-            }, ensure_ascii=False, default=str)
+            }
+            meta = mcp_attr(result, "meta", "_meta")
+            if meta is not None:
+                envelope["_meta"] = mcp_wire_value(meta)
+            result_type = mcp_attr(result, "result_type", "resultType", "complete")
+            if result_type and result_type != "complete":
+                envelope["resultType"] = str(result_type)
+            return json.dumps(envelope, ensure_ascii=False, default=str)
 
         return await self._run(_call)

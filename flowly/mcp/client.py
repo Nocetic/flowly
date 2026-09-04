@@ -45,6 +45,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from flowly.mcp.lifecycle import MCPConnectionState, MCPRetryPolicy
+from flowly.mcp.media_cache import DEFAULT_MAX_BINARY_BYTES
+from flowly.mcp.pagination import MCPPageCollection, collect_mcp_pages
 from flowly.mcp.schema import sanitize_mcp_name_component
 from flowly.mcp.security import (
     build_safe_env,
@@ -302,6 +304,9 @@ class MCPServerTask:
         self.tools: list[Any] = []
         self.tool_timeout: float = 120.0
         self.connect_timeout: float = 60.0
+        self.max_binary_bytes: int = DEFAULT_MAX_BINARY_BYTES
+        self.pagination_max_pages: int = 100
+        self.pagination_max_items: int = 10_000
         self.capabilities: Any | None = None
         # When True, an HTTP server configured for OAuth may launch the
         # interactive browser flow. False (agent boot) restricts OAuth to
@@ -335,6 +340,7 @@ class MCPServerTask:
         self._state_changed_at = time.time()
         self._protocol_version = ""
         self._protocol_era = ""
+        self._tool_pagination = MCPPageCollection(items=(), pages=0)
         self.state = MCPConnectionState.IDLE
 
     def is_http(self) -> bool:
@@ -386,6 +392,8 @@ class MCPServerTask:
             "protocolMode": self._protocol_mode() if self._config else "auto",
             "protocolEra": self._protocol_era,
             "protocolVersion": self._protocol_version,
+            "discoveredToolCount": len(self.tools),
+            "toolPagination": self._tool_pagination.metadata(),
         }
 
     def report_transport_failure(
@@ -410,6 +418,13 @@ class MCPServerTask:
         self._retry_policy = MCPRetryPolicy.from_server_config(config)
         self.tool_timeout = float(config.get("timeout", 120.0))
         self.connect_timeout = float(config.get("connect_timeout", 60.0))
+        content_cfg = config.get("content") or {}
+        pagination_cfg = config.get("pagination") or {}
+        self.max_binary_bytes = int(
+            content_cfg.get("max_binary_bytes", DEFAULT_MAX_BINARY_BYTES)
+        )
+        self.pagination_max_pages = int(pagination_cfg.get("max_pages", 100))
+        self.pagination_max_items = int(pagination_cfg.get("max_items", 10_000))
         if not math.isfinite(self.tool_timeout) or self.tool_timeout <= 0:
             raise ValueError(f"MCP server '{self.name}': timeout must be a positive finite number")
         if not math.isfinite(self.connect_timeout) or self.connect_timeout <= 0:
@@ -870,8 +885,32 @@ class MCPServerTask:
 
     async def _discover(self) -> None:
         assert self.session is not None
-        result = await self.session.list_tools()
-        self.tools = list(getattr(result, "tools", []) or [])
+        self._tool_pagination = await self._collect_tools()
+        self.tools = list(self._tool_pagination.items)
+        if self._tool_pagination.truncated:
+            logger.warning(
+                "MCP server '%s': tool discovery truncated after %d pages/%d tools (%s)",
+                self.name,
+                self._tool_pagination.pages,
+                len(self.tools),
+                self._tool_pagination.reason,
+            )
+
+    async def _collect_tools(self) -> MCPPageCollection:
+        """Collect the full bounded tool catalog from the active session."""
+        assert self.session is not None
+
+        async def _fetch(cursor: str | None) -> Any:
+            if cursor is None:
+                return await self.session.list_tools()
+            return await self.session.list_tools(cursor=cursor)
+
+        return await collect_mcp_pages(
+            _fetch,
+            "tools",
+            max_pages=self.pagination_max_pages,
+            max_items=self.pagination_max_items,
+        )
 
     # ----- Dynamic tool discovery (tools/list_changed, D8) -------------
 
@@ -918,8 +957,14 @@ class MCPServerTask:
         try:
             async with self._refresh_lock:
                 async with self.rpc_lock:  # type: ignore[arg-type]
-                    result = await self.session.list_tools()
-                self.tools = list(getattr(result, "tools", []) or [])
+                    self._tool_pagination = await self._collect_tools()
+                self.tools = list(self._tool_pagination.items)
+                if self._tool_pagination.truncated:
+                    logger.warning(
+                        "MCP server '%s': refreshed tool catalog truncated (%s)",
+                        self.name,
+                        self._tool_pagination.reason,
+                    )
                 # Re-registration touches the shared registry dict; the
                 # discovery module owns that logic so we route through it.
                 _reregister_server_tools(self)

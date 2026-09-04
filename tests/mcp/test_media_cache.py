@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from flowly.mcp.media_cache import cache_image_block
+from flowly.mcp.media_cache import cache_image_block, cache_media_block
 
 
 class _Block:
@@ -64,4 +64,30 @@ def test_malformed_base64_returns_none(isolated_home: Path):
     block = _Block(data="!!!not base64!!!", mimeType="image/png")
     # base64 is lenient; an empty/garbage decode should yield None safely.
     result = cache_image_block(block)
-    assert result is None or result.startswith("MEDIA:")
+    assert result is None
+
+
+def test_audio_is_cached_with_media_metadata(isolated_home: Path):
+    raw = b"RIFF-audio"
+    block = _Block(data=base64.b64encode(raw).decode(), mimeType="audio/wav")
+    cached = cache_media_block(block)
+    assert cached is not None
+    assert cached.path.suffix == ".wav"
+    assert cached.size == len(raw)
+    assert cached.media_tag.startswith("MEDIA:")
+    assert cached.path.read_bytes() == raw
+
+
+def test_cache_is_deduplicated_and_private(isolated_home: Path):
+    block = _Block(data=base64.b64encode(b"same").decode(), mimeType="image/png")
+    first = cache_media_block(block)
+    second = cache_media_block(block)
+    assert first is not None and second is not None
+    assert first.path == second.path
+    assert first.path.stat().st_mode & 0o077 == 0
+
+
+def test_size_limit_rejects_before_writing(isolated_home: Path):
+    block = _Block(data=base64.b64encode(b"12345").decode(), mimeType="image/png")
+    assert cache_media_block(block, max_bytes=4) is None
+    assert not (isolated_home / "media" / "mcp").exists()

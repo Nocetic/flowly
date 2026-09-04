@@ -1090,6 +1090,21 @@ class MCPServerToolsFilter(BaseModel):
     prompts: bool = False
 
 
+class MCPPaginationConfig(BaseModel):
+    """Safety bounds for automatically following MCP list cursors."""
+    max_pages: int = Field(default=100, ge=1, le=10_000)
+    max_items: int = Field(default=10_000, ge=1, le=1_000_000)
+
+
+class MCPContentConfig(BaseModel):
+    """Limits for binary MCP result content cached to local storage."""
+    max_binary_bytes: int = Field(
+        default=25 * 1024 * 1024,
+        ge=1024,
+        le=1024 * 1024 * 1024,
+    )
+
+
 class MCPServerLifecycleConfig(BaseModel):
     """Connection recovery policy for one MCP server.
 
@@ -1169,6 +1184,8 @@ class MCPServerConfig(BaseModel):
     # Server-initiated LLM (sampling/createMessage). Off by default.
     sampling: MCPSamplingConfig = Field(default_factory=MCPSamplingConfig)
     lifecycle: MCPServerLifecycleConfig = Field(default_factory=MCPServerLifecycleConfig)
+    pagination: MCPPaginationConfig = Field(default_factory=MCPPaginationConfig)
+    content: MCPContentConfig = Field(default_factory=MCPContentConfig)
 
 
 class PetDisplayConfig(BaseModel):
