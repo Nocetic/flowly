@@ -15,7 +15,7 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
 - [ ] The coding-agent tool bridge exposes browser, vision/image, speech, and
   task-board capabilities where available, preserving authoritative schemas and
   execution permissions. Stateful tools reach the owning live runtime.
-- [ ] MCP server requests for user input/consent reach the owning surface;
+- [x] MCP server requests for user input/consent reach the owning surface;
   untrusted write tools cannot execute without approval.
 - [ ] OAuth picks up cross-process token changes, coordinates concurrent 401
   recovery, and distinguishes expired sessions from expired credentials.
@@ -52,3 +52,32 @@ modify the agent's shared history index.
 Verification command: `uv run pytest tests/mcp tests/test_session_archive_integrity.py
 tests/test_session_concurrency.py tests/test_session_disk_roundtrip.py
 tests/test_session_delete_integrity.py tests/test_session_indexer_incremental.py -q`.
+
+### MCP consent and input-required continuation
+
+`tests/mcp/test_interaction.py` launches a real stdio server in auto, explicit
+modern and legacy modes. It verifies concurrent calls retain their own user
+surface, remote `session_key` arguments cannot select the owner, typed form
+answers are validated, denial and timeout disclose no data, cancellation
+retires in-flight prompts (even during notification delivery), cron context
+survives both loop hops, and untrusted writes do not run before approval.
+Modern input-required continuation preserves opaque request state, uses the
+SDK driver, and caps rounds and requests. The same continuation helper is used
+by tools, prompt reads and resource reads.
+
+`trust: untrusted` asks per-call consent for tools without `readOnlyHint: true`.
+The default remains `full` for existing manually configured integrations;
+annotations are server claims, not a process sandbox. Elicitation supports
+bounded flat non-sensitive scalar forms. URL-mode, nested/reference schemas,
+missing execution owners and sensitive credential fields decline explicitly.
+Legacy calls serialize when elicitation is enabled because legacy callbacks
+cannot reliably identify the parent call; modern calls preserve concurrency.
+Programmatic registry calls supply the runtime-owned `session_key` keyword,
+separate from the remote tool argument dictionary.
+
+Verification: `uv run pytest -q` — **4930 passed, 1 skipped, 12 deselected**
+in 85.95 seconds. This includes the 17 new consent/input tests and the public
+conversation transport tests. Real-LLM tests remain excluded; this is not proof
+of the still-unchecked acceptance items or live provider-specific behavior.
+Targeted Ruff checks for the new interaction/context/request modules and tests,
+and `git diff --check`, also pass.

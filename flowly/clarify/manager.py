@@ -77,23 +77,19 @@ class ClarifyManager:
         self._futures[pending.id] = future
         self._pending[pending.id] = pending
 
-        logger.info(
-            f"[ClarifyManager] Notifying {len(self._notify_callbacks)} "
-            f"surface(s) for {pending.id}"
-        )
-        for cb in self._notify_callbacks:
-            try:
-                await cb(pending)
-            except Exception as e:
-                logger.error(
-                    f"[ClarifyManager] Notify callback failed: {e}",
-                    exc_info=True,
-                )
-
-        timeout = max(0, pending.expires_at - time.time())
-        reason = "answered"
+        reason = "cancelled"
         try:
-            answer = await asyncio.wait_for(future, timeout=timeout)
+            async with asyncio.timeout(max(0, pending.expires_at - time.time())):
+                logger.info(
+                    f"[ClarifyManager] Notifying {len(self._notify_callbacks)} surface(s) for {pending.id}"
+                )
+                for cb in self._notify_callbacks:
+                    try:
+                        await cb(pending)
+                    except Exception as e:
+                        logger.error(f"[ClarifyManager] Notify callback failed: {e}", exc_info=True)
+                answer = await future
+            reason = "answered"
             logger.info(f"[ClarifyManager] {pending.id} answered")
             return answer
         except asyncio.TimeoutError:
@@ -101,6 +97,8 @@ class ClarifyManager:
             reason = "timeout"
             return None
         finally:
+            if not future.done():
+                future.cancel()
             self._futures.pop(pending.id, None)
             self._pending.pop(pending.id, None)
             await self._fire_close(pending, reason)

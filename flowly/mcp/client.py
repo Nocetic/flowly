@@ -330,6 +330,7 @@ class MCPServerTask:
         # silently using stored/refreshable tokens.
         self.interactive: bool = False
         self._config: dict[str, Any] = {}
+        self._interaction: Any | None = None
         self._task: asyncio.Task[Any] | None = None
         # Asyncio primitives MUST be created on the loop they belong to.
         # We allocate them lazily in ``_run`` when the loop is known.
@@ -674,9 +675,19 @@ class MCPServerTask:
         except asyncio.TimeoutError:
             return False
 
+    def get_interaction(self) -> Any:
+        if self._interaction is None:
+            from flowly.mcp.interaction import MCPInteraction
+
+            self._interaction = MCPInteraction(self.name, self._config)
+        return self._interaction
+
     def _session_kwargs(self) -> dict[str, Any]:
         """Build ClientSession kwargs — list_changed handler + sampling."""
         kwargs: dict[str, Any] = {}
+        interaction = self.get_interaction()
+        if interaction.enabled:
+            kwargs["elicitation_callback"] = interaction.elicit
         if _MCP_NOTIFICATIONS and _MCP_MESSAGE_HANDLER:
             kwargs["message_handler"] = self._make_message_handler()
         # Sampling (Faz 3d): install a callback only when the server opted in.

@@ -86,24 +86,23 @@ class ApprovalManager:
         self._futures[pending.id] = future
         self._pending[pending.id] = pending
 
-        # Notify all registered channels
-        logger.info(f"[ApprovalManager] Notifying {len(self._notify_callbacks)} channel(s) for {pending.id}")
-        for cb in self._notify_callbacks:
-            try:
-                await cb(pending)
-                logger.info(f"[ApprovalManager] Notify callback succeeded for {pending.id}")
-            except Exception as e:
-                logger.error(f"[ApprovalManager] Notify callback failed: {e}", exc_info=True)
-
-        # Wait for decision with timeout
-        timeout = max(0, pending.expires_at - time.time())
         # Assigned on every exit path so the close callbacks describe what
         # actually happened. "cancelled" is the honest default: it covers the
         # awaiting task being torn down mid-wait (gateway shutdown), which is
         # neither a decision nor a timeout.
         reason = "cancelled"
         try:
-            decision = await asyncio.wait_for(future, timeout=timeout)
+            # Notification delivery is part of the bounded wait too. If a
+            # surface hangs or the caller cancels here, finally still retires
+            # the pending request and every UI card already delivered.
+            async with asyncio.timeout(max(0, pending.expires_at - time.time())):
+                logger.info(f"[ApprovalManager] Notifying {len(self._notify_callbacks)} channel(s) for {pending.id}")
+                for cb in self._notify_callbacks:
+                    try:
+                        await cb(pending)
+                    except Exception as e:
+                        logger.error(f"[ApprovalManager] Notify callback failed: {e}", exc_info=True)
+                decision = await future
             logger.info(f"[ApprovalManager] {pending.id} resolved: {decision}")
             reason = str(decision)
             return decision
@@ -112,6 +111,8 @@ class ApprovalManager:
             reason = "timeout"
             return None
         finally:
+            if not future.done():
+                future.cancel()
             self._futures.pop(pending.id, None)
             self._pending.pop(pending.id, None)
             await self._fire_close(pending, reason)

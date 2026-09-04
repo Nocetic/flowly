@@ -169,9 +169,19 @@ flowly mcp serve --verbose
 |---|---|
 | `conversations_list` | List conversations (filter by platform / search) |
 | `conversation_get` | Metadata for one `channel:chat_id` |
-| `messages_read` | Recent user/assistant messages of a conversation |
+| `messages_read` | Paginated visible archive history, including compacted and media-only messages |
 | `messages_search` | Full-text search across all conversations (FTS5) |
-| `channels_list` | Configured channels + enabled state |
+| `channels_list` | Configured channels + enabled state + exact known conversation targets |
+| `attachments_fetch` | Attachment metadata for a stable message ID; no raw bytes or local paths |
+| `events_poll` | New message/deletion events after an opaque, restart-safe cursor |
+| `events_wait` | Cancellable wait for new events, with a bounded timeout |
+
+Start event tracking without a cursor, then retain `next_cursor` for subsequent
+polls/waits, including after restarting the MCP process. Keep the same session
+filter. `CURSOR_EXPIRED` explicitly indicates a retention gap: refresh history
+and resume from the supplied cursor. Events are discovered at poll time, not a
+guaranteed push-delivery stream. Hidden, withdrawn and deleted messages are
+excluded from public history, search and subsequent event reads.
 
 **Write tools** (only with `--allow-writes`, and they require a running `flowly gateway`): `messages_send`, `approvals_list`, `approvals_resolve` (decision = allow-once / allow-always / deny). These reach the gateway over an authed localhost control endpoint (`$FLOWLY_HOME/gateway-api.json`); when the gateway is down they return a clear "gateway not running" message instead of failing.
 
@@ -253,9 +263,26 @@ MCP servers run third-party code, so Flowly applies several guards:
 
 Subprocess stderr is redirected to `$FLOWLY_HOME/logs/mcp-stderr.log` so a chatty server can't corrupt the TUI — check it first when debugging.
 
-## Full `mcpServers` config reference
+## MCP consent and user input
 
-Every key a server entry accepts (camelCase on disk; Flowly converts to snake internally — server names and `env`/`headers` keys are preserved verbatim):
+For an integration that should ask before writing, set `trust` to `untrusted`.
+Every tool call without `readOnlyHint: true` then needs an explicit one-time
+approval on the calling conversation's surface. Existing manually configured
+integrations default to `full` for compatibility. Tool annotations are claims
+made by the server: this gate is not a replacement for a process sandbox.
+
+MCP elicitation routes non-sensitive flat forms through Flowly's approval and
+question UI. Answers are type/constraint validated before being shared. A
+missing caller, denial, timeout or cancellation never becomes silent consent.
+URL-mode, nested/reference schemas and credential fields are explicitly
+declined. Disable the feature per server with `elicitation.enabled: false`.
+Legacy calls serialize while elicitation is enabled to avoid routing a
+server-initiated question to the wrong concurrent user. Modern input-required
+continuations retain per-call ownership and bounded parallelism.
+
+## `mcpServers` config reference
+
+Common server settings (camelCase on disk; Flowly converts to snake internally — server names and `env`/`headers` keys are preserved verbatim):
 
 ```json
 {
@@ -268,6 +295,7 @@ Every key a server entry accepts (camelCase on disk; Flowly converts to snake in
       "url": "",                         // http/sse: url + headers instead
       "headers": {},
       "transport": "auto",               // auto | stdio | http | sse
+      "protocol": "auto",                // auto | stateless | legacy
       "timeout": 120,                    // per-tool-call seconds
       "connectTimeout": 60,              // initial connect seconds
       "tools": {                         // optional filtering / utilities
@@ -278,12 +306,15 @@ Every key a server entry accepts (camelCase on disk; Flowly converts to snake in
       },
       "auth": "",                        // "" | "oauth"
       "scope": "",                       // optional OAuth scope
+      "trust": "untrusted",              // full (default) | untrusted
+      "elicitation": { "enabled": true, "timeout": 300 },
       "sslVerify": true,                 // true | false | CA-bundle path
       "clientCert": "",                  // mTLS cert (path or [cert, key])
       "clientKey": "",
       "osvCheck": true,                  // OSV malware gate
       "reapOrphans": false,              // force-kill orphaned stdio children (Linux)
       "supportsParallelToolCalls": false,
+      "maxParallelToolCalls": 8,
       "sampling": {                      // server-initiated LLM (off by default)
         "enabled": false,
         "model": "",

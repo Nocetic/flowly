@@ -38,6 +38,7 @@ from flowly.mcp.content import (
 )
 from flowly.mcp.media_cache import DEFAULT_MAX_BINARY_BYTES
 from flowly.mcp.pagination import collect_mcp_pages
+from flowly.mcp.requests import call_with_input
 from flowly.mcp.schema import mcp_tool_name, normalize_mcp_input_schema
 from flowly.mcp.security import sanitize_error
 
@@ -89,7 +90,18 @@ async def _run_on_mcp_loop(
         _bump_server_error(server_name)
         return _error_envelope(f"MCP server '{server_name}' is not connected")
 
-    future = asyncio.run_coroutine_threadsafe(coro_factory(session), loop)
+    from flowly.agent.tool_context import current_tool_origin
+
+    origin = current_tool_origin()
+
+    async def invoke():
+        get_interaction = getattr(server_task, "get_interaction", None)
+        if callable(get_interaction):
+            async with get_interaction().invocation(session, origin):
+                return await coro_factory(session)
+        return await coro_factory(session)
+
+    future = asyncio.run_coroutine_threadsafe(invoke(), loop)
     try:
         result = await asyncio.wrap_future(future)
     except asyncio.TimeoutError:
@@ -201,6 +213,18 @@ class MCPTool(Tool):
             circuit_breaker_block_reason,
         )
 
+        # Consent precedes all transport work, including future lazy startup.
+        config = getattr(self._server_task, "_config", {})
+        trust = config.get("trust", "full")
+        if trust not in {"full", "untrusted"}:
+            return _error_envelope("Invalid MCP server trust policy")
+        if trust == "untrusted":
+            approved = await self._server_task.get_interaction().authorize(
+                self._remote_name, self.annotations, kwargs,
+            )
+            if not approved:
+                return _error_envelope("MCP write-capable tool was not approved by the calling user")
+
         # Circuit breaker (T10): short-circuit a server that has failed
         # repeatedly so the model stops hammering it.
         blocked = circuit_breaker_block_reason(self._server_name)
@@ -213,7 +237,7 @@ class MCPTool(Tool):
             guard = slot() if callable(slot) else self._server_task.rpc_lock
             async with guard:
                 result = await asyncio.wait_for(
-                    session.call_tool(self._remote_name, arguments=kwargs),
+                    call_with_input(session, "call_tool", self._remote_name, arguments=kwargs),
                     timeout=timeout,
                 )
             return self._format_result(result)
@@ -373,7 +397,7 @@ class MCPReadResourceTool(_MCPUtilityTool):
 
         async def _call(session: Any) -> str:
             async with self._server_task.rpc_lock:
-                result = await session.read_resource(uri)
+                result = await call_with_input(session, "read_resource", uri)
             rendered = render_resource_contents(
                 getattr(result, "contents", None) or [],
                 max_binary_bytes=getattr(
@@ -471,7 +495,7 @@ class MCPGetPromptTool(_MCPUtilityTool):
 
         async def _call(session: Any) -> str:
             async with self._server_task.rpc_lock:
-                result = await session.get_prompt(name, arguments=arguments or {})
+                result = await call_with_input(session, "get_prompt", name, arguments=arguments or {})
             messages = []
             for m in getattr(result, "messages", []) or []:
                 role = getattr(m, "role", "")

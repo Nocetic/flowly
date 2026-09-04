@@ -6553,6 +6553,7 @@ class AgentLoop:
                             tool_platform or outbound_channel
                         )
                         _execute_kwargs = {
+                            "session_key": _current_session_key,
                             "platform": tool_platform or outbound_channel,
                             "enabled_toolsets": _enabled_toolsets,
                             "disabled_toolsets": _disabled_toolsets,

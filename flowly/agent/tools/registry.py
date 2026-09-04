@@ -700,6 +700,7 @@ class ToolRegistry:
         enabled_toolsets: set[str] | frozenset[str] | None = None,
         disabled_toolsets: set[str] | frozenset[str] | None = None,
         disabled_tools: set[str] | frozenset[str] | None = None,
+        session_key: str | None = None,
     ) -> str:
         """
         Execute a tool by name with given parameters.
@@ -748,7 +749,10 @@ class ToolRegistry:
 
         t0 = time.monotonic()
         try:
-            result = await tool.execute(**_drop_unexpected_kwargs(tool, params))
+            from flowly.agent.tool_context import tool_execution_scope
+
+            with tool_execution_scope(session_key):
+                result = await tool.execute(**_drop_unexpected_kwargs(tool, params))
         except Exception as e:
             result = f"Error executing {name}: {str(e)}"
 

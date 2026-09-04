@@ -1079,6 +1079,13 @@ class MCPSamplingConfig(BaseModel):
     allowed_models: list[str] = Field(default_factory=list)  # whitelist (empty = any)
 
 
+class MCPElicitationConfig(BaseModel):
+    """Bounded user-consent and form requests routed to the calling surface."""
+
+    enabled: bool = True
+    timeout: float = Field(default=300.0, gt=0, le=600, allow_inf_nan=False)
+
+
 class MCPServerToolsFilter(BaseModel):
     """Per-server tool filter and utility-tool toggles."""
     # If non-empty, only these tool names register (whitelist).
@@ -1170,6 +1177,10 @@ class MCPServerConfig(BaseModel):
     transport: Literal["auto", "stdio", "http", "sse"] = "auto"
     auth: Literal["", "oauth"] = ""
     scope: str = ""  # optional OAuth scope string (space-separated)
+    # Existing manually installed servers remain trusted for compatibility.
+    # Untrusted servers require per-call consent unless readOnlyHint is true.
+    trust: Literal["full", "untrusted"] = "full"
+    elicitation: MCPElicitationConfig = Field(default_factory=MCPElicitationConfig)
     supports_parallel_tool_calls: bool = False
     max_parallel_tool_calls: int = Field(default=8, ge=1, le=256)
     # Opt-in (default off): force-kill stdio child processes that appear
