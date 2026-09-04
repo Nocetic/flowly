@@ -86,19 +86,39 @@ address: `mail@jarvis` addresses nobody.
 
 ## How members answer
 
-Everyone answers **at the same time**. The members you addressed each get your
-message and each write their own reply, in parallel. They do not see each
-other's answers while they are writing, so what you get back are independent
-takes rather than a discussion.
+A group answers in one of two shapes, and you pick which when you create it or
+edit it later. The setting sits under the member list, next to who answers.
 
-That is what a group does today, and there is no setting to change it.
+### All at once
+
+Everyone you addressed gets your message and writes their own reply, in
+parallel. They do not see each other's answers while they are writing, so what
+comes back are independent takes rather than a discussion.
+
+This is the faster shape, and the cheaper one: one reply per member. It is also
+the one where two members can tell you the same thing, because neither knew the
+other was saying it.
+
+### One after another
+
+Members answer in turn. Each one reads what was said before its turn, so the
+second builds on the first instead of repeating it. A member with nothing to
+add can say so and pass.
+
+The useful part is that they can bring each other in: a member that writes
+*"@jarvis should look at the security side"* puts Jarvis in the next round.
+The discussion narrows towards whoever actually has the answer, rather than
+everybody weighing in once.
+
+It costs more. A group answering all at once spends one reply per member; this
+one can spend up to **10 replies across 3 rounds** on a single message. The
+bounds exist so a discussion cannot run away, and Flowly shows which round it
+is on while it works — so you can watch it, and stop it.
 
 > [!NOTE]
-> Flowly also has a **council** shape, where members answer one after another
-> and can read what was said before their turn, bounded at 3 rounds and 10
-> turns. It works, but no app offers it yet — so nothing you create in Desktop
-> or on your phone will use it. It is here because you may see it named in the
-> host's capabilities; do not go looking for a switch.
+> Which shape a group uses can be changed at any time, and changes nothing
+> about its history. A group made before the choice existed answers all at
+> once, which is what it always did.
 
 ## While a turn is running
 
