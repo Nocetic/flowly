@@ -116,6 +116,10 @@ class ProfileIdentityConflictError(ValueError):
 
 
 def _assert_named_profile_capacity() -> None:
+    # Deliberately not tolerant of an unreadable sibling: this counts against
+    # a hard limit, and skipping what we cannot examine would undercount and
+    # let the limit be passed. It only runs where creating a bot is allowed,
+    # which is a context that may read every profile.
     count = sum(
         1
         for candidate in _PROFILES_ROOT.iterdir()
@@ -300,8 +304,7 @@ def profile_exists(name: str) -> bool:
     """Check if a named profile exists."""
     if name == "default":
         return True
-    candidate = _PROFILES_ROOT / name
-    return candidate.is_dir() and not candidate.is_symlink()
+    return _is_describable_profile_dir(_PROFILES_ROOT / name)
 
 
 # ── Profile info ──────────────────────────────────────────────────
@@ -505,12 +508,33 @@ def _read_mark_seed(value: object) -> int | None:
         return None
 
 
-def _load_config_object(path: Path) -> dict:
-    if not path.exists():
-        return {}
+def _path_exists(path: Path) -> bool:
+    """``path.exists()`` for a path we may not be allowed to look at.
+
+    ``Path.exists()`` only swallows the errors that mean "no such file";
+    a sandbox denial arrives as ``EPERM`` from ``stat`` and is raised at
+    the caller. A named bot runs under a policy that denies it the
+    primary profile, so asking whether the primary's config exists is a
+    normal question with an answer, not an error: unreadable is reported
+    as absent, which is what an unreadable file is worth to a caller
+    that cannot open it either.
+    """
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _load_config_object(path: Path) -> dict:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Invalid profile config.json: {exc}") from exc
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid profile config.json: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError("Invalid profile config.json: root must be an object")
@@ -610,6 +634,21 @@ def _installed_skill_count(profile_dir: Path) -> int | None:
         return None
 
 
+def _is_describable_profile_dir(path: Path) -> bool:
+    """Whether *path* is a profile directory we are allowed to look at.
+
+    A bot is denied its siblings, and that denial arrives as ``EPERM``
+    from ``stat`` rather than as an answer, so ``is_dir()`` raises where
+    it would normally say False. A sibling we may not examine is left out
+    of the listing: nothing true can be said about a directory we cannot
+    read, and a policy refusing us is not a failure of the listing.
+    """
+    try:
+        return path.is_dir() and not path.is_symlink()
+    except OSError:
+        return False
+
+
 def list_profiles() -> list[ProfileInfo]:
     """List all profiles (default + named)."""
     profiles = []
@@ -621,23 +660,26 @@ def list_profiles() -> list[ProfileInfo]:
         name="default",
         path=_DEFAULT_HOME,
         is_default=True,
-        has_config=(_DEFAULT_HOME / "config.json").exists(),
+        has_config=_path_exists(_DEFAULT_HOME / "config.json"),
         skill_count=_installed_skill_count(_DEFAULT_HOME),
         **default_meta,
         **default_runtime,
     ))
 
     # Named profiles
-    if _PROFILES_ROOT.exists():
-        for d in sorted(_PROFILES_ROOT.iterdir()):
-            if d.is_dir() and not d.is_symlink() and _PROFILE_NAME_RE.match(d.name):
+    try:
+        entries = sorted(_PROFILES_ROOT.iterdir())
+    except OSError:
+        entries = []
+    for d in entries:
+        if _is_describable_profile_dir(d) and _PROFILE_NAME_RE.match(d.name):
                 meta = _metadata_for(d.name, d, is_default=False)
                 runtime = _runtime_summary(d)
                 profiles.append(ProfileInfo(
                     name=d.name,
                     path=d,
                     is_default=False,
-                    has_config=(d / "config.json").exists(),
+                    has_config=_path_exists(d / "config.json"),
                     skill_count=_installed_skill_count(d),
                     **meta,
                     **runtime,
