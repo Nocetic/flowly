@@ -1615,9 +1615,23 @@ class GatewayServer:
 
             else:
                 await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", f"Unknown method: {method}")
-        except Exception as e:
-            logger.error(f"[WS] RPC {method} error: {e}")
-            await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", str(e))
+        except Exception:
+            # Only unexpected failures reach here: every deliberate one above
+            # reports itself through `_ws_rpc_error` with its own code and a
+            # sentence written for a reader. So this branch has no curated
+            # message to preserve — and sending `str(exc)` put
+            # `[Errno 1] Operation not permitted: '/Users/…/.flowly/config.json'`
+            # on somebody's screen, an errno and their home directory, in place
+            # of anything they could act on.
+            #
+            # The traceback goes to the log, which is where this failure left
+            # nothing at all before — the message named a path and never said
+            # which line reached for it.
+            logger.exception("[WS] RPC {} failed for client {}", method, client_id)
+            await self._ws_rpc_error(
+                ws, rpc_id, "UNAVAILABLE",
+                "Something went wrong handling that request. The details are in the log.",
+            )
 
     async def _handle_profile_host_rpc(
         self,
