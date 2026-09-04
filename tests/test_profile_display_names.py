@@ -25,7 +25,19 @@ def _profile(name: str, display: str = "") -> ProfileInfo:
 
 
 @pytest.fixture
-def roster(monkeypatch: pytest.MonkeyPatch):
+def roster(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Install a roster, with the real filesystem out of the way.
+
+    A label now has two sources: the profiles this process can read, and the
+    index the primary publishes for the siblings it may not. Faking only the
+    first would leave the second reading whoever's bots happen to live in
+    ``~/.flowly`` on the machine running the test.
+    """
+    home = tmp_path / ".flowly"
+    (home / "profiles").mkdir(parents=True)
+    monkeypatch.setattr(profile_module, "_DEFAULT_HOME", home)
+    monkeypatch.setattr(profile_module, "_PROFILES_ROOT", home / "profiles")
+
     def install(*profiles: ProfileInfo) -> None:
         monkeypatch.setattr(profile_module, "list_profiles", lambda: list(profiles))
     return install
