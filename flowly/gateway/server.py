@@ -38,6 +38,8 @@ from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
 from flowly.profile_collaboration import (
     PROFILE_RUN_BINDING as _PROFILE_RUN_BINDING,
+)
+from flowly.profile_collaboration import (
     ProfileRunBinding as _ProfileRunBinding,
 )
 from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
@@ -4123,6 +4125,7 @@ class GatewayServer:
                     "params": {
                         "sourceProfile": binding.current_profile,
                         "sourceSessionKey": binding.session_key,
+                        "sourceRunId": binding.run_id or binding.correlation_id,
                         "targetProfile": target,
                         "message": content,
                         "correlationId": binding.correlation_id,

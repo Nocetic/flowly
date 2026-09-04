@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import aiohttp
@@ -252,6 +253,40 @@ async def test_completed_turn_cannot_message_from_an_inherited_child_context(pro
         await server.stop()
 
 
+@pytest.mark.asyncio
+async def test_source_run_terminal_cancels_nested_request_but_not_another_run(profile_home):
+    host = ProfileHost()
+    started = asyncio.Event()
+
+    async def pending(*args):
+        started.set()
+        await asyncio.Event().wait()
+
+    host._broker = AsyncMock(side_effect=pending)
+    source = SimpleNamespace(profile="writer", ws=Socket())
+    task = asyncio.create_task(host._handle_broker_request(source, {
+        "id": "nested-request", "params": request(
+            sourceProfile="writer", sourceRunId="new-run", targetProfile="default",
+        ),
+    }))
+    await started.wait()
+    try:
+        await host._handle_profile_event("writer", "chat", {
+            "sessionKey": "ios:source", "runId": "old-run", "state": "final",
+        })
+        await asyncio.sleep(0)
+        assert not task.done()
+        await host._handle_profile_event("writer", "chat", {
+            "sessionKey": "ios:source", "runId": "new-run", "state": "aborted",
+        })
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 0.2)
+        assert not host._profile_message_requests
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 class DelegatingProvider(LLMProvider):
     """A deterministic model double; routing and tool execution remain real."""
 
@@ -299,7 +334,23 @@ async def test_real_agent_loop_from_mobile_wire_to_host_tool_and_reply(profile_h
                            require_loopback_auth=True, advertise_control=False,
                            enable_profile_host=True, on_chat_message=chat, sessions=agent.sessions)
     host = server.profile_host
-    host._run_broker_turn = AsyncMock(return_value={"ok": True, "response": "hello from writer"})
+    runtime = SimpleNamespace(active_runs=set())
+    host._ensure_runtime = AsyncMock(return_value=runtime)
+
+    async def child_rpc(active_runtime, method, params, timeout):
+        assert active_runtime is runtime
+        assert method == "chat.send"
+        assert params["allowedTools"] and "exec" not in params["allowedTools"]
+        run_id = params["idempotencyKey"]
+        # Exercise the real broker and final-event handling, including a
+        # reply arriving before the coroutine awaiting its ACK resumes.
+        await host._handle_profile_event("writer", "chat", {
+            "runId": run_id, "sessionKey": params["sessionKey"], "state": "final",
+            "message": {"content": "hello from writer"},
+        })
+        return {"runId": run_id}
+
+    host._rpc = AsyncMock(side_effect=child_rpc)
     agent.set_profile_collaboration_host(host)
     agent.tools.register(MessageProfileTool(server))
     try:
@@ -339,9 +390,41 @@ async def test_real_agent_loop_from_mobile_wire_to_host_tool_and_reply(profile_h
             assert result.content == "Writer replied: hello"
         assert "message_profile" in provider.surfaces[0]
         assert "hello from writer" in provider.results[0]
-        host._run_broker_turn.assert_awaited_once()
-        assert host._run_broker_turn.await_args.kwargs["source_profile"] == "default"
+        host._ensure_runtime.assert_awaited_once_with("writer")
+        host._rpc.assert_awaited_once()
+        assert host._rpc.await_args.args[2]["profileMessageContext"]["sourceProfile"] == "default"
+        assert not runtime.active_runs
         assert _PROFILE_RUN_BINDING.get() is None
     finally:
         agent.stop()
         await server.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["missing-host", "denied-policy"])
+async def test_model_cannot_call_profile_tool_without_run_authority_and_permission(profile_home, monkeypatch, mode):
+    provider = DelegatingProvider()
+    config = Config()
+    config.tools.routing.discovery.enabled = False
+    if mode == "denied-policy":
+        config.tools.routing.disabled_toolsets = ["delegation"]
+    agent = AgentLoop(bus=MessageBus(), provider=provider, workspace=profile_home / "workspace",
+                      main_config=config, max_iterations=3, soft_warn_at_iteration=0)
+    monkeypatch.setattr(agent, "_schedule_post_turn_compaction", lambda msg: None)
+    host = ProfileHost()
+    host._broker = AsyncMock()
+    agent.set_profile_collaboration_host(host if mode == "denied-policy" else None)
+    server = GatewayServer(host="127.0.0.1")
+    agent.tools.register(MessageProfileTool(server))
+    try:
+        await agent._process_message(InboundMessage(
+            channel="web", sender_id="phone", chat_id="thread", content="Ask writer to say hello",
+            metadata={"profile_directory": ["default", "writer"], "run_id": "run"},
+        ))
+        assert "message_profile" not in provider.surfaces[0]
+        assert "Error" in provider.results[0]
+        host._broker.assert_not_awaited()
+    finally:
+        agent.stop()
+        await server.stop()
+        await host.shutdown()

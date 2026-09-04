@@ -30,6 +30,9 @@ own host and never broadcast a delegation request to UI clients.
   target instead of introducing a cyclic wait between active agents.
 - Parent cancellation aborts the target, including cancellation racing its ACK.
   Aborting an offline target never starts it.
+- Nested requests carry their source run ID. A source terminal cancels only
+  that run's requests, not a newer turn sharing the same session. Older
+  controllers without this additive field retain their existing behavior.
 - Buffered error/aborted terminal events cannot become successful replies.
 - UI disconnect is not runtime ownership; accepted host work must not depend
   on the original UI remaining connected.
@@ -56,3 +59,18 @@ delivery or resumption across a gateway process restart.
 
 All changes stay on `codex/gateway-profile-messaging`; no merge or deployment
 is part of this task. Updating a remote host is a separate release action.
+
+### Verification result
+
+The default repository suite passed: **4806 passed, 1 skipped, 12 deselected**.
+The deselected tests require real model calls; no paid provider calls or
+physical-device tests were performed. The suite reports 12 warnings, including
+an existing subprocess teardown warning. The touched existing files retain
+the same 41 lint findings as the base checkout; both new Python files pass
+lint. The diff whitespace check is clean.
+
+The new wire tests exercise an authenticated WebSocket and queued relay input
+through the actual agent loop, tool execution and host broker, with a
+deterministic provider and child-runtime RPC double. They also cover a child
+reply arriving before its send acknowledgement. These tests do not substitute
+for a packaged Desktop/iPhone smoke test against an updated remote gateway.

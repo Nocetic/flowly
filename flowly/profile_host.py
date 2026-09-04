@@ -257,6 +257,9 @@ class ProfileHost:
         self._broker_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
         self._terminal_events: dict[tuple[str, str], dict[str, Any]] = {}
         self._broker_target_locks: dict[str, asyncio.Lock] = {}
+        self._profile_message_requests: dict[
+            tuple[str, str], tuple[str, str, asyncio.Task[Any]]
+        ] = {}
         self._task_target_locks: dict[str, asyncio.Lock] = {}
         self._shared_service_locks: dict[str, asyncio.Lock] = {}
         self._broker_sessions: dict[tuple[str, str], str] = {}
@@ -1569,6 +1572,7 @@ class ProfileHost:
             runtime.active_runs.add(run_id)
         if event == "chat" and run_id:
             if payload.get("state") in ("final", "aborted", "error"):
+                self._cancel_profile_message_requests(profile, session_key, run_id)
                 if runtime is not None:
                     runtime.active_runs.discard(run_id)
                     self._capacity_changed.set()
@@ -1690,6 +1694,39 @@ class ProfileHost:
             logger.debug("Could not auto-resolve internal {} for {}", method, profile)
 
     async def _handle_broker_request(self, source: _Runtime, frame: dict[str, Any]) -> None:
+        request_id = str(frame.get("id") or "")
+        key = (source.profile, request_id)
+        if key in self._profile_message_requests:
+            # The original request will respond on this socket. A repeated
+            # frame must not execute the same message a second time.
+            return
+        params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+        task = asyncio.current_task()
+        assert task is not None
+        self._profile_message_requests[key] = (
+            str(params.get("sourceSessionKey") or ""),
+            str(params.get("sourceRunId") or ""),
+            task,
+        )
+        try:
+            await self._respond_to_broker_request(source, frame)
+        finally:
+            self._profile_message_requests.pop(key, None)
+
+    def _cancel_profile_message_requests(
+        self, profile: str, session_key: str | None = None, run_id: str | None = None,
+    ) -> None:
+        for (source, _request_id), (session, run, task) in tuple(self._profile_message_requests.items()):
+            if source != profile or (session_key is not None and session != session_key):
+                continue
+            # Older controllers omit sourceRunId. Never cancel by session
+            # alone: a late terminal from the previous turn can arrive after
+            # the next turn has already started in that same conversation.
+            if run_id is not None and run != run_id:
+                continue
+            task.cancel()
+
+    async def _respond_to_broker_request(self, source: _Runtime, frame: dict[str, Any]) -> None:
         request_id = str(frame.get("id") or "")
         params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
         try:
@@ -1955,11 +1992,12 @@ class ProfileHost:
         result = await self._rpc(target_runtime, method, params, timeout)
         if method == "chat.send" and isinstance(result, dict):
             run_id = str(result.get("runId") or "")
-            if run_id:
+            if run_id and (target, run_id) not in self._terminal_events:
                 target_runtime.active_runs.add(run_id)
         return result
 
     async def _close_runtime(self, runtime: _Runtime) -> None:
+        self._cancel_profile_message_requests(runtime.profile)
         for future in runtime.pending.values():
             if not future.done():
                 future.set_exception(ProfileHostError("PROFILE_STOPPED", "The profile runtime was stopped."))
