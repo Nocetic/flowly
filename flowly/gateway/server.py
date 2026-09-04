@@ -1616,8 +1616,17 @@ class GatewayServer:
             else:
                 await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", f"Unknown method: {method}")
         except Exception as e:
-            logger.error(f"[WS] RPC {method} error: {e}")
-            await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", str(e))
+            # An exception reaching here is a bug, not a sentence for the
+            # reader. Log the traceback so the cause is recoverable, and tell
+            # the client only that the call failed: str(e) put raw errno text
+            # and filesystem paths on screen with nothing to act on.
+            logger.opt(exception=True).error("[WS] RPC {} failed: {}", method, e)
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "UNAVAILABLE",
+                "Something went wrong handling that request. The details are in the log.",
+            )
 
     async def _handle_profile_host_rpc(
         self,
