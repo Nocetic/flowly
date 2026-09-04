@@ -505,12 +505,33 @@ def _read_mark_seed(value: object) -> int | None:
         return None
 
 
-def _load_config_object(path: Path) -> dict:
-    if not path.exists():
-        return {}
+def _path_exists(path: Path) -> bool:
+    """``path.exists()`` for a path we may not be allowed to look at.
+
+    ``Path.exists()`` only swallows the errors that mean "no such file";
+    a sandbox denial arrives as ``EPERM`` from ``stat`` and is raised at
+    the caller. A named bot runs under a policy that denies it the
+    primary profile, so asking whether the primary's config exists is a
+    normal question with an answer, not an error: unreadable is reported
+    as absent, which is what an unreadable file is worth to a caller
+    that cannot open it either.
+    """
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _load_config_object(path: Path) -> dict:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Invalid profile config.json: {exc}") from exc
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid profile config.json: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError("Invalid profile config.json: root must be an object")
@@ -621,7 +642,7 @@ def list_profiles() -> list[ProfileInfo]:
         name="default",
         path=_DEFAULT_HOME,
         is_default=True,
-        has_config=(_DEFAULT_HOME / "config.json").exists(),
+        has_config=_path_exists(_DEFAULT_HOME / "config.json"),
         skill_count=_installed_skill_count(_DEFAULT_HOME),
         **default_meta,
         **default_runtime,
@@ -637,7 +658,7 @@ def list_profiles() -> list[ProfileInfo]:
                     name=d.name,
                     path=d,
                     is_default=False,
-                    has_config=(d / "config.json").exists(),
+                    has_config=_path_exists(d / "config.json"),
                     skill_count=_installed_skill_count(d),
                     **meta,
                     **runtime,
