@@ -12,22 +12,13 @@ normal MCP server (``~/.codex/config.toml [mcp_servers.flowly-tools]``,
 written by :mod:`flowly.codex.tool_migration`) and calls back into it
 for capabilities its built-ins don't cover.
 
-Why hand-rolled (no ``mcp`` SDK)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Protocol implementation
+~~~~~~~~~~~~~~~~~~~~~~~
 
-Flowly ships no MCP *server* dependency (the ``hub`` package is an HTTP
-skill-registry client, not MCP). Rather than pull in the ``mcp`` SDK
-just for this callback, we speak the protocol directly: newline-
-delimited JSON-RPC 2.0 over stdio, the same framing Flowly's Codex
-transport already speaks on the other side. The surface we implement is
-the minimum Codex's MCP client drives:
-
-  * ``initialize``            → serverInfo + capabilities (echo the
-                                client's requested protocolVersion)
-  * ``notifications/initialized`` (client notification — ack, no reply)
-  * ``tools/list``            → the curated tool schemas
-  * ``tools/call``            → dispatch to the Flowly tool's execute()
-  * ``ping``                  → ``{}``
+The callback uses the official MCP low-level server. This provides both
+modern discovery and legacy initialization, protocol validation, concurrent
+request handling, cancellation, and clean stdio framing without maintaining a
+second protocol implementation inside Flowly.
 
 What we expose (stateless only)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -51,8 +42,10 @@ Spawned by: Codex (stdio MCP) when the runtime is active and
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import sys
 from pathlib import Path
@@ -60,11 +53,7 @@ from typing import Any
 
 logger = logging.getLogger("flowly.codex.tools_mcp_server")
 
-# Highest MCP protocol version we understand. We echo the client's
-# requested version when it's a string (servers are expected to accept
-# the client's version or negotiate down); this constant is the fallback
-# when the client omits it.
-_FALLBACK_PROTOCOL_VERSION = "2025-06-18"
+_MAX_MEDIA_BYTES = 25 * 1024 * 1024
 
 # Curated tool names exposed through the callback. Each MUST map to a
 # Flowly tool constructible WITHOUT a live AgentLoop (stateless).
@@ -225,118 +214,181 @@ class _SkillsListTool:
 
 
 # ---------------------------------------------------------------------------
-# MCP stdio JSON-RPC server
+# Official MCP stdio server
 # ---------------------------------------------------------------------------
 
 
 class _StdioMCPServer:
-    """Minimal newline-delimited JSON-RPC 2.0 MCP server over stdio."""
+    """Official dual-era MCP server over stdio for Flowly's curated tools."""
 
     def __init__(self, tools: dict[str, Any]) -> None:
         self._tools = tools
+        from flowly import __version__
+        from mcp.server.lowlevel import Server
 
-    def _tool_schema(self, tool: Any) -> dict[str, Any]:
-        return {
-            "name": tool.name,
-            "description": tool.description,
-            "inputSchema": tool.parameters
-            or {"type": "object", "properties": {}},
-        }
+        self._server = Server(
+            "flowly-tools",
+            title="Flowly Tools",
+            version=__version__,
+            description="Curated stateless Flowly tools for coding agents.",
+            instructions=(
+                "Use these tools for web retrieval, video analysis, and the "
+                "Flowly skill library. Tool calls are stateless."
+            ),
+            on_list_tools=self._list_tools,
+            on_call_tool=self._call_tool,
+        )
 
-    async def _handle(self, msg: dict[str, Any]) -> dict[str, Any] | None:
-        """Dispatch one request; return a JSON-RPC reply dict or None
-        (for notifications, which get no reply)."""
-        method = msg.get("method", "")
-        rid = msg.get("id")
-        params = msg.get("params") or {}
+    @staticmethod
+    def _annotations(name: str) -> Any:
+        from mcp import types
 
-        # Notifications (no id) — ack silently.
-        if rid is None:
-            return None
+        return types.ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=name.startswith("web_") or name == "video_analyze",
+        )
 
-        if method == "initialize":
-            client_pv = params.get("protocolVersion")
-            pv = client_pv if isinstance(client_pv, str) and client_pv else _FALLBACK_PROTOCOL_VERSION
-            return _ok(rid, {
-                "protocolVersion": pv,
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "flowly-tools", "version": "1.0.0"},
-            })
+    def _tool_schema(self, tool: Any) -> Any:
+        from mcp import types
 
-        if method == "ping":
-            return _ok(rid, {})
+        output_schema = getattr(tool, "output_schema", None)
+        return types.Tool(
+            name=tool.name,
+            title=getattr(tool, "title", None),
+            description=tool.description,
+            inputSchema=tool.parameters or {"type": "object", "properties": {}},
+            **({"outputSchema": output_schema} if isinstance(output_schema, dict) else {}),
+            annotations=self._annotations(tool.name),
+            _meta={"source": "flowly", "stateless": True},
+        )
 
-        if method == "tools/list":
-            return _ok(rid, {
-                "tools": [self._tool_schema(t) for t in self._tools.values()],
-            })
+    async def _list_tools(self, _context: Any, _params: Any) -> Any:
+        from mcp import types
 
-        if method == "tools/call":
-            name = params.get("name") or ""
-            arguments = params.get("arguments") or {}
-            tool = self._tools.get(name)
-            if tool is None:
-                return _ok(rid, {
-                    "content": [{"type": "text", "text": f"Unknown tool: {name}"}],
-                    "isError": True,
-                })
+        return types.ListToolsResult(
+            tools=[self._tool_schema(tool) for tool in self._tools.values()],
+            cacheScope="private",
+        )
+
+    @staticmethod
+    def _error(message: str) -> Any:
+        from mcp import types
+
+        return types.CallToolResult(
+            content=[types.TextContent(text=message)],
+            isError=True,
+        )
+
+    @staticmethod
+    def _media_content(paths: list[str]) -> list[Any]:
+        from mcp import types
+
+        content: list[Any] = []
+        for raw_path in paths:
+            path = Path(raw_path)
             try:
-                result = await tool.execute(**arguments)
-            except Exception as exc:
-                logger.exception("tool %s raised", name)
-                return _ok(rid, {
-                    "content": [{"type": "text", "text": f"Error: {exc}"}],
-                    "isError": True,
-                })
-            text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-            is_error = isinstance(text, str) and text.startswith("Error")
-            return _ok(rid, {
-                "content": [{"type": "text", "text": text}],
-                "isError": is_error,
-            })
+                size = path.stat().st_size
+            except OSError:
+                continue
+            mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            if size <= _MAX_MEDIA_BYTES and mime_type.startswith(("image/", "audio/")):
+                try:
+                    with path.open("rb") as handle:
+                        raw = handle.read(_MAX_MEDIA_BYTES + 1)
+                except OSError:
+                    continue
+                if len(raw) > _MAX_MEDIA_BYTES:
+                    continue
+                encoded = base64.b64encode(raw).decode("ascii")
+                if mime_type.startswith("image/"):
+                    content.append(types.ImageContent(data=encoded, mimeType=mime_type))
+                else:
+                    content.append(types.AudioContent(data=encoded, mimeType=mime_type))
+                continue
+            try:
+                uri = path.resolve().as_uri()
+            except (OSError, ValueError):
+                continue
+            content.append(types.ResourceLink(
+                name=path.name,
+                uri=uri,
+                mimeType=mime_type,
+                size=size,
+            ))
+        return content
 
-        # Unknown method.
-        return {
-            "jsonrpc": "2.0",
-            "id": rid,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        }
+    @staticmethod
+    def _format_success(result: Any) -> Any:
+        from flowly.agent.reply_media import extract_reply_media
+        from mcp import types
+
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        media_paths, summary = extract_reply_media(text)
+        visible_text = summary if summary is not None else text
+        structured: Any = None
+        if not media_paths:
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, (dict, list)):
+                    structured = parsed
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        is_error = visible_text.lstrip().lower().startswith("error")
+        if isinstance(structured, dict) and isinstance(structured.get("error"), str):
+            is_error = True
+        content: list[Any] = [types.TextContent(text=visible_text)]
+        content.extend(_StdioMCPServer._media_content(media_paths))
+        return types.CallToolResult(
+            content=content,
+            structuredContent=structured,
+            isError=is_error,
+        )
+
+    async def _call_tool(self, _context: Any, params: Any) -> Any:
+        name = params.name
+        tool = self._tools.get(name)
+        if tool is None:
+            return self._error(f"Unknown tool: {name}")
+        arguments = params.arguments or {}
+        if not isinstance(arguments, dict):
+            return self._error("Tool arguments must be an object")
+        try:
+            result = await tool.execute(**arguments)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            from flowly.mcp.security import sanitize_error
+
+            logger.exception("tool %s raised", name)
+            return self._error(sanitize_error(f"Error executing {name}: {type(exc).__name__}"))
+        return self._format_success(result)
+
+    async def list_tools(self) -> Any:
+        """Test/introspection helper using the production list handler."""
+        return await self._list_tools(None, None)
+
+    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+        """Test/introspection helper using the production call handler."""
+        from mcp import types
+
+        return await self._call_tool(
+            None,
+            types.CallToolRequestParams(name=name, arguments=arguments or {}),
+        )
 
     async def run(self) -> None:
-        """Read stdin line-by-line, dispatch, write replies to stdout."""
-        loop = asyncio.get_event_loop()
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        """Serve stdio with the SDK's validated, cancellation-aware transport."""
+        from mcp.server.stdio import stdio_server
 
-        # stdout writer — line-buffered JSON, flushed per message.
-        def _write(obj: dict[str, Any]) -> None:
-            sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
-
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                logger.debug("non-JSON line on stdin: %r", line[:200])
-                continue
-            try:
-                reply = await self._handle(msg)
-            except Exception:
-                logger.exception("handler crashed on %r", msg.get("method"))
-                reply = None
-            if reply is not None:
-                _write(reply)
-
-
-def _ok(rid: Any, result: dict[str, Any]) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": rid, "result": result}
+        async with stdio_server() as (read_stream, write_stream):
+            await self._server.run(
+                read_stream,
+                write_stream,
+                self._server.create_initialization_options(),
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

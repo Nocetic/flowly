@@ -3,7 +3,7 @@
 Covers the three new pieces that give the codex_session runtime
 reference parity with the upstream "App-Server Runtime" feature:
 
-  * ``flowly.codex.tools_mcp_server`` — the hand-rolled stdio MCP
+  * ``flowly.codex.tools_mcp_server`` — the official-SDK stdio MCP
     server that exposes a curated subset of Flowly tools to Codex.
   * ``flowly.codex.tool_migration`` — idempotent ``~/.codex/config.toml``
     managed-block writer that registers the callback.
@@ -14,6 +14,7 @@ reference parity with the upstream "App-Server Runtime" feature:
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -128,71 +129,102 @@ def _run(coro):
 
 
 class TestMCPServerProtocol:
-    def test_initialize_echoes_client_protocol_version(self):
+    def test_server_metadata_comes_from_official_core(self):
         srv = _StdioMCPServer({})
-        reply = _run(srv._handle({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18"},
-        }))
-        assert reply["id"] == 1
-        assert reply["result"]["protocolVersion"] == "2025-06-18"
-        assert reply["result"]["serverInfo"]["name"] == "flowly-tools"
-        assert "tools" in reply["result"]["capabilities"]
-
-    def test_initialize_falls_back_when_no_version(self):
-        srv = _StdioMCPServer({})
-        reply = _run(srv._handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
-        assert reply["result"]["protocolVersion"]  # non-empty fallback
-
-    def test_notification_gets_no_reply(self):
-        srv = _StdioMCPServer({})
-        reply = _run(srv._handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
-        assert reply is None
+        options = srv._server.create_initialization_options()
+        assert options.server_name == "flowly-tools"
+        assert options.server_version
+        assert "stateless" in options.instructions.lower()
 
     def test_tools_list_returns_schemas(self):
         srv = _StdioMCPServer({"web_search": _StubTool("web_search")})
-        reply = _run(srv._handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
-        tools = reply["result"]["tools"]
+        tools = _run(srv.list_tools()).tools
         assert len(tools) == 1
-        assert tools[0]["name"] == "web_search"
-        assert tools[0]["inputSchema"]["type"] == "object"
+        assert tools[0].name == "web_search"
+        assert tools[0].input_schema["type"] == "object"
+        assert tools[0].annotations.read_only_hint is True
+        assert tools[0].annotations.open_world_hint is True
 
     def test_tools_call_dispatches(self):
         tool = _StubTool("web_search", result="hits")
         srv = _StdioMCPServer({"web_search": tool})
-        reply = _run(srv._handle({
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "web_search", "arguments": {"q": "x"}},
-        }))
+        reply = _run(srv.call_tool("web_search", {"q": "x"}))
         assert tool.calls == [{"q": "x"}]
-        assert reply["result"]["content"][0]["text"] == "hits"
-        assert reply["result"]["isError"] is False
+        assert reply.content[0].text == "hits"
+        assert reply.is_error is False
 
     def test_tools_call_unknown_tool_is_error(self):
-        srv = _StdioMCPServer({})
-        reply = _run(srv._handle({
-            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {"name": "nope", "arguments": {}},
-        }))
-        assert reply["result"]["isError"] is True
+        reply = _run(_StdioMCPServer({}).call_tool("nope"))
+        assert reply.is_error is True
 
     def test_tools_call_error_string_marks_iserror(self):
         srv = _StdioMCPServer({"t": _StubTool("t", result="Error: boom")})
-        reply = _run(srv._handle({
-            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-            "params": {"name": "t", "arguments": {}},
-        }))
-        assert reply["result"]["isError"] is True
+        reply = _run(srv.call_tool("t"))
+        assert reply.is_error is True
 
-    def test_unknown_method_returns_jsonrpc_error(self):
-        srv = _StdioMCPServer({})
-        reply = _run(srv._handle({"jsonrpc": "2.0", "id": 6, "method": "frobnicate"}))
-        assert reply["error"]["code"] == -32601
+    def test_json_result_is_native_structured_content(self):
+        srv = _StdioMCPServer({"t": _StubTool("t", result=json.dumps({"ok": True}))})
+        reply = _run(srv.call_tool("t"))
+        assert reply.structured_content == {"ok": True}
+        assert reply.is_error is False
 
-    def test_ping(self):
-        srv = _StdioMCPServer({})
-        reply = _run(srv._handle({"jsonrpc": "2.0", "id": 7, "method": "ping"}))
-        assert reply["result"] == {}
+    def test_cancellation_reaches_tool(self):
+        cancelled = asyncio.Event()
+
+        class _SlowTool(_StubTool):
+            async def execute(self, **kwargs):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+        async def _scenario():
+            srv = _StdioMCPServer({"slow": _SlowTool("slow")})
+            task = asyncio.create_task(srv.call_tool("slow"))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        _run(_scenario())
+        assert cancelled.is_set()
+
+    def test_independent_calls_can_run_concurrently(self):
+        active = 0
+        max_active = 0
+
+        class _ConcurrentTool(_StubTool):
+            async def execute(self, **kwargs):
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.02)
+                active -= 1
+                return "ok"
+
+        async def _scenario():
+            srv = _StdioMCPServer({"work": _ConcurrentTool("work")})
+            await asyncio.gather(srv.call_tool("work"), srv.call_tool("work"))
+
+        _run(_scenario())
+        assert max_active == 2
+
+    def test_reply_media_becomes_native_content(self, tmp_path):
+        from flowly.agent.reply_media import media_envelope
+
+        image = tmp_path / "result.png"
+        image.write_bytes(b"png")
+        srv = _StdioMCPServer({
+            "image": _StubTool(
+                "image",
+                result=media_envelope([str(image)], "generated"),
+            ),
+        })
+        reply = _run(srv.call_tool("image"))
+        assert reply.content[0].text == "generated"
+        assert reply.content[1].type == "image"
+        assert reply.content[1].mime_type == "image/png"
 
 
 # ---------------------------------------------------------------------------
