@@ -121,3 +121,12 @@ def test_display_names_survive_a_denied_sibling(profile_roots, deny_read):
     deny_read(root / "testbot")
 
     assert profiles.profile_display_names(["testbot"]) == {}
+
+
+def test_existence_of_a_denied_sibling_is_answered_not_raised(profile_roots, deny_read):
+    _, root = profile_roots
+    deny_read(root / "testbot")
+
+    # Both callers use this as a precondition and turn False into "unknown
+    # bot", which is a better answer than an errno the reader cannot act on.
+    assert profiles.profile_exists("testbot") is False

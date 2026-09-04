@@ -116,6 +116,10 @@ class ProfileIdentityConflictError(ValueError):
 
 
 def _assert_named_profile_capacity() -> None:
+    # Deliberately not tolerant of an unreadable sibling: this counts against
+    # a hard limit, and skipping what we cannot examine would undercount and
+    # let the limit be passed. It only runs where creating a bot is allowed,
+    # which is a context that may read every profile.
     count = sum(
         1
         for candidate in _PROFILES_ROOT.iterdir()
@@ -300,8 +304,7 @@ def profile_exists(name: str) -> bool:
     """Check if a named profile exists."""
     if name == "default":
         return True
-    candidate = _PROFILES_ROOT / name
-    return candidate.is_dir() and not candidate.is_symlink()
+    return _is_describable_profile_dir(_PROFILES_ROOT / name)
 
 
 # ── Profile info ──────────────────────────────────────────────────
