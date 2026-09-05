@@ -1129,6 +1129,11 @@ class MCPServerLifecycleConfig(BaseModel):
     keepalive_interval: float = Field(default=180.0, gt=0)
     keepalive_timeout: float = Field(default=30.0, gt=0)
     stable_connection_seconds: float = Field(default=30.0, ge=0)
+    # Zero disables that timer. Lifetime expiry drains admitted requests;
+    # idle expiry closes without reconnecting until another request arrives.
+    idle_timeout: float = Field(default=0.0, ge=0, le=604_800)
+    max_lifetime: float = Field(default=0.0, ge=0, le=604_800)
+    close_timeout: float = Field(default=10.0, gt=0, le=60)
 
     @model_validator(mode="after")
     def _validate_delay_bounds(self) -> "MCPServerLifecycleConfig":
@@ -1140,6 +1145,9 @@ class MCPServerLifecycleConfig(BaseModel):
             self.keepalive_interval,
             self.keepalive_timeout,
             self.stable_connection_seconds,
+            self.idle_timeout,
+            self.max_lifetime,
+            self.close_timeout,
         )
         if not all(math.isfinite(value) for value in values):
             raise ValueError("MCP lifecycle values must be finite")

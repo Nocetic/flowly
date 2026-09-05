@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import AsyncExitStack
 from typing import Any
 
 from flowly.agent.tools.base import Tool
@@ -36,6 +37,7 @@ from flowly.mcp.content import (
     render_content_blocks,
     render_resource_contents,
 )
+from flowly.mcp.lifecycle import MCPContractChangedError, MCPUnavailableError
 from flowly.mcp.media_cache import DEFAULT_MAX_BINARY_BYTES
 from flowly.mcp.pagination import collect_mcp_pages
 from flowly.mcp.requests import call_with_input
@@ -86,7 +88,8 @@ async def _run_on_mcp_loop(
             f"MCP loop is not running (server '{server_name}')"
         )
     session = server_task.session
-    if session is None:
+    lease = getattr(server_task, "connection_lease", None)
+    if session is None and not callable(lease):
         _bump_server_error(server_name)
         return _error_envelope(f"MCP server '{server_name}' is not connected")
 
@@ -95,11 +98,14 @@ async def _run_on_mcp_loop(
     origin = current_tool_origin()
 
     async def invoke():
-        get_interaction = getattr(server_task, "get_interaction", None)
-        if callable(get_interaction):
-            async with get_interaction().invocation(session, origin):
-                return await coro_factory(session)
-        return await coro_factory(session)
+        nonlocal session
+        async with AsyncExitStack() as stack:
+            if callable(lease):
+                session = await stack.enter_async_context(lease())
+            get_interaction = getattr(server_task, "get_interaction", None)
+            if callable(get_interaction):
+                await stack.enter_async_context(get_interaction().invocation(session, origin))
+            return await coro_factory(session)
 
     future = asyncio.run_coroutine_threadsafe(invoke(), loop)
     try:
@@ -118,6 +124,10 @@ async def _run_on_mcp_loop(
     except on_interrupt:
         _release_server_probe(server_name)
         return _error_envelope("MCP call interrupted: user sent a new message")
+    except (MCPContractChangedError, MCPUnavailableError) as exc:
+        # Local admission/contract rejection is not a failed remote operation.
+        _release_server_probe(server_name)
+        return _error_envelope(sanitize_error(str(exc)))
     except Exception as exc:
         # A failed request is often the first signal that a long-idle stream
         # has died. Wake the connection supervisor immediately instead of
@@ -132,7 +142,7 @@ async def _run_on_mcp_loop(
                 session,
             )
         _bump_server_error(server_name)
-        logger.error("MCP tool %s call failed: %s", tool_name, exc)
+        logger.error("MCP tool %s call failed: %s", tool_name, sanitize_error(_exc_text(exc)))
         return _error_envelope(
             sanitize_error(f"MCP call failed: {type(exc).__name__}: {_exc_text(exc)}")
         )
@@ -180,8 +190,9 @@ class MCPTool(Tool):
         self._parameters = normalize_mcp_input_schema(
             mcp_attr(remote_tool, "input_schema", "inputSchema")
         )
+        self._raw_parameters = mcp_wire_value(mcp_attr(remote_tool, "input_schema", "inputSchema"))
         self.title = getattr(remote_tool, "title", None)
-        self.output_schema = mcp_attr(remote_tool, "output_schema", "outputSchema")
+        self.output_schema = mcp_wire_value(mcp_attr(remote_tool, "output_schema", "outputSchema"))
         self.annotations = mcp_wire_value(getattr(remote_tool, "annotations", None))
         self.execution = mcp_wire_value(getattr(remote_tool, "execution", None))
         self.icons = mcp_wire_value(getattr(remote_tool, "icons", None))
@@ -207,13 +218,26 @@ class MCPTool(Tool):
     def discovery_source(self) -> str:
         return self._server_name
 
+    def contract_fingerprint(self) -> str:
+        """Include execution/permission metadata, not just the model schema."""
+        return json.dumps({
+            "schema": self.to_schema(),
+            "remoteInputSchema": self._raw_parameters,
+            "title": self.title,
+            "outputSchema": self.output_schema,
+            "annotations": self.annotations,
+            "execution": self.execution,
+            "icons": self.icons,
+            "meta": self.mcp_metadata,
+        }, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+
     async def execute(self, **kwargs: Any) -> str:
         from flowly.mcp.client import (
             MCPCallInterrupted,
             circuit_breaker_block_reason,
         )
 
-        # Consent precedes all transport work, including future lazy startup.
+        # Consent precedes all transport work, including waking idle servers.
         config = getattr(self._server_task, "_config", {})
         trust = config.get("trust", "full")
         if trust not in {"full", "untrusted"}:
@@ -236,6 +260,9 @@ class MCPTool(Tool):
             slot = getattr(self._server_task, "tool_call_slot", None)
             guard = slot() if callable(slot) else self._server_task.rpc_lock
             async with guard:
+                validate = getattr(self._server_task, "validate_tool_contract", None)
+                if callable(validate):
+                    validate(self._remote_name, self.contract_fingerprint())
                 result = await asyncio.wait_for(
                     call_with_input(session, "call_tool", self._remote_name, arguments=kwargs),
                     timeout=timeout,
@@ -327,10 +354,26 @@ class _MCPUtilityTool(Tool):
 
     async def _run(self, coro_factory: Any) -> str:
         from flowly.mcp.client import MCPCallInterrupted
+
+        async def checked(session):
+            from flowly.mcp.client import _capability_advertised
+
+            family = "resources" if "resource" in self._suffix else "prompts"
+            cfg = getattr(self._server_task, "_config", None)
+            if isinstance(cfg, dict) and (
+                not (cfg.get("tools") or {}).get(family)
+                or not _capability_advertised(self._server_task, family)
+            ):
+                raise MCPContractChangedError(
+                    f"MCP {family} capability changed or is no longer enabled; "
+                    "refresh the tool list. No operation was sent."
+                )
+            return await coro_factory(session)
+
         return await _run_on_mcp_loop(
             server_task=self._server_task,
             tool_name=self._tool_name,
-            coro_factory=coro_factory,
+            coro_factory=checked,
             timeout=self._server_task.tool_timeout,
             on_interrupt=MCPCallInterrupted,
         )

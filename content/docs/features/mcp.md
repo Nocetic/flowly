@@ -107,6 +107,45 @@ Limit which of a server's tools the agent sees via the `tools` block:
 
 `flowly mcp configure <name>` connects to the server, lists its tools, and gives you an interactive checkbox picker that writes `tools.include` for you.
 
+## Connection lifetime and idle recycling
+
+For servers whose state survives a new connection/process, you can opt into
+demand-driven connection recycling:
+
+```json
+"lifecycle": {
+  "idleTimeout": 300,
+  "maxLifetime": 3600,
+  "closeTimeout": 10
+}
+```
+
+Times are seconds. `idleTimeout` and `maxLifetime` default to `0` (disabled),
+and accept values up to 604800 (seven days). `closeTimeout` defaults to 10 and
+must be greater than zero and no more than 60. Recycling is deliberately
+opt-in: some MCP servers keep non-reconstructable session state in memory.
+Flowly cannot migrate that state by checking a tool schema.
+
+- Idle time counts user requests, not keepalive traffic. An idle server closes
+  its transport and stdio child, but its discovered tools remain available.
+- At the lifetime deadline, the server enters `draining`: admitted tool,
+  resource and prompt requests finish, including their queue/elicitation time.
+  New requests wait for a fresh session rather than extending the old one.
+- Closure finishes before the next transport opens. A cleanup deadline bounds
+  an unresponsive close; shutdown is terminal and never wakes an idle server.
+- Concurrent callers share one wake-up. Each caller waits at most
+  `connectTimeout` for admission; one timeout/cancellation does not cancel the
+  other callers or an already admitted operation. Failed operations are not replayed.
+- Every new connection discovers the current catalog. An old tool handler is
+  rejected if its schema, description, output contract or permission metadata
+  changed, or if it vanished. The caller must fetch the new schema and retry
+  deliberately; untrusted writes still need approval before a sleeping server
+  can be started. All bound agent registries receive the refreshed catalog.
+
+An idle runtime currently retains its catalog **in memory**. Initial discovery
+after restarting Flowly still connects to the server; disk-backed manifests and
+lazy startup across application restarts are not implemented by these timers.
+
 ## OAuth for remote servers
 
 HTTP servers with `auth: oauth` use OAuth 2.1 + PKCE. Tokens are stored per-server at `$FLOWLY_HOME/mcp-tokens/{server}.json` (mode 0600) and auto-refreshed.
@@ -449,6 +488,11 @@ Common server settings (camelCase on disk; Flowly converts to snake internally â
       "reapOrphans": false,              // force-kill orphaned stdio children (Linux)
       "supportsParallelToolCalls": false,
       "maxParallelToolCalls": 8,
+      "lifecycle": {                     // opt-in for restart-safe servers
+        "idleTimeout": 0,                // 0 disables idle closure
+        "maxLifetime": 0,                // 0 disables lifetime draining
+        "closeTimeout": 10               // bounded recycle teardown
+      },
       "sampling": {                      // server-initiated LLM (off by default)
         "enabled": false,
         "model": "",

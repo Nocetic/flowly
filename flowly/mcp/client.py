@@ -40,11 +40,17 @@ import logging
 import math
 import threading
 import time
+import weakref
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlparse
 
-from flowly.mcp.lifecycle import MCPConnectionState, MCPRetryPolicy
+from flowly.mcp.lifecycle import (
+    MCPConnectionState,
+    MCPContractChangedError,
+    MCPRetryPolicy,
+    MCPUnavailableError,
+)
 from flowly.mcp.media_cache import DEFAULT_MAX_BINARY_BYTES
 from flowly.mcp.pagination import MCPPageCollection, collect_mcp_pages
 from flowly.mcp.schema import sanitize_mcp_name_component
@@ -344,6 +350,8 @@ class MCPServerTask:
         self._registry: Any | None = None
         self._server_cfg: dict[str, Any] = {}
         self._registered_names: list[str] = []
+        self._registry_bindings: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._registry_lock = threading.RLock()
         self._refresh_lock: asyncio.Lock | None = None
         self._pending_refreshes: set[asyncio.Task[Any]] = set()
         self.connection_failed_event: asyncio.Event | None = None
@@ -362,6 +370,15 @@ class MCPServerTask:
         self._tool_pagination = MCPPageCollection(items=(), pages=0)
         self._inflight_tool_calls = 0
         self._peak_inflight_tool_calls = 0
+        self._active_requests = 0
+        self._waiting_requests = 0
+        self._last_activity = time.monotonic()
+        self._activity_event: asyncio.Event | None = None
+        self._state_event: asyncio.Event | None = None
+        self._wake_event: asyncio.Event | None = None
+        self._connect_deadline: asyncio.Timeout | None = None
+        self._planned_recycle = False
+        self._recycle_count = 0
         self.state = MCPConnectionState.IDLE
 
     def is_http(self) -> bool:
@@ -369,17 +386,28 @@ class MCPServerTask:
 
     def bind_registry(self, registry: Any, server_cfg: dict[str, Any]) -> None:
         """Record the registry + config used for dynamic re-registration."""
+        try:
+            self._registry_bindings.setdefault(registry, (server_cfg, []))
+        except TypeError:
+            pass  # Non-weakrefable custom registries retain the single binding.
         self._registry = registry
         self._server_cfg = server_cfg
 
     def set_registered_names(self, names: list[str]) -> None:
         self._registered_names = list(names)
+        try:
+            self._registry_bindings[self._registry] = (self._server_cfg, list(names))
+        except TypeError:
+            pass
 
     def _set_state(self, state: MCPConnectionState) -> None:
         if self.state is state:
             return
         self.state = state
         self._state_changed_at = time.time()
+        if self._state_event is not None:
+            self._state_event.set()
+            self._state_event = asyncio.Event()
 
     def _mark_connected(self, session: Any | None = None) -> None:
         """Record a completed handshake and wake the initial caller."""
@@ -388,6 +416,9 @@ class MCPServerTask:
         self._ever_connected = True
         self._connection_generation += 1
         self._connected_monotonic = time.monotonic()
+        self._last_activity = self._connected_monotonic
+        if self._connect_deadline is not None:
+            self._connect_deadline.reschedule(None)
         self._consecutive_failures = 0
         if session is not None:
             self._protocol_version = str(getattr(session, "protocol_version", "") or "")
@@ -421,6 +452,11 @@ class MCPServerTask:
             ),
             "inflightToolCalls": self._inflight_tool_calls,
             "peakInflightToolCalls": self._peak_inflight_tool_calls,
+            "activeRequests": self._active_requests,
+            "waitingRequests": self._waiting_requests,
+            "recycleCount": self._recycle_count,
+            "idleTimeout": self._retry_policy.idle_timeout,
+            "maxLifetime": self._retry_policy.max_lifetime,
         }
 
     def report_transport_failure(
@@ -441,6 +477,8 @@ class MCPServerTask:
 
     async def start(self, config: dict[str, Any]) -> None:
         """Spawn the run-task on the current loop and wait for readiness."""
+        if self._task is not None:
+            raise RuntimeError(f"MCP server '{self.name}' already started")
         self._config = config
         self._retry_policy = MCPRetryPolicy.from_server_config(config)
         self.tool_timeout = float(config.get("timeout", 120.0))
@@ -472,6 +510,9 @@ class MCPServerTask:
         self.rpc_lock = asyncio.Lock()
         self.tool_call_semaphore = asyncio.Semaphore(self.max_parallel_tool_calls)
         self._refresh_lock = asyncio.Lock()
+        self._activity_event = asyncio.Event()
+        self._state_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
         self.error = None
         self._set_state(MCPConnectionState.CONNECTING)
 
@@ -522,6 +563,122 @@ class MCPServerTask:
         raise asyncio.TimeoutError(
             f"MCP server '{self.name}' connect timed out after {self.connect_timeout:.0f}s"
         )
+
+    @asynccontextmanager
+    async def connection_lease(self):
+        """Pin a freshly negotiated session for one complete external request.
+
+        Counts tools, resource reads, prompt reads, queueing and elicitation.
+        Waiting for a new connection does not pin an old draining session.
+        All admission and release decisions run on the owning MCP loop.
+        """
+        self._waiting_requests += 1
+        try:
+            async with asyncio.timeout(self.connect_timeout):
+                while True:
+                    changed = self._state_event
+                    if (
+                        self.shutdown_event is None or self.shutdown_event.is_set()
+                        or self._task is None or self._task.done()
+                    ):
+                        raise MCPUnavailableError(f"MCP server '{self.name}' is stopped")
+                    if self.session is not None and self.state is MCPConnectionState.CONNECTED:
+                        session = self.session
+                        # No await between admission check and pinning this generation.
+                        self._active_requests += 1
+                        break
+                    if self.state is MCPConnectionState.IDLE and self._wake_event is not None:
+                        self._wake_event.set()
+                    assert changed is not None
+                    await changed.wait()
+        except TimeoutError as exc:
+            raise MCPUnavailableError(
+                f"MCP server '{self.name}' connection was not ready within "
+                f"{self.connect_timeout:g}s; no operation was sent"
+            ) from exc
+        finally:
+            self._waiting_requests -= 1
+        try:
+            yield session
+        finally:
+            self._active_requests -= 1
+            self._last_activity = time.monotonic()
+            if self._activity_event is not None:
+                self._activity_event.set()
+
+    def validate_tool_contract(self, remote_name: str, expected: str) -> None:
+        """Never dispatch an old handler against changed remote semantics."""
+        from flowly.mcp.tool import MCPTool
+
+        matching = [tool for tool in self.tools if getattr(tool, "name", "") == remote_name]
+        if len(matching) == 1 and _filter_remote_tool(self._config, remote_name):
+            current = MCPTool(server_task=self, remote_tool=matching[0])
+            if current.contract_fingerprint() == expected:
+                return
+        raise MCPContractChangedError(
+            f"MCP tool '{remote_name}' changed or is no longer available. "
+            "Refresh the tool list and review the current schema and permissions; "
+            "no operation was sent."
+        )
+
+    async def _wait_for_demand(self) -> bool:
+        """Keep one supervisor alive, with no transport or child process."""
+        assert self._wake_event is not None and self.shutdown_event is not None
+        self._set_state(MCPConnectionState.IDLE)
+        if self._waiting_requests:
+            self._wake_event.set()
+        shutdown_wait = asyncio.create_task(self.shutdown_event.wait())
+        try:
+            while not self.shutdown_event.is_set():
+                wake_wait = asyncio.create_task(self._wake_event.wait())
+                try:
+                    await asyncio.wait(
+                        {wake_wait, shutdown_wait}, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    wake_wait.cancel()
+                    await asyncio.gather(wake_wait, return_exceptions=True)
+                self._wake_event.clear()
+                if self.shutdown_event.is_set():
+                    return False
+                if self._waiting_requests:
+                    return True
+            return False
+        finally:
+            shutdown_wait.cancel()
+            await asyncio.gather(shutdown_wait, return_exceptions=True)
+
+    async def _recycle_when_due(self) -> None:
+        """Stop admitting at lifetime expiry, then let admitted requests drain."""
+        assert self._activity_event is not None
+        while True:
+            self._activity_event.clear()
+            now = time.monotonic()
+            lifetime = self._retry_policy.max_lifetime
+            idle = self._retry_policy.idle_timeout
+            lifetime_left = (
+                self._connected_monotonic + lifetime - now
+                if lifetime and self._connected_monotonic is not None else None
+            )
+            idle_left = self._last_activity + idle - now if idle else None
+            if lifetime_left is not None and lifetime_left <= 0:
+                self._set_state(MCPConnectionState.DRAINING)
+                if not self._active_requests:
+                    return
+                await self._activity_event.wait()
+                continue
+            if not self._active_requests and idle_left is not None and idle_left <= 0:
+                self._set_state(MCPConnectionState.DRAINING)
+                return
+            deadlines = [left for left in (lifetime_left,) if left is not None]
+            if not self._active_requests and idle_left is not None:
+                deadlines.append(idle_left)
+            try:
+                await asyncio.wait_for(
+                    self._activity_event.wait(), timeout=min(deadlines) if deadlines else None,
+                )
+            except TimeoutError:
+                pass
 
     @asynccontextmanager
     async def tool_call_slot(self):
@@ -583,9 +740,23 @@ class MCPServerTask:
                     self._set_state(MCPConnectionState.CONNECTING)
 
                 try:
-                    await self._run_transport()
+                    self._planned_recycle = False
+                    # Keep the SDK's transport enter/exit in this same task.
+                    # The handshake timer is disabled by _mark_connected;
+                    # it also bounds reconnects after the boot waiter is gone.
+                    async with asyncio.timeout(self.connect_timeout) as deadline:
+                        self._connect_deadline = deadline
+                        await self._run_transport()
+                    self._connect_deadline = None
                     if self.shutdown_event.is_set():
                         break
+                    if self._planned_recycle:
+                        self._recycle_count += 1
+                        self.session = None
+                        if not await self._wait_for_demand():
+                            break
+                        reconnect_attempt = 0
+                        continue
                     if not self._ever_connected:
                         raise RuntimeError(
                             f"MCP server '{self.name}' exited before initialization"
@@ -594,10 +765,32 @@ class MCPServerTask:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    if isinstance(exc, TimeoutError) and (
+                        self._connect_deadline is not None and self._connect_deadline.expired()
+                    ):
+                        phase = "recycle teardown" if self._planned_recycle else "connect"
+                        timeout = (
+                            self._retry_policy.close_timeout if self._planned_recycle
+                            else self.connect_timeout
+                        )
+                        exc = TimeoutError(
+                            f"MCP server '{self.name}' {phase} timed out after {timeout:.0f}s"
+                        )
+                    self._connect_deadline = None
                     self.session = None
                     self.error = exc
                     self._last_error = sanitize_error(str(exc) or repr(exc))
                     self._last_failure_at = time.time()
+                    if self._planned_recycle:
+                        # Transport context managers have unwound before we
+                        # reach this handler. Cleanup failure must not turn
+                        # an intentionally idle server into a restart storm.
+                        self._recycle_count += 1
+                        logger.warning("MCP server '%s' recycle cleanup: %s", self.name, self._last_error)
+                        if not await self._wait_for_demand():
+                            break
+                        reconnect_attempt = 0
+                        continue
 
                     if not self._ever_connected:
                         self._set_state(MCPConnectionState.FAILED)
@@ -655,6 +848,7 @@ class MCPServerTask:
                 self._set_state(MCPConnectionState.FAILED)
             raise
         finally:
+            self._connect_deadline = None
             self.session = None
             if self.shutdown_event is not None and self.shutdown_event.is_set():
                 self._set_state(MCPConnectionState.STOPPED)
@@ -892,12 +1086,15 @@ class MCPServerTask:
         self._mark_connected(session)
 
         assert self.shutdown_event is not None
+        if self._activity_event is None:
+            self._activity_event = asyncio.Event()
         shutdown_wait = asyncio.create_task(self.shutdown_event.wait())
         connection_failed_wait = asyncio.create_task(self.connection_failed_event.wait())
         keepalive = asyncio.create_task(self._keepalive_loop())
+        recycle = asyncio.create_task(self._recycle_when_due())
         try:
             done, _ = await asyncio.wait(
-                {shutdown_wait, connection_failed_wait, keepalive},
+                {shutdown_wait, connection_failed_wait, keepalive, recycle},
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if shutdown_wait in done:
@@ -907,6 +1104,14 @@ class MCPServerTask:
                 if failure is not None:
                     raise failure
                 raise ConnectionError("MCP connection was reported unhealthy")
+            if recycle in done:
+                recycle.result()
+                self._planned_recycle = True
+                if self._connect_deadline is not None:
+                    self._connect_deadline.reschedule(
+                        asyncio.get_running_loop().time() + self._retry_policy.close_timeout,
+                    )
+                return
             # Keepalive is expected to live for the full connection lifetime.
             # Its clean exit is just as suspicious as an exception.
             failure = keepalive.exception()
@@ -922,6 +1127,7 @@ class MCPServerTask:
                 shutdown_wait,
                 connection_failed_wait,
                 keepalive,
+                recycle,
                 *list(self._pending_refreshes),
             ]
             for task in pending:
@@ -1104,8 +1310,26 @@ def _register_tools_for_server(
     tool_registry: Any,
 ) -> list[str]:
     """Register MCP tools into Flowly's registry. Returns registered names."""
+    with server_task._registry_lock:
+        return _register_tools_for_server_locked(server_task, server_cfg, tool_registry)
+
+
+def _register_tools_for_server_locked(
+    server_task: MCPServerTask, server_cfg: dict[str, Any], tool_registry: Any,
+) -> list[str]:
     from flowly.mcp.tool import MCPTool
 
+    try:
+        binding = server_task._registry_bindings.get(tool_registry)
+    except TypeError:
+        binding = None
+    if binding is not None:
+        # Repeated discovery against the same registry must not forget the
+        # names we own merely because _try_register sees existing entries.
+        server_task.bind_registry(tool_registry, server_cfg)
+        registered = _sync_registry_tools(server_task, tool_registry, server_cfg, binding[1])
+        server_task.set_registered_names(registered)
+        return registered
     server_task.bind_registry(tool_registry, server_cfg)
 
     registered: list[str] = []
@@ -1147,15 +1371,36 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
     and leaves unchanged tools in place (live tool-call IDs may point at
     existing handlers). Only touches tools this server owns.
     """
-    registry = server_task._registry
-    if registry is None:
-        return
+    with server_task._registry_lock:
+        _reregister_bound_tools(server_task)
 
-    old_names = set(server_task._registered_names)
+
+def _reregister_bound_tools(server_task: MCPServerTask) -> None:
+    bindings = [(reg, cfg, names) for reg, (cfg, names)
+                in list(server_task._registry_bindings.items())]
+    if server_task._registry is not None and not any(
+        reg is server_task._registry for reg, _, _ in bindings
+    ):
+        bindings.append((server_task._registry, server_task._server_cfg, server_task._registered_names))
+    for registry, cfg, names in bindings:
+        updated = _sync_registry_tools(server_task, registry, cfg, names)
+        try:
+            server_task._registry_bindings[registry] = (cfg, updated)
+        except TypeError:
+            pass
+        if registry is server_task._registry:
+            server_task._registered_names = updated
+
+
+def _sync_registry_tools(
+    server_task: MCPServerTask, registry: Any, server_cfg: dict[str, Any], names: list[str],
+) -> list[str]:
+    """Apply one authoritative catalog to one consumer's filters/ownership."""
+
+    old_names = set(names)
     # Recompute what *should* be registered from the fresh tool list.
     from flowly.mcp.tool import MCPTool
 
-    server_cfg = server_task._server_cfg
     desired: dict[str, Any] = {}
     for remote_tool in server_task.tools:
         remote_name = getattr(remote_tool, "name", "")
@@ -1174,7 +1419,7 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
         return tools.get(name) if isinstance(tools, dict) else None
 
     def _owned_by_server(tool: Any) -> bool:
-        return str(getattr(tool, "_server_name", "")) == server_task.name
+        return getattr(tool, "_server_task", None) is server_task
 
     desired_names = set(desired)
 
@@ -1188,6 +1433,8 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
 
     def _schema_fingerprint(tool: Any) -> str:
         try:
+            if isinstance(tool, MCPTool):
+                return tool.contract_fingerprint()
             schema = tool.to_schema()
             return json.dumps(
                 schema,
@@ -1234,8 +1481,6 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
         registry.register(desired[name])
         new_names.append(name)
 
-    server_task.set_registered_names(new_names)
-
     added = desired_names - old_names
     removed = old_names - desired_names
     if added or removed or changed:
@@ -1246,6 +1491,7 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
             sorted(removed) or "none",
             sorted(changed) or "none",
         )
+    return new_names
 
 
 def _coerce_servers_input(

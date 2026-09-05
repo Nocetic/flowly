@@ -22,12 +22,21 @@ class MCPConnectionState(str, Enum):
     IDLE = "idle"
     CONNECTING = "connecting"
     CONNECTED = "connected"
+    DRAINING = "draining"
     DEGRADED = "degraded"
     RECONNECTING = "reconnecting"
     PARKED = "parked"
     STOPPING = "stopping"
     STOPPED = "stopped"
     FAILED = "failed"
+
+
+class MCPUnavailableError(RuntimeError):
+    """A request cannot obtain a live connection; no operation was sent."""
+
+
+class MCPContractChangedError(RuntimeError):
+    """The advertised tool contract is no longer current; no operation was sent."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +58,10 @@ class MCPRetryPolicy:
     keepalive_interval: float = 180.0
     keepalive_timeout: float = 30.0
     stable_connection_seconds: float = 30.0
+    # Opt in per server: some servers keep non-reconstructable state in RAM.
+    idle_timeout: float = 0.0
+    max_lifetime: float = 0.0
+    close_timeout: float = 10.0
 
     def __post_init__(self) -> None:
         positive = {
@@ -57,6 +70,7 @@ class MCPRetryPolicy:
             "parked_probe_interval": self.parked_probe_interval,
             "keepalive_interval": self.keepalive_interval,
             "keepalive_timeout": self.keepalive_timeout,
+            "close_timeout": self.close_timeout,
         }
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0:
@@ -72,6 +86,12 @@ class MCPRetryPolicy:
             or self.stable_connection_seconds < 0
         ):
             raise ValueError("stable_connection_seconds must be a non-negative finite number")
+        for name in ("idle_timeout", "max_lifetime"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0 <= value <= 604_800:
+                raise ValueError(f"{name} must be finite and between 0 and 604800 seconds")
+        if self.close_timeout > 60:
+            raise ValueError("close_timeout must not exceed 60 seconds")
 
     @classmethod
     def from_server_config(cls, config: dict) -> "MCPRetryPolicy":

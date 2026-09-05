@@ -21,6 +21,9 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
   recovery, and distinguishes expired sessions from expired credentials.
 - [ ] Persistent tool manifests support lazy server startup and bounded idle/
   lifetime recycling, without stale schemas or duplicate subprocesses.
+  Runtime idle/lifetime recycling is implemented below; disk-backed manifests,
+  lazy application startup and simultaneous initial-discovery deduplication
+  remain required.
 - [x] Explicit exclusive tool requests resolve consistently in English/Turkish,
   cannot broaden structured grants, and are enforced during execution.
 - [ ] MCP log notifications and failure diagnostics remain bounded and redact
@@ -270,3 +273,44 @@ in 111.10 seconds, with 11 existing warnings (87 tests added). Targeted Ruff
 checks and `git diff --check` pass; the broader agent-loop module retains the
 same 20 pre-existing lint findings as the committed baseline. This change is
 committed only; there was no merge, push or running-gateway deployment.
+
+### Demand-driven runtime recycling (partial manifest/lifecycle acceptance)
+
+Per-server idle/lifetime timers now retire transports without interrupting
+admitted tool, resource or prompt requests. Lifetime expiry stops new admission
+and drains the old generation; idle closure retains its tool catalog in memory
+and waits for demand. Concurrent callers share one supervisor and one wake-up.
+Connection/admission and teardown have separate finite deadlines, cancellation
+is local to its caller, and shutdown is terminal. Keepalives do not count as
+user activity. Timers default to disabled: restarting an arbitrary server may
+lose that server's in-memory session state, which schema validation cannot restore.
+
+Newly negotiated tools are compared against the calling handler's complete
+contract, including the original input schema and permission metadata.
+Changed/removed/ambiguous tools and withdrawn resource/prompt capabilities are
+rejected before the remote operation. These local refusals do not trip the
+remote failure circuit breaker. Metadata-only refreshes advance registry
+generation, all bound registries receive fresh schemas under their own filters,
+and repeated discovery does not forget owned tool names.
+
+`tests/mcp/test_idle_lifecycle.py` exercises real public stdio in automatic,
+explicit modern and legacy modes, plus real modern/legacy Streamable HTTP and
+legacy SSE. It checks actual child PIDs are gone after idle teardown, concurrent
+cold calls use one new process, cancellation preserves an unrelated live call,
+old writes are never sent after a read-only annotation changes, unapproved
+writes cannot wake an idle process, resource reads survive both deadlines, and
+withdrawn resource capability refuses the call. Controlled lifecycle fixtures
+also test hanging connection/close handshakes, cancelled drain waiters,
+admission timeout without killing active work, weak consumer ownership, timer
+bounds and terminal shutdown. No paid provider or running user gateway is involved.
+
+Disk-backed manifests, lazy startup after restarting Flowly and concurrent
+initial discovery still remain required. The separate diagnostics and final
+acceptance items remain open. This is not evidence for those unchecked items.
+
+Verification: `uv run pytest tests/mcp/test_idle_lifecycle.py -q` — **48 passed**.
+Full regression `uv run pytest -q` — **5201 passed, 1 skipped, 12 deselected**
+in 126.42 seconds on macOS, with the same 11 existing warnings. Targeted Ruff
+checks and `git diff --check` pass; `client.py` retains its single pre-existing
+N818 finding, verified against the previous commit. No merge, push, provider
+change or running-gateway deployment was performed.
