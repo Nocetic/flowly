@@ -19,11 +19,8 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
   untrusted write tools cannot execute without approval.
 - [x] OAuth picks up cross-process token changes, coordinates concurrent 401
   recovery, and distinguishes expired sessions from expired credentials.
-- [ ] Persistent tool manifests support lazy server startup and bounded idle/
+- [x] Persistent tool manifests support lazy server startup and bounded idle/
   lifetime recycling, without stale schemas or duplicate subprocesses.
-  Runtime idle/lifetime recycling is implemented below; disk-backed manifests,
-  lazy application startup and simultaneous initial-discovery deduplication
-  remain required.
 - [x] Explicit exclusive tool requests resolve consistently in English/Turkish,
   cannot broaden structured grants, and are enforced during execution.
 - [ ] MCP log notifications and failure diagnostics remain bounded and redact
@@ -304,9 +301,10 @@ also test hanging connection/close handshakes, cancelled drain waiters,
 admission timeout without killing active work, weak consumer ownership, timer
 bounds and terminal shutdown. No paid provider or running user gateway is involved.
 
-Disk-backed manifests, lazy startup after restarting Flowly and concurrent
-initial discovery still remain required. The separate diagnostics and final
-acceptance items remain open. This is not evidence for those unchecked items.
+At this historical checkpoint, disk-backed manifests, lazy startup after
+restarting Flowly and concurrent initial discovery remained required. They are
+addressed by the next section. The separate diagnostics and final acceptance
+items remain open; this checkpoint does not prove those outcomes.
 
 Verification: `uv run pytest tests/mcp/test_idle_lifecycle.py -q` — **48 passed**.
 Full regression `uv run pytest -q` — **5201 passed, 1 skipped, 12 deselected**
@@ -314,3 +312,51 @@ in 126.42 seconds on macOS, with the same 11 existing warnings. Targeted Ruff
 checks and `git diff --check` pass; `client.py` retains its single pre-existing
 N818 finding, verified against the previous commit. No merge, push, provider
 change or running-gateway deployment was performed.
+
+### Persistent manifests and shared initial startup
+
+Opt-in `lifecycle.lazyStart` now persists complete discovery hints with a
+bounded `manifestTtl`. Valid hints register tools/capability utilities without
+a transport at application boot; actual operations acquire a fresh connection
+and run the contract checks above. Corrupt, expired, incomplete, oversized,
+unsafe or identity-mismatched hints fall back to normal discovery. Probes bypass
+cached readiness, and runtime health distinguishes manifest versus live catalogs.
+
+`tests/mcp/test_manifest.py` exercises private descriptor-relative storage,
+exact-name hashing, complete schema/annotation round trips, configuration,
+environment/profile/SDK and OAuth-credential binding, cache entry and byte quotas,
+atomic publication, rejection of symlinks/hardlinks/FIFOs/shared permissions,
+parent-directory replacement, process death during a write, abandoned temporary
+files and late publication by a separate process. No raw connection config or
+credentials are persisted. Unsupported secure-filesystem primitives fall back
+to live discovery; unknown packaged SDK identity prevents cross-process reuse.
+
+`tests/mcp/test_lazy_discovery.py` uses real public stdio in automatic, modern
+and legacy modes, including independent client processes and eight concurrent
+consumers. It verifies first-call schema/read-only changes refuse the operation,
+all consumers share initial startup and later idle wake-ups, cancelled startup
+waiters are isolated, the final cancelled waiter joins subprocess cleanup,
+changed configuration/profile cannot silently reuse a runtime, shutdown sees
+unregistered startups, and an observation timeout retains ownership of ongoing
+cleanup rather than allowing a replacement server to launch. The same combined
+warm-cache/startup/idle lifecycle runs through real transports.
+
+`tests/mcp/test_idle_lifecycle.py` additionally exercises lazy manifests over
+modern/legacy Streamable HTTP and legacy SSE. `tests/mcp/test_oauth_recovery.py`
+verifies cache reuse after real OAuth recovery and forced live discovery after
+a persisted grant changes. A sanitized remote-name collision retains the same
+first winner across refreshes; raw remote identity is part of the tool contract.
+
+These tests use isolated local state and local SDK/auth servers. They are not
+claims about every paid provider, compiled application or operating system.
+The diagnostics audit and final combined acceptance remain open; no merge or
+running-gateway deployment is part of this work.
+
+Final verification: `uv run pytest tests/mcp/test_manifest.py
+tests/mcp/test_lazy_discovery.py -q -W error::RuntimeWarning` — **69 passed**.
+Full regression `uv run pytest -q` — **5275 passed, 1 skipped, 12 deselected**
+in 150.85 seconds, with the same 11 existing warnings (74 tests added over
+the preceding commit, including HTTP/SSE/OAuth and remote-name checks).
+Targeted Ruff and `git diff --check` pass; the single pre-existing client N818
+finding is unchanged. These changes are committed only: main and the user's
+running gateway remain unchanged.

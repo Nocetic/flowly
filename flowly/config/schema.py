@@ -1134,6 +1134,8 @@ class MCPServerLifecycleConfig(BaseModel):
     idle_timeout: float = Field(default=0.0, ge=0, le=604_800)
     max_lifetime: float = Field(default=0.0, ge=0, le=604_800)
     close_timeout: float = Field(default=10.0, gt=0, le=60)
+    lazy_start: bool = False
+    manifest_ttl: float = Field(default=86400.0, gt=0, le=604_800)
 
     @model_validator(mode="after")
     def _validate_delay_bounds(self) -> "MCPServerLifecycleConfig":
@@ -1148,6 +1150,7 @@ class MCPServerLifecycleConfig(BaseModel):
             self.idle_timeout,
             self.max_lifetime,
             self.close_timeout,
+            self.manifest_ttl,
         )
         if not all(math.isfinite(value) for value in values):
             raise ValueError("MCP lifecycle values must be finite")

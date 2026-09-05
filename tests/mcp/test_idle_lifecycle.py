@@ -656,6 +656,27 @@ async def test_real_http_and_sse_idle_wake_and_drain_keep_calls_exactly_once(htt
         await asyncio.gather(first, return_exceptions=True)
 
 
+async def test_real_http_and_sse_can_load_manifest_without_connecting(http_server):
+    from flowly.agent.tools.registry import ToolRegistry
+
+    url, mode, events = http_server
+    cfg = {"url": url, "protocol": "auto" if mode == "sse" else mode,
+           "transport": "sse" if mode == "sse" else "http",
+           "timeout": 3, "connect_timeout": 3, "lifecycle": {"lazy_start": True}}
+    for source in ("live", "manifest"):
+        registry = ToolRegistry()
+        assert await asyncio.to_thread(client.discover_mcp_tools,
+            servers={"http-recycle": cfg}, tool_registry=registry) == ["mcp_http_recycle_work"]
+        health = client.get_mcp_server_health()["http-recycle"]
+        assert health["catalogSource"] == source
+        if source == "manifest":
+            assert not health["connected"]
+            result = json.loads(await registry.execute("mcp_http_recycle_work", {"label": "fresh", "delay": 0}))
+            assert "error" not in result
+            assert events == [("start", "fresh"), ("done", "fresh")]
+        await asyncio.to_thread(client.shutdown_mcp_servers)
+
+
 def _remote(**changes):
     values = {"name": "read", "description": "Read data", "inputSchema": {"type": "object"}}
     values.update(changes)

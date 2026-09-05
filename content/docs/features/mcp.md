@@ -142,9 +142,45 @@ Flowly cannot migrate that state by checking a tool schema.
   deliberately; untrusted writes still need approval before a sleeping server
   can be started. All bound agent registries receive the refreshed catalog.
 
-An idle runtime currently retains its catalog **in memory**. Initial discovery
-after restarting Flowly still connects to the server; disk-backed manifests and
-lazy startup across application restarts are not implemented by these timers.
+### Persistent discovery and lazy application startup
+
+Set `lifecycle.lazyStart` to `true` to retain discovered tool manifests across
+Flowly restarts. It defaults to `false`; the first discovery always connects.
+After a successful complete discovery, later boots can load the manifest and
+leave the transport idle until a tool/resource/prompt request needs it. This
+works independently of the idle/lifetime timers above, and can be combined with them.
+
+`lifecycle.manifestTtl` defaults to 86400 seconds (one day), with a positive
+maximum of 604800 seconds (seven days). It controls whether a saved catalog is
+usable at startup, not a guarantee that the remote catalog stayed unchanged.
+Cached schemas are discovery hints: the first call still negotiates a connection
+and revalidates the complete live contract before sending the operation.
+Explicit connection probes always connect. Inspect `catalogSource` in runtime
+health to distinguish `manifest` from `live` discovery; cached readiness does
+not mean the server is currently reachable.
+
+Manifests live in `$FLOWLY_HOME/cache/mcp-manifests/` with private directory/file
+permissions. Published manifests are capped at 128 entries / 16 MiB, each at 1 MiB
+and 10000 tools. Old entries and interrupted temporary writes are reclaimable
+discovery metadata, not conversation or server state. Identity includes exact
+server name, effective configuration/policy, resolved profile, SDK, interpreter,
+working directory and allowed subprocess environment. OAuth login, refresh or
+logout invalidates hints tied to the previous credential file. Connection
+configuration and OAuth tokens contribute only fingerprints, not their raw
+values. Remote tool schemas/metadata are retained, which is why the files are private.
+
+Corrupt, expired, oversized, unsafe or mismatched cache entries fall back to
+live discovery. Secure descriptor-relative caching is available on macOS/Linux;
+other platforms use live discovery. Packaged builds without SDK distribution
+metadata cannot reuse manifests across process restarts. These fallbacks do
+not disable MCP transports.
+
+Concurrent initial discoveries within one process share a single startup and
+retain each consumer registry. Cancelling the last waiter joins startup cleanup;
+cancelling just one waiter does not affect peers. A same-name server cannot be
+silently reused under different configuration or profile authority: reload
+configured servers after such a change. Separate Flowly processes share only
+disk hints, never stdin/stdout connections or execution permission.
 
 ## OAuth for remote servers
 
@@ -491,7 +527,9 @@ Common server settings (camelCase on disk; Flowly converts to snake internally â
       "lifecycle": {                     // opt-in for restart-safe servers
         "idleTimeout": 0,                // 0 disables idle closure
         "maxLifetime": 0,                // 0 disables lifetime draining
-        "closeTimeout": 10               // bounded recycle teardown
+        "closeTimeout": 10,              // bounded recycle teardown
+        "lazyStart": false,              // opt-in persistent discovery hints
+        "manifestTtl": 86400              // saved catalog acceptance window
       },
       "sampling": {                      // server-initiated LLM (off by default)
         "enabled": false,

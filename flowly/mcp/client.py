@@ -42,6 +42,7 @@ import threading
 import time
 import weakref
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -134,6 +135,18 @@ _loop_thread: threading.Thread | None = None
 _loop_lock = threading.Lock()
 _servers: dict[str, "MCPServerTask"] = {}
 _servers_lock = threading.RLock()
+_shutting_down = False
+
+
+@dataclass
+class _Startup:
+    server: Any
+    identity: str
+    task: asyncio.Task | None = None
+    waiters: int = 0
+
+
+_starting: dict[str, _Startup] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -232,22 +245,36 @@ def _ensure_loop() -> asyncio.AbstractEventLoop:
     with _loop_lock:
         if _loop is not None and _loop.is_running():
             return _loop
+        if _loop_thread is not None and _loop_thread.is_alive():
+            _loop_thread.join(timeout=5)
+            if _loop_thread.is_alive():
+                raise MCPUnavailableError("Previous MCP loop is still stopping")
 
         ready = threading.Event()
         loop_holder: dict[str, asyncio.AbstractEventLoop] = {}
 
         def _runner() -> None:
+            global _shutting_down
             loop = asyncio.new_event_loop()
             loop_holder["loop"] = loop
             asyncio.set_event_loop(loop)
-            ready.set()
+            loop.call_soon(ready.set)  # Signal only once run_forever is actually running.
             try:
                 loop.run_forever()
             finally:
                 try:
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.wait(pending, timeout=2))
+                    loop.run_until_complete(loop.shutdown_asyncgens())
                     loop.close()
                 except Exception:
                     pass
+                finally:
+                    with _servers_lock:
+                        _shutting_down = False
 
         thread = threading.Thread(target=_runner, name="flowly-mcp-loop", daemon=True)
         thread.start()
@@ -257,19 +284,25 @@ def _ensure_loop() -> asyncio.AbstractEventLoop:
         return _loop
 
 
-def _stop_loop() -> None:
+def _stop_loop(
+    *, expected_loop: asyncio.AbstractEventLoop | None = None, request_stop: bool = True,
+) -> None:
     """Stop the MCP background loop (best effort). Used by shutdown."""
     global _loop, _loop_thread
     with _loop_lock:
         loop = _loop
-        if loop is None:
+        if loop is None or (expected_loop is not None and loop is not expected_loop):
             return
-        try:
-            loop.call_soon_threadsafe(loop.stop)
-        except Exception:
-            pass
-        _loop = None
-        _loop_thread = None
+        if request_stop:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        if _loop_thread is not None and _loop_thread is not threading.current_thread():
+            _loop_thread.join(timeout=5)
+        if _loop_thread is None or not _loop_thread.is_alive():
+            _loop = None
+            _loop_thread = None
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +412,11 @@ class MCPServerTask:
         self._connect_deadline: asyncio.Timeout | None = None
         self._planned_recycle = False
         self._recycle_count = 0
+        self._profile_home: Any | None = None
+        self._config_identity = ""
+        self._manifest_store: Any | None = None
+        self._from_manifest = False
+        self._catalog_source = "none"
         self.state = MCPConnectionState.IDLE
 
     def is_http(self) -> bool:
@@ -457,6 +495,7 @@ class MCPServerTask:
             "recycleCount": self._recycle_count,
             "idleTimeout": self._retry_policy.idle_timeout,
             "maxLifetime": self._retry_policy.max_lifetime,
+            "catalogSource": self._catalog_source,
         }
 
     def report_transport_failure(
@@ -475,7 +514,9 @@ class MCPServerTask:
         if self.connection_failed_event is not None:
             self.connection_failed_event.set()
 
-    async def start(self, config: dict[str, Any]) -> None:
+    async def start(
+        self, config: dict[str, Any], *, use_manifest: bool = False, expected_identity: str | None = None,
+    ) -> None:
         """Spawn the run-task on the current loop and wait for readiness."""
         if self._task is not None:
             raise RuntimeError(f"MCP server '{self.name}' already started")
@@ -514,6 +555,28 @@ class MCPServerTask:
         self._state_event = asyncio.Event()
         self._wake_event = asyncio.Event()
         self.error = None
+        from flowly.mcp.manifest import ManifestStore, configuration_fingerprint
+        from flowly.profile import get_flowly_home
+
+        self._profile_home = get_flowly_home().expanduser().resolve()
+        self._config_identity = configuration_fingerprint(self.name, config, self._profile_home)
+        if expected_identity is not None and expected_identity != self._config_identity:
+            raise MCPUnavailableError("MCP configuration context changed before startup")
+        if use_manifest and self._retry_policy.lazy_start and not self.interactive:
+            self._manifest_store = ManifestStore(
+                self._profile_home, self.name, self._config_identity,
+                self._retry_policy.manifest_ttl, oauth=config.get("auth") == "oauth",
+            )
+            cached = await asyncio.to_thread(self._manifest_store.load)
+            if cached is not None:
+                self.tools = list(cached.tools)
+                self.capabilities = cached.capabilities
+                self._tool_pagination = MCPPageCollection(items=cached.tools, pages=0)
+                self._from_manifest = True
+                self._catalog_source = "manifest"
+                self.ready.set()
+                self._task = asyncio.create_task(self._run(), name=f"mcp-{self.name}")
+                return
         self._set_state(MCPConnectionState.CONNECTING)
 
         self._task = asyncio.create_task(self._run(), name=f"mcp-{self.name}")
@@ -732,6 +795,8 @@ class MCPServerTask:
     async def _run(self) -> None:
         reconnect_attempt = 0
         try:
+            if self._from_manifest and not await self._wait_for_demand():
+                return
             while self.shutdown_event is not None and not self.shutdown_event.is_set():
                 generation_before = self._connection_generation
                 if self._ever_connected:
@@ -741,6 +806,7 @@ class MCPServerTask:
 
                 try:
                     self._planned_recycle = False
+                    self._validate_runtime_identity()
                     # Keep the SDK's transport enter/exit in this same task.
                     # The handshake timer is disabled by _mark_connected;
                     # it also bounds reconnects after the boot waiter is gone.
@@ -792,7 +858,7 @@ class MCPServerTask:
                         reconnect_attempt = 0
                         continue
 
-                    if not self._ever_connected:
+                    if not self._ever_connected and not self._from_manifest:
                         self._set_state(MCPConnectionState.FAILED)
                         logger.warning(
                             "MCP server '%s' initial connection failed: %s",
@@ -859,6 +925,15 @@ class MCPServerTask:
             await self._run_http()
         else:
             await self._run_stdio()
+
+    def _validate_runtime_identity(self) -> None:
+        """Do not reconnect a retained server under a different profile/env."""
+        from flowly.mcp.manifest import configuration_fingerprint
+        from flowly.profile import get_flowly_home
+
+        home = get_flowly_home().expanduser().resolve()
+        if self._config_identity and configuration_fingerprint(self.name, self._config, home) != self._config_identity:
+            raise MCPUnavailableError("MCP configuration context changed; reload the configured servers")
 
     async def _wait_for_shutdown(self, delay: float) -> bool:
         """Sleep interruptibly. Return True when shutdown won the race."""
@@ -1155,8 +1230,16 @@ class MCPServerTask:
 
     async def _discover(self) -> None:
         assert self.session is not None
+        observed_at = time.time()
+        credentials = None
+        if self._manifest_store is not None:
+            try:
+                credentials = await asyncio.to_thread(self._manifest_store._credential_revision)
+            except (OSError, ValueError):
+                pass
         self._tool_pagination = await self._collect_tools()
         self.tools = list(self._tool_pagination.items)
+        self._catalog_source = "live"
         if self._tool_pagination.truncated:
             logger.warning(
                 "MCP server '%s': tool discovery truncated after %d pages/%d tools (%s)",
@@ -1165,6 +1248,14 @@ class MCPServerTask:
                 len(self.tools),
                 self._tool_pagination.reason,
             )
+        elif self._manifest_store is not None and credentials is not None:
+            try:
+                await asyncio.to_thread(
+                    self._manifest_store.save, self.tools, self.capabilities, observed_at,
+                    expected_credentials=credentials,
+                )
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
+                logger.debug("MCP manifest write skipped for '%s' (%s)", self.name, type(exc).__name__)
 
     async def _collect_tools(self) -> MCPPageCollection:
         """Collect the full bounded tool catalog from the active session."""
@@ -1227,8 +1318,7 @@ class MCPServerTask:
         try:
             async with self._refresh_lock:
                 async with self.rpc_lock:  # type: ignore[arg-type]
-                    self._tool_pagination = await self._collect_tools()
-                self.tools = list(self._tool_pagination.items)
+                    await self._discover()
                 if self._tool_pagination.truncated:
                     logger.warning(
                         "MCP server '%s': refreshed tool catalog truncated (%s)",
@@ -1407,7 +1497,7 @@ def _sync_registry_tools(
         if not remote_name or not _filter_remote_tool(server_cfg, remote_name):
             continue
         tool = MCPTool(server_task=server_task, remote_tool=remote_tool)
-        desired[tool.name] = tool
+        desired.setdefault(tool.name, tool)
     for util_tool in _utility_tools_for_server(server_task, server_cfg):
         desired[util_tool.name] = util_tool
 
@@ -1516,162 +1606,197 @@ def _coerce_servers_input(
     return out
 
 
-def discover_mcp_tools(
-    *,
-    servers: Any,
-    tool_registry: Any,
-    interactive: bool = False,
+async def _shared_server(
+    name: str, config: dict[str, Any], identity: str, registry: Any, interactive: bool,
 ) -> list[str]:
-    """Connect to all enabled MCP servers and register their tools.
+    """One initial startup per name/context; cancelled waiters don't own peers."""
+    reuse = None
+    with _servers_lock:
+        if _shutting_down:
+            raise MCPUnavailableError("MCP servers are shutting down")
+        existing = _servers.get(name)
+        startup = _starting.get(name)
+        existing_identity = startup.identity if startup is not None else (
+            existing._config_identity if existing is not None else None
+        )
+        if existing is not None and existing_identity != identity:
+            raise MCPUnavailableError(
+                f"MCP server '{name}' is already configured differently; "
+                "shut down/reload servers before changing its profile, credentials or policy"
+            )
+        if existing is not None and startup is None:
+            if existing._task is None or existing._task.done():
+                raise MCPUnavailableError(f"MCP server '{name}' stopped; reload configured servers")
+            reuse = existing
+        if startup is None and reuse is None:
+            server = MCPServerTask(name)
+            server.interactive = interactive
+            startup = _Startup(server, identity)
+            _starting[name] = startup
+            _servers[name] = server
 
-    Called once at agent boot. Per-server failures are isolated: a
-    broken stdio command for server A does not prevent server B from
-    registering. Returns the list of registered (prefixed) tool names.
+            async def initialize() -> MCPServerTask:
+                try:
+                    await server.start(config, use_manifest=not interactive, expected_identity=identity)
+                    return server
+                except BaseException:
+                    await server.shutdown()
+                    with _servers_lock:
+                        if _servers.get(name) is server:
+                            _servers.pop(name, None)
+                    raise
+                finally:
+                    with _servers_lock:
+                        if _starting.get(name) is startup:
+                            _starting.pop(name, None)
 
-    ``interactive`` is False at agent boot so OAuth servers only use
-    stored/refreshable tokens; the CLI passes True so the browser flow
-    can run.
+            startup.task = asyncio.create_task(initialize(), name=f"mcp-start-{name}")
+            startup.task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        if startup is not None:
+            startup.waiters += 1
 
-    No-op if the ``mcp`` SDK is not importable or no servers configured.
+    if reuse is not None:
+        if interactive and reuse.session is None:
+            # Explicit discovery must check a dormant runtime, not just return
+            # its old hints. Do not upgrade another owner's OAuth interactivity;
+            # the standalone login/probe owns interactive credential recovery.
+            async with reuse.connection_lease():
+                pass
+        return _register_tools_for_server(
+            server_task=reuse, server_cfg=config, tool_registry=registry,
+        )
+    assert startup is not None and startup.task is not None
+    try:
+        server = await asyncio.shield(startup.task)
+        with _servers_lock:
+            if _shutting_down or _servers.get(name) is not server:
+                raise MCPUnavailableError("MCP startup was superseded by shutdown")
+        return _register_tools_for_server(
+            server_task=server, server_cfg=config, tool_registry=registry,
+        )
+    finally:
+        startup.waiters -= 1
+        if not startup.waiters and not startup.task.done():
+            startup.task.cancel()
+            await asyncio.gather(startup.task, return_exceptions=True)
+            # A task cancelled before its first bytecode never enters its
+            # initialize/finally block. Retire that reservation explicitly.
+            await startup.server.shutdown()
+            with _servers_lock:
+                if _starting.get(name) is startup:
+                    _starting.pop(name, None)
+                if _servers.get(name) is startup.server:
+                    _servers.pop(name, None)
+
+
+def discover_mcp_tools(
+    *, servers: Any, tool_registry: Any, interactive: bool = False,
+) -> list[str]:
+    """Register enabled servers, sharing in-flight startup across callers.
+
+    A valid opt-in manifest can advertise cached schemas without launching a
+    transport. Actual calls always acquire a newly verified live connection.
+    Interactive discovery and the standalone probe never use cached readiness.
     """
     if not _MCP_AVAILABLE:
-        logger.debug("MCP SDK unavailable — skipping discovery")
         return []
-
     raw = _coerce_servers_input(servers)
     if not raw:
         return []
-
-    # Load $FLOWLY_HOME/.env so ${VAR} placeholders in config resolve.
     try:
         from flowly.mcp.env_loader import load_flowly_dotenv
 
         load_flowly_dotenv()
     except Exception as exc:
-        logger.debug("MCP .env loader skipped: %s", exc)
+        logger.debug("MCP .env loader skipped (%s)", type(exc).__name__)
 
-    enabled: dict[str, dict[str, Any]] = {}
-    already_connected: dict[str, dict[str, Any]] = {}
+    from flowly.mcp.manifest import configuration_fingerprint
+    from flowly.profile import get_flowly_home
+
+    home = get_flowly_home().expanduser().resolve()
+    enabled = {}
     for name, cfg in raw.items():
-        sanitized_name = sanitize_mcp_name_component(name)
-        if not cfg.get("enabled", True):
-            logger.info("MCP server '%s' disabled — skipping", name)
+        if not cfg.get("enabled", True) or not sanitize_mcp_name_component(name):
             continue
-        if not sanitized_name:
-            logger.warning("MCP server name %r sanitizes to empty; skipping", name)
-            continue
-        resolved = interpolate_env_vars(cfg)
-        with _servers_lock:
-            existing_server = _servers.get(name)
-        if existing_server is not None:
-            # A live server already exists in this process (e.g. a second
-            # AgentLoop with a fresh registry). Don't reconnect — just
-            # re-register its existing tools into the new registry so it
-            # isn't left without them.
-            already_connected[name] = resolved
-            continue
-        enabled[name] = resolved
-
-    registered: list[str] = []
-
-    # Re-register tools of already-connected servers into THIS registry.
-    for name, cfg in already_connected.items():
-        with _servers_lock:
-            server = _servers.get(name)
-        if server is None:
-            continue
-        registered.extend(
-            _register_tools_for_server(
-                server_task=server,
-                server_cfg=cfg,
-                tool_registry=tool_registry,
-            )
-        )
-
+        try:
+            resolved = interpolate_env_vars(cfg)
+            enabled[name] = (resolved, configuration_fingerprint(name, resolved, home))
+        except (ValueError, TypeError) as exc:
+            # Validation errors can contain raw input values: never log them.
+            logger.warning("MCP server '%s': invalid configuration (%s)", name, type(exc).__name__)
     if not enabled:
-        if registered:
-            logger.info(
-                "MCP: re-registered %d tool(s) from %d already-connected server(s)",
-                len(registered),
-                len(already_connected),
-            )
-        return registered
-
+        return []
+    with _servers_lock:
+        if _shutting_down:
+            logger.warning("MCP discovery deferred: servers are shutting down")
+            return []
     loop = _ensure_loop()
 
-    async def _connect_all() -> dict[str, MCPServerTask | BaseException]:
-        async def _connect_one(name: str, cfg: dict[str, Any]) -> MCPServerTask:
-            task = MCPServerTask(name)
-            task.interactive = interactive
-            await task.start(cfg)
-            return task
+    async def connect_all():
+        return await asyncio.gather(*[
+            _shared_server(name, cfg, identity, tool_registry, interactive)
+            for name, (cfg, identity) in enabled.items()
+        ], return_exceptions=True)
 
-        results: dict[str, MCPServerTask | BaseException] = {}
-        coros = {name: _connect_one(name, cfg) for name, cfg in enabled.items()}
-        gathered = await asyncio.gather(*coros.values(), return_exceptions=True)
-        for name, result in zip(coros.keys(), gathered):
-            results[name] = result
-        return results
-
-    future = asyncio.run_coroutine_threadsafe(_connect_all(), loop)
+    future = asyncio.run_coroutine_threadsafe(connect_all(), loop)
     try:
         results = future.result(timeout=180)
     except Exception as exc:
+        future.cancel()  # Last startup waiter owns cancellation and joined cleanup.
         logger.warning("MCP discovery aborted: %s", sanitize_error(str(exc)))
-        return registered
+        return []
 
-    for name, result in results.items():
+    registered = []
+    for name, result in zip(enabled, results):
         if isinstance(result, BaseException):
-            logger.warning(
-                "MCP server '%s' connect failed: %s",
-                name,
-                sanitize_error(str(result) or repr(result)),
-            )
-            continue
-        with _servers_lock:
-            _servers[name] = result
-        registered.extend(
-            _register_tools_for_server(
-                server_task=result,
-                server_cfg=enabled[name],
-                tool_registry=tool_registry,
-            )
-        )
-
-    if registered:
-        logger.info(
-            "MCP: registered %d tool(s) from %d server(s): %s",
-            len(registered),
-            sum(1 for r in results.values() if not isinstance(r, BaseException)),
-            ", ".join(registered),
-        )
+            logger.warning("MCP server '%s' discovery failed: %s", name, sanitize_error(str(result)))
+        else:
+            registered.extend(result)
     return registered
 
 
-# ---------------------------------------------------------------------------
-# Shutdown
-# ---------------------------------------------------------------------------
-
-
 def shutdown_mcp_servers(timeout: float = 10.0) -> None:
-    """Tear down all registered MCP servers. Best-effort."""
+    """Close registered and still-starting servers before retiring their loop.
+
+    A caller's observation timeout does not abandon asynchronous cleanup or
+    allow a replacement startup while that cleanup is still in progress.
+    """
+    global _shutting_down
     with _servers_lock:
+        loop = _loop
+        if loop is None or _shutting_down or not _servers:
+            return
+        _shutting_down = True
         servers = list(_servers.values())
-    if _loop is None or not servers:
-        return
+        startups = [item.task for item in _starting.values() if item.task is not None]
 
-    async def _shutdown_all() -> None:
-        await asyncio.gather(
-            *(srv.shutdown() for srv in servers),
-            return_exceptions=True,
-        )
+    async def shutdown_all():
+        try:
+            for task in startups:
+                task.cancel()
+            await asyncio.gather(*startups, return_exceptions=True)
+            await asyncio.gather(*(server.shutdown() for server in servers), return_exceptions=True)
+        finally:
+            with _servers_lock:
+                _servers.clear()
+                _starting.clear()
 
+    future = asyncio.run_coroutine_threadsafe(shutdown_all(), loop)
+
+    def retire_loop(_done):
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            pass
+
+    future.add_done_callback(retire_loop)
     try:
-        future = asyncio.run_coroutine_threadsafe(_shutdown_all(), _loop)
         future.result(timeout=timeout)
+    except TimeoutError:
+        logger.warning("MCP shutdown is still draining in the background")
+        return
     except Exception as exc:
-        logger.debug("MCP shutdown errors (ignored): %s", exc)
-
-    with _servers_lock:
-        _servers.clear()
-    _stop_loop()
+        logger.debug("MCP shutdown failed (%s)", type(exc).__name__)
+    # The completion callback already scheduled stop. A second stop can land
+    # during shutdown_asyncgens and interrupt resource finalization.
+    _stop_loop(expected_loop=loop, request_stop=False)

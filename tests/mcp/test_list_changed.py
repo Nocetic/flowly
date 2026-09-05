@@ -89,6 +89,25 @@ def test_unchanged_tool_kept_in_place():
     assert reg.tools["mcp_srv_alpha"] is original
 
 
+def test_sanitized_name_collision_keeps_first_remote_identity_consistently():
+    from flowly.mcp.tool import MCPTool
+
+    reg = _Registry()
+    task = _make_server_task(reg, [_remote("a-b", description="Same"), _remote("a_b", description="Same")], [])
+    first = MCPTool(server_task=task, remote_tool=task.tools[0])
+    second = MCPTool(server_task=task, remote_tool=task.tools[1])
+    assert first.to_schema() == second.to_schema()
+    assert first.contract_fingerprint() != second.contract_fingerprint()
+    client._register_tools_for_server(server_task=task, server_cfg={}, tool_registry=reg)
+    original = reg.tools["mcp_srv_a_b"]
+    client._reregister_server_tools(task)
+    assert reg.tools["mcp_srv_a_b"] is original
+    assert original._remote_name == "a-b"
+    task.tools = task.tools[1:]
+    client._reregister_server_tools(task)
+    assert reg.tools["mcp_srv_a_b"]._remote_name == "a_b"
+
+
 def test_same_name_schema_change_replaces_tool_and_advances_generation():
     from flowly.agent.tools.registry import ToolRegistry
 

@@ -62,6 +62,8 @@ class MCPRetryPolicy:
     idle_timeout: float = 0.0
     max_lifetime: float = 0.0
     close_timeout: float = 10.0
+    lazy_start: bool = False
+    manifest_ttl: float = 86400.0
 
     def __post_init__(self) -> None:
         positive = {
@@ -71,6 +73,7 @@ class MCPRetryPolicy:
             "keepalive_interval": self.keepalive_interval,
             "keepalive_timeout": self.keepalive_timeout,
             "close_timeout": self.close_timeout,
+            "manifest_ttl": self.manifest_ttl,
         }
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0:
@@ -92,6 +95,10 @@ class MCPRetryPolicy:
                 raise ValueError(f"{name} must be finite and between 0 and 604800 seconds")
         if self.close_timeout > 60:
             raise ValueError("close_timeout must not exceed 60 seconds")
+        if self.manifest_ttl > 604_800:
+            raise ValueError("manifest_ttl must not exceed seven days")
+        if type(self.lazy_start) is not bool:
+            raise ValueError("lazy_start must be a boolean")
 
     @classmethod
     def from_server_config(cls, config: dict) -> "MCPRetryPolicy":

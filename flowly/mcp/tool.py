@@ -221,6 +221,7 @@ class MCPTool(Tool):
     def contract_fingerprint(self) -> str:
         """Include execution/permission metadata, not just the model schema."""
         return json.dumps({
+            "remoteName": self._remote_name,
             "schema": self.to_schema(),
             "remoteInputSchema": self._raw_parameters,
             "title": self.title,

@@ -700,3 +700,32 @@ async def test_public_legacy_sse_authenticates_separate_post_endpoint(authority,
     result = json.loads(await registry.execute("mcp_remote_echo", {"message": "sse"}))
     assert result["structuredContent"] == {"echo": "sse"}
     assert authority["refreshes"] == 2
+
+
+async def test_manifest_is_bound_to_the_latest_persisted_oauth_grant(authority, authenticated_mcp):
+    from flowly.agent.tools.registry import ToolRegistry
+    from flowly.mcp import discover_mcp_tools, get_mcp_server_health, shutdown_mcp_servers
+
+    storage = await seed(authority)
+    cfg = {"url": authority["url"], "auth": "oauth", "timeout": 5, "connect_timeout": 5,
+           "lifecycle": {"lazy_start": True}}
+
+    async def discover(source):
+        registry = ToolRegistry()
+        assert await asyncio.to_thread(discover_mcp_tools,
+            servers={"remote": cfg}, tool_registry=registry) == ["mcp_remote_echo"]
+        assert get_mcp_server_health()["remote"]["catalogSource"] == source
+        return registry
+
+    await discover("live")
+    assert authority["refreshes"] == 1
+    await asyncio.to_thread(shutdown_mcp_servers)
+    await discover("manifest")
+    assert not get_mcp_server_health()["remote"]["connected"]
+    await asyncio.to_thread(shutdown_mcp_servers)
+    await storage.set_tokens(OAuthToken(
+        access_token=authority["access"], refresh_token=authority["refresh"], token_type="Bearer",
+    ))
+    registry = await discover("live")
+    result = json.loads(await registry.execute("mcp_remote_echo", {"message": "current-grant"}))
+    assert result["structuredContent"] == {"echo": "current-grant"}
