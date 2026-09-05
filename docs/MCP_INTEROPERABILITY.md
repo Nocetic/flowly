@@ -23,7 +23,7 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
   lifetime recycling, without stale schemas or duplicate subprocesses.
 - [x] Explicit exclusive tool requests resolve consistently in English/Turkish,
   cannot broaden structured grants, and are enforced during execution.
-- [ ] MCP log notifications and failure diagnostics remain bounded and redact
+- [x] MCP log notifications and failure diagnostics remain bounded and redact
   credentials; existing protocol/content/transport support remains intact.
 - [ ] Real transport tests exercise the public client/server paths, permission
   boundaries, concurrency and lifecycle failures. The full regression suite
@@ -412,3 +412,64 @@ Full regression `uv run pytest -q --tb=short` — **5349 passed, 1 skipped,
 12 deselected** in 145.23 seconds, with the same 11 existing warnings. Targeted
 Ruff checks and `git diff --check` pass. The sole client N818 finding is unchanged,
 verified against the preceding commit. Main remains at `34932e9`.
+
+### Private bounded log ingestion
+
+Protocol logging now has an explicit SDK callback and validated per-server
+`logging.enabled` / `logging.level` configuration (default enabled/info).
+Modern request metadata opts into notifications; typed modern notifications and
+older root wrappers coexist without spurious list-change handler failures.
+Legacy notifications retain local level filtering. A JSON-only modern HTTP
+response legitimately has no notification stream; this is tested separately
+from the streaming HTTP/SSE paths, without breaking normal tool results.
+
+`flowly/mcp/diagnostics.py` owns a 64-record queue and one writer per retained
+server, with a 100-record/10-second ingestion budget shared across reconnects.
+Only sanitized bounded records enter the queue. A private descriptor-relative
+writer uses cross-process nonblocking locking, 0600 regular singly-linked files,
+a 0700 log directory and three 1-MiB rotations. Unsafe/oversized preexisting
+files fail closed. An interrupted record tail is repaired within its bounded
+record window; complete prior records remain intact. Busy queues/disk failures
+increment health counters, and a final loss summary is emitted when possible.
+
+The SDK receives a real pipe descriptor, not a raw disk/terminal handle.
+`StderrCapture` frames fragmented and multiline input before redaction, limits
+lines/records to 64 KiB and keeps a separate bounded excerpt for each transport.
+Oversized/unresynchronizable records are discarded without publishing partial
+secret values. An inherited writer cannot hang teardown. Unsupported pipe
+capture uses the null device; inability to open even that aborts the spawn
+instead of leaking to stderr. The old shared raw stderr log is not reused or
+automatically deleted.
+
+A context-scoped standard logging record-factory hook also closes the SDK's own
+parse-error/HTTP traceback path. It preserves previously installed factories and
+unowned clients; only owned SDK/HTTP records are consumed. SDK debug/info body
+dumps are omitted, warnings/errors enter the bounded sink, and consumed records
+contain neither raw arguments nor traceback data. Ordinary handlers skip these
+already-routed records. Task/caller scopes restore correctly after use.
+
+`tests/mcp/test_diagnostic_log.py` verifies private permissions, unsafe file and
+directory rejection, bounded rotation, four independent writers, process death,
+incomplete-tail recovery, queue/rate limits, slow/failed disk writes, profile
+isolation, existing logging behavior, multiline credentials, oversized lines,
+null-device fallback and inherited-pipe shutdown. Real SDK peers in
+`tests/mcp/test_diagnostic_transport.py` exercise logs over automatic/legacy/
+explicit-modern stdio, streaming modern/legacy HTTP and legacy SSE; a child-only
+wire duplicate injects genuinely malformed stdout to verify SDK parse errors
+cannot bypass the sanitizer. Existing error/success content and list-change
+tests remain in the same targeted run.
+
+Targeted verification: `uv run pytest tests/mcp/test_diagnostic_log.py
+tests/mcp/test_diagnostic_transport.py tests/mcp/test_list_changed.py -q
+--tb=short` — **62 passed**, three existing dependency warnings. These tests
+run on macOS with isolated local SDK peers, not paid providers or the running
+gateway. Filesystem stalls can outlive the bounded writer join; the retained
+daemon owns the outstanding IO and health reports `draining`. This is not a
+claim of lossless logging, universal secret detection or Windows/compiled-build
+verification. The final combined acceptance audit remains open.
+
+Full regression `uv run pytest -q --tb=short` — **5393 passed, 1 skipped,
+12 deselected** in 154.66 seconds, with the same 11 existing warnings (44 added
+regressions). Targeted Ruff and `git diff --check` pass; the pre-existing client
+N818 finding is unchanged. Changes are committed only, with no merge, publishing,
+model/provider change or running-gateway deployment.

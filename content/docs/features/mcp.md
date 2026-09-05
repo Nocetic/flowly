@@ -182,6 +182,59 @@ silently reused under different configuration or profile authority: reload
 configured servers after such a change. Separate Flowly processes share only
 disk hints, never stdin/stdout connections or execution permission.
 
+## Private, bounded diagnostics
+
+MCP protocol log messages and subprocess stderr are recorded in
+`$FLOWLY_HOME/logs/mcp/diagnostics.jsonl`, after credential redaction. The private
+directory uses mode `0700`; log files use `0600`. One current file and two
+rotations are each limited to 1 MiB, shared safely by concurrent Flowly processes.
+The older `logs/mcp-stderr.log` is no longer read or appended; existing copies
+are not migrated or deleted automatically.
+
+Configure protocol notification selection per server:
+
+```json
+"logging": { "enabled": true, "level": "info" }
+```
+
+Levels are `debug`, `info` (default), `notice`, `warning`, `error`, `critical`,
+`alert`, and `emergency`. Modern requests opt into log delivery through SDK
+request metadata; legacy notifications are filtered locally too. A server that
+responds with JSON only, rather than an event stream, may not deliver log
+notifications; its ordinary MCP results still work. Disabling notifications
+does not disable secure stderr capture or local transport-error handling.
+
+- Each retained server shares a 100-record / 10-second budget across reconnects,
+  plus a 64-record writer queue. Serialized records are at most 20 KiB; message
+  text is capped at 4096 characters. Flooded or busy queues drop records before
+  expensive rendering rather than blocking MCP dispatch.
+- Stderr is piped through a separate bounded reader, never written raw to disk
+  or the terminal. Fragmented writes, multiline JSON/credential fields and PEM
+  keys are framed before redaction. Lines/records are limited to 64 KiB.
+  Oversized multiline records disable the remaining stderr capture until the
+  next connection because a secret's continuation cannot be safely guessed.
+- SDK/HTTP-library errors in Flowly-owned MCP contexts use the same sink.
+  Their raw tracebacks and debug/info request/response dumps do not reach other
+  log handlers. Unrelated HTTP/SDK clients keep their existing logging behavior.
+- Runtime health's `diagnostics` object exposes received, written, filtered,
+  dropped, pending and failed-disk-write counts. A shutdown drop summary is
+  written when possible. Stalled disk IO never blocks the MCP event loop;
+  writer shutdown waits at most one second and `draining` identifies remaining
+  background work. Per-transport stderr excerpts stay bounded and cannot mix
+  output from other server processes.
+- Symlinks, hardlinks, FIFOs, unsafe permissions and oversized existing files
+  are rejected, not adopted. Disk failures retain counters and bounded stderr
+  excerpts, without a raw fallback. Descriptor-relative private storage and
+  pipe capture are verified on macOS; secure storage is supported on POSIX
+  systems with the required primitives. Unsupported storage discards disk
+  records; unsupported pipe capture uses the null device. Neither fallback
+  disables otherwise available MCP transports.
+
+Redaction covers common credential labels/formats and this connection's supplied
+credentials, including escaped variants and known multiline fragments. It is
+defense in depth, not detection of every unknown or transformed secret. Successful
+tool payloads are not scrubbed as though they were logs.
+
 ## OAuth for remote servers
 
 HTTP servers with `auth: oauth` use OAuth 2.1 + PKCE. Tokens are stored per-server at `$FLOWLY_HOME/mcp-tokens/{server}.json` (mode 0600) and auto-refreshed.
@@ -524,6 +577,7 @@ Common server settings (camelCase on disk; Flowly converts to snake internally â
       "reapOrphans": false,              // force-kill orphaned stdio children (Linux)
       "supportsParallelToolCalls": false,
       "maxParallelToolCalls": 8,
+      "logging": { "enabled": true, "level": "info" },
       "lifecycle": {                     // opt-in for restart-safe servers
         "idleTimeout": 0,                // 0 disables idle closure
         "maxLifetime": 0,                // 0 disables lifetime draining
@@ -547,7 +601,7 @@ Common server settings (camelCase on disk; Flowly converts to snake internally â
 
 | Symptom | Check |
 |---|---|
-| Server won't connect | `flowly mcp test <name>`; read `$FLOWLY_HOME/logs/mcp-stderr.log` |
+| Server won't connect | `flowly mcp test <name>`; read `$FLOWLY_HOME/logs/mcp/diagnostics.jsonl` and inspect diagnostic drop/write-failure counters |
 | `npx`/`uvx` not found | Ensure Node / uv is on `PATH`, or set an absolute `command` + `env.PATH` |
 | Tools missing after add | Start a new session â€” MCP loads at agent boot (`flowly restart`) |
 | OAuth stuck | `flowly mcp login <name>` to re-authorize; for WorkOS-style servers use the `mcp-remote` bridge above |

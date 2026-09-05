@@ -64,10 +64,8 @@ from flowly.mcp.security import (
     scan_description,
 )
 from flowly.mcp.stderr_log import (
-    get_stderr_log,
-    read_stderr_excerpt,
+    StderrCapture,
     summarize_stderr_excerpt,
-    write_stderr_log_header,
 )
 from flowly.mcp.stdio_resolver import resolve_stdio_command
 
@@ -83,6 +81,8 @@ _MCP_HTTP_AVAILABLE = False
 _MCP_SSE_AVAILABLE = False
 _MCP_NOTIFICATIONS = False
 _MCP_MESSAGE_HANDLER = False
+_MCP_LOGGING = False
+_MCP_LOG_LEVEL = False
 _MCP_UNIFIED_CLIENT = False
 try:
     from mcp import Client, ClientSession, StdioServerParameters  # type: ignore
@@ -121,6 +121,8 @@ try:
         import inspect as _inspect
 
         _MCP_MESSAGE_HANDLER = "message_handler" in _inspect.signature(ClientSession).parameters
+        _MCP_LOGGING = "logging_callback" in _inspect.signature(ClientSession).parameters
+        _MCP_LOG_LEVEL = "log_level" in _inspect.signature(ClientSession).parameters
     except (TypeError, ValueError):
         _MCP_MESSAGE_HANDLER = False
 except ImportError:
@@ -419,6 +421,7 @@ class MCPServerTask:
         self._manifest_store: Any | None = None
         self._from_manifest = False
         self._catalog_source = "none"
+        self._diagnostics: Any | None = None
         self.state = MCPConnectionState.IDLE
 
     def is_http(self) -> bool:
@@ -498,6 +501,7 @@ class MCPServerTask:
             "idleTimeout": self._retry_policy.idle_timeout,
             "maxLifetime": self._retry_policy.max_lifetime,
             "catalogSource": self._catalog_source,
+            "diagnostics": self._diagnostics.snapshot() if self._diagnostics is not None else None,
         }
 
     def report_transport_failure(
@@ -920,13 +924,18 @@ class MCPServerTask:
             self.session = None
             if self.shutdown_event is not None and self.shutdown_event.is_set():
                 self._set_state(MCPConnectionState.STOPPED)
+            if self._diagnostics is not None:
+                await asyncio.to_thread(self._diagnostics.close)
 
     async def _run_transport(self) -> None:
         """Run one transport lifetime; split out for supervision and tests."""
-        if self.is_http():
-            await self._run_http()
-        else:
-            await self._run_stdio()
+        from flowly.mcp.diagnostics import sdk_log_scope
+
+        with sdk_log_scope(self._get_diagnostics()):
+            if self.is_http():
+                await self._run_http()
+            else:
+                await self._run_stdio()
 
     def _validate_runtime_identity(self) -> None:
         """Do not reconnect a retained server under a different profile/env."""
@@ -953,9 +962,29 @@ class MCPServerTask:
             self._interaction = MCPInteraction(self.name, self._config)
         return self._interaction
 
+    def _get_diagnostics(self) -> Any:
+        if self._diagnostics is None:
+            from flowly.mcp.diagnostics import MCPDiagnostics
+            from flowly.profile import get_flowly_home
+
+            self._diagnostics = MCPDiagnostics(self.name, self._config, self._profile_home or get_flowly_home())
+        return self._diagnostics
+
     def _session_kwargs(self) -> dict[str, Any]:
-        """Build ClientSession kwargs — list_changed handler + sampling."""
+        """Build callbacks without replacing existing interaction/sampling hooks."""
         kwargs: dict[str, Any] = {}
+        diagnostics = self._get_diagnostics()
+        if _MCP_LOGGING and diagnostics.enabled:
+            async def log_message(params: Any) -> None:
+                # No filesystem work on the SDK receiver loop. The sink owns
+                # rate limiting, bounded serialization and a fixed-size queue.
+                diagnostics.emit(params.level, params.logger, params.data)
+
+            kwargs["logging_callback"] = log_message
+            if _MCP_LOG_LEVEL:
+                # Modern logs are opt-in on each request's metadata. Legacy
+                # servers need no extra roundtrip; we filter locally as well.
+                kwargs["log_level"] = diagnostics.level
         interaction = self.get_interaction()
         if interaction.enabled:
             kwargs["elicitation_callback"] = interaction.elicit
@@ -1002,8 +1031,8 @@ class MCPServerTask:
             env=resolved_env if resolved_env else None,
         )
 
-        stderr_offset = write_stderr_log_header(self.name)
-        errlog = get_stderr_log()
+        capture = StderrCapture(self._get_diagnostics())
+        errlog = capture.file
 
         # Orphan reap (S7) is OPT-IN per server (reap_orphans). Default
         # off: the spawn-window child diff can, in rare races, attribute
@@ -1037,12 +1066,15 @@ class MCPServerTask:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            diagnostic = summarize_stderr_excerpt(read_stderr_excerpt(stderr_offset))
+            await asyncio.to_thread(capture.close)
+            diagnostic = summarize_stderr_excerpt(capture.excerpt())
             if diagnostic:
                 raise RuntimeError(
                     f"MCP server '{self.name}' stdio transport failed: {diagnostic}"
                 ) from exc
             raise
+        finally:
+            await asyncio.to_thread(capture.close)
 
     def _use_sse(self) -> bool:
         """Decide whether to use the SSE transport for this HTTP server."""
@@ -1296,7 +1328,7 @@ class MCPServerTask:
                     return
                 if not (_MCP_NOTIFICATIONS and isinstance(message, ServerNotification)):
                     return
-                if isinstance(message.root, ToolListChangedNotification):
+                if isinstance(getattr(message, "root", message), ToolListChangedNotification):
                     logger.info(
                         "MCP server '%s': tools/list_changed received",
                         self.name,

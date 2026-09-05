@@ -1159,6 +1159,12 @@ class MCPServerLifecycleConfig(BaseModel):
         return self
 
 
+class MCPServerLoggingConfig(BaseModel):
+    """Protocol log selection; secure stderr capture remains mandatory."""
+    enabled: bool = True
+    level: Literal["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"] = "info"
+
+
 class MCPServerConfig(BaseModel):
     """One MCP server entry under top-level ``mcpServers``.
 
@@ -1209,6 +1215,7 @@ class MCPServerConfig(BaseModel):
     lifecycle: MCPServerLifecycleConfig = Field(default_factory=MCPServerLifecycleConfig)
     pagination: MCPPaginationConfig = Field(default_factory=MCPPaginationConfig)
     content: MCPContentConfig = Field(default_factory=MCPContentConfig)
+    logging: MCPServerLoggingConfig = Field(default_factory=MCPServerLoggingConfig)
 
 
 class PetDisplayConfig(BaseModel):

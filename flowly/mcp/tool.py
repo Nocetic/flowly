@@ -94,8 +94,13 @@ async def _run_on_mcp_loop(
     async def invoke():
         nonlocal session
         async with AsyncExitStack() as stack:
+            from flowly.mcp.diagnostics import sdk_log_scope
+
             if callable(lease):
                 session = await stack.enter_async_context(lease())
+            diagnostics = getattr(server_task, "_diagnostics", None)
+            if diagnostics is not None:
+                stack.enter_context(sdk_log_scope(diagnostics))
             get_interaction = getattr(server_task, "get_interaction", None)
             if callable(get_interaction):
                 await stack.enter_async_context(get_interaction().invocation(session, origin))

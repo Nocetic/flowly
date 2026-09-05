@@ -130,21 +130,20 @@ def test_exception_groups_surface_leaf_errors():
 
 
 def test_manifest_stderr_gets_actionable_endpoint_error(tmp_path, monkeypatch):
-    log_path = tmp_path / "mcp-stderr.log"
-    log_handle = log_path.open("a", encoding="utf-8", buffering=1)
-    monkeypatch.setattr(stderr_log, "_log_fh", log_handle)
-    offset = stderr_log.write_stderr_log_header("test")
+    from flowly.mcp.diagnostics import MCPDiagnostics
+
+    diagnostics = MCPDiagnostics("test", {}, tmp_path)
+    capture = stderr_log.StderrCapture(diagnostics)
 
     stderr = """
     Connection error: ZodError: [
       {"message":"Invalid input","keys":["$schema","remotes","authentication"]}
     ]
     """
-    log_handle.write(stderr)
-    log_handle.flush()
-
-    excerpt = stderr_log.read_stderr_excerpt(offset)
+    capture.file.write(stderr.encode())
+    capture.close()
+    diagnostics.close()
+    excerpt = capture.excerpt()
     assert summarize_stderr_excerpt(excerpt) == (
         "the URL returned an MCP manifest instead of JSON-RPC; use the endpoint in remotes[].url"
     )
-    log_handle.close()

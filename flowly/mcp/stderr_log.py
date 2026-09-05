@@ -1,100 +1,196 @@
-"""Shared stderr log file for MCP stdio subprocesses.
+"""Per-transport stderr capture; no child ever receives a raw log-file handle.
 
-The MCP Python SDK's ``stdio_client(server, errlog=...)`` parameter
-defaults to ``sys.stderr``, which means anything the subprocess writes
-to its stderr stream (MCP startup banners, JSON debug logs from
-non-spec-compliant servers, npm warnings, etc.) lands directly on the
-parent terminal. Inside the Textual TUI, that corrupts the screen and
-can wedge the input loop.
-
-We redirect every stdio MCP server's stderr to a single shared file at
-``$FLOWLY_HOME/logs/mcp-stderr.log`` so the output is preserved for
-debugging without polluting the TUI. Each server-start writes a
-human-readable header line so operators can find a particular server's
-output.
-
-If opening the log file fails we fall back to ``/dev/null`` (and as a
-last resort to the real stderr — the TUI may corrupt but the agent
-won't crash).
+The SDK needs a real OS descriptor. A bounded pipe reader frames and redacts
+records before handing them to the diagnostic writer. Each capture retains its
+own bounded sanitized excerpt, so concurrent server output cannot be confused.
 """
 
 from __future__ import annotations
 
-import logging
+import json
 import os
-import sys
+import re
+import select
 import threading
-from datetime import datetime
+import time
+from collections import deque
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from flowly.mcp.security import _sensitive_key
+
+MAX_STDERR_RECORD_BYTES = 64 * 1024
+_PEM_START = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
+_PEM_END = re.compile(r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----")
+_PENDING_FIELD = re.compile(r"""([\w-]+)["']?\s*[:=]\s*$""")
 
 
-_log_fh: Any | None = None
-_log_lock = threading.Lock()
+class StderrCapture:
+    """One pipe and reader thread per stdio transport; fail closed on overflow."""
 
+    def __init__(self, diagnostics: Any):
+        self._diagnostics = diagnostics
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._recent: deque[str] = deque(maxlen=16)
+        self._recent_lock = threading.Lock()
+        self._line = bytearray()
+        self._oversized_line = False
+        self._record = ""
+        self._record_kind = ""
+        self._disabled = False
+        read = write = None
+        try:
+            if os.name != "posix":
+                raise OSError("Nonblocking pipe capture is unavailable")
+            read, write = os.pipe()
+            os.set_blocking(read, False)
+            self.file = os.fdopen(write, "wb", buffering=0)
+            write = None
+            self._read_fd = read
+            self._thread = threading.Thread(target=self._run, name="mcp-stderr-reader", daemon=True)
+            self._thread.start()
+        except (OSError, RuntimeError):
+            if read is not None:
+                os.close(read)
+            if write is not None:
+                os.close(write)
+            if hasattr(self, "file"):
+                self.file.close()
+            self._thread = None
+            # Never fall back to sys.stderr. If even devnull cannot open,
+            # abort the spawn instead of giving the child an unsafe descriptor.
+            self.file = open(os.devnull, "wb", buffering=0)
+            self._emit("Error: secure stderr capture unavailable; subprocess diagnostics discarded")
 
-def get_stderr_log() -> Any:
-    """Return a shared, line-buffered file handle for MCP subprocess stderr.
+    def _emit(self, data: Any):
+        text = self._diagnostics.emit("warning", "stderr", data, source="stderr")
+        if text is not None:
+            with self._recent_lock:
+                self._recent.append(text)
 
-    The handle is opened once per process and reused for every spawn.
-    The MCP SDK requires a real OS file descriptor (``.fileno()``); a
-    bare ``StringIO`` will not work.
-    """
-    global _log_fh
-    with _log_lock:
-        if _log_fh is not None:
-            return _log_fh
-        _log_fh = _open_log()
-        return _log_fh
+    def _flush_record(self):
+        if self._record:
+            self._emit(self._record)
+        self._record = self._record_kind = ""
 
+    def _on_line(self, line: str):
+        if self._disabled:
+            return
+        if self._record_kind:
+            self._record += line + "\n"
+            if len(self._record.encode("utf-8")) > MAX_STDERR_RECORD_BYTES:
+                # A malformed/oversized multiline secret cannot be safely
+                # resynchronized by assuming the next newline ends its value.
+                self._disabled = True
+                self._record = self._record_kind = ""
+                self._emit("Error: stderr multiline record exceeded the size limit; remaining stream discarded")
+                return
+            if self._record_kind == "pem":
+                if _PEM_END.search(line):
+                    self._flush_record()
+                return
+            if self._record_kind == "json":
+                try:
+                    json.loads(self._record)
+                except (ValueError, RecursionError):
+                    return
+            elif self._record_kind == "field":
+                value = self._record.split("\n", 1)[1].strip()
+                if value.startswith('"'):
+                    try:
+                        json.loads(value.rstrip(",;"))
+                    except (ValueError, RecursionError):
+                        return
+                elif value.startswith("'") and not re.fullmatch(r"'(?:[^'\\]|\\.)*'\s*[,;]?", value, flags=re.S):
+                    return
+            self._flush_record()
+            return
+        if _PEM_START.search(line):
+            self._record, self._record_kind = line + "\n", "pem"
+            if _PEM_END.search(line):
+                self._flush_record()
+            return
+        stripped = line.strip()
+        if stripped in {"{", "["} or re.match(r'^\{\s*"|^\[\s*["{]', stripped):
+            try:
+                json.loads(stripped)
+            except (ValueError, RecursionError):
+                self._record, self._record_kind = line + "\n", "json"
+                return
+        match = _PENDING_FIELD.search(line)
+        if match and _sensitive_key(match[1]):
+            self._record, self._record_kind = line + "\n", "field"
+            return
+        self._emit(line)
 
-def write_stderr_log_header(server_name: str) -> int | None:
-    """Emit a session marker before launching *server_name*.
+    def _feed(self, chunk: bytes):
+        if self._disabled:
+            return
+        parts = chunk.split(b"\n")
+        for index, part in enumerate(parts):
+            if not self._oversized_line:
+                if len(self._line) + len(part) > MAX_STDERR_RECORD_BYTES:
+                    self._line.clear()
+                    self._oversized_line = True
+                else:
+                    self._line.extend(part)
+            if index == len(parts) - 1:
+                break
+            if self._oversized_line:
+                if self._record_kind:
+                    self._disabled = True
+                    self._record = self._record_kind = ""
+                self._emit("Error: stderr line exceeded the size limit and was discarded")
+            else:
+                self._on_line(self._line.decode("utf-8", errors="replace"))
+            self._line.clear()
+            self._oversized_line = False
 
-    Lets operators grep the shared log for a particular server's output
-    range without needing per-line prefixes (which would force a pipe +
-    reader thread and complicate shutdown). Returns the byte offset immediately
-    after the marker so a failed startup can inspect only its bounded excerpt.
-    """
-    fh = get_stderr_log()
-    try:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        fh.write(f"\n===== [{ts}] starting MCP server '{server_name}' =====\n")
-        fh.flush()
-        return os.lseek(fh.fileno(), 0, os.SEEK_CUR)
-    except Exception:
-        # Worst-case: log header just doesn't appear. The subprocess
-        # output itself still flows.
-        return None
+    def _run(self):
+        deadline = None
+        clean_eof = False
+        try:
+            while True:
+                if self._stop.is_set():
+                    if deadline is None:
+                        deadline = time.monotonic() + 0.2
+                    if time.monotonic() >= deadline:
+                        break
+                readable, _, _ = select.select([self._read_fd], [], [], 0.02)
+                if not readable:
+                    continue
+                try:
+                    chunk = os.read(self._read_fd, 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    clean_eof = True
+                    break
+                self._feed(chunk)
+        except (OSError, ValueError):
+            self._emit("Error: stderr capture failed; remaining diagnostics discarded")
+        finally:
+            os.close(self._read_fd)
+            if clean_eof and not self._disabled:
+                if self._oversized_line:
+                    self._emit("Error: stderr line exceeded the size limit and was discarded")
+                elif self._line:
+                    self._on_line(self._line.decode("utf-8", errors="replace"))
+                self._flush_record()
+            elif self._line or self._record or self._oversized_line:
+                self._emit("Error: incomplete stderr tail discarded during bounded shutdown")
+            self._line.clear()
+            self._record = ""
 
+    def excerpt(self) -> str:
+        with self._recent_lock:
+            return "\n".join(self._recent)
 
-def read_stderr_excerpt(offset: int | None, max_bytes: int = 128 * 1024) -> str:
-    """Read a bounded stderr excerpt written after *offset*.
-
-    A separate read handle avoids disturbing the append descriptor shared with
-    subprocesses. Concurrent MCP servers may interleave output in the shared
-    log, so this is diagnostic-only and always size-bounded.
-    """
-    if offset is None:
-        return ""
-    fh = get_stderr_log()
-    try:
-        fh.flush()
-        path = getattr(fh, "name", "")
-        if not path or path == os.devnull:
-            return ""
-        size = os.path.getsize(path)
-        start = max(offset, size - max_bytes)
-        with open(path, "rb") as reader:
-            reader.seek(start)
-            text = reader.read(max_bytes).decode("utf-8", errors="replace")
-        # Never attribute another concurrently-started server's output to this
-        # one. Losing a diagnostic is safer than presenting the wrong cause.
-        next_header = text.find("\n===== [")
-        return text[:next_header] if next_header >= 0 else text
-    except (OSError, ValueError):
-        return ""
+    def close(self):
+        self.file.close()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
 
 
 def summarize_stderr_excerpt(text: str) -> str:
@@ -147,21 +243,3 @@ def summarize_stderr_excerpt(text: str) -> str:
     from flowly.mcp.security import sanitize_error
 
     return sanitize_error(candidates[-1])[:500]
-
-
-def _open_log() -> Any:
-    try:
-        from flowly.profile import get_flowly_home
-
-        log_dir = get_flowly_home() / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        path = log_dir / "mcp-stderr.log"
-        fh = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
-        fh.fileno()  # sanity check — must be a real fd
-        return fh
-    except Exception as exc:
-        logger.debug("MCP stderr log open failed, falling back to devnull: %s", exc)
-    try:
-        return open(os.devnull, "w", encoding="utf-8")
-    except Exception:
-        return sys.stderr

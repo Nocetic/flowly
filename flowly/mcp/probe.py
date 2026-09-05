@@ -113,7 +113,7 @@ def _probe_failure(name: str, cfg_dump: dict, exc: BaseException) -> tuple[bool,
 
     detail = exception_diagnostic(exc, secrets=diagnostic_secrets(cfg_dump))
     if cfg_dump.get("command"):
-        detail += " (server output: $FLOWLY_HOME/logs/mcp-stderr.log)"
+        detail += " (sanitized server diagnostics: $FLOWLY_HOME/logs/mcp/diagnostics.jsonl)"
     return False, [], f"connect failed: {detail}"
 
 

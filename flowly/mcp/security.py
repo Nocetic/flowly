@@ -96,6 +96,11 @@ def _secret_variants(secrets: Any) -> tuple[str, ...]:
         ))
         if value.lower().startswith(("bearer ", "basic ")):
             found.add(value.split(None, 1)[1])
+        lines = value.splitlines()
+        if len(lines) > 256:
+            raise ValueError("Too many diagnostic secret fragments")
+        if len(lines) > 1:
+            found.update(line for line in lines if line)
     # Replacing a prefix first must not leave the remainder of a longer key.
     return tuple(sorted(found, key=len, reverse=True))
 
