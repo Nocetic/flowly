@@ -57,6 +57,8 @@ from flowly.mcp.pagination import MCPPageCollection, collect_mcp_pages
 from flowly.mcp.schema import sanitize_mcp_name_component
 from flowly.mcp.security import (
     build_safe_env,
+    diagnostic_secrets,
+    exception_diagnostic,
     interpolate_env_vars,
     sanitize_error,
     scan_description,
@@ -331,7 +333,7 @@ def _validate_http_url(server_name: str, url: Any) -> str:
             f"MCP server '{server_name}': scheme must be http or https, got {parsed.scheme!r}"
         )
     if not parsed.hostname:
-        raise InvalidMCPUrlError(f"MCP server '{server_name}': missing host in {stripped!r}")
+        raise InvalidMCPUrlError(f"MCP server '{server_name}': missing host in URL")
     return stripped
 
 
@@ -845,7 +847,7 @@ class MCPServerTask:
                     self._connect_deadline = None
                     self.session = None
                     self.error = exc
-                    self._last_error = sanitize_error(str(exc) or repr(exc))
+                    self._last_error = exception_diagnostic(exc, secrets=diagnostic_secrets(self._config))
                     self._last_failure_at = time.time()
                     if self._planned_recycle:
                         # Transport context managers have unwound before we
@@ -969,7 +971,7 @@ class MCPServerTask:
                 if cb is not None:
                     kwargs["sampling_callback"] = cb
             except Exception as exc:  # pragma: no cover
-                logger.debug("MCP sampling callback unavailable: %s", exc)
+                logger.debug("MCP sampling callback unavailable: %s", exception_diagnostic(exc, secrets=diagnostic_secrets(self._config)))
         return kwargs
 
     async def _run_stdio(self) -> None:
@@ -1301,8 +1303,11 @@ class MCPServerTask:
                     )
                     self._schedule_refresh()
                     await asyncio.sleep(0)
-            except Exception:
-                logger.exception("MCP server '%s' message handler error", self.name)
+            except Exception as exc:
+                logger.error(
+                    "MCP server '%s' message handler error: %s", sanitize_error(self.name, limit=200),
+                    exception_diagnostic(exc, secrets=diagnostic_secrets(self._config)),
+                )
 
         return _handler
 
@@ -1330,8 +1335,11 @@ class MCPServerTask:
                 _reregister_server_tools(self)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("MCP server '%s' dynamic refresh failed", self.name)
+        except Exception as exc:
+            logger.error(
+                "MCP server '%s' dynamic refresh failed: %s", sanitize_error(self.name, limit=200),
+                exception_diagnostic(exc, secrets=diagnostic_secrets(self._config)),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1444,6 +1452,7 @@ def _register_tools_for_server_locked(
             server_task.name,
             remote_name,
             getattr(remote_tool, "description", "") or "",
+            secrets=diagnostic_secrets(getattr(server_task, "_config", None)),
         )
         _try_register(MCPTool(server_task=server_task, remote_tool=remote_tool))
 
@@ -1749,7 +1758,10 @@ def discover_mcp_tools(
     registered = []
     for name, result in zip(enabled, results):
         if isinstance(result, BaseException):
-            logger.warning("MCP server '%s' discovery failed: %s", name, sanitize_error(str(result)))
+            logger.warning(
+                "MCP server '%s' discovery failed: %s", sanitize_error(name, limit=200),
+                exception_diagnostic(result, secrets=diagnostic_secrets(enabled[name][0])),
+            )
         else:
             registered.extend(result)
     return registered

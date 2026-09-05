@@ -109,9 +109,9 @@ def _submit_probe(
 
 def _probe_failure(name: str, cfg_dump: dict, exc: BaseException) -> tuple[bool, list[str], str]:
     """Render a sanitized, actionable probe error."""
-    from flowly.mcp.security import sanitize_error
+    from flowly.mcp.security import diagnostic_secrets, exception_diagnostic
 
-    detail = sanitize_error(_exception_detail(exc))
+    detail = exception_diagnostic(exc, secrets=diagnostic_secrets(cfg_dump))
     if cfg_dump.get("command"):
         detail += " (server output: $FLOWLY_HOME/logs/mcp-stderr.log)"
     return False, [], f"connect failed: {detail}"
@@ -124,24 +124,9 @@ def _exception_detail(exc: BaseException) -> str:
     ``ExceptionGroup`` whose plain ``str()`` only says "1 sub-exception".
     Keep the group context while including bounded, de-duplicated leaf errors.
     """
-    parts: list[str] = []
+    from flowly.mcp.security import exception_diagnostic
 
-    def _walk(current: BaseException) -> None:
-        nested = getattr(current, "exceptions", None)
-        if isinstance(nested, tuple):
-            for child in nested:
-                if isinstance(child, BaseException):
-                    _walk(child)
-            return
-        message = str(current).strip()
-        rendered = message or type(current).__name__
-        if rendered not in parts:
-            parts.append(rendered)
-
-    _walk(exc)
-    if not parts:
-        return repr(exc)
-    return "; ".join(parts[:6])
+    return exception_diagnostic(exc)
 
 
 def _probe_timeout(name: str, timeout: float) -> tuple[bool, list[str], str]:

@@ -306,12 +306,17 @@ class VideoAnalyzeTool(Tool):
             )
 
         except Exception as e:  # noqa: BLE001
-            logger.opt(exception=True).error("[video_analyze] {}", e)
+            from flowly.mcp.security import sanitize_error
+
+            keys = (getattr(self.provider, "api_key", None),)
+            detail = sanitize_error(str(e), secrets=keys)
+            # A provider traceback can include its request headers or URL.
+            logger.error("[video_analyze] {}", detail)
             return json.dumps(
                 {
                     "success": False,
-                    "error": f"Error analyzing video: {e}",
-                    "analysis": _categorize_error(e),
+                    "error": f"Error analyzing video: {detail}",
+                    "analysis": sanitize_error(_categorize_error(e), secrets=keys),
                 },
                 ensure_ascii=False,
             )

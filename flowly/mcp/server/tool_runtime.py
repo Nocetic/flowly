@@ -302,10 +302,28 @@ class RuntimeToolBridge:
         return (workspace, (get_flowly_home() / "media").resolve())
 
     def _safe_file(self, value: str) -> Path:
-        path = Path(value.removeprefix("file://")).expanduser().resolve(strict=True)
+        try:
+            path = Path(value.removeprefix("file://")).expanduser().resolve(strict=True)
+        except (OSError, ValueError, RuntimeError):
+            # Neither a server traceback nor the supplied private path belongs
+            # in the public HTTP/MCP failure. Includes missing files, NUL bytes,
+            # unavailable home expansion and symlink loops on older Python.
+            raise ToolBridgeError("Media file does not exist or cannot be safely accessed") from None
         if not path.is_file() or not any(path.is_relative_to(root) for root in self._read_roots()):
             raise ToolBridgeError("Media path is outside this runtime's workspace and media directory")
         return path
+
+    @staticmethod
+    def _tool_secrets(tool: Any) -> tuple[str, ...]:
+        # Only fields on the already-selected tool/provider. Do not instantiate
+        # providers, call configuration getters, or scan unrelated accounts.
+        values = []
+        for source in (tool, getattr(tool, "provider", None), getattr(tool, "_elevenlabs", None)):
+            for key in ("api_key", "_api_key", "_auth_token"):
+                value = getattr(source, key, None)
+                if isinstance(value, str) and value:
+                    values.append(value)
+        return tuple(values)
 
     async def _execute(self, grant: _Grant, request_id: str, name: str, arguments: dict) -> dict:
         # A busy grant must not occupy global slots while waiting for its own.
@@ -348,6 +366,7 @@ class RuntimeToolBridge:
                 identity = f"mcp:{grant.audit_id}"
                 idempotency_key = hashlib.sha256(f"{grant.audit_id}:{request_id}".encode()).hexdigest()
                 bound.set_identity(identity, created_by=identity, request_id=idempotency_key)
+            error_secrets = self._tool_secrets(bound)
             try:
                 from flowly.agent.tool_context import tool_execution_scope
 
@@ -356,7 +375,10 @@ class RuntimeToolBridge:
                         name, arguments, session_key=grant.session_key, **self._route(grant.session_key),
                         _bound_tool=bound, _dispatch_guard=dispatch_guard,
                     ), timeout=600)
-                return await asyncio.to_thread(self._format_result, name, result, native_mcp=native_mcp)
+                return await asyncio.to_thread(
+                    self._format_result, name, result, native_mcp=native_mcp,
+                    error_secrets=error_secrets + self._tool_secrets(bound),
+                )
             except asyncio.CancelledError:
                 raise
             except ToolBridgeError as exc:
@@ -364,7 +386,9 @@ class RuntimeToolBridge:
             except Exception:
                 return _error(f"Tool '{name}' failed; check the live runtime diagnostics")
 
-    def _format_result(self, name: str, result: Any, *, native_mcp: bool = False) -> dict:
+    def _format_result(
+        self, name: str, result: Any, *, native_mcp: bool = False, error_secrets: tuple[str, ...] = (),
+    ) -> dict:
         text = result if isinstance(result, str) else _json(result)
         if len(text.encode()) > MAX_RESULT_BYTES:
             return _error("Tool result exceeds the bridge response size limit")
@@ -377,11 +401,33 @@ class RuntimeToolBridge:
                 return value
         content = []
         structured = None
+        try:
+            value = json.loads(text)
+            if isinstance(value, (dict, list)):
+                structured = value
+        except (ValueError, TypeError):
+            pass
+        is_error = text.lstrip().lower().startswith((
+            "error", "[blocked:", "image generation failed", "voice generation failed",
+            "image generation error", "voice generation error",
+        ))
+        if isinstance(structured, dict):
+            is_error |= bool(structured.get("error")) or structured.get("isError") is True or structured.get("ok") is False or structured.get("success") is False
+        if is_error:
+            from flowly.mcp.security import sanitize_error
+
+            # Detect errors before peeling the media envelope: a benign summary
+            # must not override failure flags or cause partial files to be read.
+            return _error(sanitize_error(text, secrets=error_secrets))
         if name in MEDIA_TOOLS:
             from flowly.agent.reply_media import extract_reply_media
 
-            paths, summary = extract_reply_media(text)
+            try:
+                paths, summary = extract_reply_media(text, require_existing=False, strict=True)
+            except ValueError:
+                raise ToolBridgeError("Invalid generated media result") from None
             if paths:
+                structured = None
                 if len(paths) > 8:
                     raise ToolBridgeError("Too many generated media attachments")
                 text = summary or "Generated media"
@@ -406,26 +452,7 @@ class RuntimeToolBridge:
                         "type": "image" if mime.startswith("image/") else "audio",
                         "mimeType": mime, "data": base64.b64encode(data).decode(),
                     })
-        if not content:
-            try:
-                value = json.loads(text)
-                if isinstance(value, (dict, list)):
-                    structured = value
-            except (ValueError, TypeError):
-                pass
-        is_error = text.lstrip().lower().startswith((
-            "error", "[blocked:", "image generation failed", "voice generation failed",
-            "image generation error", "voice generation error",
-        ))
-        if isinstance(structured, dict):
-            is_error |= bool(structured.get("error")) or structured.get("isError") is True or structured.get("ok") is False or structured.get("success") is False
-        if is_error:
-            from flowly.mcp.security import sanitize_error
-
-            # Only bounded sanitized text is returned on errors, without an
-            # additional raw structured payload or partial media attachments.
-            return _error(sanitize_error(text)[:4096])
-        output = {"content": [{"type": "text", "text": text}, *content], "isError": is_error}
+        output = {"content": [{"type": "text", "text": text}, *content], "isError": False}
         if structured is not None:
             output["structuredContent"] = structured
         if len(_json(output).encode()) > MAX_RESULT_BYTES:

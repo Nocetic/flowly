@@ -500,6 +500,140 @@ async def test_provider_errors_are_native_redacted_failures(runtime, prefix):
     assert "sk-test-private-key" not in json.dumps(result)
 
 
+@pytest.mark.parametrize("name", ["image_generate", "voice_generate", "video_analyze"])
+async def test_real_provider_failures_redact_the_selected_opaque_key(runtime, gateway, monkeypatch, name):
+    from flowly.agent.tools.image_generate import ImageGenerateTool
+    from flowly.agent.tools.video_analyze import VideoAnalyzeTool
+    from flowly.agent.tools.voice_generate import VoiceGenerateTool
+    from flowly.voice.settings import ElevenLabsSettings
+
+    secret = "opaque-provider-credential"
+    failure = RuntimeError("402 provider rejected " + secret)
+    if name == "image_generate":
+        monkeypatch.setattr("flowly.media.fal.generate_image", AsyncMock(side_effect=failure))
+        tool = ImageGenerateTool(api_key=secret, model="unchanged-image-model")
+        args = {"prompt": "A square"}
+    elif name == "voice_generate":
+        monkeypatch.setattr("flowly.voice.generate.generate_elevenlabs", AsyncMock(side_effect=failure))
+        tool = VoiceGenerateTool(elevenlabs=ElevenLabsSettings(True, secret, "voice", "model", ""))
+        args = {"prompt": "Hello"}
+    else:
+        tool = VideoAnalyzeTool(provider=SimpleNamespace(api_key=secret, chat=AsyncMock(side_effect=failure)))
+        source = runtime.workspace / "video.mp4"
+        source.write_bytes(b"video-fixture")
+        args = {"video_url": str(source), "question": "Describe"}
+    runtime.tools.register(tool)
+    async with ToolBridgeClient(gateway[0], grant(runtime, names=[name])) as client:
+        result = await client.call(name, args)
+    assert result["isError"]
+    assert "402" in json.dumps(result)
+    assert secret not in json.dumps(result)
+
+
+@pytest.mark.parametrize("kind", ["missing", "nul", "loop"])
+@pytest.mark.parametrize("name", ["image_analyze", "video_analyze"])
+async def test_invalid_media_paths_return_safe_http_errors(runtime, gateway, kind, name):
+    path = runtime.workspace / "private-path-must-not-leak.png"
+    if kind == "loop":
+        path.symlink_to(path)
+    value = str(path) + ("\0" if kind == "nul" else "")
+    key = "image_url" if name == "image_analyze" else "video_url"
+
+    class MediaTool(Tool):
+        description = "Media validation fixture"
+        parameters = {"type": "object", "properties": {key: {"type": "string"}}, "required": [key]}
+
+        @property
+        def name(self):
+            return name
+
+        async def execute(self, **kwargs):
+            pytest.fail("Invalid media must never reach the provider")
+
+    runtime.tools.register(MediaTool())
+    async with ToolBridgeClient(gateway[0], grant(runtime, names=[name])) as client:
+        with pytest.raises(ToolBridgeError, match="Media file does not exist or cannot be safely accessed") as error:
+            await client.call(name, {key: value})
+    assert "private-path" not in str(error.value)
+
+
+@pytest.mark.parametrize("protocol", ["auto", "legacy"])
+async def test_missing_media_through_public_stdio_preserves_mcp_error_contract(runtime, gateway, protocol):
+    from mcp.client import Client
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    from flowly.agent.tools.image_analyze import ImageAnalyzeTool
+
+    runtime.tools.register(ImageAnalyzeTool(
+        provider_getter=lambda: pytest.fail("Invalid media must never reach the provider"),
+        model_getter=lambda: "unchanged-model", workspace=runtime.workspace,
+    ))
+    token = grant(runtime, names=["image_analyze"])
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "flowly", "mcp", "tools"],
+        env={**os.environ, GRANT_ENV: json.dumps({"endpoint": gateway[0], "token": token}), "FLOWLY_QUIET": "1"},
+    )
+    async with Client(stdio_client(params), mode=protocol) as connected:
+        result = await connected.session.call_tool("image_analyze", {
+            "image_url": str(runtime.workspace / "private-path-must-not-leak.png"), "question": "Describe",
+        })
+        assert result.is_error
+        assert "Media file does not exist" in result.content[0].text
+        assert "private-path" not in result.content[0].text
+
+
+async def test_missing_generated_media_is_an_actionable_tool_error(runtime):
+    from flowly.agent.reply_media import media_envelope
+
+    class MissingMedia(Tool):
+        name = "image_generate"
+        description = "Missing provider artifact fixture"
+        parameters = {"type": "object", "properties": {}}
+
+        async def execute(self):
+            return media_envelope([str(runtime.workspace / "private-path.png")], "Generated")
+
+    runtime.tools.register(MissingMedia())
+    result = await runtime.bridge.call(grant(runtime, names=["image_generate"]), "missing", "image_generate", {})
+    assert result["isError"]
+    assert "Media file does not exist" in result["content"][0]["text"]
+    assert "private-path" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("paths", [[], [""], [None], "not-a-list"])
+async def test_malformed_generated_media_does_not_claim_success(runtime, paths):
+    class MalformedMedia(Tool):
+        name = "image_generate"
+        description = "Malformed provider artifact fixture"
+        parameters = {"type": "object", "properties": {}}
+
+        async def execute(self):
+            return json.dumps({"_reply_media": paths, "summary": "Success"})
+
+    runtime.tools.register(MalformedMedia())
+    result = await runtime.bridge.call(grant(runtime, names=["image_generate"]), "bad", "image_generate", {})
+    assert result["isError"]
+    assert "Invalid generated media result" in result["content"][0]["text"]
+
+
+@pytest.mark.parametrize("flag", [{"isError": True}, {"ok": False}, {"success": False}, {"error": "Provider failed"}])
+async def test_failed_generation_with_partial_media_never_becomes_a_success(runtime, monkeypatch, flag):
+    from flowly.agent.reply_media import media_envelope
+
+    output = runtime.workspace / "partial.png"
+    output.write_bytes(b"partial-private-content")
+    raw = {**json.loads(media_envelope([str(output)], "Generated successfully")), **flag, "api_key": "hidden-value"}
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Failure artifacts must never be read")
+
+    monkeypatch.setattr("flowly.agent.media_files.read_media_file", unexpected)
+    result = runtime.bridge._format_result("image_generate", json.dumps(raw))
+    assert result["isError"]
+    assert "hidden-value" not in json.dumps(result)
+    assert len(result["content"]) == 1
+
+
 async def test_oversized_result_fails_without_returning_partial_data(runtime, monkeypatch):
     import flowly.mcp.server.tool_runtime as module
 

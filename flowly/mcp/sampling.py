@@ -22,6 +22,8 @@ import logging
 import time
 from typing import Any
 
+from flowly.mcp.security import sanitize_error
+
 logger = logging.getLogger(__name__)
 
 
@@ -103,7 +105,8 @@ class SamplingHandler:
         return messages
 
     def _error(self, message: str) -> Any:
-        logger.warning("MCP sampling (%s): %s", self.server_name, message)
+        message = sanitize_error(message)
+        logger.warning("MCP sampling (%s): %s", sanitize_error(self.server_name, limit=200), message)
         if _SAMPLING_TYPES:
             return ErrorData(code=-1, message=message)
         raise RuntimeError(message)

@@ -46,26 +46,42 @@ def media_envelope(paths: list[str], summary: str, assets: list | None = None) -
     return json.dumps(payload)
 
 
-def extract_reply_media(raw_result: str) -> tuple[list[str], str | None]:
+def extract_reply_media(
+    raw_result: str, *, require_existing: bool = True, strict: bool = False,
+) -> tuple[list[str], str | None]:
     """Parse a tool result → ``(existing_file_paths, human_summary)``.
 
     Returns ``([], None)`` when ``raw_result`` is not a reply-media envelope, so
     the loop can skip non-media tools cheaply (a substring guard avoids parsing
     every tool result as JSON). Only paths that exist on disk are returned — a
     stale or fabricated path is dropped rather than handed to a channel.
+
+    Trust-boundary consumers can request ``require_existing=False, strict=True``
+    to inspect every declared path with their own secure file reader, rejecting
+    malformed envelopes and missing files instead of silently losing artifacts.
     """
     if not isinstance(raw_result, str) or _KEY not in raw_result:
         return [], None
     try:
         parsed = json.loads(raw_result)
     except (json.JSONDecodeError, TypeError, ValueError):
+        if strict:
+            raise ValueError("Invalid reply-media envelope") from None
         return [], None
     if not isinstance(parsed, dict):
+        if strict:
+            raise ValueError("Invalid reply-media envelope")
+        return [], None
+    if _KEY not in parsed:
         return [], None
     media = parsed.get(_KEY)
     if not isinstance(media, list) or not media:
+        if strict:
+            raise ValueError("Reply-media envelope requires a non-empty path list")
         return [], None
-    paths = [p for p in media if isinstance(p, str) and p and Path(p).is_file()]
+    if strict and any(not isinstance(path, str) or not path for path in media):
+        raise ValueError("Invalid reply-media path")
+    paths = [p for p in media if isinstance(p, str) and p and (not require_existing or Path(p).is_file())]
     summary = parsed.get("summary")
     return paths, (summary if isinstance(summary, str) else None)
 

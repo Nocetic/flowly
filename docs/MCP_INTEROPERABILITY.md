@@ -360,3 +360,55 @@ the preceding commit, including HTTP/SSE/OAuth and remote-name checks).
 Targeted Ruff and `git diff --check` pass; the single pre-existing client N818
 finding is unchanged. These changes are committed only: main and the user's
 running gateway remain unchanged.
+
+### Bounded failure diagnostics (partial logging acceptance)
+
+Diagnostic text now handles credential-labelled JSON (including escaped keys),
+nested/error-prefixed text, common token formats without leaking a long token's
+suffix, HTTP authentication/cookies, URL userinfo and encoded query labels, and
+complete/incomplete PEM private keys. Per-connection explicit environment/header
+values, credential switches and URL credentials supplement pattern matching;
+JSON/URL-escaped variants and authorization values without their scheme are
+covered. The implementation does not scan unrelated account environments or
+promise detection of arbitrary unknown, transformed or unlabeled secrets.
+
+`safe_diagnostic` bounds individual input strings at 64 Ki characters and normal
+output at 4096 characters. Oversized strings are omitted whole before redaction,
+not sliced into a potentially exposed credential prefix. Structured values have
+depth, traversal and collection limits; control characters are escaped so a
+remote error cannot insert terminal controls or forge log lines. ExceptionGroup
+inspection is iterative and bounded. Probe, discovery, dynamic-refresh and
+tool-call errors use the owning connection's configured secret values; those
+handlers no longer publish raw tracebacks. Sampling failure messages and selected
+video-provider diagnostics use the safe renderer too.
+
+Error tool results are handled before rich-content decoding: binary attachments,
+structured payloads and vendor metadata on errors are not cached or relayed raw.
+Successful content/metadata remain unchanged. `tests/mcp/test_diagnostic_transport.py`
+verifies both the internal and native bridge envelopes over real automatic,
+legacy and explicit-modern stdio, modern/legacy HTTP and legacy SSE SDK peers.
+`tests/mcp/test_diagnostic_security.py` adds credential-format, complexity,
+control-character, log-handler and scoped-configuration regression tests.
+
+The live bridge now returns actionable failures for absent files, NUL paths and
+symlink loops. It strictly checks every declared generated artifact instead of
+using the channel helper's silent missing-file filtering. Malformed/empty media
+envelopes fail; failure flags are evaluated before attachment extraction so a
+successful-looking summary cannot turn a partially failed generation into a
+success. `tests/mcp/test_live_tool_bridge.py` verifies these cases over real HTTP
+and public stdio, plus the actual image/voice/video tool implementations with
+only their paid-provider boundary replaced. Selected opaque provider keys are
+redacted without building a new provider or changing the model.
+
+Targeted verification: `uv run pytest tests/mcp/test_diagnostic_security.py
+tests/mcp/test_diagnostic_transport.py tests/mcp/test_live_tool_bridge.py -q
+--tb=short` — **121 passed**, three existing dependency warnings. This step adds
+74 regressions. The log acceptance checkbox deliberately remains open: protocol
+log notification handling and bounded/private subprocess stderr capture still
+need implementation and real-transport evidence. The final combined acceptance
+audit also remains pending. No merge or running-gateway deployment was performed.
+
+Full regression `uv run pytest -q --tb=short` — **5349 passed, 1 skipped,
+12 deselected** in 145.23 seconds, with the same 11 existing warnings. Targeted
+Ruff checks and `git diff --check` pass. The sole client N818 finding is unchanged,
+verified against the preceding commit. Main remains at `34932e9`.

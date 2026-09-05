@@ -42,15 +42,9 @@ from flowly.mcp.media_cache import DEFAULT_MAX_BINARY_BYTES
 from flowly.mcp.pagination import collect_mcp_pages
 from flowly.mcp.requests import call_with_input
 from flowly.mcp.schema import mcp_tool_name, normalize_mcp_input_schema
-from flowly.mcp.security import sanitize_error
+from flowly.mcp.security import diagnostic_secrets, exception_diagnostic, sanitize_error
 
 logger = logging.getLogger(__name__)
-
-
-def _exc_text(exc: BaseException) -> str:
-    """Return non-empty text for exceptions whose ``str`` is empty."""
-    text = str(exc).strip()
-    return text if text else repr(exc)
 
 
 def _error_envelope(message: str) -> str:
@@ -142,9 +136,10 @@ async def _run_on_mcp_loop(
                 session,
             )
         _bump_server_error(server_name)
-        logger.error("MCP tool %s call failed: %s", tool_name, sanitize_error(_exc_text(exc)))
+        detail = exception_diagnostic(exc, secrets=diagnostic_secrets(getattr(server_task, "_config", None)))
+        logger.error("MCP tool %s call failed: %s", sanitize_error(tool_name, limit=200), detail)
         return _error_envelope(
-            sanitize_error(f"MCP call failed: {type(exc).__name__}: {_exc_text(exc)}")
+            sanitize_error(f"MCP call failed: {type(exc).__name__}: {detail}")
         )
 
     # Success path: only OUR error envelope (exactly ``{"error": ...}``)
@@ -280,11 +275,35 @@ class MCPTool(Tool):
 
     def _format_result(self, result: Any) -> str:
         """Render an MCP ``CallToolResult`` into the agent's JSON envelope."""
+        is_error = bool(mcp_attr(result, "is_error", "isError", False))
+        if is_error:
+            # Inspect bounded text only, before the success renderer can decode
+            # or cache remote binary attachments. Rich/structured error payloads
+            # and metadata may contain credentials too; never relay them raw.
+            chunks = []
+            size = 0
+            for index, block in enumerate(getattr(result, "content", None) or []):
+                if index >= 64:
+                    chunks = ["MCP error content exceeds the diagnostic limit"]
+                    break
+                text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+                if isinstance(text, str):
+                    size += len(text)
+                    if size > 64 * 1024:
+                        chunks = ["MCP error content exceeds the diagnostic limit"]
+                        break
+                    chunks.append(text)
+            message = sanitize_error(
+                "\n".join(chunks) or "MCP tool returned an error",
+                secrets=diagnostic_secrets(getattr(self._server_task, "_config", None)),
+            )
+            if getattr(self, "_bridge_native_result", False):
+                return json.dumps({"content": [{"type": "text", "text": message}], "isError": True}, ensure_ascii=False)
+            return json.dumps({"error": message, "isError": True}, ensure_ascii=False)
         if getattr(self, "_bridge_native_result", False):
             # Only a context-bound runtime copy sets this flag. Returning the
             # wire JSON still lets ordinary registry hooks block/transform it.
             return json.dumps(mcp_wire_value(result), ensure_ascii=False)
-        is_error = bool(mcp_attr(result, "is_error", "isError", False))
         content_blocks = getattr(result, "content", None) or []
         rendered = render_content_blocks(
             content_blocks,
@@ -294,15 +313,6 @@ class MCPTool(Tool):
                 DEFAULT_MAX_BINARY_BYTES,
             ),
         )
-
-        if is_error:
-            envelope: dict[str, Any] = {
-                "error": sanitize_error(rendered.text or "MCP tool returned an error"),
-                "isError": True,
-            }
-            if rendered.rich:
-                envelope["content"] = list(rendered.blocks)
-            return json.dumps(envelope, ensure_ascii=False, default=str)
 
         structured = mcp_attr(result, "structured_content", "structuredContent")
         envelope = {"result": rendered.text or structured or ""}
