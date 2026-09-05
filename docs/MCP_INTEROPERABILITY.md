@@ -25,7 +25,7 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
   cannot broaden structured grants, and are enforced during execution.
 - [x] MCP log notifications and failure diagnostics remain bounded and redact
   credentials; existing protocol/content/transport support remains intact.
-- [ ] Real transport tests exercise the public client/server paths, permission
+- [x] Real transport tests exercise the public client/server paths, permission
   boundaries, concurrency and lifecycle failures. The full regression suite
   passes and each acceptance item links to its evidence.
 
@@ -38,9 +38,11 @@ speech and task-board interoperability remain in scope.
 
 ## Verification record
 
-The remaining unchecked outcomes are pending. The historical baseline is commit `3c58b18`; its suite
-reported 4897 passed, 1 skipped, 12 deselected. That result is not evidence for
-the outcomes still unchecked above.
+The sections below are chronological checkpoints: statements that an outcome
+was still open describe that checkpoint, not a later one. The historical
+baseline is commit `3c58b18`; its suite reported 4897 passed, 1 skipped,
+12 deselected. The final acceptance matrix and current regression result at
+the end of this document are the authoritative summary.
 
 ### Conversation history and events
 
@@ -543,3 +545,101 @@ regressions). Targeted Ruff checks and `git diff --check` pass. The broad
 registry and MCP client retain their same ten whitespace findings and one
 N818 finding, respectively, verified against the preceding commit. Main is
 still `34932e9`; no merge, push or running-gateway deployment was performed.
+
+### Independent installed-client acceptance
+
+`tests/mcp/test_external_client_acceptance.py` drives two independently
+implemented installed coding clients, not Flowly's own Python MCP client.
+The messages-API adapter was verified with client version **2.1.235**, and
+the generate-content adapter with **0.33.0**. Each client runs inside a fresh
+temporary configuration/project and directs its model requests to a local
+fixed-response API using a synthetic credential. Hooks, unrelated tools/extensions,
+account credentials and inherited provider/proxy settings are not loaded by
+the launch adapters. No installed client, user model, account or configuration
+is modified.
+
+Both adapters exercise four complete scenarios:
+
+- A read-only live grant exposes Board reading and no Board write tool.
+- A write grant creates exactly one card in the real owning Board store,
+  reads it back, and passes the actual card ID into the client's next model
+  request. The requested model remains unchanged on every API request.
+- The public authenticated Streamable HTTP server rejects unauthenticated
+  requests. The external client then reads a real conversation nonce using
+  the configured bearer token; the token never appears in model input/output.
+- Image and audio tools return real small PNG/WAV fixtures through the live
+  bridge. Both clients complete the tool sequence with correct MIME types,
+  successful results and usable binary content in their model input or a
+  materialized client artifact, not just a success caption. These are media
+  transport tests, not paid image/speech generation tests.
+
+The stdio grant travels only through the child environment. Tests scan model
+requests, output and all temporary client state files for its credential.
+HTTP's explicitly configured static bearer is a different credential class;
+any generated settings file is private (0600). Tests impose a 60-second client
+execution deadline and a bounded model request count. The public HTTP listener
+uses a bound ephemeral socket and is joined before fixture teardown.
+
+Portable, opt-in launch adapters are in `tests/mcp/external_clients/`. Supply
+the matching installed executable explicitly; without an adapter the four
+tests skip, so ordinary tests never auto-launch an account-backed CLI.
+
+```bash
+FLOWLY_MCP_EXTERNAL_CLIENT_SPEC=tests/mcp/external_clients/messages.json \
+FLOWLY_MCP_EXTERNAL_CLIENT_EXECUTABLE=/absolute/path/to/client \
+uv run pytest tests/mcp/test_external_client_acceptance.py -q --tb=short
+
+FLOWLY_MCP_EXTERNAL_CLIENT_SPEC=tests/mcp/external_clients/generate-content.json \
+FLOWLY_MCP_EXTERNAL_CLIENT_EXECUTABLE=/absolute/path/to/client \
+uv run pytest tests/mcp/test_external_client_acceptance.py -q --tb=short
+```
+
+This supplements the real installed managed app-server tests, the generic SDK
+tests and the real multi-transport scenarios. It does not certify untested
+client versions, Windows, a compiled Desktop distribution, every paid provider,
+or a hosted multi-tenant service. The tool bridge is not an operating-system
+sandbox; diagnostic logging is bounded and intentionally lossy under overload.
+Those limits must not be represented as universal interoperability or formal
+compliance certification. Merge, publishing and deployment remain excluded.
+
+### Acceptance evidence matrix
+
+| Required outcome | Authoritative implementation | Behavioral evidence |
+|---|---|---|
+| Durable conversation events and reconnect cursors | [Event journal](../flowly/mcp/server/events.py) | [Archive/process-restart/cancellation tests](../tests/mcp/test_conversation_events.py), [public HTTP wait](../tests/mcp/test_serve_http.py) |
+| Attachment metadata without arbitrary file access | [Public projection](../flowly/mcp/server/projection.py) | [Archive and media-only tests](../tests/mcp/test_conversation_events.py), [combined public CLI](../tests/mcp/test_interoperability_acceptance.py) |
+| Exact known channel targets | [Read plane](../flowly/mcp/server/readplane.py) | [Exact target/filter tests](../tests/mcp/test_conversation_events.py), [real dispatch round trip](../tests/mcp/test_interoperability_acceptance.py) |
+| Live, scoped web/media/Board tools for external agents | [Runtime bridge](../flowly/mcp/server/tool_runtime.py), [per-turn launcher](../flowly/mcp/server/managed_tools.py) | [Runtime/provider-boundary tests](../tests/mcp/test_live_tool_bridge.py), [managed client](../tests/mcp/test_managed_tools.py), [independent clients](../tests/mcp/test_external_client_acceptance.py) |
+| Owning-surface consent and input-required continuation | [Interaction](../flowly/mcp/interaction.py), [request continuation](../flowly/mcp/requests.py) | [Real forms/denial/timeouts](../tests/mcp/test_interaction.py), [combined approvals](../tests/mcp/test_interoperability_acceptance.py) |
+| Cross-process OAuth recovery without failed-write replay | [OAuth provider](../flowly/mcp/oauth_provider.py), [durable state](../flowly/mcp/oauth_state.py) | [Real authorization server/process/HTTP/SSE tests](../tests/mcp/test_oauth_recovery.py) |
+| Private manifests, shared lazy startup and idle/lifetime recycling | [Manifest](../flowly/mcp/manifest.py), [client lifecycle](../flowly/mcp/client.py) | [Private cache](../tests/mcp/test_manifest.py), [lazy startup](../tests/mcp/test_lazy_discovery.py), [real idle recycling](../tests/mcp/test_idle_lifecycle.py), [combined restart](../tests/mcp/test_interoperability_acceptance.py) |
+| EN/TR exclusive requests and turn-long tool ceilings | [Tool policy](../flowly/agent/tool_policy.py), [execution context](../flowly/agent/tool_context.py) | [Grammar, execution and delegated transport](../tests/test_exclusive_tool_policy.py), [structured precedence](../tests/test_no_tools_policy.py) |
+| Bounded redacted logs and protocol/content fidelity | [Diagnostics](../flowly/mcp/diagnostics.py), [stderr framing](../flowly/mcp/stderr_log.py), [content](../flowly/mcp/content.py) | [Private storage/flood/failure tests](../tests/mcp/test_diagnostic_log.py), [real transport errors/logs](../tests/mcp/test_diagnostic_transport.py), [content fidelity](../tests/mcp/test_content_fidelity.py) |
+| Combined real transport/client/server/authority acceptance | [Public server](../flowly/mcp/server/serve.py), [gateway authentication](../flowly/gateway/server.py) | [Combined process scenarios](../tests/mcp/test_interoperability_acceptance.py), [independent CLI implementations](../tests/mcp/test_external_client_acceptance.py), [control auth](../tests/mcp/test_writeplane.py) |
+
+### Final verification and delivery boundary
+
+The required backend implementation and interoperability outcomes above are
+complete on this development branch, with the limitations stated in this
+record. Historical open-item notes are superseded by the matrix and these
+final runs:
+
+- Full regression with the messages-API installed-client adapter explicitly
+  enabled: **5413 passed, 1 skipped, 12 deselected**, 11 existing warnings,
+  **179.69 seconds**. Command: `uv run pytest -q --tb=short` with the two
+  `FLOWLY_MCP_EXTERNAL_CLIENT_*` variables set as shown above.
+- The generate-content installed-client adapter: **4 passed**, three existing
+  dependency warnings, **10.69 seconds**, with `-W error::RuntimeWarning`.
+- Both installed clients pass the read-only, write/read, authenticated HTTP,
+  and image/audio scenarios: **8 independently executed client scenarios**.
+  The new four test cases require explicit opt-in and do not run by default.
+- Targeted Ruff checks and `git diff --check` pass. No production code changed
+  in this final verification step; the feature guide's remaining raw-stderr
+  references were corrected to the implemented private diagnostic path.
+
+The full suite still excludes 12 real-LLM tests by its existing default. These
+results establish local protocol/runtime behavior and the tested client
+implementations, not every provider's availability, every client release, all
+operating systems, or a compliance certification. They do not assert that
+the user's running gateway has this branch: main remains `34932e9` and is
+not merged, pushed, published or deployed by this task.

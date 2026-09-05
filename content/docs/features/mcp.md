@@ -35,7 +35,7 @@ flowly mcp add linear --url https://mcp.linear.app/mcp --auth oauth
 
 | Transport | Config | Notes |
 |---|---|---|
-| stdio | `command` + `args` (+ `env`) | Local subprocess. Default for local servers. stderr → `$FLOWLY_HOME/logs/mcp-stderr.log` |
+| stdio | `command` + `args` (+ `env`) | Local subprocess. Default for local servers. Sanitized, bounded diagnostics → `$FLOWLY_HOME/logs/mcp/diagnostics.jsonl` |
 | HTTP (StreamableHTTP) | `url` (+ `headers`) | First-class. Default for remote servers |
 | SSE | `url` + `transport: sse` | For older SSE-style servers |
 
@@ -523,7 +523,7 @@ MCP servers run third-party code, so Flowly applies several guards:
 - **Sandbox** — under `FLOWLY_SANDBOX=1` the whole agent (and its MCP subprocesses) runs inside `sandbox-exec` (macOS) / `bwrap` (Linux). See [Sandbox & approvals](../using-flowly/sandbox-and-approvals.md).
 - **Circuit breaker** — a server that fails repeatedly is short-circuited for a cooldown (you'll see "unreachable, auto-retry in Ns") so the model stops hammering it; it recovers automatically.
 
-Subprocess stderr is redirected to `$FLOWLY_HOME/logs/mcp-stderr.log` so a chatty server can't corrupt the TUI — check it first when debugging.
+Subprocess stderr is captured through a bounded pipe and sanitized before it reaches `$FLOWLY_HOME/logs/mcp/diagnostics.jsonl`. When debugging, also inspect the server's diagnostic drop and storage-error counters: unsafe files, full queues and unavailable storage can cause records to be discarded.
 
 ## MCP consent and user input
 

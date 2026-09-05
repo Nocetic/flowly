@@ -1,0 +1,43 @@
+{
+  "style": "messages",
+  "command": [
+    "$CLIENT",
+    "--bare",
+    "--print",
+    "Use the granted Flowly Board tools, then report completion.",
+    "--model",
+    "$MODEL",
+    "--system-prompt",
+    "Follow the local acceptance tool sequence.",
+    "--no-session-persistence",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "$MCP_CONFIG",
+    "--setting-sources",
+    "",
+    "--tools",
+    "",
+    "--permission-mode",
+    "dontAsk",
+    "--allowedTools",
+    "mcp__flowly__board_add,mcp__flowly__board_list,mcp__flowly__conversation_get,mcp__flowly__messages_read,mcp__flowly__image_generate,mcp__flowly__voice_generate",
+    "--output-format",
+    "json"
+  ],
+  "http_mcp_options": {
+    "type": "http",
+    "url": "$MCP_URL",
+    "headers": {
+      "Authorization": "Bearer $MCP_TOKEN"
+    }
+  },
+  "env": {
+    "ANTHROPIC_BASE_URL": "$API",
+    "ANTHROPIC_API_KEY": "fake-local-acceptance-key",
+    "CLAUDE_CONFIG_DIR": "$STATE",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_AUTOUPDATER": "1",
+    "ENABLE_TOOL_SEARCH": "false",
+    "MAX_THINKING_TOKENS": "0"
+  }
+}

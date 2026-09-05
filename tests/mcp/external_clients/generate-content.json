@@ -1,0 +1,63 @@
+{
+  "style": "generate_content",
+  "command": [
+    "$CLIENT",
+    "--prompt",
+    "Use the granted Flowly Board tools, then report completion.",
+    "--model",
+    "$MODEL",
+    "--output-format",
+    "json",
+    "--allowed-mcp-server-names",
+    "flowly"
+  ],
+  "env": {
+    "GEMINI_CLI_HOME": "$STATE",
+    "GEMINI_API_KEY": "fake-local-acceptance-key",
+    "GOOGLE_GEMINI_BASE_URL": "$API",
+    "GEMINI_CLI_TRUST_WORKSPACE": "true",
+    "GEMINI_TELEMETRY_ENABLED": "false",
+    "NO_BROWSER": "true",
+    "GEMINI_CLI_SYSTEM_SETTINGS_PATH": "$STATE/settings.json"
+  },
+  "http_mcp_options": {
+    "httpUrl": "$MCP_URL",
+    "headers": {
+      "Authorization": "Bearer $MCP_TOKEN"
+    },
+    "trust": true
+  },
+  "mcp_options": {
+    "trust": true
+  },
+  "files": {
+    "settings.json": {
+      "mcpServers": "$MCP_SERVERS",
+      "security": {
+        "auth": {
+          "selectedType": "gemini-api-key"
+        }
+      },
+      "tools": {
+        "core": []
+      },
+      "telemetry": {
+        "enabled": false
+      },
+      "privacy": {
+        "usageStatisticsEnabled": false
+      },
+      "general": {
+        "enableAutoUpdate": false,
+        "enableAutoUpdateNotification": false
+      },
+      "context": {
+        "fileName": []
+      },
+      "hooks": {},
+      "model": {
+        "name": "$MODEL"
+      }
+    }
+  }
+}
