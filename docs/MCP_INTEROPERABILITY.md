@@ -473,3 +473,73 @@ Full regression `uv run pytest -q --tb=short` — **5393 passed, 1 skipped,
 regressions). Targeted Ruff and `git diff --check` pass; the pre-existing client
 N818 finding is unchanged. Changes are committed only, with no merge, publishing,
 model/provider change or running-gateway deployment.
+
+### Combined runtime acceptance and two integration fixes
+
+`tests/mcp/test_interoperability_acceptance.py` runs a separate external MCP
+client process against the live-runtime bridge, which in turn uses Flowly's
+actual client and a separate third-party server process. The six combinations
+of automatic/legacy external clients and automatic/legacy/explicit-modern
+remote connections start from persisted manifests. Invalid arguments and
+ungranted writes do not spawn the remote server; concurrent valid calls share
+one process. Idle shutdown is verified using its actual PID. After reconnect,
+a read-only tool becoming a write and a newly discovered tool cannot acquire
+an already-issued read-only grant. Remote call receipts prove no rejected
+operation reached the server. Diagnostic files remain private and contain no
+fixture credential.
+
+The other combined scenarios use two independent owners to exercise denial,
+allow-once consent, forged owner arguments, withdrawal, cancellation and
+completion without replay. Legacy parallel peers explicitly disable form
+elicitation because they do not request forms; form-enabled legacy calls
+remain serialized for correct prompt ownership, covered by the interaction
+suite. Write approval remains active independently of that setting.
+
+The conversation scenarios run the public `flowly mcp serve` CLI in separate
+processes against a real isolated `GatewayServer` with distinct gateway and
+control tokens and loopback authentication enabled. They verify read-only
+defaults, exact channel targets, idempotent message dispatch, event-cursor
+continuity across MCP process restarts, attachment metadata without local
+paths, and resolution of a real pending approval. Only the final outbound
+channel callback is local: no real user message is sent.
+
+These combined paths reproduced two failures on the preceding implementation:
+
+- Terminal client shutdown left tools registered against stopped server
+  objects. Reusing the same runtime registry then treated rediscovery as name
+  collisions. Shutdown now retires every owned tool/resource/prompt binding;
+  idle recycling retains the catalog. Conditional removal is atomic in the
+  native registry and preserves a concurrent foreign replacement and its
+  routing/cache metadata. `tests/mcp/test_list_changed.py` also exercises
+  multi-consumer cleanup, repeated shutdown and the replacement race.
+- The gateway's outer authentication rejected the separate control token
+  before MCP message/approval handlers could validate it. Only exact
+  self-authenticating endpoints now bypass that outer check, replacing broad
+  prefix exemptions. Control routes require a loopback peer and their own
+  bearer token; a gateway token is not a control credential, and a control
+  token cannot mint a gateway WebSocket ticket. Unknown prefix-sharing paths
+  remain gated. `tests/mcp/test_writeplane.py` additionally rejects nonlocal,
+  unknown and malformed peer identities, forwarded-header spoofing and
+  non-ASCII invalid credentials.
+
+Targeted verification:
+
+- `uv run pytest tests/mcp/test_interoperability_acceptance.py
+  tests/mcp/test_list_changed.py tests/mcp/test_writeplane.py -q --tb=short
+  -W error::RuntimeWarning` — **33 passed**, one existing dependency warning.
+- Lifecycle/manifest regression with RuntimeWarnings treated as errors —
+  **82 passed**, three existing dependency warnings.
+- Existing write-plane, live tool bridge, authenticated profile runtime and
+  media-stream regression — **101 passed**, one existing dependency warning.
+
+These results strengthen combined acceptance; they do not add evidence for
+other installed client implementations, paid providers, compiled binaries or
+other operating systems. Final cross-client acceptance remains open. Main and
+the user's running gateway are unchanged; changes are committed only.
+
+Full regression `uv run pytest -q --tb=short` — **5409 passed, 1 skipped,
+12 deselected** in 175.43 seconds, with the same 11 existing warnings (16 new
+regressions). Targeted Ruff checks and `git diff --check` pass. The broad
+registry and MCP client retain their same ten whitespace findings and one
+N818 finding, respectively, verified against the preceding commit. Main is
+still `34932e9`; no merge, push or running-gateway deployment was performed.

@@ -240,6 +240,28 @@ def test_control_advertisement_rejects_non_loopback_host(isolated_home):
     assert writeplane._control_base() is None
 
 
+@pytest.mark.parametrize("remote,header", [
+    ("198.51.100.9", "Bearer " + "t" * 32),
+    (None, "Bearer " + "t" * 32),
+    ("not-an-address", "Bearer " + "t" * 32),
+    ("127.0.0.1", "Bearer geçersiz"),
+])
+async def test_control_auth_rejects_nonlocal_peers_and_malformed_credentials(remote, header):
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+
+    async def send(*args):
+        pytest.fail("An unauthorized caller must not send a message")
+
+    app = web.Application()
+    control.register_control_routes(app, token="t" * 32, on_send=send)
+    request = make_mocked_request("GET", "/control/approvals", headers={
+        "Authorization": header, "X-Forwarded-For": "127.0.0.1",
+    }, app=app).clone(remote=remote)
+    match = await app.router.resolve(request)
+    assert (await match.handler(request)).status == 401
+
+
 def test_register_write_tools_adds_three():
     try:
         from mcp.server.mcpserver import MCPServer

@@ -790,6 +790,7 @@ class MCPServerTask:
                     pass
                 self.session = None
                 self._set_state(MCPConnectionState.STOPPED)
+                _unregister_server_tools(self)
                 return
             try:
                 await asyncio.wait_for(self._task, timeout=10)
@@ -797,6 +798,7 @@ class MCPServerTask:
                 await self._cancel_run_task()
         self.session = None
         self._set_state(MCPConnectionState.STOPPED)
+        _unregister_server_tools(self)
 
     async def _run(self) -> None:
         reconnect_attempt = 0
@@ -1506,6 +1508,48 @@ def _reregister_server_tools(server_task: MCPServerTask) -> None:
         _reregister_bound_tools(server_task)
 
 
+def _registered_tool(registry: Any, name: str) -> Any | None:
+    getter = getattr(registry, "get", None)
+    if callable(getter):
+        return getter(name)
+    tools = getattr(registry, "tools", None)
+    return tools.get(name) if isinstance(tools, dict) else None
+
+
+def _unregister_owned_tool(registry: Any, name: str, server_task: MCPServerTask) -> None:
+    from flowly.agent.tools.registry import ToolRegistry
+
+    existing = _registered_tool(registry, name)
+    if getattr(existing, "_server_task", None) is not server_task:
+        return
+    if isinstance(registry, ToolRegistry):
+        # A plugin can replace the name between get() and unregister(). Do not
+        # delete that new owner's handler, routing metadata or schema caches.
+        registry.unregister(name, expected=existing)
+    elif callable(getattr(registry, "unregister", None)):
+        registry.unregister(name)
+    elif isinstance(getattr(registry, "tools", None), dict):
+        registry.tools.pop(name, None)
+
+
+def _unregister_server_tools(server_task: MCPServerTask) -> None:
+    """Retire owned catalogs on terminal shutdown, not on idle recycling."""
+    with server_task._registry_lock:
+        bindings = [(reg, names) for reg, (_, names)
+                    in list(server_task._registry_bindings.items())]
+        if server_task._registry is not None and not any(
+            reg is server_task._registry for reg, _ in bindings
+        ):
+            bindings.append((server_task._registry, server_task._registered_names))
+        for registry, names in bindings:
+            for name in names:
+                _unregister_owned_tool(registry, name, server_task)
+        server_task._registry_bindings.clear()
+        server_task._registry = None
+        server_task._server_cfg = {}
+        server_task._registered_names = []
+
+
 def _reregister_bound_tools(server_task: MCPServerTask) -> None:
     bindings = [(reg, cfg, names) for reg, (cfg, names)
                 in list(server_task._registry_bindings.items())]
@@ -1542,13 +1586,6 @@ def _sync_registry_tools(
     for util_tool in _utility_tools_for_server(server_task, server_cfg):
         desired[util_tool.name] = util_tool
 
-    def _registered(name: str) -> Any | None:
-        getter = getattr(registry, "get", None)
-        if callable(getter):
-            return getter(name)
-        tools = getattr(registry, "tools", None)
-        return tools.get(name) if isinstance(tools, dict) else None
-
     def _owned_by_server(tool: Any) -> bool:
         return getattr(tool, "_server_task", None) is server_task
 
@@ -1558,9 +1595,7 @@ def _sync_registry_tools(
     # plugin may have replaced a formerly-owned name after registration; an
     # MCP refresh must never delete that newer foreign entry.
     for stale in old_names - desired_names:
-        existing = _registered(stale)
-        if existing is not None and _owned_by_server(existing):
-            registry.unregister(stale)
+        _unregister_owned_tool(registry, stale, server_task)
 
     def _schema_fingerprint(tool: Any) -> str:
         try:
@@ -1585,7 +1620,7 @@ def _sync_registry_tools(
     changed: set[str] = set()
     for name in desired_names:
         if name in old_names:
-            existing = _registered(name)
+            existing = _registered_tool(registry, name)
             if existing is None:
                 registry.register(desired[name])
                 changed.add(name)

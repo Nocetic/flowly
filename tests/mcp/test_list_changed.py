@@ -162,3 +162,64 @@ def test_refresh_never_overwrites_or_removes_a_foreign_replacement():
     task.tools = []
     client._reregister_server_tools(task)
     assert reg.tools[name] is foreign
+
+
+async def test_terminal_shutdown_retires_every_owned_catalog_but_keeps_replacements():
+    from flowly.agent.tools.registry import ToolRegistry
+    from flowly.mcp.tool import MCPTool
+
+    native, custom = ToolRegistry(), _Registry()
+    task = client.MCPServerTask("srv")
+    task.tools = [_remote("alpha"), _remote("beta")]
+    config = {"tools": {"resources": True, "prompts": True}}
+    for registry in (native, custom):
+        names = client._register_tools_for_server(server_task=task, server_cfg=config, tool_registry=registry)
+        assert len(names) == 6
+    foreign = MCPTool(server_task=client.MCPServerTask("srv"), remote_tool=_remote("alpha"))
+    native.register(foreign)
+    before = native.generation
+    await task.shutdown()
+    assert native.tool_names == [foreign.name]
+    assert native.get(foreign.name) is foreign
+    assert native.generation == before + 5
+    assert custom.tools == {}
+    assert not task._registry_bindings
+    assert task._registry is None
+    await task.shutdown()
+    assert native.generation == before + 5
+
+
+def test_concurrent_replacement_is_not_removed_by_stale_owner_cleanup(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from flowly.agent.tools.registry import ToolRegistry
+    from flowly.mcp.tool import MCPTool
+
+    registry = ToolRegistry()
+    task = client.MCPServerTask("srv")
+    old = MCPTool(server_task=task, remote_tool=_remote("alpha"))
+    foreign = MCPTool(server_task=client.MCPServerTask("srv"), remote_tool=_remote("alpha", description="New owner"))
+    registry.register(old)
+    observed, replaced = threading.Event(), threading.Event()
+    getter = registry.get
+
+    def paused_get(name):
+        value = getter(name)
+        observed.set()
+        assert replaced.wait(5)
+        return value
+
+    monkeypatch.setattr(registry, "get", paused_get)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(client._unregister_owned_tool, registry, old.name, task)
+        try:
+            assert observed.wait(5)
+            registry.register(foreign)
+            generation = registry.generation
+        finally:
+            replaced.set()
+        pending.result(timeout=5)
+    assert getter(foreign.name) is foreign
+    assert registry.generation == generation
+    assert registry.get_toolsets()[foreign.name] == foreign.toolset

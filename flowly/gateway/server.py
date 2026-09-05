@@ -785,15 +785,20 @@ class GatewayServer:
     # element, which cannot set a header. ``/api/media/tickets`` — where that
     # ticket is minted — is NOT listed and stays behind the static token.
     _AUTH_PUBLIC_PATHS = frozenset({"/health"})
-    _AUTH_SELF_GATED_PREFIXES = ("/ws", "/api/mcp", "/api/media/stream")
+    # These exact handlers authenticate their own scoped credentials. Prefix
+    # exemptions would also expose unrelated future routes under those paths.
+    _AUTH_SELF_GATED_PATHS = frozenset({
+        "/ws", "/api/media/stream",
+        "/api/mcp/tools/grants", "/api/mcp/tools/grant", "/api/mcp/tools/list",
+        "/api/mcp/tools/call", "/api/mcp/tools/cancel",
+        "/control/messages/send", "/control/approvals", "/control/approvals/resolve",
+    })
 
     def _make_auth_middleware(self):
         @web.middleware
         async def _auth_middleware(request: web.Request, handler):
             path = request.path
-            if path in self._AUTH_PUBLIC_PATHS or any(
-                path.startswith(p) for p in self._AUTH_SELF_GATED_PREFIXES
-            ):
+            if path in self._AUTH_PUBLIC_PATHS or path in self._AUTH_SELF_GATED_PATHS:
                 return await handler(request)
             if not token_matches(extract_request_token(request), self._auth_token):
                 return web.json_response(

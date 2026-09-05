@@ -340,9 +340,11 @@ class ToolRegistry:
         self.invalidate_availability(tool.name)
         self._notify_change(generation)
     
-    def unregister(self, name: str) -> None:
-        """Unregister a tool by name."""
+    def unregister(self, name: str, *, expected: Tool | None = None) -> None:
+        """Unregister by name, optionally only if this exact handler still owns it."""
         with self._lock:
+            if expected is not None and self._tools.get(name) is not expected:
+                return
             existed = name in self._tools or name in self._registrations
             self._tools.pop(name, None)
             self._registrations.pop(name, None)

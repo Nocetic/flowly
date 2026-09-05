@@ -23,6 +23,7 @@ when the write plane is disabled.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -129,10 +130,15 @@ def register_control_routes(
     send_receipts_lock = asyncio.Lock()
 
     def _authorized(request: Any) -> bool:
+        try:
+            if not ipaddress.ip_address(request.remote or "").is_loopback:
+                return False
+        except ValueError:
+            return False
         header = request.headers.get("Authorization", "")
         expected = f"Bearer {token}"
         # Constant-time compare to avoid token-timing leaks.
-        return secrets.compare_digest(header, expected)
+        return secrets.compare_digest(header.encode("utf-8"), expected.encode("utf-8"))
 
     async def _messages_send(request):
         if not _authorized(request):
