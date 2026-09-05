@@ -125,6 +125,22 @@ def maybe_reexec_sandboxed() -> None:
     # §2.2 documents Windows native sandboxing as roadmap).
 
 
+def _python_command() -> list[str]:
+    """Preserve module execution, which has a different import path than a script.
+
+    Re-executing ``python -m flowly`` as ``python flowly/__main__.py`` adds
+    the package directory to sys.path and shadows third-party packages such
+    as the MCP SDK with Flowly's internal modules of the same name.
+    """
+    specification = getattr(sys.modules.get("__main__"), "__spec__", None)
+    original = getattr(sys, "orig_argv", [])
+    if str(getattr(specification, "name", "")).startswith("flowly.") and "-m" in original:
+        module_index = original.index("-m")
+        if module_index + 1 < len(original):
+            return [sys.executable, *original[1:module_index + 2], *sys.argv[1:]]
+    return [sys.executable, *sys.argv]
+
+
 def _reexec_macos(env: "os._Environ[str]") -> None:
     """macOS re-exec under sandbox-exec(1) with a generated SBPL profile."""
     if not Path(_SANDBOX_EXEC).exists():
@@ -138,7 +154,7 @@ def _reexec_macos(env: "os._Environ[str]") -> None:
 
     new_env = dict(env)
     new_env[_RECURSION_MARKER] = "1"
-    argv = [_SANDBOX_EXEC, "-f", profile_path, sys.executable, *sys.argv]
+    argv = [_SANDBOX_EXEC, "-f", profile_path, *_python_command()]
 
     try:
         os.execve(_SANDBOX_EXEC, argv, new_env)
@@ -173,7 +189,7 @@ def _reexec_linux(env: "os._Environ[str]") -> None:
 
     new_env = dict(env)
     new_env[_RECURSION_MARKER] = "1"
-    argv = [bwrap, *bwrap_args, "--", sys.executable, *sys.argv]
+    argv = [bwrap, *bwrap_args, "--", *_python_command()]
 
     try:
         os.execve(bwrap, argv, new_env)

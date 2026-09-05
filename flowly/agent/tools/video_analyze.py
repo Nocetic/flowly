@@ -22,13 +22,14 @@ on the proxy allowlist do not natively understand video.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import ipaddress
 import json
 import os
 import socket
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -138,8 +139,12 @@ def _categorize_error(err: Exception) -> str:
 class VideoAnalyzeTool(Tool):
     """Analyze a video via a multimodal LLM (Gemini)."""
 
-    def __init__(self, provider: Any, default_model: str | None = None):
+    def __init__(
+        self, provider: Any, default_model: str | None = None, *,
+        local_file_reader: Callable[[Path], bytes] | None = None,
+    ):
         self.provider = provider
+        self._local_file_reader = local_file_reader
         self.default_model = (
             default_model
             or os.getenv("AUXILIARY_VIDEO_MODEL", "").strip()
@@ -245,7 +250,13 @@ class VideoAnalyzeTool(Tool):
                         "[video_analyze] %.1f MB — may be slow or rejected",
                         size / (1024 * 1024),
                     )
-                payload_url = _to_data_url(local, mime)
+                if self._local_file_reader is None:
+                    payload_url = _to_data_url(local, mime)
+                else:
+                    raw = await asyncio.to_thread(self._local_file_reader, local)
+                    if len(raw) > _MAX_VIDEO_BYTES or _estimated_data_url_bytes(len(raw), mime) > _MAX_LOCAL_VIDEO_DATA_URL_BYTES:
+                        return _fail("Video grew beyond the local input size limit")
+                    payload_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
             else:
                 # Remote URL — forward as-is, model provider downloads it.
                 err = _check_url_safe(video_url)

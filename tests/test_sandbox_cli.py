@@ -27,11 +27,26 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from flowly.sandbox import cli_wrap
+
+
+class TestPythonReexecution:
+    def test_preserves_module_and_interpreter_flags(self, monkeypatch):
+        monkeypatch.setattr(sys.modules["__main__"], "__spec__", SimpleNamespace(name="flowly.__main__"))
+        monkeypatch.setattr(sys, "orig_argv", [sys.executable, "-X", "utf8", "-m", "flowly", "mcp", "tools"])
+        monkeypatch.setattr(sys, "argv", ["/repo/flowly/__main__.py", "mcp", "tools"])
+        assert cli_wrap._python_command() == [sys.executable, "-X", "utf8", "-m", "flowly", "mcp", "tools"]
+
+    def test_console_script_keeps_script_arguments(self, monkeypatch):
+        monkeypatch.setattr(sys.modules["__main__"], "__spec__", None)
+        monkeypatch.setattr(sys, "orig_argv", [sys.executable, "/bin/flowly", "agent", "-m", "hello"])
+        monkeypatch.setattr(sys, "argv", ["/bin/flowly", "agent", "-m", "hello"])
+        assert cli_wrap._python_command() == [sys.executable, "/bin/flowly", "agent", "-m", "hello"]
 
 
 # ── Gate decision: env var precedence ────────────────────────────────

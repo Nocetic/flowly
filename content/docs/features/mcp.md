@@ -202,6 +202,78 @@ Point a client at it the same way you would any stdio server:
 }
 ```
 
+## Live tools for external agents
+
+`flowly mcp tools` is a separate stdio server for tools in a **running** Flowly
+gateway. Unlike `mcp serve`, it uses the live registry, provider and task board;
+it does not start a second agent or create a separate Board database.
+
+```bash
+# Use an exact, existing conversation key from conversations_list.
+flowly mcp tools --session cli:my-conversation
+
+# Explicitly permit selected writes, not every available capability.
+flowly mcp tools --session cli:my-conversation --allow-writes \
+  --tool board_add --tool board_list --ttl 1800
+```
+
+Configure any compatible stdio MCP client with the executable and arguments:
+
+```json
+{
+  "mcpServers": {
+    "flowly-live": {
+      "command": "/absolute/path/to/flowly",
+      "args": ["mcp", "tools", "--session", "cli:my-conversation"]
+    }
+  }
+}
+```
+
+The default grant can expose web search/fetch/extract, video/image analysis,
+skill lookup/listing and Board list/get **only where registered and enabled**.
+`--allow-writes` additionally permits image/voice generation and Board add,
+update and run. Repeat `--tool` to narrow either set. Browser automation,
+shell access and arbitrary registry tools are not exposed by this bridge.
+Analysis and generation can incur charges on the user's configured providers.
+Image analysis uses the selected live chat model without silently substituting
+another; a model without image support returns an error. Speech keeps the
+configured voice/model. Generated images and audio return native MCP content.
+
+Authorization comes from a bounded, expiring grant, not tool arguments. The
+local launcher uses the gateway's owner-only discovery credential to obtain a
+grant for an existing conversation. Calls carry only that scoped grant, which
+cannot issue other grants or change its session or tool set. Board write
+attribution and hook ownership use that session; the Board itself is shared
+installation data, not a per-conversation private store. Current channel tool
+availability and pre-tool hooks are enforced again before dispatch.
+
+This endpoint is loopback-only. It is a protocol permission boundary, **not an
+OS sandbox against another process running as the same user**. The public
+launcher currently targets the advertised standalone gateway. Managed coding
+sessions still use their existing callback; automatic per-turn grant injection
+and parent-policy propagation are not yet implemented. Internally supplied
+grants can retain the owning profile's reverse-RPC context, but the launcher
+does not discover profile runtimes or choose a Desktop broker on its own.
+
+Operational limits: one-hour grants by default (maximum eight hours), 128
+active grants, four executing/eight pending calls per grant, 16 executing/64
+pending globally, and 32 MiB of aggregate pending JSON arguments. Each call
+allows 12 MiB of JSON arguments and a 16 MiB result. Calls time out after ten
+minutes. A grant retains up to 1,024 used request IDs; concurrent duplicates
+share execution, completed IDs are rejected rather than replayed. The launcher
+revokes its grant on orderly shutdown; expiry, session deletion and gateway
+shutdown also revoke calls. Cancellation cannot roll back an already-executed
+external side effect, so clients must not blindly retry failed writes.
+
+Local image/video inputs and generated media are bounded to eight MiB per file and
+restricted to the live workspace/media directory. Local reads require secure
+no-follow directory descriptors (macOS/Linux); unsupported platforms fail
+closed for local files. Public image URLs and validated image data URLs do not
+need those descriptors. Media replies support up to eight attachments within
+the total response limit; oversize results return an explicit error, not partial
+content. Source schemas are preserved without provider-specific flattening.
+
 ## `flowly mcp` subcommands
 
 | Command | What it does |
@@ -213,6 +285,7 @@ Point a client at it the same way you would any stdio server:
 | `disable <name>` | Flip the server's `enabled` flag off |
 | `configure <name>` | Interactively pick enabled tools → writes `tools.include` |
 | `serve` | Run Flowly as an MCP server (`--allow-writes`, `--verbose`) |
+| `tools` | Expose live gateway tools over stdio (`--session`, `--allow-writes`, repeated `--tool`, `--ttl`) |
 | `catalog` | List the curated catalog |
 | `install <name>` | Install a catalog entry (`--force`, `--probe`) |
 | `picker` | Interactive catalog browser (TTY only) |

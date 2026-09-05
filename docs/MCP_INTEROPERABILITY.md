@@ -129,3 +129,53 @@ Final regression for this change: `uv run pytest -q` — **4970 passed,
 Targeted Ruff checks for OAuth/storage/lifecycle code and tests and
 `git diff --check` pass. The broader CLI/feature-RPC files retain their same
 14 pre-existing Ruff findings; no unrelated lint rewrites were made.
+
+### Live-runtime tool bridge (partial acceptance)
+
+`flowly mcp tools` exposes the registered web, image/video analysis, speech/image
+generation and Board tools through a separate generic SDK stdio front end.
+Grants bind exact sessions, selected tools and the owning execution context.
+Schema validation, live availability and registry hooks remain authoritative;
+Board tools are context-bound copies sharing the live store/orchestrator.
+No browser or shell tools are exposed. Local image/video/media reads use bounded,
+no-follow descriptor walks rather than trusting a prior path check alone.
+
+`tests/mcp/test_live_tool_bridge.py` exercises the real gateway HTTP routes and
+public CLI subprocess with modern and legacy MCP clients. It verifies scoped
+authorization, native image/audio and errors, real media tools with stubbed paid
+provider boundaries, unchanged chosen model/voice, exact schemas, hook denial,
+post-hook validation, session attribution, deletion/expiry/revocation,
+cancellation, duplicate-write protection and bounded concurrency/argument
+memory. It also exercises the real named-profile Board adapter and gateway
+reverse-RPC correlation using an explicitly captured owner context; an unrelated
+socket cannot answer the request. This is not a complete Desktop integration test.
+
+`tests/test_image_analyze.py` covers the actual image tool's active provider
+getters, allowed local files/data URLs, private URL rejection, invalid images,
+oversize/decompression-bomb rejection, cancellation, and a directory-symlink
+replacement during the secure open. Public CLI tests uncovered loss of `-m`
+during sandbox re-execution; `tests/test_sandbox_cli.py` now pins preservation
+of module/interpreter flags without changing sandbox permissions.
+
+**The tool-bridge acceptance checkbox remains open.** Automatic per-turn grant
+injection into managed coding sessions, propagation of the parent's structured/
+exclusive tool restrictions, and end-to-end managed profile wiring remain
+required. The public launcher only discovers the standalone gateway today;
+internally supplied grants do not widen themselves through CLI options.
+Local-file media reads currently require macOS/Linux descriptor primitives;
+this is not cross-platform runtime evidence or proof of every paid provider.
+The separate manifest/lifecycle, policy, diagnostics and final acceptance
+items also remain open.
+
+Verification: `uv run pytest tests/mcp/test_live_tool_bridge.py -q` — **47
+passed**. Final full regression: `uv run pytest -q` — **5035 passed, 1 skipped,
+12 deselected** in 97.99 seconds on macOS (65 tests added over the prior
+committed baseline). This includes immediate runtime-stop revocation and
+draining of cancelled calls after their grants have been removed. Targeted
+Ruff checks and `git diff --check` pass. The broader loop/registry/CLI files
+retain the same 32 pre-existing Ruff findings, verified against HEAD.
+
+All gateway/provider tests use isolated temporary state; this work does not
+deploy the branch to the user's running gateway. The final diagnostics audit
+still needs missing/malformed local-media transport cases and structured
+provider credential errors beyond the tested bearer/key patterns.

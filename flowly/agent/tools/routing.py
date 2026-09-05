@@ -20,7 +20,7 @@ TOOLSET_MEMBERS: dict[str, frozenset[str]] = {
     "delivery": frozenset({"message"}),
     "interactive": frozenset({"clarify", "plan"}),
     "media": frozenset({
-        "screenshot", "video_analyze", "image_generate", "video_generate",
+        "screenshot", "video_analyze", "image_analyze", "image_generate", "video_generate",
         "voice_generate", "voice_call", "computer", "browser_tab",
         "browser_plan",
     }),

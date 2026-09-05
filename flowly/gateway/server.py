@@ -761,6 +761,11 @@ class GatewayServer:
                 )
             except Exception as exc:  # pragma: no cover — never block boot
                 logger.warning("MCP control routes unavailable: {}", exc)
+        bridge = getattr(self, "_tool_bridge", None)
+        if bridge is not None:
+            from flowly.mcp.server.tool_bridge import register_tool_bridge_routes
+
+            register_tool_bridge_routes(app, bridge, admin_token=self._control_token)
         return app
 
     # ------------------------------------------------------------------

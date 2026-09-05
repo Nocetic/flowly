@@ -436,6 +436,32 @@ def configure(
 # ---------------------------------------------------------------------------
 
 
+@mcp_app.command("tools")
+def serve_live_tools(
+    session: str = typer.Option("", "--session", help="Exact existing Flowly conversation key"),
+    allow_writes: bool = typer.Option(False, "--allow-writes", help="Allow media generation and Board writes"),
+    tool: list[str] | None = typer.Option(None, "--tool", help="Restrict the grant to named tools; repeatable"),
+    ttl: int = typer.Option(3600, "--ttl", min=1, max=28800, help="Grant lifetime in seconds"),
+) -> None:
+    """Serve live, session-scoped tools to any MCP client over stdio."""
+    import asyncio
+    import sys
+
+    from flowly.mcp.server.tool_bridge import run_tool_bridge
+    from flowly.mcp.server.tool_runtime import ToolBridgeError
+
+    os.environ.setdefault("FLOWLY_QUIET", "1")
+    try:
+        asyncio.run(run_tool_bridge(
+            session_key=session or None, allow_writes=allow_writes, names=tool, ttl=ttl,
+        ))
+    except ToolBridgeError as exc:
+        sys.stderr.write(f"Flowly tool bridge: {exc}\n")
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        pass
+
+
 @mcp_app.command("serve")
 def serve(
     allow_writes: bool = typer.Option(

@@ -2045,6 +2045,9 @@ class AgentLoop:
                 raise SessionBusyError(session_key)
 
             pending: list[asyncio.Task[Any]] = []
+            bridge = getattr(self, "_external_tool_bridge", None)
+            if bridge is not None:
+                pending.extend(bridge.revoke_session(session_key))
             title_task = self._title_tasks.pop(session_key, None)
             if title_task is not None and not title_task.done():
                 title_task.cancel()
@@ -2351,6 +2354,12 @@ class AgentLoop:
         # primary chat model.
         from flowly.agent.tools.video_analyze import VideoAnalyzeTool
         self.tools.register(VideoAnalyzeTool(provider=self.provider))
+        from flowly.agent.tools.image_analyze import ImageAnalyzeTool
+
+        self.tools.register(ImageAnalyzeTool(
+            provider_getter=lambda: self.provider, model_getter=lambda: self.model,
+            workspace=self.workspace,
+        ))
 
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
@@ -3296,6 +3305,12 @@ class AgentLoop:
         guessing from tool-call timing alone.
         """
         self._gateway_server = gateway_server
+        from flowly.mcp.server.tool_runtime import RuntimeToolBridge
+
+        existing = getattr(self, "_external_tool_bridge", None)
+        if existing is None or existing._closed:
+            self._external_tool_bridge = RuntimeToolBridge(self)
+        gateway_server._tool_bridge = self._external_tool_bridge
         browser_tab = self.tools.get("browser_tab")
         if browser_tab:
             browser_tab._gateway = gateway_server
@@ -3894,6 +3909,9 @@ class AgentLoop:
         """
         self._running = False
         goal_runtime = getattr(self, "goal_runtime", None)
+        bridge = getattr(self, "_external_tool_bridge", None)
+        if bridge is not None:
+            bridge.stop()
         if goal_runtime is not None:
             goal_runtime.cancel()
         goal_unsubscribe = getattr(self, "_goal_process_unsubscribe", None)

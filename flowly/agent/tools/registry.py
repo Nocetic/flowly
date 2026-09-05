@@ -701,6 +701,8 @@ class ToolRegistry:
         disabled_toolsets: set[str] | frozenset[str] | None = None,
         disabled_tools: set[str] | frozenset[str] | None = None,
         session_key: str | None = None,
+        _bound_tool: Tool | None = None,
+        _dispatch_guard: Callable[[], bool] | None = None,
     ) -> str:
         """
         Execute a tool by name with given parameters.
@@ -741,7 +743,7 @@ class ToolRegistry:
             ctx = ToolHookContext(
                 tool_name=name,
                 params=params,
-                session_id=self._active_session_id,
+                session_id=session_key if session_key is not None else self._active_session_id,
             )
             block = await self._hooks.fire_pre_tool(ctx)
             if block is not None:
@@ -751,6 +753,14 @@ class ToolRegistry:
         try:
             from flowly.agent.tool_context import tool_execution_scope
 
+            # Runtime adapters may bind a fresh context-bearing instance, but
+            # cannot bypass the authoritative registration, route, or hooks.
+            if self.get(name) is not tool or (_dispatch_guard and not _dispatch_guard()):
+                return f"Error: Tool '{name}' permission changed before dispatch"
+            if _bound_tool is not None:
+                if type(_bound_tool) is not type(tool) or _bound_tool.name != name:
+                    return f"Error: Invalid runtime binding for '{name}'"
+                tool = _bound_tool
             with tool_execution_scope(session_key):
                 result = await tool.execute(**_drop_unexpected_kwargs(tool, params))
         except Exception as e:
