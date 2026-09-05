@@ -285,6 +285,34 @@ starts a new process with a new grant and explicitly resumes stored conversation
 history. This adds startup overhead but prevents stale warm-process authority;
 missing stored history is reported rather than silently replaced.
 
+### Per-turn exclusive tool scopes
+
+Explicit English and Turkish selectors narrow the tool surface for one turn:
+`Only use Context7`, `Sadece Context7 kullan`, and `Context7 kullan, başka
+araç kullanma` select the same registered server family. An exact tool name
+selects that tool; source-qualified short names disambiguate identical names
+on different servers. Unqualified ambiguous names and unknown exclusive
+targets grant nothing. Server and tool selectors can be combined in one list.
+Explicit named exclusions are subtracted; independently exclusive clauses
+intersect instead of accumulating permissions.
+
+Only imperative selector clauses contribute names: a forbidden tool, an
+explanatory mention, quoted instruction, or fenced example cannot grant itself
+authority. The bounded grammar is a convenience, not general natural-language
+understanding. Clients that need an exact contract should send `allowedTools`
+on gateway chat requests (internally `allowed_tools`). A supplied malformed
+allowlist fails closed; an absent/null list preserves the usual runtime policy.
+Broad `tools_allowed: true` does not erase an explicit exclusive selector.
+Structured denies continue to win, and every derived grant intersects the
+transport's positive ceiling and existing disabled-tool settings.
+
+The resulting positive ceiling stays task-local through schema disclosure,
+execution and delegated MCP calls. A newly discovered tool cannot join that
+turn even if it belongs to the selected server. Later independent turns can
+use the refreshed catalog. Concurrent turns keep separate grants. Policy
+parsing is bounded to 65,536 characters and 256 clauses; over-limit requests
+run without tools rather than ignoring an unchecked suffix.
+
 Operational limits: one-hour grants by default (maximum eight hours), 128
 active grants, four executing/eight pending calls per grant, 16 executing/64
 pending globally, and 32 MiB of aggregate pending JSON arguments. Each call

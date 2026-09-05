@@ -21,7 +21,7 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
   recovery, and distinguishes expired sessions from expired credentials.
 - [ ] Persistent tool manifests support lazy server startup and bounded idle/
   lifetime recycling, without stale schemas or duplicate subprocesses.
-- [ ] Explicit exclusive tool requests resolve consistently in English/Turkish,
+- [x] Explicit exclusive tool requests resolve consistently in English/Turkish,
   cannot broaden structured grants, and are enforced during execution.
 - [ ] MCP log notifications and failure diagnostics remain bounded and redact
   credentials; existing protocol/content/transport support remains intact.
@@ -230,3 +230,43 @@ The installed coding client used for the real-process tests is 0.149.0.
 Targeted Ruff checks and `git diff --check` pass. The modified broad loop,
 registry and existing session-test modules retain their same 36 pre-existing
 Ruff findings, verified against the committed baseline.
+
+### Exclusive policy and turn-long positive ceilings
+
+`tests/test_exclusive_tool_policy.py` verifies equivalent English/Turkish
+imperatives, short/qualified/full tool identifiers, source families, mixed
+selectors, specific exclusions, conflicting exclusive clauses, unknown and
+ambiguous aliases, Turkish suffixes/normalization collisions, quoted examples,
+purpose/frequency clauses and bounded input. The original no-tools precedence
+tests remain intact: structured deny wins, while existing broad structured
+enablement does not disable tools merely from a prose global-deny phrase.
+That broad enablement no longer erases positive exclusive constraints.
+
+The real agent-loop tests deliberately emit out-of-scope calls from scripted
+providers, intersect natural-language selectors with valid/empty/frozen/malformed
+transport grants, and register a new tool during the provider await. The tool
+cannot appear in later schemas or execute within that turn, but is usable on
+the next independent turn. Concurrent turns expose and execute only their own
+allowed tools. A positive ceiling is retained in task-local execution context,
+not just a deny list expanded from an earlier registry snapshot.
+
+The delegated transport test starts from the real parent message-processing
+path with a Turkish exclusive request and a broader structured grant. It opens
+the generic MCP SDK stdio callback, confirms only Board reading is granted,
+successfully calls it, and rejects a Board write without changing the store.
+All provider responses are local fixed fixtures; no paid model calls or live
+gateway mutations are involved.
+
+Targeted verification: `uv run pytest tests/test_exclusive_tool_policy.py
+tests/test_no_tools_policy.py tests/test_profile_capability_policy.py -q`.
+The grammar and boundaries are documented in the MCP feature guide. This is
+not a promise to understand arbitrary ambiguous prose; clients can supply an
+exact structured allowlist. Manifest/lifecycle, diagnostics and final overall
+acceptance remain required.
+
+Final verification: the targeted command above reports **131 passed**. Full
+regression `uv run pytest -q` reports **5153 passed, 1 skipped, 12 deselected**
+in 111.10 seconds, with 11 existing warnings (87 tests added). Targeted Ruff
+checks and `git diff --check` pass; the broader agent-loop module retains the
+same 20 pre-existing lint findings as the committed baseline. This change is
+committed only; there was no merge, push or running-gateway deployment.

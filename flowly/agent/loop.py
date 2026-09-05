@@ -98,6 +98,7 @@ from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
 from flowly.agent.tool_policy import (
     has_explicit_tool_invocation_intent,
+    normalize_tool_allowlist,
     resolve_exclusive_tool_scope,
     resolve_turn_tool_policy,
 )
@@ -113,16 +114,13 @@ def resolve_capability_disabled_tools(
     allowed_tools: object,
 ) -> list[str] | object:
     """Turn an optional positive grant into the executor's hard deny list."""
-    if not isinstance(allowed_tools, (list, tuple, set)):
+    allowed_set = normalize_tool_allowlist(allowed_tools)
+    if allowed_set is None:
         return disabled_tools
-    allowed_set = {
-        value for value in allowed_tools
-        if isinstance(value, str) and value
-    }
     disabled_set = {
         value for value in disabled_tools
         if isinstance(value, str)
-    } if isinstance(disabled_tools, (list, tuple, set)) else set()
+    } if isinstance(disabled_tools, (list, tuple, set, frozenset)) else set()
     disabled_set.update(set(all_tool_names) - allowed_set)
     return sorted(disabled_set)
 
@@ -4030,7 +4028,7 @@ class AgentLoop:
         if not callable(get_definitions):
             return []
         try:
-            return get_definitions(
+            definitions = get_definitions(
                 platform=platform,
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
@@ -4040,7 +4038,13 @@ class AgentLoop:
             # Compatibility for third-party registries implementing the old
             # zero-argument protocol. Runtime enforcement still uses the names
             # present in the returned schemas.
-            return get_definitions()
+            definitions = get_definitions()
+        from flowly.agent.tool_context import current_tool_origin
+
+        origin = current_tool_origin()
+        if origin is not None and origin.allowed_tools is not None:
+            definitions = [item for item in definitions if item.get("function", {}).get("name") in origin.allowed_tools]
+        return definitions
 
     def _build_tool_disclosure(
         self,
@@ -7945,13 +7949,9 @@ class AgentLoop:
             exclusive_scope = set(
                 resolve_exclusive_tool_scope(display_content, tool_catalog)
             )
-            existing_allowlist = msg.metadata.get("allowed_tools")
-            if isinstance(existing_allowlist, (list, tuple, set)):
-                exclusive_scope.intersection_update(
-                    value
-                    for value in existing_allowlist
-                    if isinstance(value, str)
-                )
+            existing_allowlist = normalize_tool_allowlist(msg.metadata.get("allowed_tools"))
+            if existing_allowlist is not None:
+                exclusive_scope.intersection_update(existing_allowlist)
             # An unresolved exclusive target fails closed with an empty positive
             # grant.  The ordinary no-tools policy remains distinct: this turn
             # asked for tool execution, but none may run unless the named scope
@@ -8019,11 +8019,11 @@ class AgentLoop:
             tool_chat_id = (msg.metadata.get("origin_chat_id") or "").strip() or msg.chat_id
 
         disabled_tools = msg.metadata.get("disabled_tools")
-        allowed_tools = msg.metadata.get("allowed_tools")
+        allowed_tools = normalize_tool_allowlist(msg.metadata.get("allowed_tools"))
         disabled_tools = resolve_capability_disabled_tools(
             set(self.tools.tool_names), disabled_tools, allowed_tools
         )
-        if isinstance(allowed_tools, (list, tuple, set)):
+        if allowed_tools is not None:
             # The resolved list affects schema disclosure and executor lookup,
             # so a hallucinated call cannot bypass the positive grant.
             msg.metadata["disabled_tools"] = disabled_tools
@@ -8537,28 +8537,33 @@ class AgentLoop:
         provider_error: dict[str, Any] = {}
         provider_state = self._provider_continuity_state(session)
         provider_state_out: dict[str, Any] = {}
-        final_content, tool_results, _executed_tools, usage, _loop_messages = await self._run_llm_tool_loop(
-            messages=messages,
-            action_turn=action_turn,
-            live_call_turn=live_call_turn,
-            turn_content=msg.content,
-            stream_callback=stream_callback,
-            session_key=msg.session_key,
-            model_override=model_override,
-            disabled_tools=disabled_tools,
-            tools_allowed=tools_allowed,
-            tool_platform=msg.channel,
-            outbound_channel=msg.channel,
-            outbound_chat_id=msg.chat_id,
-            outbound_run_id=msg.metadata.get("run_id") or "",
-            on_iteration=on_iteration,
-            reply_media=reply_media,
-            reply_media_assets=reply_media_assets,
-            error_out=provider_error,
-            turn_messages_out=turn_messages,
-            provider_state=provider_state,
-            provider_state_out=provider_state_out,
-        )
+        from flowly.agent.tool_context import tool_execution_scope
+
+        # Keep a positive ceiling for the whole turn, not just a deny list
+        # computed from one registry snapshot. Late MCP discovery cannot widen it.
+        with tool_execution_scope(msg.session_key, allowed_tools=allowed_tools if tools_allowed else frozenset()):
+            final_content, tool_results, _executed_tools, usage, _loop_messages = await self._run_llm_tool_loop(
+                messages=messages,
+                action_turn=action_turn,
+                live_call_turn=live_call_turn,
+                turn_content=msg.content,
+                stream_callback=stream_callback,
+                session_key=msg.session_key,
+                model_override=model_override,
+                disabled_tools=disabled_tools,
+                tools_allowed=tools_allowed,
+                tool_platform=msg.channel,
+                outbound_channel=msg.channel,
+                outbound_chat_id=msg.chat_id,
+                outbound_run_id=msg.metadata.get("run_id") or "",
+                on_iteration=on_iteration,
+                reply_media=reply_media,
+                reply_media_assets=reply_media_assets,
+                error_out=provider_error,
+                turn_messages_out=turn_messages,
+                provider_state=provider_state,
+                provider_state_out=provider_state_out,
+            )
         outbound_run_id = msg.metadata.get("run_id") or ""
         turn_aborted = bool(
             outbound_run_id and self.is_run_aborted(outbound_run_id)
