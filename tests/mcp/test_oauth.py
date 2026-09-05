@@ -16,8 +16,6 @@ Skipped if the SDK lacks the auth module.
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 import stat
 from pathlib import Path
 
@@ -153,6 +151,22 @@ def test_build_provider_returns_object(isolated_home: Path):
         interactive=False,
     )
     assert provider is not None
+
+
+async def test_callback_returns_sdk_result_including_issuer(isolated_home, monkeypatch):
+    from mcp.shared.auth import AuthorizationCodeResult
+
+    def callback(result, timeout):
+        result.code = "test-code"
+        result.state = "state"
+        result.iss = "https://issuer.example"
+        result.event.set()
+
+    monkeypatch.setattr(oauth, "_run_callback_server", callback)
+    provider = oauth.build_oauth_provider("acme", "https://acme.example/mcp", interactive=True)
+    result = await provider.context.callback_handler()
+    assert isinstance(result, AuthorizationCodeResult)
+    assert (result.code, result.state, result.iss) == ("test-code", "state", "https://issuer.example")
 
 
 def test_callback_server_captures_code(isolated_home: Path, monkeypatch):

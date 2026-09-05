@@ -378,7 +378,7 @@ async def mcp_test(params: dict) -> dict:
 async def mcp_oauth_start(params: dict) -> dict:
     """Run the OAuth browser flow for an OAuth-configured server on the bot host.
 
-    Clears cached tokens first, then connects interactively (opens the browser
+    Stages a new grant, then connects interactively (opens the browser
     on whichever host the bot runs on). Works cleanly for a **local** bot; for a
     remote/VPS bot the browser opens on the host, so the desktop should only
     offer this for local bots. Restart-aware on success so the agent reconnects
@@ -399,40 +399,24 @@ async def mcp_oauth_start(params: dict) -> dict:
 
     try:
         from flowly.mcp.oauth import (
-            backup_tokens,
-            clear_tokens,
             oauth_available,
-            restore_tokens,
+            oauth_login,
         )
     except Exception as exc:
         raise FeatureRpcError("UNAVAILABLE", f"OAuth runtime not importable: {exc}")
     if not oauth_available():
         raise FeatureRpcError("UNAVAILABLE", "this 'mcp' SDK build lacks OAuth support")
 
-    backup = backup_tokens(name)
-    if backup is None:
-        raise FeatureRpcError(
-            "UNAVAILABLE",
-            f"could not back up existing OAuth credentials for {name}",
-        )
-    cleared = clear_tokens(name)
-    if backup[0] and not cleared:
-        raise FeatureRpcError(
-            "UNAVAILABLE",
-            f"could not clear existing OAuth credentials for {name}",
-        )
     from flowly.mcp.probe import probe_message_async
 
-    try:
+    with oauth_login(name, dump["url"]) as login:
         ok, message = await probe_message_async(name, dump, interactive=True)
-    except BaseException:
-        restore_tokens(name, backup)
-        raise
-    if not ok:
-        restored = restore_tokens(name, backup)
-        if not restored:
-            message += "; previous OAuth credentials could not be restored"
-        raise FeatureRpcError("AUTH_FAILED", message)
+        if not ok:
+            raise FeatureRpcError("AUTH_FAILED", message)
+        try:
+            login.commit()
+        except (OSError, RuntimeError) as exc:
+            raise FeatureRpcError("AUTH_FAILED", str(exc)) from None
     return {"ok": True, "message": message, "willRestart": bool(params.get("restart", True))}
 
 

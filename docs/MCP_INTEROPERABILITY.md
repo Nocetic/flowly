@@ -17,7 +17,7 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
   execution permissions. Stateful tools reach the owning live runtime.
 - [x] MCP server requests for user input/consent reach the owning surface;
   untrusted write tools cannot execute without approval.
-- [ ] OAuth picks up cross-process token changes, coordinates concurrent 401
+- [x] OAuth picks up cross-process token changes, coordinates concurrent 401
   recovery, and distinguishes expired sessions from expired credentials.
 - [ ] Persistent tool manifests support lazy server startup and bounded idle/
   lifetime recycling, without stale schemas or duplicate subprocesses.
@@ -38,7 +38,7 @@ speech and task-board interoperability remain in scope.
 
 ## Verification record
 
-The remaining unchecked outcomes are pending. The previous baseline is commit `3c58b18`; its suite
+The remaining unchecked outcomes are pending. The historical baseline is commit `3c58b18`; its suite
 reported 4897 passed, 1 skipped, 12 deselected. That result is not evidence for
 the outcomes still unchecked above.
 
@@ -88,3 +88,44 @@ conversation transport tests. Real-LLM tests remain excluded; this is not proof
 of the still-unchecked acceptance items or live provider-specific behavior.
 Targeted Ruff checks for the new interaction/context/request modules and tests,
 and `git diff --check`, also pass.
+
+### OAuth recovery and credential publication
+
+`tests/mcp/test_oauth_recovery.py` has 38 tests using a real loopback HTTP
+authorization service, independent providers, and separate Python processes.
+It covers concurrent 401 recovery with rotating or unchanged access tokens,
+cross-process credential reload, persisted expiry and AS discovery, omitted
+refresh/scope fields, temporary/permanent failures, malformed token responses,
+issuer/resource binding, scope consent, cancelled lock waiters, and process death.
+Normal tool requests remain concurrent and successful SSE bodies stream without
+holding a recovery lease. Token writes are owner-only before bytes are written,
+atomic and revision-checked; a stale refresh cannot undo login/logout.
+
+The public-client tests run Flowly's `discover_mcp_tools` and registry calls
+against the official MCP server over modern and legacy Streamable HTTP plus
+legacy SSE (including its separate POST endpoint). A terminated legacy HTTP
+session reconnects without refreshing/deleting tokens or replaying the failed
+operation. `tests/mcp/test_lifecycle.py` also distinguishes that exact protocol
+error from ordinary method-not-found and authorization errors.
+
+CLI and desktop sign-in now stage credentials until the connection probe
+succeeds. Failed/cancelled sign-in requires no destructive rollback. Concurrent
+login/logout wins over stale publication. Tests exercise the public interactive
+probe across the MCP loop boundary, environment-expanded URLs, staging cleanup,
+and late writes after cancellation. `tests/mcp/test_oauth.py` verifies the SDK's
+typed authorization callback including the issuer parameter;
+`tests/test_feature_rpc_mcp.py` checks failed desktop sign-in preserves the
+working grant. Existing legacy token files remain readable and acquire an
+explicit name/URL binding on their next write.
+
+Targeted verification: `uv run pytest tests/mcp/test_oauth_recovery.py -q` —
+**38 passed**. This is controlled local HTTP/SDK evidence, not a claim that every
+vendor-specific SSO configuration or every operating system has been tested.
+The remaining unchecked tool-bridge, manifest/lifecycle, policy, diagnostics and
+final acceptance outcomes are still required.
+
+Final regression for this change: `uv run pytest -q` — **4970 passed,
+1 skipped, 12 deselected** in 89.70 seconds on the current macOS host.
+Targeted Ruff checks for OAuth/storage/lifecycle code and tests and
+`git diff --check` pass. The broader CLI/feature-RPC files retain their same
+14 pre-existing Ruff findings; no unrelated lint rewrites were made.

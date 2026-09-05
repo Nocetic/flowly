@@ -26,13 +26,20 @@ skipped + logged like any other failure — boot is never blocked.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
-import os
+import math
 import threading
+import time
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
+from flowly.mcp.oauth_state import atomic_private_write, read_private, state_lock
 from flowly.mcp.schema import sanitize_mcp_name_component
 
 logger = logging.getLogger(__name__)
@@ -40,9 +47,9 @@ logger = logging.getLogger(__name__)
 
 _OAUTH_AVAILABLE = False
 try:
-    from mcp.client.auth import OAuthClientProvider  # type: ignore
     from mcp.client.auth.oauth2 import TokenStorage  # type: ignore
     from mcp.shared.auth import (  # type: ignore
+        AuthorizationCodeResult,
         OAuthClientInformationFull,
         OAuthClientMetadata,
         OAuthToken,
@@ -91,6 +98,14 @@ def _token_file(server_name: str) -> Path:
     return _tokens_dir() / f"{safe}.json"
 
 
+class OAuthStateChangedError(RuntimeError):
+    """A newer login/logout won while a network authorization was in flight."""
+
+
+_UNGUARDED = object()
+_active_login: ContextVar[Any] = ContextVar("oauth_active_login", default=None)
+
+
 class FlowlyTokenStorage(TokenStorage):  # type: ignore[misc]
     """Persist OAuth client info + tokens to ``$FLOWLY_HOME/mcp-tokens/``.
 
@@ -99,38 +114,78 @@ class FlowlyTokenStorage(TokenStorage):  # type: ignore[misc]
     from the MCP event loop.
     """
 
-    def __init__(self, server_name: str) -> None:
+    def __init__(self, server_name: str, url: str | None = None) -> None:
         self._server_name = server_name
         self._path = _token_file(server_name)
+        self._url = url
+        self._closed = False
+        self._expected: ContextVar[Any] = ContextVar("oauth_expected_revision", default=_UNGUARDED)
+
+    @property
+    def recovery_path(self) -> Path:
+        return self._path.with_suffix(".auth.lock")
 
     def _read(self) -> dict[str, Any]:
-        if not self._path.exists():
-            return {}
         try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            raw = read_private(self._path)
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return {}
+            if "revision" not in data:
+                # Distinguish legacy credentials from an absent file so an
+                # in-flight first refresh cannot undo a concurrent logout.
+                data["revision"] = "legacy:" + hashlib.sha256(raw).hexdigest()
+            return data
+        except (FileNotFoundError, ValueError):
             return {}
 
-    def _write(self, data: dict[str, Any]) -> None:
-        import secrets
+    def _bound(self, data: dict[str, Any]) -> bool:
+        return (
+            data.get("server_name", self._server_name) == self._server_name
+            and (self._url is None or data.get("server_url", self._url) == self._url)
+        )
 
-        tmp = self._path.with_suffix(f".tmp.{secrets.token_hex(4)}")
+    def snapshot(self) -> dict[str, Any]:
+        data = self._read()
+        if not self._bound(data):
+            return {"revision": data.get("revision")}
+        return data
+
+    @contextmanager
+    def guard(self, snapshot: dict[str, Any]):
+        token = self._expected.set(snapshot.get("revision"))
         try:
-            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            from flowly.utils.file_security import secure_file
+            yield
+        finally:
+            self._expected.reset(token)
 
-            # Set owner-only permissions before the atomic rename so there is
-            # no window where the destination contains credentials with the
-            # process umask's broader default mode.
-            secure_file(tmp)
-            os.replace(str(tmp), str(self._path))
-            secure_file(self._path)  # POSIX chmod; real owner-only ACL on Windows
-        except OSError as exc:
-            logger.warning("MCP token write failed for '%s': %s", self._server_name, exc)
-            tmp.unlink(missing_ok=True)
+    def _update_sync(self, values: dict[str, Any], expected: Any) -> str:
+        if self._closed:
+            raise OAuthStateChangedError("OAuth login was cancelled or completed")
+        with state_lock(self._path.with_suffix(".lock")):
+            if self._closed:
+                raise OAuthStateChangedError("OAuth login was cancelled or completed")
+            data = self._read()
+            if expected is not _UNGUARDED and data.get("revision") != expected:
+                raise OAuthStateChangedError("OAuth credentials changed during recovery; retry the request")
+            if not self._bound(data):
+                data = {}
+            data.update(values)
+            data["server_name"] = self._server_name
+            if self._url is not None:
+                data["server_url"] = self._url
+            revision = data["revision"] = uuid.uuid4().hex
+            atomic_private_write(self._path, json.dumps(data, indent=2).encode("utf-8"))
+            return revision
+
+    async def update(self, values: dict[str, Any]) -> None:
+        expected = self._expected.get()
+        revision = await asyncio.to_thread(self._update_sync, values, expected)
+        if expected is not _UNGUARDED:
+            self._expected.set(revision)
 
     async def get_tokens(self) -> Any | None:
-        data = self._read().get("tokens")
+        data = self.snapshot().get("tokens")
         if not data:
             return None
         try:
@@ -139,12 +194,18 @@ class FlowlyTokenStorage(TokenStorage):  # type: ignore[misc]
             return None
 
     async def set_tokens(self, tokens: Any) -> None:
-        data = self._read()
-        data["tokens"] = json.loads(tokens.model_dump_json())
-        self._write(data)
+        expires_in = getattr(tokens, "expires_in", None)
+        expires_at = None
+        if isinstance(expires_in, (int, float)) and math.isfinite(expires_in):
+            expires_at = time.time() + max(0, expires_in)
+        await self.update({
+            "tokens": json.loads(tokens.model_dump_json()), "expires_at": expires_at,
+            "token_revision": uuid.uuid4().hex,
+            "refresh_rejected": None, "refresh_retry_at": None,
+        })
 
     async def get_client_info(self) -> Any | None:
-        data = self._read().get("client_info")
+        data = self.snapshot().get("client_info")
         if not data:
             return None
         try:
@@ -153,20 +214,20 @@ class FlowlyTokenStorage(TokenStorage):  # type: ignore[misc]
             return None
 
     async def set_client_info(self, client_info: Any) -> None:
-        data = self._read()
-        data["client_info"] = json.loads(client_info.model_dump_json())
-        self._write(data)
+        await self.update({"client_info": json.loads(client_info.model_dump_json())})
 
 
 def clear_tokens(server_name: str) -> bool:
     """Delete the stored token file for *server_name*. Returns True if removed."""
     path = _token_file(server_name)
-    if path.exists():
-        try:
+    try:
+        with state_lock(path.with_suffix(".lock")):
+            if not path.exists():
+                return False
             path.unlink()
             return True
-        except OSError as exc:
-            logger.warning("MCP token clear failed for '%s': %s", server_name, exc)
+    except OSError:
+        logger.warning("MCP token clear failed for '%s'", server_name)
     return False
 
 
@@ -186,7 +247,7 @@ def backup_tokens(server_name: str) -> tuple[bool, bytes] | None:
     if not path.exists():
         return False, b""
     try:
-        return True, path.read_bytes()
+        return True, read_private(path)
     except OSError as exc:
         logger.warning("MCP token backup failed for '%s': %s", server_name, exc)
         return None
@@ -198,26 +259,19 @@ def restore_tokens(server_name: str, backup: tuple[bool, bytes]) -> bool:
     path = _token_file(server_name)
     if not existed:
         try:
-            path.unlink(missing_ok=True)
+            with state_lock(path.with_suffix(".lock")):
+                path.unlink(missing_ok=True)
             return True
         except OSError as exc:
             logger.warning("MCP partial-token cleanup failed for '%s': %s", server_name, exc)
             return False
 
-    import secrets
-
-    tmp = path.with_suffix(f".restore.{secrets.token_hex(4)}")
     try:
-        tmp.write_bytes(data)
-        from flowly.utils.file_security import secure_file
-
-        secure_file(tmp)
-        os.replace(str(tmp), str(path))
-        secure_file(path)
+        with state_lock(path.with_suffix(".lock")):
+            atomic_private_write(path, data)
         return True
     except OSError as exc:
         logger.warning("MCP token restore failed for '%s': %s", server_name, exc)
-        tmp.unlink(missing_ok=True)
         return False
 
 
@@ -230,6 +284,7 @@ class _CallbackResult:
     def __init__(self) -> None:
         self.code: str | None = None
         self.state: str | None = None
+        self.iss: str | None = None
         self.error: str | None = None
         self.event = threading.Event()
 
@@ -250,6 +305,7 @@ def _run_callback_server(result: _CallbackResult, timeout: float) -> None:
             params = parse_qs(parsed.query)
             result.code = (params.get("code") or [None])[0]
             result.state = (params.get("state") or [None])[0]
+            result.iss = (params.get("iss") or [None])[0]
             result.error = (params.get("error") or [None])[0]
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -305,6 +361,7 @@ def build_oauth_provider(
     interactive: bool,
     scope: str | None = None,
     callback_timeout: float = OAUTH_CALLBACK_TIMEOUT_SECONDS,
+    allow_same_origin_paths: bool = False,
 ) -> Any | None:
     """Construct an ``OAuthClientProvider`` for *url*, or ``None``.
 
@@ -341,7 +398,7 @@ def build_oauth_provider(
         except Exception:
             pass
 
-    async def _callback_handler() -> tuple[str, str | None]:
+    async def _callback_handler() -> Any:
         if not interactive:
             raise RuntimeError(f"MCP server '{server_name}' needs interactive OAuth callback")
         import asyncio
@@ -375,12 +432,64 @@ def build_oauth_provider(
             raise RuntimeError(f"OAuth callback error: {result.error}")
         if not result.code:
             raise RuntimeError("OAuth callback timed out without a code")
-        return result.code, result.state
+        return AuthorizationCodeResult(code=result.code, state=result.state, iss=result.iss)
 
-    return OAuthClientProvider(
+    from flowly.mcp.oauth_provider import CoordinatedOAuthProvider
+
+    return CoordinatedOAuthProvider(
+        interactive=interactive,
+        server_name=server_name,
+        allow_same_origin_paths=allow_same_origin_paths,
         server_url=url,
         client_metadata=client_metadata,
-        storage=FlowlyTokenStorage(server_name),
+        storage=token_storage_for(server_name, url),
         redirect_handler=_redirect_handler,
         callback_handler=_callback_handler,
     )
+
+
+def token_storage_for(server_name: str, url: str) -> FlowlyTokenStorage:
+    """Only a runtime-owned login context may select a staging credential store."""
+    staged = _active_login.get()
+    if staged is not None and staged._server_name == server_name and staged._url == url:
+        return staged
+    return FlowlyTokenStorage(server_name, url)
+
+
+@contextmanager
+def oauth_login(server_name: str, url: str):
+    """Stage re-authorization; publish only a successfully probed fresh grant.
+
+    Working credentials stay available during login. Failure/cancellation
+    needs no rollback and cannot overwrite another process's newer login.
+    The context follows the existing thread-safe probe submission to its loop.
+    """
+    from flowly.mcp.env_loader import load_flowly_dotenv
+    from flowly.mcp.security import interpolate_env_vars
+
+    load_flowly_dotenv()
+    url = str(interpolate_env_vars({"url": url})["url"]).strip()
+    canonical = FlowlyTokenStorage(server_name, url)
+    original = canonical.snapshot()
+    staged = FlowlyTokenStorage(server_name, url)
+    staged._path = canonical._path.with_name(f".login-{uuid.uuid4().hex}.json")
+
+    class Login:
+        def commit(self) -> None:
+            data = staged.snapshot()
+            if not data.get("tokens"):
+                raise OAuthStateChangedError("OAuth login produced no credentials")
+            canonical._update_sync(data, original.get("revision"))
+
+    context_token = _active_login.set(staged)
+    try:
+        yield Login()
+    finally:
+        _active_login.reset(context_token)
+        # A cancelled cross-loop probe may still be unwinding. Close first,
+        # then synchronize with any short disk write before removing staging.
+        staged._closed = True
+        with state_lock(staged._path.with_suffix(".lock")):
+            staged._path.unlink(missing_ok=True)
+        staged._path.with_suffix(".lock").unlink(missing_ok=True)
+        staged.recovery_path.unlink(missing_ok=True)

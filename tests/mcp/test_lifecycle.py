@@ -67,6 +67,15 @@ def test_protocol_application_errors_do_not_force_reconnect():
     assert is_transport_failure(RuntimeError("tool execution failed")) is False
 
 
+def test_only_exact_terminated_session_error_reconnects_without_oauth_recovery():
+    from mcp.shared.exceptions import MCPError
+
+    assert is_transport_failure(MCPError(code=-32600, message="Session terminated"))
+    assert not is_transport_failure(MCPError(code=-32601, message="Not Found"))
+    assert not is_transport_failure(MCPError(code=-32603, message="Session terminated"))
+    assert not is_transport_failure(RuntimeError("OAuth credentials expired"))
+
+
 def test_half_open_breaker_allows_exactly_one_recovery_probe():
     name = "half-open"
     client._server_error_counts[name] = client._CIRCUIT_BREAKER_THRESHOLD

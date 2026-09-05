@@ -798,6 +798,7 @@ class MCPServerTask:
                 url,
                 interactive=self.interactive,
                 scope=self._config.get("scope") or None,
+                allow_same_origin_paths=self._use_sse(),
             )
             if auth is None:
                 raise ImportError(

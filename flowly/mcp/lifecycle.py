@@ -148,6 +148,15 @@ def is_transport_failure(exc: BaseException) -> bool:
     and explicit closed-session messages.
     """
     for leaf in _exception_leaves(exc):
+        # The SDK maps HTTP 404 *with a negotiated session ID* to this
+        # protocol error. Reconnect that session without touching OAuth state.
+        # A stateless 404/method-not-found is a normal application error.
+        error = getattr(leaf, "error", None)
+        if (
+            getattr(error, "code", None) == -32600
+            and getattr(error, "message", "") == "Session terminated"
+        ):
+            return True
         if isinstance(
             leaf,
             (

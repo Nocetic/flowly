@@ -671,8 +671,8 @@ def login_server(
 ) -> None:
     """Run (or re-run) the OAuth flow for an OAuth-configured HTTP server.
 
-    Clears any cached tokens first so a stuck/expired grant is replaced
-    by a fresh browser authorization.
+    Stage fresh browser authorization and replace credentials only after a
+    successful connection. Failed/cancelled login keeps the current grant.
     """
     config, servers = _config_with_servers()
     if name not in servers:
@@ -690,7 +690,7 @@ def login_server(
         raise typer.Exit(code=1)
 
     try:
-        from flowly.mcp.oauth import clear_tokens, oauth_available
+        from flowly.mcp.oauth import oauth_available, oauth_login
     except Exception as exc:
         console.print(f"[red]OAuth runtime not importable: {exc}[/red]")
         raise typer.Exit(code=1)
@@ -698,9 +698,14 @@ def login_server(
         console.print("[red]This 'mcp' SDK build lacks OAuth support — upgrade the package.[/red]")
         raise typer.Exit(code=1)
 
-    clear_tokens(name)
     console.print(f"[cyan]Starting OAuth flow for {name!r}...[/cyan]")
-    ok, message = _probe(name, entry, interactive=True)
+    try:
+        with oauth_login(name, entry.url) as login:
+            ok, message = _probe(name, entry, interactive=True)
+            if ok:
+                login.commit()
+    except (OSError, RuntimeError) as exc:
+        ok, message = False, str(exc)
     if ok:
         console.print(f"[green]Authenticated. {message}[/green]")
     else:

@@ -268,7 +268,13 @@ def test_oauth_start_restores_previous_tokens_on_failure(
     token_file.write_bytes(original)
 
     async def fail_probe(*args, **kwargs):
-        token_file.write_bytes(b'{"tokens":{"access_token":"partial"}}')
+        from mcp.shared.auth import OAuthToken
+
+        from flowly.mcp.oauth import build_oauth_provider
+
+        assert token_file.read_bytes() == original
+        provider = build_oauth_provider("remote", "https://x/mcp", interactive=True)
+        await provider.storage.set_tokens(OAuthToken(access_token="partial", token_type="Bearer"))
         return False, "authorization denied"
 
     from flowly.mcp import probe
