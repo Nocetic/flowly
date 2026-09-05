@@ -238,6 +238,7 @@ class CodexAppServerClient:
         env: dict[str, str] | None = None,
         client_name: str = "flowly",
         client_version: str = "1.9.9",
+        config_overrides: list[str] | None = None,
     ) -> "CodexAppServerClient":
         """Spawn ``codex app-server`` and complete the initialize handshake.
 
@@ -325,6 +326,7 @@ class CodexAppServerClient:
             self._proc = await asyncio.create_subprocess_exec(
                 resolved_bin,
                 "app-server",
+                *(value for override in (config_overrides or ()) for value in ("-c", override)),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

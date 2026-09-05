@@ -48,6 +48,7 @@ class _Grant:
     names: frozenset[str]
     context: contextvars.Context
     expires_at: float
+    allow_writes: bool = False
     audit_id: str = field(default_factory=lambda: secrets.token_hex(16))
     pending: int = 0
     active: bool = True
@@ -98,13 +99,29 @@ class RuntimeToolBridge:
         return (
             not self._closed and grant.active and time.monotonic() < grant.expires_at
             and name in grant.names
+            and self._permitted(self.owner.tools.get(name), allow_writes=grant.allow_writes)
             and self.owner.tools.is_available(name, **self._route(grant.session_key))
         )
+
+    @staticmethod
+    def _permitted(tool: Any, *, allow_writes: bool) -> bool:
+        from flowly.mcp.tool import MCPTool, _MCPUtilityTool
+
+        if tool is None:
+            return False
+        if isinstance(tool, MCPTool):
+            # Preserve configured MCP integrations through the owning client,
+            # including its consent/OAuth/transport policy, not a second connection.
+            return allow_writes or (tool.annotations or {}).get("readOnlyHint") is True
+        if isinstance(tool, _MCPUtilityTool):
+            return True
+        return tool.name in READ_TOOLS or (allow_writes and tool.name in WRITE_TOOLS)
 
     def create_grant(
         self, session_key: str, *, names: list[str] | None = None,
         allow_writes: bool = False, ttl: float = 3600,
         context: contextvars.Context | None = None,
+        allow_empty: bool = False,
     ) -> dict:
         if self._closed:
             raise ToolBridgeError("Tool runtime is stopped")
@@ -121,18 +138,28 @@ class RuntimeToolBridge:
             raise ToolBridgeError("tools must be a list of at most 64 names")
         if len(self._grants) >= 128:
             raise ToolBridgeError("Too many active tool grants")
-        permitted = READ_TOOLS | (WRITE_TOOLS if allow_writes else frozenset())
+        permitted = frozenset(name for name in self.owner.tools.tool_names if self._permitted(
+            self.owner.tools.get(name), allow_writes=allow_writes,
+        ))
         selected = frozenset(names) if names is not None else permitted
         if not selected <= permitted:
             raise ToolBridgeError("Requested tools exceed the permitted bridge capabilities")
         selected &= frozenset(self.owner.tools.get_available_names(**self._route(session_key)))
-        if not selected:
+        from flowly.agent.tool_context import current_tool_origin
+
+        origin = current_tool_origin()
+        if origin is not None:
+            if origin.session_key != session_key:
+                raise ToolBridgeError("A delegated grant cannot change its owning session")
+            if origin.allowed_tools is not None:
+                selected &= origin.allowed_tools
+        if not selected and not allow_empty:
             raise ToolBridgeError("No requested tools are available in this session")
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode()).hexdigest()
         grant = _Grant(
             session_key, selected, context if context is not None else contextvars.copy_context(),
-            time.monotonic() + ttl,
+            time.monotonic() + ttl, allow_writes=allow_writes,
         )
         self._grants[digest] = grant
         grant.timer = asyncio.get_running_loop().call_later(ttl, self._revoke_digest, digest)
@@ -156,9 +183,11 @@ class RuntimeToolBridge:
             if task is not None and not task.done():
                 task.cancel()
 
-    def revoke(self, token: str) -> None:
-        self._grant(token)
+    def revoke(self, token: str) -> list[asyncio.Task]:
+        grant = self._grant(token)
+        tasks = [task for _, task in grant.calls.values() if task is not None]
         self._revoke_digest(hashlib.sha256(token.encode()).hexdigest())
+        return tasks
 
     def revoke_session(self, session_key: str) -> list[asyncio.Task]:
         """Revoke before deleting the owner; return calls for the owner to drain."""
@@ -198,6 +227,9 @@ class RuntimeToolBridge:
             output = getattr(tool, "output_schema", None)
             if isinstance(output, dict):
                 definition["outputSchema"] = copy.deepcopy(output)
+            annotations = getattr(tool, "annotations", None)
+            if isinstance(annotations, dict):
+                definition["annotations"] = copy.deepcopy(annotations)
             definitions.append(definition)
         return definitions
 
@@ -297,6 +329,13 @@ class RuntimeToolBridge:
             # Context-bearing Board tools are never mutated on the shared
             # registry instance. Their store/orchestrator remains the live one.
             bound = copy.copy(original)
+            from flowly.mcp.tool import MCPTool
+
+            native_mcp = isinstance(bound, MCPTool)
+            if native_mcp:
+                # Keep the public MCP result shape through the registry hooks;
+                # do not turn remote media into internal local-path envelopes.
+                bound._bridge_native_result = True
             if name == "video_analyze":
                 from flowly.agent.media_files import read_media_file
 
@@ -310,11 +349,14 @@ class RuntimeToolBridge:
                 idempotency_key = hashlib.sha256(f"{grant.audit_id}:{request_id}".encode()).hexdigest()
                 bound.set_identity(identity, created_by=identity, request_id=idempotency_key)
             try:
-                result = await asyncio.wait_for(self.owner.tools.execute(
-                    name, arguments, session_key=grant.session_key, **self._route(grant.session_key),
-                    _bound_tool=bound, _dispatch_guard=dispatch_guard,
-                ), timeout=600)
-                return await asyncio.to_thread(self._format_result, name, result)
+                from flowly.agent.tool_context import tool_execution_scope
+
+                with tool_execution_scope(grant.session_key, allowed_tools=grant.names):
+                    result = await asyncio.wait_for(self.owner.tools.execute(
+                        name, arguments, session_key=grant.session_key, **self._route(grant.session_key),
+                        _bound_tool=bound, _dispatch_guard=dispatch_guard,
+                    ), timeout=600)
+                return await asyncio.to_thread(self._format_result, name, result, native_mcp=native_mcp)
             except asyncio.CancelledError:
                 raise
             except ToolBridgeError as exc:
@@ -322,10 +364,17 @@ class RuntimeToolBridge:
             except Exception:
                 return _error(f"Tool '{name}' failed; check the live runtime diagnostics")
 
-    def _format_result(self, name: str, result: Any) -> dict:
+    def _format_result(self, name: str, result: Any, *, native_mcp: bool = False) -> dict:
         text = result if isinstance(result, str) else _json(result)
         if len(text.encode()) > MAX_RESULT_BYTES:
             return _error("Tool result exceeds the bridge response size limit")
+        if native_mcp:
+            try:
+                value = json.loads(text)
+            except (ValueError, TypeError):
+                value = None
+            if isinstance(value, dict) and not value.get("isError") and isinstance(value.get("content"), list):
+                return value
         content = []
         structured = None
         if name in MEDIA_TOOLS:
@@ -369,7 +418,7 @@ class RuntimeToolBridge:
             "image generation error", "voice generation error",
         ))
         if isinstance(structured, dict):
-            is_error |= bool(structured.get("error")) or structured.get("ok") is False or structured.get("success") is False
+            is_error |= bool(structured.get("error")) or structured.get("isError") is True or structured.get("ok") is False or structured.get("success") is False
         if is_error:
             from flowly.mcp.security import sanitize_error
 

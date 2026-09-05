@@ -90,6 +90,8 @@ NOTIFICATION_POLL_TIMEOUT_S: float = 0.25
 # put a tight timeout on it — the loop itself takes minutes);
 # turn/interrupt is best-effort and should return immediately.
 THREAD_START_TIMEOUT_S: float = 15.0
+# Required MCP startup allows 30 seconds, plus local thread initialization.
+MANAGED_THREAD_START_TIMEOUT_S: float = 45.0
 TURN_INTERRUPT_TIMEOUT_S: float = 5.0
 
 # OAuth refresh hint keywords scanned in Codex's stderr when a
@@ -223,7 +225,11 @@ class CodexSessionConfig:
     codex_bin: str = "codex"
     codex_home: str | None = None
     cwd: str | None = None
-    extra_env: dict[str, str] = field(default_factory=dict)
+    extra_env: dict[str, str] = field(default_factory=dict, repr=False)
+    config_overrides: list[str] = field(default_factory=list)
+    auto_accept_callback_elicitation: bool = True
+    managed_tool_callback: bool = False
+    managed_tool_server: dict[str, Any] = field(default_factory=dict, repr=False)
     turn_timeout_s: float = DEFAULT_TURN_TIMEOUT_S
     post_tool_quiet_timeout_s: float = POST_TOOL_QUIET_TIMEOUT_S
     client_name: str = "flowly"
@@ -269,6 +275,7 @@ class CodexSession:
         # so a stale session can resume the same thread across
         # Flowly restarts.
         self._thread_id: str | None = None
+        self._thread_loaded = False
         # Codex turn id for the IN-FLIGHT turn (or the most recently
         # completed one). Used to scope turn/interrupt so a stale
         # interrupt doesn't tear down a turn that already replaced
@@ -295,6 +302,7 @@ class CodexSession:
         clears the id and forces a fresh thread/start on next run.
         """
         self._thread_id = thread_id
+        self._thread_loaded = False
 
     def set_initial_reasoning_items(
         self, items: list[dict[str, Any]],
@@ -332,6 +340,7 @@ class CodexSession:
             env=self._config.extra_env or None,
             client_name=self._config.client_name,
             client_version=self._config.client_version,
+            config_overrides=self._config.config_overrides or None,
         )
         return self._client
 
@@ -416,7 +425,7 @@ class CodexSession:
             result.should_retire = True
             return result
         except asyncio.TimeoutError:
-            result.error = (
+            result.error = "timed out initializing the managed thread or MCP tools" if self._config.managed_tool_callback else (
                 f"timed out starting Codex turn "
                 f"({THREAD_START_TIMEOUT_S}s)"
             )
@@ -446,7 +455,8 @@ class CodexSession:
         """Send the right thread/start or turn/start request.
 
         First turn → ``thread/start`` (creates a new Codex thread).
-        Subsequent turns → ``turn/start`` (resumes the existing one).
+        Stored thread in a new process → ``thread/resume``, then ``turn/start``.
+        Subsequent turns in the same process → ``turn/start``.
 
         On first turn we also pass the reasoning_items seed if the
         session was resumed from disk. On subsequent turns we ship
@@ -472,16 +482,31 @@ class CodexSession:
         # First call in a session does both back-to-back; subsequent
         # calls only need turn/start because the thread is already
         # alive.
-        # Whether we're resuming a stored thread (vs creating one now). A
-        # resumed thread can be stale: codex app-server threads live with the
-        # subprocess, so a gateway restart / session retirement / a thread
-        # created by a different codex process leaves the persisted id
-        # dangling, and turn/start then fails "thread not found". When that
-        # happens we drop the dead thread and start fresh instead of erroring.
+        # Keep the legacy missing-turn recovery for a previously loaded thread.
+        # Failure to resume persisted history itself is surfaced, not discarded.
         was_resuming = self._thread_id is not None
 
         if self._thread_id is None:
             await self._do_thread_start(client)
+        elif not self._thread_loaded:
+            # A stored id is not loaded in a newly spawned process. Resume it
+            # explicitly before turn/start so process recycling retains history.
+            params: dict[str, Any] = {"threadId": self._thread_id}
+            if self._config.cwd:
+                params["cwd"] = self._config.cwd
+            if self._config.managed_tool_callback:
+                from flowly.codex.live_tools import thread_tool_overrides
+
+                params["config"] = await thread_tool_overrides(client, self._config.cwd, self._config.managed_tool_server)
+            await client.request("thread/resume", params, timeout=(
+                MANAGED_THREAD_START_TIMEOUT_S if self._config.managed_tool_callback else THREAD_START_TIMEOUT_S
+            ))
+            self._thread_loaded = True
+
+        if self._config.managed_tool_callback:
+            from flowly.codex.live_tools import verify_thread_tools
+
+            await verify_thread_tools(client, self._thread_id, set(self._config.managed_tool_server.get("enabled_tools", [])))
 
         # Always send turn/start after the thread exists — this is
         # the call that actually kicks off the model and the
@@ -500,6 +525,8 @@ class CodexSession:
                 self._reasoning_items = []
                 input_items = self._build_input_items(user_input)
                 await self._do_thread_start(client)
+                if self._config.managed_tool_callback:
+                    await verify_thread_tools(client, self._thread_id, set(self._config.managed_tool_server.get("enabled_tools", [])))
                 turn_result = await self._do_turn_start(client, input_items)
             else:
                 raise
@@ -517,8 +544,14 @@ class CodexSession:
         start_params: dict[str, Any] = {}
         if self._config.cwd:
             start_params["cwd"] = self._config.cwd
+        if self._config.managed_tool_callback:
+            from flowly.codex.live_tools import thread_tool_overrides
+
+            start_params["config"] = await thread_tool_overrides(client, self._config.cwd, self._config.managed_tool_server)
         result = await client.request(
-            "thread/start", start_params, timeout=THREAD_START_TIMEOUT_S,
+            "thread/start", start_params, timeout=(
+                MANAGED_THREAD_START_TIMEOUT_S if self._config.managed_tool_callback else THREAD_START_TIMEOUT_S
+            ),
         )
         thread_id = self._extract_thread_id(result)
         if not thread_id:
@@ -526,6 +559,7 @@ class CodexSession:
                 f"thread/start returned no thread id: {result!r}"
             )
         self._thread_id = thread_id
+        self._thread_loaded = True
 
     async def _do_turn_start(
         self, client: CodexAppServerClient, input_items: list[dict[str, Any]],
@@ -800,7 +834,7 @@ class CodexSession:
         # via Codex's own flow.
         if method == "mcpServer/elicitation/request":
             server_name = params.get("serverName") or params.get("server") or ""
-            if server_name == "flowly-tools":
+            if server_name == "flowly-tools" and self._config.auto_accept_callback_elicitation:
                 await client.respond(
                     req_id, {"action": "accept", "content": None, "_meta": None},
                 )

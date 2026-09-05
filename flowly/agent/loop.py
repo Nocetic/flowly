@@ -2979,6 +2979,14 @@ class AgentLoop:
             session_key_getter=lambda: self._codex_active_session_key,
         )
 
+        from flowly.mcp.server.managed_tools import managed_tool_launch
+
+        def tool_bridge_factory(session_key):
+            return managed_tool_launch(
+                self, session_key, allow_writes=codex_cfg.sandbox != "read-only",
+                ttl=min(28800, max(60, float(codex_cfg.turn_timeout_s) + 60)),
+            )
+
         self.tools.register(CodexSessionTool(
             config=runtime_cfg,
             session_accessor=_codex_session_accessor,
@@ -2991,6 +2999,7 @@ class AgentLoop:
             ),
             active_session_key_getter=lambda: self._codex_active_session_key,
             approval_callback=approval_cb,
+            tool_bridge_factory=tool_bridge_factory if getattr(codex_cfg, "expose_flowly_tools", True) else None,
         ))
         logger.info(f"codex_session tool registered (sandbox={runtime_cfg.sandbox})")
 

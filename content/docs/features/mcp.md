@@ -233,8 +233,13 @@ Configure any compatible stdio MCP client with the executable and arguments:
 The default grant can expose web search/fetch/extract, video/image analysis,
 skill lookup/listing and Board list/get **only where registered and enabled**.
 `--allow-writes` additionally permits image/voice generation and Board add,
-update and run. Repeat `--tool` to narrow either set. Browser automation,
-shell access and arbitrary registry tools are not exposed by this bridge.
+update and run. Repeat `--tool` to narrow either set. Flowly's built-in browser,
+shell and arbitrary non-MCP registry tools are not exposed by this bridge.
+Registered third-party MCP tools are also available through the owning Flowly
+client: read-only grants include only tools declaring `readOnlyHint: true`,
+plus enabled resource/prompt utilities. Other remote tools require a write
+grant. These annotations are server claims, not an operating-system sandbox;
+Flowly's existing trust, consent, tool filters and OAuth policy still apply.
 Analysis and generation can incur charges on the user's configured providers.
 Image analysis uses the selected live chat model without silently substituting
 another; a model without image support returns an error. Speech keeps the
@@ -250,11 +255,35 @@ availability and pre-tool hooks are enforced again before dispatch.
 
 This endpoint is loopback-only. It is a protocol permission boundary, **not an
 OS sandbox against another process running as the same user**. The public
-launcher currently targets the advertised standalone gateway. Managed coding
-sessions still use their existing callback; automatic per-turn grant injection
-and parent-policy propagation are not yet implemented. Internally supplied
-grants can retain the owning profile's reverse-RPC context, but the launcher
-does not discover profile runtimes or choose a Desktop broker on its own.
+launcher targets the advertised standalone gateway; it does not discover profile
+runtimes or choose a Desktop broker on its own.
+
+Managed coding sessions (`tools.codexSession.exposeFlowlyTools: true`) instead
+receive a fresh, private loopback callback for each turn. This works without
+an advertised gateway, including TUI and named-profile execution. The callback
+uses the parent's live registry and captured profile/Board reverse-RPC owner.
+Its exact tool grant intersects the parent's per-turn permissions; read-only
+sandbox settings also exclude write-capable tools. Empty grants stay empty.
+No session key in a model-authored argument can change the owner.
+
+The managed client gets temporary configuration overrides. Other direct MCP
+connections, account-backed apps and plugins are disabled in the delegated
+client; registered
+Flowly MCP integrations remain reachable through the callback, with the parent
+client's policies. Before a model turn starts, MCP discovery must contain the
+callback and exactly its granted tool names, with no extra active server tools.
+Unsupported client configuration/protocols fail explicitly rather than falling
+back to an unrestricted or stateless callback.
+
+The transient credential is inherited via an environment variable, not written
+to configuration or argv. Managed launches disable shell snapshots and clear
+that variable for ordinary shell commands. Existing configuration/model choices
+are not rewritten by these per-turn overrides (the separate legacy enable/boot
+migration still manages its existing configuration block). Successful completion,
+cancellation and errors revoke authority before process teardown. The next turn
+starts a new process with a new grant and explicitly resumes stored conversation
+history. This adds startup overhead but prevents stale warm-process authority;
+missing stored history is reported rather than silently replaced.
 
 Operational limits: one-hour grants by default (maximum eight hours), 128
 active grants, four executing/eight pending calls per grant, 16 executing/64

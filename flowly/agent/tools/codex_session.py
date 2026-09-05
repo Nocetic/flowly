@@ -55,6 +55,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import replace
 from typing import Any, Awaitable, Callable
 
 from flowly.agent.tools.base import Tool
@@ -181,6 +182,7 @@ class CodexSessionTool(Tool):
         session_store_set: SessionSetter,
         active_session_key_getter: Callable[[], str] = lambda: "",
         approval_callback: Any = None,
+        tool_bridge_factory: Any = None,
     ) -> None:
         self._config = config
         self._session_accessor = session_accessor
@@ -194,6 +196,8 @@ class CodexSessionTool(Tool):
         # default (auto-decline inside CodexSession). The loop wires
         # this in production; tests can leave it None.
         self._approval_callback = approval_callback
+        self._tool_bridge_factory = tool_bridge_factory
+        self._active_calls: set[str] = set()
 
     # ── Tool ABC surface ─────────────────────────────────────────────
 
@@ -266,9 +270,12 @@ class CodexSessionTool(Tool):
         rest of the tool surface follows the same convention.
         """
         # Resolve which Flowly session is firing this tool. The
-        # active_session_key_getter is set by the loop on a per-turn
-        # basis so concurrent sessions don't cross-contaminate.
-        session_key = self._active_session_key_getter() or ""
+        # task-local registry owner wins over the legacy active-chat getter;
+        # concurrent delegated turns must never share mutable global ownership.
+        from flowly.agent.tool_context import current_tool_origin
+
+        origin = current_tool_origin()
+        session_key = origin.session_key if origin else self._active_session_key_getter() or ""
         if not session_key:
             # Defensive — shouldn't happen in production but tests
             # can hit this if they exercise the tool in isolation.
@@ -277,6 +284,31 @@ class CodexSessionTool(Tool):
                 hint="this is a Flowly internal error — please report it",
             )
 
+        if session_key in self._active_calls:
+            return _err("A coding turn is already running for this session")
+        self._active_calls.add(session_key)
+        try:
+            if self._tool_bridge_factory is None:
+                return await self._execute_session(session_key, kwargs)
+            from flowly.mcp.server.tool_runtime import ToolBridgeError
+
+            try:
+                async with self._tool_bridge_factory(session_key) as launch:
+                    metadata = self._session_accessor(session_key)
+                    await self._reset_session(session_key, metadata, keep_thread=True)
+                    try:
+                        return await self._execute_session(session_key, kwargs, launch=launch)
+                    finally:
+                        launch.withdraw()
+                        # The lease is revoked when this scope exits. A future
+                        # call gets a new process/grant but resumes saved history.
+                        await self._reset_session(session_key, metadata, keep_thread=True)
+            except ToolBridgeError as exc:
+                return _err(str(exc))
+        finally:
+            self._active_calls.discard(session_key)
+
+    async def _execute_session(self, session_key: str, kwargs: dict, *, launch=None) -> str:
         task = (kwargs.get("task") or "").strip()
         if not task:
             return _err(
@@ -307,10 +339,22 @@ class CodexSessionTool(Tool):
         # ── Resolve or create the CodexSession ─────────────────────
         codex_session = self._session_store_get(session_key)
         if codex_session is None or codex_session.retired:
+            build_kwargs = {}
+            if launch is not None:
+                from flowly.codex.live_tools import callback_overrides, callback_server_config
+
+                build_kwargs["config_override"] = replace(
+                    self._config, extra_env={**self._config.extra_env, **launch.env},
+                    config_overrides=[*self._config.config_overrides, *callback_overrides(launch)],
+                    auto_accept_callback_elicitation=False,
+                    managed_tool_callback=True,
+                    managed_tool_server=callback_server_config(launch),
+                )
             codex_session = self._build_codex_session(
                 metadata=metadata,
                 cwd_override=cwd_override,
                 session_key=session_key,
+                **build_kwargs,
             )
             self._session_store_set(session_key, codex_session)
 
@@ -329,11 +373,16 @@ class CodexSessionTool(Tool):
             # TurnResult.error. Treat this as a fatal session
             # crash, retire, and surface a clear error.
             logger.exception("[codex_session] turn raised unexpectedly")
+            if launch is not None:
+                launch.withdraw()
             await self._reset_session(session_key, metadata)
             return _err(
                 f"Codex session crashed: {exc}",
                 hint="the session was retired; the next call will spawn a fresh one",
             )
+        finally:
+            if launch is not None:
+                launch.withdraw()
 
         # ── Persist updated thread id / reasoning state ─────────────
         if turn.thread_id:
@@ -385,6 +434,7 @@ class CodexSessionTool(Tool):
         metadata: dict[str, Any],
         cwd_override: str | None,
         session_key: str = "",
+        config_override: CodexSessionConfig | None = None,
     ) -> CodexSession:
         """Construct a fresh CodexSession, seeded from metadata.
 
@@ -406,22 +456,11 @@ class CodexSessionTool(Tool):
             if pinned is not None:
                 cwd_override = str(pinned)
 
-        config = self._config
+        config = config_override or self._config
         if cwd_override:
             # Build a shallow-modified copy so per-call cwd overrides
             # don't leak into the session-wide config.
-            config = CodexSessionConfig(
-                codex_bin=self._config.codex_bin,
-                codex_home=self._config.codex_home,
-                cwd=cwd_override,
-                extra_env=dict(self._config.extra_env),
-                turn_timeout_s=self._config.turn_timeout_s,
-                post_tool_quiet_timeout_s=self._config.post_tool_quiet_timeout_s,
-                client_name=self._config.client_name,
-                client_version=self._config.client_version,
-                approval_policy=self._config.approval_policy,
-                sandbox=self._config.sandbox,
-            )
+            config = replace(config, cwd=cwd_override, extra_env=dict(config.extra_env))
 
         session = CodexSession(
             config=config,

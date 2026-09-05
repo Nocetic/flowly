@@ -452,9 +452,9 @@ class TestSubsequentTurns:
         await session.run_turn("resumed turn")
 
         methods = [r[0] for r in fake.requests]
-        # No thread/start — resume via turn/start directly.
+        # A new process must load the saved thread before starting its turn.
         assert "thread/start" not in methods
-        assert "turn/start" in methods
+        assert methods[:2] == ["thread/resume", "turn/start"]
 
         # The persisted reasoning blob is replayed on the new turn.
         turn_start = next(r for r in fake.requests if r[0] == "turn/start")

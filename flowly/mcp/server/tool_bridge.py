@@ -43,7 +43,10 @@ async def _read_json(stream, limit: int) -> dict:
     return body
 
 
-def register_tool_bridge_routes(app: Any, bridge: RuntimeToolBridge, *, admin_token: str | None) -> None:
+def register_tool_bridge_routes(
+    app: Any, bridge: RuntimeToolBridge, *, admin_token: str | None,
+    close_on_shutdown: bool = True,
+) -> None:
     from aiohttp import web
 
     body_readers = 0
@@ -168,7 +171,8 @@ def register_tool_bridge_routes(app: Any, bridge: RuntimeToolBridge, *, admin_to
     app.router.add_get(f"{_PREFIX}/list", listing)
     app.router.add_post(f"{_PREFIX}/call", call)
     app.router.add_post(f"{_PREFIX}/cancel", cancel)
-    app.on_shutdown.append(shutdown)
+    if close_on_shutdown:
+        app.on_shutdown.append(shutdown)
 
 
 def _validate_endpoint(endpoint: str) -> str:

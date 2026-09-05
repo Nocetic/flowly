@@ -663,7 +663,6 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found"
-
         if not isinstance(params, dict):
             return f"Error: Invalid parameters for tool '{name}'"
 
@@ -720,6 +719,14 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found"
+        from flowly.agent.tool_context import current_tool_origin
+
+        origin = current_tool_origin()
+        if (
+            origin and (session_key is None or origin.session_key == session_key)
+            and origin.allowed_tools is not None and name not in origin.allowed_tools
+        ):
+            return f"Error: Tool '{name}' exceeds the calling session's permissions"
         if not self.is_available(
             name,
             platform=platform,
@@ -761,7 +768,13 @@ class ToolRegistry:
                 if type(_bound_tool) is not type(tool) or _bound_tool.name != name:
                     return f"Error: Invalid runtime binding for '{name}'"
                 tool = _bound_tool
-            with tool_execution_scope(session_key):
+            allowed_names = frozenset(self.get_available_names(
+                platform=platform, enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets, disabled_tools=disabled_tools,
+            ))
+            if name not in allowed_names:
+                return f"Error: Tool '{name}' permission changed before dispatch"
+            with tool_execution_scope(session_key, allowed_tools=allowed_names):
                 result = await tool.execute(**_drop_unexpected_kwargs(tool, params))
         except Exception as e:
             result = f"Error executing {name}: {str(e)}"

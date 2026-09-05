@@ -12,7 +12,7 @@ on `codex/mcp-enterprise`; merging and publishing are outside this task.
   messages, without arbitrary filesystem access or losing archive history.
 - [x] External clients can discover known channel targets with exact session
   addresses and configured enabled state (not a promise of live delivery).
-- [ ] The coding-agent tool bridge exposes vision/image, speech, and
+- [x] The coding-agent tool bridge exposes vision/image, speech, and
   task-board capabilities where available, preserving authoritative schemas and
   execution permissions. Stateful tools reach the owning live runtime.
 - [x] MCP server requests for user input/consent reach the owning surface;
@@ -157,7 +157,7 @@ replacement during the secure open. Public CLI tests uncovered loss of `-m`
 during sandbox re-execution; `tests/test_sandbox_cli.py` now pins preservation
 of module/interpreter flags without changing sandbox permissions.
 
-**The tool-bridge acceptance checkbox remains open.** Automatic per-turn grant
+At this historical checkpoint, the tool-bridge acceptance checkbox remained open. Automatic per-turn grant
 injection into managed coding sessions, propagation of the parent's structured/
 exclusive tool restrictions, and end-to-end managed profile wiring remain
 required. The public launcher only discovers the standalone gateway today;
@@ -179,3 +179,54 @@ All gateway/provider tests use isolated temporary state; this work does not
 deploy the branch to the user's running gateway. The final diagnostics audit
 still needs missing/malformed local-media transport cases and structured
 provider credential errors beyond the tested bearer/key patterns.
+
+### Managed per-turn tool authority
+
+Managed coding turns now receive a fresh live-runtime grant, constrained by
+the registry's task-local owner, parent tool permissions and read-only sandbox
+ceiling. The private listener needs no advertised gateway. Captured profile
+context reaches the existing shared Board reverse-RPC adapter; another socket
+cannot satisfy the request. Nested registry dispatch cannot widen the caller's
+tool set. Concurrent sessions keep independent authority, and an overlapping
+turn in the same coding session is rejected.
+
+The managed client uses launch/thread overrides, disables other direct MCP
+connections/plugins for that thread, and verifies the exact callback tool list
+before starting a model turn. Registered third-party MCP tools are proxied
+through Flowly's existing client, retaining consent, schema, native content and
+transport policy. Read-only grants recheck remote annotations at dispatch.
+The bridge is still a protocol boundary, not protection from arbitrary code
+running with the user's full operating-system privileges.
+
+`tests/mcp/test_managed_tools.py` exercises generic SDK stdio, real loopback
+HTTP, the owning registry and named-profile Board adapter, third-party MCP
+consent, native media/output schemas, cancellation/teardown ordering, empty
+grants, catalog validation and packaged-executable selection. It also launches
+the installed coding client against isolated configuration: a real MCP Board
+call succeeds, stale callback paths/filters/profile variables are overridden,
+other direct connections are disabled, and disk configuration is unchanged.
+
+A second real-client test runs two turns in separate processes using a local
+fixed-response HTTP provider (no paid model calls). It verifies history resumes,
+grants rotate, the second turn can have zero granted tools, and the configured
+model stays unchanged. Scanning the client's temporary state caught inherited
+credentials in shell snapshots; managed launches now disable snapshotting and
+clear the lease variable for ordinary shells. The test scans all client state
+files to ensure neither transient credential was persisted.
+
+The targeted managed suite contains **31 tests**; together with the session
+suite, **54 passed**. It also exercises the actual agent-loop registration and
+read-only configuration, disables account-backed app/plugin MCP sources in the
+private child, and bounds the complete catalog verification with one deadline.
+This is local macOS
+transport/runtime evidence, not proof of every third-party client version,
+paid provider, compiled Desktop binary or operating system. The separate
+manifest/lifecycle, natural-language policy, diagnostics and final acceptance
+requirements remain open. No merge, push or live-gateway deployment was done.
+
+Final regression for this change: `uv run pytest -q` — **5066 passed,
+1 skipped, 12 deselected** in 109.07 seconds, with 11 existing warnings.
+The installed coding client used for the real-process tests is 0.149.0.
+Targeted Ruff checks and `git diff --check` pass. The modified broad loop,
+registry and existing session-test modules retain their same 36 pre-existing
+Ruff findings, verified against the committed baseline.

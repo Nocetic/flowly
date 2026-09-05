@@ -222,6 +222,10 @@ def build_codex_approval_callback(
     adds a new approval surface defaults to safe behaviour.
     """
     async def _callback(req: dict[str, Any]) -> dict[str, Any]:
+        from flowly.agent.tool_context import current_tool_origin
+
+        origin = current_tool_origin()
+        session_key = origin.session_key if origin else session_key_getter() or ""
         method = req.get("method", "")
         params = req.get("params") or {}
 
@@ -231,10 +235,8 @@ def build_codex_approval_callback(
             return {"decision": "decline"}
 
         if method == _COMMAND_APPROVAL:
-            session_key = session_key_getter() or ""
             pending = _build_pending_for_command(params, session_key)
         elif method == _FILE_CHANGE_APPROVAL:
-            session_key = session_key_getter() or ""
             pending = _build_pending_for_file_change(params, session_key)
         else:
             # Unknown approval surface — decline so Codex moves on.

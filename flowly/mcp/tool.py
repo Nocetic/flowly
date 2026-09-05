@@ -252,6 +252,10 @@ class MCPTool(Tool):
 
     def _format_result(self, result: Any) -> str:
         """Render an MCP ``CallToolResult`` into the agent's JSON envelope."""
+        if getattr(self, "_bridge_native_result", False):
+            # Only a context-bound runtime copy sets this flag. Returning the
+            # wire JSON still lets ordinary registry hooks block/transform it.
+            return json.dumps(mcp_wire_value(result), ensure_ascii=False)
         is_error = bool(mcp_attr(result, "is_error", "isError", False))
         content_blocks = getattr(result, "content", None) or []
         rendered = render_content_blocks(
