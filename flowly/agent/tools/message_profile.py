@@ -1,4 +1,4 @@
-"""Profile-to-profile messaging through the authenticated Desktop broker."""
+"""Profile-to-profile messaging through the current run's authenticated host."""
 
 from __future__ import annotations
 
@@ -52,11 +52,9 @@ class MessageProfileTool(Tool):
     def toolset(self) -> str:
         return "delegation"
 
-    @property
-    def supported_platforms(self) -> frozenset[str]:
-        return frozenset({"desktop"})
-
     def is_available(self) -> bool:
+        # Turn authority is enforced by the loop and the execution endpoint,
+        # not this cached registry probe or a client-platform allowlist.
         return self._gateway is not None
 
     async def execute(self, target_profile: str, message: str) -> str:

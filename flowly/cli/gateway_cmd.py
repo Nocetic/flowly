@@ -1856,6 +1856,7 @@ Respond to the user now:"""
     from flowly.agent.tools.message_profile import MessageProfileTool
 
     agent.tools.register(MessageProfileTool(gateway_server))
+    agent.set_profile_collaboration_host(gateway_server.profile_host)
 
     # Named profiles keep private automatic context artifacts in their own
     # state directory, while their model-facing Board/Artifact tools operate

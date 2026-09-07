@@ -96,6 +96,7 @@ async def test_profile_reverse_rpc_accepts_only_owning_socket() -> None:
         assert sent["params"] == {
             "sourceProfile": "alpha",
             "sourceSessionKey": "desktop:source",
+            "sourceRunId": "correlation-1",
             "targetProfile": "beta",
             "message": "Review this",
             "correlationId": "correlation-1",
