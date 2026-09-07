@@ -17,6 +17,14 @@ _PROBE_SHUTDOWN_GRACE_SECONDS = 30.0
 _POST_AUTH_CONNECT_GRACE_SECONDS = 60.0
 
 
+class ProbedTools(list[str]):
+    """List-compatible discovery result with explicitly advertised utilities."""
+
+    def __init__(self, names, *, resources: bool = False, prompts: bool = False):
+        super().__init__(names)
+        self.capabilities = {"resources": resources, "prompts": prompts}
+
+
 def _submit_probe(
     name: str,
     cfg_dump: dict,
@@ -99,7 +107,14 @@ def _submit_probe(
         task.interactive = interactive
         try:
             await task.start(cfg)
-            return [getattr(tool, "name", "?") for tool in task.tools]
+            caps = task.capabilities
+            def advertised(key: str) -> bool:
+                value = caps.get(key) if isinstance(caps, dict) else getattr(caps, key, None)
+                return value is not None and value is not False
+            return ProbedTools(
+                [getattr(tool, "name", "?") for tool in task.tools],
+                resources=advertised("resources"), prompts=advertised("prompts"),
+            )
         finally:
             await task.shutdown()
 

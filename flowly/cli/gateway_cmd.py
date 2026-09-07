@@ -1763,6 +1763,10 @@ Respond to the user now:"""
             lambda: agent.tools,
             on_tool_access_reload,
         )
+        _feature_rpc.set_mcp_connection_runtime(
+            lambda: agent.tools, on_tool_access_reload,
+            external_provider=lambda: getattr(getattr(agent, "_gateway_server", None), "_external_mcp_service", None),
+        )
         # Board RPC (board.snapshot / board.action) over relay + gateway.
         _feature_rpc.set_board_provider(
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None))
@@ -2598,6 +2602,8 @@ Respond to the user now:"""
         finally:
             # Graceful shutdown
             console.print("[dim]Cleaning up...[/dim]")
+            from flowly.channels import feature_rpc as _feature_rpc
+            await _feature_rpc.close_mcp_connection_runtime()
             if voice_plugin:
                 await voice_plugin.stop()
             if _watch_task is not None:

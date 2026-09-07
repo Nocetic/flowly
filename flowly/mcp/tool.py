@@ -378,6 +378,8 @@ class _MCPUtilityTool(Tool):
             cfg = getattr(self._server_task, "_config", None)
             if isinstance(cfg, dict) and (
                 not (cfg.get("tools") or {}).get(family)
+                or getattr(self._server_task, "_retiring", False)
+                or (cfg.get("tools") or {}).get("mode", "legacy") not in {"legacy", "all", "selected"}
                 or not _capability_advertised(self._server_task, family)
             ):
                 raise MCPContractChangedError(

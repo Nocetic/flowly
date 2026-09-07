@@ -64,6 +64,9 @@ async def _cors_middleware(request: web.Request, handler: Callable) -> web.Strea
     OPTIONS preflights short-circuit before the route handler runs so we
     don't 404 on routes that are GET/POST-only.
     """
+    # External MCP has its own strict Origin/auth checks, including OPTIONS.
+    if request.path == "/mcp":
+        return await handler(request)
     if request.method == "OPTIONS":
         return web.Response(
             status=204,
@@ -766,6 +769,11 @@ class GatewayServer:
             from flowly.mcp.server.tool_bridge import register_tool_bridge_routes
 
             register_tool_bridge_routes(app, bridge, admin_token=self._control_token)
+        external = getattr(self, "_external_mcp_service", None)
+        if external is not None:
+            from flowly.mcp.server.external_http import register_external_mcp_route
+
+            register_external_mcp_route(app, external)
         return app
 
     # ------------------------------------------------------------------
@@ -792,6 +800,7 @@ class GatewayServer:
         "/api/mcp/tools/grants", "/api/mcp/tools/grant", "/api/mcp/tools/list",
         "/api/mcp/tools/call", "/api/mcp/tools/cancel",
         "/control/messages/send", "/control/approvals", "/control/approvals/resolve",
+        "/mcp",
     })
 
     def _make_auth_middleware(self):
@@ -5169,6 +5178,9 @@ class GatewayServer:
             if not sockets:
                 raise RuntimeError("gateway started without a listening socket")
             self.port = int(sockets[0].getsockname()[1])
+        external = getattr(self, "_external_mcp_service", None)
+        if external is not None:
+            external.local_endpoint = f"http://127.0.0.1:{self.port}/mcp"
         if self.on_chat_message:
             self._tick_task = asyncio.create_task(self._tick_loop())
         # Advertise the MCP control endpoint for `flowly mcp serve`.

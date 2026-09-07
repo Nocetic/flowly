@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
+import re
 import time
 from typing import Any
 
@@ -36,9 +38,50 @@ from mcp.shared.auth import (
 from flowly.mcp.oauth import FlowlyTokenStorage, OAuthStateChangedError
 from flowly.mcp.oauth_state import recovery_lease
 
+_OAUTH_ERROR_BODY_LIMIT = 16 * 1024
+_OAUTH_ERROR_READ_TIMEOUT_SECONDS = 2.0
+# RFC 6749 section 5.2. Never render arbitrary error/error_description values:
+# providers may echo credentials or user-controlled input into either field.
+_TOKEN_ERROR_CODES = frozenset({
+    "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client",
+    "unsupported_grant_type", "invalid_scope",
+})
+_TOKEN_ERROR_FIELDS = (
+    "client_id", "client_secret", "code", "code_verifier", "redirect_uri", "grant_type", "resource", "scope",
+)
+
 
 class OAuthRecoveryError(RuntimeError):
     """Safe diagnostic: never includes response bodies or credential values."""
+
+
+async def _token_error_detail(response: httpx2.Response) -> str | None:
+    """Best-effort diagnostic; a broken/slow body must not mask the HTTP error."""
+    try:
+        async with asyncio.timeout(_OAUTH_ERROR_READ_TIMEOUT_SECONDS):
+            content = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(content) + len(chunk) > _OAUTH_ERROR_BODY_LIMIT:
+                    return None
+                content.extend(chunk)
+            # Match aread() after consuming the stream, without an unbounded read.
+            response._content = bytes(content)
+            body = json.loads(content)
+        code = body.get("error") if isinstance(body, dict) else None
+        if not isinstance(code, str) or code not in _TOKEN_ERROR_CODES:
+            return None
+        # Report only fixed parameter names mentioned by the provider, never
+        # their values or its free-form description. A mention is context, not
+        # proof that the corresponding field caused the failure.
+        description = body.get("error_description")
+        fields = []
+        if isinstance(description, str):
+            fields = [field for field in _TOKEN_ERROR_FIELDS if re.search(
+                rf"(?<![\w-]){field}(?![\w-])", description, flags=re.IGNORECASE,
+            )]
+        return f"{code} (provider fields: {', '.join(fields)})" if fields else code
+    except (httpx2.HTTPError, httpx2.StreamError, ValueError, RecursionError, TimeoutError):
+        return None
 
 
 def _model(cls, value):
@@ -134,7 +177,18 @@ class CoordinatedOAuthProvider(OAuthClientProvider):
 
     async def _handle_token_response(self, response: httpx2.Response) -> None:
         if response.status_code not in {200, 201}:
-            raise OAuthRecoveryError(f"OAuth token exchange failed (HTTP {response.status_code})")
+            diagnostic = await _token_error_detail(response)
+            detail = f": {diagnostic}" if diagnostic else ""
+            info = self.context.client_info
+            if diagnostic and info is not None:
+                method = info.token_endpoint_auth_method
+                if method is None:
+                    method = "unspecified"
+                elif method not in {"none", "client_secret_basic", "client_secret_post"}:
+                    method = "other"
+                presence = "yes" if info.client_secret else "no"
+                detail += f" [client_auth={method}; secret_present={presence}]"
+            raise OAuthRecoveryError(f"OAuth token exchange failed (HTTP {response.status_code}){detail}")
         token = await self._parse_token(response)
         if token.scope is None:
             token.scope = self.context.client_metadata.scope

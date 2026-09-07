@@ -240,6 +240,61 @@ def connections_set(params: dict) -> dict:
 # next agent boot, so mutations are restart-aware like connections.set.
 
 
+_mcp_connection_service = None
+
+
+def set_mcp_connection_runtime(registry_provider, reload_config=None, *, external_provider=None) -> None:
+    """Bind owner connection operations to this exact profile runtime."""
+    from flowly.config.loader import get_config_path
+    from flowly.mcp.connections import MCPConnectionService
+
+    global _mcp_connection_service
+    if _mcp_connection_service is not None:
+        raise RuntimeError("Close the previous MCP connection service before rebinding")
+    _mcp_connection_service = MCPConnectionService(
+        get_config_path(), registry_provider, reload_config, external_provider=external_provider,
+    )
+
+
+async def close_mcp_connection_runtime() -> None:
+    global _mcp_connection_service
+    service = _mcp_connection_service
+    if service is not None:
+        await service.close()
+        if _mcp_connection_service is service:
+            _mcp_connection_service = None
+
+
+def mcp_capabilities() -> dict:
+    from flowly.mcp.oauth import oauth_available
+
+    available = _mcp_connection_service is not None and not _mcp_connection_service.manager._closed
+    return {
+        "version": 1, "connectionSetup": available,
+        "nativeOAuth": available and oauth_available(), "liveReconfigure": available,
+        "explicitPermissions": available, "setupTimeoutSeconds": 600,
+        "chatSetup": available,
+        "externalAgentAccess": bool(available and _mcp_connection_service.external is not None
+                                    and not _mcp_connection_service.external._closed),
+    }
+
+
+def _mcp_connection_handler(action: str):
+    async def handle(params: dict) -> dict:
+        from flowly.mcp.setup import MCPSetupError
+
+        service = _mcp_connection_service
+        if service is None:
+            raise FeatureRpcError("UNAVAILABLE", "Start or update this agent to manage MCP connections")
+        try:
+            return await service.invoke(action, params)
+        except MCPSetupError as exc:
+            # Electron preserves a rejected IPC message but not custom error
+            # fields. Keep the code recoverable across every owner transport.
+            raise FeatureRpcError(exc.code, f"[{exc.code}] {exc}") from None
+    return handle
+
+
 def _mcp_entry_dict(e) -> dict:
     """Serialise an ``MCPServerEntry`` for the wire (camelCase)."""
     return {
@@ -4561,6 +4616,22 @@ _DISPATCH: dict[str, tuple] = {
     "pet.disable": (pet_disable, True, False),
     "pet.scale": (pet_scale, True, False),
     "pet.thumb": (pet_thumb, True, False),
+    "mcp.capabilities": (mcp_capabilities, False, False),
+    "mcp.connections.list": (_mcp_connection_handler("list"), True, False),
+    "mcp.connections.action": (_mcp_connection_handler("action"), True, False),
+    "mcp.setup.begin": (_mcp_connection_handler("begin"), True, False),
+    "mcp.setup.status": (_mcp_connection_handler("status"), True, False),
+    "mcp.setup.pending": (_mcp_connection_handler("pending"), True, False),
+    "mcp.setup.confirm": (_mcp_connection_handler("confirm"), True, False),
+    "mcp.setup.callback": (_mcp_connection_handler("callback"), True, False),
+    "mcp.setup.cancel": (_mcp_connection_handler("cancel"), True, False),
+    "mcp.setup.cancel_request": (_mcp_connection_handler("cancel_request"), True, False),
+    "mcp.access.catalog": (_mcp_connection_handler("access.catalog"), True, False),
+    "mcp.access.list": (_mcp_connection_handler("access.list"), True, False),
+    "mcp.access.create": (_mcp_connection_handler("access.create"), True, False),
+    "mcp.access.revoke": (_mcp_connection_handler("access.revoke"), True, False),
+    "mcp.chat.pending": (_mcp_connection_handler("chat.pending"), True, False),
+    "mcp.chat.cancel": (_mcp_connection_handler("chat.cancel"), True, False),
     "mcp.list": (mcp_list, False, False),
     "mcp.upsert": (mcp_upsert, True, True),
     "mcp.set_enabled": (mcp_set_enabled, True, True),
@@ -4652,6 +4723,9 @@ _PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.")
 LONG_RUNNING_METHODS = frozenset({
     "mcp.test",
     "mcp.oauth_start",
+    "mcp.setup.cancel",
+    "mcp.setup.cancel_request",
+    "mcp.chat.cancel",
     # Explicit opt-in may download and verify ~245 MiB of pinned local assets.
     "tools.semantic.enable",
     # A cold catalog sync walks every category over the network.

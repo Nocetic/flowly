@@ -1088,6 +1088,9 @@ class MCPElicitationConfig(BaseModel):
 
 class MCPServerToolsFilter(BaseModel):
     """Per-server tool filter and utility-tool toggles."""
+    # Missing mode keeps existing hand-written configurations unchanged.
+    # New UI choices are explicit: selected + [] means zero tools, not all.
+    mode: Literal["legacy", "all", "selected", "none"] = "legacy"
     # If non-empty, only these tool names register (whitelist).
     include: list[str] = Field(default_factory=list)
     # If non-empty and include is empty, exclude these names (blacklist).
@@ -1193,6 +1196,9 @@ class MCPServerConfig(BaseModel):
     protocol: Literal["auto", "stateless", "legacy"] = "auto"
     transport: Literal["auto", "stdio", "http", "sse"] = "auto"
     auth: Literal["", "oauth"] = ""
+    # A successful Desktop setup atomically selects a new credential slot.
+    # Empty preserves the legacy per-server credential file.
+    oauth_credential_id: str = Field(default="", pattern=r"^(?:[a-f0-9]{32})?$")
     scope: str = ""  # optional OAuth scope string (space-separated)
     # Existing manually installed servers remain trusted for compatibility.
     # Untrusted servers require per-call consent unless readOnlyHint is true.

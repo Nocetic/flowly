@@ -17,6 +17,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -25,10 +26,10 @@ _HTTP_TIMEOUT = 15.0
 _MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
-def _control_base() -> tuple[str, str] | None:
+def _control_base(runtime_home: Path | None = None) -> tuple[str, str] | None:
     """Return ``(base_url, token)`` for the control endpoint, or None."""
     from flowly.mcp.server.control import read_api_file
-    info = read_api_file()
+    info = read_api_file(runtime_home / "gateway-api.json") if runtime_home is not None else read_api_file()
     if not info:
         return None
     host = info.get("host") or "127.0.0.1"
@@ -50,9 +51,9 @@ def _control_base() -> tuple[str, str] | None:
     return f"http://{url_host}:{port}/control", str(token)
 
 
-def _request(method: str, path: str, payload: dict | None = None) -> dict:
+def _request(method: str, path: str, payload: dict | None = None, *, runtime_home: Path | None = None) -> dict:
     """Make an authed control request; return parsed JSON or an error dict."""
-    base = _control_base()
+    base = _control_base(runtime_home) if runtime_home is not None else _control_base()
     if base is None:
         return {
             "error": "Flowly gateway is not running (no gateway-api.json). "
@@ -99,7 +100,7 @@ def _request(method: str, path: str, payload: dict | None = None) -> dict:
         return {"error": f"control request failed: {exc}"}
 
 
-def register_write_tools(mcp: Any, render: Callable[[dict[str, Any]], Any]) -> None:
+def register_write_tools(mcp: Any, render: Callable[[dict[str, Any]], Any], *, requester=None) -> None:
     """Register the gateway-backed write tools on the MCP server."""
     from mcp import types as mcp_types
 
@@ -140,12 +141,12 @@ def register_write_tools(mcp: Any, render: Callable[[dict[str, Any]], Any]) -> N
         payload = {"target": target, "message": message}
         if idempotency_key:
             payload["idempotency_key"] = idempotency_key
-        return render(_request("POST", "/messages/send", payload))
+        return render((requester or _request)("POST", "/messages/send", payload))
 
     @mcp.tool(annotations=approval_read_annotations, structured_output=False)
     def approvals_list() -> Any:
         """List pending exec approval requests (requires a running gateway)."""
-        return render(_request("GET", "/approvals"))
+        return render((requester or _request)("GET", "/approvals"))
 
     @mcp.tool(annotations=approval_write_annotations, structured_output=False)
     def approvals_resolve(id: str, decision: str) -> Any:
@@ -155,5 +156,5 @@ def register_write_tools(mcp: Any, render: Callable[[dict[str, Any]], Any]) -> N
             id: the approval id from approvals_list
             decision: one of 'allow-once', 'allow-always', 'deny'
         """
-        return render(_request("POST", "/approvals/resolve",
+        return render((requester or _request)("POST", "/approvals/resolve",
                                {"id": id, "decision": decision}))

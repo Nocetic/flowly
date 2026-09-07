@@ -31,6 +31,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import threading
 import time
 import uuid
@@ -93,9 +94,23 @@ def _tokens_dir() -> Path:
     return path
 
 
-def _token_file(server_name: str) -> Path:
+def _configured_credential_id(server_name: str) -> str:
+    from flowly.config.loader import get_config_path
+
+    try:
+        data = json.loads(get_config_path().read_text(encoding="utf-8"))
+        entry = (data.get("mcpServers") or {}).get(server_name) or {}
+        return str(entry.get("oauthCredentialId") or entry.get("oauth_credential_id") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def _token_file(server_name: str, credential_id: str | None = None) -> Path:
     safe = sanitize_mcp_name_component(server_name) or "server"
-    return _tokens_dir() / f"{safe}.json"
+    slot = _configured_credential_id(server_name) if credential_id is None else credential_id
+    if not isinstance(slot, str) or (slot and not re.fullmatch(r"[a-f0-9]{32}", slot)):
+        raise ValueError("Invalid MCP OAuth credential slot")
+    return _tokens_dir() / f"{safe}{'.' + slot if slot else ''}.json"
 
 
 class OAuthStateChangedError(RuntimeError):
@@ -114,9 +129,10 @@ class FlowlyTokenStorage(TokenStorage):  # type: ignore[misc]
     from the MCP event loop.
     """
 
-    def __init__(self, server_name: str, url: str | None = None) -> None:
+    def __init__(self, server_name: str, url: str | None = None, *, credential_id: str | None = None) -> None:
         self._server_name = server_name
-        self._path = _token_file(server_name)
+        self._credential_id = _configured_credential_id(server_name) if credential_id is None else credential_id
+        self._path = _token_file(server_name, self._credential_id)
         self._url = url
         self._closed = False
         self._expected: ContextVar[Any] = ContextVar("oauth_expected_revision", default=_UNGUARDED)
@@ -217,9 +233,9 @@ class FlowlyTokenStorage(TokenStorage):  # type: ignore[misc]
         await self.update({"client_info": json.loads(client_info.model_dump_json())})
 
 
-def clear_tokens(server_name: str) -> bool:
+def clear_tokens(server_name: str, *, credential_id: str | None = None) -> bool:
     """Delete the stored token file for *server_name*. Returns True if removed."""
-    path = _token_file(server_name)
+    path = _token_file(server_name, credential_id)
     try:
         with state_lock(path.with_suffix(".lock")):
             if not path.exists():
@@ -229,6 +245,18 @@ def clear_tokens(server_name: str) -> bool:
     except OSError:
         logger.warning("MCP token clear failed for '%s'", server_name)
     return False
+
+
+def clear_all_tokens(server_name: str) -> bool:
+    """Remove only this connection's legacy/current/retired credential slots."""
+    safe = sanitize_mcp_name_component(server_name) or "server"
+    pattern = re.compile(re.escape(safe) + r"(?:\.([a-f0-9]{32}))?\.json\Z")
+    removed = False
+    for path in _tokens_dir().iterdir():
+        match = pattern.fullmatch(path.name)
+        if match:
+            removed = clear_tokens(server_name, credential_id=match.group(1) or "") or removed
+    return removed
 
 
 def has_tokens(server_name: str) -> bool:
@@ -362,6 +390,7 @@ def build_oauth_provider(
     scope: str | None = None,
     callback_timeout: float = OAUTH_CALLBACK_TIMEOUT_SECONDS,
     allow_same_origin_paths: bool = False,
+    credential_id: str | None = None,
 ) -> Any | None:
     """Construct an ``OAuthClientProvider`` for *url*, or ``None``.
 
@@ -374,12 +403,18 @@ def build_oauth_provider(
     if not _OAUTH_AVAILABLE:
         return None
 
-    redirect_uri = f"http://{_CALLBACK_HOST}:{_CALLBACK_PORT}{_CALLBACK_PATH}"
+    from flowly.mcp.oauth_handoff import handoff_for
+
+    handoff = handoff_for(server_name, url) if interactive else None
+    redirect_uri = handoff.redirect_uri if handoff else f"http://{_CALLBACK_HOST}:{_CALLBACK_PORT}{_CALLBACK_PATH}"
     client_metadata = OAuthClientMetadata(
         client_name="Flowly",
         redirect_uris=[redirect_uri],  # type: ignore[arg-type]
         grant_types=["authorization_code", "refresh_token"],
         response_types=["code"],
+        # A local PKCE client must request public registration explicitly;
+        # omission permits the server's confidential-client default (RFC 7591).
+        token_endpoint_auth_method="none",
         scope=scope,
     )
 
@@ -389,6 +424,9 @@ def build_oauth_provider(
                 f"MCP server '{server_name}' needs interactive OAuth; run "
                 f"`flowly mcp login {server_name}`"
             )
+        if handoff is not None:
+            await handoff.redirect(authorization_url)
+            return
         import webbrowser
 
         print(f"\n  Opening browser to authorize MCP server '{server_name}'...")
@@ -401,6 +439,19 @@ def build_oauth_provider(
     async def _callback_handler() -> Any:
         if not interactive:
             raise RuntimeError(f"MCP server '{server_name}' needs interactive OAuth callback")
+        if handoff is not None:
+            from mcp.client.auth.utils import validate_authorization_response_iss
+
+            payload = await handoff.wait()
+            # Validate the issuer on error responses too, before acting on any
+            # provider-controlled error. The SDK repeats this for success.
+            try:
+                validate_authorization_response_iss(payload["iss"], provider.context.oauth_metadata)
+            except Exception:
+                raise RuntimeError("OAuth issuer validation failed") from None
+            if payload["error"]:
+                raise RuntimeError("OAuth authorization was declined or cancelled")
+            return AuthorizationCodeResult(code=payload["code"], state=payload["state"], iss=payload["iss"])
         import asyncio
 
         result = _CallbackResult()
@@ -436,28 +487,30 @@ def build_oauth_provider(
 
     from flowly.mcp.oauth_provider import CoordinatedOAuthProvider
 
-    return CoordinatedOAuthProvider(
+    provider = CoordinatedOAuthProvider(
         interactive=interactive,
         server_name=server_name,
         allow_same_origin_paths=allow_same_origin_paths,
         server_url=url,
         client_metadata=client_metadata,
-        storage=token_storage_for(server_name, url),
+        storage=token_storage_for(server_name, url, credential_id=credential_id),
         redirect_handler=_redirect_handler,
         callback_handler=_callback_handler,
     )
+    return provider
 
 
-def token_storage_for(server_name: str, url: str) -> FlowlyTokenStorage:
+def token_storage_for(server_name: str, url: str, *, credential_id: str | None = None) -> FlowlyTokenStorage:
     """Only a runtime-owned login context may select a staging credential store."""
     staged = _active_login.get()
-    if staged is not None and staged._server_name == server_name and staged._url == url:
+    slot = _configured_credential_id(server_name) if credential_id is None else credential_id
+    if staged is not None and staged._server_name == server_name and staged._url == url and staged._credential_id == slot:
         return staged
-    return FlowlyTokenStorage(server_name, url)
+    return FlowlyTokenStorage(server_name, url, credential_id=slot)
 
 
 @contextmanager
-def oauth_login(server_name: str, url: str):
+def oauth_login(server_name: str, url: str, *, credential_id: str | None = None):
     """Stage re-authorization; publish only a successfully probed fresh grant.
 
     Working credentials stay available during login. Failure/cancellation
@@ -469,9 +522,9 @@ def oauth_login(server_name: str, url: str):
 
     load_flowly_dotenv()
     url = str(interpolate_env_vars({"url": url})["url"]).strip()
-    canonical = FlowlyTokenStorage(server_name, url)
+    canonical = FlowlyTokenStorage(server_name, url, credential_id=credential_id)
     original = canonical.snapshot()
-    staged = FlowlyTokenStorage(server_name, url)
+    staged = FlowlyTokenStorage(server_name, url, credential_id=canonical._credential_id)
     staged._path = canonical._path.with_name(f".login-{uuid.uuid4().hex}.json")
 
     class Login:

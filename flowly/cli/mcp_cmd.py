@@ -300,8 +300,8 @@ def remove_server(
         raise typer.Exit(code=1)
     # Drop any stored OAuth tokens so a re-add starts clean.
     try:
-        from flowly.mcp.oauth import clear_tokens
-        if clear_tokens(name):
+        from flowly.mcp.oauth import clear_all_tokens
+        if clear_all_tokens(name):
             console.print("[dim]Cleared stored OAuth tokens.[/dim]")
     except Exception:
         pass
@@ -457,6 +457,25 @@ def serve_live_tools(
         ))
     except ToolBridgeError as exc:
         sys.stderr.write(f"Flowly tool bridge: {exc}\n")
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        pass
+
+
+@mcp_app.command("connect")
+def connect_external_access() -> None:
+    """Connect a stdio MCP client using FLOWLY_MCP_ENDPOINT and FLOWLY_MCP_ACCESS_KEY."""
+    import asyncio
+    import sys
+
+    from flowly.mcp.external_access import ExternalAccessError
+    from flowly.mcp.server.external_stdio import run_external_stdio
+
+    os.environ.setdefault("FLOWLY_QUIET", "1")
+    try:
+        asyncio.run(run_external_stdio())
+    except ExternalAccessError as exc:
+        sys.stderr.write(f"Flowly MCP: {exc}\n")
         raise typer.Exit(1) from None
     except KeyboardInterrupt:
         pass

@@ -1699,6 +1699,14 @@ class SessionManager:
         """
 
         with self._session_write_lock(key):
+            # Creation takes this same lease before persisting an external key.
+            # Withdraw authority first: a failed durable write must abort deletion,
+            # and recreating this session key must never revive its old credentials.
+            access_path = self.sessions_dir.parent / "mcp-access.json"
+            if access_path.exists():
+                from flowly.mcp.external_access import ExternalAccessStore
+
+                ExternalAccessStore(access_path).revoke_session(key)
             self._cache.pop(key, None)
             canonical = self._get_session_path(key)
             display = self._get_full_path(key)

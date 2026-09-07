@@ -103,6 +103,10 @@ def create_server(
     allow_writes: bool = False,
     auth_token: str = "",
     resource_url: str = "http://127.0.0.1:8765/mcp",
+    reader=None,
+    channel_reader=None,
+    control_request=None,
+    journal_path: Path | None = None,
 ) -> Any:
     """Build the Flowly MCP server with read (and optional write) tools."""
     if not _MCP_SERVER_AVAILABLE:
@@ -153,14 +157,14 @@ def create_server(
         ),
         **server_kwargs,
     )
-    reader = get_session_reader()
+    reader = reader or get_session_reader()
     # Construct on first use, so listing tools alone does not create state.
     from functools import lru_cache
 
     @lru_cache(maxsize=1)
     def event_journal():
         from flowly.mcp.server.events import EventJournal
-        return EventJournal(reader)
+        return EventJournal(reader, path=journal_path)
 
     read_annotations = mcp_types.ToolAnnotations(
         readOnlyHint=True,
@@ -226,7 +230,7 @@ def create_server(
     @mcp.tool(annotations=read_annotations, structured_output=False)
     def channels_list(platform: str | None = None) -> Any:
         """List configured channels and whether each is enabled."""
-        return _result(_channels_list(platform))
+        return _result((channel_reader or _channels_list)(platform))
 
     @mcp.tool(annotations=read_annotations, structured_output=False)
     def attachments_fetch(session_key: str, message_id: str) -> Any:
@@ -263,7 +267,7 @@ def create_server(
     if allow_writes:
         try:
             from flowly.mcp.server.writeplane import register_write_tools
-            register_write_tools(mcp, _result)
+            register_write_tools(mcp, _result, requester=control_request)
         except ImportError:
             logger.warning(
                 "MCP serve: write tools requested but write plane is "

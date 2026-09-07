@@ -123,8 +123,9 @@ def _extract_text(content: Any) -> str:
 class SessionReader:
     """Lazily builds a SessionManager + SessionIndexer for read access."""
 
-    def __init__(self) -> None:
-        self._manager: Any | None = None
+    def __init__(self, manager: Any | None = None) -> None:
+        self._manager = manager
+        self._initialized = False
         self._indexer: Any | None = None
         self._indexed_sources: dict[str, tuple] = {}
         self._public_metadata: dict[str, dict] = {}
@@ -135,7 +136,7 @@ class SessionReader:
 
     def _ensure(self) -> None:
         with self._lock:
-            if self._manager is not None:
+            if self._initialized:
                 return
             from flowly.profile import get_flowly_home
             from flowly.session.indexer import SessionIndexer
@@ -143,8 +144,9 @@ class SessionReader:
 
             # The manager's sessions_dir derives from $FLOWLY_HOME; workspace
             # is only used for non-session paths here, so the home is enough.
-            home = get_flowly_home()
-            self._manager = SessionManager(workspace=home)
+            if self._manager is None:
+                home = get_flowly_home()
+                self._manager = SessionManager(workspace=home)
             try:
                 # A public-only index must not mutate the agent's shared index
                 # or retain withdrawn/internal rows from an earlier snapshot.
@@ -152,6 +154,7 @@ class SessionReader:
             except Exception as exc:  # FTS optional — degrade to manager-only
                 logger.debug("MCP serve: session indexer unavailable: %s", exc)
                 self._indexer = None
+            self._initialized = True
 
     def _refresh_index(self) -> None:
         """Reconcile changed archives, including writers in other processes.
@@ -443,11 +446,11 @@ def get_session_reader() -> SessionReader:
     return SessionReader()
 
 
-def channels_list(platform: str | None = None) -> dict:
+def channels_list(platform: str | None = None, *, config_path: Path | None = None, reader: SessionReader | None = None) -> dict:
     """Enumerate channel configuration and known addressable conversations."""
     from flowly.config.loader import load_config
 
-    config = load_config()
+    config = load_config(config_path) if config_path is not None else load_config()
     channels = config.channels
     out: list[dict[str, Any]] = []
     for name in ("telegram", "discord", "slack", "whatsapp", "imessage", "web", "email", "teams"):
@@ -457,7 +460,7 @@ def channels_list(platform: str | None = None) -> dict:
         if platform and name.lower() != platform.lower():
             continue
         out.append({"platform": name, "enabled": bool(getattr(cfg, "enabled", False))})
-    reader = get_session_reader()
+    reader = reader or get_session_reader()
     reader._ensure()
     enabled = {entry["platform"]: entry["enabled"] for entry in out}
     targets = []

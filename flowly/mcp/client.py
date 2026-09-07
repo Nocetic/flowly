@@ -140,6 +140,8 @@ _loop_lock = threading.Lock()
 _servers: dict[str, "MCPServerTask"] = {}
 _servers_lock = threading.RLock()
 _shutting_down = False
+# Owner-applied configuration wins over a late boot/discovery snapshot.
+_desired_identities: dict[str, str | None] = {}
 
 
 @dataclass
@@ -357,6 +359,7 @@ class MCPServerTask:
     """
 
     def __init__(self, name: str) -> None:
+        self._retiring = False
         self.name = name
         self.session: Any | None = None
         self.tools: list[Any] = []
@@ -572,6 +575,7 @@ class MCPServerTask:
             self._manifest_store = ManifestStore(
                 self._profile_home, self.name, self._config_identity,
                 self._retry_policy.manifest_ttl, oauth=config.get("auth") == "oauth",
+                credential_id=config.get("oauth_credential_id") or "",
             )
             cached = await asyncio.to_thread(self._manifest_store.load)
             if cached is not None:
@@ -647,7 +651,7 @@ class MCPServerTask:
                 while True:
                     changed = self._state_event
                     if (
-                        self.shutdown_event is None or self.shutdown_event.is_set()
+                        self._retiring or self.shutdown_event is None or self.shutdown_event.is_set()
                         or self._task is None or self._task.done()
                     ):
                         raise MCPUnavailableError(f"MCP server '{self.name}' is stopped")
@@ -680,7 +684,7 @@ class MCPServerTask:
         from flowly.mcp.tool import MCPTool
 
         matching = [tool for tool in self.tools if getattr(tool, "name", "") == remote_name]
-        if len(matching) == 1 and _filter_remote_tool(self._config, remote_name):
+        if not self._retiring and len(matching) == 1 and _filter_remote_tool(self._config, remote_name):
             current = MCPTool(server_task=self, remote_tool=matching[0])
             if current.contract_fingerprint() == expected:
                 return
@@ -805,7 +809,7 @@ class MCPServerTask:
         try:
             if self._from_manifest and not await self._wait_for_demand():
                 return
-            while self.shutdown_event is not None and not self.shutdown_event.is_set():
+            while self.shutdown_event is not None and not self.shutdown_event.is_set() and not self._retiring:
                 generation_before = self._connection_generation
                 if self._ever_connected:
                     self._set_state(self._retry_policy.state_for(max(1, reconnect_attempt)))
@@ -1104,6 +1108,7 @@ class MCPServerTask:
                 interactive=self.interactive,
                 scope=self._config.get("scope") or None,
                 allow_same_origin_paths=self._use_sse(),
+                credential_id=self._config.get("oauth_credential_id") or "",
             )
             if auth is None:
                 raise ImportError(
@@ -1388,6 +1393,13 @@ def _filter_remote_tool(
     tools_cfg = server_cfg.get("tools") or {}
     include = [str(x) for x in (tools_cfg.get("include") or [])]
     exclude = [str(x) for x in (tools_cfg.get("exclude") or [])]
+    mode = tools_cfg.get("mode", "legacy")
+    if mode not in {"legacy", "all", "selected"}:
+        return False
+    if mode == "selected":
+        return remote_name in include and remote_name not in exclude
+    if mode == "all":
+        return remote_name not in exclude
     if include:
         return remote_name in include
     if exclude:
@@ -1422,6 +1434,8 @@ def _utility_tools_for_server(
     )
 
     tools_cfg = server_cfg.get("tools") or {}
+    if tools_cfg.get("mode", "legacy") not in {"legacy", "all", "selected"}:
+        return []
     want_resources = bool(tools_cfg.get("resources"))
     want_prompts = bool(tools_cfg.get("prompts"))
 
@@ -1690,7 +1704,11 @@ async def _shared_server(
     with _servers_lock:
         if _shutting_down:
             raise MCPUnavailableError("MCP servers are shutting down")
+        if name in _desired_identities and _desired_identities[name] != identity:
+            raise MCPUnavailableError("MCP discovery configuration was superseded by an owner change")
         existing = _servers.get(name)
+        if existing is not None and existing._retiring:
+            raise MCPUnavailableError("MCP connection is draining for an owner change")
         startup = _starting.get(name)
         existing_identity = startup.identity if startup is not None else (
             existing._config_identity if existing is not None else None
@@ -1745,7 +1763,7 @@ async def _shared_server(
     try:
         server = await asyncio.shield(startup.task)
         with _servers_lock:
-            if _shutting_down or _servers.get(name) is not server:
+            if _shutting_down or server._retiring or _servers.get(name) is not server:
                 raise MCPUnavailableError("MCP startup was superseded by shutdown")
         return _register_tools_for_server(
             server_task=server, server_cfg=config, tool_registry=registry,
@@ -1834,6 +1852,101 @@ def discover_mcp_tools(
     return registered
 
 
+async def reload_mcp_server(name: str, config: Any, tool_registry: Any) -> dict[str, Any]:
+    """Replace one owner's connection without restarting channels or peers.
+
+    Withdraw admission/catalogs first, drain calls already sent, then tear down
+    that transport and register its replacement. Late discovery cannot undo an
+    owner change. A cancelled observer does not abandon transport cleanup.
+    The host serializes updates for a given name.
+    """
+    from flowly.mcp.manifest import configuration_fingerprint
+    from flowly.profile import get_flowly_home
+    from flowly.mcp.env_loader import load_flowly_dotenv
+
+    load_flowly_dotenv()
+    cfg = config.model_dump() if hasattr(config, "model_dump") else dict(config or {})
+    enabled = bool(cfg) and cfg.get("enabled", True)
+    resolved = interpolate_env_vars(cfg) if enabled else None
+    identity = configuration_fingerprint(name, resolved, get_flowly_home()) if resolved else None
+    loop = _ensure_loop()
+
+    async def replace():
+        consumers = []
+        previous_tools = {}
+        with _servers_lock:
+            if _shutting_down:
+                raise MCPUnavailableError("MCP runtime is stopping")
+            old = _servers.get(name)
+            startup = _starting.get(name)
+            if old is not None and old._retiring:
+                raise MCPUnavailableError("MCP connection is already being reconfigured")
+            _desired_identities[name] = identity
+            if old is not None:
+                consumers = [(registry, dict(binding[0])) for registry, binding in old._registry_bindings.items()]
+                previous_tools = old._config.get("tools", {})
+                old._retiring = True
+                old._set_state(MCPConnectionState.DRAINING)
+                _unregister_server_tools(old)
+        if startup is not None and startup.task is not None:
+            startup.task.cancel()
+            await asyncio.gather(startup.task, return_exceptions=True)
+        if old is not None:
+            # New leases and queued old-schema calls have been withdrawn.
+            # Calls that reached the server retain their complete reply.
+            while old._active_requests:
+                activity = old._activity_event
+                if activity is None:
+                    raise MCPUnavailableError("MCP request accounting is unavailable")
+                activity.clear()
+                if old._active_requests:
+                    await activity.wait()
+            await old.shutdown()
+            with _servers_lock:
+                if _servers.get(name) is old:
+                    _servers.pop(name, None)
+                if _starting.get(name) is startup:
+                    _starting.pop(name, None)
+        if resolved is not None:
+            names = await _shared_server(name, resolved, identity, tool_registry, False)
+            with _servers_lock:
+                current = _servers[name]
+            # An explicit owner retry/apply must verify the transport, not
+            # report a cached manifest as a successful connection. This sends
+            # no tool action and preserves lazy lifecycle settings afterward.
+            async with current.connection_lease():
+                pass
+            for registry, consumer_config in consumers:
+                if registry is tool_registry:
+                    continue
+                binding_config = dict(resolved)
+                if consumer_config.get("tools", {}) != previous_tools:
+                    # A consumer-specific restriction is additional authority,
+                    # not something an owner-wide connection change can erase.
+                    owner_filter = resolved.get("tools", {})
+                    consumer_filter = consumer_config.get("tools", {})
+                    binding_config["tools"] = {
+                        "mode": "selected",
+                        "include": [tool.name for tool in current.tools if _filter_remote_tool(resolved, tool.name) and _filter_remote_tool(consumer_config, tool.name)],
+                        "resources": bool(owner_filter.get("resources") and consumer_filter.get("resources")),
+                        "prompts": bool(owner_filter.get("prompts") and consumer_filter.get("prompts")),
+                    }
+                _register_tools_for_server(server_task=current, server_cfg=binding_config, tool_registry=registry)
+            health = current.health_snapshot()
+            return {"ok": True, "state": health["state"], "connected": health["connected"], "tools": names, "willRestart": False}
+        return {"ok": True, "state": "disabled", "tools": [], "willRestart": False}
+
+    future = asyncio.run_coroutine_threadsafe(replace(), loop)
+    wrapped = asyncio.wrap_future(future)
+    try:
+        return await asyncio.shield(wrapped)
+    except asyncio.CancelledError:
+        # Retrieve eventual errors even when the UI has disconnected. The
+        # accepted reconfiguration remains authoritative on the MCP loop.
+        wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        raise
+
+
 def shutdown_mcp_servers(timeout: float = 10.0) -> None:
     """Close registered and still-starting servers before retiring their loop.
 
@@ -1843,7 +1956,10 @@ def shutdown_mcp_servers(timeout: float = 10.0) -> None:
     global _shutting_down
     with _servers_lock:
         loop = _loop
-        if loop is None or _shutting_down or not _servers:
+        if loop is None or loop.is_closed():
+            _desired_identities.clear()
+            return
+        if _shutting_down:
             return
         _shutting_down = True
         servers = list(_servers.values())
@@ -1859,6 +1975,7 @@ def shutdown_mcp_servers(timeout: float = 10.0) -> None:
             with _servers_lock:
                 _servers.clear()
                 _starting.clear()
+                _desired_identities.clear()
 
     future = asyncio.run_coroutine_threadsafe(shutdown_all(), loop)
 

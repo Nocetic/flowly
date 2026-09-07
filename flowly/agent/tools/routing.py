@@ -18,7 +18,7 @@ TOOLSET_MEMBERS: dict[str, frozenset[str]] = {
     "execution": frozenset({"exec", "process", "docker", "system"}),
     "web": frozenset({"web_search", "web_fetch", "web_extract", "x_search"}),
     "delivery": frozenset({"message"}),
-    "interactive": frozenset({"clarify", "plan"}),
+    "interactive": frozenset({"clarify", "plan", "mcp_connection"}),
     "media": frozenset({
         "screenshot", "video_analyze", "image_analyze", "image_generate", "video_generate",
         "voice_generate", "voice_call", "computer", "browser_tab",

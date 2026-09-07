@@ -34,6 +34,7 @@ from flowly.config.loader import (
     convert_to_camel,
     get_config_path,
 )
+from flowly.config.transaction import ConfigSnapshot, config_write_lock
 from flowly.integrations.cards import Field, FieldType, IntegrationCard
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,6 @@ def _assert_config_valid(raw: dict[str, Any]) -> None:
     boot accepts (a free ``str`` SELECT like ``fal_image.model`` passes; only a
     constrained ``Literal`` field rejects an off-list value) — no over-rejection.
     """
-    from flowly.config.loader import convert_keys
     from flowly.config.schema import Config
 
     try:
@@ -188,12 +188,13 @@ def _load_raw() -> dict[str, Any]:
 
 def _load_raw_or_empty(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {}
+        return ConfigSnapshot({}, path, None)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        source = path.read_text(encoding="utf-8")
+        data = json.loads(source)
     except (OSError, json.JSONDecodeError):
         return {}
-    return data if isinstance(data, dict) else {}
+    return ConfigSnapshot(data if isinstance(data, dict) else {}, path, source)
 
 
 def _descend(raw: dict[str, Any], dotted_snake: str) -> dict[str, Any] | None:
@@ -250,6 +251,15 @@ def _set_path(
 
 def _atomic_write_json(path: Path, raw: dict[str, Any]) -> None:
     """Write ``raw`` to ``path`` atomically with backup + 0600 perms."""
+    with config_write_lock(path):
+        if isinstance(raw, ConfigSnapshot):
+            raw.check_current(path)
+        _write_json_locked(path, raw)
+        if isinstance(raw, ConfigSnapshot):
+            raw.source_text = path.read_text(encoding="utf-8")
+
+
+def _write_json_locked(path: Path, raw: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Backup current parseable file.
     if path.exists():

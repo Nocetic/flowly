@@ -70,18 +70,24 @@ class MCPServerEntry:
 def _transport_summary_from_cfg(cfg: dict) -> str:
     url = cfg.get("url") or ""
     command = cfg.get("command") or ""
-    if url:
+    if isinstance(url, str) and url:
         short = url if len(url) <= 40 else url[:37] + "…"
         return f"http: {short}"
-    if command:
-        args = " ".join(str(a) for a in (cfg.get("args") or [])[:3])
+    if isinstance(command, str) and command:
+        raw_args = cfg.get("args")
+        args = " ".join(str(a) for a in raw_args[:3]) if isinstance(raw_args, list) else ""
         return f"stdio: {command} {args}".strip()
     return "invalid"
 
 
 def _tool_filter_summary(tools: dict) -> str:
+    if not isinstance(tools, dict):
+        return "invalid"
     include = tools.get("include") or []
     exclude = tools.get("exclude") or []
+    mode = tools.get("mode", "legacy")
+    if mode == "none" or (mode == "selected" and not include):
+        return "none"
     if include:
         return f"{len(include)} selected"
     if exclude:
@@ -89,7 +95,7 @@ def _tool_filter_summary(tools: dict) -> str:
     return "all"
 
 
-def list_mcp_servers() -> list[MCPServerEntry]:
+def list_mcp_servers(raw: dict | None = None) -> list[MCPServerEntry]:
     """Return configured servers + not-yet-installed catalog entries.
 
     Configured first (sorted by name), then catalog "available" rows for
@@ -97,10 +103,11 @@ def list_mcp_servers() -> list[MCPServerEntry]:
     """
     from flowly.integrations.config_io import _load_raw
 
-    try:
-        raw = _load_raw()
-    except Exception:
-        raw = {}
+    if raw is None:
+        try:
+            raw = _load_raw()
+        except Exception:
+            raw = {}
     servers = raw.get("mcpServers") or {}
     if not isinstance(servers, dict):
         servers = {}
@@ -115,8 +122,15 @@ def list_mcp_servers() -> list[MCPServerEntry]:
     for name in sorted(servers):
         cfg = servers[name] if isinstance(servers[name], dict) else {}
         has_transport = bool(cfg.get("url") or cfg.get("command"))
+        valid = True
+        try:
+            from flowly.config.loader import convert_keys
+            from flowly.config.schema import MCPServerConfig
+            MCPServerConfig.model_validate(convert_keys(cfg))
+        except (TypeError, ValueError):
+            valid = False
         enabled = bool(cfg.get("enabled", True))
-        if not has_transport:
+        if not has_transport or not valid:
             status: str = "invalid"
         elif enabled:
             status = "enabled"
@@ -143,13 +157,13 @@ def list_mcp_servers() -> list[MCPServerEntry]:
             transport=_transport_summary_from_cfg(cfg),
             enabled=enabled,
             auth=auth,
-            tool_filter=_tool_filter_summary(cfg.get("tools") or {}),
+            tool_filter=_tool_filter_summary(cfg.get("tools") or {}) if valid else "invalid",
             source="configured",
             description="",
             status=status,  # type: ignore[arg-type]
             needs_oauth=False,
             secret_fields=None,
-            error=("no command or url" if not has_transport else current_error),
+            error=("Invalid connection settings; repair this connection" if not valid else "no command or url" if not has_transport else current_error),
             authorized=authorized,
             runtime_state=runtime_state,
             connected=runtime.get("connected"),
@@ -221,8 +235,8 @@ def remove_mcp_server(name: str) -> bool:
         raw.pop("mcpServers", None)
     _atomic_write_json(get_config_path(), raw)
     try:
-        from flowly.mcp.oauth import clear_tokens
-        clear_tokens(name)
+        from flowly.mcp.oauth import clear_all_tokens
+        clear_all_tokens(name)
     except Exception:
         pass
     return True

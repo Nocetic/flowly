@@ -2058,11 +2058,13 @@ class AgentLoop:
             # No await occurs between the busy check and the filesystem
             # transaction. A later chat therefore observes a cleanly deleted
             # session and may create a fresh one, never a half-deleted history.
-            deleted = self.sessions.delete(session_key)
-            self._last_turn_total_tokens.pop(session_key, None)
-            self._started_sessions.discard(session_key)
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                deleted = self.sessions.delete(session_key)
+                self._last_turn_total_tokens.pop(session_key, None)
+                self._started_sessions.discard(session_key)
+            finally:
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
             return deleted
 
     def _should_save_trajectories(self) -> bool:
@@ -2343,6 +2345,8 @@ class AgentLoop:
         # back an answer; see flowly.clarify.
         from flowly.agent.tools.clarify import ClarifyTool
         self.tools.register(ClarifyTool())
+        from flowly.agent.tools.mcp_connection import MCPConnectionRequestTool
+        self.tools.register(MCPConnectionRequestTool())
 
         # Video analysis tool — routes attached videos through the
         # OpenRouter ``video_url`` content block to a video-capable
@@ -3318,6 +3322,13 @@ class AgentLoop:
         if existing is None or existing._closed:
             self._external_tool_bridge = RuntimeToolBridge(self)
         gateway_server._tool_bridge = self._external_tool_bridge
+        from flowly.config.loader import get_config_path
+        from flowly.mcp.server.external_service import ExternalMCPService
+
+        if getattr(gateway_server, "_external_mcp_service", None) is None:
+            gateway_server._external_mcp_service = ExternalMCPService(
+                get_config_path().parent / "mcp-access.json", self._external_tool_bridge,
+            )
         browser_tab = self.tools.get("browser_tab")
         if browser_tab:
             browser_tab._gateway = gateway_server

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from flowly.config.schema import Config
-
+from flowly.config.transaction import config_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ def load_config(config_path: Path | None = None) -> Config:
                     logger.info("config: seeded backup at %s", bak)
                 except OSError as exc:
                     logger.warning("config: backup seed failed: %s", exc)
-            return cfg
+            return _remember_mcp_source(cfg, path, data)
 
     # Corrupted: try .bak.
     bak_data = _try_parse_config(bak)
@@ -133,9 +133,20 @@ def load_config(config_path: Path | None = None) -> Config:
             # Move broken original aside for forensics, then restore.
             broken = path.with_suffix(path.suffix + f".broken-{int(time.time())}")
             try:
-                if path.exists():
-                    os.replace(str(path), str(broken))
-                shutil.copy2(str(bak), str(path))
+                with config_write_lock(path):
+                    # A Desktop/core save may have repaired the file after our
+                    # first read. Recovery must not roll that new state back.
+                    fresh = _try_parse_config(path)
+                    if fresh is not None:
+                        try:
+                            latest = Config.model_validate(convert_keys(fresh))
+                        except ValueError:
+                            pass
+                        else:
+                            return _remember_mcp_source(latest, path, fresh)
+                    if path.exists():
+                        os.replace(str(path), str(broken))
+                    shutil.copy2(str(bak), str(path))
                 logger.warning(
                     "config: recovered from backup; broken original kept at %s",
                     broken,
@@ -147,14 +158,24 @@ def load_config(config_path: Path | None = None) -> Config:
                     "config: recovery rename/copy failed (%s) — using "
                     "in-memory backup", exc,
                 )
-            return cfg
+            return _remember_mcp_source(cfg, path, bak_data)
 
     # Both gone. Last resort.
     if path.exists() or bak.exists():
         logger.error(
             "config: both %s and %s unusable — using defaults", path, bak,
         )
-    return Config()
+    return _remember_mcp_source(Config(), path, {})
+
+
+def _remember_mcp_source(config: Config, path: Path, raw: dict) -> Config:
+    # Non-schema metadata: never serialized or included in provider settings.
+    import copy
+    object.__setattr__(config, "_mcp_config_source", (
+        path.resolve(), copy.deepcopy(raw.get("mcpServers", {})),
+        convert_to_camel(config.model_dump()).get("mcpServers", {}),
+    ))
+    return config
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
@@ -171,6 +192,11 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     must not propagate into the safety net.
     """
     path = config_path or get_config_path()
+    with config_write_lock(path):
+        _save_config_locked(config, path)
+
+
+def _save_config_locked(config: Config, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # 1. Load whatever is already on disk (preserves unknown fields)
@@ -187,8 +213,20 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     # 2. Dump only the fields Pydantic knows about, convert to camelCase
     known = convert_to_camel(config.model_dump())
 
+    # A long-lived agent may save unrelated settings after Desktop has changed
+    # MCP permissions. Do not re-emit its stale connections or resurrect a
+    # removed one. An intentional conflicting MCP edit requires a fresh read.
+    source = getattr(config, "_mcp_config_source", None)
+    if source is not None and source[0] == path.resolve():
+        if known.get("mcpServers", {}) == source[2]:
+            known.pop("mcpServers", None)
+        elif existing.get("mcpServers", {}) != source[1]:
+            raise ValueError("MCP connections changed; reload settings before saving this edit")
+
     # 3. Deep-merge: existing is the base, known fields win
     merged = _deep_merge(existing, known)
+    if source is not None and source[0] == path.resolve() and "mcpServers" in known:
+        merged["mcpServers"] = known["mcpServers"]
 
     # 4. Backup the current parseable file BEFORE overwriting. We
     # deliberately don't back up unparseable content — that would
@@ -217,6 +255,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         secure_file(path)  # POSIX chmod; real owner-only ACL on Windows
     except OSError:
         pass
+    if source is None or "mcpServers" in known:
+        _remember_mcp_source(config, path, merged)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

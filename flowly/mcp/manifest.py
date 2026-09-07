@@ -63,12 +63,15 @@ class ManifestStore:
     Unsupported platforms fail closed and callers perform ordinary discovery.
     """
 
-    def __init__(self, home: Path, name: str, identity: str, ttl: float, *, oauth: bool = False):
+    def __init__(self, home: Path, name: str, identity: str, ttl: float, *, oauth: bool = False, credential_id: str = ""):
         self.home = home.expanduser().resolve()
         self.name = name
         self.identity = identity
         self.ttl = ttl
         self.oauth = oauth
+        if credential_id and not re.fullmatch(r"[a-f0-9]{32}", credential_id):
+            raise ValueError("Invalid MCP OAuth credential slot")
+        self.credential_id = credential_id
         self.filename = hashlib.sha256(name.encode()).hexdigest() + ".json"
         if not math.isfinite(ttl) or not 0 < ttl <= 604_800:
             raise ValueError("Manifest TTL must be positive and at most seven days")
@@ -79,7 +82,8 @@ class ManifestStore:
         from flowly.agent.media_files import read_media_file
         from flowly.mcp.schema import sanitize_mcp_name_component
 
-        path = self.home / "mcp-tokens" / f"{sanitize_mcp_name_component(self.name) or 'server'}.json"
+        suffix = "." + self.credential_id if self.credential_id else ""
+        path = self.home / "mcp-tokens" / f"{sanitize_mcp_name_component(self.name) or 'server'}{suffix}.json"
         try:
             data = read_media_file(path, (self.home,), MAX_MANIFEST_BYTES)
         except FileNotFoundError:

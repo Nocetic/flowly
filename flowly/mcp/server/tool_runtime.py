@@ -18,7 +18,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from jsonschema.validators import validator_for
@@ -49,6 +49,7 @@ class _Grant:
     context: contextvars.Context
     expires_at: float
     allow_writes: bool = False
+    authority_check: Callable[[], bool] | None = None
     audit_id: str = field(default_factory=lambda: secrets.token_hex(16))
     pending: int = 0
     active: bool = True
@@ -98,6 +99,7 @@ class RuntimeToolBridge:
     def _available(self, grant: _Grant, name: str) -> bool:
         return (
             not self._closed and grant.active and time.monotonic() < grant.expires_at
+            and (grant.authority_check is None or grant.authority_check())
             and name in grant.names
             and self._permitted(self.owner.tools.get(name), allow_writes=grant.allow_writes)
             and self.owner.tools.is_available(name, **self._route(grant.session_key))
@@ -122,6 +124,7 @@ class RuntimeToolBridge:
         allow_writes: bool = False, ttl: float = 3600,
         context: contextvars.Context | None = None,
         allow_empty: bool = False,
+        authority_check: Callable[[], bool] | None = None,
     ) -> dict:
         if self._closed:
             raise ToolBridgeError("Tool runtime is stopped")
@@ -160,6 +163,7 @@ class RuntimeToolBridge:
         grant = _Grant(
             session_key, selected, context if context is not None else contextvars.copy_context(),
             time.monotonic() + ttl, allow_writes=allow_writes,
+            authority_check=authority_check,
         )
         self._grants[digest] = grant
         grant.timer = asyncio.get_running_loop().call_later(ttl, self._revoke_digest, digest)
@@ -210,6 +214,16 @@ class RuntimeToolBridge:
 
     def list_tools(self, token: str) -> list[dict]:
         grant = self._grant(token)
+        return self._definitions(grant)
+
+    def available_tools(self, session_key: str) -> list[dict]:
+        """Owner-only capability preview; it issues no executable grant."""
+        return self._definitions(_Grant(
+            session_key, frozenset(self.owner.tools.tool_names), contextvars.copy_context(),
+            time.monotonic() + 1, allow_writes=True,
+        ))
+
+    def _definitions(self, grant: _Grant) -> list[dict]:
         definitions = []
         for name in sorted(grant.names):
             if not self._available(grant, name):

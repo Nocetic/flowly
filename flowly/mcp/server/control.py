@@ -79,8 +79,8 @@ def write_api_file(host: str, port: int, token: str) -> None:
                 pass
 
 
-def read_api_file() -> dict[str, Any] | None:
-    path = _api_path()
+def read_api_file(path: Path | None = None) -> dict[str, Any] | None:
+    path = path if path is not None else _api_path()
     if not path.exists() or path.is_symlink():
         return None
     try:

@@ -35,7 +35,7 @@ async def authority():
         "seen": [], "delay": 0, "status": 200, "requests_active": 0,
         "peak": 0, "resource_status": 200, "discovery": 0,
         "token_started": asyncio.Event(), "hold_token": None, "token_body": None,
-        "resource_headers": {},
+        "resource_headers": {}, "token_error": None,
     }
 
     async def resource(request):
@@ -61,7 +61,10 @@ async def authority():
         if state["hold_token"] is not None:
             await state["hold_token"].wait()
         if state["status"] != 200:
-            return web.json_response({"error": "SECRET-must-not-appear-in-errors"}, status=state["status"])
+            return web.json_response(
+                state["token_error"] or {"error": "SECRET-must-not-appear-in-errors"},
+                status=state["status"],
+            )
         if state["token_body"] is not None:
             return web.json_response(state["token_body"])
         if data.get("grant_type") == "authorization_code":
@@ -313,6 +316,94 @@ async def test_full_sdk_authorization_uses_pkce_and_persists_discovery(authority
     snapshot = provider.storage.snapshot()
     assert snapshot["oauth_metadata"]["token_endpoint"] == authority["base"] + "/token"
     assert snapshot["client_info"]["issuer"] == authority["base"]
+
+
+@pytest.mark.parametrize("error_code,description_prefix,diagnostic", [
+    ("invalid_client", "", "invalid_client"),
+    ("invalid_request", "Missing client_secret; ", "invalid_request (provider fields: client_secret)"),
+])
+async def test_token_error_reaches_owner_rpc_and_chat_without_saving_or_leaking(
+    authority, tmp_path, monkeypatch, caplog, error_code, description_prefix, diagnostic,
+):
+    from unittest.mock import AsyncMock
+
+    from flowly.agent.tool_context import tool_execution_scope
+    from flowly.agent.tools.mcp_connection import MCPConnectionRequestTool
+    from flowly.agent.tools.registry import ToolRegistry
+    from flowly.channels import feature_rpc
+    from flowly.mcp.client import shutdown_mcp_servers
+    from flowly.mcp.connections import MCPConnectionService
+
+    private = "private-provider-response-54321"
+    authority["status"] = 400
+    authority["token_error"] = {
+        "error": error_code, "error_description": description_prefix + private,
+        "access_token": private, "code": private,
+    }
+    path = tmp_path / "config.json"
+    original = '{"channels":{"email":{"enabled":true}},"mcpServers":{"existing":{"command":"untouched"}}}'
+    path.write_text(original)
+    existing = FlowlyTokenStorage("existing", "https://untouched.example/mcp")
+    await existing.set_tokens(OAuthToken(access_token="existing-access"))
+    before_tokens = existing.snapshot()
+    registry = ToolRegistry()
+    apply = AsyncMock()
+    service = MCPConnectionService(path, lambda: registry, apply=apply)
+    monkeypatch.setattr(feature_rpc, "_mcp_connection_service", service)
+
+    async def rpc(method, params=None):
+        result, restart = await feature_rpc.dispatch(method, params or {})
+        assert restart is False
+        return result
+
+    with tool_execution_scope("web:diagnostic-owner"):
+        waiting = asyncio.create_task(MCPConnectionRequestTool().execute(
+            action="request", name="diagnostic", reason="Verify the connection error",
+            config={"url": authority["url"], "auth": "oauth"},
+        ))
+    try:
+        async with asyncio.timeout(10):
+            while not (pending := await rpc("mcp.chat.pending"))["requests"]:
+                await asyncio.sleep(0.01)
+            started = await rpc("mcp.setup.begin", {
+                "chatRequestId": pending["requests"][0]["id"], "requestId": "diagnostic-request-12345",
+                "redirectUri": "http://127.0.0.1:54321/mcp/oauth/callback/" + "a" * 32,
+            })
+            while not (status := await rpc("mcp.setup.status", {"id": started["id"]}))["authorizationUrl"]:
+                assert status["phase"] not in {"failed", "expired", "cancelled"}, status
+                await asyncio.sleep(0.01)
+            query = parse_qs(urlparse(status["authorizationUrl"]).query)
+            assert query["code_challenge_method"] == ["S256"]
+            await rpc("mcp.setup.callback", {
+                "id": started["id"], "callback": {"code": "test-code", "state": query["state"][0]},
+            })
+            chat_result = json.loads(await waiting)
+            owner_result = await rpc("mcp.setup.status", {"id": started["id"]})
+        expected = {
+            "code": "CONNECTION_FAILED",
+            "message": (
+                f"connect failed: OAuth token exchange failed (HTTP 400): {diagnostic}"
+                " [client_auth=none; secret_present=no]"
+            ),
+        }
+        assert chat_result["error"] == owner_result["error"] == expected
+        assert chat_result["status"] == owner_result["phase"] == "failed"
+        assert chat_result["saved"] is owner_result["saved"] is False
+        assert chat_result["connected"] is False
+        assert owner_result["sessionKey"] == "web:diagnostic-owner"
+        assert not registry.tool_names
+        apply.assert_not_awaited()
+        assert path.read_text() == original
+        assert existing.snapshot() == before_tokens
+        assert authority["refreshes"] == 1
+        assert private not in json.dumps([chat_result, owner_result]) + caplog.text
+        assert not list((tmp_path / "mcp-tokens").glob(".login-*.json"))
+        assert not list((tmp_path / "mcp-tokens").glob("diagnostic*.json"))
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await service.close()
+        await asyncio.to_thread(shutdown_mcp_servers)
 
 
 async def test_separate_processes_coordinate_refresh(authority):
