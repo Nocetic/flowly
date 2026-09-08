@@ -25,12 +25,13 @@ class OAuthHandoffError(ValueError):
 
 
 IOS_OAUTH_REDIRECT_URI = "https://useflowlyapp.com/api/auth/mcp/ios/callback"
+ANDROID_OAUTH_REDIRECT_URI = "https://useflowlyapp.com/api/auth/mcp/android/callback"
 
 
 def validate_owner_redirect(uri: str) -> str:
     # Exact bytes, not normalized host/path: no arbitrary HTTPS receiver, query,
     # alternate port, credentials or encoded path may receive an owner's code.
-    if isinstance(uri, str) and uri == IOS_OAUTH_REDIRECT_URI:
+    if isinstance(uri, str) and uri in {IOS_OAUTH_REDIRECT_URI, ANDROID_OAUTH_REDIRECT_URI}:
         return uri
     return validate_desktop_redirect(uri)
 

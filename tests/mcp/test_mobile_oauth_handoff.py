@@ -3,21 +3,22 @@
 import pytest
 
 from flowly.mcp.oauth_handoff import (
-    IOS_OAUTH_REDIRECT_URI, OwnerOAuthHandoff, OAuthHandoffError,
+    IOS_OAUTH_REDIRECT_URI, ANDROID_OAUTH_REDIRECT_URI, OwnerOAuthHandoff, OAuthHandoffError,
     validate_owner_redirect, validate_desktop_redirect,
 )
 from tests.mcp.test_oauth_handoff import authorization_url, STATE, REDIRECT
 
 
-@pytest.mark.parametrize("uri", [IOS_OAUTH_REDIRECT_URI, REDIRECT])
+@pytest.mark.parametrize("uri", [IOS_OAUTH_REDIRECT_URI, ANDROID_OAUTH_REDIRECT_URI, REDIRECT])
 def test_accepts_only_supported_owner_callback_modes(uri):
     assert validate_owner_redirect(uri) == uri
 
 
 @pytest.mark.parametrize("suffix", ["/", "?state=x", "#x", "?", "#", "\n"])
-def test_mobile_callback_requires_exact_uri(suffix):
+@pytest.mark.parametrize("uri", [IOS_OAUTH_REDIRECT_URI, ANDROID_OAUTH_REDIRECT_URI])
+def test_mobile_callback_requires_exact_uri(suffix, uri):
     with pytest.raises(OAuthHandoffError):
-        validate_owner_redirect(IOS_OAUTH_REDIRECT_URI + suffix)
+        validate_owner_redirect(uri + suffix)
 
 
 @pytest.mark.parametrize("uri", [
@@ -25,7 +26,9 @@ def test_mobile_callback_requires_exact_uri(suffix):
     "https://useflowlyapp.com:443/api/auth/mcp/ios/callback",
     "https://useflowlyapp.com.attacker.example/api/auth/mcp/ios/callback",
     "https://attacker@useflowlyapp.com/api/auth/mcp/ios/callback",
-    "https://useflowlyapp.com/api/auth/mcp/android/callback",
+    "https://useflowlyapp.com/api/auth/mcp/android/%63allback",
+    "https://useflowlyapp.com:443/api/auth/mcp/android/callback",
+    "https://useflowlyapp.com.attacker.example/api/auth/mcp/android/callback",
     "https://useflowlyapp.com/api/auth/mcp/ios/%63allback",
 ])
 def test_rejects_unregistered_mobile_redirects(uri):
@@ -33,15 +36,17 @@ def test_rejects_unregistered_mobile_redirects(uri):
         validate_owner_redirect(uri)
 
 
-def test_desktop_validator_remains_loopback_only():
+@pytest.mark.parametrize("uri", [IOS_OAUTH_REDIRECT_URI, ANDROID_OAUTH_REDIRECT_URI])
+def test_desktop_validator_remains_loopback_only(uri):
     with pytest.raises(OAuthHandoffError):
-        validate_desktop_redirect(IOS_OAUTH_REDIRECT_URI)
+        validate_desktop_redirect(uri)
 
 
 @pytest.mark.asyncio
-async def test_mobile_state_retry_and_cancel():
-    flow = OwnerOAuthHandoff(IOS_OAUTH_REDIRECT_URI)
-    await flow.redirect(authorization_url(redirect=IOS_OAUTH_REDIRECT_URI))
+@pytest.mark.parametrize("uri", [IOS_OAUTH_REDIRECT_URI, ANDROID_OAUTH_REDIRECT_URI])
+async def test_mobile_state_retry_and_cancel(uri):
+    flow = OwnerOAuthHandoff(uri)
+    await flow.redirect(authorization_url(redirect=uri))
     with pytest.raises(OAuthHandoffError):
         flow.submit({"code": "code", "state": "wrong"})
     payload = {"code": "code", "state": STATE}

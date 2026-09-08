@@ -32,9 +32,27 @@ async def test_methods_and_capabilities_negotiate_without_runtime(monkeypatch):
     capabilities = await call("mcp.capabilities")
     assert capabilities["version"] == 1
     assert capabilities["connectionSetup"] is False
+    assert capabilities["oauthCallbackModes"] == []
+    assert capabilities["oauthRedirectUris"] == {}
     with pytest.raises(feature_rpc.FeatureRpcError) as error:
         await call("mcp.setup.begin", {})
     assert error.value.code == "UNAVAILABLE"
+
+
+@pytest.mark.parametrize("available", [True, False])
+async def test_mobile_callback_capabilities_match_native_oauth_availability(service, monkeypatch, available):
+    from flowly.mcp import oauth
+    from flowly.mcp.oauth_handoff import ANDROID_OAUTH_REDIRECT_URI, IOS_OAUTH_REDIRECT_URI
+
+    monkeypatch.setattr(oauth, "oauth_available", lambda: available)
+    capabilities = await call("mcp.capabilities")
+    assert capabilities["nativeOAuth"] is available
+    assert capabilities["oauthCallbackModes"] == (
+        ["desktop_loopback", "ios_https", "android_https"] if available else []
+    )
+    assert capabilities["oauthRedirectUris"] == (
+        {"ios": IOS_OAUTH_REDIRECT_URI, "android": ANDROID_OAUTH_REDIRECT_URI} if available else {}
+    )
 
 
 async def test_setup_surface_is_short_lived_and_never_requests_gateway_restart(service):
