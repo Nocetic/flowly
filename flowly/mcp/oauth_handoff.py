@@ -1,4 +1,4 @@
-"""One bounded OAuth exchange with a callback owned by the user's Desktop.
+"""One bounded OAuth exchange with a callback owned by the user's device.
 
 Only runtime code can install this context; server configuration cannot replace
 OAuth handlers. Futures are thread-safe because MCP runs on its own event loop.
@@ -24,6 +24,17 @@ class OAuthHandoffError(ValueError):
     """An intentionally credential-free, user-actionable validation error."""
 
 
+IOS_OAUTH_REDIRECT_URI = "https://useflowlyapp.com/api/auth/mcp/ios/callback"
+
+
+def validate_owner_redirect(uri: str) -> str:
+    # Exact bytes, not normalized host/path: no arbitrary HTTPS receiver, query,
+    # alternate port, credentials or encoded path may receive an owner's code.
+    if isinstance(uri, str) and uri == IOS_OAUTH_REDIRECT_URI:
+        return uri
+    return validate_desktop_redirect(uri)
+
+
 def validate_desktop_redirect(uri: str) -> str:
     if not isinstance(uri, str) or len(uri) > 512:
         raise OAuthHandoffError("Invalid Desktop callback address")
@@ -44,9 +55,9 @@ def validate_desktop_redirect(uri: str) -> str:
     return uri
 
 
-class DesktopOAuthHandoff:
+class OwnerOAuthHandoff:
     def __init__(self, redirect_uri: str, *, timeout: float = 300.0):
-        self.redirect_uri = validate_desktop_redirect(redirect_uri)
+        self.redirect_uri = validate_owner_redirect(redirect_uri)
         if not 0 < timeout <= 600:
             raise OAuthHandoffError("Invalid OAuth callback deadline")
         self._deadline = time.monotonic() + timeout
@@ -143,13 +154,20 @@ class DesktopOAuthHandoff:
             self._callback.cancel()
 
 
-_active_handoff: ContextVar[tuple[str, str, DesktopOAuthHandoff] | None] = ContextVar(
+class DesktopOAuthHandoff(OwnerOAuthHandoff):
+    """Compatibility entry point retaining the original loopback-only contract."""
+
+    def __init__(self, redirect_uri: str, *, timeout: float = 300.0):
+        super().__init__(validate_desktop_redirect(redirect_uri), timeout=timeout)
+
+
+_active_handoff: ContextVar[tuple[str, str, OwnerOAuthHandoff] | None] = ContextVar(
     "mcp_desktop_oauth_handoff", default=None,
 )
 
 
 @contextmanager
-def desktop_oauth_handoff(server_name: str, url: str, handoff: DesktopOAuthHandoff):
+def desktop_oauth_handoff(server_name: str, url: str, handoff: OwnerOAuthHandoff):
     token = _active_handoff.set((server_name, url, handoff))
     try:
         yield handoff
@@ -158,7 +176,7 @@ def desktop_oauth_handoff(server_name: str, url: str, handoff: DesktopOAuthHando
         handoff.close()
 
 
-def handoff_for(server_name: str, url: str) -> DesktopOAuthHandoff | None:
+def handoff_for(server_name: str, url: str) -> OwnerOAuthHandoff | None:
     current = _active_handoff.get()
     if current is None:
         return None

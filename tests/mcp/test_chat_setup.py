@@ -68,8 +68,9 @@ async def test_lost_begin_ack_reuses_operation_and_other_desktop_cannot_take_rec
     params = {"chatRequestId": req["id"], "requestId": "request-123456789"}
     first = service.chat.begin(params)
     assert service.chat.begin(params)["id"] == first["id"]
-    with pytest.raises(MCPSetupError, match="another Desktop"):
+    with pytest.raises(MCPSetupError, match="another device") as conflict:
         service.chat.begin({**params, "requestId": "different-request-1234"})
+    assert conflict.value.code == "BUSY"
     await service.chat.cancel(req["id"])
     assert (await task)["status"] == "cancelled"
 

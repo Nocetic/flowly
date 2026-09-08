@@ -267,11 +267,15 @@ async def close_mcp_connection_runtime() -> None:
 
 def mcp_capabilities() -> dict:
     from flowly.mcp.oauth import oauth_available
+    from flowly.mcp.oauth_handoff import IOS_OAUTH_REDIRECT_URI
 
     available = _mcp_connection_service is not None and not _mcp_connection_service.manager._closed
+    native_oauth = available and oauth_available()
     return {
         "version": 1, "connectionSetup": available,
-        "nativeOAuth": available and oauth_available(), "liveReconfigure": available,
+        "nativeOAuth": native_oauth, "liveReconfigure": available,
+        "oauthCallbackModes": ["desktop_loopback", "ios_https"] if native_oauth else [],
+        "oauthRedirectUris": {"ios": IOS_OAUTH_REDIRECT_URI} if native_oauth else {},
         "explicitPermissions": available, "setupTimeoutSeconds": 600,
         "chatSetup": available,
         "externalAgentAccess": bool(available and _mcp_connection_service.external is not None

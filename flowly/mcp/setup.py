@@ -24,7 +24,7 @@ from flowly.config.loader import convert_keys, convert_to_camel
 from flowly.config.schema import MCPServerConfig, MCPServerToolsFilter
 from flowly.config.transaction import config_write_lock
 from flowly.mcp.oauth import clear_tokens, oauth_login
-from flowly.mcp.oauth_handoff import DesktopOAuthHandoff, desktop_oauth_handoff
+from flowly.mcp.oauth_handoff import OwnerOAuthHandoff, desktop_oauth_handoff
 from flowly.mcp.oauth_state import atomic_private_write, read_private
 
 TERMINAL = frozenset({"complete", "failed", "cancelled", "expired"})
@@ -101,7 +101,7 @@ class SetupOperation:
     error: dict | None = None
     saved: bool = False
     runtime: dict | None = None
-    handoff: DesktopOAuthHandoff | None = None
+    handoff: OwnerOAuthHandoff | None = None
     decision: asyncio.Future | None = None
     task: asyncio.Task | None = None
 
@@ -261,7 +261,7 @@ class MCPSetupManager:
         if config["auth"] == "oauth" and intent != "permissions":
             if not config["url"]:
                 raise MCPSetupError("INVALID", "Native OAuth requires an HTTP connection")
-            handoff = DesktopOAuthHandoff(params.get("redirectUri"))
+            handoff = OwnerOAuthHandoff(params.get("redirectUri"))
             config["oauth_credential_id"] = uuid.uuid4().hex
         elif supplied is not None:
             config["oauth_credential_id"] = ""

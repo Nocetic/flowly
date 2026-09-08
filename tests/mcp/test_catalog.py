@@ -21,7 +21,7 @@ def test_all_shipped_manifests_parse():
     cat = load_catalog()
     # The curated set we ship — all must parse cleanly.
     assert {"context7", "fetch", "time", "filesystem", "github",
-            "linear", "playwright", "notion"} <= set(cat)
+            "linear", "playwright", "notion", "notion-cloud", "canva", "higgsfield"} <= set(cat)
 
 
 def test_entry_fields():
@@ -55,6 +55,33 @@ def test_build_config_http_oauth():
     cfg = build_server_config(get_entry("linear"))
     assert cfg["url"] == "https://mcp.linear.app/mcp"
     assert cfg["auth"] == "oauth"
+
+
+@pytest.mark.parametrize("name,url", [
+    ("higgsfield", "https://mcp.higgsfield.ai/mcp"),
+    ("canva", "https://mcp.canva.com/mcp"),
+    ("notion-cloud", "https://mcp.notion.com/mcp"),
+])
+def test_consumer_catalog_uses_official_oauth_endpoints(name, url):
+    entry = get_entry(name)
+    assert entry.auth_type == "oauth"
+    assert entry.transport_type == "http"
+    assert entry.source.startswith("https://")
+    assert entry.env == []
+    assert build_server_config(entry) == {"enabled": True, "url": url, "auth": "oauth"}
+
+
+def test_notion_api_key_entry_is_not_silently_migrated():
+    entry = get_entry("notion")
+    assert entry.transport_type == "stdio"
+    assert entry.auth_type == "api_key"
+    assert build_server_config(entry)["env"]["NOTION_API_KEY"] == "${NOTION_API_KEY}"
+
+
+def test_higgsfield_catalog_explains_credit_usage():
+    entry = get_entry("higgsfield")
+    assert "credits" in entry.description
+    assert "Unlimited" in entry.description
 
 
 # ── install ─────────────────────────────────────────────────────────

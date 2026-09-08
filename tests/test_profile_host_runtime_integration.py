@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
+import sys
+from pathlib import Path
 
 import aiohttp
 import pytest
@@ -48,6 +51,65 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
 
         result = await host.rpc("writer", "sessions.list", {})
         assert result == {"sessions": []}
+
+        writer = next(item for item in (await host.list())["profiles"] if item["name"] == "writer")
+        identity = {"expected_host_id": host.host_id, "expected_bot_id": writer["botId"]}
+        capability = await host.rpc("writer", "mcp.capabilities", {}, **identity)
+        assert capability["connectionSetup"] is True
+        assert capability["explicitPermissions"] is True
+        connections = await host.rpc("writer", "mcp.connections.list", {}, **identity)
+        assert isinstance(connections["servers"], list)
+        pending = await host.rpc("writer", "mcp.setup.pending", {}, **identity)
+        assert pending == {"operations": []}
+
+        sibling = profiles.create_profile("reader", local_runtime=True)
+        sibling_before = (sibling / "config.json").read_bytes()
+        primary_config = default / "config.json"
+        primary_before = primary_config.read_bytes() if primary_config.exists() else None
+        writer_before = json.loads(config_path.read_text())
+        peer = Path(__file__).parent / "mcp" / "profile_setup_peer.py"
+        request = {"name": "ios_fixture", "requestId": "ios-profile-fixture-request-001",
+                   "config": {"command": sys.executable, "args": [str(peer.resolve())]}}
+        started = await host.rpc("writer", "mcp.setup.begin", request, **identity)
+        operation_id = started["id"]
+
+        async def await_phase(phase):
+            async with asyncio.timeout(30):
+                while True:
+                    snapshot = await host.rpc("writer", "mcp.setup.status", {"id": operation_id}, **identity)
+                    assert snapshot["phase"] not in {"failed", "cancelled", "expired"}, snapshot.get("error")
+                    if snapshot["phase"] == phase:
+                        return snapshot
+                    await asyncio.sleep(0.05)
+
+        review = await await_phase("review")
+        assert set(review["tools"]) == {"read_fixture", "other_fixture"}
+        assert "ios_fixture" not in json.loads(config_path.read_text()).get("mcpServers", {})
+        await host.rpc("writer", "mcp.setup.confirm", {
+            "id": operation_id, "permissions": {"mode": "selected", "include": ["read_fixture"]},
+        }, **identity)
+        complete = await await_phase("complete")
+        assert complete["saved"] is True
+        assert complete["runtime"]["connected"] is True
+        saved = json.loads(config_path.read_text())
+        assert saved["mcpServers"]["ios_fixture"]["tools"]["include"] == ["read_fixture"]
+        assert {key: value for key, value in saved.items() if key != "mcpServers"} == {
+            key: value for key, value in writer_before.items() if key != "mcpServers"
+        }
+        assert (sibling / "config.json").read_bytes() == sibling_before
+        assert (primary_config.read_bytes() if primary_config.exists() else None) == primary_before
+
+        saved_before_cancel = config_path.read_bytes()
+        # A second draft must remain disposable and cannot erase the first one.
+        second = {**request, "name": "cancelled_fixture", "requestId": "ios-profile-fixture-request-002"}
+        started = await host.rpc("writer", "mcp.setup.begin", second, **identity)
+        operation_id = started["id"]
+        await await_phase("review")
+        cancelled = await host.rpc("writer", "mcp.setup.cancel", {"id": operation_id}, **identity)
+        assert cancelled["phase"] == "cancelled"
+        assert config_path.read_bytes() == saved_before_cancel
+        assert (sibling / "config.json").read_bytes() == sibling_before
+        assert (primary_config.read_bytes() if primary_config.exists() else None) == primary_before
 
         stopped = await host.stop("writer")
         assert stopped["status"]["state"] == "stopped"

@@ -338,6 +338,7 @@ class ProfileHost:
                 *self._rooms.methods,
             ],
             "profileRpcMethods": sorted(PROFILE_RPC_TIMEOUTS),
+            "rpcIdentityGuard": True,
             "events": ["profile.event", "profile.room"],
             "storageMode": "profile-local",
             "processIsolation": "per-profile-gateway",
@@ -467,6 +468,8 @@ class ProfileHost:
                 params.get("method"),
                 params.get("params"),
                 params.get("timeoutMs"),
+                expected_host_id=params.get("expectedHostId"),
+                expected_bot_id=params.get("expectedBotId"),
             )
         if method in self._rooms.methods:
             result = await self._rooms.dispatch(method, params)
@@ -807,9 +810,21 @@ class ProfileHost:
         method: Any,
         params: Any = None,
         timeout_ms: Any = None,
+        *,
+        expected_host_id: Any = None,
+        expected_bot_id: Any = None,
     ) -> Any:
         _validate_profile_selector(name)
         method, safe = validate_profile_rpc(method, params)
+        guarded = expected_host_id is not None or expected_bot_id is not None
+        if method.startswith("mcp.") and not guarded:
+            raise ProfileHostError("INVALID_PARAMS", "MCP operations require the selected profile identities.")
+        if guarded:
+            if not isinstance(expected_host_id, str) or not expected_host_id or not isinstance(expected_bot_id, str) or not expected_bot_id:
+                raise ProfileHostError("INVALID_PARAMS", "Both expected profile identities are required.")
+            if expected_host_id != self.host_id:
+                raise ProfileHostError("PROFILE_IDENTITY_CHANGED", "The selected host identity changed.")
+            self._check_rpc_profile_identity(name, expected_bot_id)
         if method == "chat.send":
             directory = [profile.name for profile in list_profiles()]
             mentions = safe.get("profileMentions")
@@ -826,8 +841,9 @@ class ProfileHost:
             safe.pop("allowedTools", None)
             safe.pop("disabledTools", None)
             safe["turnOrigin"] = "user"
+        identity_options = {"expected_bot_id": expected_bot_id} if guarded else {}
         result = await self._target_rpc(
-            name, method, safe, bounded_timeout(method, timeout_ms)
+            name, method, safe, bounded_timeout(method, timeout_ms), **identity_options
         )
         if method == "sessions.list" and isinstance(result, dict):
             sessions = result.get("sessions")
@@ -1967,14 +1983,22 @@ class ProfileHost:
         except Exception:
             logger.debug("Could not abort cancelled profile collaboration {}", run_id)
 
+    def _check_rpc_profile_identity(self, name: str, expected_bot_id: str) -> None:
+        if _public_profile(name).get("botId") != expected_bot_id:
+            raise ProfileHostError("PROFILE_IDENTITY_CHANGED", "The selected profile identity changed.")
+
     async def _target_rpc(
         self,
         target: str,
         method: str,
         params: dict[str, Any],
         timeout: float,
+        *,
+        expected_bot_id: str | None = None,
     ) -> Any:
         if target == "default":
+            if expected_bot_id is not None:
+                self._check_rpc_profile_identity(target, expected_bot_id)
             if self._primary_rpc is None:
                 raise ProfileHostError(
                     "DEFAULT_PROFILE_UNAVAILABLE",
@@ -1989,6 +2013,10 @@ class ProfileHost:
                 return {"aborted": False}
         else:
             target_runtime = await self._ensure_runtime(target)
+        # Runtime startup can yield while a profile is deleted/re-created.
+        # Recheck immediately before sending to the captured runtime socket.
+        if expected_bot_id is not None:
+            self._check_rpc_profile_identity(target, expected_bot_id)
         result = await self._rpc(target_runtime, method, params, timeout)
         if method == "chat.send" and isinstance(result, dict):
             run_id = str(result.get("runId") or "")

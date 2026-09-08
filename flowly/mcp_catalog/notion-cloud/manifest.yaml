@@ -1,0 +1,13 @@
+manifest_version: 1
+name: notion-cloud
+description: Search and update Notion pages and workspace information with account sign-in.
+source: https://developers.notion.com/guides/mcp/get-started-with-mcp
+transport:
+  type: http
+  url: https://mcp.notion.com/mcp
+auth:
+  type: oauth
+post_install: |
+  Sign in with `flowly mcp login notion-cloud` and choose your workspace access.
+  This is separate from the existing API-key based `notion` catalog entry;
+  installing it does not migrate or replace that connection.

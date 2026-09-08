@@ -1,4 +1,4 @@
-"""Chat proposals are inert until an authenticated owner starts Desktop setup."""
+"""Chat proposals are inert until an authenticated owner starts app setup."""
 
 from __future__ import annotations
 
@@ -83,14 +83,14 @@ class MCPChatSetupManager:
         start = {"name": name, "intent": intent, "sessionKey": session_key}
         if original is not None:
             if draft is not None:
-                raise MCPSetupError("INVALID", "Edit an existing connection in Desktop; do not replace it from chat")
+                raise MCPSetupError("INVALID", "Edit an existing connection in the Flowly app; do not replace it from chat")
             source = original
             preview = {"kind": "existing", "intent": intent, "fields": []}
         elif intent != "connect":
             raise MCPSetupError("INVALID", "This action requires an existing connection")
         elif draft is not None:
             if not isinstance(draft, dict) or set(draft) - {"command", "args", "url", "transport", "auth"}:
-                raise MCPSetupError("INVALID", "Enter credentials and advanced settings privately in Desktop")
+                raise MCPSetupError("INVALID", "Enter credentials and advanced settings privately in the Flowly app")
             try:
                 if len(json.dumps(draft, allow_nan=False).encode()) > 16_384:
                     raise ValueError
@@ -115,10 +115,10 @@ class MCPChatSetupManager:
         try:
             config = MCPServerConfig.model_validate(convert_keys(source)).model_dump()
         except (TypeError, ValueError):
-            raise MCPSetupError("INVALID", "This connection needs to be repaired in Desktop first") from None
+            raise MCPSetupError("INVALID", "This connection needs to be repaired in the Flowly app first") from None
         # Never start a helper-based login implicitly from a chat request.
         if any(isinstance(arg, str) and (arg == "mcp-remote" or arg.startswith("mcp-remote@")) for arg in config.get("args", [])):
-            raise MCPSetupError("MIGRATION_REQUIRED", "Use Desktop's explicit native sign-in migration for this connection first")
+            raise MCPSetupError("MIGRATION_REQUIRED", "Use the Flowly app's explicit native sign-in migration for this connection first")
         req = ChatSetupRequest(
             secrets.token_urlsafe(24), name, session_key, reason, start, preview, revision,
             catalog_revision, config.get("auth") == "oauth" and intent != "permissions",
@@ -155,7 +155,7 @@ class MCPChatSetupManager:
         if req.operation_id:
             op = self.manager.get(req.operation_id)
             if params.get("requestId") != op.request_id:
-                raise MCPSetupError("BUSY", "This request was started on another Desktop; finish it there")
+                raise MCPSetupError("BUSY", "This request was started on another device; finish it there")
             return op.snapshot()
         if time.time() >= req.created_at + CHAT_SETUP_TIMEOUT:
             raise MCPSetupError("EXPIRED", "This connection request expired")
@@ -166,7 +166,7 @@ class MCPChatSetupManager:
             entry = get_entry(req.name)
             if entry is None or _revision(build_server_config(entry)) != req.catalog_revision:
                 raise MCPSetupError("CONFLICT", "The catalog connection changed; ask for a new request")
-        # The user may add catalog credentials and the private Desktop callback,
+        # The owner may add catalog credentials and a supported private callback,
         # but cannot silently rebind this conversation's request to another name.
         start = {**req.params, **{k: params[k] for k in ("requestId", "redirectUri", "envValues") if k in params}}
         snapshot = self.manager.begin(start)

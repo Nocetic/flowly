@@ -1,0 +1,12 @@
+manifest_version: 1
+name: higgsfield
+description: Generate images, videos, and audio. MCP generations spend Higgsfield credits, including on Unlimited plans.
+source: https://higgsfield.ai/creator-hub/help-center/integrations/what-is-higgsfield-mcp
+transport:
+  type: http
+  url: https://mcp.higgsfield.ai/mcp
+auth:
+  type: oauth
+post_install: |
+  Sign in with `flowly mcp login higgsfield`. Generations use your Higgsfield
+  credits; web-only free and Unlimited generations do not apply to MCP.

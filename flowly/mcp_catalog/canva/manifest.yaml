@@ -1,0 +1,12 @@
+manifest_version: 1
+name: canva
+description: Work with Canva designs and presentations using your own account.
+source: https://www.canva.dev/docs/mcp/verify-integration/
+transport:
+  type: http
+  url: https://mcp.canva.com/mcp
+auth:
+  type: oauth
+post_install: |
+  Sign in with `flowly mcp login canva`. Each user authorizes their own account;
+  available features depend on the account and provider permissions.

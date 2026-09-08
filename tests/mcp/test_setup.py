@@ -7,7 +7,7 @@ import pytest
 from mcp.shared.auth import OAuthToken
 
 from flowly.mcp.oauth import FlowlyTokenStorage, token_storage_for
-from flowly.mcp.oauth_handoff import handoff_for
+from flowly.mcp.oauth_handoff import IOS_OAUTH_REDIRECT_URI, handoff_for
 from flowly.mcp.setup import MCPSetupError, MCPSetupManager
 
 REDIRECT = "http://127.0.0.1:54321/mcp/oauth/callback/" + "a" * 32
@@ -109,7 +109,8 @@ async def test_cancellation_before_worker_starts_is_terminal(manager):
 
 
 @pytest.mark.asyncio
-async def test_reauth_publishes_new_slot_only_after_consent(manager):
+@pytest.mark.parametrize("redirect_uri", [REDIRECT, IOS_OAUTH_REDIRECT_URI])
+async def test_reauth_publishes_new_slot_only_after_consent(manager, redirect_uri):
     url = "https://mcp.example"
     old = FlowlyTokenStorage("demo", url)
     await old.set_tokens(OAuthToken(access_token="working", token_type="Bearer"))
@@ -118,12 +119,13 @@ async def test_reauth_publishes_new_slot_only_after_consent(manager):
     async def probe(name, config, *, interactive):
         assert interactive is True
         assert handoff_for(name, url) is not None
+        assert handoff_for(name, url).redirect_uri == redirect_uri
         await token_storage_for(name, url, credential_id=config["oauth_credential_id"]).set_tokens(
             OAuthToken(access_token="fresh", token_type="Bearer"),
         )
         return True, ["read"], ""
     manager.probe = probe
-    operation = begin(manager, config=None, intent="reauthorize", redirectUri=REDIRECT)
+    operation = begin(manager, config=None, intent="reauthorize", redirectUri=redirect_uri)
     op = await ready(manager, operation)
     assert old._path.read_bytes() == original
     assert (await FlowlyTokenStorage("demo", url).get_tokens()).access_token == "working"

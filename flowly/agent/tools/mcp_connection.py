@@ -11,8 +11,8 @@ class MCPConnectionRequestTool(Tool):
     name = "mcp_connection"
     description = (
         "List MCP connections or ask the user to connect a service, reauthorize it, or review its tool permissions. "
-        "A request pauses until the user reviews it in Desktop; it does not run commands, sign in, or grant tools by itself. "
-        "Use catalog names where possible. Never put API keys, tokens or passwords into this tool: the user enters them privately in Desktop. "
+        "A request pauses until the owner reviews it in a supported Flowly app; it does not run commands, sign in, or grant tools by itself. "
+        "Use catalog names where possible. Never put API keys, tokens or passwords into this tool: the owner enters them privately in the Flowly app. "
         "After cancellation or failure, do not bypass setup with shell commands or config edits."
     )
     parameters = {
@@ -37,7 +37,7 @@ class MCPConnectionRequestTool(Tool):
 
         service = _mcp_connection_service
         if service is None or service.manager._closed:
-            return json.dumps({"error": "MCP setup requires the running gateway and Desktop"})
+            return json.dumps({"error": "MCP setup requires the running gateway and a supported Flowly app"})
         try:
             if kwargs.get("action") == "list":
                 return json.dumps(service.list())

@@ -35,10 +35,24 @@ _NON_PUBLIC_ATTACHMENT_HOST_SUFFIXES = (
     ".home.arpa",
 )
 
-# Deliberately excludes raw config/secrets, arbitrary CLI execution, and
-# MCP/skill installation. The small access-policy projection below is safe to
+# Deliberately excludes raw global config/secrets, arbitrary CLI execution, and
+# legacy MCP/skill installation. Modern MCP setup stays in the selected runtime's
+# staged owner-confirmation service; it never falls back to direct config writes.
+# The small access-policy projection below is safe to
 # expose because it accepts only closed enums and a deny-only toolset list.
 PROFILE_RPC_TIMEOUTS: dict[str, int] = {
+    "mcp.capabilities": 30_000,
+    "mcp.connections.list": 30_000,
+    "mcp.connections.action": 60_000,
+    "mcp.setup.begin": 60_000,
+    "mcp.setup.status": 30_000,
+    "mcp.setup.pending": 30_000,
+    "mcp.setup.confirm": 30_000,
+    "mcp.setup.callback": 30_000,
+    "mcp.setup.cancel": 30_000,
+    "mcp.setup.cancel_request": 30_000,
+    "mcp.chat.pending": 30_000,
+    "mcp.chat.cancel": 30_000,
     "provider.list": 30_000,
     "provider.active": 30_000,
     "model.list": 60_000,
