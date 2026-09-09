@@ -199,15 +199,19 @@ Inspect and correct long-term memory (the governed memory store). See [Memory](.
 |---|---|
 | `list` | Show configured MCP servers. |
 | `add` | Register an MCP server (probes by default; `--no-probe` to skip). |
-| `remove` | Drop a server entry. |
+| `remove` | Drop a server entry and its associated OAuth credentials. |
 | `enable` / `disable` | Toggle whether a server loads at agent boot. |
 | `configure` | Pick which of a server's tools are enabled (interactive). |
-| `serve` | Run Flowly itself as an MCP server on stdio. |
+| `tools` | Start an expiring stdio bridge to selected tools in a running gateway. |
+| `connect` | Adapt a scoped remote Flowly MCP endpoint to stdio. |
+| `serve` | Expose Flowly archives and optional gateway writes over stdio or Streamable HTTP. |
 | `catalog` | List the curated, ready-to-install MCP servers. |
 | `install` | Install a curated server from the catalog. |
 | `picker` | Browse the catalog and install interactively. |
 | `test` | Connect to a server and show its tool list. |
 | `login` | Run (or re-run) the OAuth flow for an OAuth-configured HTTP server. |
+
+`serve` is read-only by default; `--allow-writes` adds message-send and approval tools when a gateway is running. Its HTTP mode supports an exact host, port, path, stateless operation, bearer-token environment variable, and TLS certificate/key. `tools` requires an exact existing conversation, accepts repeated `--tool` limits, and grants at most eight hours. `connect` reads only `FLOWLY_MCP_ENDPOINT` and `FLOWLY_MCP_ACCESS_KEY`. See [MCP](../features/mcp.md) for owner-managed app setup, OAuth, permission, transport, and external-access details.
 
 ## flowly approvals
 

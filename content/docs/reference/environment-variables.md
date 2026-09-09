@@ -79,8 +79,19 @@ These let tools pick up credentials from the environment instead of `config.json
 | `TRELLO_API_KEY`, `TRELLO_TOKEN` | `trello` |
 | `XAI_API_KEY` | `x_search` (fallback when no OAuth subscription) |
 | `XAI_BASE_URL` | `x_search` (overrides the xAI API base URL) |
-| `GITHUB_TOKEN` | GitHub MCP server (from the catalog) |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub MCP server installed from the catalog |
+| `GITHUB_TOKEN` | GitHub-oriented skills and repository watchers |
 | `EDITOR` | Opening the TUI draft with `Ctrl+E` |
+
+## MCP bridges
+
+| Variable | Used by |
+|---|---|
+| `FLOWLY_MCP_ENDPOINT` | `flowly mcp connect`: the exact remote HTTPS MCP URL, or local loopback HTTP URL |
+| `FLOWLY_MCP_ACCESS_KEY` | `flowly mcp connect`: the scoped, expiring key created in Desktop |
+| `FLOWLY_MCP_TOKEN` | Default bearer-token variable for `flowly mcp serve --transport http`; override its name with `--auth-token-env` |
+
+These keys serve different bridges. A scoped access key is not the gateway administration token. See [MCP](../features/mcp.md#let-another-agent-use-flowly) for configuration and permission details.
 
 ## TUI
 

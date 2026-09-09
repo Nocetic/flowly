@@ -1,618 +1,578 @@
 ---
 title: MCP (Model Context Protocol)
 eyebrow: Features
-description: Connect Flowly to external MCP servers (GitHub, Linear, Notion, Playwright, your own) so the agent can call their tools — and expose Flowly itself as an MCP server to other clients.
+description: Connect the Flowly agent you own to external tools, manage sign-in and permissions from Flowly apps, or give another agent limited access to Flowly.
 ---
 
-Flowly speaks [MCP](https://modelcontextprotocol.io) **both ways**:
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io) is a standard way for agents and tools to work together. Flowly supports both directions:
 
-- **As a client** — connect Flowly to external MCP servers (Context7, GitHub, Linear, Playwright, your own) and the agent calls their tools like any built-in.
-- **As a server** — run `flowly mcp serve` so other MCP clients (Claude Desktop, Cursor, Claude Code, another agent) can read your Flowly conversation history and, optionally, send messages and resolve approvals.
+- **Flowly as an MCP client:** connect services such as Linear, Notion, Canva, GitHub, Higgsfield, or your own MCP server. The personal AI agent you own can then use the tools you permit.
+- **Flowly as an MCP server:** let another compatible agent use a deliberately limited part of Flowly with an expiring access key, or run one of the local MCP bridges from the CLI.
 
-Everything is managed from the `flowly mcp` command group, the `/mcp` modal in the TUI, the desktop **MCP** tab, or by hand-editing the `mcpServers` block in `~/.flowly/config.json`. Changes take effect at the next agent boot — restart the gateway (`flowly restart`) or start a new session.
+You do not need to understand MCP configuration files to connect a service. The Flowly apps provide the recommended setup flow. The CLI and `mcpServers` configuration remain available for advanced and headless installations.
 
-## Adding a server
+## Choose the right path
 
-Use `flowly mcp add` for stdio (local subprocess) or HTTP servers:
+| What you want | Recommended path |
+|---|---|
+| Connect a supported service | Open **MCP connections** in Flowly Desktop, iOS, or Android |
+| Let Flowly request a connection while you are chatting | Ask it to connect the service, then review the connection card yourself |
+| Add a custom local or remote MCP server | Use **Add connection** in an app, or `flowly mcp add` |
+| Let another agent use selected Flowly tools | In Flowly Desktop, use **External agent access** |
+| Expose conversation archives over a local MCP process | Run `flowly mcp serve` |
+| Expose selected tools from a running local gateway | Run `flowly mcp tools` |
 
-```bash
-# stdio: local subprocess
-flowly mcp add context7 --command npx --arg -y --arg @upstash/context7-mcp
+## Connect a service from a Flowly app
 
-# HTTP (StreamableHTTP): remote URL
-flowly mcp add acme --url https://mcp.example.com/mcp --header "X-Api-Key: ..."
+The owner-managed connection flow is available in Flowly Desktop, iOS, and Android. It works with the exact Flowly runtime you selected: local, direct self-hosted, relay-managed, or a selected profile runtime, as long as that runtime advertises MCP connection support.
 
-# HTTP + OAuth
-flowly mcp add linear --url https://mcp.linear.app/mcp --auth oauth
-```
+1. Open the selected Flowly's **MCP connections** screen.
+2. Choose a catalog service or add a custom connection.
+3. Enter any required URL, local command, header, environment value, or account sign-in details in the secure setup screen—not in chat.
+4. Flowly tests the connection and discovers its tools.
+5. Choose **all tools**, **selected tools**, or **no tools**. You can separately enable resource and prompt access when the server provides them.
+6. Confirm the review. Only then does Flowly publish the new configuration and apply it to the selected runtime.
 
-`--command` and `--url` are mutually exclusive; `--auth oauth` requires `--url`. Other flags: `--env KEY=VALUE`, `--timeout` (120s default), `--connect-timeout` (60s), `--probe`/`--no-probe`, `--force`.
+Supported app actions include:
+
+- Connect a new catalog or custom server.
+- Sign in with OAuth and reauthorize an existing connection.
+- Select exact tools and optional resource/prompt access.
+- Enable, disable, retry, or remove a connection.
+- See whether a connection is actually healthy, not merely present in configuration.
+
+The setup draft expires after 10 minutes while waiting for connection verification and your decision. Closing the setup sheet does **not** cancel it; use the setup's cancellation action when you want to end it. Failure or cancellation before publication preserves the previous working configuration and credentials.
+
+After you confirm, Flowly saves the configuration and then applies it to the live runtime. If that final step fails or is interrupted, the new settings remain saved. The screen reports the failure with `saved: true`; retry the connection and verify its live status. A failed apply does not automatically restore the previous settings.
 
 > [!NOTE]
-> A new session must start for newly-registered tools to appear.
+> App-managed changes use targeted live reconfiguration. Existing chat and mail connections do not restart just because you connected, disabled, or removed one MCP server. CLI, TUI, and manual configuration changes still need a new agent session or runtime restart before the registered tool list changes.
 
-### Transports
+### Understanding connection status
 
-| Transport | Config | Notes |
-|---|---|---|
-| stdio | `command` + `args` (+ `env`) | Local subprocess. Default for local servers. Sanitized, bounded diagnostics → `$FLOWLY_HOME/logs/mcp/diagnostics.jsonl` |
-| HTTP (StreamableHTTP) | `url` (+ `headers`) | First-class. Default for remote servers |
-| SSE | `url` + `transport: sse` | For older SSE-style servers |
+**Saved** and **connected** are different facts. A server can be saved but disabled, waiting for sign-in, temporarily unreachable, or reconnecting.
 
-## The `mcpServers` config block
+| Status | Meaning |
+|---|---|
+| Disabled | Saved in configuration but unavailable to the agent |
+| Sign-in needed | Enabled, but OAuth authorization is missing or no longer valid |
+| Connecting | Flowly is opening the transport and discovering capabilities |
+| Connected | The live connection is healthy |
+| Degraded / reconnecting | A connection failed and Flowly is recovering it automatically |
+| Parked | Fast retries were exhausted; Flowly now probes slowly until the server returns |
+| Failed | Setup or the latest connection attempt could not complete; inspect the shown error |
 
-Servers live under the top-level `mcpServers` key in `~/.flowly/config.json`. Keys are camelCase. A real stdio example with an injected secret:
+Flowly does not automatically replay an operation that failed during a disconnect. The operation may have already changed external data, so an automatic retry could duplicate the effect.
 
-```json
-{
-  "mcpServers": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}" }
-    }
-  }
-}
-```
+## Request a connection from a conversation
 
-`${VAR}` interpolation works in `env`, `args`, and `headers`. Variables resolve at boot from `$FLOWLY_HOME/.env` (and the process environment, which wins on conflict).
+You can say, for example, “Connect Linear” or “I want to use the Higgsfield MCP.” Flowly can create a connection request for that conversation, but it cannot approve its own access.
 
-> [!TIP]
-> Store secrets in `.env` (mode 0600) and reference them by `${VAR}` rather than inlining them.
+The request appears as a connection card in the supported app. You review the endpoint or catalog entry, complete sign-in, choose permissions, and confirm. If you leave and reopen the conversation, a still-pending request appears again. Cancelling it is explicit.
 
-An HTTP server with OAuth:
+From chat, the agent can request a new connection, reauthorization, or permission review. Disabling or removing an existing connection remains an owner action in the MCP connections screen.
 
-```json
-{
-  "mcpServers": {
-    "linear": {
-      "url": "https://mcp.linear.app/mcp",
-      "auth": "oauth"
-    }
-  }
-}
-```
+This conversation flow is intentionally limited:
 
-For mTLS / a custom CA on HTTP/SSE servers, set `clientCert`, `clientKey`, and `sslVerify` (`true` | `false` | path to a CA bundle).
+- The agent cannot put credentials into the request.
+- A request does not edit configuration or grant tools by itself.
+- The agent cannot silently expand an existing connection's permissions.
+- Cancelled and failed setup cannot be bypassed from chat.
+- Scheduled runs cannot start an interactive connection request.
+- The request is bound to the originating conversation and selected runtime; a model-written session identifier cannot redirect it elsewhere.
 
-For stdio servers installed via `npx`/`uvx`/`pipx`, `osvCheck` (default `true`) queries the OSV API for known supply-chain malware advisories on the package before the server spawns. Set it to `false` to skip the check for a trusted or local server.
+## OAuth sign-in
 
-## Per-server tool filtering
+Remote HTTP servers with `auth: "oauth"` use native OAuth 2.1 discovery and PKCE.
 
-Each remote tool registers as `mcp_{server}_{tool}` (non-alphanumeric characters become `_`). For example, Context7's `resolve-library-id` becomes `mcp_context7_resolve_library_id`. On a name collision the **existing tool wins** and the MCP one is skipped — Flowly's native tools are never overwritten.
+### App-managed OAuth flow
 
-Limit which of a server's tools the agent sees via the `tools` block:
+1. The selected Flowly runtime discovers the provider's authorization endpoints and creates a short-lived request with PKCE and a random state value.
+2. The authorization URL is delivered to the owner app over its authenticated feature connection.
+3. The system browser opens on the **owner's device**, even when the selected runtime is on another machine.
+4. The provider returns to an exact callback:
+   - Desktop uses a random loopback URL on `127.0.0.1`.
+   - iOS uses `https://useflowlyapp.com/api/auth/mcp/ios/callback`.
+   - Android uses `https://useflowlyapp.com/api/auth/mcp/android/callback`.
+5. The app validates that the callback belongs to the setup it started and sends the authorization result to the original selected runtime.
+6. That runtime exchanges the code, stores the provider tokens, connects to the MCP server, and discovers its tools.
+7. You review permissions. The new connection and credential slot are published together only after confirmation.
 
-```json
-{
-  "mcpServers": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "tools": {
-        "include": ["search_repositories", "get_issue"],
-        "exclude": [],
-        "resources": false,
-        "prompts": false
-      }
-    }
-  }
-}
-```
+Provider tokens remain on the selected Flowly runtime under `$FLOWLY_HOME/mcp-tokens/`; the mobile app does not keep them. The website callback is a secure return path into the mobile app, not the place where provider tokens are stored or exchanged.
 
-- `tools.include` is a whitelist — if set, it wins and everything else is hidden.
-- `tools.exclude` is a blacklist — used only when `include` is empty.
-- Empty `include` + empty `exclude` exposes all tools.
-- `resources` / `prompts` expose the server's resource/prompt utility tools when it advertises those capabilities.
+Failed or cancelled sign-in does not replace a working credential. If two processes race to update the same connection, stale setup cannot overwrite the newer credential state. Running connections detect credential changes, and concurrent `401` responses share a single refresh attempt.
 
-`flowly mcp configure <name>` connects to the server, lists its tools, and gives you an interactive checkbox picker that writes `tools.include` for you.
+> [!IMPORTANT]
+> General OAuth support does not guarantee that every MCP provider accepts every redirect URI or dynamic client registration policy. A provider may require its own callback registration or release-specific validation. Flowly reports that provider error instead of saving a connection as healthy.
 
-## Connection lifetime and idle recycling
+### CLI OAuth flow
 
-For servers whose state survives a new connection/process, you can opt into
-demand-driven connection recycling:
-
-```json
-"lifecycle": {
-  "idleTimeout": 300,
-  "maxLifetime": 3600,
-  "closeTimeout": 10
-}
-```
-
-Times are seconds. `idleTimeout` and `maxLifetime` default to `0` (disabled),
-and accept values up to 604800 (seven days). `closeTimeout` defaults to 10 and
-must be greater than zero and no more than 60. Recycling is deliberately
-opt-in: some MCP servers keep non-reconstructable session state in memory.
-Flowly cannot migrate that state by checking a tool schema.
-
-- Idle time counts user requests, not keepalive traffic. An idle server closes
-  its transport and stdio child, but its discovered tools remain available.
-- At the lifetime deadline, the server enters `draining`: admitted tool,
-  resource and prompt requests finish, including their queue/elicitation time.
-  New requests wait for a fresh session rather than extending the old one.
-- Closure finishes before the next transport opens. A cleanup deadline bounds
-  an unresponsive close; shutdown is terminal and never wakes an idle server.
-- Concurrent callers share one wake-up. Each caller waits at most
-  `connectTimeout` for admission; one timeout/cancellation does not cancel the
-  other callers or an already admitted operation. Failed operations are not replayed.
-- Every new connection discovers the current catalog. An old tool handler is
-  rejected if its schema, description, output contract or permission metadata
-  changed, or if it vanished. The caller must fetch the new schema and retry
-  deliberately; untrusted writes still need approval before a sleeping server
-  can be started. All bound agent registries receive the refreshed catalog.
-
-### Persistent discovery and lazy application startup
-
-Set `lifecycle.lazyStart` to `true` to retain discovered tool manifests across
-Flowly restarts. It defaults to `false`; the first discovery always connects.
-After a successful complete discovery, later boots can load the manifest and
-leave the transport idle until a tool/resource/prompt request needs it. This
-works independently of the idle/lifetime timers above, and can be combined with them.
-
-`lifecycle.manifestTtl` defaults to 86400 seconds (one day), with a positive
-maximum of 604800 seconds (seven days). It controls whether a saved catalog is
-usable at startup, not a guarantee that the remote catalog stayed unchanged.
-Cached schemas are discovery hints: the first call still negotiates a connection
-and revalidates the complete live contract before sending the operation.
-Explicit connection probes always connect. Inspect `catalogSource` in runtime
-health to distinguish `manifest` from `live` discovery; cached readiness does
-not mean the server is currently reachable.
-
-Manifests live in `$FLOWLY_HOME/cache/mcp-manifests/` with private directory/file
-permissions. Published manifests are capped at 128 entries / 16 MiB, each at 1 MiB
-and 10000 tools. Old entries and interrupted temporary writes are reclaimable
-discovery metadata, not conversation or server state. Identity includes exact
-server name, effective configuration/policy, resolved profile, SDK, interpreter,
-working directory and allowed subprocess environment. OAuth login, refresh or
-logout invalidates hints tied to the previous credential file. Connection
-configuration and OAuth tokens contribute only fingerprints, not their raw
-values. Remote tool schemas/metadata are retained, which is why the files are private.
-
-Corrupt, expired, oversized, unsafe or mismatched cache entries fall back to
-live discovery. Secure descriptor-relative caching is available on macOS/Linux;
-other platforms use live discovery. Packaged builds without SDK distribution
-metadata cannot reuse manifests across process restarts. These fallbacks do
-not disable MCP transports.
-
-Concurrent initial discoveries within one process share a single startup and
-retain each consumer registry. Cancelling the last waiter joins startup cleanup;
-cancelling just one waiter does not affect peers. A same-name server cannot be
-silently reused under different configuration or profile authority: reload
-configured servers after such a change. Separate Flowly processes share only
-disk hints, never stdin/stdout connections or execution permission.
-
-## Private, bounded diagnostics
-
-MCP protocol log messages and subprocess stderr are recorded in
-`$FLOWLY_HOME/logs/mcp/diagnostics.jsonl`, after credential redaction. The private
-directory uses mode `0700`; log files use `0600`. One current file and two
-rotations are each limited to 1 MiB, shared safely by concurrent Flowly processes.
-The older `logs/mcp-stderr.log` is no longer read or appended; existing copies
-are not migrated or deleted automatically.
-
-Configure protocol notification selection per server:
-
-```json
-"logging": { "enabled": true, "level": "info" }
-```
-
-Levels are `debug`, `info` (default), `notice`, `warning`, `error`, `critical`,
-`alert`, and `emergency`. Modern requests opt into log delivery through SDK
-request metadata; legacy notifications are filtered locally too. A server that
-responds with JSON only, rather than an event stream, may not deliver log
-notifications; its ordinary MCP results still work. Disabling notifications
-does not disable secure stderr capture or local transport-error handling.
-
-- Each retained server shares a 100-record / 10-second budget across reconnects,
-  plus a 64-record writer queue. Serialized records are at most 20 KiB; message
-  text is capped at 4096 characters. Flooded or busy queues drop records before
-  expensive rendering rather than blocking MCP dispatch.
-- Stderr is piped through a separate bounded reader, never written raw to disk
-  or the terminal. Fragmented writes, multiline JSON/credential fields and PEM
-  keys are framed before redaction. Lines/records are limited to 64 KiB.
-  Oversized multiline records disable the remaining stderr capture until the
-  next connection because a secret's continuation cannot be safely guessed.
-- SDK/HTTP-library errors in Flowly-owned MCP contexts use the same sink.
-  Their raw tracebacks and debug/info request/response dumps do not reach other
-  log handlers. Unrelated HTTP/SDK clients keep their existing logging behavior.
-- Runtime health's `diagnostics` object exposes received, written, filtered,
-  dropped, pending and failed-disk-write counts. A shutdown drop summary is
-  written when possible. Stalled disk IO never blocks the MCP event loop;
-  writer shutdown waits at most one second and `draining` identifies remaining
-  background work. Per-transport stderr excerpts stay bounded and cannot mix
-  output from other server processes.
-- Symlinks, hardlinks, FIFOs, unsafe permissions and oversized existing files
-  are rejected, not adopted. Disk failures retain counters and bounded stderr
-  excerpts, without a raw fallback. Descriptor-relative private storage and
-  pipe capture are verified on macOS; secure storage is supported on POSIX
-  systems with the required primitives. Unsupported storage discards disk
-  records; unsupported pipe capture uses the null device. Neither fallback
-  disables otherwise available MCP transports.
-
-Redaction covers common credential labels/formats and this connection's supplied
-credentials, including escaped variants and known multiline fragments. It is
-defense in depth, not detection of every unknown or transformed secret. Successful
-tool payloads are not scrubbed as though they were logs.
-
-## OAuth for remote servers
-
-HTTP servers with `auth: oauth` use OAuth 2.1 + PKCE. Tokens are stored per-server at `$FLOWLY_HOME/mcp-tokens/{server}.json` (mode 0600) and auto-refreshed.
+For a manually configured OAuth server:
 
 ```bash
 flowly mcp login linear
 ```
 
-`flowly mcp login` stages fresh browser authorization separately from the working credentials. CLI and desktop sign-in publish the new grant only after a successful connection; failed/cancelled sign-in leaves the previous grant intact. If another process changes or removes the credentials during sign-in, the stale login cannot overwrite that newer state. The callback is pinned to `http://127.0.0.1:8765/callback`, so only one interactive MCP OAuth flow can run at a time, and that redirect URI must match the authorization server's registration. At agent boot, stored tokens are used/refreshed non-interactively — if a server needs login and no browser is available, that server is skipped and boot is never blocked. `flowly mcp remove` also clears the server's tokens.
+The CLI callback is fixed at `http://127.0.0.1:8765/callback`. The provider must accept that redirect, and only one interactive CLI MCP sign-in can use that port at a time. Stored tokens are reused and refreshed without opening a browser during normal startup. If interactive sign-in is needed but unavailable, Flowly skips that server instead of blocking startup.
 
-Running connections reload credential state before requests, including changes from another process. Token expiry and authorization-server discovery are persisted. Concurrent 401 responses share one refresh per credential file; ordinary tool calls and long-lived SSE streams do not hold that recovery lock. A cancelled or terminated process releases the lock automatically. Temporary authorization-server failures retain credentials and briefly back off, while a rejected refresh requires interactive sign-in. Permission/scope increases never authorize themselves in a non-interactive session.
+Older configurations that use a recognized external OAuth helper are not silently rewritten. The app can offer an explicit migration; accepting it creates and tests a native connection before replacing the old setup.
 
-An expired stateful MCP session is different from expired OAuth credentials: Flowly reconnects the MCP session without deleting tokens. It does not automatically replay the failed tool operation, because that operation may have side effects. New credential files are bound to the configured server name and URL; legacy files acquire that binding on their next write.
+## Catalog connections
 
-> [!TIP]
-> Some providers' OAuth (notably WorkOS-backed servers) complete the browser step but fail the **token exchange** with the raw MCP SDK — `flowly mcp login` returns a `401`/token-exchange error even though you authorized successfully. Wire those servers through [`mcp-remote`](https://www.npmjs.com/package/mcp-remote), the ecosystem-standard OAuth bridge, instead:
->
-> ```bash
-> flowly mcp add yargi --command npx \
->   --arg=-y --arg=mcp-remote@latest --arg=https://server.example.com/mcp \
->   --connect-timeout 300
-> ```
->
-> The first connect opens the browser, `mcp-remote` completes the OAuth and caches the token under `~/.mcp-auth`, and the bot reuses it on every boot. To Flowly this is a plain stdio server (no `auth: oauth`), so it needs **Node.js on the bot host**. The desktop app's **Requires OAuth sign-in** checkbox does all of this for you (see [Managing servers from the desktop app](#managing-servers-from-the-desktop-app)).
+The built-in catalog gives common services a known URL or local command and explains any required setup. The catalog can grow over time, so `flowly mcp catalog` is the source of truth for the installed version.
 
-## The curated catalog
-
-Flowly ships a curated catalog of ready-to-install servers. Browse and install them:
-
-```bash
-flowly mcp catalog            # table: Name / Auth / Transport / Description
-flowly mcp install github     # resolve manifest, prompt for secrets, write config, probe
-flowly mcp picker             # interactive catalog browser (TTY only)
-```
-
-The catalog has exactly 8 entries:
-
-| Name | Transport | Auth |
+| Name | What it provides | Connection |
 |---|---|---|
-| `context7` | stdio (npx) | none |
-| `fetch` | stdio (uvx) | none |
-| `time` | stdio (uvx) | none |
-| `filesystem` | stdio (npx) | api_key (`MCP_FILESYSTEM_ROOT`) |
-| `github` | stdio (npx) | api_key (`GITHUB_PERSONAL_ACCESS_TOKEN`) |
-| `notion` | stdio (npx) | api_key (`NOTION_API_KEY`) |
-| `playwright` | stdio (npx) | none |
-| `linear` | HTTP | oauth |
+| `canva` | Work with designs and presentations | Remote HTTP + OAuth |
+| `higgsfield` | Generate images, video, and audio; provider credits may be used | Remote HTTP + OAuth |
+| `linear` | Find and manage issues, projects, and comments | Remote HTTP + OAuth |
+| `notion-cloud` | Search and update a Notion workspace through account sign-in | Remote HTTP + OAuth |
+| `github` | Work with repositories, issues, and pull requests | Local stdio + access token |
+| `notion` | Work with pages, databases, and blocks | Local stdio + API key |
+| `context7` | Retrieve current, version-specific library documentation | Local stdio |
+| `fetch` | Fetch a URL as readable Markdown | Local stdio |
+| `filesystem` | Read, write, and search only the directory you choose | Local stdio + allowed root path |
+| `playwright` | Navigate, click, fill forms, and capture browser screenshots | Local stdio |
+| `time` | Read time and convert time zones | Local stdio |
 
-`flowly mcp install <name>` resolves the manifest, prompts for any declared environment variables, saves them to `$FLOWLY_HOME/.env`, writes the `mcpServers` entry, and probes the server (probing is skipped for OAuth servers). It then prints the manifest's `post_install` note — for OAuth entries like `linear`, that note tells you to run `flowly mcp login linear` next. To see the current catalog at any time, run `flowly mcp catalog`.
-
-## Running Flowly as an MCP server
-
-Expose your Flowly conversation history to any MCP client (Claude Desktop, Cursor, Claude Code) over stdio:
-
-```bash
-flowly mcp serve                 # read-only (default)
-flowly mcp serve --allow-writes  # also expose send + approvals (needs gateway)
-flowly mcp serve --verbose
-```
-
-**Read tools** (always available, no gateway required — they read JSONL sessions and the FTS index directly):
-
-| Tool | Purpose |
-|---|---|
-| `conversations_list` | List conversations (filter by platform / search) |
-| `conversation_get` | Metadata for one `channel:chat_id` |
-| `messages_read` | Paginated visible archive history, including compacted and media-only messages |
-| `messages_search` | Full-text search across all conversations (FTS5) |
-| `channels_list` | Configured channels + enabled state + exact known conversation targets |
-| `attachments_fetch` | Attachment metadata for a stable message ID; no raw bytes or local paths |
-| `events_poll` | New message/deletion events after an opaque, restart-safe cursor |
-| `events_wait` | Cancellable wait for new events, with a bounded timeout |
-
-Start event tracking without a cursor, then retain `next_cursor` for subsequent
-polls/waits, including after restarting the MCP process. Keep the same session
-filter. `CURSOR_EXPIRED` explicitly indicates a retention gap: refresh history
-and resume from the supplied cursor. Events are discovered at poll time, not a
-guaranteed push-delivery stream. Hidden, withdrawn and deleted messages are
-excluded from public history, search and subsequent event reads.
-
-**Write tools** (only with `--allow-writes`, and they require a running `flowly gateway`): `messages_send`, `approvals_list`, `approvals_resolve` (decision = allow-once / allow-always / deny). These reach the gateway over an authed localhost control endpoint (`$FLOWLY_HOME/gateway-api.json`); when the gateway is down they return a clear "gateway not running" message instead of failing.
-
-> [!TIP]
-> `serve` is read-only by default, so it is safe to point at your real `~/.flowly`.
-
-Point a client at it the same way you would any stdio server:
-
-```json
-{
-  "mcpServers": {
-    "flowly": { "command": "/path/to/flowly", "args": ["mcp", "serve"] }
-  }
-}
-```
-
-## Live tools for external agents
-
-`flowly mcp tools` is a separate stdio server for tools in a **running** Flowly
-gateway. Unlike `mcp serve`, it uses the live registry, provider and task board;
-it does not start a second agent or create a separate Board database.
+From the CLI:
 
 ```bash
-# Use an exact, existing conversation key from conversations_list.
-flowly mcp tools --session cli:my-conversation
-
-# Explicitly permit selected writes, not every available capability.
-flowly mcp tools --session cli:my-conversation --allow-writes \
-  --tool board_add --tool board_list --ttl 1800
+flowly mcp catalog
+flowly mcp install github
+flowly mcp picker
 ```
 
-Configure any compatible stdio MCP client with the executable and arguments:
+`install` resolves the catalog manifest, asks for declared values, writes the connection, and probes it when possible. OAuth entries require sign-in before they can be connected. Local catalog servers may require their package runner, such as `npx` or `uvx`, to exist on the selected runtime host.
 
-```json
-{
-  "mcpServers": {
-    "flowly-live": {
-      "command": "/absolute/path/to/flowly",
-      "args": ["mcp", "tools", "--session", "cli:my-conversation"]
-    }
-  }
-}
+## Add a server with the CLI
+
+Use `flowly mcp add` for a local stdio process or remote HTTP endpoint:
+
+```bash
+# Local subprocess
+flowly mcp add docs --command npx --arg -y --arg @upstash/context7-mcp
+
+# Remote Streamable HTTP with an explicit header
+flowly mcp add acme \
+  --url https://mcp.example.com/mcp \
+  --header 'X-Api-Key: ${ACME_MCP_KEY}'
+
+# Remote HTTP with OAuth
+flowly mcp add linear \
+  --url https://mcp.linear.app/mcp \
+  --auth oauth
 ```
 
-The default grant can expose web search/fetch/extract, video/image analysis,
-skill lookup/listing and Board list/get **only where registered and enabled**.
-`--allow-writes` additionally permits image/voice generation and Board add,
-update and run. Repeat `--tool` to narrow either set. Flowly's built-in browser,
-shell and arbitrary non-MCP registry tools are not exposed by this bridge.
-Registered third-party MCP tools are also available through the owning Flowly
-client: read-only grants include only tools declaring `readOnlyHint: true`,
-plus enabled resource/prompt utilities. Other remote tools require a write
-grant. These annotations are server claims, not an operating-system sandbox;
-Flowly's existing trust, consent, tool filters and OAuth policy still apply.
-Analysis and generation can incur charges on the user's configured providers.
-Image analysis uses the selected live chat model without silently substituting
-another; a model without image support returns an error. Speech keeps the
-configured voice/model. Generated images and audio return native MCP content.
+`--command` and `--url` are mutually exclusive. `--auth oauth` is valid only with an HTTP URL. Repeat `--arg`, `--env KEY=VALUE`, and `--header "Name: value"` as needed. Connection timeout defaults to 60 seconds and tool-call timeout to 120 seconds. The command probes by default; if a probe fails, Flowly asks whether to save the entry disabled.
 
-Authorization comes from a bounded, expiring grant, not tool arguments. The
-local launcher uses the gateway's owner-only discovery credential to obtain a
-grant for an existing conversation. Calls carry only that scoped grant, which
-cannot issue other grants or change its session or tool set. Board write
-attribution and hook ownership use that session; the Board itself is shared
-installation data, not a per-conversation private store. Current channel tool
-availability and pre-tool hooks are enforced again before dispatch.
+After a CLI, TUI, or manual configuration change, start a new agent session or restart the affected runtime so its tool registry is rebuilt.
 
-This endpoint is loopback-only. It is a protocol permission boundary, **not an
-OS sandbox against another process running as the same user**. The public
-launcher targets the advertised standalone gateway; it does not discover profile
-runtimes or choose a Desktop broker on its own.
+The TUI `/mcp` modal provides the same catalog and basic configuration operations without leaving the terminal.
 
-Managed coding sessions (`tools.codexSession.exposeFlowlyTools: true`) instead
-receive a fresh, private loopback callback for each turn. This works without
-an advertised gateway, including TUI and named-profile execution. The callback
-uses the parent's live registry and captured profile/Board reverse-RPC owner.
-Its exact tool grant intersects the parent's per-turn permissions; read-only
-sandbox settings also exclude write-capable tools. Empty grants stay empty.
-No session key in a model-authored argument can change the owner.
+## Tools, resources, and prompts
 
-The managed client gets temporary configuration overrides. Other direct MCP
-connections, account-backed apps and plugins are disabled in the delegated
-client; registered
-Flowly MCP integrations remain reachable through the callback, with the parent
-client's policies. Before a model turn starts, MCP discovery must contain the
-callback and exactly its granted tool names, with no extra active server tools.
-Unsupported client configuration/protocols fail explicitly rather than falling
-back to an unrestricted or stateless callback.
+Each remote tool is registered as `mcp_{server}_{tool}`. Punctuation becomes `_`; for example, `resolve-library-id` on a server named `context7` becomes `mcp_context7_resolve_library_id`. If a name collides, the tool already registered in Flowly wins. An MCP server never overwrites another tool silently.
 
-The transient credential is inherited via an environment variable, not written
-to configuration or argv. Managed launches disable shell snapshots and clear
-that variable for ordinary shell commands. Existing configuration/model choices
-are not rewritten by these per-turn overrides (the separate legacy enable/boot
-migration still manages its existing configuration block). Successful completion,
-cancellation and errors revoke authority before process teardown. The next turn
-starts a new process with a new grant and explicitly resumes stored conversation
-history. This adds startup overhead but prevents stale warm-process authority;
-missing stored history is reported rather than silently replaced.
+App-managed connections save an explicit permission mode:
 
-### Per-turn exclusive tool scopes
-
-Explicit English and Turkish selectors narrow the tool surface for one turn:
-`Only use Context7`, `Sadece Context7 kullan`, and `Context7 kullan, başka
-araç kullanma` select the same registered server family. An exact tool name
-selects that tool; source-qualified short names disambiguate identical names
-on different servers. Unqualified ambiguous names and unknown exclusive
-targets grant nothing. Server and tool selectors can be combined in one list.
-Explicit named exclusions are subtracted; independently exclusive clauses
-intersect instead of accumulating permissions.
-
-Only imperative selector clauses contribute names: a forbidden tool, an
-explanatory mention, quoted instruction, or fenced example cannot grant itself
-authority. The bounded grammar is a convenience, not general natural-language
-understanding. Clients that need an exact contract should send `allowedTools`
-on gateway chat requests (internally `allowed_tools`). A supplied malformed
-allowlist fails closed; an absent/null list preserves the usual runtime policy.
-Broad `tools_allowed: true` does not erase an explicit exclusive selector.
-Structured denies continue to win, and every derived grant intersects the
-transport's positive ceiling and existing disabled-tool settings.
-
-The resulting positive ceiling stays task-local through schema disclosure,
-execution and delegated MCP calls. A newly discovered tool cannot join that
-turn even if it belongs to the selected server. Later independent turns can
-use the refreshed catalog. Concurrent turns keep separate grants. Policy
-parsing is bounded to 65,536 characters and 256 clauses; over-limit requests
-run without tools rather than ignoring an unchecked suffix.
-
-Operational limits: one-hour grants by default (maximum eight hours), 128
-active grants, four executing/eight pending calls per grant, 16 executing/64
-pending globally, and 32 MiB of aggregate pending JSON arguments. Each call
-allows 12 MiB of JSON arguments and a 16 MiB result. Calls time out after ten
-minutes. A grant retains up to 1,024 used request IDs; concurrent duplicates
-share execution, completed IDs are rejected rather than replayed. The launcher
-revokes its grant on orderly shutdown; expiry, session deletion and gateway
-shutdown also revoke calls. Cancellation cannot roll back an already-executed
-external side effect, so clients must not blindly retry failed writes.
-
-Local image/video inputs and generated media are bounded to eight MiB per file and
-restricted to the live workspace/media directory. Local reads require secure
-no-follow directory descriptors (macOS/Linux); unsupported platforms fail
-closed for local files. Public image URLs and validated image data URLs do not
-need those descriptors. Media replies support up to eight attachments within
-the total response limit; oversize results return an explicit error, not partial
-content. Source schemas are preserved without provider-specific flattening.
-
-## `flowly mcp` subcommands
-
-| Command | What it does |
+| Mode | Result |
 |---|---|
-| `list` | Table of configured servers: Name / Transport / Tools filter / Status |
-| `add <name>` | Add a server (`--command`/`--url`, `--arg`, `--env`, `--header`, `--auth oauth`, `--timeout`, `--connect-timeout`, `--probe`, `--force`) |
-| `remove <name>` | Remove a server (`--yes`); also clears its OAuth tokens |
-| `enable <name>` | Flip the server's `enabled` flag on |
-| `disable <name>` | Flip the server's `enabled` flag off |
-| `configure <name>` | Interactively pick enabled tools → writes `tools.include` |
-| `serve` | Run Flowly as an MCP server (`--allow-writes`, `--verbose`) |
-| `tools` | Expose live gateway tools over stdio (`--session`, `--allow-writes`, repeated `--tool`, `--ttl`) |
-| `catalog` | List the curated catalog |
-| `install <name>` | Install a catalog entry (`--force`, `--probe`) |
-| `picker` | Interactive catalog browser (TTY only) |
-| `test <name>` | Connect + list tools — a health check |
-| `login <name>` | (Re)run the OAuth browser flow |
+| `all` | All tools, including tools discovered later, except names in `tools.exclude` |
+| `selected` | Only names in `tools.include`, minus `tools.exclude`; an empty list means zero regular tools |
+| `none` | No tools, resources, or prompts; app confirmation also saves the connection disabled |
+| `legacy` | Compatibility behavior for older hand-written configurations |
 
-## The `/mcp` slash command
+In `legacy` mode, a non-empty `include` list is a whitelist. Otherwise a non-empty `exclude` list is a blacklist. When both are empty, all tools are available. New app-managed setup does not rely on this ambiguous empty-list behavior.
 
-In the TUI, `/mcp` opens a modal to manage MCP servers and install entries from the curated catalog — the same operations as the CLI, without leaving the chat.
+For fixed access, choose `selected`. It is possible to permit resources or prompts without regular tools using `selected` and an empty include list. If no tools, resources, or prompts are selected, app confirmation converts the decision to `none`. Review permissions before enabling that connection again. External-agent keys always use exact tool names and never automatically inherit newly discovered tools, even when the underlying connection uses `all`.
 
-## Managing servers from the desktop app
+When enabled, MCP resources and prompts appear as bounded utility tools:
 
-Flowly Desktop has an **MCP** tab (Dashboard → MCP) for managing a bot's servers from a GUI — the same operations as the CLI and TUI, served over the bot's feature RPC. It works identically whether the selected bot is **local**, a **relay** bot, or a **direct self-hosted gateway**: there's one source of truth (the bot's `mcpServers` config), never a per-transport path.
+- `mcp_{server}_list_resources`
+- `mcp_{server}_read_resource`
+- `mcp_{server}_list_prompts`
+- `mcp_{server}_get_prompt`
 
-The tab shows two groups:
+They appear only when the server advertises the capability and you permitted it. Tool, resource, and prompt discovery follows pagination with cycle detection and configured page/item limits.
 
-- **Configured** — your servers, each with a status badge, an enable/disable toggle, **Test** (connect + list tools), and **Remove**.
-- **Available** — installable curated-catalog entries. **Install** writes the entry, prompting first for any required secrets (which are saved to the bot's `.env`).
+`flowly mcp configure <name>` connects to a configured server and opens an interactive tool picker.
 
-**Add server** opens a dialog with two transports:
+## Connection reliability
 
-- **Local (stdio)** — command + space-separated arguments + environment variables.
-- **Remote (HTTP)** — URL + headers, with an optional **Requires OAuth sign-in**.
+Flowly supervises every MCP transport instead of treating the first disconnect as permanent.
 
-A change restarts the bot's gateway so newly-registered tools load at the next boot; the panel refreshes automatically when the bot reconnects.
+- Fast failures use exponential backoff with jitter.
+- After the fast retry budget, the connection becomes **parked** and is probed at a slower interval. Recovery has no terminal retry limit.
+- Keepalive checks detect dead transports even when no tool call is active.
+- A stable connection resets the consecutive-failure counter.
+- Dynamic `tools/list_changed` notifications refresh every bound live registry. Removed or changed contracts invalidate stale handlers rather than calling them with an old schema.
+- Existing calls are allowed to drain during targeted reload or optional lifetime recycling. New calls wait for the replacement connection.
+- A failed operation is never replayed automatically.
 
-### OAuth from the desktop
+Optional idle and maximum-lifetime recycling are disabled by default because some servers keep state that cannot be reconstructed. `lifecycle.lazyStart` can reuse a private discovery manifest after restart while leaving the actual transport closed until the first request.
 
-Checking **Requires OAuth sign-in** on a Remote (HTTP) server turns the dialog's button into **Sign in & add**, and Flowly wires the server through [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) rather than the native HTTP+OAuth path:
+Discovery manifests are hints, not proof that a server is reachable. The first operation reconnects and validates the full live contract. Manifests are private, bounded, expire by default after one day, and contain credential fingerprints rather than raw secrets. Invalid, stale, unsafe, or unsupported cache entries fall back to live discovery.
 
-1. Click **Sign in & add** — a browser window opens for the provider's authorization (e.g. WorkOS).
-2. Approve; `mcp-remote` caches the token.
-3. The server is saved + enabled, and the bot reconnects using the cached token — no further sign-in.
+The manifest cache holds at most 128 entries and 16 MiB in total; one entry is limited to 1 MiB and 10000 tools. Its identity includes the exact server name, effective configuration and policy, profile, SDK/interpreter, working directory, and permitted subprocess environment. Separate Flowly processes may share these disk hints, but never share a live stdin/stdout connection or execution authority.
 
-This avoids the token-exchange failures some providers' OAuth has with the raw MCP SDK (a direct `auth: oauth` HTTP server may `401` on token exchange where `mcp-remote` succeeds). It requires **Node.js on the bot host** (for `npx`).
+## Protocol and result compatibility
 
-For OAuth servers the status badge reflects real authorization state — **sign-in needed** (enabled but no token yet) vs **signed in** — and a configured OAuth server you haven't signed into yet exposes a prominent **Sign in** button on its row. A plain **enabled** badge means the server is on in config; it is *not* a connectivity guarantee, so use **Test** to confirm a server actually connects.
+For external MCP servers, Flowly supports:
 
-> [!NOTE]
-> The browser opens on the **bot host**. For a local/desktop bot that is your own machine, so sign-in is one click. For a remote/VPS bot, run the one-time `npx -y mcp-remote@latest <url>` on the host (over SSH) to cache the token there, then add the server as a **Local (stdio)** `mcp-remote` command from the tab.
+- Local stdio, Streamable HTTP, and legacy SSE transports.
+- Modern stateless discovery and the older initialize handshake.
+- `protocol: "auto"`, which tries modern discovery and falls back to the legacy handshake; `stateless` and `legacy` force one mode.
+- Native MCP text, image, audio, resource-link, and embedded-resource content.
+- Structured content, output schemas, annotations, and `_meta` fields.
+- Bounded binary-media caching, so large base64 payloads are not expanded directly into the agent context.
+- Server-initiated non-sensitive elicitation forms and optional, tightly bounded sampling.
 
-## Security
+Interoperability is tested against real stdio, HTTP, and SSE SDK peers and independent compatible clients. That is not a claim that every provider, client version, extension, or mobile association policy has been certified. Use `flowly mcp test <name>` for the exact server and version you plan to deploy.
 
-MCP servers run third-party code, so Flowly applies several guards:
+## Let another agent use Flowly
 
-- **OSV malware gate** — before an `npx`/`uvx` server spawns, Flowly queries the [OSV](https://osv.dev) database for known-malware advisories and blocks the spawn if any match. Fail-open (a network error allows the spawn); per-server opt-out via `osvCheck: false`.
-- **Filtered subprocess env** — stdio servers get only a safe baseline (`PATH`, `HOME`, …) plus the `env` you explicitly list. Flowly's own provider keys are never inherited.
-- **Credential redaction** — tokens and keys in error messages are replaced with `[REDACTED]` before the model or the logs see them.
-- **Prompt-injection scan** — tool descriptions are scanned for override patterns and logged (not blocked) so a hostile server is detectable.
-- **Sandbox** — under `FLOWLY_SANDBOX=1` the whole agent (and its MCP subprocesses) runs inside `sandbox-exec` (macOS) / `bwrap` (Linux). See [Sandbox & approvals](../using-flowly/sandbox-and-approvals.md).
-- **Circuit breaker** — a server that fails repeatedly is short-circuited for a cooldown (you'll see "unreachable, auto-retry in Ns") so the model stops hammering it; it recovers automatically.
+There are three public bridges and one managed internal bridge. They serve different purposes.
 
-Subprocess stderr is captured through a bounded pipe and sanitized before it reaches `$FLOWLY_HOME/logs/mcp/diagnostics.jsonl`. When debugging, also inspect the server's diagnostic drop and storage-error counters: unsafe files, full queues and unavailable storage can cause records to be discarded.
+### 1. Scoped external access key — recommended
 
-## MCP consent and user input
+Flowly Desktop can issue an independent, limited, expiring key for another compatible agent.
 
-For an integration that should ask before writing, set `trust` to `untrusted`.
-Every tool call without `readOnlyHint: true` then needs an explicit one-time
-approval on the calling conversation's surface. Existing manually configured
-integrations default to `full` for compatibility. Tool annotations are claims
-made by the server: this gate is not a replacement for a process sandbox.
+1. Open the selected Flowly's **MCP connections** screen in Desktop.
+2. Under **External agent access**, choose **Create access key**.
+3. Give the key a recognizable name.
+4. Choose an existing owning conversation. It provides context for live actions.
+5. Select the exact tools to expose. The initial selection is empty, and future tools are never added automatically.
+6. Choose a lifetime of 1, 7, 30, or 90 days.
+7. Create the key and save it immediately. Flowly shows the plaintext key only once.
 
-MCP elicitation routes non-sensitive flat forms through Flowly's approval and
-question UI. Answers are type/constraint validated before being shared. A
-missing caller, denial, timeout or cancellation never becomes silent consent.
-URL-mode, nested/reference schemas and credential fields are explicitly
-declined. Disable the feature per server with `elicitation.enabled: false`.
-Legacy calls serialize while elicitation is enabled to avoid routing a
-server-initiated question to the wrong concurrent user. Modern input-required
-continuations retain per-call ownership and bounded parallelism.
+The Desktop app currently creates and revokes external-agent keys. iOS and Android can manage MCP connections and OAuth, but do not currently create these keys.
 
-## `mcpServers` config reference
-
-Common server settings (camelCase on disk; Flowly converts to snake internally — server names and `env`/`headers` keys are preserved verbatim):
+The copied Streamable HTTP configuration has this shape:
 
 ```json
 {
   "mcpServers": {
-    "example": {
-      "enabled": true,
-      "command": "npx",                  // stdio: command + args + env
-      "args": ["-y", "@scope/pkg"],
-      "env": { "TOKEN": "${TOKEN}" },
-      "url": "",                         // http/sse: url + headers instead
-      "headers": {},
-      "transport": "auto",               // auto | stdio | http | sse
-      "protocol": "auto",                // auto | stateless | legacy
-      "timeout": 120,                    // per-tool-call seconds
-      "connectTimeout": 60,              // initial connect seconds
-      "tools": {                         // optional filtering / utilities
-        "include": [],                   //   whitelist (empty = all)
-        "exclude": [],                   //   blacklist (ignored if include set)
-        "resources": false,              //   expose resources/* utility tools
-        "prompts": false                 //   expose prompts/* utility tools
-      },
-      "auth": "",                        // "" | "oauth"
-      "scope": "",                       // optional OAuth scope
-      "trust": "untrusted",              // full (default) | untrusted
-      "elicitation": { "enabled": true, "timeout": 300 },
-      "sslVerify": true,                 // true | false | CA-bundle path
-      "clientCert": "",                  // mTLS cert (path or [cert, key])
-      "clientKey": "",
-      "osvCheck": true,                  // OSV malware gate
-      "reapOrphans": false,              // force-kill orphaned stdio children (Linux)
-      "supportsParallelToolCalls": false,
-      "maxParallelToolCalls": 8,
-      "logging": { "enabled": true, "level": "info" },
-      "lifecycle": {                     // opt-in for restart-safe servers
-        "idleTimeout": 0,                // 0 disables idle closure
-        "maxLifetime": 0,                // 0 disables lifetime draining
-        "closeTimeout": 10,              // bounded recycle teardown
-        "lazyStart": false,              // opt-in persistent discovery hints
-        "manifestTtl": 86400              // saved catalog acceptance window
-      },
-      "sampling": {                      // server-initiated LLM (off by default)
-        "enabled": false,
-        "model": "",
-        "maxRpm": 10,
-        "maxTokensCap": 4096,
-        "allowedModels": []
+    "flowly": {
+      "url": "https://your-flowly.example/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_SCOPED_KEY"
       }
     }
   }
 }
 ```
 
+For a client that only accepts stdio MCP configuration, install the Flowly CLI on that client machine and use the compatibility adapter:
+
+```json
+{
+  "mcpServers": {
+    "flowly": {
+      "command": "flowly",
+      "args": ["mcp", "connect"],
+      "env": {
+        "FLOWLY_MCP_ENDPOINT": "https://your-flowly.example/mcp",
+        "FLOWLY_MCP_ACCESS_KEY": "YOUR_SCOPED_KEY"
+      }
+    }
+  }
+}
+```
+
+The key is bound to one existing conversation and at most 64 exact tool names. A key cannot mint another key, change its owning conversation, or expand its tool set. The gateway stores only a SHA-256 digest, not the plaintext key. Listing keys never returns their secrets.
+
+> [!IMPORTANT]
+> Conversation-list, read, and search tools cover the **entire selected profile** when you grant them. The owning conversation supplies context for live actions; it does not narrow those archive tools to one conversation.
+
+Revoking a key blocks new calls and cancels running calls where possible. It cannot undo an external action that was already sent. Deleting the owning conversation revokes its keys, and recreating a conversation with the same visible name does not restore them.
+
+The `/mcp` endpoint uses native stateless Streamable HTTP. It rejects browser-origin requests, credentials in the query string, the gateway administration token, and plaintext non-loopback transport. For remote use, expose only the MCP route through a reachable HTTPS endpoint. A relay connection manages Flowly remotely but does **not** publish a public MCP URL for you.
+
+If a reverse proxy terminates TLS and forwards plain HTTP locally, the upstream connection must use a loopback peer address and a loopback Host such as `127.0.0.1` or `localhost`. Forwarded-protocol headers alone do not make an insecure upstream request acceptable. Preserve the scoped Authorization header, restrict the published route to `/mcp`, and keep gateway control routes private.
+
+### 2. Conversation archive server: `flowly mcp serve`
+
+`serve` exposes Flowly conversation data over stdio or Streamable HTTP. It is read-only by default.
+
+```bash
+# Local stdio
+flowly mcp serve
+
+# Include send and approval tools; a gateway must be running
+flowly mcp serve --allow-writes
+
+# Local Streamable HTTP
+flowly mcp serve --transport http --host 127.0.0.1 --port 8765 --path /mcp
+```
+
+Read tools, available without a running gateway:
+
+| Tool | Purpose |
+|---|---|
+| `conversations_list` | List conversations with optional platform/search filters |
+| `conversation_get` | Read metadata for one exact conversation key |
+| `messages_read` | Read paginated visible history, including compacted and media-only messages |
+| `messages_search` | Full-text search across visible conversations |
+| `channels_list` | List configured channels, enabled state, and known targets |
+| `attachments_fetch` | Return attachment metadata for a stable message ID, without raw bytes or local paths |
+| `events_poll` | Read message/deletion events after an opaque cursor |
+| `events_wait` | Wait cancellably for new events with a bounded timeout |
+
+Retain the returned event cursor between calls and process restarts. `CURSOR_EXPIRED` means retention no longer covers that position; refresh the relevant history and continue from the supplied cursor. Hidden, withdrawn, and deleted content is excluded from public history and search.
+
+With `--allow-writes`, a running gateway adds `messages_send`, `approvals_list`, and `approvals_resolve`. `messages_send` accepts an optional idempotency key. These calls use the authenticated local gateway control API and return a clear error when the gateway is unavailable.
+
+For non-loopback HTTP, Flowly requires both TLS (`--tls-cert` and `--tls-key`) and a bearer token of at least 32 characters. Put that token in the environment variable named by `--auth-token-env` (default: `FLOWLY_MCP_TOKEN`). Use `--stateless` if each HTTP request must have no server-held session state.
+
+### 3. Ephemeral live tools: `flowly mcp tools`
+
+This local stdio bridge exposes selected tools from a **running** gateway for an exact existing conversation:
+
+```bash
+flowly mcp tools \
+  --session cli:my-conversation \
+  --allow-writes \
+  --tool board_list \
+  --tool board_add \
+  --ttl 1800
+```
+
+The default lifetime is one hour; the maximum is eight hours. Repeat `--tool` to narrow the grant. Without `--allow-writes`, built-in availability is limited to registered read tools such as web read/search, media analysis, skill lookup, and Board read operations. Write mode can additionally expose registered image/voice generation and Board mutation tools.
+
+The eligible built-in set is explicit and still depends on what the owning runtime has enabled:
+
+| Read grant | Write grant also permits |
+|---|---|
+| `web_search`, `web_fetch`, `web_extract` | `image_generate`, `voice_generate` |
+| `video_analyze`, `image_analyze` | `board_add`, `board_update`, `board_run` |
+| `skill_view`, `skills_list` | |
+| `board_list`, `board_get` | |
+
+Configured third-party MCP tools can also pass through the owning Flowly runtime. Read-only grants accept only tools whose server declares `readOnlyHint: true`; other remote tools require write permission. Server annotations are claims, not an operating-system sandbox.
+
+This bridge never exposes Flowly's shell, browser controller, or arbitrary internal registry tools. It is loopback-only and is a protocol permission boundary—not protection from another same-user process on the host.
+
+Live-tool grants are bounded to 128 active grants. Each grant allows four executing and eight pending calls; global limits are 16 executing and 64 pending calls with at most 32 MiB of queued JSON arguments. One call accepts 12 MiB of JSON arguments, a 16 MiB result, and up to ten minutes of execution. Up to 1024 used request IDs are retained per grant: concurrent duplicates share the same execution, while a completed ID is rejected instead of replayed.
+
+Local media input is limited to 8 MiB per file and must resolve inside the live workspace or media directory through secure no-follow access on supported systems. A reply can contain up to eight media attachments within the total result limit. Unsupported secure local-file access fails closed; validated public image URLs and image data URLs do not depend on that local path mechanism.
+
+### 4. Managed per-turn access
+
+When a supported managed coding session is configured to expose Flowly tools, Flowly creates a fresh private callback and a new exact grant for each turn. The credential is passed through the process environment rather than saved in configuration or command-line arguments. It is revoked on completion, cancellation, or error, and a later turn starts with a new process and grant.
+
+The grant intersects the parent's current permissions and any exact per-turn allowlist. Unknown, ambiguous, malformed, or over-limit exclusive tool selection fails closed. A newly discovered tool cannot join an already-running turn. This prevents a delegated process or model-authored session value from widening its own authority.
+
+Simple English and Turkish exclusive requests can narrow one turn, such as `Only use Context7`, `Sadece Context7 kullan`, or an exact tool name. Independently exclusive clauses intersect, and explicit named exclusions are subtracted. Only imperative selector clauses grant names: quoted examples, explanations, and mentions of forbidden tools cannot authorize themselves. This parser is bounded convenience, not unrestricted natural-language policy. Integrators that need an exact contract should supply the structured per-turn allowlist supported by the gateway; malformed structured input fails closed.
+
+The managed process receives temporary configuration that contains only the callback and its granted tools. Direct external MCP connections and unrelated account-backed extensions are disabled for that managed turn; permitted configured MCP tools remain reachable through Flowly's parent-controlled callback. The temporary secret is removed from ordinary shell environments, and successful completion, cancellation, or failure revokes it before process teardown.
+
+## Security boundaries
+
+MCP connects Flowly to third-party code and external accounts. The important controls are:
+
+- **Explicit owner confirmation:** app setup publishes nothing until connection, discovery, and permission review succeed.
+- **Least-privilege tool filters:** choose all, selected, or none; new external-access keys start empty.
+- **Untrusted-server consent:** `trust: "untrusted"` requires one-time approval for calls not declaring `readOnlyHint: true`.
+- **Filtered subprocess environment:** stdio servers receive a safe baseline plus values explicitly configured for that server. Flowly provider credentials are not inherited.
+- **OSV package check:** before spawning recognized `npx`, `uvx`, or `pipx` packages, Flowly checks OSV for known malware advisories. Network, parse, or unrecognized-package failures are fail-open, so this is not a complete supply-chain guarantee.
+- **Private OAuth storage:** token files use private storage and are bound to the configured server identity.
+- **Bounded diagnostics:** protocol logs and subprocess stderr are sanitized, rate-limited, size-limited, and written privately.
+- **Transport policy:** owner-scoped remote access requires HTTPS and a distinct scoped key; gateway administration credentials are not accepted as MCP keys.
+- **Bounded execution:** grants, request sizes, result sizes, concurrency, timeouts, pagination, and binary content all have limits.
+- **No blind write replay:** Flowly does not retry a possibly side-effecting operation automatically.
+- **Optional process sandbox:** when Flowly itself runs inside its supported sandbox, its MCP subprocesses inherit that boundary. See [Sandbox & approvals](../using-flowly/sandbox-and-approvals.md).
+
+The tool-description prompt-injection scan is diagnostic only; it logs suspicious patterns but does not prove that a server is safe. `readOnlyHint` and other annotations also come from the server. Use an operating-system sandbox and restricted provider credentials when running code you do not trust.
+
+### Consent, elicitation, and sampling
+
+MCP elicitation can route a server's non-sensitive, flat input form to the correct calling surface. Flowly validates primitive types and constraints before returning an answer. Missing ownership, denial, timeout, or cancellation declines the request. Credential fields, nested/reference schemas, and URL-mode elicitation are rejected.
+
+Server-initiated model sampling is disabled by default. If enabled, it remains subject to per-minute, model, and token limits and may consume your configured model-provider quota. Only text sampling is supported.
+
+## Diagnostics and operational limits
+
+MCP protocol diagnostics and sanitized subprocess stderr are written to:
+
+```text
+$FLOWLY_HOME/logs/mcp/diagnostics.jsonl
+```
+
+The directory uses mode `0700` and files use `0600` on supported POSIX systems. One current file and two rotations are capped at 1 MiB each. Records and queues are bounded; under overload, diagnostics may be dropped rather than delaying tool calls. Runtime health includes received, written, filtered, dropped, pending, and disk-failure counters.
+
+Each retained server has a 100-record-per-10-second budget and a 64-record writer queue. Serialized records are limited to 20 KiB, message text to 4096 characters, and framed stderr lines/records to 64 KiB. Oversized multiline stderr disables the remainder of that connection's stderr capture because Flowly cannot safely guess whether a secret continues in the discarded bytes. Unsafe links, file types, permissions, and oversized existing files are rejected instead of adopted.
+
+Redaction covers configured credentials and common key/token formats, including multiline fragments. It is defense in depth, not a guarantee that every transformed secret can be recognized. Successful tool results are not modified as though they were log lines.
+
+Owner-scoped external access is also bounded: a key has at most 64 tools and at most a 90-day lifetime; the store supports at most 256 records and 1 MiB of state. Calls permit 12 MiB of JSON arguments, a 16 MiB result, and roughly ten minutes of execution. The gateway allows up to four running calls per key and 32 across keys. These limits protect availability, but they do not roll back a side effect already accepted by an external service.
+
+## `flowly mcp` command reference
+
+| Command | What it does |
+|---|---|
+| `list` | List configured servers and their current configuration status |
+| `add <name>` | Add a local command or remote URL; repeat args, environment values, and headers as needed |
+| `remove <name>` | Remove a server and its associated OAuth credentials |
+| `enable <name>` / `disable <name>` | Change whether a configured server is available |
+| `configure <name>` | Discover tools and choose an allowlist interactively |
+| `tools` | Start an expiring local bridge into a running gateway |
+| `connect` | Adapt a scoped remote Streamable HTTP endpoint to stdio using `FLOWLY_MCP_ENDPOINT` and `FLOWLY_MCP_ACCESS_KEY` |
+| `serve` | Expose Flowly archives and optional gateway writes over stdio or Streamable HTTP |
+| `catalog` | Show the catalog included in this installation |
+| `install <name>` | Install one catalog entry |
+| `picker` | Browse and install catalog entries interactively |
+| `test <name>` | Connect and discover tools as a health check |
+| `login <name>` | Run or repeat OAuth sign-in for a manually configured HTTP server |
+
+Useful `serve` options:
+
+```text
+--allow-writes
+--verbose
+--transport stdio|http
+--host HOST
+--port PORT
+--path /mcp
+--stateless
+--auth-token-env FLOWLY_MCP_TOKEN
+--tls-cert PATH
+--tls-key PATH
+```
+
+Run `flowly mcp <command> --help` for the exact options supported by your installed version.
+
+## `mcpServers` configuration reference
+
+Servers live under the top-level `mcpServers` object in `$FLOWLY_HOME/config.json` (normally `~/.flowly/config.json`). Configuration keys are camelCase. Server names and environment/header names are preserved exactly.
+
+`${VAR}` interpolation works in `env`, `args`, and `headers`. Values resolve from `$FLOWLY_HOME/.env` and the process environment, with the process environment winning. Keep secret files private and prefer references over inline credentials.
+
+The annotated example below shows the defaults. Remove its `//` comments before copying it into `config.json`, which requires valid JSON. Replace the placeholder package with the server you intend to run.
+
+```jsonc
+{
+  "mcpServers": {
+    "example": {
+      "enabled": true,
+
+      // Choose command/args/env for stdio OR url/headers for HTTP/SSE.
+      "command": "npx",
+      "args": ["-y", "@scope/package"],
+      "env": { "TOKEN": "${EXAMPLE_TOKEN}" },
+      "url": "",
+      "headers": {},
+
+      "transport": "auto",       // auto | stdio | http | sse
+      "protocol": "auto",        // auto | stateless | legacy
+      "timeout": 120,
+      "connectTimeout": 60,
+
+      "auth": "",                // "" | oauth; OAuth is HTTP only
+      "scope": "",
+      "trust": "full",           // full | untrusted
+
+      "tools": {
+        "mode": "legacy",        // legacy | all | selected | none
+        "include": [],
+        "exclude": [],
+        "resources": false,
+        "prompts": false
+      },
+
+      "sslVerify": true,          // true | false | CA-bundle path
+      "clientCert": "",          // combined PEM or supported cert tuple
+      "clientKey": "",
+
+      "supportsParallelToolCalls": false,
+      "maxParallelToolCalls": 8,
+      "reapOrphans": false,
+      "osvCheck": true,
+
+      "elicitation": {
+        "enabled": true,
+        "timeout": 300
+      },
+
+      "sampling": {
+        "enabled": false,
+        "model": "",
+        "maxRpm": 10,
+        "maxTokensCap": 4096,
+        "allowedModels": []
+      },
+
+      "lifecycle": {
+        "reconnectEnabled": true,
+        "reconnectBaseDelay": 1,
+        "reconnectMaxDelay": 30,
+        "reconnectJitter": 0.2,
+        "parkAfterAttempts": 8,
+        "parkedProbeInterval": 300,
+        "keepaliveInterval": 180,
+        "keepaliveTimeout": 30,
+        "stableConnectionSeconds": 30,
+        "idleTimeout": 0,
+        "maxLifetime": 0,
+        "closeTimeout": 10,
+        "lazyStart": false,
+        "manifestTtl": 86400
+      },
+
+      "pagination": {
+        "maxPages": 100,
+        "maxItems": 10000
+      },
+
+      "content": {
+        "maxBinaryBytes": 26214400
+      },
+
+      "logging": {
+        "enabled": true,
+        "level": "info"
+      }
+    }
+  }
+}
+```
+
+`oauthCredentialId` is an internal, app-managed credential-slot identifier. Do not copy it between servers or edit it to try to reuse an OAuth grant.
+
+Important bounds:
+
+- `elicitation.timeout`: greater than 0 and at most 600 seconds.
+- `maxParallelToolCalls`: 1–256.
+- `idleTimeout` and `maxLifetime`: 0 disables; otherwise at most 604800 seconds.
+- `closeTimeout`: greater than 0 and at most 60 seconds.
+- `manifestTtl`: greater than 0 and at most 604800 seconds.
+- `pagination.maxPages`: 1–10000; `maxItems`: 1–1000000.
+- `content.maxBinaryBytes`: 1 KiB–1 GiB.
+- Logging levels: `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`.
+
+For mTLS, provide `clientCert` and `clientKey` in the supported form. `sslVerify: false` disables server-certificate verification and should be limited to controlled development environments.
+
 ## Troubleshooting
 
-| Symptom | Check |
+| Symptom | What to check |
 |---|---|
-| Server won't connect | `flowly mcp test <name>`; read `$FLOWLY_HOME/logs/mcp/diagnostics.jsonl` and inspect diagnostic drop/write-failure counters |
-| `npx`/`uvx` not found | Ensure Node / uv is on `PATH`, or set an absolute `command` + `env.PATH` |
-| Tools missing after add | Start a new session — MCP loads at agent boot (`flowly restart`) |
-| OAuth stuck | `flowly mcp login <name>` to re-authorize; for WorkOS-style servers use the `mcp-remote` bridge above |
-| "unreachable, auto-retry in Ns" | Circuit breaker is open after repeated failures — fix the server; it recovers automatically |
+| **Saved but not connected** | Open the connection detail. If the apply step failed after confirmation, the new settings are already saved; retry and verify live status. Also check whether it is disabled or needs sign-in. |
+| Sign-in closes before the provider appears | Confirm the selected runtime supports the callback mode, the provider accepts the exact redirect URI, and the app link/associated domain opens the installed app. Restarting setup creates a new state value; do not reuse an old callback. |
+| OAuth finishes but connection fails | Read the provider error shown by Flowly. The token exchange may have succeeded while the MCP endpoint, scope, or provider account still rejects discovery. Retry does not overwrite a working credential until the replacement is healthy. |
+| Tools do not appear after app setup | Confirm permissions were saved as `all` or `selected`, then inspect live status. App setup reloads the one server without restarting chat. |
+| Tools do not appear after CLI/TUI/manual setup | Start a new agent session or restart the affected runtime; those paths do not perform owner-managed live reload. |
+| A server repeatedly reconnects | Let the row show the last error, run `flowly mcp test <name>`, and inspect `$FLOWLY_HOME/logs/mcp/diagnostics.jsonl`. Parked servers keep probing slowly. |
+| `npx`, `uvx`, or `pipx` is missing | Install the required runner on the machine hosting the selected runtime, or use an absolute command and explicit `env.PATH`. |
+| A local server works on one Flowly but not another | Local commands and files run on the selected runtime host, not necessarily the phone or Desktop app displaying the controls. |
+| External agent cannot connect | Use the exact endpoint and one-time key from Desktop. Remote endpoints must be reachable over HTTPS; relay management alone is not an MCP URL. Check that the key is active, unexpired, tied to an existing conversation, and includes the requested tool. |
+| A granted tool is still denied | Tool grants are an upper bound. Existing connection permissions, trust/approval policy, disabled-tool settings, and live tool availability still apply. |
+| Event cursor expired | Refresh the relevant conversation history, then continue with the replacement cursor returned in `CURSOR_EXPIRED`. |
 
 ## Related
 
-- [Browser control](browser.md)
-- [Computer use](computer-use.md)
-- [Google Workspace](../integrations/google-workspace.md)
-- [Tools reference](../reference/tools.md)
+- [Configuration](../using-flowly/configuration.md)
 - [CLI commands](../reference/cli-commands.md)
 - [Slash commands](../reference/slash-commands.md)
+- [Tools reference](../reference/tools.md)
+- [Profiles](../using-flowly/profiles.md)
 - [Sandbox & approvals](../using-flowly/sandbox-and-approvals.md)

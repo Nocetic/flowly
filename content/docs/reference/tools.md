@@ -93,6 +93,15 @@ See [Image generation](../features/image-generation.md) for the full image_gener
 | `obsidian_search` / `obsidian_read` / `obsidian_list` / `obsidian_write` / `obsidian_append` | Search, read, list, write, and append notes in your Obsidian vault. | `integrations.obsidian.enabled` |
 | `ha_list_entities`, `ha_get_state`, `ha_list_services`, `ha_call_service` | Home Assistant control. | `integrations.homeAssistant.{url,token}` |
 
+## MCP connections
+
+| Tool | What it does | Requires |
+|---|---|---|
+| `mcp_connection` | List connections or request connection, reauthorization, or permission review. The owner completes setup in the app. | Active setup service; requests require a live conversation and a supported Flowly app |
+| `mcp_{server}_{tool}` | Call a tool exposed by a configured MCP server. | Connection enabled, tool permitted, and applicable consent satisfied |
+
+The connection-request tool cannot grant permissions or receive credentials. It does not offer disable/remove actions; those are available to the owner in the connection screen. See [MCP](../features/mcp.md) for setup, resource/prompt utilities, and the separate tools exposed to external agents.
+
 ## Related
 
 - [Slash commands](slash-commands.md) — `/permissions`, `/integrations`

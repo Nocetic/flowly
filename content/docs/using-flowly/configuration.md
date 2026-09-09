@@ -245,7 +245,13 @@ Bundled plugins load by default unless listed in `disabled`. User plugins under 
 
 ### mcpServers
 
-A map of server name → server config. Per server: `enabled=true`; stdio (`command=""`, `args=[]`, `env={}`) or http/sse (`url=""`, `headers={}`); `transport="auto"` (`"auto"`\|`"stdio"`\|`"http"`\|`"sse"`); `timeout=120.0`, `connectTimeout=60.0`; `auth=""` (`""`\|`"oauth"`); `tools.include=[]`, `tools.exclude=[]`, `tools.resources=false`, `tools.prompts=false`; plus TLS, sampling, and `osvCheck=true`. Server names are preserved verbatim by the loader.
+A map of server name → server config. Each server uses either local stdio (`command`, `args`, `env`) or HTTP/SSE (`url`, `headers`). Common defaults include `enabled=true`, `transport="auto"`, `protocol="auto"`, `timeout=120`, and `connectTimeout=60`. HTTP connections can use native OAuth with `auth="oauth"`; TLS, mTLS, scope, trust, elicitation, bounded sampling, diagnostics, pagination, binary-content, concurrency, and supervised lifecycle controls are available per server.
+
+Tool permissions use `tools.mode`: `all`, `selected`, `none`, or `legacy`. `selected` with an empty `include` list means no tools. `legacy` preserves older hand-written behavior, where a non-empty include list wins, otherwise exclude applies, otherwise all tools load. Resource and prompt utilities are separately controlled by `tools.resources` and `tools.prompts`.
+
+In `all` and `selected` modes, `exclude` still removes matching tool names. `all` includes future discoveries; use `selected` to pin exact tool names. App confirmation of `none` disables the connection and clears resource/prompt access. Configuration publication and live application are separate steps: an apply failure can leave the new settings saved, so inspect the reported runtime state and retry.
+
+App-managed setup writes an internal `oauthCredentialId` only after OAuth, connection testing, discovery, and explicit permission confirmation succeed. Do not copy that identifier between server entries. Server names and `env`/`headers` keys are preserved verbatim by the loader. See the complete [MCP configuration reference](../features/mcp.md#mcpservers-configuration-reference) for every key, default, bound, and lifecycle behavior.
 
 ## Example
 

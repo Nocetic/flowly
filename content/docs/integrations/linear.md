@@ -4,6 +4,9 @@ eyebrow: Integrations
 description: The linear tool lets the agent read and manage Linear issues, projects, teams, and comments through Linear's GraphQL API, authenticated with a personal API key.
 ---
 
+> [!NOTE]
+> Flowly also includes Linear in the MCP catalog. That path uses Linear account sign-in and explicit MCP tool permissions from Flowly Desktop, iOS, or Android. This page documents the separate built-in `linear` tool, which uses a personal API key. See [MCP](../features/mcp.md#connect-a-service-from-a-flowly-app) to choose the account-sign-in path.
+
 ## Tool
 
 | Tool | Actions |

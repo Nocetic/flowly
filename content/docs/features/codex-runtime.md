@@ -69,15 +69,11 @@ The directory is stored in `tools.codexSession.cwd`. When unset, Flowly resolves
 
 ## Flowly tools inside Codex
 
-Codex ships its own toolset (shell, file edits, planning). To keep Flowly's richer tools available during a Codex turn, Flowly registers itself as an MCP callback (`flowly-tools`) that Codex can call back into. The callback exposes:
+Codex ships its own toolset (shell, file edits, planning). To keep Flowly's richer tools available during a Codex turn, Flowly can register a private MCP callback (`flowly-tools`) into the parent runtime. This is controlled by `tools.codexSession.exposeFlowlyTools`.
 
-- `web_search`
-- `web_fetch`
-- `video_analyze`
-- `skill_view`
-- `skills_list`
+The callback does not carry a permanent fixed tool list. Each turn receives a fresh, expiring grant whose exact tools are the intersection of the parent's live registry, the turn's allowlist, disabled-tool settings, and the active write/sandbox ceiling. Eligible built-ins include web read/search, media analysis, skill lookup, Board read operations, and—when writes are allowed—media generation and Board changes. Permitted tools from configured MCP connections can pass through the same callback.
 
-This is controlled by `tools.codexSession.exposeFlowlyTools`.
+The temporary credential is inherited through the managed process environment, is unavailable to ordinary shell commands, and is revoked on completion, cancellation, or failure. A later turn starts with a new process and grant, so stale authority is not reused. See [MCP](./mcp.md#4-managed-per-turn-access) for the complete permission and lifecycle behavior.
 
 ## Configuration
 
