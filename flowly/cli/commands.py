@@ -136,6 +136,9 @@ app.add_typer(plugins_app, name="plugins")
 from flowly.cli.mcp_cmd import mcp_app
 app.add_typer(mcp_app, name="mcp")
 
+from flowly.cli.gmail_cmd import gmail_app
+app.add_typer(gmail_app, name="gmail")
+
 from flowly.cli.xai_cmd import xai_app
 app.add_typer(xai_app, name="xai")
 

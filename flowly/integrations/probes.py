@@ -216,18 +216,25 @@ async def probe_imessage(values: dict[str, Any]) -> ProbeResult:
 
 
 async def probe_email(values: dict[str, Any]) -> ProbeResult:
-    # Gmail uses OAuth credentials at ~/.flowly/gmail-credentials.json — we
-    # can detect presence but proper validation needs a token refresh.
-    from pathlib import Path
-    creds = Path.home() / ".flowly" / "gmail-credentials.json"
+    import asyncio
+    from flowly.channels.gmail_auth import load_credentials
+    from flowly.integrations.gmail_connection import GmailConnection
+
+    credentials = load_credentials()
     if not values.get("enabled"):
         return ProbeResult(
-            "disabled" if creds.exists() else "not_configured",
-            "credentials present · channel disabled" if creds.exists() else "no OAuth credentials",
+            "disabled" if credentials else "not_configured",
+            "Gmail disabled" if credentials else "Gmail not connected",
         )
-    if not creds.exists():
-        return ProbeResult("not_configured", "run gmail OAuth setup")
-    return ProbeResult("ok", "OAuth credentials on disk")
+    if not credentials:
+        return ProbeResult("not_configured", "Connect Gmail from Flowly or run flowly gmail connect")
+    try:
+        result = await asyncio.to_thread(GmailConnection().status)
+        if result.get("connected"):
+            return ProbeResult("ok", "Gmail connection verified")
+        return ProbeResult("down", "Gmail connection needs attention")
+    except Exception:
+        return ProbeResult("down", "Gmail connection could not be verified")
 
 
 async def probe_fal_image(values: dict[str, Any]) -> ProbeResult:

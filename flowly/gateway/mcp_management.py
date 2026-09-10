@@ -12,7 +12,6 @@ from aiohttp import web
 from flowly.channels import feature_rpc
 from flowly.gateway.auth import extract_request_token, host_origin_allowed, token_matches
 
-
 METHODS = frozenset({
     "mcp.capabilities", "mcp.connections.list", "mcp.connections.action",
     "mcp.setup.begin", "mcp.setup.status", "mcp.setup.pending",
@@ -43,6 +42,15 @@ def _protected_socket(request: web.Request) -> bool:
 
 
 def register_mcp_management(app: web.Application, gateway) -> None:
+    _register_management(app, gateway, methods=METHODS, path="/api/mcp/manage", surface="MCP")
+
+
+def register_gmail_management(app: web.Application, gateway) -> None:
+    from flowly.integrations.gmail_rpc import METHODS as GMAIL_METHODS
+    _register_management(app, gateway, methods=GMAIL_METHODS, path="/api/gmail/manage", surface="Gmail")
+
+
+def _register_management(app, gateway, *, methods: frozenset[str], path: str, surface: str) -> None:
     async def handle(request: web.Request) -> web.Response:
         # Loopback is a transport boundary, never an authentication bypass.
         if not token_matches(extract_request_token(request), gateway._auth_token):
@@ -54,19 +62,19 @@ def register_mcp_management(app: web.Application, gateway) -> None:
             async for chunk in request.content.iter_chunked(16 * 1024):
                 body.extend(chunk)
                 if len(body) > MAX_BODY:
-                    return _error("TOO_LARGE", "MCP request is too large.", 413)
+                    return _error("TOO_LARGE", f"{surface} request is too large.", 413)
             payload = json.loads(body)
         except (ValueError, UnicodeError):
-            return _error("INVALID_PARAMS", "Expected a JSON MCP request.")
+            return _error("INVALID_PARAMS", f"Expected a JSON {surface} request.")
         if not isinstance(payload, dict) or set(payload) - {"method", "params", "profile"}:
-            return _error("INVALID_PARAMS", "Invalid MCP request envelope.")
+            return _error("INVALID_PARAMS", f"Invalid {surface} request envelope.")
         method, params, profile = payload.get("method"), payload.get("params", {}), payload.get("profile")
-        if not isinstance(method, str) or method not in METHODS:
-            return _error("UNKNOWN_METHOD", "Only MCP management methods are supported.")
+        if not isinstance(method, str) or method not in methods:
+            return _error("UNKNOWN_METHOD", f"Only {surface} management methods are supported.")
         if not isinstance(params, dict) or (profile is not None and (
             not isinstance(profile, str) or not profile.strip() or len(profile) > 128
         )):
-            return _error("INVALID_PARAMS", "Invalid MCP request parameters.")
+            return _error("INVALID_PARAMS", f"Invalid {surface} request parameters.")
         try:
             if profile is not None:
                 if gateway._profile_host is None:
@@ -80,7 +88,7 @@ def register_mcp_management(app: web.Application, gateway) -> None:
             return _error(exc.code, exc.message)
         except Exception:
             # Credentials and OAuth callbacks must never escape via diagnostics.
-            return _error("UNAVAILABLE", "MCP management could not complete the request.", 503)
+            return _error("UNAVAILABLE", f"{surface} management could not complete the request.", 503)
         return web.json_response({"result": result}, headers={"Cache-Control": "no-store"})
 
-    app.router.add_post("/api/mcp/manage", handle)
+    app.router.add_post(path, handle)
