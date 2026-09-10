@@ -127,13 +127,25 @@ async def main():
         feature_rpc.set_mcp_connection_runtime(lambda: registry)
         config_path = Path(temporary) / "config.json"
         config_path.write_text(json.dumps({"channels": {"email": {"enabled": True, "imapHost": "unchanged.test"}}}))
+        gateway_runner = None
+        gateway_port = None
+        if os.environ.get("FLOWLY_MCP_TEST_SSH") == "1":
+            from aiohttp import web
+            from flowly.gateway.server import GatewayServer
+
+            gateway = GatewayServer(auth_token="desktop-ssh-test-token", advertise_control=False)
+            gateway_runner = web.AppRunner(gateway._create_app())
+            await gateway_runner.setup()
+            site = web.TCPSite(gateway_runner, "127.0.0.1", 0)
+            await site.start()
+            gateway_port = site._server.sockets[0].getsockname()[1]
         try:
             async with asyncio.timeout(10):
                 while not server.started:
                     if serving.done():
                         await serving
                     await asyncio.sleep(0.01)
-            output({"ready": True, "url": base + "/mcp"})
+            output({"ready": True, "url": base + "/mcp", "gatewayPort": gateway_port})
             while line := await asyncio.to_thread(sys.stdin.readline):
                 request = json.loads(line)
                 if request.get("method") == "test.close":
@@ -185,6 +197,8 @@ async def main():
                 except Exception as exc:
                     output({"id": request["id"], "error": str(exc)})
         finally:
+            if gateway_runner:
+                await gateway_runner.cleanup()
             lease_release.set()
             if lease_task:
                 await lease_task

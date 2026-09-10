@@ -702,6 +702,9 @@ class GatewayServer:
             middlewares=middlewares,
         )
         app.router.add_get("/health", self._handle_health)
+        from flowly.gateway.mcp_management import register_mcp_management
+
+        register_mcp_management(app, self)
         # WS-upgrade ticket minter. Active only when auth is engaged; the
         # static token (checked by the auth middleware) gates this route, and
         # it hands back a single-use short-TTL ticket for the /ws upgrade.
