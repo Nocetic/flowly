@@ -9,6 +9,7 @@ settings. Uses the same approval UI as the exec tool.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import mimetypes
 import os
@@ -99,9 +100,10 @@ class EmailTool(Tool):
         }
 
     async def execute(self, action: str, **kwargs: Any) -> str:
-        token, email = gmail_auth.get_valid_access_token()
+        # Managed token refresh performs HTTPS I/O; keep the gateway responsive.
+        token, email = await asyncio.to_thread(gmail_auth.get_valid_access_token)
         if not token:
-            return "Error: Gmail not connected. Connect via Desktop app settings."
+            return "Error: Gmail not connected. Connect in the app or run `flowly gmail connect` on this agent."
 
         if action == "inbox":
             return await self._list_inbox(token, kwargs.get("max_results", 5))

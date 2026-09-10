@@ -4714,6 +4714,18 @@ _DISPATCH: dict[str, tuple] = {
 }
 
 #: Every method this module serves. Transports gate on membership.
+def _gmail_handler(method: str):
+    async def handle(params: dict) -> dict:
+        from flowly.integrations.gmail_rpc import gmail_rpc
+        return await gmail_rpc(method, params)
+    return handle
+
+
+from flowly.integrations.gmail_rpc import METHODS as _GMAIL_METHODS
+
+for _gmail_method in _GMAIL_METHODS:
+    _DISPATCH[_gmail_method] = (_gmail_handler(_gmail_method), True, False)
+
 FEATURE_METHODS = frozenset(_DISPATCH)
 
 # These surfaces are installation-wide and are owned exclusively by the

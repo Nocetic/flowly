@@ -702,9 +702,10 @@ class GatewayServer:
             middlewares=middlewares,
         )
         app.router.add_get("/health", self._handle_health)
-        from flowly.gateway.mcp_management import register_mcp_management
+        from flowly.gateway.mcp_management import register_mcp_management, register_gmail_management
 
         register_mcp_management(app, self)
+        register_gmail_management(app, self)
         # WS-upgrade ticket minter. Active only when auth is engaged; the
         # static token (checked by the auth middleware) gates this route, and
         # it hands back a single-use short-TTL ticket for the /ws upgrade.
@@ -1392,6 +1393,16 @@ class GatewayServer:
         method = data.get("method", "")
         rpc_id = data.get("id", "")
         params = data.get("params") or {}
+
+        # Gmail management uses the same TLS/SSH boundary as its HTTP endpoint.
+        # No change to ordinary chat RPCs or other features on this connection.
+        requested = params.get("method", "") if method == "profiles.rpc" and isinstance(params, dict) else method
+        if isinstance(requested, str) and requested.startswith("gmail.") and requested != "gmail.capabilities":
+            from flowly.gateway.mcp_management import _protected_socket
+            request = getattr(ws, "_req", None)
+            if request is None or not _protected_socket(request):
+                await self._ws_rpc_error(ws, rpc_id, "SECURE_TRANSPORT_REQUIRED", "Use TLS or an SSH tunnel for Gmail setup.")
+                return
 
         try:
             if method == "health":

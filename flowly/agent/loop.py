@@ -2283,20 +2283,29 @@ class AgentLoop:
             main_config=self._main_config,
         ))
 
-        # Google Workspace tools (Gmail API — only act when user asks)
+        # Gmail can be connected while this runtime is already serving a client.
+        # The readiness gate is dynamic; no gateway/chat restart is needed.
+        from flowly.agent.tools.email import EmailTool
+        from flowly.channels.gmail_auth import email_tool_ready
+        legacy_email_enabled = bool(
+            self._main_config and getattr(getattr(self._main_config, 'channels', None), 'email', None)
+            and self._main_config.channels.email.enabled
+        )
+        self.tools.register(EmailTool(), check_fn=lambda _context: email_tool_ready(legacy_enabled=legacy_email_enabled))
+
+        # Existing broader Google Workspace grants remain opt-in and unchanged.
         if self._main_config and hasattr(self._main_config, 'channels'):
             email_cfg = getattr(self._main_config.channels, 'email', None)
             if email_cfg and email_cfg.enabled:
-                from flowly.agent.tools.email import EmailTool
                 from flowly.agent.tools.google_calendar import GoogleCalendarTool
                 from flowly.agent.tools.google_drive import GoogleDriveTool
                 from flowly.agent.tools.google_contacts import GoogleContactsTool
                 from flowly.agent.tools.google_tasks import GoogleTasksTool
                 def _google_ready(_context: Any) -> bool:
                     from flowly.channels.gmail_auth import load_credentials
-                    return load_credentials() is not None
+                    credentials = load_credentials()
+                    return credentials is not None and credentials.get("mode") != "flowly_broker"
 
-                self.tools.register(EmailTool(), check_fn=_google_ready)
                 self.tools.register(GoogleCalendarTool(), check_fn=_google_ready)
                 self.tools.register(GoogleDriveTool(), check_fn=_google_ready)
                 self.tools.register(GoogleContactsTool(), check_fn=_google_ready)

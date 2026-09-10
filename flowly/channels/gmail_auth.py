@@ -8,7 +8,6 @@ web app OAuth flow — the bot never sees the user's password.
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
@@ -33,6 +32,11 @@ def load_credentials() -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        if data.get("mode") == "flowly_broker":
+            from flowly.integrations.gmail_connection import is_managed_credentials
+            return data if is_managed_credentials(data) else None
         if not data.get("refresh_token"):
             logger.warning("[Gmail] Credentials missing refresh_token")
             return None
@@ -44,14 +48,8 @@ def load_credentials() -> dict[str, Any] | None:
 
 def save_credentials(creds: dict[str, Any]) -> None:
     """Save Gmail OAuth credentials to disk (mode 0600)."""
-    path = _creds_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(creds, indent=2), encoding="utf-8")
-    try:
-        from flowly.utils.file_security import secure_file
-        secure_file(path)  # POSIX chmod; real owner-only ACL on Windows
-    except OSError:
-        pass
+    from flowly.integrations.gmail_connection import atomic_private_json
+    atomic_private_json(_creds_path(), creds)
 
 
 def _is_expired(creds: dict[str, Any]) -> bool:
@@ -60,7 +58,7 @@ def _is_expired(creds: dict[str, Any]) -> bool:
     if not expiry:
         return True
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime
         exp_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
         return exp_dt.timestamp() - time.time() < _REFRESH_BUFFER_SECONDS
     except (ValueError, TypeError):
@@ -89,11 +87,11 @@ def _refresh(creds: dict[str, Any]) -> dict[str, Any] | None:
             timeout=15,
         )
         if resp.status_code != 200:
-            logger.error(f"[Gmail] Token refresh failed ({resp.status_code}): {resp.text[:200]}")
+            logger.error(f"[Gmail] Token refresh failed ({resp.status_code})")
             return None
 
         data = resp.json()
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
         expiry = datetime.now(timezone.utc) + timedelta(seconds=data.get("expires_in", 3600))
 
         creds["access_token"] = data["access_token"]
@@ -105,8 +103,8 @@ def _refresh(creds: dict[str, Any]) -> dict[str, Any] | None:
         save_credentials(creds)
         logger.debug("[Gmail] Access token refreshed")
         return creds
-    except Exception as e:
-        logger.error(f"[Gmail] Token refresh error: {e}")
+    except Exception:
+        logger.error("[Gmail] Token refresh could not complete")
         return None
 
 
@@ -119,9 +117,31 @@ def get_valid_access_token() -> tuple[str | None, str | None]:
     if not creds:
         return None, None
 
+    if creds.get("mode") == "flowly_broker":
+        from flowly.integrations.gmail_connection import GmailConnection
+        try:
+            return GmailConnection().access_token()
+        except Exception:
+            logger.warning("[Gmail] Managed authorization unavailable; reconnect if access was revoked")
+            return None, None
+
     if _is_expired(creds):
         creds = _refresh(creds)
         if not creds:
             return None, None
 
     return creds.get("access_token"), creds.get("email")
+
+
+def email_tool_ready(*, legacy_enabled: bool = False) -> bool:
+    """Expose newly connected Gmail without restarting the live agent."""
+    credentials = load_credentials()
+    if not credentials or credentials.get("disconnect_pending") or credentials.get("reauthorize_required"):
+        return False
+    if credentials.get("mode") != "flowly_broker":
+        return legacy_enabled
+    try:
+        config = json.loads((get_flowly_home() / "config.json").read_text(encoding="utf-8"))
+        return config.get("channels", {}).get("email", {}).get("enabled") is True
+    except (ValueError, OSError, AttributeError):
+        return False

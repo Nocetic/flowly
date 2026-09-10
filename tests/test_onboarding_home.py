@@ -346,6 +346,8 @@ def test_already_configured_skips_home(monkeypatch):
 
 
 def test_tty_unconfigured_opens_home(monkeypatch):
+    # This routing test must not discover accounts from the developer's machine.
+    monkeypatch.setattr("flowly.integrations.active_provider.external_credential_in_use", lambda: None)
     calls = []
     monkeypatch.setattr(ob, "seed_workspace", lambda: Path("/tmp/x"))
     monkeypatch.setattr(ob, "_already_configured", lambda: False)
@@ -389,6 +391,7 @@ def test_tty_friendly_loop_is_noop_off_macos(monkeypatch):
 def test_interactive_setup_swallows_event_loop_oserror(monkeypatch, capsys):
     """A terminal that still can't attach to an event loop must degrade to an
     actionable hint, never a raw traceback on a first-run user."""
+    monkeypatch.setattr("flowly.integrations.active_provider.external_credential_in_use", lambda: None)
     monkeypatch.setattr(ob, "seed_workspace", lambda: Path("/tmp/x"))
     monkeypatch.setattr(ob, "_already_configured", lambda: False)
     monkeypatch.setattr(ob.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
