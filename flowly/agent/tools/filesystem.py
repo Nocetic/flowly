@@ -620,26 +620,18 @@ class MemoryAppendTool(Tool):
             memory_dir.mkdir(parents=True, exist_ok=True)
             memory_file = memory_dir / "MEMORY.md"
 
-            # Read existing memory for duplicate check
-            existing = ""
-            if memory_file.exists():
-                existing = memory_file.read_text(encoding="utf-8")
-
-            # Duplicate check (exact hash + near-duplicate similarity)
-            dup_reason = self._check_duplicate(content, existing)
-            if dup_reason:
-                return f"Rejected: {dup_reason}"
-
-            # Append new entry
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-            note = f"\n\n<!-- {timestamp} -->\n{content.strip()}"
-            new_text = existing + note
-
-            # Enforce size cap (evict oldest if over limit)
-            new_text = self._enforce_size_cap(new_text)
-
-            # Atomic write (not append, because size cap may have removed entries)
-            memory_file.write_text(new_text, encoding="utf-8")
+            from flowly.config.transaction import config_write_lock
+            from flowly.memory.editor import atomic_write
+            # Coordinate with the owner editor and summary regeneration.
+            with config_write_lock(memory_file):
+                existing = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
+                dup_reason = self._check_duplicate(content, existing)
+                if dup_reason:
+                    return f"Rejected: {dup_reason}"
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                note = f"\n\n<!-- {timestamp} -->\n{content.strip()}"
+                new_text = self._enforce_size_cap(existing + note)
+                atomic_write(memory_file, new_text)
 
             return f"Appended to MEMORY.md ({len(content)} chars)"
         except Exception as e:

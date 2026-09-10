@@ -1093,6 +1093,22 @@ def plan_mode_set(params: dict) -> dict:
     return {"sticky": sticky}
 
 
+async def memory_editor(action: str, params: dict) -> dict:
+    import asyncio
+    return await asyncio.to_thread(_memory_editor_sync, action, params)
+
+
+def _memory_editor_sync(action: str, params: dict) -> dict:
+    from flowly.config.loader import load_config
+    from flowly.memory.editor import dispatch_editor, MemoryEditorError
+    try:
+        return dispatch_editor(action, params, load_config().workspace_path, state_db("memory_governance.sqlite3"))
+    except MemoryEditorError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from None
+    except TimeoutError:
+        raise FeatureRpcError("MEMORY_BUSY", "Memory is busy. Retry the save.") from None
+
+
 def memory_entries() -> dict:
     """MEMORY.md date-stamped blocks + USER.md — the desktop listMemories()
     shape."""
@@ -1130,7 +1146,10 @@ def memory_update_user(params: dict) -> dict:
         raise FeatureRpcError("INVALID", "content must be a string")
     ws = workspace_dir()
     ws.mkdir(parents=True, exist_ok=True)
-    (ws / "USER.md").write_text(content, encoding="utf-8")
+    from flowly.config.transaction import config_write_lock
+    from flowly.memory.editor import atomic_write
+    with config_write_lock(ws / "USER.md"):
+        atomic_write(ws / "USER.md", content)
     return {"ok": True}
 
 
@@ -4643,6 +4662,9 @@ _DISPATCH: dict[str, tuple] = {
     "mcp.install": (mcp_install, True, True),
     "mcp.test": (mcp_test, True, False),
     "mcp.oauth_start": (mcp_oauth_start, True, True),
+    "memory.editor.list": (_partial(memory_editor, "list"), True, False),
+    "memory.editor.document": (_partial(memory_editor, "document"), True, False),
+    "memory.editor.save": (_partial(memory_editor, "save"), True, False),
     "memory.entries": (memory_entries, False, False),
     "memory.update_user": (memory_update_user, True, False),
     "memory.gov_list": (_partial(memory_gov, "list"), True, False),
@@ -4725,6 +4747,9 @@ _PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.")
 # WebSocket transports dispatch them in tracked background tasks so their
 # receive loops keep processing control frames, pings, and unrelated RPCs.
 LONG_RUNNING_METHODS = frozenset({
+    "memory.editor.list",
+    "memory.editor.document",
+    "memory.editor.save",
     "mcp.test",
     "mcp.oauth_start",
     "mcp.setup.cancel",

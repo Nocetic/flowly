@@ -118,7 +118,7 @@ def splice_generated_block(existing: str, block: str) -> str:
     return existing[:start] + block + existing[end:]
 
 
-def regenerate_memory_md(gov, memory_store, kg_summary: str = "") -> str:
+def regenerate_memory_md(gov, memory_store, kg_summary: str | None = "") -> str:
     """Rebuild MEMORY.md's generated block from active governance items.
 
     Manual content (outside the sentinels) is preserved. ``secret`` items are
@@ -126,14 +126,25 @@ def regenerate_memory_md(gov, memory_store, kg_summary: str = "") -> str:
     depth on top of the dreamer never auto-activating sensitive candidates.
     Returns the new full file content.
     """
-    items = [
-        i for i in gov.list_items(status=STATUS_ACTIVE)
-        if i.privacy_level != "secret"
-    ]
-    block = render_generated_block(items, kg_summary=kg_summary)
-    existing = memory_store.read_long_term()
-    new_content = splice_generated_block(existing, block)
-    memory_store.write_long_term(new_content)
+    # Serialize with the owner editor so regeneration cannot erase manual edits.
+    from flowly.config.transaction import config_write_lock
+    from flowly.memory.editor import atomic_write
+    with config_write_lock(memory_store.memory_file):
+        existing = memory_store.read_long_term()
+        # An editor of governed text does not own the graph. Preserve its
+        # existing summary unless the caller supplies a freshly computed one.
+        if kg_summary is None:
+            region = _find_region(existing)
+            generated = existing[region[0]:region[1]] if region else ""
+            heading = "\n## Knowledge Graph\n"
+            kg_summary = generated.split(heading, 1)[1].split(SENTINEL_END, 1)[0].strip() if heading in generated else ""
+        items = [
+            i for i in gov.list_items(status=STATUS_ACTIVE)
+            if i.privacy_level != "secret"
+        ]
+        block = render_generated_block(items, kg_summary=kg_summary)
+        new_content = splice_generated_block(existing, block)
+        atomic_write(memory_store.memory_file, new_content)
     return new_content
 
 

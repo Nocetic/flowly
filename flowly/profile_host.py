@@ -817,8 +817,8 @@ class ProfileHost:
         _validate_profile_selector(name)
         method, safe = validate_profile_rpc(method, params)
         guarded = expected_host_id is not None or expected_bot_id is not None
-        if method.startswith("mcp.") and not guarded:
-            raise ProfileHostError("INVALID_PARAMS", "MCP operations require the selected profile identities.")
+        if method.startswith(("mcp.", "memory.editor.")) and not guarded:
+            raise ProfileHostError("INVALID_PARAMS", "This operation requires the selected profile identities.")
         if guarded:
             if not isinstance(expected_host_id, str) or not expected_host_id or not isinstance(expected_bot_id, str) or not expected_bot_id:
                 raise ProfileHostError("INVALID_PARAMS", "Both expected profile identities are required.")

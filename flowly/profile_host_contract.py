@@ -41,6 +41,9 @@ _NON_PUBLIC_ATTACHMENT_HOST_SUFFIXES = (
 # The small access-policy projection below is safe to
 # expose because it accepts only closed enums and a deny-only toolset list.
 PROFILE_RPC_TIMEOUTS: dict[str, int] = {
+    "memory.editor.list": 30_000,
+    "memory.editor.document": 30_000,
+    "memory.editor.save": 30_000,
     "mcp.capabilities": 30_000,
     "mcp.connections.list": 30_000,
     "mcp.connections.action": 60_000,

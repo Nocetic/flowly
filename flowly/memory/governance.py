@@ -284,6 +284,37 @@ class GovernanceStore:
         with self._lock:
             self._conn.close()
 
+    def editor_page(self, cursor: str, query: str) -> list[MemoryItem]:
+        """Stable keyset pagination; search is literal, not a SQL wildcard."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_ITEM_COLUMNS} FROM memory_items "
+                "WHERE status='active' AND id > ? AND instr(lower(text), lower(?)) > 0 "
+                "ORDER BY id LIMIT 51", (cursor, query),
+            ).fetchall()
+            return [self._row_to_item(row) for row in rows]
+
+    def editor_correct(self, item_id: str, text: str, expected: str) -> MemoryItem:
+        """Compare and edit in one transaction, including the audit record."""
+        from flowly.memory.editor import MemoryEditorError, item_revision
+
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                item = self._get_item_locked(item_id)
+                if item is None or item.status != STATUS_ACTIVE or item_revision(item) != expected:
+                    raise MemoryEditorError("MEMORY_CONFLICT", "This memory changed. Reload it before saving.")
+                self._conn.execute(
+                    "UPDATE memory_items SET text=?, updated_at=? WHERE id=?",
+                    (text, _now_iso(), item_id),
+                )
+                self._audit_locked(item_id, item.status, item.status, ACTOR_USER, "user_correct")
+                self._conn.commit()
+                return self._get_item_locked(item_id)
+            except Exception:
+                self._conn.rollback()
+                raise
+
     # -- internal -----------------------------------------------------------
 
     @staticmethod
