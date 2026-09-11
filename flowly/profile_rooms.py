@@ -3223,9 +3223,28 @@ class ProfileRoomService:
             index for index in range(len(room["messages"]) - 1, -1, -1)
             if room["messages"][index]["role"] == "user"
         ), -1)
+        responses = room["messages"][start + 1:]
+        # A user stop applies to the whole turn, including earlier members
+        # that finished with a mention. Real approval/clarify requests are
+        # independent and still win in both _public and _live_patch.
+        if any(message.get("aborted") is True for message in responses):
+            return False
+        run = room.get("run")
+        if isinstance(run, dict) and run.get("state") == "aborted":
+            # An unanswered later user message can retain the previous run.
+            # Do not let that old stop suppress a new decision request.
+            if start < 0:
+                return False
+            try:
+                user_at = datetime.fromisoformat(room["messages"][start]["createdAt"].replace("Z", "+00:00"))
+                finished_at = datetime.fromisoformat(run["finishedAt"].replace("Z", "+00:00"))
+                if user_at <= finished_at:
+                    return False
+            except (KeyError, AttributeError, ValueError, TypeError):
+                pass
         return any(
             message["role"] == "assistant" and "@user" in message["content"].lower()
-            for message in room["messages"][start + 1:]
+            for message in responses
         )
 
     @staticmethod
