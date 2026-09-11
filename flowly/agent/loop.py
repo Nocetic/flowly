@@ -141,6 +141,9 @@ _TOOL_MAX_CHARS: dict[str, int] = {
     "web_search": 4000,
     "web_fetch": 6000,
     "process": 6000,
+    # Explicit Gmail pages (up to 100 summaries) and bounded body chunks carry
+    # continuation metadata. Do not split ordinary pages at the 8K default.
+    "email": 64000,
     # A skill body is authoritative, self-contained guidance the model must read
     # WHOLE. At the 8000 default a large skill (e.g. flowlets, ~25 KB) gets
     # truncated to a third and spilled to a temp file — the model then burns
