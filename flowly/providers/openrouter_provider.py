@@ -566,6 +566,10 @@ class OpenRouterProvider(LLMProvider):
                             entry["extra_content"] = extra
         except Exception as exc:
             logger.error(f"LLM stream read error: {self._redact(str(exc))}")
+        finally:
+            # A consumer may close this generator while it is suspended at
+            # a yielded chunk. Always release the SDK response/connection.
+            await stream.close()
 
         # Emit the final response (with tool calls if any).
         if tool_call_accum:

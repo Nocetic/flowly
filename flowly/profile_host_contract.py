@@ -67,6 +67,7 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "chat.inflight": 30_000,
     "chat.send": 60_000,
     "chat.abort": 30_000,
+    "chat.steer": 30_000,
     "media.read": 30_000,
     "exec.approval.list": 30_000,
     "exec.approval.resolve": 30_000,
@@ -325,6 +326,7 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
         "chat.history",
         "chat.inflight",
         "chat.send",
+        "chat.steer",
         "sessions.model.get",
         "sessions.model.set",
     }
@@ -359,7 +361,7 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
                 "Profile media request is invalid.",
             )
         value = {"mediaId": media_id, "offset": offset, "length": length}
-    if method == "chat.send":
+    if method in {"chat.send", "chat.steer"}:
         # Remote clients may upload bytes, but they may never select paths or
         # browser registrations on the machine that owns the bot host.
         if value.get("cwd") is not None or value.get("browserAccess") is not None:
