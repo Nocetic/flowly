@@ -590,7 +590,7 @@ class Session:
         closing_idx: int | None = None
         for i in range(len(new_messages) - 1, -1, -1):
             m = new_messages[i]
-            if m.get("role") == "assistant" and not m.get("tool_calls"):
+            if m.get("role") == "assistant" and not m.get("tool_calls") and not m.get("steering_source_run_id"):
                 closing_idx = i
                 break
 
@@ -607,6 +607,8 @@ class Session:
                     "tool_calls",
                     "tool_call_id",
                     "name", "id", "steering_run_id", "media", "timestamp",
+                    "run_id", "aborted", "steering_source_run_id", "steering_message_id", "steering_iteration_idx",
+                    "steering_previous_iteration_idx", "steering_tool_call_ids", "steering_sequence",
                     PROVIDER_REPLAY_KEY,
                 )
                 if k in new_msg

@@ -5057,38 +5057,46 @@ class AgentLoop:
 
         async def consume_stream() -> None:
             nonlocal accumulated_text, final_response, chunk_count, aborted
-            async for chunk in self.provider.chat_stream(
+            stream = self.provider.chat_stream(
                 messages=messages,
                 tools=tools,
                 model=model,
                 temperature=temperature,
                 tool_choice=tool_choice,
-            ):
-                # Keep this cooperative check as a second line of defence for
-                # providers that yield immediately after the stop request.
-                # The RunAbortController below also cancels a provider that is
-                # silent / reasoning and has not yielded another chunk yet.
-                if run_id and self.is_run_aborted(run_id):
-                    aborted = True
-                    break
-                # Error text is routing input, not user-visible model output.
-                # Keep it on the final response for classification but never
-                # stream raw provider/SDK payloads into a client bubble.
-                if chunk.content and chunk.finish_reason != "error":
-                    chunk_count += 1
-                    accumulated_text += chunk.content
-                    # Heartbeat for the inactivity watchdog — every stream
-                    # chunk counts as progress. Without this a long streaming
-                    # reply could look "idle" to the poller even though the
-                    # model is actively emitting tokens.
-                    self._touch_activity("receiving stream response")
-                    logger.debug(f"[stream] chunk #{chunk_count}: {len(chunk.content)} chars")
-                    try:
-                        await stream_callback(chunk.content)
-                    except Exception as e:
-                        logger.warning(f"[stream] stream_callback error: {e}")
-                if chunk.finish_reason:
-                    final_response = chunk
+            )
+            try:
+                async for chunk in stream:
+                    # Keep this cooperative check as a second line of defence for
+                    # providers that yield immediately after the stop request.
+                    # The RunAbortController below also cancels a provider that is
+                    # silent / reasoning and has not yielded another chunk yet.
+                    if run_id and self.is_run_aborted(run_id):
+                        aborted = True
+                        break
+                    # Error text is routing input, not user-visible model output.
+                    # Keep it on the final response for classification but never
+                    # stream raw provider/SDK payloads into a client bubble.
+                    if chunk.content and chunk.finish_reason != "error":
+                        chunk_count += 1
+                        accumulated_text += chunk.content
+                        self._steering().observe_text(run_id, chunk.content)
+                        # Heartbeat for the inactivity watchdog — every stream
+                        # chunk counts as progress. Without this a long streaming
+                        # reply could look "idle" to the poller even though the
+                        # model is actively emitting tokens.
+                        self._touch_activity("receiving stream response")
+                        logger.debug(f"[stream] chunk #{chunk_count}: {len(chunk.content)} chars")
+                        try:
+                            await stream_callback(chunk.content)
+                        except Exception as e:
+                            logger.warning(f"[stream] stream_callback error: {e}")
+                    if chunk.finish_reason:
+                        final_response = chunk
+
+            finally:
+                close_stream = getattr(stream, "aclose", None)
+                if close_stream is not None:
+                    await close_stream()
 
         try:
             await self._run_aborts.run_cancellable(
@@ -5464,6 +5472,7 @@ class AgentLoop:
         # tool-result name matching remains valid.
         from flowly.tool_activity import project_tool_messages_for_ui
 
+        self._steering().observe_iteration(outbound_run_id, iteration_idx, message)
         ui_message = project_tool_messages_for_ui([message])[0]
         role = ui_message.get("role") or ""
         if role not in ("assistant", "tool"):
@@ -5749,11 +5758,13 @@ class AgentLoop:
         # results (commit af50376) plus the planner's evidence
         # requirement now catch real loops without the false positives.
 
-        steering_prefix: list[str] = []
         steering = self._steering()
         while iteration < max_turn_iterations or steering.has_pending(outbound_run_id):
             iteration += 1
             for guidance in steering.take(outbound_run_id):
+                checkpoint = guidance.pop("_steering_checkpoint", None)
+                if checkpoint:
+                    _record_turn_message(checkpoint)
                 # Durable text/media stays distinct from the provider's image
                 # blocks and extracted document content.
                 provider_message = {"role": "user", "content": self.context._build_user_content(
@@ -6060,7 +6071,9 @@ class AgentLoop:
             # tags the OutboundMessage with ``aborted: true`` so
             # the UI can render the [Aborted] marker.
             if outbound_run_id and self.is_run_aborted(outbound_run_id):
-                final_content = response.content or ""
+                # Accepted guidance already sealed this partial as a checkpoint.
+                # Stop before the next call must not duplicate it as the final.
+                final_content = "" if steering.has_pending(outbound_run_id) else response.content or ""
                 logger.info(
                     f"[loop] aborted at iteration {iteration}, "
                     f"{len(final_content)} chars preserved, "
@@ -6114,23 +6127,19 @@ class AgentLoop:
                 )
 
             if outbound_run_id and self.is_run_aborted(outbound_run_id):
-                final_content = response.content or ""
+                # Accepted guidance already sealed this partial as a checkpoint.
+                # Stop before the next call must not duplicate it as the final.
+                final_content = "" if steering.has_pending(outbound_run_id) else response.content or ""
                 break
 
             if response.finish_reason == "steered" or steering.has_pending(outbound_run_id):
                 if response.usage:
                     _merge_turn_usage(total_usage, response.usage)
                 if response.content:
-                    steering_prefix.append(response.content)
-                    # The final capstone contains this prefix once. Keep the
-                    # partial only in the current provider context, so future
-                    # turns do not see it again as a duplicate assistant row.
+                    # This partial has its own durable checkpoint before the
+                    # guidance. Keep it once in provider context, never glue
+                    # it back onto the next assistant reply.
                     messages.append({"role": "assistant", "content": response.content})
-                    if stream_callback:
-                        try:
-                            await stream_callback("\n\n")
-                        except Exception:
-                            logger.debug("steering stream boundary unavailable", exc_info=True)
                 # A partial tool call is never executable. Continue the same
                 # run with the guidance at the next provider boundary.
                 iteration -= 1
@@ -6272,13 +6281,6 @@ class AgentLoop:
                     ]
                     if not any(phrase in content_lower for phrase in hallucination_phrases):
                         assistant_content = response.content
-
-                if steering_prefix:
-                    # Iteration events move streamed preambles into the tool
-                    # panel. Move the retained prefix with them exactly once,
-                    # rather than hiding it until the final response arrives.
-                    assistant_content = "\n\n".join([*steering_prefix, assistant_content or ""]).rstrip()
-                    steering_prefix.clear()
 
                 messages = _add_assistant_turn_message(
                     messages,
@@ -7274,8 +7276,6 @@ class AgentLoop:
             if summary:
                 final_content = summary
 
-        if steering_prefix:
-            final_content = "\n\n".join([*steering_prefix, final_content or ""]).rstrip()
         return final_content, accumulated_tool_results, executed_tool_names, total_usage, messages
 
     async def _run_memory_flush(
@@ -8692,11 +8692,13 @@ class AgentLoop:
             receipts = {**old_receipts, receipt["messageId"]: receipt}
             session.metadata["steering_receipts"] = dict(list(receipts.items())[-128:])
             try:
-                self.sessions.save(session, extra_messages=[_pending_user, *accepted_guidance, message])
+                checkpoint = receipt.get("checkpoint")
+                additions = [*([checkpoint] if checkpoint else []), message]
+                self.sessions.save(session, extra_messages=[_pending_user, *accepted_guidance, *additions])
             except Exception:
                 session.metadata["steering_receipts"] = old_receipts
                 raise
-            accepted_guidance.append(message)
+            accepted_guidance.extend(additions)
 
         # Keep a positive ceiling for the whole turn, not just a deny list
         # computed from one registry snapshot. Late MCP discovery cannot widen it.

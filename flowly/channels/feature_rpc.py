@@ -4467,6 +4467,7 @@ def system_capabilities() -> dict:
     return {
         "version": __version__,
         "featureMethods": sorted(methods),
+        "chatSteeringVersion": 2 if _chat_steering_callback is not None else 0,
         "runtime": {
             "role": runtime.role.value,
             "profile": runtime.profile_name,

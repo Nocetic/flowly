@@ -7,6 +7,7 @@ interrupt a provider; tools and the parent turn task are never cancelled here.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 from collections import deque
@@ -36,6 +37,11 @@ class SteeringRun:
     receipts: dict = field(default_factory=dict)
     provider: asyncio.Task | None = None
     accepting: bool = True
+    response_text: str = ""
+    iteration_idx: int = -1
+    checkpoint_iteration_idx: int = -1
+    tool_call_ids: list[str] = field(default_factory=list)
+    checkpoint_tool_count: int = 0
 
 
 class RunSteeringController:
@@ -71,8 +77,22 @@ class RunSteeringController:
             raise SteeringError("STEERING_LIMIT", "This response has reached its guidance limit.")
         message = prepare()
         timestamp = datetime.now(timezone.utc).isoformat()
-        message.update(role="user", id=message_id, steering_run_id=run_id, timestamp=timestamp)
+        sequence = len(state.receipts) + 1
+        message.update(role="user", id=message_id, steering_run_id=run_id, timestamp=timestamp, steering_sequence=sequence)
+        checkpoint = None
+        if not state.pending and (state.response_text or len(state.tool_call_ids) > state.checkpoint_tool_count):
+            checkpoint_id = f"{run_id}:steer:{message_id}"
+            checkpoint = dict(
+                id=checkpoint_id, run_id=checkpoint_id, role="assistant",
+                content=state.response_text, timestamp=timestamp, aborted=True,
+                steering_source_run_id=run_id, steering_message_id=message_id, steering_sequence=sequence,
+                steering_iteration_idx=state.iteration_idx,
+                steering_previous_iteration_idx=state.checkpoint_iteration_idx,
+                steering_tool_call_ids=state.tool_call_ids[state.checkpoint_tool_count:],
+            )
         receipt = dict(
+            version=2, sequence=sequence,
+            checkpoint=checkpoint,
             accepted=True,
             messageId=message_id,
             runId=run_id,
@@ -82,7 +102,12 @@ class RunSteeringController:
         )
         state.persist(message, receipt)  # failure must leave the run unchanged
         state.receipts[message_id] = receipt
-        state.pending.append(message)
+        state.pending.append({**message, "_steering_checkpoint": checkpoint})
+        if checkpoint:
+            state.checkpoint_iteration_idx = state.iteration_idx
+            state.checkpoint_tool_count = len(state.tool_call_ids)
+            from flowly.agent import inflight
+            inflight.clear_text(session_key, run_id, sequence)
         if state.provider is not None:
             state.provider.cancel()
         return self.replay(receipt, digest)
@@ -118,7 +143,22 @@ class RunSteeringController:
                 "IDENTITY_CONFLICT",
                 "This message identity was already used for different guidance.",
             )
-        return {k: v for k, v in receipt.items() if k != "digest"}
+        return copy.deepcopy({k: v for k, v in receipt.items() if k != "digest"})
+
+    def observe_text(self, run_id: str, text: str) -> None:
+        state = self.runs.get(run_id)
+        if state:
+            state.response_text += text
+
+    def observe_iteration(self, run_id: str, index: int, message: dict) -> None:
+        state = self.runs.get(run_id)
+        if state:
+            state.iteration_idx = max(state.iteration_idx, index)
+            for call in message.get("tool_calls") or []:
+                if call.get("id") and call["id"] not in state.tool_call_ids:
+                    state.tool_call_ids.append(call["id"])
+            if message.get("tool_calls"):
+                state.response_text = ""
 
     def has_pending(self, run_id: str) -> bool:
         state = self.runs.get(run_id)
@@ -143,6 +183,7 @@ class RunSteeringController:
             return await operation()
         if state.pending:
             raise ProviderSteeredError()
+        state.response_text = ""
         task = asyncio.create_task(operation())
         state.provider = task
         try:

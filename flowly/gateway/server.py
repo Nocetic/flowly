@@ -2753,6 +2753,16 @@ class GatewayServer:
                 msg["id"] = m["id"]
             if m.get("steering_run_id"):
                 msg["steeringRunId"] = m["steering_run_id"]
+            for source, target in (
+                ("steering_sequence", "steeringSequence"),
+                ("steering_source_run_id", "steeringSourceRunId"),
+                ("steering_message_id", "steeringMessageId"),
+                ("steering_iteration_idx", "steeringIterationIdx"),
+                ("steering_previous_iteration_idx", "steeringPreviousIterationIdx"),
+                ("steering_tool_call_ids", "steeringToolCallIds"),
+            ):
+                if source in m:
+                    msg[target] = m[source]
             run_id = m.get("run_id")
             if isinstance(run_id, str) and run_id:
                 msg["runId"] = run_id

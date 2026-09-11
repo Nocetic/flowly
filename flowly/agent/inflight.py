@@ -94,6 +94,16 @@ def append_iteration(session_key: str, run_id: str, event: dict) -> None:
     cur["updatedAt"] = time.time()
 
 
+def clear_text(session_key: str, run_id: str, steering_sequence: int = 0) -> None:
+    """A persisted steering checkpoint owns the text before the new segment."""
+    cur = _runs.get(session_key)
+    if cur and cur.get("runId") == run_id:
+        cur["text"] = ""
+        if steering_sequence:
+            cur["steeringSequence"] = steering_sequence
+        cur["updatedAt"] = time.time()
+
+
 def finish(session_key: str, run_id: str) -> None:
     """Drop the run once it settles (final / aborted / error). Only clears
     if the stored run still matches — a newer run for the same session
@@ -119,4 +129,5 @@ def get(session_key: str) -> dict | None:
         "text": cur["text"],
         "user": cur.get("user", ""),
         "iterations": list(cur.get("iterations", [])),
+        **({"steeringSequence": cur["steeringSequence"]} if cur.get("steeringSequence") else {}),
     }

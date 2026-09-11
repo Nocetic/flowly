@@ -99,8 +99,9 @@ async def test_stop_cancellation_wins_over_simultaneous_steer():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_tools", [False, True])
+@pytest.mark.parametrize("stop_after_steer", [False, True])
 async def test_real_turn_continues_after_guidance_and_receipt_survives_reload(
-    tmp_path, monkeypatch, use_tools
+    tmp_path, monkeypatch, use_tools, stop_after_steer
 ):
     from flowly.agent.loop import AgentLoop
     from flowly.agent.tools.base import Tool
@@ -187,26 +188,44 @@ async def test_real_turn_continues_after_guidance_and_receipt_survives_reload(
     monkeypatch.setattr(feature_rpc, "_chat_steering_callback", agent.steer_chat)
     receipt, _ = await feature_rpc.dispatch("chat.steer", params)
     assert receipt["accepted"] is True
+    if stop_after_steer:
+        agent.mark_aborted("story")
     result, metadata = await asyncio.wait_for(task, 5)
+    if stop_after_steer:
+        history = agent.sessions.get_full_messages("web:story")
+        assert metadata["aborted"] is True
+        assert len(provider.calls) == 1
+        assert sum("Once upon a time" in str(row["content"]) for row in history) == 1
+        assert [row["role"] for row in history] == ["user", "assistant", "user", "assistant"]
+        assert history[1]["content"] == "Once upon a time"
+        assert history[2]["id"] == "shorter"
+        assert history[-1]["content"] == ""
+        assert not agent._steering().runs
+        assert agent.steer_chat(params) == receipt
+        return
     assert len(provider.calls) == (3 if use_tools else 2)
     assert provider.calls[1][-1] == {"role": "user", "content": "Make it shorter"}
     if use_tools:
         assert result == "A short ending."
-        assert events[0]["content"] == "Once upon a time\n\nLooking up."
+        assert events[0]["content"] == "Looking up."
     else:
-        assert result == "".join(chunks) == "Once upon a time\n\nA short ending."
+        assert result == "A short ending."
+        assert "".join(chunks) == "Once upon a timeA short ending."
     assert metadata.get("aborted") is not True
     assert not agent.is_run_aborted("story")
     assert not agent._steering().runs
     # Canonical save must contain guidance exactly once, before the same run's answer.
     history = agent.sessions.get_full_messages("web:story")
     assert [row["role"] for row in history] == (
-        ["user", "user", "assistant", "tool", "assistant"]
+        ["user", "assistant", "user", "assistant", "tool", "assistant"]
         if use_tools
-        else ["user", "user", "assistant"]
+        else ["user", "assistant", "user", "assistant"]
     )
     assert sum("Once upon a time" in str(row["content"]) for row in history) == 1
-    assert history[1]["id"] == "shorter"
+    assert history[1]["content"] == "Once upon a time"
+    assert history[1]["aborted"] is True
+    assert history[1]["run_id"] == receipt["checkpoint"]["run_id"]
+    assert history[2]["id"] == "shorter"
     assert history[-1]["run_id"] == "story"
     agent.sessions = SessionManager(tmp_path)
     assert agent.steer_chat(params) == receipt
@@ -312,3 +331,38 @@ async def test_rpc_distinguishes_a_finished_run_from_unconfirmed_delivery(monkey
         "sessionKey": "chat",
         "messageId": "guidance",
     }
+
+
+def test_multiple_guidance_checkpoints_preserve_tool_ownership_and_idempotency():
+    from flowly.agent import inflight
+    controller = RunSteeringController()
+    saved = []
+    inflight.begin("chat", "run", "Story")
+    inflight.append("chat", "run", "Old")
+    with controller.register("run", "chat", lambda *args: saved.append(args)):
+        controller.observe_text("run", "Old")
+        one = controller.submit(request(), lambda: {"content": "Make it shorter"})
+        assert inflight.get("chat")["text"] == ""
+        assert inflight.get("chat")["steeringSequence"] == 1
+        # A second accepted message before the loop resumes has no duplicate checkpoint.
+        params = request()
+        params["idempotencyKey"] = "second"
+        two = controller.submit(params, lambda: {"content": "Make it shorter"})
+        assert two["checkpoint"] is None
+        assert len(controller.take("run")) == 2
+        controller.observe_iteration("run", 0, {"tool_calls": [{"id": "old-tool"}]})
+        params["idempotencyKey"] = "third"
+        three = controller.submit(params, lambda: {"content": "Make it shorter"})
+        assert three["checkpoint"]["content"] == ""
+        assert three["checkpoint"]["steering_tool_call_ids"] == ["old-tool"]
+        controller.take("run")
+        controller.observe_iteration("run", 1, {"role": "tool", "tool_call_id": "old-tool"})
+        controller.observe_iteration("run", 2, {"tool_calls": [{"id": "new-tool"}]})
+        params["idempotencyKey"] = "fourth"
+        four = controller.submit(params, lambda: {"content": "Make it shorter"})
+        assert four["checkpoint"]["steering_tool_call_ids"] == ["new-tool"]
+        assert four["checkpoint"]["steering_previous_iteration_idx"] == 0
+        # Returning a receipt must not expose mutable durable/controller state.
+        one["checkpoint"]["content"] = "tampered"
+        assert controller.submit(request(), lambda: {})["checkpoint"]["content"] == "Old"
+    inflight.finish("chat", "run")
