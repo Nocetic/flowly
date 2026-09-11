@@ -2749,6 +2749,10 @@ class GatewayServer:
                 msg["usage"] = m["usage"]
             if m.get("aborted") is True:
                 msg["aborted"] = True
+            if m.get("id"):
+                msg["id"] = m["id"]
+            if m.get("steering_run_id"):
+                msg["steeringRunId"] = m["steering_run_id"]
             run_id = m.get("run_id")
             if isinstance(run_id, str) and run_id:
                 msg["runId"] = run_id

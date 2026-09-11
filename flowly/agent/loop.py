@@ -95,6 +95,7 @@ from flowly.render_capabilities import normalize_render_capabilities
 from flowly.agent.reply_media import extract_reply_media, extract_reply_media_assets
 from flowly.media.assets import ASSETS_META_KEY, assets_to_meta
 from flowly.agent.run_abort import RunAbortedError, RunAbortController
+from flowly.agent.run_steering import ProviderSteeredError, RunSteeringController, SteeringError
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
 from flowly.agent.tool_policy import (
     has_explicit_tool_invocation_intent,
@@ -3927,6 +3928,32 @@ class AgentLoop:
             logger.info(f"[agent] mark_aborted run_id={run_id}")
         return requested
 
+    def _steering(self) -> RunSteeringController:
+        if not hasattr(self, "_run_steering"):
+            self._run_steering = RunSteeringController()
+        return self._run_steering
+
+    def steer_chat(self, params: dict) -> dict:
+        controller = self._steering()
+        run_id, session_key, message_id, digest = controller.identity(params)
+        # Receipts survive a lost ACK, completion and process restart. A retry
+        # can never become a second ordinary chat.send after the run ends.
+        session = self.sessions.get_or_create(session_key)
+        previous = session.metadata.get("steering_receipts", {}).get(message_id)
+        if previous:
+            return controller.replay(previous, digest)
+
+        def prepare() -> dict:
+            from flowly.gateway.server import _save_attachments
+            from flowly.profile import get_flowly_home
+            attachments = params.get("attachments") or []
+            media = _save_attachments(attachments, get_flowly_home() / "media") if attachments else []
+            if len(media) != len(attachments):
+                raise SteeringError("INVALID_ATTACHMENT", "A guidance attachment could not be read.")
+            return {"content": params.get("message", ""), **({"media": media} if media else {})}
+
+        return controller.submit(params, prepare, stopped=self.is_run_aborted(run_id))
+
     def is_run_aborted(self, run_id: str) -> bool:
         """Test whether a run_id has been marked aborted."""
         return self._run_aborts.is_requested(run_id)
@@ -5026,6 +5053,7 @@ class AgentLoop:
         final_response = None
         chunk_count = 0
         aborted = False
+        steered = False
 
         async def consume_stream() -> None:
             nonlocal accumulated_text, final_response, chunk_count, aborted
@@ -5063,9 +5091,13 @@ class AgentLoop:
                     final_response = chunk
 
         try:
-            await self._run_aborts.run_cancellable(run_id, consume_stream)
+            await self._run_aborts.run_cancellable(
+                run_id, lambda: self._steering().provider_call(run_id, consume_stream)
+            )
         except RunAbortedError:
             aborted = True
+        except ProviderSteeredError:
+            steered = True
 
         if aborted:
             logger.info(
@@ -5075,15 +5107,15 @@ class AgentLoop:
 
         logger.info(f"[stream] done: {chunk_count} chunks, {len(accumulated_text)} total chars{' (ABORTED)' if aborted else ''}")
 
-        if aborted:
+        if aborted or steered:
             # Build a synthetic final response that carries the
             # partial text + aborted finish_reason. We don't preserve
             # any partial tool_calls — half-built tool_call deltas
             # are unsafe to execute.
             return LLMResponse(
                 content=accumulated_text or None,
-                finish_reason="aborted",
-                usage={},
+                finish_reason="aborted" if aborted else "steered",
+                usage=dict(final_response.usage) if steered and final_response and final_response.usage else {},
                 partial_content_delivered=bool(accumulated_text),
             )
 
@@ -5165,14 +5197,16 @@ class AgentLoop:
         try:
             return await self._run_aborts.run_cancellable(
                 run_id,
-                lambda: self.provider.chat(
+                lambda: self._steering().provider_call(run_id, lambda: self.provider.chat(
                     messages=messages,
                     tools=tools,
                     model=model,
                     temperature=temperature,
                     tool_choice=tool_choice,
-                ),
+                )),
             )
+        except ProviderSteeredError:
+            return LLMResponse(content=None, finish_reason="steered", usage={})
         except RunAbortedError:
             logger.info(f"[chat] blocking provider call aborted, run_id={run_id}")
             return LLMResponse(
@@ -5715,8 +5749,21 @@ class AgentLoop:
         # results (commit af50376) plus the planner's evidence
         # requirement now catch real loops without the false positives.
 
-        while iteration < max_turn_iterations:
+        steering_prefix: list[str] = []
+        steering = self._steering()
+        while iteration < max_turn_iterations or steering.has_pending(outbound_run_id):
             iteration += 1
+            for guidance in steering.take(outbound_run_id):
+                # Durable text/media stays distinct from the provider's image
+                # blocks and extracted document content.
+                provider_message = {"role": "user", "content": self.context._build_user_content(
+                    guidance["content"], guidance.get("media"))}
+                messages.append(provider_message)
+                _record_turn_message(guidance)
+                turn_content = guidance["content"] or turn_content
+                continuity_state.clear()
+                if provider_state_out is not None:
+                    provider_state_out.clear()
 
             # Mid-turn context guard. Tool results accumulate INSIDE a turn
             # (a long codex session easily adds tens of K tokens across
@@ -6066,6 +6113,29 @@ class AgentLoop:
                     provider_state_out=provider_state_out,
                 )
 
+            if outbound_run_id and self.is_run_aborted(outbound_run_id):
+                final_content = response.content or ""
+                break
+
+            if response.finish_reason == "steered" or steering.has_pending(outbound_run_id):
+                if response.usage:
+                    _merge_turn_usage(total_usage, response.usage)
+                if response.content:
+                    steering_prefix.append(response.content)
+                    # The final capstone contains this prefix once. Keep the
+                    # partial only in the current provider context, so future
+                    # turns do not see it again as a duplicate assistant row.
+                    messages.append({"role": "assistant", "content": response.content})
+                    if stream_callback:
+                        try:
+                            await stream_callback("\n\n")
+                        except Exception:
+                            logger.debug("steering stream boundary unavailable", exc_info=True)
+                # A partial tool call is never executable. Continue the same
+                # run with the guidance at the next provider boundary.
+                iteration -= 1
+                continue
+
             if response.provider_state.get("_checkpoint_emitted"):
                 marker = self.provider.continuity_marker(
                     continuity_state,
@@ -6202,6 +6272,13 @@ class AgentLoop:
                     ]
                     if not any(phrase in content_lower for phrase in hallucination_phrases):
                         assistant_content = response.content
+
+                if steering_prefix:
+                    # Iteration events move streamed preambles into the tool
+                    # panel. Move the retained prefix with them exactly once,
+                    # rather than hiding it until the final response arrives.
+                    assistant_content = "\n\n".join([*steering_prefix, assistant_content or ""]).rstrip()
+                    steering_prefix.clear()
 
                 messages = _add_assistant_turn_message(
                     messages,
@@ -6850,6 +6927,9 @@ class AgentLoop:
                     successful_tools_were_used = True
                     forced_tool_retry = False
 
+                if steering.has_pending(outbound_run_id):
+                    continue
+
                 if terminal_action_executed:
                     successful = [t for t in accumulated_tool_results if t.get("success")]
                     if successful:
@@ -7112,6 +7192,9 @@ class AgentLoop:
                 )
                 break
 
+            # No awaits between the last provider boundary and this plain
+            # final. Closing acceptance here makes completion vs Steer atomic.
+            steering.close(outbound_run_id)
             final_content = response.content
             _record_final_response(
                 response,
@@ -7120,6 +7203,7 @@ class AgentLoop:
             )
             break
 
+        steering.close(outbound_run_id)
         run_was_aborted = bool(
             outbound_run_id and self.is_run_aborted(outbound_run_id)
         )
@@ -7190,6 +7274,8 @@ class AgentLoop:
             if summary:
                 final_content = summary
 
+        if steering_prefix:
+            final_content = "\n\n".join([*steering_prefix, final_content or ""]).rstrip()
         return final_content, accumulated_tool_results, executed_tool_names, total_usage, messages
 
     async def _run_memory_flush(
@@ -8600,9 +8686,23 @@ class AgentLoop:
         provider_state_out: dict[str, Any] = {}
         from flowly.agent.tool_context import tool_execution_scope
 
+        accepted_guidance: list[dict] = []
+        def persist_guidance(message: dict, receipt: dict) -> None:
+            old_receipts = session.metadata.get("steering_receipts", {})
+            receipts = {**old_receipts, receipt["messageId"]: receipt}
+            session.metadata["steering_receipts"] = dict(list(receipts.items())[-128:])
+            try:
+                self.sessions.save(session, extra_messages=[_pending_user, *accepted_guidance, message])
+            except Exception:
+                session.metadata["steering_receipts"] = old_receipts
+                raise
+            accepted_guidance.append(message)
+
         # Keep a positive ceiling for the whole turn, not just a deny list
         # computed from one registry snapshot. Late MCP discovery cannot widen it.
-        with tool_execution_scope(msg.session_key, allowed_tools=allowed_tools if tools_allowed else frozenset()):
+        with tool_execution_scope(msg.session_key, allowed_tools=allowed_tools if tools_allowed else frozenset()), self._steering().register(
+            msg.metadata.get("run_id") or "", msg.session_key, persist_guidance
+        ):
             final_content, tool_results, _executed_tools, usage, _loop_messages = await self._run_llm_tool_loop(
                 messages=messages,
                 action_turn=action_turn,
@@ -8625,6 +8725,8 @@ class AgentLoop:
                 provider_state=provider_state,
                 provider_state_out=provider_state_out,
             )
+        journal_ids = {message.get("id") for message in turn_messages}
+        turn_messages.extend(message for message in accepted_guidance if message["id"] not in journal_ids)
         outbound_run_id = msg.metadata.get("run_id") or ""
         turn_aborted = bool(
             outbound_run_id and self.is_run_aborted(outbound_run_id)

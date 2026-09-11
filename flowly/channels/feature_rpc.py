@@ -56,6 +56,29 @@ class FeatureRpcError(Exception):
         self.message = message
 
 
+_chat_steering_callback = None
+
+
+def set_chat_steering_callback(callback) -> None:
+    global _chat_steering_callback
+    _chat_steering_callback = callback
+
+
+def chat_steer(params: dict) -> dict:
+    from flowly.agent.run_steering import SteeringError
+    if _chat_steering_callback is None:
+        raise FeatureRpcError("UNAVAILABLE", "Guidance is unavailable in this runtime.")
+    try:
+        return _chat_steering_callback(params)
+    except SteeringError as exc:
+        if exc.code in {"RUN_NOT_ACTIVE", "STEERING_LIMIT"}:
+            # A definite refusal is different from a lost ACK: the original
+            # local queue can continue normally without resubmitting guidance.
+            return {"accepted": False, "code": exc.code, "runId": params.get("runId"),
+                    "sessionKey": params.get("sessionKey"), "messageId": params.get("idempotencyKey")}
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+
+
 # ── Shared on-disk locations ────────────────────────────────────────────────
 
 
@@ -4608,6 +4631,7 @@ _DISPATCH: dict[str, tuple] = {
     "push.register": (push_register, True, False),
     "push.unregister": (push_unregister, True, False),
     "chat.inflight": (chat_inflight, True, False),
+    "chat.steer": (chat_steer, True, False),
     "goal.get": (goal_get, True, False),
     "goal.pause": (goal_pause, True, False),
     "goal.resume": (goal_resume, True, False),

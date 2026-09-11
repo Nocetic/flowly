@@ -606,7 +606,7 @@ class Session:
                 for k in (
                     "tool_calls",
                     "tool_call_id",
-                    "name",
+                    "name", "id", "steering_run_id", "media", "timestamp",
                     PROVIDER_REPLAY_KEY,
                 )
                 if k in new_msg

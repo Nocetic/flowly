@@ -1795,6 +1795,7 @@ Respond to the user now:"""
         # Chip pause/play buttons — the control must run through the agent so
         # the runtime is cancelled/woken and every client gets goal.updated.
         _feature_rpc.set_goal_control_callback(agent.goal_control)
+        _feature_rpc.set_chat_steering_callback(agent.steer_chat)
         # Subagent manager — for subagents.spawn (manual background subagent).
         _feature_rpc.set_subagent_manager_provider(
             lambda: getattr(agent, "subagents", None)
