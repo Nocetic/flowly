@@ -57,6 +57,29 @@ sidecars):
 | `artifacts.sqlite` | Version-tracked [artifacts](/docs/features/artifacts). |
 | session store | Session history + full-text search. |
 
+## MCP state
+
+Paths below are relative to the selected `$FLOWLY_HOME` (or named profile home).
+Do not copy credentials between profiles or edit credential identifiers by hand.
+
+| Path | What it is |
+|---|---|
+| `config.json` → `mcpServers` | Server configuration, explicit tool permissions, and app-managed OAuth credential-slot pointers |
+| `mcp-tokens/` | Private provider OAuth client/token records, staged credential slots, and cross-process lock files |
+| `mcp-access.json` | Scoped external-access key digests, owning conversations, tool grants, expiry and revocation state; not a recoverable list of raw keys |
+| `cache/mcp-manifests/` | Bounded discovery hints for lazy startup; cached tools do not grant permission to execute |
+| `mcp/conversation-events.sqlite` | Restart-safe, bounded conversation event journal and cursor state, with SQLite WAL/SHM sidecars |
+| `logs/mcp/diagnostics.jsonl` | Private, sanitized MCP diagnostics and subprocess stderr, with bounded rotations |
+| `media/mcp/` | Validated binary MCP content saved for rendering as media |
+
+The SSH management endpoint does not create an SSH password store on the
+runtime. SSH credentials and host trust belong to the client; MCP provider OAuth
+tokens stay on the selected runtime. For backups, treat MCP configuration,
+tokens, access state, logs and media as sensitive. Restoring an old access-state
+backup can restore older authorization decisions; file restoration is outside
+the live key-revocation protocol. See [MCP](../features/mcp.md) and
+[Remote MCP setup](../using-flowly/remote-mcp.md).
+
 ## Runtime / IPC files
 
 | File | What it is |

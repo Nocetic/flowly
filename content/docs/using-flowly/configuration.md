@@ -196,6 +196,15 @@ Setting a provider explicitly (`/provider`, `flowly setup`, or `active` in this 
 |---|---|
 | `host` | `"127.0.0.1"` |
 | `port` | `18790` (1–65535) |
+| `token` | `""` — static gateway administration token; the CLI ensures one on a non-loopback bind |
+
+The dedicated `POST /api/mcp/manage` route always requires a valid, non-empty
+gateway token, including through an SSH loopback forward. An empty token may
+retain legacy local behavior on other routes; it never unlocks MCP management.
+The token is not an external-agent MCP access key. SSH passwords and host-key
+verification are client responsibilities, not `gateway` or `mcpServers` settings.
+See [Remote MCP setup](remote-mcp.md) and the
+[management API](../reference/mcp-management-api.md).
 
 ### tools
 

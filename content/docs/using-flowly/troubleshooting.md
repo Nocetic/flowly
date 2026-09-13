@@ -145,6 +145,24 @@ Confirm the channel is `enabled` in config and that access control
 (`allowFrom` / pairing) permits the sender. See the channel's own page under
 [Channels](/docs/channels/overview).
 
+## Remote MCP setup
+
+If remote chat works but connecting an MCP service asks for WSS, the existing
+chat connection may be unencrypted. Switching **Use TLS** on does not install TLS
+on the server. Use a properly configured secure gateway path or a client with
+verified SSH MCP management; see [Remote MCP setup](remote-mcp.md).
+
+SSH login, gateway authentication, and provider OAuth are three separate checks.
+`UNAUTHORIZED` from `/api/mcp/manage` means the gateway token is missing or wrong,
+even if SSH succeeded. A missing route (404) usually means the running gateway is
+old or the client reached the wrong port/path. Update the **selected remote
+installation**, restart its running process, and verify the app supports SSH.
+Do not bypass certificate or host-key verification to hide the error.
+
+For saved-but-disconnected status and provider sign-in failures, use the
+[MCP troubleshooting table](../features/mcp.md#troubleshooting). Completing OAuth
+does not by itself prove the MCP connection or permission review succeeded.
+
 ## Still stuck?
 
 - Check the logs: `flowly service logs` (service mode) or the terminal running
