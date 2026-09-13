@@ -22,6 +22,7 @@ from flowly.bus.events import InboundMessage as _Base
 from flowly.bus.events import OutboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.channels import feature_rpc
+from flowly.agent.subagent_observation import client_event, event_version
 from flowly.channels.base import BaseChannel
 from flowly.config.schema import WebChannelConfig
 from flowly.profile import get_flowly_home
@@ -251,6 +252,10 @@ class WebChannel(BaseChannel):
         self._max_reconnect_delay = 60
         # Track active browser sessions: sessionId → asyncio.Event (response ready)
         self._pending: dict[str, asyncio.Queue] = {}
+        self._subagent_observers: dict[str, float] = {}
+        self._subagent_event_versions: dict[str, int] = {}
+        self._profile_subagent_observers: dict[tuple[str, str], tuple[int, float]] = {}
+        self._profile_subagent_reads: dict[object, str] = {}
         # Map session_key (e.g. "web:FirestoreId") → relay session_id (browser UUID)
         self._session_key_to_relay_id: dict[str, str] = {}
         # Outbound replay queue. When a send fails (transient WS drop, frame
@@ -522,6 +527,7 @@ class WebChannel(BaseChannel):
             self._unbind_profile_conversation(profile, session_key, session_id)
 
     def _clear_profile_subscriptions(self) -> None:
+        self._clear_profile_subagent_observers()
         for session_id in tuple(self._profile_bindings_by_relay):
             self._remove_profile_relay_session(session_id)
         self._profile_directory_sessions.clear()
@@ -575,6 +581,20 @@ class WebChannel(BaseChannel):
         event_type = str(envelope.get("type") or "")
         data = envelope.get("data")
         payload = data if isinstance(data, dict) else {}
+        if event_type.startswith("subagent."):
+            self._prune_profile_subagent_observers(now)
+            if self._ws is None:
+                return
+            async def send_task(session_id: str, version: int) -> None:
+                name, body = client_event(event_type, payload, version)
+                await asyncio.wait_for(self._ws.send(json.dumps({
+                    "type": "event", "event": "profile.event", "sessionId": session_id,
+                    "data": {**envelope, "type": name, "data": body},
+                })), timeout=1)
+            await asyncio.gather(*(send_task(session, version)
+                for (session, candidate), (version, _expiry) in self._profile_subagent_observers.items()
+                if candidate == profile), return_exceptions=True)
+            return
         targets: set[str] = set()
 
         if event_type == "directory":
@@ -654,7 +674,7 @@ class WebChannel(BaseChannel):
         inner_method = ""
         inner_session_key = ""
         if isinstance(params, dict) and method == "profiles.rpc":
-            profile = str(params.get("name") or "")
+            profile = str(params.get("name") or "").strip()
             inner_method = str(params.get("method") or "")
             inner_params = params.get("params")
             try:
@@ -671,6 +691,9 @@ class WebChannel(BaseChannel):
                     profile, inner_session_key, session_id
                 )
 
+        read_token = object()
+        if inner_method in {"subagents.list", "subagents.get"} and session_id and len(self._profile_subagent_reads) < 128:
+            self._profile_subagent_reads[read_token] = session_id
         try:
             result = await host.dispatch(method, params)
         except ProfileHostError as exc:
@@ -695,6 +718,8 @@ class WebChannel(BaseChannel):
             logger.exception("[WebChannel] profile rpc {} failed", method)
             error = {"code": "INTERNAL", "message": "The profile operation failed."}
         else:
+            if self._profile_subagent_reads.get(read_token) == session_id and session_id:
+                self._observe_profile_subagents(session_id, profile, validated_params)
             if (
                 inner_method == "chat.send"
                 and inner_session_key
@@ -713,6 +738,8 @@ class WebChannel(BaseChannel):
                 "result": result,
             }))
             return
+        finally:
+            self._profile_subagent_reads.pop(read_token, None)
 
         await ws.send(json.dumps({
             "type": "rpc",
@@ -765,6 +792,8 @@ class WebChannel(BaseChannel):
     async def stop(self) -> None:
         self._running = False
         self._clear_profile_subscriptions()
+        self._subagent_observers.clear()
+        self._subagent_event_versions.clear()
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -1445,6 +1474,9 @@ class WebChannel(BaseChannel):
             # with the websockets-library 1 MB default.
             max_size=_WS_MAX_SIZE,
         ) as ws:
+            self._subagent_observers.clear()
+            self._subagent_event_versions.clear()
+            self._clear_profile_subagent_observers()
             self._ws = ws
             logger.info("[WebChannel] Connected to relay proxy")
 
@@ -1499,9 +1531,10 @@ class WebChannel(BaseChannel):
                     task.cancel()
                 if pending_long_rpcs:
                     await asyncio.gather(*pending_long_rpcs, return_exceptions=True)
-
-        self._clear_profile_subscriptions()
-        self._ws = None
+                self._clear_profile_subscriptions()
+                self._subagent_observers.clear()
+                self._subagent_event_versions.clear()
+                self._ws = None
 
     async def _serve_media_fetch(self, ws, msg: dict) -> None:
         """Answer one relay-bridged media window request.
@@ -1579,6 +1612,9 @@ class WebChannel(BaseChannel):
             session_id = msg.get("sessionId", "")
             logger.info(f"[WebChannel] Browser disconnected: {session_id}")
             self._pending.pop(session_id, None)
+            self._subagent_observers.pop(session_id, None)
+            self._subagent_event_versions.pop(session_id, None)
+            self._clear_profile_subagent_observers(session_id)
             self._remove_profile_relay_session(session_id)
 
         elif msg_type == "rpc":
@@ -1954,6 +1990,13 @@ class WebChannel(BaseChannel):
                 )
             )
             return
+        if method in {"subagents.list", "subagents.get"} and session_id:
+            now = time.monotonic()
+            self._prune_subagent_observers(now)
+            if session_id in self._subagent_observers or len(self._subagent_observers) < 64:
+                self._subagent_observers[session_id] = now + 120
+                if "eventVersion" in params:
+                    self._subagent_event_versions[session_id] = event_version(params)
         if method == "system.capabilities" and self._profile_host is not None:
             result = {**result, "profileHost": self._profile_host.capabilities()}
         await ws.send(
@@ -1968,6 +2011,59 @@ class WebChannel(BaseChannel):
         )
         if needs_restart:
             self._schedule_feature_restart()
+
+    def _prune_profile_subagent_observers(self, now: float) -> None:
+        for key, (_version, expiry) in tuple(self._profile_subagent_observers.items()):
+            if expiry <= now:
+                self._remove_profile_subagent_observer(key)
+
+    def _remove_profile_subagent_observer(self, key: tuple[str, str]) -> None:
+        if self._profile_subagent_observers.pop(key, None) is not None:
+            session_id, profile = key
+            if profile == "default" and self._profile_host is not None:
+                self._profile_host.release_default_events(self._profile_lease_owner(session_id) + ":subagents")
+
+    def _clear_profile_subagent_observers(self, session_id: str | None = None) -> None:
+        # In-flight profile RPCs can complete after browser-disconnected. They
+        # must not resurrect the subscription that disconnect just removed.
+        self._profile_subagent_reads = {token: reader for token, reader in self._profile_subagent_reads.items()
+                                       if session_id is not None and reader != session_id}
+        for key in tuple(self._profile_subagent_observers):
+            if session_id is None or key[0] == session_id:
+                self._remove_profile_subagent_observer(key)
+
+    def _observe_profile_subagents(self, session_id: str, profile: str, params: dict) -> None:
+        now = time.monotonic()
+        self._prune_profile_subagent_observers(now)
+        key = (session_id, profile)
+        previous = self._profile_subagent_observers.get(key)
+        if previous is None and len(self._profile_subagent_observers) >= 64:
+            return
+        version = event_version(params) if "eventVersion" in params else (previous[0] if previous else 1)
+        self._profile_subagent_observers[key] = (version, now + 120)
+        if previous is None and profile == "default" and self._profile_host is not None:
+            self._profile_host.retain_default_events(self._profile_lease_owner(session_id) + ":subagents")
+
+    def _prune_subagent_observers(self, now: float) -> None:
+        self._subagent_observers = {key: expiry for key, expiry in self._subagent_observers.items() if expiry > now}
+        self._subagent_event_versions = {key: version for key, version in self._subagent_event_versions.items()
+                                        if key in self._subagent_observers}
+
+    async def send_subagent_event(self, event_name: str, data: dict) -> None:
+        """Live updates for successful task-history readers; no offline replay.
+
+        A list/get refresh renews a two-minute lease. Reconnect requires a new
+        snapshot. Routing uses the authenticated browser's relay session only.
+        """
+        if not self._ws:
+            return
+        now = time.monotonic()
+        self._prune_subagent_observers(now)
+        async def send(session_id: str) -> None:
+            name, body = client_event(event_name, data, self._subagent_event_versions.get(session_id, 1))
+            payload = {"type": "event", "event": name, "data": body, "sessionId": session_id}
+            await asyncio.wait_for(self._ws.send(json.dumps(payload)), timeout=1)
+        await asyncio.gather(*(send(key) for key in self._subagent_observers), return_exceptions=True)
 
     def _schedule_feature_restart(self) -> None:
         """Bounce the gateway after the ACK frame has flushed, so a config/

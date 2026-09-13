@@ -82,6 +82,7 @@ class _Harness:
     _request_too_large_response = staticmethod(AgentLoop._request_too_large_response)
     _call_provider_with_context_recovery = AgentLoop._call_provider_with_context_recovery
     is_run_aborted = AgentLoop.is_run_aborted
+    _steering = AgentLoop._steering
 
     def __init__(self, reply: str):
         self.provider = _Provider(reply)

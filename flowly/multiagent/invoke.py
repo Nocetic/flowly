@@ -2,12 +2,12 @@
 
 import asyncio
 import json
+import os
+import signal
 from pathlib import Path
 
-from loguru import logger
-
 from flowly.config.schema import MultiAgentConfig
-
+from loguru import logger
 
 # CLI install hints for error messages
 INSTALL_HINTS = {
@@ -51,7 +51,9 @@ def parse_codex_jsonl(output: str) -> str:
                 response = data["item"].get("text", "")
         except (json.JSONDecodeError, KeyError):
             continue
-    return response or "Sorry, I could not generate a response."
+    if not response.strip():
+        raise RuntimeError("The delegated task produced no final response")
+    return response
 
 
 def _build_system_context(agent_id: str, workspace_path: Path) -> str:
@@ -186,6 +188,7 @@ async def run_subprocess(
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=(os.name == "posix"),
         )
     except FileNotFoundError:
         cmd = args[0]
@@ -194,9 +197,20 @@ async def run_subprocess(
 
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        raise RuntimeError(f"Agent subprocess timed out after {timeout}s")
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        # The subprocess owns a session on POSIX: stop descendants as well,
+        # then reap the direct child before acknowledging cancellation.
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise RuntimeError(f"Agent subprocess timed out after {timeout}s") from exc
 
     if proc.returncode != 0:
         error_msg = stderr.decode().strip() or f"Process exited with code {proc.returncode}"

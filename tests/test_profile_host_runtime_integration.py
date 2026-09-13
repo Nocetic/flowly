@@ -52,6 +52,16 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
         result = await host.rpc("writer", "sessions.list", {})
         assert result == {"sessions": []}
 
+        # Exercise the actual child process's feature handlers and allowlist,
+        # rather than a permissive mock of profiles.rpc.
+        history = await host.rpc("writer", "subagents.list", {"eventVersion": 2})
+        assert history["schemaVersion"] == 2
+        assert history["tasks"] == []
+        for method in ("subagents.get", "subagents.result"):
+            with pytest.raises(ProfileHostError) as missing:
+                await host.rpc("writer", method, {"runId": "missing"})
+            assert missing.value.code == "NOT_FOUND"
+
         writer = next(item for item in (await host.list())["profiles"] if item["name"] == "writer")
         identity = {"expected_host_id": host.host_id, "expected_bot_id": writer["botId"]}
         capability = await host.rpc("writer", "mcp.capabilities", {}, **identity)

@@ -20,6 +20,7 @@ def profile_roots(tmp_path, monkeypatch: pytest.MonkeyPatch):
     root = default / "profiles"
     monkeypatch.setattr(profiles, "_DEFAULT_HOME", default)
     monkeypatch.setattr(profiles, "_PROFILES_ROOT", root)
+    monkeypatch.setenv("FLOWLY_HOME", str(default))
     default.mkdir(parents=True)
     (default / "workspace").mkdir()
     return default, root

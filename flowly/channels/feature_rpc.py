@@ -3676,59 +3676,127 @@ def gmail_set_credentials(params: dict) -> dict:
     return {"ok": True, "willRestart": True}
 
 
-def subagents_list(params: dict) -> dict:
-    """Background subagent tasks for the live agent — running + recent.
-
-    Registered in FEATURE_METHODS so a single shape serves BOTH relay and
-    gateway (the gateway's legacy ``_ws_rpc_subagents_list`` is shadowed by this
-    one). The user-facing ``label`` is always the task-derived ``display_name``
-    (never an internal key like ``builtin:researcher``).
-
-    Params: ``{"status": "running"|"completed"|"failed"|<all>}`` (optional).
-    Returns ``{"tasks": [{runId, label, task, model, status, duration,
-    createdAt, endedAt, error, parentSessionKey}]}`` — newest first.
-    """
-    import time as _time
-
-    reg = _registry()
-    if reg is None:
-        return {"tasks": []}
+def _subagent_registry():
+    registry = _registry()
+    if registry is None:
+        raise FeatureRpcError("UNAVAILABLE", "Task history is unavailable")
     try:
-        reg._load_from_disk()  # pick up runs spawned since the last read
-    except Exception:
-        pass
+        registry._load_from_disk()
+    except Exception as exc:
+        raise FeatureRpcError("UNAVAILABLE", "Task history could not be read") from exc
+    return registry
 
-    records = reg.all()
-    status_filter = (params or {}).get("status")
-    if status_filter == "running":
-        records = [r for r in records if r.ended_at is None]
-    elif status_filter == "completed":
-        records = [r for r in records if r.outcome == "ok"]
-    elif status_filter == "failed":
-        records = [r for r in records if r.outcome in ("error", "timeout")]
 
-    tasks = []
-    for r in sorted(records, key=lambda x: x.created_at, reverse=True):
-        duration = None
-        if r.started_at and r.ended_at:
-            duration = round(r.ended_at - r.started_at, 1)
-        elif r.started_at:
-            duration = round(_time.time() - r.started_at, 1)
-        tasks.append(
-            {
-                "runId": r.run_id,
-                "label": getattr(r, "display_name", "") or r.label,
-                "task": r.task,
-                "model": r.model,
-                "status": "running" if r.ended_at is None else (r.outcome or "unknown"),
-                "duration": duration,
-                "createdAt": r.created_at,
-                "endedAt": r.ended_at,
-                "error": r.error,
-                "parentSessionKey": r.parent_session_key,
-            }
-        )
-    return {"tasks": tasks}
+def _subagent_record(params: dict, *, allow_prefix: bool = False):
+    run_id = params.get("runId")
+    if not isinstance(run_id, str) or not run_id or len(run_id) > 200:
+        raise FeatureRpcError("INVALID", "runId is required")
+    registry = _subagent_registry()
+    record = registry.get(run_id)
+    if record is None and allow_prefix:
+        matches = [r for r in registry.all() if r.run_id.startswith(run_id)]
+        if len(matches) > 1:
+            raise FeatureRpcError("CONFLICT", "Task ID is ambiguous")
+        record = matches[0] if matches else None
+    if record is None:
+        raise FeatureRpcError("NOT_FOUND", "Task not found")
+    return registry, record
+
+
+def subagents_list(params: dict) -> dict:
+    """Versioned full snapshot by default; optional stable cursor pagination."""
+    import base64
+    import math
+
+    from flowly.agent.subagent_observation import run_view
+
+    _validate_subagent_event_version(params)
+
+    records = _subagent_registry().all()
+    status = params.get("status")
+    filters = {
+        "running": lambda r: r.ended_at is None,
+        "completed": lambda r: r.outcome == "ok",
+        "failed": lambda r: r.outcome in ("error", "timeout"),
+        "stopped": lambda r: r.outcome in ("cancelled", "interrupted"),
+    }
+    if status not in (None, "all", *filters):
+        raise FeatureRpcError("INVALID", "Invalid task status")
+    counts = {name: sum(predicate(r) for r in records) for name, predicate in filters.items()}
+    if status in filters:
+        records = [r for r in records if filters[status](r)]
+    records.sort(key=lambda r: (r.created_at, r.run_id), reverse=True)
+    cursor = params.get("cursor")
+    if cursor is not None:
+        try:
+            if not isinstance(cursor, str) or len(cursor) > 1024:
+                raise ValueError()
+            created_at, run_id = json.loads(base64.urlsafe_b64decode(cursor))
+            if type(created_at) not in (int, float) or not math.isfinite(created_at) or not isinstance(run_id, str):
+                raise ValueError()
+            records = [r for r in records if (r.created_at, r.run_id) < (created_at, run_id)]
+        except Exception as exc:
+            raise FeatureRpcError("INVALID", "Invalid task cursor") from exc
+    limit = params.get("limit")
+    if limit is not None and (type(limit) is not int or not 1 <= limit <= 200):
+        raise FeatureRpcError("INVALID", "limit must be between 1 and 200")
+    page = records if limit is None else records[:limit]
+    next_cursor = None
+    if page and len(page) < len(records):
+        last = page[-1]
+        next_cursor = base64.urlsafe_b64encode(json.dumps([last.created_at, last.run_id]).encode()).decode()
+    return {"schemaVersion": 2, "tasks": [run_view(r) for r in page],
+            "counts": counts, "nextCursor": next_cursor}
+
+
+def subagents_get(params: dict) -> dict:
+    from flowly.agent.subagent_observation import run_view
+    _validate_subagent_event_version(params)
+    _, record = _subagent_record(params)
+    return {"schemaVersion": 2, "task": run_view(record, detail=True)}
+
+
+def _validate_subagent_event_version(params: dict) -> None:
+    from flowly.agent.subagent_observation import event_version
+    try:
+        event_version(params)
+    except ValueError as exc:
+        raise FeatureRpcError("INVALID", str(exc)) from exc
+
+
+def subagents_result(params: dict) -> dict:
+    registry, record = _subagent_record(params)
+    try:
+        return registry.read_result(record.run_id, params.get("offset", 0), params.get("limit", 32000))
+    except ValueError as exc:
+        raise FeatureRpcError("INVALID", str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise FeatureRpcError("NOT_FOUND", "No saved result is available for this task") from exc
+    except OSError as exc:
+        raise FeatureRpcError("UNAVAILABLE", "The task result could not be read") from exc
+
+
+async def subagents_cancel(params: dict) -> dict:
+    _, record = _subagent_record(params, allow_prefix=True)
+    if record.ended_at is not None:
+        return {"ok": True, "runId": record.run_id, "run_id": record.run_id[:8], "status": record.outcome}
+    manager = _subagent_manager()
+    if record.kind == "delegate":
+        manager = _subagent_delegate_provider() if _subagent_delegate_provider else None
+    if manager is None:
+        raise FeatureRpcError("UNAVAILABLE", "This task cannot be stopped here")
+    result = json.loads(await manager.cancel(record.run_id))
+    if result.get("status") == "error":
+        raise FeatureRpcError("CONFLICT", result.get("error", "Task state changed"))
+    return {"ok": True, "runId": record.run_id, "run_id": record.run_id[:8], "status": record.outcome or result.get("status")}
+
+
+_subagent_delegate_provider = None
+
+
+def set_subagent_delegate_provider(provider) -> None:
+    global _subagent_delegate_provider
+    _subagent_delegate_provider = provider
 
 
 def subagents_assistants(params: dict) -> dict:
@@ -4619,6 +4687,9 @@ _DISPATCH: dict[str, tuple] = {
     "board.snapshot": (board_snapshot, False, False),
     "board.action": (board_action, True, False),
     "subagents.list": (subagents_list, True, False),
+    "subagents.get": (subagents_get, True, False),
+    "subagents.result": (subagents_result, True, False),
+    "subagents.cancel": (subagents_cancel, True, False),
     "subagents.assistants": (subagents_assistants, True, False),
     "subagents.set_model": (subagents_set_model, True, False),
     "subagents.spawn": (subagents_spawn, True, False),
