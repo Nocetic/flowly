@@ -21,9 +21,11 @@ import flowly.mcp.client as client
 def clean_breaker():
     client._server_error_counts.clear()
     client._server_breaker_opened_at.clear()
+    client._server_breaker_probe_inflight.clear()
     yield
     client._server_error_counts.clear()
     client._server_breaker_opened_at.clear()
+    client._server_breaker_probe_inflight.clear()
 
 
 def test_below_threshold_no_block():
@@ -41,7 +43,7 @@ def test_at_threshold_blocks(monkeypatch):
         client._bump_server_error("srv")
     reason = client.circuit_breaker_block_reason("srv")
     assert reason is not None
-    assert "unreachable" in reason
+    assert "temporarily paused" in reason
     assert "srv" in reason
 
 

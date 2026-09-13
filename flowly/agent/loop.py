@@ -391,6 +391,16 @@ def _browser_tool_result_failed(effective_tool_name: str, tool_result: str) -> b
     return bool(parsed.get("error") or parsed.get("error_code"))
 
 
+def _tool_result_failed(effective_tool_name: str, tool_result: str) -> bool:
+    from flowly.agent.tool_result_status import mcp_tool_result_failed
+
+    return (
+        tool_result.startswith("Error")
+        or _browser_tool_result_failed(effective_tool_name, tool_result)
+        or mcp_tool_result_failed(effective_tool_name, tool_result)
+    )
+
+
 def _messages_contain_image_input(messages: list[dict[str, Any]]) -> bool:
     """Detect OpenAI-compatible image blocks without inspecting image data."""
     for message in messages:
@@ -6651,14 +6661,9 @@ class AgentLoop:
                                         reply_media_assets.append(_asset)
                                         _known.add(_asset.path)
                             _tool_result = _attach_summary
-                        _tool_success = not _tool_result.startswith("Error")
-                        # Browser errors ride inside an {"error": ...} JSON
-                        # envelope that doesn't start with "Error"; catch it so a
-                        # failed page action isn't counted as a completed step.
-                        if _tool_success and _browser_tool_result_failed(
-                            _effective_tool_name, _tool_result
-                        ):
-                            _tool_success = False
+                        # JSON MCP/browser errors must not count as completed
+                        # work in turn summaries, logs, or UI tool status.
+                        _tool_success = not _tool_result_failed(_effective_tool_name, _tool_result)
                         accumulated_tool_results.append({
                             "tool": _effective_tool_name,
                             "success": _tool_success,

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
+from flowly.agent.tool_result_status import mcp_tool_result_failed
 from flowly.agent.tools.base import Tool
 from flowly.agent.tools.routing import infer_toolset
 
@@ -786,7 +787,7 @@ class ToolRegistry:
         if self._hooks and ctx is not None:
             ctx.result = result
             ctx.duration_ms = (time.monotonic() - t0) * 1000
-            ctx.success = not result.startswith("Error")
+            ctx.success = not result.startswith("Error") and not mcp_tool_result_failed(name, result)
             await self._hooks.fire_post_tool(ctx)
             transformed = await self._hooks.fire_transform_tool_result(ctx)
             if transformed is not None:

@@ -159,11 +159,12 @@ _starting: dict[str, _Startup] = {}
 # Circuit breaker (T10)
 # ---------------------------------------------------------------------------
 #
-# After a server racks up N consecutive failed tool calls we "open" the
+# After N consecutive connection/timeout/service-availability failures we open the
 # breaker: further calls short-circuit with a clear message so the model
-# stops hammering a dead server and tries another approach. After the
+# stops hammering an unavailable service and tries another approach. After the
 # cooldown elapses the breaker is half-open — the next call goes through
-# as a probe; success resets it, failure re-arms the cooldown.
+# as a probe; a response (including tool errors) resets it, while another
+# availability failure re-arms the cooldown.
 
 _CIRCUIT_BREAKER_THRESHOLD = 5
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
@@ -222,8 +223,8 @@ def circuit_breaker_block_reason(server_name: str) -> str | None:
             return None  # half-open: allow exactly one probe
         remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
     return (
-        f"MCP server '{server_name}' is unreachable after {count} consecutive "
-        f"failures. Auto-retry available in ~{remaining}s. Do NOT retry this "
+        f"MCP server '{server_name}' calls are temporarily paused after {count} consecutive "
+        f"connection, timeout, or service-availability failures. Retry available in ~{remaining}s. Do NOT retry this "
         f"tool yet — use a different approach or ask the user to check the "
         f"MCP server."
     )
