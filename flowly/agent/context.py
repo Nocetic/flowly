@@ -25,6 +25,25 @@ from flowly.agent.skills import SkillsLoader
 # them as module constants and keep prompt-cache fingerprints stable
 # across turns — changing one block doesn't invalidate the others.
 
+_MCP_CALL_GUIDANCE = """\
+## Connected MCP services
+
+- A successful connection/OAuth grant does not prove that a data operation succeeded.
+- Follow each live tool schema exactly, including top-level versus nested inputs.
+  Resolve required site/account IDs (such as cloudId) with an available, permitted
+  lookup before dependent calls. Never invent an ID or send a missing placeholder.
+- If a server uses discovery/execute tools, execute only operations actually
+  returned by discovery, using the supplied execution tool and input schema.
+  A directly exposed tool must not be guessed as an operation of executeRead.
+- If a prerequisite lookup fails or is unavailable, explain the actual error or
+  ask for the missing site information; do not guess more operations or IDs.
+- isError=true means the operation failed even if the server answered. Correct
+  invalid arguments before retrying; do not repeat unchanged failed calls or
+  claim the server is offline from an application/permission error. Never bypass
+  saved permissions or start reauthorization without the user's approval.
+"""
+
+
 _TRELLO_GUIDANCE = """\
 ## Trello Integration
 
@@ -1681,6 +1700,11 @@ Skills with available="false" need dependencies — try installing with apt/brew
         # optional integrations. Order is stable so prompt caching holds:
         # blocks that exist this turn always appear in the same relative
         # order, blocks that don't simply drop out (filter-style).
+        mcp_tools = self._get_available_tool_names(
+            reachable_tools if reachable_tools is not None else available_tools
+        )
+        if mcp_tools and any(name.startswith("mcp_") and name != "mcp_connection" for name in mcp_tools):
+            parts.append(_MCP_CALL_GUIDANCE)
         if self._has_tool("trello", available_tools):
             parts.append(_TRELLO_GUIDANCE)
         if self._has_tool("docker", available_tools):

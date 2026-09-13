@@ -184,6 +184,12 @@ def is_transport_failure(exc: BaseException) -> bool:
             and getattr(error, "message", "") == "Session terminated"
         ):
             return True
+        # Explicit protocol/HTTP responses are not broken transports. Their
+        # message may quote user arguments containing words like "stream closed".
+        if isinstance(getattr(error, "code", None), int):
+            continue
+        if isinstance(getattr(getattr(leaf, "response", None), "status_code", None), int):
+            continue
         if isinstance(
             leaf,
             (
@@ -199,5 +205,23 @@ def is_transport_failure(exc: BaseException) -> bool:
             return True
         message = str(leaf).lower()
         if any(marker in message for marker in _TRANSPORT_ERROR_MARKERS):
+            return True
+    return False
+
+
+def is_availability_failure(exc: BaseException) -> bool:
+    """Count transport/timeouts and explicit transient HTTP availability errors.
+
+    Tool execution errors are responses, not evidence of an unreachable server.
+    In particular, invalid arguments and authentication/permission responses
+    must leave unrelated tools on the same server usable.
+    """
+    for leaf in _exception_leaves(exc):
+        status = getattr(getattr(leaf, "response", None), "status_code", None)
+        if isinstance(status, int):
+            if status == 429 or 500 <= status <= 599:
+                return True
+            continue
+        if isinstance(leaf, TimeoutError) or is_transport_failure(leaf):
             return True
     return False

@@ -31,6 +31,7 @@ from contextlib import AsyncExitStack
 from typing import Any
 
 from flowly.agent.tools.base import Tool
+from flowly.mcp.arguments import argument_issue, input_validator
 from flowly.mcp.content import (
     mcp_attr,
     mcp_wire_value,
@@ -62,7 +63,7 @@ async def _run_on_mcp_loop(
     """Schedule ``coro_factory(session)`` on the MCP loop, return its string.
 
     Handles loop/session presence checks, cross-thread scheduling,
-    circuit-breaker accounting (success resets, failure bumps), interrupt
+    circuit-breaker accounting (responses reset, availability failures bump), interrupt
     translation, timeout, and credential-sanitized error envelopes.
     Shared by :class:`MCPTool` and the resource/prompt utility tools.
     """
@@ -132,7 +133,7 @@ async def _run_on_mcp_loop(
         # has died. Wake the connection supervisor immediately instead of
         # waiting for the next keepalive. Application/protocol errors are
         # deliberately excluded so a bad argument never churns the session.
-        from flowly.mcp.lifecycle import is_transport_failure
+        from flowly.mcp.lifecycle import is_availability_failure, is_transport_failure
 
         if is_transport_failure(exc):
             loop.call_soon_threadsafe(
@@ -140,28 +141,20 @@ async def _run_on_mcp_loop(
                 exc,
                 session,
             )
-        _bump_server_error(server_name)
+        if is_availability_failure(exc):
+            _bump_server_error(server_name)
+        else:
+            _reset_server_error(server_name)
         detail = exception_diagnostic(exc, secrets=diagnostic_secrets(getattr(server_task, "_config", None)))
         logger.error("MCP tool %s call failed: %s", sanitize_error(tool_name, limit=200), detail)
         return _error_envelope(
             sanitize_error(f"MCP call failed: {type(exc).__name__}: {detail}")
         )
 
-    # Success path: only OUR error envelope (exactly ``{"error": ...}``)
-    # counts as a server-side failure for the breaker. A tool that
-    # legitimately returns data containing an ``error`` key alongside
-    # other fields is a healthy call and must not trip the breaker.
-    try:
-        parsed = json.loads(result)
-        is_error_envelope = isinstance(parsed, dict) and (
-            set(parsed.keys()) == {"error"} or parsed.get("isError") is True
-        )
-    except (json.JSONDecodeError, TypeError):
-        is_error_envelope = False
-    if is_error_envelope:
-        _bump_server_error(server_name)
-    else:
-        _reset_server_error(server_name)
+    # Even isError=True is a completed MCP response: the service is reachable.
+    # Preserve that error for the caller without blocking other tools or a
+    # corrected request. This also completes a half-open recovery probe.
+    _reset_server_error(server_name)
     return result
 
 
@@ -191,6 +184,7 @@ class MCPTool(Tool):
             mcp_attr(remote_tool, "input_schema", "inputSchema")
         )
         self._raw_parameters = mcp_wire_value(mcp_attr(remote_tool, "input_schema", "inputSchema"))
+        self._input_validator = input_validator(self._raw_parameters)
         self.title = getattr(remote_tool, "title", None)
         self.output_schema = mcp_wire_value(mcp_attr(remote_tool, "output_schema", "outputSchema"))
         self.annotations = mcp_wire_value(getattr(remote_tool, "annotations", None))
@@ -237,6 +231,24 @@ class MCPTool(Tool):
             MCPCallInterrupted,
             circuit_breaker_block_reason,
         )
+
+        # Validate the original wire schema, not the lossy provider-facing
+        # normalization. Invalid calls must not wake a connection, ask for
+        # consent, or reserve a half-open recovery probe.
+        issue = argument_issue(self._input_validator, kwargs)
+        if issue is not None:
+            code, message = issue
+            return json.dumps(
+                {
+                    "error": sanitize_error(
+                        message,
+                        secrets=diagnostic_secrets(getattr(self._server_task, "_config", None)),
+                    ),
+                    "code": code,
+                    "isError": True,
+                },
+                ensure_ascii=False,
+            )
 
         # Consent precedes all transport work, including waking idle servers.
         config = getattr(self._server_task, "_config", {})

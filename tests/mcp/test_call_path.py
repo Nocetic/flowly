@@ -140,32 +140,29 @@ def test_image_result_emits_media_tag(tmp_path, isolated_home):
     assert cached, "expected a cached PNG under media/mcp/"
 
 
-def test_breaker_opens_after_repeated_failures(tmp_path, isolated_home):
+def test_tool_errors_do_not_open_connection_breaker(tmp_path, isolated_home):
     import flowly.mcp.client as client
 
     reg = _discover(tmp_path, isolated_home)
     boom = reg.tools["mcp_img_boom"]
 
-    # Drive failures up to threshold.
-    for _ in range(client._CIRCUIT_BREAKER_THRESHOLD):
+    # The peer replies with isError=True, so it is not unreachable.
+    for _ in range(client._CIRCUIT_BREAKER_THRESHOLD + 1):
         out = json.loads(asyncio.run(boom.execute()))
         assert "error" in out
-
-    # Next call is short-circuited by the open breaker.
-    out = json.loads(asyncio.run(boom.execute()))
-    assert "unreachable" in out["error"]
+        assert out["isError"] is True
+    assert client.circuit_breaker_block_reason("img") is None
 
 
 def test_breaker_resets_on_success(tmp_path, isolated_home):
     import flowly.mcp.client as client
 
     reg = _discover(tmp_path, isolated_home)
-    boom = reg.tools["mcp_img_boom"]
     shot = reg.tools["mcp_img_shot"]
 
-    # A few failures (below threshold), then a success must reset.
+    # Connection failures (below threshold), then a real response resets.
     for _ in range(client._CIRCUIT_BREAKER_THRESHOLD - 1):
-        asyncio.run(boom.execute())
+        client._bump_server_error("img")
     assert client._server_error_counts.get("img", 0) > 0
 
     asyncio.run(shot.execute())
@@ -174,8 +171,8 @@ def test_breaker_resets_on_success(tmp_path, isolated_home):
 
 def test_legit_error_keyed_data_does_not_trip_breaker(tmp_path, isolated_home):
     # A tool returning data that contains an 'error' key is a HEALTHY
-    # call — our envelope wraps it under "result", so it must not bump
-    # the breaker (Fix 4: only an exact {"error": ...} envelope counts).
+    # call — our envelope wraps it under "result", preserving the data
+    # without treating it as a failed operation or connection failure.
     import flowly.mcp.client as client
 
     reg = _discover(tmp_path, isolated_home)
