@@ -32,6 +32,7 @@ from flowly.agent.tools.shell import ExecTool
 from flowly.exec.types import ExecConfig
 from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
+from flowly.agent.subagent_observation import TaskEvents, run_view
 from flowly.agent.subagent_announce_queue import AnnounceItem, get_or_create_queue
 
 
@@ -345,6 +346,8 @@ class SubagentManager:
         self._recent_completed_dispatches: dict[str, list[dict[str, Any]]] = {}
         self._dispatch_history_cap_per_session = 20
         self._on_event = on_event  # async callback(event_name, data)
+        self._events = TaskEvents(self._deliver_event)
+        self._cancel_outcomes: dict[str, str] = {}
         self._state_dir = state_dir or (workspace / ".flowly_state")
         self._web_search_proxy_url = web_search_proxy_url
         self._web_search_server_id = web_search_server_id
@@ -473,17 +476,21 @@ class SubagentManager:
 
     def resume_pending(self) -> None:
         """Called on startup: announce any tasks that were running when process crashed."""
-        pending = self._registry.pending()
+        try:
+            pending = self._registry.pending()
+        except (OSError, ValueError):
+            logger.exception("Subagent history recovery unavailable")
+            return
         if not pending:
             return
         logger.warning(f"[SubagentManager] Found {len(pending)} pending task(s) from previous run — marking as failed")
         for record in pending:
-            self._registry.update(
-                record.run_id,
-                ended_at=time.time(),
-                outcome="error",
+            self._registry.finish(
+                record.run_id, "error", error_code="process_restarted",
                 error="Process restarted before task completed",
             )
+            if record.delivery_state == "not_required":
+                continue
             # Track recovery announce tasks (audit: was fire-and-forget)
             task = asyncio.create_task(
                 self._announce(record.run_id, "The process restarted before this task completed.", "error")
@@ -575,57 +582,48 @@ class SubagentManager:
             model=resolved_model,
             cleanup=cleanup,
             created_at=time.time(),
+            activity={"phase": "queued"},
+            delivery_state="not_required" if wait or silent else "pending",
         )
         self._registry.register(record)
 
         logger.info(f"[SubagentManager] Spawned [{run_id[:8]}]: {resolved_display}")
 
-        # Broadcast event to connected clients
-        if self._on_event:
-            try:
-                asyncio.ensure_future(self._on_event("subagent.started", {
-                    "runId": run_id[:8],
-                    "label": resolved_display,
-                    "task": task[:200],
-                    "model": resolved_model,
-                }))
-            except Exception:
-                pass
-
-        if wait:
-            # Sync mode — inline execution. Returns the child's final
-            # response text directly so the parent (typically a cron run)
-            # can aggregate it into the same turn instead of waiting for
-            # an async announcement that arrives on a later session turn.
-            return await self._run_subagent(
-                run_id, task, display_label, origin_channel, origin_chat_id,
-                resolved_model, timeout_seconds, skip_announce=True,
-                assistant=assistant,
-            )
-
-        # Fire-and-forget default — background task, result announced
-        # to the parent session via _announce when it completes.
-        # silent=True (self-review) skips the announce: the child still
-        # runs and does its work (memory_append / KG writes), but no
-        # system message is pushed to the parent session — avoids a
-        # parent LLM turn triggered just to paraphrase "review done".
+        await self._emit_event("subagent.started", run_id, resolved_display, "running")
         bg_task = asyncio.create_task(
             self._run_subagent(run_id, task, display_label, origin_channel, origin_chat_id,
                                resolved_model, timeout_seconds, assistant=assistant,
-                               skip_announce=silent)
+                               skip_announce=wait or silent)
         )
         self._running_tasks[run_id] = bg_task
         self._children_by_parent.setdefault(parent_session_key, set()).add(run_id)
 
-        def _cleanup(_task: asyncio.Task[None], _rid: str = run_id, _pk: str = parent_session_key) -> None:
-            self._running_tasks.pop(_rid, None)
-            siblings = self._children_by_parent.get(_pk)
-            if siblings is not None:
-                siblings.discard(_rid)
-                if not siblings:
-                    self._children_by_parent.pop(_pk, None)
+        def _cleanup(_task: asyncio.Task, _rid: str = run_id, _pk: str = parent_session_key) -> None:
+            try:
+                # A task cancelled before its first instruction has no handler.
+                rec = self._registry.get(_rid)
+                if rec and rec.ended_at is None:
+                    outcome = self._cancel_outcomes.get(_rid, "interrupted") if _task.cancelled() else "error"
+                    self._registry.finish(_rid, outcome,
+                                          error_code="cancelled" if _task.cancelled() else "worker_failed",
+                                          error="Task interrupted" if _task.cancelled() else "Task could not finish")
+                    self._publish_event("subagent.completed", _rid)
+            except Exception:
+                logger.exception("Could not persist task cleanup")
+            finally:
+                if not _task.cancelled():
+                    _task.exception()
+                self._cancel_outcomes.pop(_rid, None)
+                self._running_tasks.pop(_rid, None)
+                siblings = self._children_by_parent.get(_pk)
+                if siblings is not None:
+                    siblings.discard(_rid)
+                    if not siblings:
+                        self._children_by_parent.pop(_pk, None)
 
         bg_task.add_done_callback(_cleanup)
+        if wait:
+            return await bg_task
 
         # Async dispatch envelope. The wording here is load-bearing —
         # earlier versions said only "Background task started. I'll
@@ -688,6 +686,7 @@ class SubagentManager:
         self._registry.update(run_id, started_at=time.time())
 
         async def _do_run() -> tuple[str, bool, list[dict[str, Any]]]:
+            nonlocal status, error_str, error_code
             # Subagent tool registry — factory lookup + assistant-level
             # allowlist. SubagentToolRegistry still refuses blocked names
             # (spawn, delegate_to, cron, message, …) on register so a
@@ -817,7 +816,7 @@ class SubagentManager:
             # (args_bytes / result_bytes / status / duration_ms) so the
             # parent LLM and registry audit know exactly what happened —
             # not just which tools fired.
-            _tool_trace: list[dict[str, Any]] = []
+            _tool_trace = tool_trace
             _consecutive_errors = 0  # Global error counter (not per-iteration)
             _MAX_CONSECUTIVE_ERRORS = 3
             # Context overflow gets one rescue attempt per run. Beyond that the
@@ -855,6 +854,7 @@ class SubagentManager:
 
             while iteration < max_iterations:
                 iteration += 1
+                await self._progress(run_id, {"phase": "thinking", "iteration": iteration})
                 _heartbeat(
                     f"subagent {label}: iteration {iteration}/{max_iterations}",
                     None,
@@ -1016,6 +1016,13 @@ class SubagentManager:
                         )
                         _tool_t0 = time.monotonic()
                         _tool_status = "ok"
+                        step = {"tool": effective_tool_name, "args_bytes": len(json.dumps(tool_args or {}).encode()),
+                                "result_bytes": 0, "status": "running", "duration_ms": 0,
+                                "started_at": time.time()}
+                        _tool_trace.append(step)
+                        self._registry.update(run_id, tool_trace=_tool_trace)
+                        await self._progress(run_id, {"phase": "tool", "tool": effective_tool_name,
+                                                      "iteration": iteration})
                         try:
                             if (
                                 effective_tool_name == "artifact"
@@ -1046,13 +1053,18 @@ class SubagentManager:
                         # (common for validation-level failures).
                         if _tool_status == "ok" and result.startswith("Error"):
                             _tool_status = "error"
-                        _tool_trace.append({
-                            "tool": effective_tool_name,
-                            "args_bytes": len(json.dumps(tool_args or {})),
-                            "result_bytes": len(result),
-                            "status": _tool_status,
-                            "duration_ms": _tool_duration_ms,
-                        })
+                        step.update(result_bytes=len(result.encode()), status=_tool_status,
+                                    duration_ms=_tool_duration_ms, ended_at=time.time())
+                        self._registry.update(run_id, tool_trace=_tool_trace)
+                        if effective_tool_name == "artifact" and _tool_status == "ok":
+                            try:
+                                payload = json.loads(result)
+                                artifact_id = payload.get("id") if isinstance(payload, dict) else None
+                                if isinstance(artifact_id, str):
+                                    self._link_artifact(run_id, artifact_id)
+                            except (TypeError, ValueError):
+                                pass
+                        await self._progress(run_id, {"phase": "thinking", "iteration": iteration})
                         # Truncate long tool results to prevent context bloat
                         if len(result) > 4000:
                             result = result[:4000] + f"\n[... truncated from {len(result)} chars]"
@@ -1146,6 +1158,7 @@ class SubagentManager:
                                 # a parent-agent result. Unknown terminal kinds
                                 # get stable product copy; raw detail stays logged.
                                 final_result = "Error: The model provider couldn't respond."
+                            status, error_str, error_code = "error", final_result, _category.value
                             break
 
                         if _consecutive_errors <= _MAX_CONSECUTIVE_ERRORS and iteration < max_iterations:
@@ -1155,6 +1168,8 @@ class SubagentManager:
                                 f"iteration {iteration}, backoff {_delay:.1f}s: "
                                 f"{_err_snippet}"
                             )
+                            await self._progress(run_id, {"phase": "retrying", "attempt": _consecutive_errors,
+                                                          "errorCode": _category.value})
                             await asyncio.sleep(_delay)
                             continue
                         else:
@@ -1163,6 +1178,7 @@ class SubagentManager:
                                 f"({_consecutive_errors} consecutive, last={_category.value})"
                             )
                             final_result = f"Error: Task failed after {_consecutive_errors} consecutive LLM errors."
+                            status, error_str, error_code = "error", final_result, _category.value
                             break
 
                     # Empty response check
@@ -1170,7 +1186,8 @@ class SubagentManager:
                         logger.warning(f"[SubagentManager] [{run_id[:8]}] empty response on iteration {iteration}")
                         if iteration < max_iterations:
                             continue  # Retry
-                        final_result = "Task completed but produced no output."
+                        final_result = "Task produced no output."
+                        status, error_str, error_code = "error", final_result, "empty_response"
                         break
 
                     # Successful response — reset error counter
@@ -1213,6 +1230,7 @@ class SubagentManager:
                     ),
                 })
                 _heartbeat(f"subagent {label}: generating summary", None)
+                await self._progress(run_id, {"phase": "summarizing"})
                 _preserved = final_result  # None for max-iter, error string for llm-errors
                 try:
                     summary_response = await self.provider.chat(
@@ -1222,9 +1240,11 @@ class SubagentManager:
                         max_tokens=4096,
                         timeout=60,
                     )
-                    if summary_response.content and summary_response.content.strip():
+                    if summary_response.finish_reason != "error" and summary_response.content and summary_response.content.strip():
                         final_result = summary_response.content
+                        status, error_str, error_code = "ok", None, None
                     elif _hit_max_iter:
+                        status, error_code = "error", "summary_failed"
                         final_result = (
                             f"Reached the iteration limit ({max_iterations}) "
                             "but the summary response was empty."
@@ -1235,9 +1255,10 @@ class SubagentManager:
                         f"[SubagentManager] [{run_id[:8]}] summary grace-call failed: {e}"
                     )
                     if _hit_max_iter:
+                        status, error_code = "error", "summary_failed"
                         final_result = (
                             f"Reached the iteration limit ({max_iterations}) "
-                            f"and the summary attempt failed: {e}"
+                            "and the summary attempt failed."
                         )
                     # _hit_llm_errors + grace-call failed → keep _preserved error
                     else:
@@ -1257,6 +1278,7 @@ class SubagentManager:
         final_result: str = ""
         status: str = "ok"
         error_str: str | None = None
+        error_code: str | None = None
         tool_trace: list[dict[str, Any]] = []
 
         # Artifact save is OPT-IN. Driven solely by
@@ -1282,6 +1304,8 @@ class SubagentManager:
             else:
                 final_result, model_used_artifact, tool_trace = await _do_run()
 
+            durable_result = final_result
+
             # Assistant-opt-in auto-save. Skip if the model already used
             # the artifact tool itself (prevents duplicates) or if the
             # result is an error message.
@@ -1296,6 +1320,7 @@ class SubagentManager:
                     session_key=f"{origin_channel}:{origin_chat_id}",
                 )
                 if artifact_id:
+                    self._link_artifact(run_id, artifact_id)
                     final_result = (
                         f"{final_result}\n\n"
                         f"[Result saved as artifact: {artifact_id}]"
@@ -1346,6 +1371,7 @@ class SubagentManager:
                         session_key=f"{origin_channel}:{origin_chat_id}",
                     )
                 if artifact_id_for_cap:
+                    self._link_artifact(run_id, artifact_id_for_cap)
                     _total = len(final_result)
                     _preview, _has_more = generate_preview(final_result)
                     final_result = build_persisted_output_message(
@@ -1366,7 +1392,7 @@ class SubagentManager:
             # — that's not an exception, so without this check the registry
             # would record outcome="ok" even when every LLM call hit a 504
             # and the parent receives a bare error string.
-            if final_result and final_result.startswith("Error: Task failed"):
+            if status == "error" or (final_result and final_result.startswith("Error: Task failed")):
                 status = "error"
                 error_str = final_result
                 logger.warning(
@@ -1387,16 +1413,12 @@ class SubagentManager:
                         artifact_id=artifact_id_for_cap,
                         title=(task or label)[:200],
                     )
-            self._registry.update(
-                run_id, ended_at=time.time(), outcome=status,
-                error=error_str, tool_trace=tool_trace,
-            )
+            self._registry.finish(run_id, status, result=durable_result,
+                                  error=error_str, error_code=error_code)
 
         except asyncio.TimeoutError:
             logger.warning(f"[SubagentManager] [{run_id[:8]}] timed out")
-            self._registry.update(
-                run_id, ended_at=time.time(), outcome="timeout", tool_trace=tool_trace,
-            )
+            self._registry.finish(run_id, "timeout", error="Task timed out", error_code="timeout")
             final_result = "(task timed out)"
             status = "timeout"
 
@@ -1407,62 +1429,59 @@ class SubagentManager:
             # then re-raise so asyncio considers the task properly
             # cancelled and doesn't treat it as a "completed" future.
             logger.info(f"[SubagentManager] [{run_id[:8]}] cancelled")
-            self._registry.update(
-                run_id,
-                ended_at=time.time(),
-                outcome="interrupted",
-                error="Parent interrupted before the task could finish",
-                tool_trace=tool_trace,
-            )
+            outcome = self._cancel_outcomes.get(run_id, "interrupted")
+            self._registry.finish(run_id, outcome, error="Task interrupted", error_code="cancelled")
             if not skip_announce:
                 try:
-                    await self._announce(run_id, "(task was interrupted)", "interrupted")
+                    await self._announce(run_id, "(task was interrupted)", outcome)
                 except Exception:
                     logger.exception(f"[SubagentManager] [{run_id[:8]}] announce on cancel failed")
             try:
-                await self._emit_event("subagent.completed", run_id, label, "interrupted", None)
+                await self._emit_event("subagent.completed", run_id, label, outcome, None)
             except Exception:
                 pass
             raise
 
         except Exception as e:
             logger.error(f"[SubagentManager] [{run_id[:8]}] failed: {e}")
-            self._registry.update(
-                run_id,
-                ended_at=time.time(),
-                outcome="error",
-                error=str(e),
-                tool_trace=tool_trace,
-            )
-            final_result = f"Error: {e}"
+            self._registry.finish(run_id, "error", error="Task could not finish", error_code="execution_failed")
+            final_result = "Error: Task could not finish."
             status = "error"
-            error_str = str(e)
+            error_str = final_result
 
-        if not skip_announce:
-            await self._announce(run_id, final_result, status)
-        await self._emit_event("subagent.completed", run_id, label, status, error_str)
+        try:
+            if not skip_announce:
+                await self._announce(run_id, final_result, status)
+        finally:
+            await self._emit_event("subagent.completed", run_id, label, status, error_str)
         return final_result
 
-    async def _emit_event(self, event_name: str, run_id: str, label: str, outcome: str, error: str | None = None) -> None:
-        """Broadcast subagent lifecycle event to connected clients."""
-        if not self._on_event:
-            return
-        # P1.2 — surface the structured tool_trace so the desktop UI /
-        # telemetry can show what the child actually did. Registry is
-        # fetched fresh here so the caller doesn't need to pass it.
-        record = self._registry.get(run_id)
-        tool_trace = record.tool_trace if record else []
+    async def _deliver_event(self, event: str, data: dict) -> None:
+        if self._on_event:
+            await self._on_event(event, data)
+
+    def _publish_event(self, event: str, run_id: str) -> None:
         try:
-            await self._on_event(event_name, {
-                "runId": run_id[:8],
-                "label": label,
-                "outcome": outcome,
-                "error": error,
-                "running": len(self._running_tasks),
-                "toolTrace": tool_trace,
-            })
+            record = self._registry.get(run_id)
+            if record:
+                data = run_view(record, detail=event == "subagent.completed")
+                data.update(outcome=record.outcome, running=len(self._registry.pending()))
+                self._events.publish(event, data)
         except Exception:
-            pass
+            logger.exception("Task observation unavailable")
+
+    async def _emit_event(self, event_name: str, run_id: str, label: str,
+                          outcome: str, error: str | None = None) -> None:
+        self._publish_event(event_name, run_id)
+
+    async def _progress(self, run_id: str, activity: dict) -> None:
+        self._registry.update(run_id, activity=activity)
+        self._publish_event("subagent.progress", run_id)
+
+    def _link_artifact(self, run_id: str, artifact_id: str) -> None:
+        record = self._registry.get(run_id)
+        if record and artifact_id not in record.artifact_ids:
+            self._registry.update(run_id, artifact_ids=[*record.artifact_ids, artifact_id])
 
     async def _announce(self, run_id: str, result: str, status: str) -> None:
         """Deliver result to parent agent — via queue if parent is busy."""
@@ -1485,7 +1504,7 @@ class SubagentManager:
         # Full content is in the artifact — parent just needs to know it's done
         _result_preview = result[:2000] if len(result) > 2000 else result
         if len(result) > 2000:
-            _result_preview += f"\n[... full result truncated from {len(result)} chars — saved as artifact]"
+            _result_preview += f"\n[... full result truncated from {len(result)} chars — available in the saved task result]"
 
         # P1.2 — one-line "Tools used: web_search×2, exec×1" summary. Helps
         # the parent LLM reason about what the child actually did instead
@@ -1529,7 +1548,7 @@ class SubagentManager:
         else:
             await _send(announce_content)
 
-        self._registry.update(run_id, announced=True)
+        self._registry.update(run_id, announced=True, delivery_state="queued")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1762,40 +1781,19 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
 
     async def cancel(self, run_id_prefix: str) -> str:
         """Cancel a running subagent by run_id (prefix match)."""
-        # Find matching task
-        matched_id = None
-        for rid in self._running_tasks:
-            if rid.startswith(run_id_prefix) or rid[:8] == run_id_prefix:
-                matched_id = rid
-                break
-
-        if not matched_id:
-            return json.dumps({"status": "error", "error": f"No running task matching '{run_id_prefix}'"})
-
-        task = self._running_tasks.get(matched_id)
-        if not task:
-            return json.dumps({"status": "error", "error": "Task already completed"})
-
-        # Cancel the asyncio task
+        matches = [rid for rid in self._running_tasks if run_id_prefix and rid.startswith(run_id_prefix)]
+        if len(matches) != 1:
+            return json.dumps({"status": "error", "error": "Task ID is missing, unknown or ambiguous"})
+        run_id = matches[0]
+        task = self._running_tasks[run_id]
+        self._cancel_outcomes[run_id] = "cancelled"
         task.cancel()
-        logger.info(f"[SubagentManager] [{matched_id[:8]}] cancelled by user")
-
-        # Update registry
-        self._registry.update(
-            matched_id,
-            ended_at=time.time(),
-            outcome="cancelled",
-            error="Cancelled by user",
-        )
-
-        # Announce cancellation
-        await self._announce(matched_id, "Task was cancelled by user.", "cancelled")
-
-        return json.dumps({
-            "status": "cancelled",
-            "run_id": matched_id[:8],
-            "message": f"Task [{matched_id[:8]}] cancelled successfully.",
-        })
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        record = self._registry.get(run_id)
+        return json.dumps({"status": record.outcome if record else "cancelled", "run_id": run_id[:8]})
 
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""

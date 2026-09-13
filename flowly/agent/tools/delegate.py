@@ -6,18 +6,24 @@ completes, the result is automatically sent back to the user via the bus.
 """
 
 import asyncio
+import json
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-from loguru import logger
-
+from flowly.agent.subagent_observation import TaskEvents, run_view
+from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
 from flowly.agent.tools.base import Tool
-from flowly.bus.events import InboundMessage, OutboundMessage
+from flowly.bus.events import InboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.config.schema import MultiAgentConfig, MultiAgentTeamConfig
-from flowly.multiagent.invoke import invoke_agent, resolve_claude_model, resolve_codex_model
+from flowly.multiagent.invoke import (
+    invoke_agent,
+    resolve_claude_model,
+    resolve_codex_model,
+)
+from loguru import logger
 
 
 class DelegateTool(Tool):
@@ -36,7 +42,11 @@ class DelegateTool(Tool):
         workspace: Path,
         bus: MessageBus,
         on_event: Any | None = None,
+        registry: SubagentRegistry | None = None,
     ):
+        self._registry = registry or SubagentRegistry()
+        self._events = TaskEvents(self._deliver_event)
+        self._tasks: dict[str, asyncio.Task] = {}
         self._agents = agents
         self._teams = teams
         self._workspace = workspace
@@ -121,82 +131,100 @@ class DelegateTool(Tool):
         channel = self._channel
         chat_id = self._chat_id
 
-        # Track running delegate + broadcast start event
-        run_id = uuid.uuid4().hex[:8]
-        self._running[run_id] = {
-            'agent_id': agent_id,
-            'label': f"@{agent_id}: {message[:60]}",
-            'task': message[:200],
-            'model': model_display,
-            'started_at': time.time(),
-        }
-        if self._on_event:
-            try:
-                asyncio.ensure_future(self._on_event("subagent.started", {
-                    "runId": run_id,
-                    "label": f"@{agent_id}: {message[:60]}",
-                    "task": message[:200],
-                    "model": model_display,
-                    "running": len(self._running),
-                }))
-            except Exception:
-                pass
+        run_id = str(uuid.uuid4())
+        record = SubagentRunRecord(
+            run_id=run_id, child_session_key=f"delegate:{run_id}",
+            parent_session_key=f"{channel}:{chat_id}", parent_channel=channel,
+            parent_chat_id=chat_id, task=message, label=agent_id,
+            display_name=f"@{agent_id}: {message[:100]}", model=model_display,
+            cleanup="keep", created_at=time.time(), kind="delegate", agent_id=agent_id,
+            activity={"phase": "queued"},
+            delivery_state="pending" if channel and chat_id else "not_required",
+        )
+        self._registry.register(record)
+        self._running[run_id] = {"agent_id": agent_id, "label": record.display_name,
+                                 "task": message, "model": model_display, "started_at": record.created_at}
+        self._publish_event("subagent.started", run_id)
 
         async def _run_in_background() -> None:
-            outcome = "error"  # default — overwritten on success
-            content = ""
+            result = ""
             try:
-                result = await invoke_agent(
-                    agent, agent_id, message, self._workspace, timeout=1800,
-                )
-                content = (
-                    f"[DELEGATE_RESULT:{agent_id}] "
-                    f"@{agent_id} has completed the task. "
-                    f"Summarize the result for the user in your own words.\n\n"
-                    f"Result:\n{result}"
-                )
-                outcome = "ok"
-            except Exception as e:
-                logger.error(f"Background delegation to @{agent_id} failed: {e}")
-                content = (
-                    f"[DELEGATE_RESULT:{agent_id}] "
-                    f"@{agent_id} failed with an error. "
-                    f"Tell the user what happened.\n\n"
-                    f"Error: {e}"
-                )
+                self._registry.update(run_id, started_at=time.time(), activity={"phase": "working"})
+                self._publish_event("subagent.progress", run_id)
+                result = await invoke_agent(agent, agent_id, message, self._workspace, timeout=1800)
+                if not result.strip():
+                    raise ValueError("Task produced no output")
+                self._registry.finish(run_id, "ok", result=result)
+            except asyncio.CancelledError:
+                self._registry.finish(run_id, "cancelled", error="Task interrupted", error_code="cancelled")
+                raise
+            except Exception as exc:
+                logger.error(f"Background delegation to @{agent_id} failed: {exc}")
+                self._registry.finish(run_id, "error", error="Task could not finish", error_code="delegate_failed")
             finally:
                 self._running.pop(run_id, None)
-                if self._on_event:
-                    try:
-                        await self._on_event("subagent.completed", {
-                            "runId": run_id,
-                            "label": f"@{agent_id}",
-                            "outcome": outcome,
-                            "running": len(self._running),
-                        })
-                    except Exception:
-                        pass
+                self._publish_event("subagent.completed", run_id)
 
-            # Send back through agent loop so the model summarizes it.
-            # The DELEGATE_RESULT marker tells the routing layer to temporarily
-            # remove the delegate_to tool, preventing re-delegation loops.
             if channel and chat_id:
-                await self._bus.publish_inbound(
-                    InboundMessage(
-                        channel=channel,
-                        sender_id="delegate_result",
-                        chat_id=chat_id,
-                        content=content,
-                    )
-                )
-            else:
-                logger.warning(f"No message context for @{agent_id} result delivery")
+                current = self._registry.get(run_id)
+                outcome = "completed" if current.outcome == "ok" else "failed"
+                content = (f"[DELEGATE_RESULT:{agent_id}] @{agent_id} {outcome}. "
+                           f"Summarize the result for the user.\n\n{result or current.error}")
+                await self._bus.publish_inbound(InboundMessage(
+                    channel=channel, sender_id="delegate_result", chat_id=chat_id, content=content,
+                ))
+                self._registry.update(run_id, announced=True, delivery_state="queued")
 
-        # Fire-and-forget
-        asyncio.create_task(_run_in_background())
+        task = asyncio.create_task(_run_in_background())
+        self._tasks[run_id] = task
 
-        return (
-            f"Task delegated to @{agent_id} ({agent.name or agent_id}, {model_display}). "
-            f"The agent is now working in the background. "
-            f"The result will be delivered automatically when the agent finishes."
-        )
+        def cleanup(done: asyncio.Task) -> None:
+            self._tasks.pop(run_id, None)
+            self._running.pop(run_id, None)
+            try:
+                record = self._registry.get(run_id)
+                if record and record.ended_at is None:
+                    self._registry.finish(run_id, "cancelled" if done.cancelled() else "error",
+                                          error="Task interrupted", error_code="worker_stopped")
+                    self._publish_event("subagent.completed", run_id)
+            except Exception:
+                logger.exception("Could not persist delegated task cleanup")
+            finally:
+                if not done.cancelled():
+                    done.exception()
+
+        task.add_done_callback(cleanup)
+        return (f"Task delegated to @{agent_id} ({agent.name or agent_id}, {model_display}). "
+                "The agent is now working in the background. "
+                "The result will be delivered automatically when the agent finishes.")
+
+    async def _deliver_event(self, event: str, data: dict) -> None:
+        if self._on_event:
+            await self._on_event(event, data)
+
+    def _publish_event(self, event: str, run_id: str) -> None:
+        try:
+            record = self._registry.get(run_id)
+            if record:
+                data = run_view(record)
+                data.update(outcome=record.outcome, running=len(self._registry.pending()))
+                self._events.publish(event, data)
+        except Exception:
+            logger.exception("Delegated task observation unavailable")
+
+    async def cancel(self, run_id: str) -> str:
+        task = self._tasks.get(run_id)
+        if task is None:
+            return json.dumps({"status": "error", "error": "Task is no longer running"})
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return json.dumps({"status": "cancelled", "run_id": run_id})
+
+    def cancel_all(self) -> int:
+        active = [task for task in self._tasks.values() if not task.done()]
+        for task in active:
+            task.cancel()
+        return len(active)

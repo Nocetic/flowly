@@ -816,6 +816,11 @@ class ProfileHost:
     ) -> Any:
         _validate_profile_selector(name)
         method, safe = validate_profile_rpc(method, params)
+        if method in {"subagents.list", "subagents.get"}:
+            # The shared runtime socket carries canonical events internally.
+            # Each external gateway/relay reader selects its own wire version.
+            # Old runtimes ignore the additive parameter and keep legacy events.
+            safe["eventVersion"] = 2
         guarded = expected_host_id is not None or expected_bot_id is not None
         if method.startswith(("mcp.", "memory.editor.")) and not guarded:
             raise ProfileHostError("INVALID_PARAMS", "This operation requires the selected profile identities.")

@@ -41,6 +41,9 @@ _NON_PUBLIC_ATTACHMENT_HOST_SUFFIXES = (
 # The small access-policy projection below is safe to
 # expose because it accepts only closed enums and a deny-only toolset list.
 PROFILE_RPC_TIMEOUTS: dict[str, int] = {
+    "subagents.list": 15_000,
+    "subagents.get": 15_000,
+    "subagents.result": 15_000,
     "memory.editor.list": 30_000,
     "memory.editor.document": 30_000,
     "memory.editor.save": 30_000,
@@ -322,6 +325,12 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
     if size > MAX_REQUEST_BYTES:
         raise ProfileHostError("REQUEST_TOO_LARGE", "Profile request is too large.")
     value = _validate_access_policy(method, value)
+    if method in {"subagents.list", "subagents.get"}:
+        from flowly.agent.subagent_observation import event_version
+        try:
+            event_version(value)
+        except ValueError as exc:
+            raise ProfileHostError("INVALID_PARAMS", str(exc)) from exc
     session_key_methods = {
         "chat.history",
         "chat.inflight",

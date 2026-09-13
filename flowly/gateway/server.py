@@ -14,12 +14,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from urllib.parse import quote
+from weakref import WeakKeyDictionary
 
 import aiohttp
 from aiohttp import web
 from loguru import logger
 
 from flowly.agent.subagent_registry import SubagentRegistry
+from flowly.agent.subagent_observation import client_event, event_version
 from flowly.artifacts.context import is_internal_context_artifact
 from flowly.artifacts.summary import artifact_summary
 from flowly.browser_annotations import append_browser_annotation_context
@@ -578,6 +580,8 @@ class GatewayServer:
         self._site: web.TCPSite | None = None
         # Track active WebSocket clients and their running tasks for abort support.
         self._ws_clients: dict[str, web.WebSocketResponse] = {}
+        self._subagent_event_versions: WeakKeyDictionary[web.WebSocketResponse, int] = WeakKeyDictionary()
+        self._profile_subagent_event_versions: WeakKeyDictionary = WeakKeyDictionary()
         self._active_tasks: dict[str, asyncio.Task] = {}
         # Named profile gateways may be shared by two authenticated managers
         # (Desktop and the primary Gateway).  Only the runtime itself can
@@ -1686,7 +1690,7 @@ class GatewayServer:
         inner_method = ""
         inner_session_key = ""
         if isinstance(params, dict) and method == "profiles.rpc":
-            profile = str(params.get("name") or "")
+            profile = str(params.get("name") or "").strip()
             inner_method = str(params.get("method") or "")
             inner_params = params.get("params")
             if isinstance(inner_params, dict):
@@ -1733,6 +1737,11 @@ class GatewayServer:
                 retryable=True,
             )
             return
+        if inner_method in {"subagents.list", "subagents.get"}:
+            inner_params = inner_params if isinstance(inner_params, dict) else {}
+            versions = self._profile_subagent_event_versions.setdefault(ws, {})
+            if profile in versions or len(versions) < _PROFILE_PROFILES_PER_CLIENT_LIMIT:
+                versions[profile] = event_version(inner_params) if "eventVersion" in inner_params else versions.get(profile, 1)
         if (
             inner_method == "chat.send"
             and inner_session_key
@@ -3700,6 +3709,10 @@ class GatewayServer:
         # this session, so rebind its live stream to THIS socket — any run still
         # in flight now streams forward events here instead of the socket that
         # started it (which the client may have already left).
+        if method in {"subagents.list", "subagents.get"} and "eventVersion" in params:
+            # Socket-local, not clientId-local: a replacement connection starts
+            # in legacy mode, even if stale-socket cleanup runs after reconnect.
+            self._subagent_event_versions[ws] = event_version(params)
         if method == "chat.inflight":
             self.bind_session_ws(str(params.get("sessionKey") or ""), ws)
         if method == "system.capabilities" and self._profile_host is not None:
@@ -4766,10 +4779,16 @@ class GatewayServer:
         await self._ws_rpc_reply(ws, rpc_id, {"versions": versions})
 
     async def _broadcast_subagent_event(self, event_name: str, data: dict) -> None:
-        """Push subagent lifecycle event to all connected WS clients."""
-        event = {"type": "event", "event": event_name, "data": data}
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        """A slow observer must not delay other observers or task execution."""
+        async def send(ws: web.WebSocketResponse) -> None:
+            name, payload = client_event(event_name, data, self._subagent_event_versions.get(ws, 1))
+            await asyncio.wait_for(self._ws_send(ws, {
+                "type": "event", "event": name, "data": payload,
+            }), timeout=1)
+        await asyncio.gather(
+            *(send(ws) for ws in list(self._ws_clients.values())),
+            return_exceptions=True,
+        )
 
     async def _broadcast_compaction_event(self, data: dict) -> None:
         """Push a compaction event to clients watching that session.
@@ -4973,6 +4992,18 @@ class GatewayServer:
             ) in subscription.conversations:
                 targets.add(client_id)
 
+        if event_type.startswith("subagent."):
+            async def send_task(ws: web.WebSocketResponse) -> None:
+                versions = self._profile_subagent_event_versions.get(ws, {})
+                name, body = client_event(event_type, event_data, versions.get(profile, 1))
+                await asyncio.wait_for(self._ws_send(ws, {
+                    "type": "event", "event": "profile.event",
+                    "data": {**data, "type": name, "data": body},
+                }), timeout=1)
+            sockets = [ws for client_id, ws in self._ws_clients.items()
+                       if client_id in targets or profile in self._profile_subagent_event_versions.get(ws, {})]
+            await asyncio.gather(*(send_task(ws) for ws in sockets), return_exceptions=True)
+            return
         event = {"type": "event", "event": "profile.event", "data": data}
         for client_id in sorted(targets):
             ws = self._ws_clients.get(client_id)

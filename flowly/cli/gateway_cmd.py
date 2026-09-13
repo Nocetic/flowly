@@ -794,7 +794,7 @@ def gateway(
             ensure_agent_directory(agent_dir, aid, multi_agents, multi_teams)
 
         # Register delegate_to tool on main agent
-        delegate_tool = DelegateTool(multi_agents, multi_teams, agents_workspace, bus)
+        delegate_tool = DelegateTool(multi_agents, multi_teams, agents_workspace, bus, registry=agent.subagents.registry)
         agent.tools.register(delegate_tool)
 
         # Wrap _process_message with multi-agent routing
@@ -2191,7 +2191,11 @@ Respond to the user now:"""
 
     # Wire subagent events → gateway broadcast
     async def _on_subagent_event(event_name: str, data: dict) -> None:
-        await gateway_server._broadcast_subagent_event(event_name, data)
+        deliveries = [gateway_server._broadcast_subagent_event(event_name, data)]
+        web = channels.get_channel("web")
+        if web is not None:
+            deliveries.append(web.send_subagent_event(event_name, data))
+        await asyncio.gather(*deliveries, return_exceptions=True)
 
     agent.subagents._on_event = _on_subagent_event
 
@@ -2230,6 +2234,7 @@ Respond to the user now:"""
     cron.on_complete = _on_cron_lifecycle
 
     # Wire delegate tool to same subagent event callback (if multi-agent is active)
+    _feature_rpc.set_subagent_delegate_provider(lambda: agent.tools.get("delegate_to"))
     delegate = agent.tools.get('delegate_to')
     if delegate and hasattr(delegate, '_on_event'):
         delegate._on_event = _on_subagent_event
@@ -2621,6 +2626,8 @@ Respond to the user now:"""
             await gateway_server.stop()
             heartbeat.stop()
             cron.stop()
+            if delegate is not None and hasattr(delegate, "cancel_all"):
+                delegate.cancel_all()
             agent.stop()
             await channels.stop_all()
             console.print("[green]✓[/green] Shutdown complete")

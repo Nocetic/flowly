@@ -722,9 +722,9 @@ class TestMaxIterationsGraceCall:
         assert "iteration limit" in result.lower()
         assert "502" in result or "failed" in result.lower()
         records = mgr._registry.all()
-        # The run ITSELF still succeeded (the grace-call is a fallback,
-        # not a new failure mode). Outcome stays "ok".
-        assert records[0].outcome == "ok"
+        # An exhausted run with no final summary must not look successful.
+        assert records[0].outcome == "error"
+        assert records[0].error_code == "summary_failed"
 
 
 class TestErrorClassification:
