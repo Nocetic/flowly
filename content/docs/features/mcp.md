@@ -18,13 +18,14 @@ You do not need to understand MCP configuration files to connect a service. The 
 | Connect a supported service | Open **MCP connections** in Flowly Desktop, iOS, or Android |
 | Let Flowly request a connection while you are chatting | Ask it to connect the service, then review the connection card yourself |
 | Add a custom local or remote MCP server | Use **Add connection** in an app, or `flowly mcp add` |
+| Manage MCP on a direct remote gateway without working WSS | Use a client with [verified SSH management](../using-flowly/remote-mcp.md); the gateway remains direct |
 | Let another agent use selected Flowly tools | In Flowly Desktop, use **External agent access** |
 | Expose conversation archives over a local MCP process | Run `flowly mcp serve` |
 | Expose selected tools from a running local gateway | Run `flowly mcp tools` |
 
 ## Connect a service from a Flowly app
 
-The owner-managed connection flow is available in Flowly Desktop, iOS, and Android. It works with the exact Flowly runtime you selected: local, direct self-hosted, relay-managed, or a selected profile runtime, as long as that runtime advertises MCP connection support.
+The owner-managed connection flow is available in Flowly Desktop, iOS, and Android. It works with the exact Flowly runtime you selected: local, direct self-hosted, relay-managed, or a selected profile runtime, as long as that runtime advertises MCP connection support and the client supports its secure management transport. Updating the gateway alone does not add SSH support to an older app.
 
 1. Open the selected Flowly's **MCP connections** screen.
 2. Choose a catalog service or add a custom connection.
@@ -81,6 +82,34 @@ This conversation flow is intentionally limited:
 - Scheduled runs cannot start an interactive connection request.
 - The request is bound to the originating conversation and selected runtime; a model-written session identifier cannot redirect it elsewhere.
 
+## Manage MCP on a remote gateway
+
+An ordinary remote chat connection working over `ws://` does not make it safe to
+send MCP credentials or OAuth callbacks over that same connection. WSS is
+WebSocket over TLS; turning on **Use TLS** in an app only asks the client to use
+TLS. It does not install a certificate or enable TLS on the server.
+
+Flowly now provides a separate, authenticated **MCP management endpoint** for
+clients that support verified SSH. The client verifies the SSH server, opens an
+encrypted channel to the gateway's remote loopback port, and sends owner MCP
+requests to `POST /api/mcp/manage` with the existing gateway token. It does not
+need a relay or Firestore gateway registration.
+
+SSH credentials belong to the client, not to `mcpServers` or the agent. OAuth
+sign-in still opens on the owner's device; provider tokens and MCP execution
+stay on the selected Flowly runtime. SSH authentication does not approve tool
+permissions—you still review and confirm them separately.
+
+> [!WARNING]
+> This protects the MCP management path, not existing chat, media, or general
+> gateway traffic. A shared gateway token sent over public plaintext traffic can
+> still be intercepted. Keep that traffic on a trusted private path or behind
+> correctly configured TLS; MCP-only SSH is not whole-gateway protection.
+
+See [Remote MCP setup](../using-flowly/remote-mcp.md) for prerequisites, fingerprint
+verification, app-version/profile limits, and troubleshooting. Client developers
+can use the [MCP management API reference](../reference/mcp-management-api.md).
+
 ## OAuth sign-in
 
 Remote HTTP servers with `auth: "oauth"` use native OAuth 2.1 discovery and PKCE.
@@ -88,7 +117,7 @@ Remote HTTP servers with `auth: "oauth"` use native OAuth 2.1 discovery and PKCE
 ### App-managed OAuth flow
 
 1. The selected Flowly runtime discovers the provider's authorization endpoints and creates a short-lived request with PKCE and a random state value.
-2. The authorization URL is delivered to the owner app over its authenticated feature connection.
+2. The authorization URL is delivered to the owner app over its supported secure management path: the existing local/secure feature connection or the dedicated verified SSH path for direct remote gateways.
 3. The system browser opens on the **owner's device**, even when the selected runtime is on another machine.
 4. The provider returns to an exact callback:
    - Desktop uses a random loopback URL on `127.0.0.1`.
@@ -379,6 +408,7 @@ MCP connects Flowly to third-party code and external accounts. The important con
 - **Private OAuth storage:** token files use private storage and are bound to the configured server identity.
 - **Bounded diagnostics:** protocol logs and subprocess stderr are sanitized, rate-limited, size-limited, and written privately.
 - **Transport policy:** owner-scoped remote access requires HTTPS and a distinct scoped key; gateway administration credentials are not accepted as MCP keys.
+- **Separate owner management:** `/api/mcp/manage` requires a non-empty gateway token even on loopback, and accepts only a TLS socket or loopback peer. SSH-forwarded management and external-agent `/mcp` access are different endpoints with different credentials.
 - **Bounded execution:** grants, request sizes, result sizes, concurrency, timeouts, pagination, and binary content all have limits.
 - **No blind write replay:** Flowly does not retry a possibly side-effecting operation automatically.
 - **Optional process sandbox:** when Flowly itself runs inside its supported sandbox, its MCP subprocesses inherit that boundary. See [Sandbox & approvals](../using-flowly/sandbox-and-approvals.md).
@@ -557,6 +587,8 @@ For mTLS, provide `clientCert` and `clientKey` in the supported form. `sslVerify
 | Symptom | What to check |
 |---|---|
 | **Saved but not connected** | Open the connection detail. If the apply step failed after confirmation, the new settings are already saved; retry and verify live status. Also check whether it is disabled or needs sign-in. |
+| Remote chat works, but MCP asks for WSS or secure transport | Use working TLS or a client with verified SSH MCP management. Enabling a TLS switch alone cannot configure the server. See [Remote MCP setup](../using-flowly/remote-mcp.md). |
+| SSH works, but MCP management fails | Verify the gateway token, updated running gateway, actual gateway port, and permission to forward to its loopback listener. A successful SSH login is not gateway authentication. |
 | Sign-in closes before the provider appears | Confirm the selected runtime supports the callback mode, the provider accepts the exact redirect URI, and the app link/associated domain opens the installed app. Restarting setup creates a new state value; do not reuse an old callback. |
 | OAuth finishes but connection fails | Read the provider error shown by Flowly. The token exchange may have succeeded while the MCP endpoint, scope, or provider account still rejects discovery. Retry does not overwrite a working credential until the replacement is healthy. |
 | Tools do not appear after app setup | Confirm permissions were saved as `all` or `selected`, then inspect live status. App setup reloads the one server without restarting chat. |
@@ -571,6 +603,8 @@ For mTLS, provide `clientCert` and `clientKey` in the supported form. `sslVerify
 ## Related
 
 - [Configuration](../using-flowly/configuration.md)
+- [Remote MCP setup](../using-flowly/remote-mcp.md)
+- [MCP management API](../reference/mcp-management-api.md)
 - [CLI commands](../reference/cli-commands.md)
 - [Slash commands](../reference/slash-commands.md)
 - [Tools reference](../reference/tools.md)

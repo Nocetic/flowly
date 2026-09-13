@@ -84,6 +84,12 @@ commands instead, so automation can never stop a service silently.
 | `--token` | Set an explicit remote-access token (otherwise one is auto-generated on the first non-loopback bind). |
 | `--rotate-token` | Generate a fresh remote-access token before starting (invalidates the old one). |
 
+An updated gateway registers the owner-only `/api/mcp/manage` route automatically;
+there is no separate `flowly mcp` command to start it. It requires a configured
+gateway token even on loopback. `--remote` exposes a bind address; it does **not**
+enable TLS or start an SSH server. See [Remote MCP setup](../using-flowly/remote-mcp.md)
+and the [management API](mcp-management-api.md).
+
 ## flowly enroll
 
 Connect a phone or another device to this gateway in one step: enables remote access (binds `0.0.0.0` + ensures a token), prints the **LAN IP** to use on the same Wi-Fi (plus the public IP for internet access), the port, token, and TLS note, and offers to open the firewall on Windows. Restart the gateway afterward so it rebinds.

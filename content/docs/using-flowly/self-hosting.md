@@ -86,6 +86,19 @@ flowly service install --start --host 0.0.0.0 --port 18790 --token "$(openssl ra
 > - Prefer an **SSH tunnel** or a TLS reverse proxy over exposing `0.0.0.0` directly to the internet. Restrict the port with a firewall / security group.
 > - The agent has shell and filesystem access on the host — **treat gateway access as host access.** See the repo's [`SECURITY.md`](https://github.com/Nocetic/flowly/blob/main/SECURITY.md).
 
+### MCP management from a remote app
+
+An updated gateway provides `POST /api/mcp/manage` for verified SSH-capable
+clients. Keep the gateway as a **direct remote gateway**; this does not require a
+relay or Firestore registration. The client connects through SSH to the remote
+loopback gateway port, then authenticates with the gateway token. The Flowly
+runtime does not receive or store your SSH password.
+
+This is a separate management path: it does not encrypt the ordinary chat or
+media connection, publish an external-agent MCP URL, or configure TLS for you.
+App support must also be present; updating only the runtime is not enough.
+Follow [Remote MCP setup](remote-mcp.md) before connecting external services.
+
 ## 5. Sandbox
 
 Shell/exec tooling runs inside an OS sandbox by default: **`sandbox-exec` on macOS**, **`bwrap` (bubblewrap) on Linux**. On Linux, install bubblewrap so the sandbox is active:
@@ -129,5 +142,6 @@ If something's off, `flowly doctor` is the first stop — it checks provider key
 ## Related
 
 - [Open source vs. Desktop & Cloud](desktop-vs-oss.md)
+- [Remote MCP setup](remote-mcp.md)
 - [Running as a service](service.md) · [Profiles](profiles.md) · [Sandbox & approvals](sandbox-and-approvals.md)
 - [Providers & models](providers-and-models.md) · [Configuration](configuration.md)

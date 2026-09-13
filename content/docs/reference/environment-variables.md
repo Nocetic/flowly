@@ -93,6 +93,12 @@ These let tools pick up credentials from the environment instead of `config.json
 
 These keys serve different bridges. A scoped access key is not the gateway administration token. See [MCP](../features/mcp.md#let-another-agent-use-flowly) for configuration and permission details.
 
+SSH-based owner management does not use these bridge variables. Its
+`/api/mcp/manage` requests authenticate with the configured gateway token
+(`gateway.token`), inside the client's verified SSH channel. There is no SSH
+password to set in the runtime environment for this feature; enter SSH details
+in a supported client. See [Remote MCP setup](../using-flowly/remote-mcp.md).
+
 ## TUI
 
 | Variable | Default | What it does |
