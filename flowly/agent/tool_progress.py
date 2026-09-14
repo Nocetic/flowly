@@ -8,9 +8,9 @@ from loguru import logger
 
 from flowly.providers.tool_preview import MAX_PREVIEW_ARGUMENTS, ToolCallPreview
 from flowly.tool_activity import project_tool_call_for_ui
+from flowly.utils.display_text import bounded_tool_result
 
 _TERMINAL = frozenset({"completed", "failed", "stopped"})
-_MAX_RESULT = 32_768
 
 
 class ToolProgress:
@@ -89,8 +89,9 @@ class ToolProgress:
         call = self.calls.get(call_id)
         if call is None or call["state"] in _TERMINAL:
             return
+        bounded, truncated = bounded_tool_result(result)
         call.update(state="stopped" if stopped else "failed" if failed else "completed",
-                    result=result[:_MAX_RESULT], resultTruncated=len(result) > _MAX_RESULT,
+                    result=bounded, resultTruncated=truncated,
                     completedAt=int(time.time() * 1000))
         await self._emit(call)
 

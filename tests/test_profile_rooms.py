@@ -676,6 +676,7 @@ async def test_stop_checkpoints_partial_member_reply_as_aborted_history(tmp_path
     assert isinstance(reply["durationMs"], int)
     assert reply["toolCalls"] == [{
         "id": "read-1",
+        "activityId": reply["toolCalls"][0]["activityId"],
         "name": "read_file",
         "argumentsJson": '{"path":"/workspace/report.md"}',
         "executionState": "stopped",
@@ -1416,6 +1417,7 @@ async def test_tool_activity_is_projected_and_attached_to_durable_reply(tmp_path
     reply = (await service.list())[0]["messages"][-1]
     assert reply["toolCalls"] == [{
         "id": "call-1",
+        "activityId": reply["toolCalls"][0]["activityId"],
         "name": "read_file",
         "argumentsJson": '{"path":"/safe/file.txt"}',
         "executionState": "completed",
@@ -2864,7 +2866,7 @@ async def test_precise_tool_progress_preserves_text_results_and_state_across_rel
         **envelope, "state": "final", "message": {"content": "Unable to read the file."},
     })
     await _eventually(lambda: _room_settled(service, room["id"]))
-    expected = [{"id": "read-1", "name": "read_file", "argumentsJson": '{"path":"/safe/file.txt"}',
+    expected = [{"id": "read-1", "activityId": activity["activityId"], "name": "read_file", "argumentsJson": '{"path":"/safe/file.txt"}',
                  "executionState": "failed", "result": "Permission denied", "resultTruncated": False}]
     assert (await service.list())[0]["messages"][-1]["toolCalls"] == expected
     await service.shutdown()
@@ -2895,4 +2897,31 @@ async def test_room_tool_results_are_bounded_and_unfinished_calls_are_not_succes
     call = service._tool_calls(room["id"], "writer")[0]
     assert call["executionState"] == "failed" and call["result"] == "Failed\ufffdoutput"
     assert call["resultTruncated"] is False
+    # The desktop wire limit is UTF-16 units, not Python code points.
+    assert service._update_activity(room["id"], "writer", {"phase": "result", "toolCallId": "unicode", "name": "exec", "result": "a" + "🙂" * 20_000})
+    unicode_call = next(call for call in service._tool_calls(room["id"], "writer") if call["id"] == "unicode")
+    assert unicode_call["result"] == "a" + "🙂" * 16_383
+    assert unicode_call["resultTruncated"] is True
+    assert len(unicode_call["result"].encode("utf-16-le")) <= 65_536
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_room_tool_identity_is_per_member_and_execution_not_provider_id(tmp_path: Path) -> None:
+    async def rpc(*args: Any):
+        return {"ok": True}
+
+    service = ProfileRoomService(target_rpc=rpc, profile_directory=lambda: ["default", "writer"], on_event=None, store_path=tmp_path / "rooms.json")
+    room = await service.create("Council", ["default", "writer"])
+    event = {"phase": "start", "toolCallId": "same-provider-id", "name": "exec"}
+    for profile in ["default", "writer"]:
+        assert service._update_activity(room["id"], profile, event)
+    first = service._tool_calls(room["id"], "default")[0]["activityId"]
+    other = service._tool_calls(room["id"], "writer")[0]["activityId"]
+    assert isinstance(first, str) and first and first != other
+    service._update_activity(room["id"], "default", {**event, "phase": "result", "result": "done"})
+    assert service._tool_calls(room["id"], "default")[0]["activityId"] == first
+    service._finish_member(room["id"], "default")
+    service._update_activity(room["id"], "default", event)
+    assert service._tool_calls(room["id"], "default")[0]["activityId"] not in {first, other}
     await service.shutdown()

@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from loguru import logger
 
 from flowly.profile import default_home
+from flowly.utils.display_text import bounded_tool_result
 from flowly.profile_host_contract import MAX_PROFILE_MESSAGE_CHARS, ProfileHostError
 from flowly.profile_room_store import (
     RoomStoreConflictError,
@@ -64,7 +65,6 @@ _MAX_HISTORY_CURSOR_CHARS = 512
 _MAX_SUMMARY_CONTENT_CHARS = 512
 _MAX_LEGACY_STORE_BYTES = 16 * 1024 * 1024
 _MAX_TOOL_CALLS = 8
-_MAX_TOOL_RESULT_CHARS = 32_768
 _TOOL_TERMINAL_STATES = frozenset({"completed", "failed", "stopped", "unknown"})
 _TOOL_EXECUTION_STATES = _TOOL_TERMINAL_STATES | {"preparing", "queued", "running"}
 _MAX_ATTACHMENTS = 10
@@ -3379,6 +3379,7 @@ class ProfileRoomService:
                 arguments = projected
         next_value = {
             **(existing or {}),
+            "activityId": (existing or {}).get("activityId") or str(uuid.uuid4()),
             "id": call_id, "profile": profile, "toolName": name,
             "argumentsJson": arguments,
             # Preserve the old wire enum for clients predating precise states.
@@ -3392,8 +3393,8 @@ class ProfileRoomService:
         if isinstance(result, str) and (
             "result" not in next_value or phase == "progress"
         ):
-            next_value["result"] = result[:_MAX_TOOL_RESULT_CHARS].replace("\x00", "\ufffd")
-            next_value["resultTruncated"] = value.get("resultTruncated") is True or len(result) > _MAX_TOOL_RESULT_CHARS
+            next_value["result"], truncated = bounded_tool_result(result)
+            next_value["resultTruncated"] = value.get("resultTruncated") is True or truncated
         if existing == next_value:
             return False
         activities[key] = next_value
@@ -3437,6 +3438,7 @@ class ProfileRoomService:
         return [
             {
                 "id": value["id"],
+                **({"activityId": value["activityId"]} if value.get("activityId") else {}),
                 "name": value["toolName"],
                 "argumentsJson": value["argumentsJson"],
                 "executionState": value["executionState"] if value.get("executionState") in _TOOL_TERMINAL_STATES else unfinished,
@@ -3969,13 +3971,18 @@ class ProfileRoomService:
                 if not isinstance(parsed_arguments, dict):
                     raise ValueError("invalid tool arguments")
                 clean_call = {"id": call_id, "name": name, "argumentsJson": arguments}
+                if "activityId" in call:
+                    activity_id = call["activityId"]
+                    if not isinstance(activity_id, str) or not activity_id or len(activity_id) > 256 or "\x00" in activity_id:
+                        raise ValueError("invalid tool activity identity")
+                    clean_call["activityId"] = activity_id
                 if "executionState" in call:
                     if not isinstance(call["executionState"], str) or call["executionState"] not in _TOOL_TERMINAL_STATES:
                         raise ValueError("invalid settled tool state")
                     clean_call["executionState"] = call["executionState"]
                 if "result" in call:
                     result = call["result"]
-                    if not isinstance(result, str) or len(result) > _MAX_TOOL_RESULT_CHARS or "\x00" in result:
+                    if not isinstance(result, str) or bounded_tool_result(result) != (result, False):
                         raise ValueError("invalid tool result")
                     clean_call["result"] = result
                 if "resultTruncated" in call:
