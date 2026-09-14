@@ -11,16 +11,15 @@ def call(call_id, name="exec", arguments='{"command":"pwd"}'):
 
 
 @pytest.mark.asyncio
-async def test_preparation_queue_execution_and_result_are_distinct_ordered_snapshots():
+async def test_queue_execution_and_result_are_distinct_ordered_snapshots():
     events = []
 
     async def publish(event):
         events.append(event)
 
     progress = ToolProgress("run-a", publish)
-    await progress.preview(0, ToolCallPreview(0, "first", "exec", '{"command":'))
-    first_snapshot = deepcopy(events[0])
     await progress.announce(0, [call("first"), call("second")])
+    first_snapshot = deepcopy(events[0])
     await progress.start("first", "exec", {"command": "pwd"})
     assert events[-1]["call"]["state"] == "running"
     assert progress.calls["second"]["state"] == "queued"
@@ -28,7 +27,7 @@ async def test_preparation_queue_execution_and_result_are_distinct_ordered_snaps
     await progress.start("second", "exec", {"command": "pwd"})
     await progress.result("second", "Error: fixture failure", failed=True)
     assert [e["call"]["state"] for e in events] == [
-        "preparing", "queued", "queued", "running", "completed", "running", "failed",
+        "queued", "queued", "running", "completed", "running", "failed",
     ]
     assert [e["revision"] for e in events] == list(range(1, len(events) + 1))
     assert all(e["state"] == "tool_progress" and e["runId"] == "run-a" for e in events)
@@ -38,19 +37,18 @@ async def test_preparation_queue_execution_and_result_are_distinct_ordered_snaps
 
 
 @pytest.mark.asyncio
-async def test_stop_seals_previews_and_queued_calls_without_claiming_completion():
+async def test_stop_seals_running_and_queued_calls_without_claiming_completion():
     events = []
 
     async def publish(event):
         events.append(event)
 
     progress = ToolProgress("run", publish)
-    await progress.preview(7, ToolCallPreview(2, "preview", "write_file", "{"))
     await progress.announce(7, [call("preview", "write_file"), call("queued")])
     await progress.start("preview", "write_file", {})
     await progress.settle("stopped")
     count = len(events)
-    await progress.preview(7, ToolCallPreview(2, "preview", "write_file", "late"))
+    await progress.announce(7, [call("preview", "write_file"), call("queued")])
     await progress.result("preview", "late", failed=False)
     assert len(events) == count
     assert all(record["state"] == "stopped" for record in progress.calls.values())
@@ -58,21 +56,21 @@ async def test_stop_seals_previews_and_queued_calls_without_claiming_completion(
 
 
 @pytest.mark.asyncio
-async def test_retries_close_orphan_preparations_and_keep_revisions_monotonic():
+async def test_new_iterations_close_unfinished_calls_and_keep_revisions_monotonic():
     events = []
 
     async def publish(event):
         events.append(event)
 
     progress = ToolProgress("run", publish)
-    await progress.preview(0, ToolCallPreview(1, "abandoned", "read_file", "{"))
-    await progress.announce(0, [call("accepted")])
-    assert progress.calls["abandoned"]["state"] == "stopped"
+    await progress.announce(0, [call("abandoned", "read_file")])
+    await progress.announce(1, [call("accepted")])
+    assert any(e["call"]["id"] == "abandoned" and e["call"]["state"] == "stopped" for e in events)
     await progress.result("accepted", "x" * 50000, failed=False)
     result = events[-1]["call"]
     assert len(result["result"]) == 32768 and result["resultTruncated"]
     last_revision = events[-1]["revision"]
-    await progress.preview(3, ToolCallPreview(0, "next", "exec", "{}"))
+    await progress.announce(3, [call("next")])
     assert events[-1]["iterationIdx"] == 3 and events[-1]["revision"] > last_revision
     assert len(progress.calls) == 1
 
@@ -109,7 +107,7 @@ def test_inflight_replay_is_scoped_revisioned_and_detached():
 
 
 @pytest.mark.asyncio
-async def test_real_loop_exposes_preparation_and_actual_sequential_execution(tmp_path, monkeypatch):
+async def test_real_loop_hides_partial_arguments_and_publishes_actual_sequential_execution(tmp_path, monkeypatch):
     from flowly.agent.loop import AgentLoop
     from flowly.agent.tools.base import Tool
     from flowly.bus.queue import MessageBus
@@ -151,7 +149,7 @@ async def test_real_loop_exposes_preparation_and_actual_sequential_execution(tmp
                 yield LLMResponse(content=None, finish_reason="", tool_call_previews=[
                     ToolCallPreview(0, "first", "progress_lookup", '{"value":'),
                 ])
-                assert events[-1]["call"]["state"] == "preparing" and not executed
+                assert not events and not executed, "Partial arguments must not publish tool activity"
                 yield LLMResponse(content=None, finish_reason="tool_calls", tool_calls=[
                     ToolCallRequest("first", "progress_lookup", {"value": "first"}),
                     ToolCallRequest("second", "progress_lookup", {"value": "second"}),
@@ -175,6 +173,7 @@ async def test_real_loop_exposes_preparation_and_actual_sequential_execution(tmp
     assert executed == ["first", "second"]
     assert text == ["Checking.", "Finished."]
     activity = [e for e in events if e.get("state") == "tool_progress"]
+    assert [e["call"]["state"] for e in activity] == ["queued", "queued", "running", "completed", "running", "completed"]
     assert activity[-1]["call"]["state"] == "completed"
     assert activity[-1]["call"]["result"] == "result second"
     canonical = [e for e in events if e.get("role")]

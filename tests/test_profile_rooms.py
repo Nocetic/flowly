@@ -2840,6 +2840,7 @@ async def test_precise_tool_progress_preserves_text_results_and_state_across_rel
     await progress(99, "preparing", index=128)
     assert service._live_patch(room["id"])["activities"] == []
     await progress(1, "preparing")
+    assert service._live_patch(room["id"])["activities"] == [], "Legacy preparation must not be relayed to group clients"
     await progress(2, "queued")
     assert service._live_patch(room["id"])["activities"][0]["executionState"] == "queued"
     await progress(3, "running")

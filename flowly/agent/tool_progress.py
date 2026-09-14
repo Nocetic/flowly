@@ -6,11 +6,11 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from flowly.providers.tool_preview import MAX_PREVIEW_ARGUMENTS, ToolCallPreview
 from flowly.tool_activity import project_tool_call_for_ui
 from flowly.utils.display_text import bounded_tool_result
 
 _TERMINAL = frozenset({"completed", "failed", "stopped"})
+_MAX_ARGUMENTS = 16_384
 
 
 class ToolProgress:
@@ -38,20 +38,6 @@ class ToolProgress:
         except Exception:
             logger.debug("Tool progress delivery failed (non-fatal)", exc_info=True)
 
-    async def preview(self, iteration: int, preview: ToolCallPreview) -> None:
-        if not preview.id or not preview.name:
-            return
-        await self._batch(iteration)
-        previous = self.calls.get(preview.id)
-        if previous and previous["state"] != "preparing":
-            return
-        call = {"id": preview.id, "index": preview.index, "name": preview.name,
-                "arguments": preview.arguments, "argumentsTruncated": preview.arguments_truncated,
-                "state": "preparing"}
-        if call != previous:
-            self.calls[preview.id] = call
-            await self._emit(call)
-
     async def announce(self, iteration: int, calls: list[dict[str, Any]]) -> None:
         await self._batch(iteration)
         accepted = {call.get("id") for call in calls}
@@ -65,13 +51,13 @@ class ToolProgress:
             if not isinstance(call_id, str) or not call_id:
                 continue
             previous = self.calls.get(call_id)
-            if previous and previous["state"] != "preparing":
+            if previous:
                 continue
             function = projected.get("function") or {}
             arguments = str(function.get("arguments") or "{}")
             call = {"id": call_id, "index": index, "name": str(function.get("name") or "")[:128],
-                    "arguments": arguments[:MAX_PREVIEW_ARGUMENTS],
-                    "argumentsTruncated": len(arguments) > MAX_PREVIEW_ARGUMENTS, "state": "queued"}
+                    "arguments": arguments[:_MAX_ARGUMENTS],
+                    "argumentsTruncated": len(arguments) > _MAX_ARGUMENTS, "state": "queued"}
             self.calls[call_id] = call
             await self._emit(call)
 
@@ -81,8 +67,8 @@ class ToolProgress:
             return
         encoded = json.dumps(arguments, ensure_ascii=False, default=str)
         call.update(state="running", name=name[:128], startedAt=int(time.time() * 1000),
-                    arguments=encoded[:MAX_PREVIEW_ARGUMENTS],
-                    argumentsTruncated=len(encoded) > MAX_PREVIEW_ARGUMENTS)
+                    arguments=encoded[:_MAX_ARGUMENTS],
+                    argumentsTruncated=len(encoded) > _MAX_ARGUMENTS)
         await self._emit(call)
 
     async def result(self, call_id: str, result: str, *, failed: bool, stopped: bool = False) -> None:

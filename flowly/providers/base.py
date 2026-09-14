@@ -153,8 +153,9 @@ class LLMResponse:
     # exact position. AgentLoop persists the opaque envelope under
     # ``PROVIDER_REPLAY_KEY``; product surfaces never expose it.
     provider_replay: dict[str, Any] = field(default_factory=dict)
-    # Display-only preparation snapshots. Never persisted as provider history
-    # or placed in tool_calls; only a completed response can authorize execution.
+    # Internal partial-argument activity keeps the stream watchdog alive.
+    # Never sent to clients, persisted as history or placed in tool_calls;
+    # only a completed response can authorize execution.
     tool_call_previews: list[ToolCallPreview] = field(default_factory=list)
 
     @property

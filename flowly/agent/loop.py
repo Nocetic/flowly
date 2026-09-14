@@ -5044,7 +5044,6 @@ class AgentLoop:
         tool_choice: str,
         stream_callback: Callable[[str], Awaitable[None]],
         run_id: str = "",
-        tool_preview_callback: Callable[[Any], Awaitable[None]] | None = None,
     ):
         """
         Call provider.chat_stream(), fire stream_callback for each text delta,
@@ -5084,13 +5083,10 @@ class AgentLoop:
                     if run_id and self.is_run_aborted(run_id):
                         aborted = True
                         break
-                    for preview in chunk.tool_call_previews:
-                        self._touch_activity("preparing tool request")
-                        if tool_preview_callback is not None:
-                            try:
-                                await tool_preview_callback(preview)
-                            except Exception:
-                                logger.debug("Tool preview delivery failed (non-fatal)", exc_info=True)
+                    if chunk.tool_call_previews:
+                        # Partial arguments keep the watchdog alive but never
+                        # create a user-facing preparation stage or tool call.
+                        self._touch_activity("receiving tool arguments")
                     # Error text is routing input, not user-visible model output.
                     # Keep it on the final response for classification but never
                     # stream raw provider/SDK payloads into a client bubble.
@@ -5277,7 +5273,6 @@ class AgentLoop:
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
         provider_state: dict[str, Any] | None = None,
         provider_state_out: dict[str, Any] | None = None,
-        tool_preview_callback: Callable[[Any], Awaitable[None]] | None = None,
     ) -> tuple[LLMResponse, list[dict[str, Any]]]:
         """Budget, dispatch, and recover one main-agent provider request.
 
@@ -5353,7 +5348,6 @@ class AgentLoop:
                         tool_choice=tool_choice,
                         stream_callback=stream_callback,
                         run_id=run_id,
-                        tool_preview_callback=tool_preview_callback,
                     )
                 else:
                     response = await self._chat_without_stream(
@@ -5767,9 +5761,6 @@ class AgentLoop:
 
         progress = ToolProgress(outbound_run_id, publish_progress)
 
-        async def preview_tool(preview: Any) -> None:
-            await progress.preview(_iteration_event_idx, preview)
-
         async def emit_iteration(**event: Any) -> None:
             message = event["message"]
             if message.get("role") == "assistant" and message.get("tool_calls"):
@@ -6123,7 +6114,6 @@ class AgentLoop:
                     run_id=outbound_run_id,
                     iteration=iteration,
                     stream_callback=stream_callback if use_stream else None,
-                    tool_preview_callback=preview_tool if use_stream else None,
                     provider_state=continuity_state,
                     provider_state_out=provider_state_out,
                 )
