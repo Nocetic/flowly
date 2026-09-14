@@ -3185,6 +3185,13 @@ class GatewayServer:
         # tracks) so the client accepts the events regardless of any internal
         # run id the loop used.
         async def iteration_callback(event: dict) -> None:
+            if event.get("state") == "tool_progress":
+                wrapped = {**event, "runId": run_id}
+                inflight.append_tool_progress(session_key, run_id, wrapped)
+                await self._session_send(
+                    session_key, ws, {"type": "event", "event": "chat", "data": wrapped}
+                )
+                return
             wrapped = {**event, "state": "iteration_step", "runId": run_id}
             # Persist the tool-turn event so a client that re-enters mid-stream
             # can rebuild the live tool-call panel (chat.inflight returns these),

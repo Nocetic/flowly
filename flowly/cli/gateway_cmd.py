@@ -1598,6 +1598,7 @@ Respond to the user now:"""
             render_capabilities=render_capabilities,
             return_metadata=True,
             on_iteration=iteration_callback,
+            on_tool_progress=iteration_callback,
             run_id=run_id,
             defer_goal_delivery=True,
             extra_metadata=extra_metadata,

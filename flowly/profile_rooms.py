@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from loguru import logger
 
 from flowly.profile import default_home
+from flowly.utils.display_text import bounded_tool_result
 from flowly.profile_host_contract import MAX_PROFILE_MESSAGE_CHARS, ProfileHostError
 from flowly.profile_room_store import (
     RoomStoreConflictError,
@@ -64,6 +65,8 @@ _MAX_HISTORY_CURSOR_CHARS = 512
 _MAX_SUMMARY_CONTENT_CHARS = 512
 _MAX_LEGACY_STORE_BYTES = 16 * 1024 * 1024
 _MAX_TOOL_CALLS = 8
+_TOOL_TERMINAL_STATES = frozenset({"completed", "failed", "stopped", "unknown"})
+_TOOL_EXECUTION_STATES = _TOOL_TERMINAL_STATES | {"queued", "running"}
 _MAX_ATTACHMENTS = 10
 _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 _MAX_ATTACHMENT_B64_CHARS = ((_MAX_ATTACHMENT_BYTES + 2) // 3) * 4
@@ -212,6 +215,7 @@ def _message_weight(message: dict[str, Any]) -> int:
     for call in message.get("toolCalls") or []:
         if isinstance(call, dict):
             weight += len(str(call.get("argumentsJson") or ""))
+            weight += len(str(call.get("result") or ""))
     for attachment in message.get("attachments") or []:
         if isinstance(attachment, dict):
             weight += len(str(attachment.get("thumbnail") or ""))
@@ -2207,8 +2211,31 @@ class ProfileRoomService:
         if event != "chat":
             return True
         state = str(payload.get("state") or "")
+        if state == "tool_progress":
+            call = payload.get("call")
+            revision = payload.get("revision")
+            iteration = payload.get("iterationIdx")
+            if (
+                isinstance(call, dict)
+                and isinstance(iteration, int) and not isinstance(iteration, bool)
+                and 0 <= iteration <= 9_007_199_254_740_991
+                and isinstance(call.get("index"), int) and not isinstance(call["index"], bool)
+                and 0 <= call["index"] < 128
+                and isinstance(revision, int) and not isinstance(revision, bool)
+                and 0 < revision <= 9_007_199_254_740_991
+                and isinstance(call.get("state"), str) and call["state"] in _TOOL_EXECUTION_STATES
+                and self._update_activity(room_id, profile, {
+                    "phase": "progress", "toolCallId": call.get("id"),
+                    "name": call.get("name"), "argumentsJson": call.get("arguments"),
+                    "executionState": call.get("state"), "progressRevision": revision,
+                    "result": call.get("result"), "resultTruncated": call.get("resultTruncated"),
+                })
+            ):
+                await self._emit_live(room_id, "activity", profile)
+            return True
         if state == "iteration_step":
-            self._streams.get(room_id, {}).pop(profile, None)
+            if payload.get("role") == "assistant":
+                self._streams.get(room_id, {}).pop(profile, None)
             changed = self._iteration_activities(room_id, profile, payload)
             await self._emit_live(room_id, "activity" if changed else "stream", profile)
             return True
@@ -2845,7 +2872,7 @@ class ProfileRoomService:
                     terminal = None
                 if isinstance(terminal, dict):
                     content = _final_text(terminal)
-            calls = self._tool_calls(room_id, profile)
+            calls = self._tool_calls(room_id, profile, unfinished="stopped")
             message: dict[str, Any] = {
                 "id": str(uuid.uuid4()),
                 "role": "assistant",
@@ -3305,34 +3332,72 @@ class ProfileRoomService:
         value: dict[str, Any],
     ) -> bool:
         phase = value.get("phase")
-        call_id = str(value.get("toolCallId") or "")[:256]
-        name = str(value.get("name") or "")[:128]
-        if phase not in {"start", "result"} or not call_id:
+        raw_id = value.get("toolCallId")
+        if not isinstance(raw_id, str) or not raw_id or len(raw_id) > 256 or "\x00" in raw_id:
+            return False
+        call_id = raw_id
+        if phase not in {"start", "result", "progress"}:
             return False
         key = (profile, call_id)
-        existing = self._activities.setdefault(room_id, {}).get(key)
-        if not name and existing:
-            name = existing["toolName"]
-        if not name:
+        activities = self._activities.setdefault(room_id, {})
+        existing = activities.get(key)
+        revision = value.get("progressRevision")
+        if phase == "progress" and (
+            not isinstance(revision, int) or isinstance(revision, bool)
+            or not 0 < revision <= 9_007_199_254_740_991
+            or revision <= (existing or {}).get("progressRevision", 0)
+        ):
             return False
-        arguments = (
-            _project_arguments(name, value.get("argumentsJson", value.get("args")))
-            if phase == "start"
-            else (existing or {}).get("argumentsJson", "{}")
+        incoming_name = value.get("name")
+        name = incoming_name if isinstance(incoming_name, str) and incoming_name else (existing or {}).get("toolName", "")
+        if not name or len(name) > 128 or "\x00" in name:
+            return False
+        old_state = (existing or {}).get("executionState", (existing or {}).get("state"))
+        incoming_state = value.get("executionState")
+        known_state = isinstance(incoming_state, str) and incoming_state in _TOOL_EXECUTION_STATES
+        if phase == "progress" and not known_state:
+            return False
+        state = incoming_state if known_state else (
+            "completed" if phase == "result" else "running"
         )
+        if phase == "progress" and old_state in _TOOL_TERMINAL_STATES and (
+            (existing or {}).get("progressRevision") or state not in _TOOL_TERMINAL_STATES
+        ):
+            return False
+        # A legacy iteration/lifecycle duplicate cannot restart a terminal
+        # call or override the more precise, revisioned execution state.
+        if phase != "progress" and (
+            old_state in _TOOL_TERMINAL_STATES or (existing or {}).get("progressRevision")
+        ):
+            state = old_state
+        if phase != "progress" and (existing or {}).get("progressRevision"):
+            name = existing["toolName"]
+        arguments = (existing or {}).get("argumentsJson", "{}")
+        if phase in {"start", "progress"}:
+            projected = _project_arguments(name, value.get("argumentsJson", value.get("args")))
+            if projected != "{}" or not existing:
+                arguments = projected
         next_value = {
-            "id": call_id,
-            "profile": profile,
-            "toolName": name,
+            **(existing or {}),
+            "activityId": (existing or {}).get("activityId") or str(uuid.uuid4()),
+            "id": call_id, "profile": profile, "toolName": name,
             "argumentsJson": arguments,
-            "state": "completed"
-            if phase == "result" or (existing or {}).get("state") == "completed"
-            else "running",
+            # Preserve the old wire enum for clients predating precise states.
+            "state": "completed" if state in _TOOL_TERMINAL_STATES else "running",
+            "executionState": state,
             "startedAt": (existing or {}).get("startedAt", int(time.time() * 1000)),
         }
+        if phase == "progress":
+            next_value["progressRevision"] = revision
+        result = value.get("result")
+        if isinstance(result, str) and (
+            "result" not in next_value or phase == "progress"
+        ):
+            next_value["result"], truncated = bounded_tool_result(result)
+            next_value["resultTruncated"] = value.get("resultTruncated") is True or truncated
         if existing == next_value:
             return False
-        self._activities[room_id][key] = next_value
+        activities[key] = next_value
         return True
 
     def _iteration_activities(
@@ -3352,16 +3417,18 @@ class ProfileRoomService:
                     "toolCallId": raw.get("id"),
                     "name": function.get("name"),
                     "argumentsJson": function.get("arguments"),
+                    "executionState": "queued",
                 }) or changed
         elif payload.get("role") == "tool":
             changed = self._update_activity(room_id, profile, {
                 "phase": "result",
                 "toolCallId": payload.get("tool_call_id"),
                 "name": payload.get("name"),
+                "result": payload.get("content"),
             }) or changed
         return changed
 
-    def _tool_calls(self, room_id: str, profile: str) -> list[dict[str, Any]]:
+    def _tool_calls(self, room_id: str, profile: str, *, unfinished: str = "unknown") -> list[dict[str, Any]]:
         values = [
             value
             for (owner, _), value in self._activities.get(room_id, {}).items()
@@ -3371,8 +3438,11 @@ class ProfileRoomService:
         return [
             {
                 "id": value["id"],
+                **({"activityId": value["activityId"]} if value.get("activityId") else {}),
                 "name": value["toolName"],
                 "argumentsJson": value["argumentsJson"],
+                "executionState": value["executionState"] if value.get("executionState") in _TOOL_TERMINAL_STATES else unfinished,
+                **({"result": value["result"], "resultTruncated": value.get("resultTruncated", False)} if "result" in value else {}),
             }
             for value in values[-_MAX_TOOL_CALLS:]
         ]
@@ -3870,7 +3940,7 @@ class ProfileRoomService:
             calls = message.get("toolCalls", [])
             if not isinstance(calls, list) or len(calls) > _MAX_TOOL_CALLS:
                 raise ValueError("invalid tool calls")
-            clean_calls: list[dict[str, str]] = []
+            clean_calls: list[dict[str, Any]] = []
             call_ids: set[str] = set()
             for call in calls:
                 if not isinstance(call, dict):
@@ -3900,11 +3970,26 @@ class ProfileRoomService:
                     raise ValueError("invalid tool arguments") from exc
                 if not isinstance(parsed_arguments, dict):
                     raise ValueError("invalid tool arguments")
-                clean_calls.append({
-                    "id": call_id,
-                    "name": name,
-                    "argumentsJson": arguments,
-                })
+                clean_call = {"id": call_id, "name": name, "argumentsJson": arguments}
+                if "activityId" in call:
+                    activity_id = call["activityId"]
+                    if not isinstance(activity_id, str) or not activity_id or len(activity_id) > 256 or "\x00" in activity_id:
+                        raise ValueError("invalid tool activity identity")
+                    clean_call["activityId"] = activity_id
+                if "executionState" in call:
+                    if not isinstance(call["executionState"], str) or call["executionState"] not in _TOOL_TERMINAL_STATES:
+                        raise ValueError("invalid settled tool state")
+                    clean_call["executionState"] = call["executionState"]
+                if "result" in call:
+                    result = call["result"]
+                    if not isinstance(result, str) or bounded_tool_result(result) != (result, False):
+                        raise ValueError("invalid tool result")
+                    clean_call["result"] = result
+                if "resultTruncated" in call:
+                    if not isinstance(call["resultTruncated"], bool):
+                        raise ValueError("invalid tool result truncation")
+                    clean_call["resultTruncated"] = call["resultTruncated"]
+                clean_calls.append(clean_call)
             tools = message.get("tools", [])
             if not isinstance(tools, list) or len(tools) > _MAX_TOOL_CALLS:
                 raise ValueError("invalid tools")

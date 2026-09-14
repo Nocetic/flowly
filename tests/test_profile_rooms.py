@@ -676,8 +676,10 @@ async def test_stop_checkpoints_partial_member_reply_as_aborted_history(tmp_path
     assert isinstance(reply["durationMs"], int)
     assert reply["toolCalls"] == [{
         "id": "read-1",
+        "activityId": reply["toolCalls"][0]["activityId"],
         "name": "read_file",
         "argumentsJson": '{"path":"/workspace/report.md"}',
+        "executionState": "stopped",
     }]
     assert settled["running"] is False
     assert settled["runState"]["state"] == "aborted"
@@ -1415,8 +1417,10 @@ async def test_tool_activity_is_projected_and_attached_to_durable_reply(tmp_path
     reply = (await service.list())[0]["messages"][-1]
     assert reply["toolCalls"] == [{
         "id": "call-1",
+        "activityId": reply["toolCalls"][0]["activityId"],
         "name": "read_file",
         "argumentsJson": '{"path":"/safe/file.txt"}',
+        "executionState": "completed",
     }]
     assert not any("drop-me" in json.dumps(event) for event in events)
 
@@ -2811,3 +2815,114 @@ def test_no_user_facing_code_is_only_a_developer_code() -> None:
     assert not set(rooms_module.ROOM_ERROR_CODES) & set(
         rooms_module.ROOM_DEVELOPER_ERROR_CODES
     )
+
+
+@pytest.mark.asyncio
+async def test_precise_tool_progress_preserves_text_results_and_state_across_reload(tmp_path: Path) -> None:
+    path = tmp_path / "rooms.json"
+
+    async def rpc(profile: str, method: str, params: dict[str, Any], timeout: float):
+        return {"runId": "progress-run"} if method == "chat.send" else {"ok": True}
+
+    service = ProfileRoomService(target_rpc=rpc, profile_directory=lambda: ["default", "writer"], on_event=None, store_path=path)
+    room = await service.create("Council", ["default", "writer"])
+    await service.send(room["id"], "@writer inspect")
+    await _eventually(lambda: bool(service._waiters))
+    envelope = {"sessionKey": f"desktop:profile-room:{room['id']}", "runId": "progress-run"}
+
+    async def progress(revision: int, state: str, **extra: Any) -> None:
+        await service.handle_profile_event("writer", "chat", {
+            **envelope, "state": "tool_progress", "iterationIdx": 0, "revision": revision,
+            "call": {"id": "read-1", "name": "read_file", "index": 0, "state": state,
+                     "arguments": '{"path":"/safe/file.txt","secret":"private-argument"}', **extra},
+        })
+
+    await progress(99, "preparing", index=128)
+    assert service._live_patch(room["id"])["activities"] == []
+    await progress(1, "preparing")
+    assert service._live_patch(room["id"])["activities"] == [], "Legacy preparation must not be relayed to group clients"
+    await progress(2, "queued")
+    assert service._live_patch(room["id"])["activities"][0]["executionState"] == "queued"
+    await progress(3, "running")
+    await service.handle_profile_event("writer", "agent", {
+        **envelope, "stream": "assistant", "data": {"text": "Visible continuation"},
+    })
+    await progress(4, "failed", result="Permission denied", resultTruncated=False)
+    # Delayed preparation and legacy duplicates must not restart an already
+    # settled tool, replace its result, or erase a later assistant prefix.
+    await progress(2, "preparing", result="stale")
+    await progress(5, "running", result="late")
+    await service.handle_profile_event("writer", "chat", {
+        **envelope, "state": "iteration_step", "role": "tool", "tool_call_id": "read-1",
+        "name": "read_file", "content": "Permission denied",
+    })
+    patch = service._live_patch(room["id"])
+    assert patch["streams"]["writer"] == "Visible continuation"
+    activity = patch["activities"][0]
+    assert activity["state"] == "completed"  # Old clients retain their wire enum.
+    assert activity["executionState"] == "failed"
+    assert activity["result"] == "Permission denied"
+    assert "private-argument" not in json.dumps(patch)
+    await service.handle_profile_event("writer", "chat", {
+        **envelope, "state": "final", "message": {"content": "Unable to read the file."},
+    })
+    await _eventually(lambda: _room_settled(service, room["id"]))
+    expected = [{"id": "read-1", "activityId": activity["activityId"], "name": "read_file", "argumentsJson": '{"path":"/safe/file.txt"}',
+                 "executionState": "failed", "result": "Permission denied", "resultTruncated": False}]
+    assert (await service.list())[0]["messages"][-1]["toolCalls"] == expected
+    await service.shutdown()
+    reloaded = ProfileRoomService(target_rpc=rpc, profile_directory=lambda: ["default", "writer"], on_event=None, store_path=path)
+    assert (await reloaded.list())[0]["messages"][-1]["toolCalls"] == expected
+    await reloaded.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_room_tool_results_are_bounded_and_unfinished_calls_are_not_successes(tmp_path: Path) -> None:
+    async def rpc(*args: Any):
+        return {"ok": True}
+
+    service = ProfileRoomService(target_rpc=rpc, profile_directory=lambda: ["default", "writer"], on_event=None, store_path=tmp_path / "rooms.json")
+    room = await service.create("Council", ["default", "writer"])
+    assert service._update_activity(room["id"], "writer", {"phase": "start", "toolCallId": "a", "name": "exec", "args": {"command": "pwd"}})
+    assert service._tool_calls(room["id"], "writer")[0]["executionState"] == "unknown"
+    assert service._tool_calls(room["id"], "writer", unfinished="stopped")[0]["executionState"] == "stopped"
+    for revision in [None, True, -1, 0, "1", 2**53]:
+        assert not service._update_activity(room["id"], "writer", {"phase": "progress", "toolCallId": "a", "name": "exec", "executionState": "running", "progressRevision": revision})
+    assert not service._update_activity(room["id"], "writer", {"phase": "progress", "toolCallId": "a", "name": "exec", "executionState": {}, "progressRevision": 1})
+    assert service._update_activity(room["id"], "writer", {"phase": "result", "toolCallId": "a", "name": "exec", "result": "x" * 40_000, "private": "do not copy"})
+    call = service._tool_calls(room["id"], "writer")[0]
+    assert len(call["result"]) == 32_768 and call["resultTruncated"] is True
+    assert "do not copy" not in json.dumps(call)
+    # A precise terminal can correct a legacy terminal with no outcome flag.
+    assert service._update_activity(room["id"], "writer", {"phase": "progress", "toolCallId": "a", "name": "exec", "executionState": "failed", "progressRevision": 3, "result": "Failed\x00output"})
+    call = service._tool_calls(room["id"], "writer")[0]
+    assert call["executionState"] == "failed" and call["result"] == "Failed\ufffdoutput"
+    assert call["resultTruncated"] is False
+    # The desktop wire limit is UTF-16 units, not Python code points.
+    assert service._update_activity(room["id"], "writer", {"phase": "result", "toolCallId": "unicode", "name": "exec", "result": "a" + "🙂" * 20_000})
+    unicode_call = next(call for call in service._tool_calls(room["id"], "writer") if call["id"] == "unicode")
+    assert unicode_call["result"] == "a" + "🙂" * 16_383
+    assert unicode_call["resultTruncated"] is True
+    assert len(unicode_call["result"].encode("utf-16-le")) <= 65_536
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_room_tool_identity_is_per_member_and_execution_not_provider_id(tmp_path: Path) -> None:
+    async def rpc(*args: Any):
+        return {"ok": True}
+
+    service = ProfileRoomService(target_rpc=rpc, profile_directory=lambda: ["default", "writer"], on_event=None, store_path=tmp_path / "rooms.json")
+    room = await service.create("Council", ["default", "writer"])
+    event = {"phase": "start", "toolCallId": "same-provider-id", "name": "exec"}
+    for profile in ["default", "writer"]:
+        assert service._update_activity(room["id"], profile, event)
+    first = service._tool_calls(room["id"], "default")[0]["activityId"]
+    other = service._tool_calls(room["id"], "writer")[0]["activityId"]
+    assert isinstance(first, str) and first and first != other
+    service._update_activity(room["id"], "default", {**event, "phase": "result", "result": "done"})
+    assert service._tool_calls(room["id"], "default")[0]["activityId"] == first
+    service._finish_member(room["id"], "default")
+    service._update_activity(room["id"], "default", event)
+    assert service._tool_calls(room["id"], "default")[0]["activityId"] not in {first, other}
+    await service.shutdown()

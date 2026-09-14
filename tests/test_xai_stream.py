@@ -8,9 +8,19 @@ finish_reason set, tool_calls + usage).
 """
 
 import asyncio
+import pytest
 
 import flowly.providers.xai_responses_provider as xai
 from flowly.providers.xai_responses_provider import XAIResponsesProvider
+
+
+@pytest.fixture(autouse=True)
+def restore_http_client():
+    original = xai.httpx.AsyncClient
+    try:
+        yield
+    finally:
+        xai.httpx.AsyncClient = original
 
 
 class _FakeStream:

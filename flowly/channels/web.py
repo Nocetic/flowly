@@ -860,6 +860,15 @@ class WebChannel(BaseChannel):
         """
         session_id = msg.chat_id  # chat_id = sessionId for web channel
 
+        progress = msg.metadata.get("tool_progress_event")
+        if isinstance(progress, dict) and progress.get("state") == "tool_progress":
+            data = {**progress, "sessionKey": self._session_key_for_relay_id(session_id), "source": "relay"}
+            await self._send_or_queue(json.dumps({
+                "type": "event", "sessionId": session_id, "event": "chat", "data": data,
+            }))
+            asyncio.create_task(self._emit_local_event("chat", data))
+            return
+
         # Goal status is CHIP state, not conversation: emit the snapshot as a
         # `goal.updated` event only. Sending the explanatory text as a chat
         # final would persist a fake assistant bubble in every client.

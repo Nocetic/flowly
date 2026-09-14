@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterator
 
+from flowly.providers.tool_preview import ToolCallPreview
+
 # Prompt-only control row. It is never persisted as a conversation message;
 # eligible Responses providers translate it into an opaque input item while
 # every other provider sees no row at all.
@@ -151,6 +153,10 @@ class LLMResponse:
     # exact position. AgentLoop persists the opaque envelope under
     # ``PROVIDER_REPLAY_KEY``; product surfaces never expose it.
     provider_replay: dict[str, Any] = field(default_factory=dict)
+    # Internal partial-argument activity keeps the stream watchdog alive.
+    # Never sent to clients, persisted as history or placed in tool_calls;
+    # only a completed response can authorize execution.
+    tool_call_previews: list[ToolCallPreview] = field(default_factory=list)
 
     @property
     def has_tool_calls(self) -> bool:

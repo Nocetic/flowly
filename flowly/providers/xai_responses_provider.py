@@ -20,6 +20,7 @@ from flowly.auth.xai_oauth import (
     resolve_runtime_credentials,
     validate_xai_oauth_base_url,
 )
+from flowly.providers.tool_preview import ResponseToolPreviews
 from flowly.providers.base import (
     LLMProvider,
     LLMResponse,
@@ -369,6 +370,8 @@ class XAIResponsesProvider(LLMProvider):
                     if text:
                         content_parts.append(text)
                 elif item_type in {"function_call", "custom_tool_call"}:
+                    if status == "incomplete":
+                        continue
                     name = str(item.get("name") or "")
                     raw_args = item.get("arguments") if item_type == "function_call" else item.get("input")
                     if isinstance(raw_args, dict):
@@ -376,8 +379,13 @@ class XAIResponsesProvider(LLMProvider):
                     else:
                         try:
                             args = json.loads(raw_args or "{}")
-                        except json.JSONDecodeError:
-                            args = {"raw": str(raw_args or "")}
+                        except (json.JSONDecodeError, TypeError):
+                            if item_type == "custom_tool_call":
+                                args = {"raw": str(raw_args or "")}
+                            else:
+                                return self._error_response(RuntimeError("Response returned incomplete tool arguments"))
+                    if not isinstance(args, dict) or not name:
+                        return self._error_response(RuntimeError("Response returned invalid tool arguments"))
                     call_id = str(item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}")
                     tool_calls.append(ToolCallRequest(id=call_id, name=name, arguments=args))
 
@@ -439,6 +447,7 @@ class XAIResponsesProvider(LLMProvider):
             "User-Agent": "flowly/xai-responses",
         }
 
+        delivered_output = False
         try:
             for attempt in range(2):
                 streamed_text = False
@@ -472,6 +481,7 @@ class XAIResponsesProvider(LLMProvider):
                                 self._redact(body[:500]),
                             )
 
+                        previews = ResponseToolPreviews()
                         async for line in response.aiter_lines():
                             line = line.strip()
                             if not line or not line.startswith("data:"):
@@ -483,22 +493,34 @@ class XAIResponsesProvider(LLMProvider):
                                 event = json.loads(data_str)
                             except json.JSONDecodeError:
                                 continue
+                            if not isinstance(event, dict):
+                                continue
+                            preview = previews.consume(event)
+                            if preview is not None:
+                                delivered_output = True
+                                yield LLMResponse(content=None, finish_reason="", tool_call_previews=[preview])
                             etype = str(event.get("type") or "")
                             if etype == "response.output_text.delta":
                                 delta = event.get("delta")
                                 if isinstance(delta, str) and delta:
                                     streamed_text = True
+                                    delivered_output = True
                                     yield LLMResponse(content=delta, finish_reason="")
                             elif etype in {"response.completed", "response.incomplete"}:
                                 full = event.get("response")
+                                if isinstance(full, dict) and etype == "response.incomplete":
+                                    full = {**full, "status": "incomplete"}
                                 parsed = (
                                     self._parse_response(full)
                                     if isinstance(full, dict)
-                                    else LLMResponse(content=None, finish_reason="stop")
+                                    else self._error_response(RuntimeError("Malformed terminal response"))
                                 )
                                 # If the model never emitted text deltas (some
                                 # turns send only the final payload), stream the
                                 # full text now so the user still sees the reply.
+                                if parsed.finish_reason == "error":
+                                    yield parsed
+                                    return
                                 if not streamed_text and parsed.content:
                                     yield LLMResponse(content=parsed.content, finish_reason="")
                                 yield LLMResponse(
@@ -516,15 +538,11 @@ class XAIResponsesProvider(LLMProvider):
                                 )
                                 raise XAIAuthError(json.dumps(err, ensure_ascii=False)[:500])
 
-                        # Stream closed without a terminal ``response.completed``.
-                        if streamed_text:
-                            # Text already delivered — just close the turn.
-                            yield LLMResponse(content=None, finish_reason="stop")
-                            return
-                        # Nothing usable parsed (unexpected event shape): don't
-                        # leave the turn empty — fall back to the blocking call.
                         raise XAIAuthError("xAI stream closed without recognizable output")
         except Exception as exc:
+            if delivered_output:
+                yield self._error_response(exc)
+                return
             # Never leave a turn empty: fall back to the blocking Responses call
             # (the model still answers, just without live tokens this turn).
             logger.warning("xAI stream failed ({}); falling back to blocking call", self._redact(str(exc)))

@@ -340,6 +340,12 @@ async def test_chat_stream_accumulates_text_usage_and_tool_calls(monkeypatch):
     ]
 
     assert chunks[0].content == "Hi"
+    previews = [preview for chunk in chunks for preview in chunk.tool_call_previews]
+    assert [(preview.name, preview.arguments) for preview in previews] == [
+        ("get_weather", ""), ("get_weather", '{"city":'),
+        ("get_weather", '{"city":"Istanbul"}'),
+    ]
+    assert all(not chunk.tool_calls for chunk in chunks[:-1])
     final = chunks[-1]
     assert final.finish_reason == "tool_calls"
     assert final.usage == {

@@ -44,6 +44,22 @@ def channel():
 
 
 @pytest.mark.asyncio
+async def test_tool_progress_forwards_immediately_without_becoming_a_final(channel):
+    progress = {"state": "tool_progress", "runId": "run", "iterationIdx": 0,
+                "revision": 1, "call": {"id": "call", "name": "exec", "state": "preparing",
+                                        "arguments": '{"command":'}}
+    await channel.send(OutboundMessage(channel="web", chat_id="session", content="",
+                                       metadata={"tool_progress_event": progress}))
+    assert len(channel._capture) == 1
+    event = channel._capture[0]
+    assert event["type"] == "event" and event["event"] == "chat"
+    assert event["sessionId"] == "session"
+    assert event["data"]["call"] == progress["call"]
+    assert event["data"]["state"] == "tool_progress"
+    assert "toolMessages" not in event["data"] and "message" not in event["data"]
+
+
+@pytest.mark.asyncio
 async def test_tool_messages_included_when_non_empty(channel) -> None:
     """Tool-using turn: relay must receive the structured tool turn
     entries so it can persist them to tool_turns/."""
