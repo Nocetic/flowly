@@ -44,6 +44,7 @@ from flowly.auth.openai_codex import (
     redact_secret,
     resolve_runtime_credentials,
 )
+from flowly.providers.tool_preview import ResponseToolPreviews
 from flowly.providers.base import (
     PROVIDER_COMPACTION_CHECKPOINT_KEY,
     PROVIDER_REPLAY_KEY,
@@ -976,6 +977,8 @@ class CodexResponsesProvider(LLMProvider):
                     if replay_item is not None:
                         replay_items.append(replay_item)
                 elif item_type in {"function_call", "custom_tool_call"}:
+                    if status == "incomplete":
+                        continue
                     name = str(item.get("name") or "")
                     raw_args = (
                         item.get("arguments") if item_type == "function_call"
@@ -986,8 +989,13 @@ class CodexResponsesProvider(LLMProvider):
                     else:
                         try:
                             args = json.loads(raw_args or "{}")
-                        except json.JSONDecodeError:
-                            args = {"raw": str(raw_args or "")}
+                        except (json.JSONDecodeError, TypeError):
+                            if item_type == "custom_tool_call":
+                                args = {"raw": str(raw_args or "")}
+                            else:
+                                return self._error_response(RuntimeError("Response returned incomplete tool arguments"))
+                    if not isinstance(args, dict) or not name:
+                        return self._error_response(RuntimeError("Response returned invalid tool arguments"))
                     call_id = str(item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}")
                     tool_calls.append(ToolCallRequest(id=call_id, name=name, arguments=args))
                 elif item_type == "compaction":
@@ -1042,6 +1050,7 @@ class CodexResponsesProvider(LLMProvider):
         request_timeout = self.request_timeout_seconds
         auth_refreshed = False
         recovery_attempts = 0
+        delivered_output = False
         try:
             for _attempt in range(4):
                 payload, session_id = self._build_payload(
@@ -1085,6 +1094,7 @@ class CodexResponsesProvider(LLMProvider):
                             )
 
                         collected_items: list[dict[str, Any]] = []
+                        previews = ResponseToolPreviews()
                         async for line in response.aiter_lines():
                             line = line.strip()
                             if not line or not line.startswith("data:"):
@@ -1096,11 +1106,18 @@ class CodexResponsesProvider(LLMProvider):
                                 event = json.loads(data_str)
                             except json.JSONDecodeError:
                                 continue
+                            if not isinstance(event, dict):
+                                continue
+                            preview = previews.consume(event)
+                            if preview is not None:
+                                delivered_output = True
+                                yield LLMResponse(content=None, finish_reason="", tool_call_previews=[preview])
                             etype = str(event.get("type") or "")
                             if etype == "response.output_text.delta":
                                 delta = event.get("delta")
                                 if isinstance(delta, str) and delta:
                                     streamed_text = True
+                                    delivered_output = True
                                     yield LLMResponse(content=delta, finish_reason="")
                             elif etype == "response.output_item.done":
                                 item = event.get("item")
@@ -1121,6 +1138,9 @@ class CodexResponsesProvider(LLMProvider):
                                     parsed,
                                     resolved_model,
                                 )
+                                if parsed.finish_reason == "error":
+                                    yield parsed
+                                    return
                                 if not streamed_text and parsed.content:
                                     yield LLMResponse(content=parsed.content, finish_reason="")
                                 yield LLMResponse(
@@ -1140,25 +1160,11 @@ class CodexResponsesProvider(LLMProvider):
                                 )
                                 raise CodexAuthError(json.dumps(err, ensure_ascii=False)[:500])
 
-                        if streamed_text or collected_items:
-                            parsed = self._parse_response(
-                                {"output": collected_items, "usage": {}, "status": "completed"}
-                            )
-                            parsed = self._merge_response_state(
-                                parsed,
-                                resolved_model,
-                            )
-                            yield LLMResponse(
-                                content=None,
-                                tool_calls=parsed.tool_calls,
-                                finish_reason=parsed.finish_reason,
-                                usage=parsed.usage,
-                                provider_state=parsed.provider_state,
-                                provider_replay=parsed.provider_replay,
-                            )
-                            return
                         raise CodexAuthError("Codex stream closed without recognizable output")
         except Exception as exc:
+            if delivered_output:
+                yield self._error_response(exc)
+                return
             logger.warning(
                 "Codex stream failed ({}); falling back to blocking call", self._redact(str(exc))
             )

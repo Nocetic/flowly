@@ -46,6 +46,7 @@ from flowly.providers.base import (
 )
 from flowly.providers.key_rotator import KeyRotator, classify_error
 from flowly.providers.prompt_caching import apply_cache_control, is_cacheable_model
+from flowly.providers.tool_preview import ToolPreviewSnapshots
 
 
 _DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
@@ -471,7 +472,8 @@ class OpenRouterProvider(LLMProvider):
             return
 
         tool_call_accum: dict[int, dict[str, Any]] = {}
-        finish_reason = "stop"
+        previews = ToolPreviewSnapshots()
+        finish_reason = ""
         final_usage: dict[str, int] = {}
 
         try:
@@ -564,23 +566,38 @@ class OpenRouterProvider(LLMProvider):
                         extra = _extract_tool_call_extra(tc_delta)
                         if extra is not None:
                             entry["extra_content"] = extra
+                        preview = previews.update(idx, entry["id"], entry["name"], entry["arguments_str"])
+                        if preview is not None:
+                            yield LLMResponse(content=None, finish_reason="", tool_call_previews=[preview])
         except Exception as exc:
             logger.error(f"LLM stream read error: {self._redact(str(exc))}")
+            # A transport failure must not turn an unfinished JSON argument
+            # into an executable call or claim a successful stream completion.
+            yield self._error_response(exc)
+            return
         finally:
             # A consumer may close this generator while it is suspended at
             # a yielded chunk. Always release the SDK response/connection.
             await stream.close()
 
-        # Emit the final response (with tool calls if any).
-        if tool_call_accum:
+        if not finish_reason:
+            yield self._error_response(RuntimeError("Stream ended before completion"))
+            return
+
+        # A length/filter stop may contain valid JSON for just the beginning
+        # of a batch. Never execute that incomplete batch.
+        if tool_call_accum and finish_reason in {"stop", "tool_calls"}:
             tool_calls: list[ToolCallRequest] = []
             for idx in sorted(tool_call_accum):
                 entry = tool_call_accum[idx]
                 args_str = entry["arguments_str"]
                 try:
                     args = json.loads(args_str) if args_str else {}
-                except json.JSONDecodeError:
-                    args = {"raw": args_str}
+                    if not isinstance(args, dict) or not entry["name"]:
+                        raise ValueError("Invalid tool arguments or missing tool name")
+                except (json.JSONDecodeError, ValueError):
+                    yield self._error_response(RuntimeError("Stream returned incomplete tool arguments"))
+                    return
                 tool_calls.append(ToolCallRequest(
                     id=entry["id"] or f"call_{idx}",
                     name=entry["name"],

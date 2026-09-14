@@ -5044,6 +5044,7 @@ class AgentLoop:
         tool_choice: str,
         stream_callback: Callable[[str], Awaitable[None]],
         run_id: str = "",
+        tool_preview_callback: Callable[[Any], Awaitable[None]] | None = None,
     ):
         """
         Call provider.chat_stream(), fire stream_callback for each text delta,
@@ -5083,6 +5084,13 @@ class AgentLoop:
                     if run_id and self.is_run_aborted(run_id):
                         aborted = True
                         break
+                    for preview in chunk.tool_call_previews:
+                        self._touch_activity("preparing tool request")
+                        if tool_preview_callback is not None:
+                            try:
+                                await tool_preview_callback(preview)
+                            except Exception:
+                                logger.debug("Tool preview delivery failed (non-fatal)", exc_info=True)
                     # Error text is routing input, not user-visible model output.
                     # Keep it on the final response for classification but never
                     # stream raw provider/SDK payloads into a client bubble.
@@ -5269,6 +5277,7 @@ class AgentLoop:
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
         provider_state: dict[str, Any] | None = None,
         provider_state_out: dict[str, Any] | None = None,
+        tool_preview_callback: Callable[[Any], Awaitable[None]] | None = None,
     ) -> tuple[LLMResponse, list[dict[str, Any]]]:
         """Budget, dispatch, and recover one main-agent provider request.
 
@@ -5344,6 +5353,7 @@ class AgentLoop:
                         tool_choice=tool_choice,
                         stream_callback=stream_callback,
                         run_id=run_id,
+                        tool_preview_callback=tool_preview_callback,
                     )
                 else:
                     response = await self._chat_without_stream(
@@ -5444,6 +5454,23 @@ class AgentLoop:
             recovered.after.estimated_input_tokens,
         )
         return await dispatch(recovered.messages), recovered.messages
+
+    async def _publish_tool_progress(
+        self, event: dict[str, Any], *, session_key: str,
+        outbound_channel: str, outbound_chat_id: str,
+        on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        on_tool_progress: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> None:
+        from flowly.agent import inflight
+
+        inflight.append_tool_progress(session_key, event["runId"], event)
+        if on_tool_progress is not None:
+            await on_tool_progress(event)
+        elif on_iteration is None and outbound_channel == "web" and outbound_chat_id:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=outbound_channel, chat_id=outbound_chat_id, content="",
+                metadata={"tool_progress_event": event},
+            ))
 
     async def _emit_iteration_event(
         self,
@@ -5557,6 +5584,7 @@ class AgentLoop:
         outbound_chat_id: str = "",
         outbound_run_id: str = "",
         on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_tool_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         reply_media: list[str] | None = None,
         reply_media_assets: list | None = None,
         error_out: dict[str, Any] | None = None,
@@ -5727,6 +5755,38 @@ class AgentLoop:
         # toolMessages writes are idempotent — same doc id, same
         # content, Firestore set+merge no-ops the second hit.
         _iteration_event_idx = 0
+
+        from flowly.agent.tool_progress import ToolProgress
+
+        async def publish_progress(event: dict[str, Any]) -> None:
+            await self._publish_tool_progress(
+                event, session_key=session_key, outbound_channel=outbound_channel,
+                outbound_chat_id=outbound_chat_id, on_iteration=on_iteration,
+                on_tool_progress=on_tool_progress,
+            )
+
+        progress = ToolProgress(outbound_run_id, publish_progress)
+
+        async def preview_tool(preview: Any) -> None:
+            await progress.preview(_iteration_event_idx, preview)
+
+        async def emit_iteration(**event: Any) -> None:
+            message = event["message"]
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                await progress.announce(event["iteration_idx"], message["tool_calls"])
+            elif message.get("role") == "tool":
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    content = "\n".join(part.get("text", "") for part in content
+                                        if isinstance(part, dict) and part.get("type") == "text")
+                content = str(content)
+                call_id = message.get("tool_call_id", "")
+                name = progress.calls.get(call_id, {}).get("name", message.get("name", ""))
+                await progress.result(
+                    call_id, content, failed=_tool_result_failed(name, content),
+                    stopped=bool(outbound_run_id and self.is_run_aborted(outbound_run_id)),
+                )
+            await self._emit_iteration_event(**event)
 
         # Per-turn model override (used by cron jobs with a `model` field so
         # a single job can run on a different model than the gateway default).
@@ -6063,6 +6123,7 @@ class AgentLoop:
                     run_id=outbound_run_id,
                     iteration=iteration,
                     stream_callback=stream_callback if use_stream else None,
+                    tool_preview_callback=preview_tool if use_stream else None,
                     provider_state=continuity_state,
                     provider_state_out=provider_state_out,
                 )
@@ -6143,6 +6204,7 @@ class AgentLoop:
                 break
 
             if response.finish_reason == "steered" or steering.has_pending(outbound_run_id):
+                await progress.settle("stopped")
                 if response.usage:
                     _merge_turn_usage(total_usage, response.usage)
                 if response.content:
@@ -6308,7 +6370,7 @@ class AgentLoop:
                 # doc with inProgress:true. ChatGPT-style: the panel
                 # populates as the model emits each tool call,
                 # without waiting for the whole turn to finish.
-                await self._emit_iteration_event(
+                await emit_iteration(
                     outbound_channel=outbound_channel,
                     outbound_chat_id=outbound_chat_id,
                     outbound_run_id=outbound_run_id,
@@ -6357,7 +6419,7 @@ class AgentLoop:
                         messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
-                        await self._emit_iteration_event(
+                        await emit_iteration(
                             outbound_channel=outbound_channel,
                             outbound_chat_id=outbound_chat_id,
                             outbound_run_id=outbound_run_id,
@@ -6400,7 +6462,7 @@ class AgentLoop:
                         messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
-                        await self._emit_iteration_event(
+                        await emit_iteration(
                             outbound_channel=outbound_channel,
                             outbound_chat_id=outbound_chat_id,
                             outbound_run_id=outbound_run_id,
@@ -6422,7 +6484,7 @@ class AgentLoop:
                         messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
-                        await self._emit_iteration_event(
+                        await emit_iteration(
                             outbound_channel=outbound_channel,
                             outbound_chat_id=outbound_chat_id,
                             outbound_run_id=outbound_run_id,
@@ -6448,7 +6510,7 @@ class AgentLoop:
                             messages = _add_tool_turn_message(
                                 messages, tool_call.id, _protocol_tool_name, _resolved
                             )
-                            await self._emit_iteration_event(
+                            await emit_iteration(
                                 outbound_channel=outbound_channel,
                                 outbound_chat_id=outbound_chat_id,
                                 outbound_run_id=outbound_run_id,
@@ -6498,7 +6560,7 @@ class AgentLoop:
                         messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
-                        await self._emit_iteration_event(
+                        await emit_iteration(
                             outbound_channel=outbound_channel,
                             outbound_chat_id=outbound_chat_id,
                             outbound_run_id=outbound_run_id,
@@ -6529,7 +6591,7 @@ class AgentLoop:
                         messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
-                        await self._emit_iteration_event(
+                        await emit_iteration(
                             outbound_channel=outbound_channel,
                             outbound_chat_id=outbound_chat_id,
                             outbound_run_id=outbound_run_id,
@@ -6573,7 +6635,7 @@ class AgentLoop:
                                 messages = _add_tool_turn_message(
                                     messages, tool_call.id, _protocol_tool_name, result
                                 )
-                                await self._emit_iteration_event(
+                                await emit_iteration(
                                     outbound_channel=outbound_channel,
                                     outbound_chat_id=outbound_chat_id,
                                     outbound_run_id=outbound_run_id,
@@ -6630,7 +6692,7 @@ class AgentLoop:
                         messages = _add_tool_turn_message(
                             messages, tool_call.id, _protocol_tool_name, result
                         )
-                        await self._emit_iteration_event(
+                        await emit_iteration(
                             outbound_channel=outbound_channel,
                             outbound_chat_id=outbound_chat_id,
                             outbound_run_id=outbound_run_id,
@@ -6644,6 +6706,7 @@ class AgentLoop:
                     _t0 = time.monotonic()
                     _tool_result = ""
                     _tool_success = False
+                    await progress.start(tool_call.id, _effective_tool_name, call_args)
                     # Best-effort live event for streaming clients. Failures
                     # (no callback wired, peer disconnect, slow consumer)
                     # must not affect agent execution.
@@ -6861,7 +6924,7 @@ class AgentLoop:
                     )
                     # Live tool-result event for the UI panel — same
                     # path as the two earlier early-out branches.
-                    await self._emit_iteration_event(
+                    await emit_iteration(
                         outbound_channel=outbound_channel,
                         outbound_chat_id=outbound_chat_id,
                         outbound_run_id=outbound_run_id,
@@ -6888,7 +6951,7 @@ class AgentLoop:
                             _append_turn_message(messages, _cm)
                         if codex_pairs:
                             for _cm in codex_pairs:
-                                await self._emit_iteration_event(
+                                await emit_iteration(
                                     outbound_channel=outbound_channel,
                                     outbound_chat_id=outbound_chat_id,
                                     outbound_run_id=outbound_run_id,
@@ -7281,6 +7344,7 @@ class AgentLoop:
             if summary:
                 final_content = summary
 
+        await progress.settle("stopped" if run_was_aborted else "failed")
         return final_content, accumulated_tool_results, executed_tool_names, total_usage, messages
 
     async def _run_memory_flush(
@@ -8655,6 +8719,7 @@ class AgentLoop:
         live_call_turn = self._is_live_call_turn(msg.content)
         stream_callback = msg.metadata.get("stream_callback")
         on_iteration = msg.metadata.get("on_iteration")
+        on_tool_progress = msg.metadata.get("on_tool_progress")
         model_override = msg.metadata.get("model_override")
         disabled_tools = msg.metadata.get("disabled_tools")
 
@@ -8725,6 +8790,7 @@ class AgentLoop:
                 outbound_chat_id=msg.chat_id,
                 outbound_run_id=msg.metadata.get("run_id") or "",
                 on_iteration=on_iteration,
+                on_tool_progress=on_tool_progress,
                 reply_media=reply_media,
                 reply_media_assets=reply_media_assets,
                 error_out=provider_error,
@@ -9390,6 +9456,7 @@ class AgentLoop:
         voice_mode: bool = False,
         render_capabilities: list[str] | tuple[str, ...] | None = None,
         on_iteration: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_tool_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         run_id: str | None = None,
         tools_allowed: bool | None = None,
         defer_goal_delivery: bool = False,
@@ -9434,6 +9501,8 @@ class AgentLoop:
             # Live per-iteration tool-turn events delivered straight to the
             # caller's transport (the direct gateway → iteration_step WS event).
             metadata["on_iteration"] = on_iteration
+        if on_tool_progress is not None:
+            metadata["on_tool_progress"] = on_tool_progress
         if model_override:
             metadata["model_override"] = model_override
         if disabled_tools:

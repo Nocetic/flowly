@@ -94,6 +94,25 @@ def append_iteration(session_key: str, run_id: str, event: dict) -> None:
     cur["updatedAt"] = time.time()
 
 
+def append_tool_progress(session_key: str, run_id: str, event: dict) -> None:
+    """Retain latest per-call display snapshots without resetting streamed text."""
+    cur = _runs.get(session_key)
+    if cur is None or cur.get("runId") != run_id:
+        return
+    call = event.get("call")
+    if not isinstance(call, dict) or not call.get("id"):
+        return
+    progress = cur.setdefault("toolProgress", {})
+    key = (event.get("iterationIdx"), call["id"])
+    previous = progress.get(key)
+    if previous and previous.get("revision", 0) >= event.get("revision", 0):
+        return
+    progress[key] = {**event, "call": dict(call)}
+    while len(progress) > _MAX_ITERATIONS:
+        del progress[next(iter(progress))]
+    cur["updatedAt"] = time.time()
+
+
 def clear_text(session_key: str, run_id: str, steering_sequence: int = 0) -> None:
     """A persisted steering checkpoint owns the text before the new segment."""
     cur = _runs.get(session_key)
@@ -129,5 +148,8 @@ def get(session_key: str) -> dict | None:
         "text": cur["text"],
         "user": cur.get("user", ""),
         "iterations": list(cur.get("iterations", [])),
+        **({"toolProgress": [{**event, "call": dict(event["call"])}
+                             for event in cur["toolProgress"].values()]}
+           if cur.get("toolProgress") else {}),
         **({"steeringSequence": cur["steeringSequence"]} if cur.get("steeringSequence") else {}),
     }

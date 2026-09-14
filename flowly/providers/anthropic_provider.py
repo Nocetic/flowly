@@ -25,6 +25,7 @@ from flowly.providers.base import (
 )
 from flowly.providers.key_rotator import KeyRotator, classify_error
 from flowly.providers.prompt_caching import apply_cache_control, is_cacheable_model
+from flowly.providers.tool_preview import ToolPreviewSnapshots
 
 _DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com/v1"
 _ANTHROPIC_VERSION = "2023-06-01"
@@ -579,7 +580,8 @@ class AnthropicProvider(LLMProvider):
         url = f"{self._base_url}/messages"
 
         tool_call_accum: dict[int, dict[str, Any]] = {}
-        finish_reason = "stop"
+        previews = ToolPreviewSnapshots()
+        finish_reason = ""
         usage: dict[str, int] = {}
 
         try:
@@ -627,6 +629,10 @@ class AnthropicProvider(LLMProvider):
                                         if isinstance(initial_input, dict) and initial_input else ""
                                     ),
                                 }
+                                entry = tool_call_accum[index]
+                                preview = previews.update(index, entry["id"], entry["name"], entry["arguments_str"])
+                                if preview is not None:
+                                    yield LLMResponse(content=None, finish_reason="", tool_call_previews=[preview])
                         elif event_type == "content_block_delta":
                             index = int(event.get("index") or 0)
                             delta = event.get("delta")
@@ -649,6 +655,9 @@ class AnthropicProvider(LLMProvider):
                                         },
                                     )
                                     entry["arguments_str"] += partial
+                                    preview = previews.update(index, entry["id"], entry["name"], entry["arguments_str"])
+                                    if preview is not None:
+                                        yield LLMResponse(content=None, finish_reason="", tool_call_previews=[preview])
                         elif event_type == "message_delta":
                             delta = event.get("delta")
                             if isinstance(delta, dict) and delta.get("stop_reason"):
@@ -675,13 +684,24 @@ class AnthropicProvider(LLMProvider):
                 + final_usage.get("completion_tokens", 0)
             )
 
+        if not finish_reason:
+            yield self._error_response(RuntimeError("Stream ended before completion"))
+            return
+
         tool_calls: list[ToolCallRequest] = []
-        for index in sorted(tool_call_accum):
+        for index in sorted(tool_call_accum) if finish_reason in {"stop", "tool_calls"} else []:
             entry = tool_call_accum[index]
+            try:
+                arguments = json.loads(entry.get("arguments_str") or "{}")
+                if not isinstance(arguments, dict) or not entry["name"]:
+                    raise ValueError("Invalid tool arguments or missing tool name")
+            except (json.JSONDecodeError, ValueError):
+                yield self._error_response(RuntimeError("Stream returned incomplete tool arguments"))
+                return
             tool_calls.append(ToolCallRequest(
                 id=entry["id"],
                 name=entry["name"],
-                arguments=_parse_args(entry.get("arguments_str")),
+                arguments=arguments,
             ))
 
         yield LLMResponse(
