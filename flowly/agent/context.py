@@ -25,6 +25,16 @@ from flowly.agent.skills import SkillsLoader
 # them as module constants and keep prompt-cache fingerprints stable
 # across turns — changing one block doesn't invalidate the others.
 
+_MCP_SKILL_GUIDANCE = """\
+## MCP workflow skill
+
+For an MCP connection, permission, troubleshooting, or service task, load
+`skill_view(name="mcp-usage")` if it is not already loaded in this context.
+It covers setup, continuing the original task, and researching unfamiliar
+services or missing service skills. Examples are not a supported-service list.
+"""
+
+
 _MCP_CALL_GUIDANCE = """\
 ## Connected MCP services
 
@@ -1703,6 +1713,12 @@ Skills with available="false" need dependencies — try installing with apt/brew
         mcp_tools = self._get_available_tool_names(
             reachable_tools if reachable_tools is not None else available_tools
         )
+        if (
+            mcp_tools
+            and any(name.startswith("mcp_") for name in mcp_tools)
+            and self._has_tool("skill_view", available_tools)
+        ):
+            parts.append(_MCP_SKILL_GUIDANCE)
         if mcp_tools and any(name.startswith("mcp_") and name != "mcp_connection" for name in mcp_tools):
             parts.append(_MCP_CALL_GUIDANCE)
         if self._has_tool("trello", available_tools):

@@ -122,7 +122,26 @@ class SkillImproveTool(Tool):
             if signals is None:
                 self._facade.log.set_meta(MINE_WATERMARK, str(new_wm))
                 return "Skill mine: no recurring procedures found."
-            prompt = MINE_PROMPT.replace("{context}", json.dumps(signals.to_context(), ensure_ascii=False))
+            try:
+                catalog = []
+                if self._skills is not None:
+                    for skill in self._skills.list_skills(filter_unavailable=False):
+                        metadata = self._skills.get_skill_metadata(skill["name"]) or {}
+                        catalog.append({
+                            "name": skill["name"],
+                            "description": str(metadata.get("description", ""))[:1000],
+                        })
+                retired = [u.name for u in self._usage.all() if u.state == "archived"]
+            except Exception:
+                logger.exception("[skill-improve] unable to inspect existing skill catalog")
+                return "Skill mine: catalog unavailable; skipped creation to avoid duplicates."
+            # Substitute once: metadata containing a placeholder must stay data.
+            prefix, _, suffix = MINE_PROMPT.partition("{catalog}")
+            prompt = (
+                prefix
+                + json.dumps({"skills": catalog, "retired_names": retired}, ensure_ascii=False)
+                + suffix.replace("{context}", json.dumps(signals.to_context(), ensure_ascii=False))
+            )
             actor = ACTOR_MINER
         elif mode == "curate":
             ctx = build_curate_context(self._skill_rows())
@@ -135,6 +154,17 @@ class SkillImproveTool(Tool):
 
         raw = await self._stream(prompt)
         specs = parse_specs(raw)
+        if mode == "mine":
+            # Model guidance handles semantic overlap; exact existing/retired
+            # names and duplicates within a batch are rejected deterministically.
+            reserved = {s["name"] for s in catalog} | set(retired)
+            accepted = []
+            for spec in specs:
+                if spec.kind != "create" or spec.draft_name in reserved:
+                    continue
+                reserved.add(spec.draft_name)
+                accepted.append(spec)
+            specs = accepted
         if not specs:
             if new_wm is not None:
                 self._facade.log.set_meta(MINE_WATERMARK, str(new_wm))
