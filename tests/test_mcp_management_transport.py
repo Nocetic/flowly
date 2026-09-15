@@ -38,6 +38,7 @@ async def test_real_capability_dispatch(client):
     {"method": "chat.send"}, {"method": "profiles.rpc", "params": {"method": "config.set"}},
     {"method": "mcp.capabilities", "params": []}, {"method": []}, [],
     {"method": "mcp.capabilities", "profile": ""},
+    {"method": "mcp.capabilities", "profile": "../work", "expectedHostId": "host-id", "expectedBotId": "bot-id"},
     {"method": "mcp.capabilities", "url": "http://other"},
 ])
 async def test_rejects_other_surfaces(client, payload):
@@ -73,10 +74,70 @@ async def test_profile_routing_preserves_mcp_allowlist():
     app = web.Application()
     transport.register_mcp_management(app, SimpleNamespace(_auth_token="token", _profile_host=host))
     async with TestClient(TestServer(app)) as client:
-        response = await client.post("/api/mcp/manage", json={"method": "mcp.capabilities", "profile": "work"},
+        response = await client.post("/api/mcp/manage", json={
+            "method": "mcp.capabilities", "profile": "work",
+            "expectedHostId": "host-id", "expectedBotId": "bot-id",
+        },
                                      headers={"Authorization": "Bearer token"})
         assert response.status == 200
-    host.dispatch.assert_awaited_once_with("profiles.rpc", {"name": "work", "method": "mcp.capabilities", "params": {}})
+    host.dispatch.assert_awaited_once_with("profiles.rpc", {
+        "name": "work", "method": "mcp.capabilities", "params": {},
+        "expectedHostId": "host-id", "expectedBotId": "bot-id",
+    })
+
+
+@pytest.mark.parametrize("payload", [
+    {"method": "mcp.capabilities", "profile": "work"},
+    {"method": "mcp.capabilities", "profile": "work", "expectedHostId": "host-id"},
+    {"method": "mcp.capabilities", "expectedHostId": "host-id", "expectedBotId": "bot-id"},
+])
+async def test_profile_routing_requires_complete_identity(payload):
+    host = SimpleNamespace(dispatch=AsyncMock())
+    app = web.Application()
+    transport.register_mcp_management(app, SimpleNamespace(_auth_token="token", _profile_host=host))
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/api/mcp/manage", json=payload,
+                                     headers={"Authorization": "Bearer token"})
+        assert response.status == 400
+    host.dispatch.assert_not_awaited()
+
+
+async def test_profile_identity_error_is_preserved_without_private_diagnostics():
+    from flowly.profile_host_contract import ProfileHostError
+
+    host = SimpleNamespace(dispatch=AsyncMock(side_effect=ProfileHostError(
+        "PROFILE_IDENTITY_CHANGED", "The selected profile identity changed.",
+    )))
+    app = web.Application()
+    transport.register_mcp_management(app, SimpleNamespace(_auth_token="token", _profile_host=host))
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/api/mcp/manage", json={
+            "method": "mcp.setup.begin", "profile": "work",
+            "expectedHostId": "host-id", "expectedBotId": "retired-bot-id",
+        }, headers={"Authorization": "Bearer token"})
+        assert response.status == 409
+        assert (await response.json())["error"]["code"] == "PROFILE_IDENTITY_CHANGED"
+
+
+async def test_profile_management_reaches_identity_guarded_runtime(monkeypatch):
+    import flowly.profile_host as profile_module
+    from flowly.profile_host import ProfileHost
+
+    monkeypatch.setattr(profile_module, "_public_profile", lambda name: {"name": name, "botId": "bot-id"})
+    host = ProfileHost()
+    host._target_rpc = AsyncMock(return_value={"servers": []})
+    app = web.Application()
+    transport.register_mcp_management(app, SimpleNamespace(_auth_token="token", _profile_host=host))
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/api/mcp/manage", json={
+            "method": "mcp.connections.list", "profile": "work",
+            "expectedHostId": host.host_id, "expectedBotId": "bot-id",
+        }, headers={"Authorization": "Bearer token"})
+        assert response.status == 200
+        assert (await response.json())["result"] == {"servers": []}
+    host._target_rpc.assert_awaited_once_with(
+        "work", "mcp.connections.list", {}, 30.0, expected_bot_id="bot-id",
+    )
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"])

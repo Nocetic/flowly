@@ -11,6 +11,8 @@ from aiohttp import web
 
 from flowly.channels import feature_rpc
 from flowly.gateway.auth import extract_request_token, host_origin_allowed, token_matches
+from flowly.profile import validate_profile_name
+from flowly.profile_host_contract import ProfileHostError
 
 METHODS = frozenset({
     "mcp.capabilities", "mcp.connections.list", "mcp.connections.action",
@@ -66,26 +68,48 @@ def _register_management(app, gateway, *, methods: frozenset[str], path: str, su
             payload = json.loads(body)
         except (ValueError, UnicodeError):
             return _error("INVALID_PARAMS", f"Expected a JSON {surface} request.")
-        if not isinstance(payload, dict) or set(payload) - {"method", "params", "profile"}:
+        if not isinstance(payload, dict) or set(payload) - {
+            "method", "params", "profile", "expectedHostId", "expectedBotId",
+        }:
             return _error("INVALID_PARAMS", f"Invalid {surface} request envelope.")
         method, params, profile = payload.get("method"), payload.get("params", {}), payload.get("profile")
+        expected_host_id = payload.get("expectedHostId")
+        expected_bot_id = payload.get("expectedBotId")
         if not isinstance(method, str) or method not in methods:
             return _error("UNKNOWN_METHOD", f"Only {surface} management methods are supported.")
         if not isinstance(params, dict) or (profile is not None and (
             not isinstance(profile, str) or not profile.strip() or len(profile) > 128
         )):
             return _error("INVALID_PARAMS", f"Invalid {surface} request parameters.")
+        if profile is None:
+            if expected_host_id is not None or expected_bot_id is not None:
+                return _error("INVALID_PARAMS", "Profile identities require a selected profile.")
+        elif (
+            not isinstance(expected_host_id, str) or not expected_host_id or len(expected_host_id) > 128
+            or not isinstance(expected_bot_id, str) or not expected_bot_id or len(expected_bot_id) > 128
+        ):
+            return _error("INVALID_PARAMS", "Both selected profile identities are required.")
+        elif profile != "default":
+            try:
+                validate_profile_name(profile)
+            except ValueError:
+                return _error("INVALID_PARAMS", "Invalid selected profile.")
         try:
             if profile is not None:
                 if gateway._profile_host is None:
                     return _error("PROFILE_HOST_UNAVAILABLE", "This gateway does not manage profiles.", 503)
                 result = await gateway._profile_host.dispatch("profiles.rpc", {
                     "name": profile, "method": method, "params": params,
+                    "expectedHostId": expected_host_id, "expectedBotId": expected_bot_id,
                 })
             else:
                 result, _ = await feature_rpc.dispatch(method, params)
         except feature_rpc.FeatureRpcError as exc:
             return _error(exc.code, exc.message)
+        except ProfileHostError as exc:
+            return _error(exc.code, exc.message, 409 if exc.code == "PROFILE_IDENTITY_CHANGED" else 400)
+        except FileNotFoundError:
+            return _error("PROFILE_NOT_FOUND", "The selected profile no longer exists.", 404)
         except Exception:
             # Credentials and OAuth callbacks must never escape via diagnostics.
             return _error("UNAVAILABLE", f"{surface} management could not complete the request.", 503)
