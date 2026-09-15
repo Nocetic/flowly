@@ -8,6 +8,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from flowly.gateway import mcp_management as transport
+from flowly.profile_host_contract import ProfileHostError
 
 
 @pytest.fixture
@@ -103,8 +104,6 @@ async def test_profile_routing_requires_complete_identity(payload):
 
 
 async def test_profile_identity_error_is_preserved_without_private_diagnostics():
-    from flowly.profile_host_contract import ProfileHostError
-
     host = SimpleNamespace(dispatch=AsyncMock(side_effect=ProfileHostError(
         "PROFILE_IDENTITY_CHANGED", "The selected profile identity changed.",
     )))
@@ -116,7 +115,36 @@ async def test_profile_identity_error_is_preserved_without_private_diagnostics()
             "expectedHostId": "host-id", "expectedBotId": "retired-bot-id",
         }, headers={"Authorization": "Bearer token"})
         assert response.status == 409
-        assert (await response.json())["error"]["code"] == "PROFILE_IDENTITY_CHANGED"
+        assert (await response.json())["error"] == {
+            "code": "PROFILE_IDENTITY_CHANGED",
+            "message": "The selected profile identity changed.",
+            "retryable": False,
+        }
+
+
+@pytest.mark.parametrize(
+    "error,expected_status,expected_retryable",
+    [
+        (ProfileHostError("PROFILE_NOT_FOUND", "The selected profile no longer exists."), 404, False),
+        (ProfileHostError("PROFILE_OFFLINE", "The profile runtime is offline.", retryable=True), 503, True),
+    ],
+)
+async def test_profile_error_http_status_preserves_machine_contract(
+    error, expected_status, expected_retryable,
+):
+    host = SimpleNamespace(dispatch=AsyncMock(side_effect=error))
+    app = web.Application()
+    transport.register_mcp_management(app, SimpleNamespace(_auth_token="token", _profile_host=host))
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/api/mcp/manage", json={
+            "method": "mcp.connections.list", "profile": "work",
+            "expectedHostId": "host-id", "expectedBotId": "bot-id",
+        }, headers={"Authorization": "Bearer token"})
+        payload = await response.json()
+    assert response.status == expected_status
+    assert payload["error"]["code"] == error.code
+    assert payload["error"]["retryable"] is expected_retryable
+    assert response.headers["Cache-Control"] == "no-store"
 
 
 async def test_profile_management_reaches_identity_guarded_runtime(monkeypatch):
@@ -167,4 +195,6 @@ async def test_unexpected_dispatch_error_does_not_echo_credentials(client, monke
     response = await client.post("/api/mcp/manage", json={"method": "mcp.setup.begin"},
                                  headers={"Authorization": "Bearer owner-token"})
     assert response.status == 503
-    assert "private-password" not in await response.text()
+    payload = await response.json()
+    assert payload["error"]["retryable"] is True
+    assert "private-password" not in str(payload)

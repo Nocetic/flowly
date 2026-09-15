@@ -24,9 +24,18 @@ METHODS = frozenset({
 MAX_BODY = 256 * 1024
 
 
-def _error(code: str, message: str, status: int = 400) -> web.Response:
-    return web.json_response({"error": {"code": code, "message": message}}, status=status,
-                             headers={"Cache-Control": "no-store"})
+def _error(
+    code: str,
+    message: str,
+    status: int = 400,
+    *,
+    retryable: bool = False,
+) -> web.Response:
+    return web.json_response(
+        {"error": {"code": code, "message": message, "retryable": retryable}},
+        status=status,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _protected_socket(request: web.Request) -> bool:
@@ -97,7 +106,12 @@ def _register_management(app, gateway, *, methods: frozenset[str], path: str, su
         try:
             if profile is not None:
                 if gateway._profile_host is None:
-                    return _error("PROFILE_HOST_UNAVAILABLE", "This gateway does not manage profiles.", 503)
+                    return _error(
+                        "PROFILE_HOST_UNAVAILABLE",
+                        "This gateway does not manage profiles.",
+                        503,
+                        retryable=True,
+                    )
                 result = await gateway._profile_host.dispatch("profiles.rpc", {
                     "name": profile, "method": method, "params": params,
                     "expectedHostId": expected_host_id, "expectedBotId": expected_bot_id,
@@ -105,14 +119,23 @@ def _register_management(app, gateway, *, methods: frozenset[str], path: str, su
             else:
                 result, _ = await feature_rpc.dispatch(method, params)
         except feature_rpc.FeatureRpcError as exc:
-            return _error(exc.code, exc.message)
+            retryable = bool(getattr(exc, "retryable", False))
+            return _error(exc.code, exc.message, 503 if retryable else 400, retryable=retryable)
         except ProfileHostError as exc:
-            return _error(exc.code, exc.message, 409 if exc.code == "PROFILE_IDENTITY_CHANGED" else 400)
+            status = 404 if exc.code == "PROFILE_NOT_FOUND" else (
+                409 if exc.code == "PROFILE_IDENTITY_CHANGED" else (503 if exc.retryable else 400)
+            )
+            return _error(exc.code, exc.message, status, retryable=exc.retryable)
         except FileNotFoundError:
             return _error("PROFILE_NOT_FOUND", "The selected profile no longer exists.", 404)
         except Exception:
             # Credentials and OAuth callbacks must never escape via diagnostics.
-            return _error("UNAVAILABLE", f"{surface} management could not complete the request.", 503)
+            return _error(
+                "UNAVAILABLE",
+                f"{surface} management could not complete the request.",
+                503,
+                retryable=True,
+            )
         return web.json_response({"result": result}, headers={"Cache-Control": "no-store"})
 
     app.router.add_post(path, handle)
