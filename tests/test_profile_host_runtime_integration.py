@@ -27,6 +27,14 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
     home.mkdir()
     default.mkdir()
     (default / "workspace").mkdir()
+    default_credentials = default / "credentials" / "gmail.json"
+    default_credentials.parent.mkdir()
+    default_credentials.write_text(json.dumps({
+        "mode": "flowly_broker", "issuer": "https://useflowlyapp.com",
+        "grant_id": "a" * 32, "grant_secret": "b" * 43,
+        "email": "primary@example.test", "disconnect_pending": True,
+    }), encoding="utf-8")
+    default_credentials_before = default_credentials.read_bytes()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("OPENAI_API_KEY", "test-profile-host-key")
     monkeypatch.setattr(profiles, "_DEFAULT_HOME", default)
@@ -71,9 +79,31 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
         assert isinstance(connections["servers"], list)
         pending = await host.rpc("writer", "mcp.setup.pending", {}, **identity)
         assert pending == {"operations": []}
+        gmail_capability = await host.rpc("writer", "gmail.capabilities", {}, **identity)
+        assert set(gmail_capability["methods"]) == {
+            "gmail.capabilities", "gmail.status", "gmail.setup.begin", "gmail.setup.pending",
+            "gmail.setup.status", "gmail.setup.cancel", "gmail.disconnect",
+        }
+        gmail = await host.rpc("writer", "gmail.status", {}, **identity)
+        assert gmail == {"status": "not_configured", "connected": False}
+        assert default_credentials.read_bytes() == default_credentials_before
+        external_access = await host.rpc("writer", "mcp.access.list", {}, **identity)
+        assert external_access["credentials"] == []
+        assert external_access["endpointPath"] == "/mcp"
 
         sibling = profiles.create_profile("reader", local_runtime=True)
         sibling_before = (sibling / "config.json").read_bytes()
+        sibling_credentials = sibling / "credentials" / "gmail.json"
+        sibling_credentials.parent.mkdir(exist_ok=True)
+        sibling_credentials.write_text(json.dumps({
+            "mode": "flowly_broker", "issuer": "https://useflowlyapp.com",
+            "grant_id": "c" * 32, "grant_secret": "d" * 43,
+            "email": "reader@example.test", "disconnect_pending": True,
+        }), encoding="utf-8")
+        sibling_credentials_before = sibling_credentials.read_bytes()
+        assert await host.rpc("writer", "gmail.status", {}, **identity) == {
+            "status": "not_configured", "connected": False,
+        }
         primary_config = default / "config.json"
         primary_before = primary_config.read_bytes() if primary_config.exists() else None
         writer_before = json.loads(config_path.read_text())
@@ -107,6 +137,8 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
             key: value for key, value in writer_before.items() if key != "mcpServers"
         }
         assert (sibling / "config.json").read_bytes() == sibling_before
+        assert sibling_credentials.read_bytes() == sibling_credentials_before
+        assert default_credentials.read_bytes() == default_credentials_before
         assert (primary_config.read_bytes() if primary_config.exists() else None) == primary_before
 
         saved_before_cancel = config_path.read_bytes()
@@ -119,6 +151,8 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
         assert cancelled["phase"] == "cancelled"
         assert config_path.read_bytes() == saved_before_cancel
         assert (sibling / "config.json").read_bytes() == sibling_before
+        assert sibling_credentials.read_bytes() == sibling_credentials_before
+        assert default_credentials.read_bytes() == default_credentials_before
         assert (primary_config.read_bytes() if primary_config.exists() else None) == primary_before
 
         stopped = await host.stop("writer")

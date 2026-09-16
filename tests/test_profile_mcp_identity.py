@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 import flowly.profile_host as module
+from flowly.gateway.mcp_management import METHODS as MCP_MANAGEMENT_METHODS
+from flowly.integrations.gmail_rpc import METHODS as GMAIL_MANAGEMENT_METHODS
 from flowly.profile_host import ProfileHost
 from flowly.profile_host_contract import ProfileHostError
 from flowly.profile_host_contract import PROFILE_RPC_TIMEOUTS, validate_profile_rpc
@@ -54,12 +56,15 @@ def test_profile_mcp_surface_is_explicit_and_preserves_session_boundary():
         "mcp.capabilities", "mcp.connections.list", "mcp.connections.action",
         "mcp.setup.begin", "mcp.setup.status", "mcp.setup.pending", "mcp.setup.confirm",
         "mcp.setup.callback", "mcp.setup.cancel", "mcp.setup.cancel_request",
+        "mcp.access.catalog", "mcp.access.list", "mcp.access.create", "mcp.access.revoke",
         "mcp.chat.pending", "mcp.chat.cancel",
     }
-    assert {method for method in PROFILE_RPC_TIMEOUTS if method.startswith("mcp.")} == expected
+    profile_methods = {method for method in PROFILE_RPC_TIMEOUTS if method.startswith("mcp.")}
+    assert profile_methods == expected
+    assert profile_methods == MCP_MANAGEMENT_METHODS
     for method in expected:
         assert validate_profile_rpc(method, {}) == (method, {})
-    for method in ["mcp.install", "mcp.upsert", "mcp.oauth_start", "mcp.access.create", "mcp.arbitrary"]:
+    for method in ["mcp.install", "mcp.upsert", "mcp.oauth_start", "mcp.arbitrary"]:
         with pytest.raises(ProfileHostError, match="not available"):
             validate_profile_rpc(method, {})
     for method in ["mcp.chat.pending", "mcp.setup.begin"]:
@@ -77,5 +82,33 @@ async def test_mcp_cannot_use_legacy_name_only_routing(monkeypatch, tmp_path):
     host._target_rpc = AsyncMock()
     with pytest.raises(ProfileHostError) as error:
         await host.rpc("writer", "mcp.setup.begin", {})
+    assert error.value.code == "INVALID_PARAMS"
+    host._target_rpc.assert_not_awaited()
+
+
+def test_profile_gmail_surface_is_explicit():
+    expected = {
+        "gmail.capabilities", "gmail.status", "gmail.setup.begin", "gmail.setup.pending",
+        "gmail.setup.status", "gmail.setup.cancel", "gmail.disconnect",
+    }
+    profile_methods = {method for method in PROFILE_RPC_TIMEOUTS if method.startswith("gmail.")}
+    assert profile_methods == expected
+    assert profile_methods == GMAIL_MANAGEMENT_METHODS
+    for method in expected:
+        assert validate_profile_rpc(method, {}) == (method, {})
+    with pytest.raises(ProfileHostError, match="not available"):
+        validate_profile_rpc("gmail.arbitrary", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["gmail.status", "mcp.access.list"])
+async def test_profile_owner_surfaces_require_pinned_identity(monkeypatch, tmp_path, method):
+    import flowly.profile as profiles
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", tmp_path)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", tmp_path / "profiles")
+    host = ProfileHost()
+    host._target_rpc = AsyncMock()
+    with pytest.raises(ProfileHostError) as error:
+        await host.rpc("writer", method, {})
     assert error.value.code == "INVALID_PARAMS"
     host._target_rpc.assert_not_awaited()
