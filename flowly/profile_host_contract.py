@@ -117,7 +117,7 @@ _CODEX_APPROVAL = {"on-request", "never", "auto-review", "granular"}
 _CODEX_SANDBOX = {"read-only", "workspace-write", "full-access"}
 
 
-_REMOTE_SESSION_PREFIXES = ("desktop:", "web:", "ios:")
+REMOTE_SESSION_PREFIXES = ("desktop:", "web:", "ios:", "android:")
 _INTERNAL_PROFILE_SESSION_PREFIXES = (
     "desktop:profile-inbox:",
     "desktop:profile-room:",
@@ -145,7 +145,7 @@ def _validate_session_key(value: Any, *, required: bool = False) -> None:
             "Profile conversation identity is invalid.",
         )
     if (
-        not value.startswith(_REMOTE_SESSION_PREFIXES)
+        not value.startswith(REMOTE_SESSION_PREFIXES)
         or is_internal_profile_session(value)
     ):
         raise ProfileHostError(

@@ -48,6 +48,7 @@ from flowly.profile_host_contract import (
     MAX_PROFILE_HOPS,
     MAX_PROFILE_MESSAGE_CHARS,
     PROFILE_RPC_TIMEOUTS,
+    REMOTE_SESSION_PREFIXES,
     ProfileHostError,
     bounded_timeout,
     is_internal_profile_session,
@@ -860,7 +861,7 @@ class ProfileHost:
                         for session in sessions
                         if isinstance(session, dict)
                         and isinstance(session.get("key"), str)
-                        and session["key"].startswith(("desktop:", "web:", "ios:"))
+                        and session["key"].startswith(REMOTE_SESSION_PREFIXES)
                         and not is_internal_profile_session(session["key"])
                     ],
                 }

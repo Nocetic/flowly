@@ -80,7 +80,8 @@ async def test_profile_directory_and_statuses_are_public_and_stable(profile_root
 
 
 @pytest.mark.asyncio
-async def test_remote_chat_proxy_assigns_identity_and_authority(profile_roots) -> None:
+@pytest.mark.parametrize("prefix", ["ios", "android", "web", "desktop"])
+async def test_remote_chat_proxy_assigns_identity_and_authority(profile_roots, prefix) -> None:
     profiles.create_profile("writer", local_runtime=True)
     profiles.create_profile("reviewer", local_runtime=True)
     host = ProfileHost()
@@ -92,7 +93,7 @@ async def test_remote_chat_proxy_assigns_identity_and_authority(profile_roots) -
         "writer",
         "chat.send",
         {
-            "sessionKey": "ios:thread-1",
+            "sessionKey": f"{prefix}:thread-1",
             "message": "Ask @reviewer",
             "profileDirectory": ["spoofed"],
             "profileMentions": ["reviewer", "writer", "missing"],
@@ -105,6 +106,7 @@ async def test_remote_chat_proxy_assigns_identity_and_authority(profile_roots) -
 
     assert result == {"runId": "run-1"}
     sent = host._rpc.await_args.args[2]
+    assert sent["sessionKey"] == f"{prefix}:thread-1"
     assert sent["profileDirectory"] == ["default", "reviewer", "writer"]
     assert sent["profileMentions"] == ["reviewer"]
     assert sent["turnOrigin"] == "user"
@@ -123,6 +125,7 @@ async def test_remote_session_directory_hides_internal_collaboration(profile_roo
     host._rpc = AsyncMock(return_value={  # type: ignore[method-assign]
         "sessions": [
             {"key": "ios:visible"},
+            {"key": "android:visible"},
             {"key": "desktop:profile-inbox:writer:source"},
             {"key": "desktop:profile-task:private"},
             {"key": "desktop:profile-room:00000000-0000-0000-0000-000000000001"},
@@ -133,7 +136,7 @@ async def test_remote_session_directory_hides_internal_collaboration(profile_roo
 
     result = await host.rpc("writer", "sessions.list", {})
 
-    assert result == {"sessions": [{"key": "ios:visible"}]}
+    assert result == {"sessions": [{"key": "ios:visible"}, {"key": "android:visible"}]}
 
 
 @pytest.mark.asyncio

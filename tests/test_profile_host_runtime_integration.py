@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import asyncio
 import sys
 from pathlib import Path
 
@@ -215,9 +215,11 @@ async def test_second_manager_cooperatively_stops_desktop_owned_profile_runtime(
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.name == "nt", reason="managed process-group lifecycle is POSIX-specific")
+@pytest.mark.parametrize("session_prefix", ["ios", "android"])
 async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    session_prefix: str,
 ) -> None:
     home = tmp_path / "home"
     default = home / ".flowly"
@@ -342,7 +344,7 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                 history = await rpc("profiles.rpc", {
                     "name": "writer",
                     "method": "chat.history",
-                    "params": {"sessionKey": "ios:writer-thread"},
+                    "params": {"sessionKey": f"{session_prefix}:writer-thread"},
                 })
                 assert history["messages"] == []
                 media = await rpc("profiles.rpc", {
@@ -366,7 +368,7 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                     "name": "writer",
                     "method": "sessions.model.set",
                     "params": {
-                        "sessionKey": "ios:writer-thread",
+                        "sessionKey": f"{session_prefix}:writer-thread",
                         "model": "openai/gpt-4o-mini",
                     },
                 })
@@ -374,7 +376,7 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                 model = await rpc("profiles.rpc", {
                     "name": "writer",
                     "method": "sessions.model.get",
-                    "params": {"sessionKey": "ios:writer-thread"},
+                    "params": {"sessionKey": f"{session_prefix}:writer-thread"},
                 })
                 assert model["model"] == "openai/gpt-4o-mini"
                 approvals = await rpc("profiles.rpc", {

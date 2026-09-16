@@ -274,6 +274,18 @@ def test_remote_profile_rpc_denies_internal_session_namespaces(
     assert raised.value.code == "REMOTE_SESSION_DENIED"
 
 
+@pytest.mark.parametrize("method, params", [
+    ("chat.history", {"sessionKey": "android:new-thread"}),
+    ("chat.inflight", {"sessionKey": "android:new-thread"}),
+    ("sessions.model.get", {"sessionKey": "android:new-thread"}),
+    ("sessions.delete", {"key": "android:new-thread"}),
+])
+def test_android_profile_conversation_lifecycle(method, params) -> None:
+    actual_method, safe = validate_profile_rpc(method, params)
+    assert actual_method == method
+    assert safe == params
+
+
 def test_profile_media_windows_are_bounded_and_basename_only() -> None:
     method, safe = validate_profile_rpc("media.read", {
         "mediaId": "generated-image.png",
