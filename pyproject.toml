@@ -83,6 +83,11 @@ search = [
 flowly = "flowly.cli.entry:main"
 flowly-hub = "flowly.hub.cli:main"
 
+[dependency-groups]
+# Build tooling stays out of the installed agent's runtime dependencies.
+# Change deliberately and validate standalone smoke tests on native runners.
+nuitka = ["nuitka==2.8.10"]
+
 [project.urls]
 Homepage = "https://github.com/Nocetic/flowly"
 Repository = "https://github.com/Nocetic/flowly"

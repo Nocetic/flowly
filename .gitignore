@@ -49,6 +49,7 @@ flowly/channels/helpers/Flowly iMessage Helper.app/
 !docs/feature-rpc-architecture.md
 !docs/MCP_CONNECTIONS_IMPLEMENTATION.md
 !docs/mcp-ssh-management.md
+!docs/nuitka-build.md
 # The chat wire contract — bot, relay, desktop and iOS all implement it, so
 # it has to be readable by anyone cloning any of them.
 !docs/chat-wire-protocol.md
