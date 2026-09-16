@@ -1266,14 +1266,17 @@ class ContextBuilder:
         from flowly.channels.gmail_auth import load_credentials
         return load_credentials() is not None
 
-    def _has_linear_tools(self) -> bool:
-        """Check if Linear integration is configured (API key set)."""
-        try:
-            from flowly.config.loader import load_config
-            cfg = load_config()
-            return bool(cfg.integrations.linear.api_key)
-        except Exception:
-            return False
+    def _has_linear_tools(
+        self,
+        available_tools: set[str] | frozenset[str] | None = None,
+    ) -> bool:
+        """Return whether the legacy model-facing ``linear`` tool exists.
+
+        Configuration alone is not authority: an enabled Linear MCP shadows a
+        retained personal API key, and routed turns may expose only a subset of
+        the live registry.  Prompt guidance must describe that exact tool set.
+        """
+        return self._has_tool("linear", available_tools)
 
     def _get_delegate_agents(self) -> dict:
         """Get configured delegate agents from config."""
@@ -1774,7 +1777,7 @@ Skills with available="false" need dependencies — try installing with apt/brew
             )
 
         # Linear guidance (only when Linear tool is available)
-        if self._has_linear_tools():
+        if self._has_linear_tools(available_tools):
             parts.append(
                 "# Linear\n\n"
                 "You have access to the user's Linear workspace:\n\n"

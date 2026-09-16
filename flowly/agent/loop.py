@@ -2266,6 +2266,48 @@ class AgentLoop:
             self.tools.unregister("x_search")
         return self.tools.has("x_search")
 
+    def sync_linear_tool(self) -> bool:
+        """Keep the legacy Linear API tool behind an enabled Linear MCP.
+
+        A saved MCP connection is the owner's explicit choice of provider.  If
+        the old personal API key remains in config, exposing both integrations
+        lets the model call ``linear`` while the healthy OAuth-backed tools are
+        registered as ``mcp_linear_*``.  Apart from being surprising, a stale
+        personal key then produces a 401 that looks like an MCP OAuth failure.
+
+        Treat an enabled ``mcpServers.linear`` entry as authoritative.  The
+        legacy credential stays on disk and becomes available again if that
+        MCP entry is disabled or removed; it is never silently deleted.
+        """
+        from flowly.agent.tools.linear import LinearTool
+
+        existing = self.tools.get("linear")
+        config = self._main_config
+        if config is None:
+            return isinstance(existing, LinearTool)
+
+        servers = getattr(config, "mcp_servers", None) or {}
+        linear_mcp = servers.get("linear")
+        mcp_is_authoritative = bool(
+            linear_mcp is not None and getattr(linear_mcp, "enabled", True)
+        )
+
+        if mcp_is_authoritative:
+            if isinstance(existing, LinearTool):
+                self.tools.unregister("linear", expected=existing)
+            return False
+
+        linear_config = getattr(getattr(config, "integrations", None), "linear", None)
+        api_key = str(getattr(linear_config, "api_key", "") or "")
+        if api_key:
+            # Re-register so a changed credential takes effect immediately.
+            # Do not replace a plugin that deliberately owns the same name.
+            if existing is None or isinstance(existing, LinearTool):
+                self.tools.register(LinearTool(api_key=api_key))
+        elif isinstance(existing, LinearTool):
+            self.tools.unregister("linear", expected=existing)
+        return isinstance(self.tools.get("linear"), LinearTool)
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         # File tools (sandboxed to workspace + ~/.flowly)
@@ -2452,12 +2494,9 @@ class AgentLoop:
         # `xai login` can register it without a gateway restart.
         self.sync_xai_search_tool()
 
-        # Linear tool (if configured)
-        if self._main_config and hasattr(self._main_config, 'integrations'):
-            linear_cfg = getattr(self._main_config.integrations, 'linear', None)
-            if linear_cfg and linear_cfg.api_key:
-                from flowly.agent.tools.linear import LinearTool
-                self.tools.register(LinearTool(api_key=linear_cfg.api_key))
+        # Legacy Linear API tool. An enabled OAuth-backed Linear MCP is the
+        # authoritative provider and shadows this without deleting its key.
+        self.sync_linear_tool()
 
         # GitHub tool (if a token is configured).
         if self._main_config and hasattr(self._main_config, 'integrations'):

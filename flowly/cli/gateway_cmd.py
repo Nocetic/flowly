@@ -1749,6 +1749,10 @@ Respond to the user now:"""
         from flowly.config.loader import load_config
 
         agent._main_config = load_config()
+        # MCP setup is applied live. Keep provider precedence live too: a
+        # newly connected Linear MCP withdraws the stale personal-key tool,
+        # while disabling/removing it restores the retained legacy fallback.
+        agent.sync_linear_tool()
         agent.tools.invalidate_availability()
 
     try:
