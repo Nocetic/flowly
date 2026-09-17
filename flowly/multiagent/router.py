@@ -1,7 +1,7 @@
 """Agent routing — @mention parsing and message routing."""
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from flowly.config.schema import MultiAgentConfig, MultiAgentTeamConfig
 
@@ -12,6 +12,7 @@ class RoutingResult:
     agent_id: str
     message: str
     is_team: bool = False
+    team_id: str | None = None
 
 
 @dataclass
@@ -70,7 +71,8 @@ class AgentRouter:
         if candidate in self.teams:
             team = self.teams[candidate]
             return RoutingResult(
-                agent_id=team.leader_agent, message=clean_message, is_team=True
+                agent_id=team.leader_agent, message=clean_message,
+                is_team=True, team_id=candidate,
             )
 
         # Agent name match (case-insensitive)
@@ -82,7 +84,8 @@ class AgentRouter:
         for team_id, team in self.teams.items():
             if team.name.lower() == candidate:
                 return RoutingResult(
-                    agent_id=team.leader_agent, message=clean_message, is_team=True
+                    agent_id=team.leader_agent, message=clean_message,
+                    is_team=True, team_id=team_id,
                 )
 
         # No match — default

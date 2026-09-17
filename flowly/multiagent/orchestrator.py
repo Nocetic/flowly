@@ -6,10 +6,9 @@ from pathlib import Path
 
 from loguru import logger
 
-from flowly.config.schema import MultiAgentConfig, MultiAgentTeamConfig
+from flowly.config.schema import MultiAgentConfig
 from flowly.multiagent.invoke import invoke_agent
 from flowly.multiagent.router import AgentRouter, TeamContext
-
 
 MAX_CHAIN_DEPTH = 10
 
@@ -48,8 +47,17 @@ class TeamOrchestrator:
       all are invoked in parallel. Chain ends after fan-out.
     """
 
-    def __init__(self, router: AgentRouter):
+    def __init__(
+        self,
+        router: AgentRouter,
+        max_concurrent: int = 5,
+        invocation_semaphore: asyncio.Semaphore | None = None,
+    ):
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be positive")
         self.router = router
+        self.max_concurrent = max_concurrent
+        self.invocation_semaphore = invocation_semaphore or asyncio.Semaphore(max_concurrent)
 
     async def execute(
         self,
@@ -112,21 +120,30 @@ class TeamOrchestrator:
                     f"Fan-out: @{current_agent_id} → "
                     f"{[m.agent_id for m in mentions]}"
                 )
-                fan_tasks = [
-                    self._invoke_safe(
-                        agents,
-                        m.agent_id,
-                        f"[Message from teammate @{current_agent_id}]:\n{m.message}",
-                        workspace,
-                    )
-                    for m in mentions
-                ]
-                fan_results = await asyncio.gather(*fan_tasks, return_exceptions=True)
+                fan_results: list[str | Exception | None] = [None] * len(mentions)
+                pending = iter(enumerate(mentions))
+
+                async def worker() -> None:
+                    for index, mention in pending:
+                        try:
+                            fan_results[index] = await self._invoke_safe(
+                                agents,
+                                mention.agent_id,
+                                f"[Message from teammate @{current_agent_id}]:\n{mention.message}",
+                                workspace,
+                            )
+                        except Exception as exc:
+                            fan_results[index] = exc
+
+                await asyncio.gather(
+                    *(worker() for _ in range(min(self.max_concurrent, len(mentions))))
+                )
 
                 for mention, result in zip(mentions, fan_results):
                     if isinstance(result, Exception):
                         steps.append(ChainStep(mention.agent_id, f"Error: {result}"))
                     else:
+                        assert result is not None
                         steps.append(ChainStep(mention.agent_id, result))
 
                 logger.info(f"Fan-out complete — {len(fan_results)} responses collected")
@@ -150,7 +167,8 @@ class TeamOrchestrator:
             return f"Error: Agent '{agent_id}' not found."
 
         try:
-            return await invoke_agent(agent, agent_id, message, workspace)
+            async with self.invocation_semaphore:
+                return await invoke_agent(agent, agent_id, message, workspace)
         except Exception as e:
             logger.error(f"Agent @{agent_id} invocation failed: {e}")
             return f"Error invoking @{agent_id}: {e}"

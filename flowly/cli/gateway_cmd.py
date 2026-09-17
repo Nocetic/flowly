@@ -779,13 +779,11 @@ def gateway(
     multi_teams = config.agents.teams
 
     if multi_agents:
-        from flowly.multiagent.router import AgentRouter
-        from flowly.multiagent.orchestrator import TeamOrchestrator
-        from flowly.multiagent.setup import ensure_agent_directory
         from flowly.agent.tools.delegate import DelegateTool
+        from flowly.multiagent.router import AgentRouter
+        from flowly.multiagent.setup import ensure_agent_directory
 
         ma_router = AgentRouter(multi_agents, multi_teams)
-        ma_orchestrator = TeamOrchestrator(ma_router)
 
         # Setup agent working directories
         agents_workspace = config.workspace_path / "agents"
@@ -794,15 +792,17 @@ def gateway(
             ensure_agent_directory(agent_dir, aid, multi_agents, multi_teams)
 
         # Register delegate_to tool on main agent
-        delegate_tool = DelegateTool(multi_agents, multi_teams, agents_workspace, bus, registry=agent.subagents.registry)
+        delegate_tool = DelegateTool(
+            multi_agents, multi_teams, agents_workspace, bus,
+            registry=agent.subagents.registry,
+            max_concurrent=config.agents.max_concurrent_cli_agents,
+        )
         agent.tools.register(delegate_tool)
 
         # Wrap _process_message with multi-agent routing
         _original_process = agent._process_message
 
         async def _routed_process(msg):
-            from flowly.bus.events import InboundMessage as _IB, OutboundMessage as _OB
-
             # Update delegate tool context so background results go to the right chat
             delegate_tool.set_context(msg.channel, msg.chat_id)
 
@@ -832,12 +832,19 @@ def gateway(
             model_display = delegate_tool._resolve_model(agent_cfg)
 
             # Fire-and-forget: invoke agent subprocess in background
-            await delegate_tool.execute(routing.agent_id, routing.message)
+            await delegate_tool.execute(
+                routing.agent_id, routing.message, team_id=routing.team_id
+            )
 
             # Return immediate ack to user — let main LLM phrase it naturally
+            target_id = routing.team_id or routing.agent_id
+            target_name = (
+                multi_teams[routing.team_id].name if routing.team_id
+                else agent_cfg.name or routing.agent_id
+            )
             msg.content = (
-                f"[SYSTEM: You have just delegated a task to @{routing.agent_id} "
-                f"({agent_cfg.name or routing.agent_id}, {model_display}). "
+                f"[SYSTEM: You have just delegated a task to @{target_id} "
+                f"({target_name}, {model_display}). "
                 f"The agent is now working in the background. "
                 f"Tell the user briefly that the task was delegated and they will be notified when done. "
                 f"Do NOT re-delegate or call any tools.]"

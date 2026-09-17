@@ -76,6 +76,8 @@ The subprocess is built per provider (for example `anthropic` → `claude --dang
 
 You can address a single agent (`@coder fix the login bug`) or a **team** (`@dev …`). A team has a leader and members. The orchestrator invokes the leader first; teammate mentions in the leader's response drive either a sequential handoff or a **parallel fan-out**. Team chains are bounded by a maximum depth of `10`.
 
+CLI agent subprocesses share a concurrency limit across direct delegations and team runs. The default is **5** running subprocesses per gateway. Set `agents.maxConcurrentCliAgents` in `~/.flowly/config.json` to change it (1–64); additional team members wait for a slot, and their results retain the team's mention order.
+
 ### Setting up agents and teams
 
 Run the interactive wizard:

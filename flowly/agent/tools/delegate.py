@@ -12,6 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from flowly.agent.subagent_observation import TaskEvents, run_view
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
 from flowly.agent.tools.base import Tool
@@ -23,7 +25,8 @@ from flowly.multiagent.invoke import (
     resolve_claude_model,
     resolve_codex_model,
 )
-from loguru import logger
+from flowly.multiagent.orchestrator import TeamOrchestrator
+from flowly.multiagent.router import AgentRouter, TeamContext
 
 
 class DelegateTool(Tool):
@@ -43,12 +46,19 @@ class DelegateTool(Tool):
         bus: MessageBus,
         on_event: Any | None = None,
         registry: SubagentRegistry | None = None,
+        max_concurrent: int = 5,
     ):
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be positive")
         self._registry = registry or SubagentRegistry()
         self._events = TaskEvents(self._deliver_event)
         self._tasks: dict[str, asyncio.Task] = {}
         self._agents = agents
         self._teams = teams
+        self._invocation_semaphore = asyncio.Semaphore(max_concurrent)
+        self._orchestrator = TeamOrchestrator(
+            AgentRouter(agents, teams), max_concurrent, self._invocation_semaphore
+        )
         self._workspace = workspace
         self._bus = bus
         self._on_event = on_event  # async callback(event_name, data) for UI notifications
@@ -106,7 +116,9 @@ class DelegateTool(Tool):
             "required": ["agent_id", "message"],
         }
 
-    async def execute(self, agent_id: str, message: str, **kwargs: Any) -> str:
+    async def execute(
+        self, agent_id: str, message: str, *, team_id: str | None = None, **kwargs: Any
+    ) -> str:
         """Delegate a task to the specified agent (fire-and-forget).
 
         Starts the agent subprocess in the background and returns immediately.
@@ -123,9 +135,14 @@ class DelegateTool(Tool):
             available = list(self._agents.keys())
             return f"Error: Agent '{agent_id}' not found. Available agents: {available}"
 
+        team = self._teams.get(team_id) if team_id else None
+        if team_id and (team is None or team.leader_agent != agent_id):
+            return f"Error: Team '{team_id}' not found for leader @{agent_id}."
+
         agent = self._agents[agent_id]
+        target_id = team_id or agent_id
         model_display = self._resolve_model(agent)
-        logger.info(f"Delegating to @{agent_id}: {message[:80]}...")
+        logger.info(f"Delegating to @{target_id}: {message[:80]}...")
 
         # Capture context for the background task
         channel = self._channel
@@ -135,14 +152,14 @@ class DelegateTool(Tool):
         record = SubagentRunRecord(
             run_id=run_id, child_session_key=f"delegate:{run_id}",
             parent_session_key=f"{channel}:{chat_id}", parent_channel=channel,
-            parent_chat_id=chat_id, task=message, label=agent_id,
-            display_name=f"@{agent_id}: {message[:100]}", model=model_display,
-            cleanup="keep", created_at=time.time(), kind="delegate", agent_id=agent_id,
+            parent_chat_id=chat_id, task=message, label=target_id,
+            display_name=f"@{target_id}: {message[:100]}", model=model_display,
+            cleanup="keep", created_at=time.time(), kind="delegate", agent_id=target_id,
             activity={"phase": "queued"},
             delivery_state="pending" if channel and chat_id else "not_required",
         )
         self._registry.register(record)
-        self._running[run_id] = {"agent_id": agent_id, "label": record.display_name,
+        self._running[run_id] = {"agent_id": target_id, "label": record.display_name,
                                  "task": message, "model": model_display, "started_at": record.created_at}
         self._publish_event("subagent.started", run_id)
 
@@ -151,7 +168,17 @@ class DelegateTool(Tool):
             try:
                 self._registry.update(run_id, started_at=time.time(), activity={"phase": "working"})
                 self._publish_event("subagent.progress", run_id)
-                result = await invoke_agent(agent, agent_id, message, self._workspace, timeout=1800)
+                if team is not None:
+                    team_result = await self._orchestrator.execute(
+                        message, agent_id, TeamContext(team_id, team),
+                        self._agents, self._workspace,
+                    )
+                    result = team_result.final_response
+                else:
+                    async with self._invocation_semaphore:
+                        result = await invoke_agent(
+                            agent, agent_id, message, self._workspace, timeout=1800
+                        )
                 if not result.strip():
                     raise ValueError("Task produced no output")
                 self._registry.finish(run_id, "ok", result=result)
@@ -159,7 +186,7 @@ class DelegateTool(Tool):
                 self._registry.finish(run_id, "cancelled", error="Task interrupted", error_code="cancelled")
                 raise
             except Exception as exc:
-                logger.error(f"Background delegation to @{agent_id} failed: {exc}")
+                logger.error(f"Background delegation to @{target_id} failed: {exc}")
                 self._registry.finish(run_id, "error", error="Task could not finish", error_code="delegate_failed")
             finally:
                 self._running.pop(run_id, None)
@@ -168,7 +195,7 @@ class DelegateTool(Tool):
             if channel and chat_id:
                 current = self._registry.get(run_id)
                 outcome = "completed" if current.outcome == "ok" else "failed"
-                content = (f"[DELEGATE_RESULT:{agent_id}] @{agent_id} {outcome}. "
+                content = (f"[DELEGATE_RESULT:{target_id}] @{target_id} {outcome}. "
                            f"Summarize the result for the user.\n\n{result or current.error}")
                 await self._bus.publish_inbound(InboundMessage(
                     channel=channel, sender_id="delegate_result", chat_id=chat_id, content=content,
@@ -194,7 +221,8 @@ class DelegateTool(Tool):
                     done.exception()
 
         task.add_done_callback(cleanup)
-        return (f"Task delegated to @{agent_id} ({agent.name or agent_id}, {model_display}). "
+        target_name = team.name if team is not None else agent.name or agent_id
+        return (f"Task delegated to @{target_id} ({target_name}, {model_display}). "
                 "The agent is now working in the background. "
                 "The result will be delivered automatically when the agent finishes.")
 
