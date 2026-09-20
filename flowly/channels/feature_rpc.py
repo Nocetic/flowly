@@ -4190,6 +4190,7 @@ def cron_list(params: dict) -> dict:
     if svc is None:
         raise FeatureRpcError("UNAVAILABLE", "Scheduler not configured")
     from flowly.cron.service import _OUTPUT_RETENTION_DAYS
+    from flowly.cron.timezone import host_timezone_metadata
 
     include_disabled = bool(params.get("includeDisabled", True))
     include_archived = bool(params.get("includeArchived", False))
@@ -4210,6 +4211,7 @@ def cron_list(params: dict) -> dict:
         "jobs": [_cron_job_to_dict(j, running.get(j.id)) for j in jobs],
         "running": list(running.values()),
         "retentionDays": max(0, _OUTPUT_RETENTION_DAYS),
+        "schedulerTimeZone": host_timezone_metadata(),
     }
 
 

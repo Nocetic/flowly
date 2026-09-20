@@ -11,6 +11,12 @@
 #    nuitka-project: --include-package=tokenizers
 #    nuitka-project: --include-distribution-metadata=fastembed
 
+# Python's zoneinfo loads this package dynamically when an OS timezone database
+# is unavailable (notably in Windows standalone builds). Bundle both its module
+# and IANA resource files so explicit cron timezones work in the packaged agent.
+# nuitka-project: --include-package=tzdata
+# nuitka-project: --include-package-data=tzdata
+
 """CLI entry point — extracts --profile BEFORE any Flowly module import.
 
 This is critical because many modules evaluate ``get_flowly_home()`` at

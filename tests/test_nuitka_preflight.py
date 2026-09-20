@@ -1,8 +1,16 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from scripts import nuitka_preflight as preflight
+
+
+def test_nuitka_entry_bundles_iana_timezone_database():
+    entry = Path(preflight.__file__).parents[1] / "flowly" / "cli" / "entry.py"
+    source = entry.read_text(encoding="utf-8")
+    assert "# nuitka-project: --include-package=tzdata" in source
+    assert "# nuitka-project: --include-package-data=tzdata" in source
 
 
 @pytest.fixture

@@ -15,6 +15,7 @@ from typing import Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
+from flowly.cron.timezone import schedule_timezone
 from flowly.cron.types import (
     CronJob,
     CronJobState,
@@ -154,26 +155,50 @@ def _compute_grace_ms(schedule: CronSchedule) -> int:
 
     if schedule.kind == "cron" and schedule.expr:
         try:
-            import datetime as _dt
-
-            from croniter import croniter
-            tz = schedule.tz or "UTC"
-            try:
-                import zoneinfo
-                tzinfo = zoneinfo.ZoneInfo(tz)
-            except Exception:
-                tzinfo = _dt.timezone.utc
-            now_aware = _dt.datetime.now(tz=tzinfo)
-            cron = croniter(schedule.expr, now_aware)
-            first = cron.get_next(_dt.datetime)
-            second = cron.get_next(_dt.datetime)
-            period_ms = int((second - first).total_seconds() * 1000)
+            tzinfo = schedule_timezone(schedule.tz)
+            now_ms = _now_ms()
+            first = _next_cron_datetime(schedule.expr, now_ms, tzinfo)
+            second = _next_cron_datetime(
+                schedule.expr, int(first.timestamp() * 1000), tzinfo
+            )
+            period_ms = int((second.timestamp() - first.timestamp()) * 1000)
             grace = period_ms // 2
             return max(_GRACE_MIN_MS, min(grace, _GRACE_MAX_MS))
         except Exception:
             pass
 
     return _GRACE_MIN_MS
+
+
+def _next_cron_datetime(
+    expression: str, after_ms: int, tzinfo: _dt.tzinfo
+) -> _dt.datetime:
+    """Resolve the next cron wall time deterministically across DST changes.
+
+    ``croniter``'s timezone-aware arithmetic can shift an ordinary wall-clock
+    schedule by an hour on the day after a transition. Iterate naive local
+    calendar values instead, then attach the requested zone and verify that
+    the local value exists. A spring-forward gap is skipped. During a repeated
+    fall-back hour, fold 0 is selected so the job runs once at the earlier
+    occurrence rather than twice.
+    """
+    from croniter import croniter
+
+    after = _dt.datetime.fromtimestamp(after_ms / 1000, tz=tzinfo)
+    cron = croniter(expression, after.replace(tzinfo=None))
+    # This covers even a per-second expression across the largest historical
+    # civil-time gap (24 hours), while still bounding damaged tzinfo behavior.
+    for _ in range(100_000):
+        wall = cron.get_next(_dt.datetime)
+        candidate = wall.replace(tzinfo=tzinfo, fold=0)
+        timestamp = candidate.timestamp()
+        normalized = _dt.datetime.fromtimestamp(timestamp, tz=tzinfo)
+        if normalized.replace(tzinfo=None) != wall:
+            # This local calendar value does not exist (spring-forward gap).
+            continue
+        if int(timestamp * 1000) > after_ms:
+            return normalized
+    raise ValueError("Unable to resolve next cron occurrence in timezone")
 
 
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
@@ -189,18 +214,8 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
 
     if schedule.kind == "cron" and schedule.expr:
         try:
-            import datetime as _dt
-
-            from croniter import croniter
-            tz = schedule.tz or "UTC"
-            try:
-                import zoneinfo
-                tzinfo = zoneinfo.ZoneInfo(tz)
-            except Exception:
-                tzinfo = _dt.timezone.utc
-            now_aware = _dt.datetime.now(tz=tzinfo)
-            cron = croniter(schedule.expr, now_aware)
-            next_dt = cron.get_next(_dt.datetime)
+            tzinfo = schedule_timezone(schedule.tz)
+            next_dt = _next_cron_datetime(schedule.expr, now_ms, tzinfo)
             return int(next_dt.timestamp() * 1000)
         except Exception:
             return None
@@ -901,7 +916,21 @@ class CronService:
                     job.completed_at_ms = job.completed_at_ms or job.state.last_run_at_ms
                     job.state.next_run_at_ms = None
                 continue
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+            next_run = _compute_next_run(job.schedule, now)
+            if job.schedule.kind == "cron" and next_run is None:
+                # Older builds silently treated unknown explicit zones as UTC.
+                # Do not keep executing that guess, and do not leave an enabled
+                # job stranded with no due time. Pausing preserves the record so
+                # a client can repair its timezone or expression.
+                logger.error(
+                    "Cron: pausing job '{}' because its schedule cannot be resolved",
+                    job.name,
+                )
+                job.lifecycle = "paused"
+                job.enabled = False
+                job.state.next_run_at_ms = None
+                continue
+            job.state.next_run_at_ms = next_run
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -1815,6 +1844,8 @@ class CronService:
             if new_sched is not None:
                 if not isinstance(new_sched, CronSchedule):
                     raise ValueError("schedule must be a CronSchedule")
+                if new_sched.kind == "cron":
+                    schedule_timezone(new_sched.tz)
                 reschedule = bool(updates.get("reschedule")) or not _schedule_equal(
                     job.schedule, new_sched
                 )
@@ -1948,6 +1979,9 @@ class CronService:
                     f"(got {schedule.every_ms}ms)"
                 )
 
+        if schedule.kind == "cron":
+            schedule_timezone(schedule.tz)
+
         # Validate cron expression upfront
         if schedule.kind == "cron" and schedule.expr:
             try:
@@ -1981,6 +2015,10 @@ class CronService:
             str(source_id).strip() if source_id and str(source_id).strip()
             else new_job_id if normalized_source else None
         )
+        next_run_at_ms = _compute_next_run(schedule, now)
+        if schedule.kind == "cron" and next_run_at_ms is None:
+            raise ValueError("Cron schedule has no resolvable future occurrence")
+
         job = CronJob(
             id=new_job_id,
             name=name,
@@ -1995,7 +2033,7 @@ class CronService:
                 tool_name=tool_name,
                 tool_args=tool_args,
             ),
-            state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
+            state=CronJobState(next_run_at_ms=next_run_at_ms),
             created_at_ms=now,
             updated_at_ms=now,
             lifecycle="scheduled",

@@ -30,7 +30,7 @@ class CronSchedule:
     every_ms: int | None = None
     # For "cron": cron expression (e.g. "0 9 * * *")
     expr: str | None = None
-    # Timezone for cron expressions
+    # IANA timezone for cron expressions; omitted = execution host timezone
     tz: str | None = None
 
 

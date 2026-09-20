@@ -431,7 +431,11 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                     "method": "cron.list",
                     "params": {},
                 })
-                assert routines == {"jobs": [], "running": [], "retentionDays": 30}
+                assert routines["jobs"] == []
+                assert routines["running"] == []
+                assert routines["retentionDays"] == 30
+                assert isinstance(routines["schedulerTimeZone"]["utcOffsetSeconds"], int)
+                assert routines["schedulerTimeZone"]["name"]
                 added = await rpc("profiles.rpc", {
                     "name": "writer",
                     "method": "cron.add",

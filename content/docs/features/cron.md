@@ -140,3 +140,35 @@ The agent can manage jobs directly with the `cron` tool. Actions: `list`, `add`,
 - [Voice](voice.md)
 - [CLI commands reference](../reference/cli-commands.md)
 - [Slash commands reference](../reference/slash-commands.md)
+
+### Execution timezone
+
+Clients that create a recurring schedule should send the user's IANA timezone in
+`schedule.tz`, for example `America/New_York`, `Europe/Madrid`, or `UTC`. The
+agent stores and returns that value and evaluates the cron expression in that
+timezone, regardless of the timezone of the machine running the agent. Invalid
+explicit timezone names are rejected on create and update.
+
+When `schedule.tz` is omitted, the expression uses the timezone of the machine
+running the agent, including its `TZ` environment override and daylight-saving
+rules. This fallback preserves legacy records and CLI callers; a GUI should not
+rely on it to represent the user's timezone.
+
+Cron expressions describe local calendar values. If a value does not exist
+during a spring-forward gap, that occurrence is skipped. If a value occurs twice
+during a fall-back fold, it runs once at the earlier occurrence. Normal daily
+wall times resume without a one-hour drift after either transition.
+
+`cron.list` includes `schedulerTimeZone: {id, name, utcOffsetSeconds}` so clients
+can label the execution clock. `id` is an IANA identifier when detectable and may
+be null on systems that do not expose one; the current name/offset remain
+available. An offset alone must not be used as a replacement for DST rules.
+One-time `atMs` values are absolute Unix milliseconds and are never shifted;
+interval schedules remain elapsed durations.
+
+Compatibility: older releases defaulted missing cron timezones to UTC. Existing
+implicit-timezone schedules now follow the host when next-run times are
+recomputed, including on restart. Explicit timezones remain unchanged. If a user
+previously compensated by entering a time three hours earlier, they must edit
+that schedule back to the intended wall time; expressions are not automatically
+rewritten.
