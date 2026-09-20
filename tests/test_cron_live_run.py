@@ -431,7 +431,11 @@ class TestCronOutputRpc:
 
     async def test_unknown_job_is_empty_not_an_error(self, wired):
         res = feature_rpc.cron_output({"id": "no-such-job"})
-        assert res == {"outputs": [], "live": None, "artifacts": []}
+        assert res["status"] == "not_found"
+        assert res["job"] is None
+        assert res["outputs"] == []
+        assert res["live"] is None
+        assert res["artifacts"] == []
 
 
 # ── cron.run RPC ────────────────────────────────────────────────────

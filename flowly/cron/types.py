@@ -1,8 +1,9 @@
 """Cron types."""
 
 from dataclasses import dataclass, field
-from typing import Any
-from typing import Literal
+from typing import Any, Literal
+
+CronLifecycle = Literal["scheduled", "paused", "completed", "archived"]
 
 
 @dataclass
@@ -57,6 +58,9 @@ class CronJobState:
     # errors. A job can run cleanly but fail to deliver — e.g. Telegram API
     # down — and should NOT be marked as a failed *run*.
     last_delivery_error: str | None = None
+    # Persistence failure for the latest transcript/metadata. This is neither
+    # an agent execution error nor an outbound delivery error.
+    last_output_error: str | None = None
     # Number of back-to-back failures the scheduler is using to decide
     # whether to fire a failure alert (reset on success). See Phase 4.2.
     consecutive_failures: int = 0
@@ -67,6 +71,10 @@ class CronJobState:
     # success or when max retries are exhausted and the job is let through
     # as a "real" failure. See Phase 4.1.
     retry_attempt: int = 0
+    # Durable identity of the latest run. Unlike the transient `runId` exposed
+    # while a run is active, this survives restarts and selects the exact
+    # archived transcript opened from a notification.
+    last_run_id: str | None = None
 
 
 @dataclass
@@ -80,6 +88,16 @@ class CronJob:
     state: CronJobState = field(default_factory=CronJobState)
     created_at_ms: int = 0
     updated_at_ms: int = 0
+    # Scheduling lifecycle is deliberately separate from the outcome of the
+    # latest run (`state.last_status`). A recurring scheduled job may have a
+    # successful latest run without being a completed schedule.
+    lifecycle: CronLifecycle = "scheduled"
+    completed_at_ms: int | None = None
+    archived_at_ms: int | None = None
+    # Optional stable ownership identity used by external sync. Names and
+    # delivery targets are mutable and must never be treated as ownership.
+    source: str | None = None
+    source_id: str | None = None
     delete_after_run: bool = False
     # Where this job was created — auto-captured from CronTool.set_context().
     # Carries richer routing metadata than `payload.channel`/`payload.to`
@@ -128,5 +146,5 @@ class CronJob:
 @dataclass
 class CronStore:
     """Persistent store for cron jobs."""
-    version: int = 1
+    version: int = 2
     jobs: list[CronJob] = field(default_factory=list)

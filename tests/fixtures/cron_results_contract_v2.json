@@ -1,0 +1,130 @@
+{
+  "cronListRequest": {
+    "includeDisabled": true,
+    "includeArchived": true
+  },
+  "cronListResponse": {
+    "retentionDays": 30,
+    "running": [],
+    "jobs": [
+      {
+        "id": "job-123",
+        "name": "Daily report",
+        "enabled": false,
+        "lifecycle": "completed",
+        "completedAtMs": 1800000005000,
+        "archivedAtMs": null,
+        "source": "firestore:user-42:server-a",
+        "sourceId": "task-123",
+        "sessionKey": "cron:job-123",
+        "schedule": {
+          "kind": "at",
+          "atMs": 1800000000000,
+          "everyMs": null,
+          "expr": null,
+          "tz": null
+        },
+        "payload": {
+          "kind": "agent_turn",
+          "message": "Prepare the report",
+          "deliver": false,
+          "channel": null,
+          "to": null
+        },
+        "state": {
+          "nextRunAtMs": null,
+          "lastRunAtMs": 1800000000000,
+          "lastStatus": "ok",
+          "lastError": null,
+          "lastDeliveryError": null,
+          "lastOutputError": null,
+          "lastRunId": "run-abc",
+          "consecutiveFailures": 0,
+          "retryAttempt": 0,
+          "running": false,
+          "runId": null,
+          "runStartedAtMs": null
+        },
+        "createdAtMs": 1799999000000,
+        "updatedAtMs": 1800000005000,
+        "repeatTimes": 1,
+        "repeatCompleted": 1,
+        "retryMaxAttempts": 0,
+        "retryBackoffMs": [],
+        "model": null,
+        "provider": null,
+        "origin": null
+      }
+    ]
+  },
+  "cronOutputRequest": {
+    "id": "job-123",
+    "runId": "run-abc",
+    "limit": 10
+  },
+  "cronOutputResponse": {
+    "status": "available",
+    "retentionDays": 30,
+    "error": null,
+    "job": {
+      "id": "job-123",
+      "name": "Daily report",
+      "lifecycle": "completed",
+      "lastRunId": "run-abc"
+    },
+    "outputs": [
+      {
+        "name": "1800000000000-run-abc",
+        "runId": "run-abc",
+        "status": "ok",
+        "startedAtMs": 1800000000000,
+        "completedAtMs": 1800000005000,
+        "error": null,
+        "deliveryError": null,
+        "expired": false,
+        "content": "# Cron Job: Daily report\n\n## Response\n\nDone\n"
+      }
+    ],
+    "live": null,
+    "artifacts": []
+  },
+  "cronCompletedEvent": {
+    "jobId": "job-123",
+    "jobName": "Daily report",
+    "runId": "run-abc",
+    "status": "ok",
+    "errorMessage": null,
+    "deliveryError": null,
+    "preview": "Done",
+    "durationMs": 5000,
+    "scheduleKind": "at",
+    "sessionKey": "cron:job-123",
+    "lifecycle": "completed",
+    "completedAtMs": 1800000005000,
+    "outputPersisted": true,
+    "silent": false
+  },
+  "archiveRequest": {
+    "id": "job-123"
+  },
+  "archiveResponse": {
+    "ok": true,
+    "archived": true,
+    "purged": false
+  },
+  "purgeRequest": {
+    "id": "job-123",
+    "purge": true
+  },
+  "manualRunRequest": {
+    "id": "job-123",
+    "force": true,
+    "wait": false
+  },
+  "manualRunResponse": {
+    "ok": true,
+    "started": true,
+    "runId": "run-def",
+    "sessionKey": "cron:job-123"
+  }
+}

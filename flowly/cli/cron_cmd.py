@@ -25,22 +25,27 @@ cron_app = typer.Typer(help="Manage scheduled tasks")
 
 @cron_app.command("list")
 def cron_list(
-    all: bool = typer.Option(False, "--all", "-a", help="Include disabled jobs"),
+    all: bool = typer.Option(
+        False,
+        "--all",
+        "-a",
+        help="Include paused, completed, and archived job history",
+    ),
 ):
-    """List scheduled jobs."""
+    """List active schedules, or all lifecycle/history records."""
     from flowly.config.loader import get_data_dir
     from flowly.cron.service import CronService
 
     store_path = get_data_dir() / "cron" / "jobs.json"
     service = CronService(store_path)
 
-    jobs = service.list_jobs(include_disabled=all)
+    jobs = service.list_jobs(include_disabled=all, include_archived=all)
 
     if not jobs:
         console.print("No scheduled jobs.")
         return
 
-    table = Table(title="Scheduled Jobs")
+    table = Table(title="Scheduled Jobs and History" if all else "Scheduled Jobs")
     table.add_column("ID", style="cyan")
     table.add_column("Name")
     table.add_column("Schedule")
@@ -63,7 +68,14 @@ def cron_list(
             next_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(job.state.next_run_at_ms / 1000))
             next_run = next_time
 
-        status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
+        styles = {
+            "scheduled": "green",
+            "paused": "yellow",
+            "completed": "cyan",
+            "archived": "dim",
+        }
+        style = styles.get(job.lifecycle, "white")
+        status = f"[{style}]{job.lifecycle}[/{style}]"
 
         table.add_row(job.id, job.name, sched, status, next_run)
 
@@ -109,6 +121,7 @@ def cron_add(
         deliver=deliver,
         to=to,
         channel=channel,
+        source="cli",
     )
 
     console.print(f"[green]✓[/green] Added job '{job.name}' ({job.id})")
@@ -116,19 +129,57 @@ def cron_add(
 
 @cron_app.command("remove")
 def cron_remove(
-    job_id: str = typer.Argument(..., help="Job ID to remove"),
+    job_id: str = typer.Argument(..., help="Job ID to archive"),
+    purge: bool = typer.Option(
+        False,
+        "--purge",
+        help="Permanently delete the job record and cron output history",
+    ),
 ):
-    """Remove a scheduled job."""
+    """Archive a schedule by default, or explicitly purge its cron history."""
     from flowly.config.loader import get_data_dir
     from flowly.cron.service import CronService
 
     store_path = get_data_dir() / "cron" / "jobs.json"
     service = CronService(store_path)
 
-    if service.remove_job(job_id):
-        console.print(f"[green]✓[/green] Removed job {job_id}")
+    if service.remove_job(job_id, purge=purge):
+        action = "Permanently purged" if purge else "Archived"
+        console.print(f"[green]✓[/green] {action} job {job_id}")
     else:
         console.print(f"[red]Job {job_id} not found[/red]")
+
+
+@cron_app.command("output")
+def cron_output(
+    job_id: str = typer.Argument(..., help="Job ID whose history to read"),
+    run_id: str = typer.Option(None, "--run-id", help="Read one exact run"),
+    limit: int = typer.Option(10, "--limit", min=1, max=50),
+):
+    """Read retained cron output, including expired-result metadata."""
+    from flowly.config.loader import get_data_dir
+    from flowly.cron.service import CronService, _OUTPUT_RETENTION_DAYS
+
+    service = CronService(get_data_dir() / "cron" / "jobs.json")
+    records = service._read_run_records(job_id, include_content=True)
+    if run_id:
+        records = [record for record in records if record.get("runId") == run_id]
+    records = records[:limit]
+    if not records:
+        console.print(f"[yellow]No retained result found for {job_id}.[/yellow]")
+        return
+
+    for record in records:
+        console.rule(
+            f"{record.get('jobName', job_id)} · {record.get('runId')} · "
+            f"{record.get('status', 'unknown')}"
+        )
+        if record.get("expired"):
+            console.print(
+                f"[yellow]Result content expired after {_OUTPUT_RETENTION_DAYS} day(s).[/yellow]"
+            )
+        else:
+            console.print(record.get("content") or "")
 
 
 @cron_app.command("enable")
@@ -143,7 +194,11 @@ def cron_enable(
     store_path = get_data_dir() / "cron" / "jobs.json"
     service = CronService(store_path)
 
-    job = service.enable_job(job_id, enabled=not disable)
+    try:
+        job = service.enable_job(job_id, enabled=not disable)
+    except ValueError as exc:
+        console.print(f"[red]Cannot update job:[/red] {exc}")
+        raise typer.Exit(1) from exc
     if job:
         status = "disabled" if disable else "enabled"
         console.print(f"[green]✓[/green] Job '{job.name}' {status}")
@@ -154,10 +209,14 @@ def cron_enable(
 @cron_app.command("run")
 def cron_run(
     job_id: str = typer.Argument(..., help="Job ID or name to run"),
-    force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
+    force: bool = typer.Option(
+        True,
+        "--force/--no-force",
+        help="Run paused/completed jobs without reactivating their schedule",
+    ),
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
 ):
-    """Manually run a job (delegates to running gateway)."""
+    """Run one manual attempt without changing the schedule lifecycle."""
     import json
     import urllib.request
     import urllib.error
@@ -184,5 +243,3 @@ def cron_run(
             "[red]Gateway not reachable.[/red] Is 'flowly run' running?\n"
             f"Tried http://localhost:{port}/api/cron/run"
         )
-
-

@@ -71,8 +71,40 @@ def _reload_coaching_runtime(
     return True
 
 
+def _should_register_cron_with_relay(job) -> bool:
+    """Only executable schedules may be recreated by relay reconciliation."""
+    return bool(
+        getattr(job, "lifecycle", None) == "scheduled"
+        and getattr(job, "enabled", False)
+    )
+
+
+def _should_push_persisted_cron_completion(job, data: dict) -> bool:
+    """Preserve existing push eligibility, gated on durable non-silent output."""
+    if not data.get("outputPersisted") or data.get("silent"):
+        return False
+    if not getattr(getattr(job, "payload", None), "deliver", False):
+        return False
+    origin = getattr(job, "origin", None)
+    origin_channel = (
+        (getattr(origin, "platform", None) if origin else None)
+        or getattr(job.payload, "channel", None)
+        or ""
+    )
+    is_local_target = bool(
+        getattr(job.payload, "to", None)
+        and origin_channel in ("cli", "tui", "desktop", "ios")
+    )
+    has_no_target = not bool(getattr(job.payload, "to", None))
+    return is_local_target or has_no_target
+
+
 def _schedule_cron_push_notification(
-    job, response: str | None, *, conversation_id: str = ""
+    job,
+    response: str | None,
+    *,
+    conversation_id: str = "",
+    run_id: str | None = None,
 ) -> None:
     """Best-effort APNs/FCM notification for a completed gateway cron run.
 
@@ -89,6 +121,7 @@ def _schedule_cron_push_notification(
         "type": "cron",
         "jobId": str(getattr(job, "id", "") or ""),
         "jobName": str(getattr(job, "name", "") or ""),
+        "runId": str(run_id or ""),
     }
     data = {k: v for k, v in data.items() if v}
 
@@ -1208,7 +1241,6 @@ def gateway(
                         # APNs/FCM via the relay too — the WS push only reaches a
                         # FOREGROUNDED app; this wakes a closed/backgrounded one.
                         # Fire-and-forget; no-op if no device registered push.
-                        _schedule_cron_push_notification(job, response, conversation_id=_sk)
                     else:
                         from flowly.bus.events import OutboundMessage
                         try:
@@ -1275,9 +1307,6 @@ def gateway(
             logger.error(f"Cron job '{job.name}' agent_turn failed: {e}")
             await _notify_error(err)
             return f"__error__:{err}"
-
-        if job.payload.deliver and response and not is_silent_response(response):
-            _schedule_cron_push_notification(job, response)
 
         return response
 
@@ -1378,6 +1407,12 @@ def gateway(
             fixed = 0
             synced = 0
             for j in jobs:
+                # Relay registration describes executable schedules. Paused,
+                # completed, and archived history must never be re-registered
+                # on reconnect, which could resurrect a terminal one-shot in
+                # an older receiver.
+                if not _should_register_cron_with_relay(j):
+                    continue
                 if not j.payload.deliver or j.payload.channel != "web":
                     continue
 
@@ -1406,7 +1441,11 @@ def gateway(
                 # 2. Re-sync to Firestore
                 try:
                     await web_ch.send_cron_register({
+                        "id": j.id,
                         "name": j.name,
+                        "lifecycle": j.lifecycle,
+                        "source": j.source,
+                        "sourceId": j.source_id,
                         "message": j.payload.message or "",
                         "schedule": {
                             "type": "interval" if j.schedule.kind == "every"
@@ -2237,6 +2276,42 @@ Respond to the user now:"""
     # gateway server existed (it's needed by the agent), so the callbacks are
     # attached here once both are live.
     async def _on_cron_lifecycle(event_name: str, data: dict) -> None:
+        if event_name == "cron.completed":
+            job = next(
+                (
+                    candidate
+                    for candidate in cron.list_jobs(
+                        include_disabled=True,
+                        include_archived=True,
+                    )
+                    if candidate.id == data.get("jobId")
+                ),
+                None,
+            )
+            if job is not None and _should_push_persisted_cron_completion(job, data):
+                origin_channel = (
+                    (job.origin.platform if job.origin else None)
+                    or job.payload.channel
+                    or ""
+                )
+                origin_chat_id = (
+                    (job.origin.chat_id if job.origin else None)
+                    or job.payload.to
+                    or ""
+                )
+                conversation_id = (
+                    f"{origin_channel}:{origin_chat_id}"
+                    if origin_channel and origin_chat_id else ""
+                )
+                # Schedule after persistence and before the WS broadcast so a
+                # broken client connection cannot suppress a durable APNs/FCM
+                # notification.
+                _schedule_cron_push_notification(
+                    job,
+                    data.get("preview"),
+                    conversation_id=conversation_id,
+                    run_id=data.get("runId"),
+                )
         await gateway_server.broadcast_cron_event(event_name, data)
 
     # Both ends of a run go out on the same broadcast: `cron.started` flips a
@@ -2635,9 +2710,13 @@ Respond to the user now:"""
                 _manager_task.cancel()
             if _board_orchestrator is not None:
                 await _board_orchestrator.stop_dispatcher()
+            # Disarm cron wake-ups and give an in-flight run a bounded chance
+            # to persist.  If it cannot finish within the grace period,
+            # CronService records one explicit cancelled result before the
+            # event loop and agent are torn down.
+            await cron.shutdown()
             await gateway_server.stop()
             heartbeat.stop()
-            cron.stop()
             if delegate is not None and hasattr(delegate, "cancel_all"):
                 delegate.cancel_all()
             agent.stop()

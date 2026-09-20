@@ -1,9 +1,13 @@
 """Cron service for scheduling agent tasks."""
 
 import asyncio
+import datetime as _dt
+import hashlib
 import json
 import os
+import re
 import secrets
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -11,7 +15,14 @@ from typing import Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
-from flowly.cron.types import CronJob, CronJobState, CronOrigin, CronPayload, CronSchedule, CronStore
+from flowly.cron.types import (
+    CronJob,
+    CronJobState,
+    CronOrigin,
+    CronPayload,
+    CronSchedule,
+    CronStore,
+)
 
 # Cross-platform file locking. fcntl is Unix-only; on Windows use msvcrt.
 # Used to serialize cron ticks across overlapping processes (gateway
@@ -54,6 +65,12 @@ _OUTPUT_RETENTION_DAYS = int(os.getenv("FLOWLY_CRON_RETENTION_DAYS", "30"))
 # Convention: response body containing this sentinel is not delivered.
 SILENT_MARKER = "[SILENT]"
 
+_LIFECYCLES = {"scheduled", "paused", "completed", "archived"}
+
+
+class CronStoreLoadError(RuntimeError):
+    """The durable cron store exists but cannot be loaded safely."""
+
 
 def is_silent_response(response: str | None) -> bool:
     """Return True if a cron callback response is the [SILENT] sentinel."""
@@ -64,6 +81,42 @@ def is_silent_response(response: str | None) -> bool:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _schedule_equal(left: CronSchedule, right: CronSchedule) -> bool:
+    return (
+        left.kind == right.kind
+        and left.at_ms == right.at_ms
+        and left.every_ms == right.every_ms
+        and left.expr == right.expr
+        and left.tz == right.tz
+    )
+
+
+def _legacy_lifecycle(raw: dict[str, Any]) -> str:
+    """Infer a safe lifecycle for a pre-v2 jobs.json entry.
+
+    A past one-shot with no recorded run remains scheduled so restart can run
+    it. A one-shot that did run, or an exhausted repeat limit, is completed.
+    Disabled records remain paused rather than being silently re-enabled.
+    """
+    explicit = raw.get("lifecycle")
+    if explicit in _LIFECYCLES:
+        return str(explicit)
+
+    state = raw.get("state") if isinstance(raw.get("state"), dict) else {}
+    repeat_times = raw.get("repeatTimes")
+    repeat_completed = int(raw.get("repeatCompleted", 0) or 0)
+    schedule = raw.get("schedule") if isinstance(raw.get("schedule"), dict) else {}
+    has_run = state.get("lastRunAtMs") is not None
+
+    if repeat_times is not None and repeat_completed >= int(repeat_times):
+        return "completed"
+    if schedule.get("kind") == "at" and has_run:
+        return "completed"
+    if not bool(raw.get("enabled", True)):
+        return "paused"
+    return "scheduled"
 
 
 # Grace window bounds for stale-job fast-forward. If the gateway was down
@@ -101,8 +154,9 @@ def _compute_grace_ms(schedule: CronSchedule) -> int:
 
     if schedule.kind == "cron" and schedule.expr:
         try:
-            from croniter import croniter
             import datetime as _dt
+
+            from croniter import croniter
             tz = schedule.tz or "UTC"
             try:
                 import zoneinfo
@@ -126,17 +180,18 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     """Compute next run time in ms."""
     if schedule.kind == "at":
         return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
-    
+
     if schedule.kind == "every":
         if not schedule.every_ms or schedule.every_ms <= 0:
             return None
         # Next interval from now
         return now_ms + schedule.every_ms
-    
+
     if schedule.kind == "cron" and schedule.expr:
         try:
-            from croniter import croniter
             import datetime as _dt
+
+            from croniter import croniter
             tz = schedule.tz or "UTC"
             try:
                 import zoneinfo
@@ -149,7 +204,7 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
             return int(next_dt.timestamp() * 1000)
         except Exception:
             return None
-    
+
     return None
 
 
@@ -193,8 +248,25 @@ class CronService:
         self.activity_probe = activity_probe
         self.interrupt_fn = interrupt_fn
         self._store: CronStore | None = None
+        # The wake task owns only the cancellable sleep until the next due
+        # time.  It must never await an executing job: ordinary mutations
+        # re-arm this task, and cancelling it used to cancel that job too.
         self._timer_task: asyncio.Task | None = None
+        # One scheduler pass may execute several jobs that became due at the
+        # same instant.  Keep it separate from the wake task so re-arming the
+        # clock cannot disturb work already in progress.
+        self._scheduler_task: asyncio.Task | None = None
+        # Includes scheduled and manual executions.  Strong references make
+        # shutdown draining deterministic even when the caller launched a
+        # detached manual run.
+        self._execution_tasks: set[asyncio.Task] = set()
+        # A reservation is visible in ``_active_runs`` before a detached
+        # child task gets its first event-loop turn. Tracking the owner
+        # separately lets shutdown distinguish that unstarted reservation
+        # from work it must drain or cancel.
+        self._execution_owners: dict[str, asyncio.Task] = {}
         self._running = False
+        self._stopping = False
         self._executing = False  # Prevent concurrent _on_timer() calls
         # job_id → in-flight run record. Populated for the whole duration of
         # ``_execute_job`` so live views (cron.list, health_report) can tell
@@ -203,17 +275,20 @@ class CronService:
         # rather than a single slot because a manual trigger can overlap a
         # scheduled fire of a DIFFERENT job.
         self._active_runs: dict[str, dict[str, Any]] = {}
-    
+
     def _load_store(self) -> CronStore:
         """Load jobs from disk."""
         if self._store:
             return self._store
-        
+
         if self.store_path.exists():
             try:
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict) or not isinstance(data.get("jobs", []), list):
+                    raise ValueError("cron store must contain a jobs array")
                 jobs = []
                 for j in data.get("jobs", []):
+                    lifecycle = _legacy_lifecycle(j)
                     origin_raw = j.get("origin")
                     origin_obj = None
                     if isinstance(origin_raw, dict):
@@ -223,16 +298,30 @@ class CronService:
                             chat_name=origin_raw.get("chatName") or origin_raw.get("chat_name"),
                             thread_id=origin_raw.get("threadId") or origin_raw.get("thread_id"),
                         )
+                    state_raw = j.get("state", {})
+                    schedule_raw = j["schedule"]
+                    next_run_at_ms = state_raw.get("nextRunAtMs")
+                    # Pre-v2 restart recovery: do not strand an overdue
+                    # one-shot merely because `_compute_next_run` rejects past
+                    # timestamps. Its original timestamp remains a due time.
+                    if (
+                        lifecycle == "scheduled"
+                        and schedule_raw.get("kind") == "at"
+                        and state_raw.get("lastRunAtMs") is None
+                        and next_run_at_ms is None
+                    ):
+                        next_run_at_ms = schedule_raw.get("atMs")
+
                     jobs.append(CronJob(
                         id=j["id"],
                         name=j["name"],
-                        enabled=j.get("enabled", True),
+                        enabled=(lifecycle == "scheduled"),
                         schedule=CronSchedule(
-                            kind=j["schedule"]["kind"],
-                            at_ms=j["schedule"].get("atMs"),
-                            every_ms=j["schedule"].get("everyMs"),
-                            expr=j["schedule"].get("expr"),
-                            tz=j["schedule"].get("tz"),
+                            kind=schedule_raw["kind"],
+                            at_ms=schedule_raw.get("atMs"),
+                            every_ms=schedule_raw.get("everyMs"),
+                            expr=schedule_raw.get("expr"),
+                            tz=schedule_raw.get("tz"),
                         ),
                         payload=CronPayload(
                             kind=j["payload"].get("kind", "agent_turn"),
@@ -244,17 +333,24 @@ class CronService:
                             tool_args=j["payload"].get("toolArgs"),
                         ),
                         state=CronJobState(
-                            next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
-                            last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
-                            last_status=j.get("state", {}).get("lastStatus"),
-                            last_error=j.get("state", {}).get("lastError"),
-                            last_delivery_error=j.get("state", {}).get("lastDeliveryError"),
-                            consecutive_failures=j.get("state", {}).get("consecutiveFailures", 0),
-                            last_alert_at_ms=j.get("state", {}).get("lastAlertAtMs"),
-                            retry_attempt=j.get("state", {}).get("retryAttempt", 0),
+                            next_run_at_ms=next_run_at_ms,
+                            last_run_at_ms=state_raw.get("lastRunAtMs"),
+                            last_status=state_raw.get("lastStatus"),
+                            last_error=state_raw.get("lastError"),
+                            last_delivery_error=state_raw.get("lastDeliveryError"),
+                            last_output_error=state_raw.get("lastOutputError"),
+                            consecutive_failures=state_raw.get("consecutiveFailures", 0),
+                            last_alert_at_ms=state_raw.get("lastAlertAtMs"),
+                            retry_attempt=state_raw.get("retryAttempt", 0),
+                            last_run_id=state_raw.get("lastRunId"),
                         ),
                         created_at_ms=j.get("createdAtMs", 0),
                         updated_at_ms=j.get("updatedAtMs", 0),
+                        lifecycle=lifecycle,
+                        completed_at_ms=j.get("completedAtMs"),
+                        archived_at_ms=j.get("archivedAtMs"),
+                        source=j.get("source"),
+                        source_id=j.get("sourceId"),
                         delete_after_run=j.get("deleteAfterRun", False),
                         origin=origin_obj,
                         repeat_times=j.get("repeatTimes"),
@@ -270,15 +366,25 @@ class CronService:
                             "failureAlertCooldownMs", 24 * 60 * 60 * 1000
                         ),
                     ))
-                self._store = CronStore(jobs=jobs)
+                self._store = CronStore(version=2, jobs=jobs)
             except Exception as e:
-                logger.warning(f"Failed to load cron store: {e}")
-                self._store = CronStore()
+                # Fail closed. Treating an existing unreadable store as empty
+                # lets a later add/recovery save silently erase user schedules.
+                self._store = None
+                logger.error(f"Failed to load cron store safely: {e}")
+                raise CronStoreLoadError(
+                    f"Cron store is unreadable; refusing to overwrite {self.store_path}: {e}"
+                ) from e
         else:
             self._store = CronStore()
-        
+
+        # Older versions deleted the job definition but sometimes left its
+        # output directory. Recover those directories as inert archived jobs
+        # so History can discover them without already knowing the UUID.
+        if self._recover_orphan_archives():
+            self._save_store()
         return self._store
-    
+
     def _save_store(self) -> None:
         """Save jobs to disk atomically."""
         if not self._store:
@@ -315,12 +421,19 @@ class CronService:
                         "lastStatus": j.state.last_status,
                         "lastError": j.state.last_error,
                         "lastDeliveryError": j.state.last_delivery_error,
+                        "lastOutputError": j.state.last_output_error,
                         "consecutiveFailures": j.state.consecutive_failures,
                         "lastAlertAtMs": j.state.last_alert_at_ms,
                         "retryAttempt": j.state.retry_attempt,
+                        "lastRunId": j.state.last_run_id,
                     },
                     "createdAtMs": j.created_at_ms,
                     "updatedAtMs": j.updated_at_ms,
+                    "lifecycle": j.lifecycle,
+                    "completedAtMs": j.completed_at_ms,
+                    "archivedAtMs": j.archived_at_ms,
+                    "source": j.source,
+                    "sourceId": j.source_id,
                     "deleteAfterRun": j.delete_after_run,
                     "origin": (
                         {
@@ -357,17 +470,18 @@ class CronService:
             except OSError:
                 pass
             raise
-    
+
     async def start(self) -> None:
         """Start the cron service."""
+        self._stopping = False
         self._running = True
         self._load_store()
         self._recompute_next_runs()
         self._save_store()
         self._arm_timer()
-        # One-shot housekeeping on gateway boot — prune old run archives
-        # and orphaned `output/{job_id}/` folders whose job has been
-        # deleted. Cheap, logged, fully skippable via env var.
+        # One-shot housekeeping on gateway boot. Transcript bodies age out,
+        # while their small metadata records remain so History can say
+        # "expired" instead of confusing expiry with no result or I/O error.
         try:
             self._prune_archive()
         except Exception as e:
@@ -378,55 +492,242 @@ class CronService:
         """Return the `output/` root (siblings the jobs.json file)."""
         return self.store_path.parent / "output"
 
+    def _job_output_dir(self, job_id: str) -> Path:
+        """Resolve one archive directory without permitting path traversal."""
+        if not job_id or Path(job_id).name != job_id or job_id in {".", ".."}:
+            raise ValueError("invalid cron job id")
+        root = self._output_root().resolve()
+        candidate = root / job_id
+        resolved = candidate.resolve(strict=False)
+        if resolved.parent != root:
+            raise ValueError("cron output path escapes archive root")
+        return candidate
+
+    @staticmethod
+    def _run_output_path(job_dir: Path, output_name: str) -> Path:
+        """Resolve a metadata-referenced body inside its job directory."""
+        if (
+            not output_name
+            or Path(output_name).name != output_name
+            or output_name in {".", ".."}
+        ):
+            raise OSError("invalid cron output filename")
+        root = job_dir.resolve()
+        candidate = job_dir / output_name
+        if candidate.resolve(strict=False).parent != root:
+            raise OSError("cron output file escapes job archive")
+        return candidate
+
+    def _write_run_metadata(self, job_dir: Path, record: dict[str, Any]) -> Path:
+        """Atomically persist the small durable index for one run."""
+        run_id = str(record["runId"])
+        path = job_dir / f"{run_id}.json"
+        tmp = path.with_suffix(f".tmp.{secrets.token_hex(4)}")
+        try:
+            tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            os.replace(str(tmp), str(path))
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return path
+
+    def _legacy_run_record(self, job_id: str, path: Path) -> dict[str, Any]:
+        """Build stable metadata for an archive created before run IDs."""
+        content = path.read_text(encoding="utf-8")
+        first_line = content.splitlines()[0] if content else ""
+        match = re.match(r"^# Cron Job: (.*?)(?: \(FAILED\))?$", first_line)
+        name = match.group(1) if match else job_id
+        time_match = re.search(r"^\*\*Run Time:\*\* (.+)$", content, re.MULTILINE)
+        started_ms: int
+        if time_match:
+            try:
+                started_ms = int(_dt.datetime.fromisoformat(time_match.group(1)).timestamp() * 1000)
+            except (TypeError, ValueError):
+                started_ms = int(path.stat().st_mtime * 1000)
+        else:
+            started_ms = int(path.stat().st_mtime * 1000)
+        digest = hashlib.sha256(f"{job_id}/{path.name}".encode()).hexdigest()[:20]
+        return {
+            "version": 1,
+            "runId": f"legacy-{digest}",
+            "jobId": job_id,
+            "jobName": name,
+            "startedAtMs": started_ms,
+            "completedAtMs": started_ms,
+            "status": "error" if " (FAILED)" in first_line else "ok",
+            "error": None,
+            "deliveryError": None,
+            "outputFile": path.name,
+            "expired": False,
+            "legacy": True,
+        }
+
+    def _read_run_records(
+        self,
+        job_id: str,
+        *,
+        include_content: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Read new metadata plus any unindexed legacy Markdown outputs."""
+        try:
+            job_dir = self._job_output_dir(job_id)
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
+        if not job_dir.is_dir():
+            return []
+
+        records: list[dict[str, Any]] = []
+        referenced: set[str] = set()
+        for meta_path in job_dir.glob("*.json"):
+            try:
+                raw = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise OSError(f"Unreadable cron run metadata {meta_path.name}: {exc}") from exc
+            if not isinstance(raw, dict) or not raw.get("runId"):
+                continue
+            record = dict(raw)
+            output_name = record.get("outputFile")
+            if isinstance(output_name, str):
+                if Path(output_name).name != output_name:
+                    raise OSError("invalid outputFile in cron run metadata")
+                record["outputFile"] = output_name
+                referenced.add(output_name)
+            records.append(record)
+
+        for output_path in job_dir.glob("*.md"):
+            if output_path.name not in referenced:
+                records.append(self._legacy_run_record(job_id, output_path))
+
+        for record in records:
+            output_name = record.get("outputFile")
+            output_path = (
+                self._run_output_path(job_dir, str(output_name))
+                if output_name else None
+            )
+            available = output_path is not None and output_path.is_file()
+            record["expired"] = bool(record.get("expired")) or not available
+            if include_content:
+                record["content"] = output_path.read_text(encoding="utf-8") if available else None
+            record.setdefault("jobId", job_id)
+            record.setdefault("jobName", job_id)
+            record.setdefault("status", "ok")
+            record.setdefault("startedAtMs", 0)
+            record.setdefault("completedAtMs", record.get("startedAtMs", 0))
+            record.setdefault("deliveryError", None)
+
+        return sorted(
+            records,
+            key=lambda record: (
+                int(record.get("completedAtMs") or record.get("startedAtMs") or 0),
+                str(record.get("runId") or ""),
+            ),
+            reverse=True,
+        )
+
+    def _recover_orphan_archives(self) -> bool:
+        """Recover output-only jobs as inert archived History records."""
+        if self._store is None:
+            return False
+        output_root = self._output_root()
+        if not output_root.is_dir():
+            return False
+        known = {job.id: job for job in self._store.jobs}
+        changed = False
+        for job_dir in output_root.iterdir():
+            if not job_dir.is_dir():
+                continue
+            try:
+                records = self._read_run_records(job_dir.name)
+            except OSError as exc:
+                logger.warning(f"Cron: cannot recover archive {job_dir.name}: {exc}")
+                continue
+            if not records:
+                continue
+            latest = records[0]
+            existing = known.get(job_dir.name)
+            latest_started = int(latest.get("startedAtMs") or 0)
+            latest_completed = int(
+                latest.get("completedAtMs") or latest_started
+            )
+            if existing is not None:
+                # A crash may land run metadata before the final jobs.json
+                # save. Replay the newer durable snapshot idempotently.
+                if existing.state.last_run_id == str(latest.get("runId")):
+                    continue
+                if latest_completed < int(existing.updated_at_ms or 0):
+                    continue
+                existing.state.last_run_at_ms = latest_started or None
+                existing.state.last_run_id = str(latest.get("runId"))
+                status = latest.get("status")
+                if status in {"ok", "error", "skipped"}:
+                    existing.state.last_status = status
+                existing.state.last_error = latest.get("error")
+                existing.state.last_delivery_error = latest.get("deliveryError")
+                existing.state.retry_attempt = int(latest.get("retryAttempt") or 0)
+                existing.state.next_run_at_ms = latest.get("nextRunAtMs")
+                existing.repeat_completed = max(
+                    existing.repeat_completed,
+                    int(latest.get("repeatCompleted") or 0),
+                )
+                recovered_lifecycle = latest.get("lifecycleAfterRun")
+                if recovered_lifecycle in _LIFECYCLES:
+                    existing.lifecycle = recovered_lifecycle
+                    existing.enabled = recovered_lifecycle == "scheduled"
+                    if recovered_lifecycle == "completed":
+                        existing.completed_at_ms = int(
+                            latest.get("completedAtMs") or latest_started
+                        ) or None
+                existing.updated_at_ms = latest_completed
+                changed = True
+                logger.info(
+                    f"Cron: reconciled job {existing.id} from durable run metadata"
+                )
+                continue
+            started_values = [int(r.get("startedAtMs") or 0) for r in records]
+            completed = int(latest.get("completedAtMs") or latest.get("startedAtMs") or 0)
+            recovered = CronJob(
+                id=job_dir.name,
+                name=str(latest.get("jobName") or job_dir.name),
+                enabled=False,
+                schedule=CronSchedule(kind="at"),
+                payload=CronPayload(),
+                state=CronJobState(
+                    next_run_at_ms=None,
+                    last_run_at_ms=int(latest.get("startedAtMs") or 0) or None,
+                    last_status=latest.get("status") if latest.get("status") in {"ok", "error", "skipped"} else None,
+                    last_error=latest.get("error"),
+                    last_delivery_error=latest.get("deliveryError"),
+                    last_run_id=str(latest.get("runId")),
+                ),
+                created_at_ms=min((v for v in started_values if v), default=completed),
+                updated_at_ms=completed,
+                lifecycle="archived",
+                completed_at_ms=completed or None,
+                archived_at_ms=completed or _now_ms(),
+            )
+            self._store.jobs.append(recovered)
+            known[recovered.id] = recovered
+            changed = True
+            logger.info(f"Cron: recovered archived history for missing job {recovered.id}")
+        return changed
+
     def _prune_archive(self) -> None:
-        """Delete stale run transcripts and orphaned per-job archive dirs.
-
-        Two cleanups:
-
-          * **Old transcripts:** any `.md` file under
-            `output/{job_id}/` older than `_OUTPUT_RETENTION_DAYS` days
-            is removed. 0 disables this pass.
-
-          * **Orphaned directories:** `output/{job_id}/` folders whose
-            `job_id` no longer exists in the store (job was removed or
-            renamed) are deleted entirely. Runs on every start so users
-            who `cron remove` from the CLI don't leak disk.
-
-        Safe to be interrupted — each file is `unlink(missing_ok=True)`;
-        each dir is removed only after its files are gone.
-        """
+        """Expire old transcript bodies while preserving run metadata."""
         output_root = self._output_root()
         if not output_root.exists():
             return
 
         now = time.time()
         retention_s = max(0, _OUTPUT_RETENTION_DAYS) * 86400
-        live_ids = {j.id for j in (self._store.jobs if self._store else [])}
-
         pruned_files = 0
-        orphan_dirs = 0
+        if retention_s <= 0:
+            return
         for job_dir in output_root.iterdir():
             if not job_dir.is_dir():
                 continue
-
-            is_orphan = job_dir.name not in live_ids
-            if is_orphan:
-                # Job gone — everything in this dir is stale by definition.
-                try:
-                    for f in job_dir.iterdir():
-                        try:
-                            f.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                    job_dir.rmdir()
-                    orphan_dirs += 1
-                except OSError:
-                    pass
-                continue
-
-            if retention_s <= 0:
-                continue
-
             for f in job_dir.iterdir():
                 if not f.is_file() or f.suffix != ".md":
                     continue
@@ -436,71 +737,243 @@ class CronService:
                     continue
                 if age > retention_s:
                     try:
+                        records = self._read_run_records(job_dir.name)
+                        record = next(
+                            (r for r in records if r.get("outputFile") == f.name),
+                            self._legacy_run_record(job_dir.name, f),
+                        )
+                        record["expired"] = True
+                        self._write_run_metadata(job_dir, record)
                         f.unlink(missing_ok=True)
                         pruned_files += 1
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        logger.warning(f"Cron: failed to expire {f}: {exc}")
 
-        if pruned_files or orphan_dirs:
+        if pruned_files:
             logger.info(
-                f"Cron: archive housekeeping — pruned {pruned_files} old "
-                f"run(s), removed {orphan_dirs} orphan dir(s)"
+                f"Cron: archive housekeeping — expired {pruned_files} old run(s)"
             )
-    
+
     def stop(self) -> None:
-        """Stop the cron service."""
+        """Stop scheduling new work without cancelling an in-flight run.
+
+        This synchronous method remains backward-compatible for embedders that
+        only need to disarm the clock.  Process shutdown should await
+        :meth:`shutdown`, which gives active work a grace period and records an
+        explicit cancelled result if the process cannot wait any longer.
+        """
         self._running = False
-        if self._timer_task:
-            self._timer_task.cancel()
-            self._timer_task = None
+        self._stopping = True
+        timer = self._timer_task
+        self._timer_task = None
+        if timer and not timer.done():
+            timer.cancel()
+
+    async def shutdown(self, grace_period_s: float = 10.0) -> None:
+        """Stop scheduling, then drain or durably cancel active executions."""
+        self.stop()
+        current = asyncio.current_task()
+
+        # Retire reservations whose detached child has not started yet. This
+        # section intentionally contains no await: in one event-loop turn we
+        # close admission, snapshot ownership, and make every already-issued
+        # run ID durable. The child will later see that its reservation was
+        # retired and return without invoking the job callback.
+        orphaned_completions: list[tuple[CronJob, dict[str, Any]]] = []
+        jobs_by_id = {
+            job.id: job for job in (self._store.jobs if self._store else [])
+        }
+        for job_id, run in list(self._active_runs.items()):
+            owner = self._execution_owners.get(job_id)
+            if owner is not None:
+                continue
+            job = jobs_by_id.get(job_id)
+            if job is None:
+                logger.error(
+                    f"Cron: cannot persist unowned reservation {run.get('runId')}; "
+                    f"job {job_id} is missing"
+                )
+                del self._active_runs[job_id]
+                continue
+            completion = self._persist_cancelled_run(
+                job,
+                run,
+                manual=bool(run.get("manual", True)),
+                baseline_repeat_completed=job.repeat_completed,
+                baseline_consecutive_failures=job.state.consecutive_failures,
+                baseline_retry_attempt=job.state.retry_attempt,
+            )
+            if self._active_runs.get(job_id) is run:
+                del self._active_runs[job_id]
+            if completion is not None:
+                orphaned_completions.append((job, completion))
+
+        tasks = {
+            task
+            for task in self._execution_tasks
+            if task is not current and not task.done()
+        }
+        scheduler = self._scheduler_task
+        if scheduler is not None and scheduler is not current and not scheduler.done():
+            tasks.add(scheduler)
+
+        for job, completion in orphaned_completions:
+            await self._publish_completion(job, completion)
+
+        if not tasks:
+            return
+
+        timeout = max(0.0, float(grace_period_s))
+        _done, pending = await asyncio.wait(tasks, timeout=timeout)
+        if not pending:
+            return
+
+        logger.warning(
+            f"Cron: cancelling {len(pending)} task(s) after "
+            f"{timeout:g}s shutdown grace period"
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def reload(self) -> int:
         """Reload jobs from disk (picks up externally added jobs). Returns job count."""
+        old_store = self._load_store()
+        active_jobs = {
+            job.id: job for job in old_store.jobs if job.id in self._active_runs
+        }
         self._store = None  # Clear cache so _load_store reads from disk
-        self._load_store()
+        try:
+            fresh_store = self._load_store()
+        except BaseException:
+            # An active run still owns objects from the old store.  Restoring
+            # the cache prevents its eventual completion from becoming a
+            # no-op save after a failed reload.
+            self._store = old_store
+            raise
+
+        if active_jobs:
+            fresh_by_id = {job.id: index for index, job in enumerate(fresh_store.jobs)}
+            for job_id, active_job in active_jobs.items():
+                index = fresh_by_id.get(job_id)
+                if index is None:
+                    # An external rewrite cannot erase a run that is already
+                    # executing; retain it until that exact run is durable.
+                    fresh_store.jobs.append(active_job)
+                else:
+                    # Preserve the object `_execute_job` will mutate.  Offline
+                    # writers are already forbidden while the gateway is live,
+                    # so ignoring an external edit to this one active record is
+                    # the only atomic choice.
+                    fresh_store.jobs[index] = active_job
+            self._store = fresh_store
         self._recompute_next_runs()
         self._save_store()
         self._arm_timer()
         count = len(self._store.jobs) if self._store else 0
         logger.info(f"Cron service reloaded: {count} jobs")
         return count
-    
+
     def _recompute_next_runs(self) -> None:
-        """Recompute next run times for all enabled jobs."""
+        """Repair next runs without losing retry or overdue one-shot state."""
         if not self._store:
             return
         now = _now_ms()
         for job in self._store.jobs:
-            if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
-    
+            if job.lifecycle != "scheduled" or not job.enabled:
+                job.enabled = False
+                job.state.next_run_at_ms = None
+                continue
+            if job.state.retry_attempt > 0 and job.state.next_run_at_ms is not None:
+                # Persisted backoff is part of the in-progress fire. Recomputing
+                # from the base schedule here used to erase it on every restart.
+                continue
+            if job.schedule.kind == "at":
+                if job.state.last_run_at_ms is None:
+                    # Keep a persisted due time (including an overdue one), or
+                    # restore the original at timestamp for legacy records.
+                    job.state.next_run_at_ms = (
+                        job.state.next_run_at_ms or job.schedule.at_ms
+                    )
+                else:
+                    job.lifecycle = "completed"
+                    job.enabled = False
+                    job.completed_at_ms = job.completed_at_ms or job.state.last_run_at_ms
+                    job.state.next_run_at_ms = None
+                continue
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
         if not self._store:
             return None
-        times = [j.state.next_run_at_ms for j in self._store.jobs 
-                 if j.enabled and j.state.next_run_at_ms]
+        times = [
+            j.state.next_run_at_ms
+            for j in self._store.jobs
+            if (
+                j.lifecycle == "scheduled"
+                and j.enabled
+                and j.state.next_run_at_ms
+                and j.id not in self._active_runs
+            )
+        ]
         return min(times) if times else None
-    
+
     def _arm_timer(self) -> None:
-        """Schedule the next timer tick."""
-        if self._timer_task:
-            self._timer_task.cancel()
-        
+        """Schedule the next wake without owning the scheduler execution."""
+        previous = self._timer_task
+        self._timer_task = None
+        if previous and not previous.done():
+            previous.cancel()
+
         next_wake = self._get_next_wake_ms()
         if not next_wake or not self._running:
             return
-        
+
         delay_ms = max(0, next_wake - _now_ms())
         delay_s = delay_ms / 1000
-        
-        async def tick():
-            await asyncio.sleep(delay_s)
-            if self._running:
-                await self._on_timer()
-        
+
+        async def tick() -> None:
+            try:
+                await asyncio.sleep(delay_s)
+            except asyncio.CancelledError:
+                return
+
+            task = asyncio.current_task()
+            # A newer re-arm may have replaced this sleeper at the same event
+            # loop boundary.  Only the currently-owned wake may dispatch.
+            if self._timer_task is not task:
+                return
+            self._timer_task = None
+            if not self._running:
+                return
+            self._start_scheduler_pass()
+
         self._timer_task = asyncio.create_task(tick())
-    
+
+    def _start_scheduler_pass(self) -> None:
+        """Launch one due-job pass, or let the active pass re-arm when done."""
+        current = self._scheduler_task
+        if current is not None and not current.done():
+            return
+
+        task = asyncio.create_task(self._on_timer())
+        self._scheduler_task = task
+
+        def retire(completed: asyncio.Task) -> None:
+            if self._scheduler_task is completed:
+                self._scheduler_task = None
+            # Retrieve unexpected BaseException outcomes so a scheduler bug is
+            # visible rather than becoming an unobserved task warning.
+            if completed.cancelled():
+                return
+            try:
+                completed.exception()
+            except asyncio.CancelledError:
+                pass
+
+        task.add_done_callback(retire)
+
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
         if self._executing:
@@ -567,7 +1040,12 @@ class CronService:
         grace_saved = False
 
         for j in self._store.jobs:
-            if not (j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms):
+            if not (
+                j.lifecycle == "scheduled"
+                and j.enabled
+                and j.state.next_run_at_ms
+                and now >= j.state.next_run_at_ms
+            ):
                 continue
 
             # Grace window: if a recurring job is past-due by more than
@@ -595,7 +1073,29 @@ class CronService:
         if grace_saved:
             self._save_store()
 
-        for job in due_jobs:
+        for stale_job in due_jobs:
+            if self._stopping:
+                break
+            # The pass may have awaited an earlier due job.  Re-resolve every
+            # later entry because archive/purge/pause/update/reload can change
+            # it while that first job is running.  Executing this stale
+            # snapshot used to run a job the user had already stopped.
+            job = next(
+                (candidate for candidate in self._store.jobs if candidate.id == stale_job.id),
+                None,
+            )
+            now = _now_ms()
+            if not (
+                job is not None
+                and job.lifecycle == "scheduled"
+                and job.enabled
+                and job.state.next_run_at_ms
+                and now >= job.state.next_run_at_ms
+            ):
+                continue
+            if self.current_run(job.id) is not None:
+                logger.info(f"Cron: job '{job.name}' is already running; leaving it due")
+                continue
             # Advance next_run_at BEFORE executing recurring jobs so a crash
             # mid-run does not re-fire the job on next startup (at-most-once
             # semantics). One-shot "at" jobs are left alone so they can
@@ -613,25 +1113,25 @@ class CronService:
         self,
         job: CronJob,
         *,
+        run_id: str,
         run_start_ms: int,
+        completed_at_ms: int,
         response: str | None = None,
         error: str | None = None,
         actions: list[str] | None = None,
         files: list[str] | None = None,
-    ) -> Path | None:
+    ) -> Path:
         """Write a single-run transcript to the per-job archive directory.
 
-        Location: `<store_path.parent>/output/<job_id>/<YYYY-MM-DD_HH-MM-SS>.md`.
-        Keeps a human-readable audit trail independent of the live
-        job state.
+        The UUID in the filename prevents two fast/manual runs from replacing
+        each other. A small sibling JSON record preserves identity and status
+        after the Markdown body expires.
         """
-        import datetime as _dt
-
-        output_dir = self.store_path.parent / "output" / job.id
+        output_dir = self._job_output_dir(job.id)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         ts = _dt.datetime.fromtimestamp(run_start_ms / 1000)
-        output_file = output_dir / (ts.strftime("%Y-%m-%d_%H-%M-%S") + ".md")
+        output_file = output_dir / f"{run_start_ms}-{run_id}.md"
 
         header = f"# Cron Job: {job.name}" + (" (FAILED)" if error else "")
         schedule_display = _format_schedule(job.schedule)
@@ -640,6 +1140,7 @@ class CronService:
             header,
             "",
             f"**Job ID:** {job.id}",
+            f"**Run ID:** {run_id}",
             f"**Run Time:** {ts.isoformat()}",
             f"**Schedule:** {schedule_display}",
             "",
@@ -674,6 +1175,26 @@ class CronService:
             except OSError:
                 pass
             raise
+
+        metadata = {
+            "version": 1,
+            "runId": run_id,
+            "jobId": job.id,
+            "jobName": job.name,
+            "startedAtMs": run_start_ms,
+            "completedAtMs": completed_at_ms,
+            "status": job.state.last_status,
+            "error": job.state.last_error,
+            "deliveryError": job.state.last_delivery_error,
+            "outputFile": output_file.name,
+            "expired": False,
+            "scheduleKind": job.schedule.kind,
+            "lifecycleAfterRun": job.lifecycle,
+            "nextRunAtMs": job.state.next_run_at_ms,
+            "retryAttempt": job.state.retry_attempt,
+            "repeatCompleted": job.repeat_completed,
+        }
+        self._write_run_metadata(output_dir, metadata)
         return output_file
 
     async def _maybe_send_failure_alert(self, job: CronJob, error_text: str) -> None:
@@ -834,40 +1355,219 @@ class CronService:
             "scheduleKind": job.schedule.kind,
         }
 
-    async def _execute_job(self, job: CronJob) -> None:
-        """Execute a job while publishing its in-flight state.
-
-        The run is registered BEFORE the callback so ``on_job`` can read its
-        own ``runId`` (via :meth:`current_run`) and tag the stream it emits
-        with the same identity the start event announced.
-        """
+    def reserve_run(
+        self,
+        job: CronJob,
+        *,
+        manual: bool = False,
+    ) -> dict[str, Any] | None:
+        """Atomically reserve the per-job run slot for timer/manual callers."""
+        if self._stopping:
+            return None
+        if job.id in self._active_runs:
+            return None
         run = self._run_record(job, _now_ms())
+        run["manual"] = manual
         self._active_runs[job.id] = run
+        return run
 
-        if self.on_run_start is not None:
-            try:
-                await self.on_run_start("cron.started", dict(run))
-            except Exception as e:
-                logger.warning(
-                    f"Cron: on_run_start callback failed for '{job.name}': {e}"
-                )
+    def _persist_cancelled_run(
+        self,
+        job: CronJob,
+        run: dict[str, Any],
+        *,
+        manual: bool,
+        baseline_repeat_completed: int,
+        baseline_consecutive_failures: int,
+        baseline_retry_attempt: int,
+    ) -> dict[str, Any] | None:
+        """Turn forced task cancellation into one durable terminal result."""
+        start_ms = int(run["startedAtMs"])
+        completed_at_ms = _now_ms()
+        error_text = (
+            "Cancelled during scheduler shutdown"
+            if self._stopping else "Cancelled before completion"
+        )
+        logger.warning(f"Cron: job '{job.name}' {error_text.lower()}")
 
+        job.state.last_status = "error"
+        job.state.last_error = error_text
+        job.state.last_delivery_error = None
+        job.state.last_run_at_ms = start_ms
+        job.state.last_run_id = str(run["runId"])
+        job.state.consecutive_failures = baseline_consecutive_failures + 1
+        job.state.retry_attempt = baseline_retry_attempt if manual else 0
+        job.updated_at_ms = completed_at_ms
+
+        if not manual:
+            # Shutdown cancellation is a terminal outcome for this fire.  It
+            # must not leave a one-shot due so restart executes it a second
+            # time under a different run ID.
+            job.repeat_completed = baseline_repeat_completed + 1
+            reached_limit = (
+                job.repeat_times is not None
+                and job.repeat_completed >= job.repeat_times
+            )
+            if reached_limit or job.schedule.kind == "at":
+                job.lifecycle = "completed"
+                job.enabled = False
+                job.state.next_run_at_ms = None
+                job.completed_at_ms = completed_at_ms
+
+        archive_ok = False
         try:
-            await self._run_job_body(job, run=run)
-        finally:
-            # Reap only OUR record. A re-entrant run for the same job (a manual
-            # trigger racing the scheduler) owns a different record, and the
-            # older run finishing must not erase the newer one's marker.
+            self._save_job_output(
+                job,
+                run_id=str(run["runId"]),
+                run_start_ms=start_ms,
+                completed_at_ms=completed_at_ms,
+                error=error_text,
+                actions=run.get("actions"),
+                files=run.get("files"),
+            )
+            archive_ok = True
+            job.state.last_output_error = None
+        except Exception as archive_err:
+            job.state.last_output_error = (
+                f"{type(archive_err).__name__}: {archive_err}"
+            )[:500]
+            logger.warning(
+                f"Cron: failed to archive cancelled output for '{job.name}': "
+                f"{archive_err}"
+            )
+
+        self._save_store()
+        if not archive_ok:
+            return None
+        return {
+            "jobId": job.id,
+            "jobName": job.name,
+            "runId": run["runId"],
+            "status": "error",
+            "errorMessage": error_text,
+            "deliveryError": None,
+            "preview": None,
+            "durationMs": completed_at_ms - start_ms,
+            "scheduleKind": getattr(job.schedule, "kind", None),
+            "sessionKey": f"cron:{job.id}",
+            "lifecycle": job.lifecycle,
+            "completedAtMs": job.completed_at_ms,
+            "outputPersisted": True,
+            "silent": False,
+            "cancelled": True,
+        }
+
+    async def _execute_job(
+        self,
+        job: CronJob,
+        *,
+        run: dict[str, Any] | None = None,
+        manual: bool = False,
+    ) -> bool:
+        """Execute one reserved run and publish completion after persistence."""
+        run = run or self.reserve_run(job, manual=manual)
+        if run is None or self._active_runs.get(job.id) is not run:
+            return False
+        run["manual"] = manual
+        run["lifecycle"] = job.lifecycle
+        baseline_repeat_completed = job.repeat_completed
+        baseline_consecutive_failures = job.state.consecutive_failures
+        baseline_retry_attempt = job.state.retry_attempt
+
+        # ``stop()`` may run after an external caller reserved this ID but
+        # before its detached child entered here. Do not start agent work
+        # after admission closed; preserve the exact advertised run ID as a
+        # durable cancellation instead.
+        if self._stopping:
+            completion = self._persist_cancelled_run(
+                job,
+                run,
+                manual=manual,
+                baseline_repeat_completed=baseline_repeat_completed,
+                baseline_consecutive_failures=baseline_consecutive_failures,
+                baseline_retry_attempt=baseline_retry_attempt,
+            )
             if self._active_runs.get(job.id) is run:
                 del self._active_runs[job.id]
+            if completion is not None:
+                await self._publish_completion(job, completion)
+            return False
 
-    async def _run_job_body(self, job: CronJob, *, run: dict[str, Any]) -> None:
+        owner = asyncio.current_task()
+        if owner is not None:
+            self._execution_tasks.add(owner)
+            self._execution_owners[job.id] = owner
+        completion: dict[str, Any] | None = None
+        cancelled_error: asyncio.CancelledError | None = None
+        try:
+            if self.on_run_start is not None:
+                try:
+                    await self.on_run_start("cron.started", dict(run))
+                except Exception as e:
+                    logger.warning(
+                        f"Cron: on_run_start callback failed for '{job.name}': {e}"
+                    )
+
+            completion = await self._run_job_body(job, run=run, manual=manual)
+        except asyncio.CancelledError as exc:
+            cancelled_error = exc
+            completion = self._persist_cancelled_run(
+                job,
+                run,
+                manual=manual,
+                baseline_repeat_completed=baseline_repeat_completed,
+                baseline_consecutive_failures=baseline_consecutive_failures,
+                baseline_retry_attempt=baseline_retry_attempt,
+            )
+        finally:
+            if self._active_runs.get(job.id) is run:
+                del self._active_runs[job.id]
+            if owner is not None:
+                self._execution_tasks.discard(owner)
+                if self._execution_owners.get(job.id) is owner:
+                    del self._execution_owners[job.id]
+
+        # Listeners must only observe a run after its transcript and terminal
+        # job state are durable, and after it is no longer reported active.
+        if completion is not None:
+            await self._publish_completion(job, completion)
+        if cancelled_error is not None:
+            # Cancellation remains observable to the task owner after the
+            # exact run outcome has been made durable and published.
+            raise cancelled_error
+        return True
+
+    async def _publish_completion(
+        self,
+        job: CronJob,
+        completion: dict[str, Any],
+    ) -> None:
+        """Best-effort lifecycle delivery after state and output are durable."""
+        if self.on_complete is None:
+            return
+        try:
+            await self.on_complete("cron.completed", completion)
+        except Exception as complete_err:
+            logger.warning(
+                f"Cron: on_complete callback failed for '{job.name}': {complete_err}"
+            )
+
+    async def _run_job_body(
+        self,
+        job: CronJob,
+        *,
+        run: dict[str, Any],
+        manual: bool,
+    ) -> dict[str, Any] | None:
         """Execute a single job."""
         start_ms = int(run["startedAtMs"])
         logger.info(f"Cron: executing job '{job.name}' ({job.id})")
 
         response: str | None = None
         error_text: str | None = None
+        # Delivery is evaluated afresh for each run. The gateway callback may
+        # set a new delivery error while producing the response.
+        job.state.last_delivery_error = None
 
         try:
             if self.on_job:
@@ -895,25 +1595,10 @@ class CronService:
             job.state.last_error = error_text
             logger.error(f"Cron: job '{job.name}' failed: {e}")
 
-        # Archive this run (success or failure) so past runs can be audited
-        # / replayed even after the job is later removed. Non-fatal on error:
-        # a failed archive must not fail the run.
-        try:
-            self._save_job_output(
-                job,
-                run_start_ms=start_ms,
-                response=response if error_text is None else None,
-                error=error_text,
-                actions=run.get("actions"),
-                files=run.get("files"),
-            )
-        except Exception as archive_err:
-            logger.warning(
-                f"Cron: failed to archive output for '{job.name}': {archive_err}"
-            )
-
         job.state.last_run_at_ms = start_ms
-        job.updated_at_ms = _now_ms()
+        job.state.last_run_id = str(run["runId"])
+        completed_at_ms = _now_ms()
+        job.updated_at_ms = completed_at_ms
 
         # ─── Retry on failure ───────────────────────────────────────────
         # If the fire failed and the job has retries remaining, override
@@ -923,7 +1608,13 @@ class CronService:
         # burning a repeat slot or firing a premature failure alert.
         # Retries are scheduled on the main tick loop so other due jobs
         # aren't blocked by a retrying job's backoff sleep.
-        if error_text and job.retry_max_attempts > 0 and job.state.retry_attempt < job.retry_max_attempts:
+        retrying = bool(
+            not manual
+            and error_text
+            and job.retry_max_attempts > 0
+            and job.state.retry_attempt < job.retry_max_attempts
+        )
+        if retrying:
             backoffs = job.retry_backoff_ms or [30_000, 60_000, 300_000]
             idx = min(job.state.retry_attempt, len(backoffs) - 1)
             backoff_ms = backoffs[idx]
@@ -934,39 +1625,7 @@ class CronService:
                 f"{job.state.retry_attempt}/{job.retry_max_attempts} "
                 f"scheduled in {backoff_ms}ms"
             )
-            return
-
-        # Terminal outcome reached (success, or failure with no retries left).
-        # Notify any listener BEFORE the repeat-limit deletion below so the
-        # event fires even for a "run once then delete" job. Fire-and-forget:
-        # a broken callback must never abort the run's bookkeeping.
-        if self.on_complete is not None:
-            try:
-                preview = (response or "").strip()
-                await self.on_complete(
-                    "cron.completed",
-                    {
-                        "jobId": job.id,
-                        "jobName": job.name,
-                        # Same identity ``cron.started`` announced, so a client
-                        # retires exactly the run it was watching.
-                        "runId": run["runId"],
-                        "status": job.state.last_status,  # "ok" | "error"
-                        "errorMessage": job.state.last_error,
-                        "preview": preview[:500] if preview else None,
-                        "durationMs": _now_ms() - start_ms,
-                        "scheduleKind": getattr(job.schedule, "kind", None),
-                        "sessionKey": f"cron:{job.id}",
-                    },
-                )
-            except Exception as complete_err:
-                logger.warning(
-                    f"Cron: on_complete callback failed for '{job.name}': {complete_err}"
-                )
-
-        # Success (or retries exhausted) — reset the retry counter so the
-        # next fire starts clean.
-        if not error_text:
+        elif not error_text:
             job.state.retry_attempt = 0
             job.state.consecutive_failures = 0
         else:
@@ -976,33 +1635,73 @@ class CronService:
             job.state.consecutive_failures += 1
             await self._maybe_send_failure_alert(job, error_text)
 
-        # Increment repeat counter for every attempt — success or failure.
-        # Counting failures too prevents a persistently-broken job from
-        # running forever.
-        job.repeat_completed += 1
-
-        # Enforce repeat limit: when `repeat_times` is set and we have hit
-        # it, remove the job outright. Applies to all schedule kinds, so a
-        # recurring job can be declared as "run N times then delete".
-        if job.repeat_times is not None and job.repeat_completed >= job.repeat_times:
-            logger.info(
-                f"Cron: job '{job.name}' reached repeat limit "
-                f"({job.repeat_times}), removing"
+        # Manual reruns are standalone history entries. They never consume a
+        # schedule slot, enable a paused/terminal schedule, or queue retries.
+        if not manual and not retrying:
+            job.repeat_completed += 1
+            reached_limit = (
+                job.repeat_times is not None
+                and job.repeat_completed >= job.repeat_times
             )
-            self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
-            return
-
-        # Handle one-shot jobs without a repeat limit (legacy path for
-        # jobs created before repeat_times existed). Recurring jobs have
-        # already had their next_run_at advanced in _advance_next_run(),
-        # so we don't recompute here.
-        if job.schedule.kind == "at":
-            if job.delete_after_run:
-                self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
-            else:
+            if reached_limit or job.schedule.kind == "at":
+                job.lifecycle = "completed"
                 job.enabled = False
                 job.state.next_run_at_ms = None
-    
+                job.completed_at_ms = completed_at_ms
+                logger.info(
+                    f"Cron: job '{job.name}' completed its schedule"
+                )
+
+        # Save transcript+metadata first, then the job record. If jobs.json
+        # fails after metadata lands, startup reconciliation uses the metadata
+        # lifecycle/retry snapshot and prevents a terminal one-shot rerun.
+        archive_ok = False
+        try:
+            self._save_job_output(
+                job,
+                run_id=str(run["runId"]),
+                run_start_ms=start_ms,
+                completed_at_ms=completed_at_ms,
+                response=response if error_text is None else None,
+                error=error_text,
+                actions=run.get("actions"),
+                files=run.get("files"),
+            )
+            archive_ok = True
+            job.state.last_output_error = None
+        except Exception as archive_err:
+            job.state.last_output_error = f"{type(archive_err).__name__}: {archive_err}"[:500]
+            logger.warning(
+                f"Cron: failed to archive output for '{job.name}': {archive_err}"
+            )
+
+        self._save_store()
+
+        if retrying:
+            return None
+        if not archive_ok:
+            # Do not publish a completion notification that suggests the
+            # result can be opened when the archive/metadata did not persist.
+            return None
+
+        preview = (response or "").strip()
+        return {
+            "jobId": job.id,
+            "jobName": job.name,
+            "runId": run["runId"],
+            "status": job.state.last_status,
+            "errorMessage": job.state.last_error,
+            "deliveryError": job.state.last_delivery_error,
+            "preview": preview[:500] if preview else None,
+            "durationMs": completed_at_ms - start_ms,
+            "scheduleKind": getattr(job.schedule, "kind", None),
+            "sessionKey": f"cron:{job.id}",
+            "lifecycle": job.lifecycle,
+            "completedAtMs": job.completed_at_ms,
+            "outputPersisted": True,
+            "silent": is_silent_response(response),
+        }
+
     # ========== Public API ==========
 
     def running_runs(self) -> list[dict[str, Any]]:
@@ -1048,11 +1747,32 @@ class CronService:
         if run is not None:
             run["files"] = list(paths)
 
-    def list_jobs(self, include_disabled: bool = False) -> list[CronJob]:
-        """List all jobs."""
+    def list_jobs(
+        self,
+        include_disabled: bool = False,
+        *,
+        include_archived: bool = False,
+        lifecycles: set[str] | None = None,
+    ) -> list[CronJob]:
+        """List jobs without conflating paused, completed, and archived."""
         store = self._load_store()
-        jobs = store.jobs if include_disabled else [j for j in store.jobs if j.enabled]
-        return sorted(jobs, key=lambda j: j.state.next_run_at_ms or float('inf'))
+        if lifecycles is not None:
+            jobs = [j for j in store.jobs if j.lifecycle in lifecycles]
+        elif include_disabled:
+            jobs = [j for j in store.jobs if include_archived or j.lifecycle != "archived"]
+        else:
+            jobs = [j for j in store.jobs if j.lifecycle == "scheduled" and j.enabled]
+        return sorted(
+            jobs,
+            key=lambda j: (
+                0 if j.lifecycle == "scheduled" else 1,
+                (
+                    j.state.next_run_at_ms or float("inf")
+                    if j.lifecycle == "scheduled"
+                    else -(j.updated_at_ms or j.created_at_ms or 0)
+                ),
+            ),
+        )
 
     def mark_delivery_error(self, job_id: str, error: str | None) -> None:
         """Record a delivery-time failure separately from an agent-run failure.
@@ -1082,6 +1802,37 @@ class CronService:
             if job.id != job_id and job.name != job_id:
                 continue
 
+            normalized_repeat_times: int | None = job.repeat_times
+            if "repeat_times" in updates:
+                raw_repeat = updates["repeat_times"]
+                normalized_repeat_times = (
+                    int(raw_repeat) if raw_repeat and int(raw_repeat) > 0 else None
+                )
+
+            new_sched = updates.get("schedule")
+            reschedule = False
+            next_run: int | None = None
+            if new_sched is not None:
+                if not isinstance(new_sched, CronSchedule):
+                    raise ValueError("schedule must be a CronSchedule")
+                reschedule = bool(updates.get("reschedule")) or not _schedule_equal(
+                    job.schedule, new_sched
+                )
+                if reschedule:
+                    if new_sched.kind == "every" and (
+                        not new_sched.every_ms or new_sched.every_ms < 60_000
+                    ):
+                        raise ValueError("Minimum interval is 60 seconds")
+                    if new_sched.kind == "cron" and new_sched.expr:
+                        try:
+                            from croniter import croniter
+                            croniter(new_sched.expr)
+                        except Exception as exc:
+                            raise ValueError(f"Invalid cron expression: {exc}") from exc
+                    next_run = _compute_next_run(new_sched, _now_ms())
+                    if next_run is None:
+                        raise ValueError("rescheduled job must have a future valid schedule")
+
             if "name" in updates and updates["name"]:
                 job.name = str(updates["name"])
             if "message" in updates and updates["message"] is not None:
@@ -1110,15 +1861,28 @@ class CronService:
             if "provider" in updates:
                 raw = updates["provider"]
                 job.provider = str(raw).strip() if raw and str(raw).strip() else None
+            if "source" in updates:
+                raw = updates["source"]
+                job.source = str(raw).strip() if raw and str(raw).strip() else None
+            if "source_id" in updates or "sourceId" in updates:
+                raw = updates.get("source_id", updates.get("sourceId"))
+                job.source_id = str(raw).strip() if raw and str(raw).strip() else None
             if "repeat_times" in updates:
-                rt = updates["repeat_times"]
-                job.repeat_times = int(rt) if rt and int(rt) > 0 else None
+                job.repeat_times = normalized_repeat_times
 
-            if "schedule" in updates and updates["schedule"] is not None:
-                new_sched = updates["schedule"]
-                if isinstance(new_sched, CronSchedule):
-                    job.schedule = new_sched
-                    job.state.next_run_at_ms = _compute_next_run(new_sched, _now_ms())
+            if reschedule and isinstance(new_sched, CronSchedule):
+                old_kind = job.schedule.kind
+                job.schedule = new_sched
+                job.lifecycle = "scheduled"
+                job.enabled = True
+                job.completed_at_ms = None
+                job.archived_at_ms = None
+                job.state.next_run_at_ms = next_run
+                job.state.retry_attempt = 0
+                job.repeat_completed = 0
+                job.delete_after_run = False
+                if "repeat_times" not in updates and old_kind != new_sched.kind:
+                    job.repeat_times = 1 if new_sched.kind == "at" else None
 
             job.updated_at_ms = _now_ms()
             self._save_store()
@@ -1142,7 +1906,7 @@ class CronService:
                 self._save_store()
                 return True
         return False
-    
+
     def add_job(
         self,
         name: str,
@@ -1165,6 +1929,8 @@ class CronService:
         retry_backoff_ms: list[int] | None = None,
         failure_alert_after: int = 3,
         failure_alert_cooldown_ms: int = 24 * 60 * 60 * 1000,
+        source: str | None = None,
+        source_id: str | None = None,
     ) -> CronJob:
         """Add a new job."""
         if not name or len(name) > 256:
@@ -1174,11 +1940,11 @@ class CronService:
 
         # Enforce minimum interval to prevent cron bomb / runaway LLM cost.
         # Matches the relay-side validation (defense in depth).
-        MIN_INTERVAL_MS = 60_000
+        min_interval_ms = 60_000
         if schedule.kind == "every":
-            if not schedule.every_ms or schedule.every_ms < MIN_INTERVAL_MS:
+            if not schedule.every_ms or schedule.every_ms < min_interval_ms:
                 raise ValueError(
-                    f"Minimum interval is {MIN_INTERVAL_MS // 1000} seconds "
+                    f"Minimum interval is {min_interval_ms // 1000} seconds "
                     f"(got {schedule.every_ms}ms)"
                 )
 
@@ -1209,8 +1975,14 @@ class CronService:
                 if text and text not in normalized_skills:
                     normalized_skills.append(text)
 
+        new_job_id = str(uuid.uuid4())[:12]
+        normalized_source = str(source).strip() if source and str(source).strip() else None
+        normalized_source_id = (
+            str(source_id).strip() if source_id and str(source_id).strip()
+            else new_job_id if normalized_source else None
+        )
         job = CronJob(
-            id=str(uuid.uuid4())[:12],
+            id=new_job_id,
             name=name,
             enabled=True,
             schedule=schedule,
@@ -1226,6 +1998,9 @@ class CronService:
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
             updated_at_ms=now,
+            lifecycle="scheduled",
+            source=normalized_source,
+            source_id=normalized_source_id,
             delete_after_run=delete_after_run,
             origin=origin,
             repeat_times=repeat_times,
@@ -1239,86 +2014,104 @@ class CronService:
             failure_alert_after=max(0, int(failure_alert_after or 0)),
             failure_alert_cooldown_ms=max(0, int(failure_alert_cooldown_ms or 0)),
         )
-        
+
         store.jobs.append(job)
         self._save_store()
         self._arm_timer()
-        
+
         logger.info(f"Cron: added job '{name}' ({job.id})")
         return job
-    
-    def remove_job(self, job_id: str) -> bool:
-        """Remove a job by ID or name, and cascade-delete its archive."""
+
+    def remove_job(self, job_id: str, *, purge: bool = False) -> bool:
+        """Archive a job by default; explicit purge removes record and history."""
         store = self._load_store()
-        # Collect the UUIDs of every matching job BEFORE we mutate the
-        # list — `job_id` can match either id or name, so a single call
-        # can reap multiple entries.
-        targeted_ids = {j.id for j in store.jobs if j.id == job_id or j.name == job_id}
+        targets = [j for j in store.jobs if j.id == job_id or j.name == job_id]
+        if not targets:
+            return False
+        if any(j.id in self._active_runs for j in targets):
+            return False
 
-        before = len(store.jobs)
-        store.jobs = [j for j in store.jobs if j.id != job_id and j.name != job_id]
-        removed = len(store.jobs) < before
+        if purge:
+            target_ids = {j.id for j in targets}
+            for target_id in target_ids:
+                job_dir = self._job_output_dir(target_id)
+                if job_dir.exists():
+                    shutil.rmtree(job_dir)
+            store.jobs = [j for j in store.jobs if j.id not in target_ids]
+            logger.info(f"Cron: permanently purged job/history {job_id}")
+        else:
+            archived_at = _now_ms()
+            for job in targets:
+                job.lifecycle = "archived"
+                job.enabled = False
+                job.state.next_run_at_ms = None
+                job.archived_at_ms = archived_at
+                job.updated_at_ms = archived_at
+            logger.info(f"Cron: archived job {job_id}")
 
-        if removed:
-            self._save_store()
-            self._arm_timer()
-            # Cascade-delete the per-job archive so `~/.flowly/cron/output/`
-            # doesn't accumulate orphans after `remove_job`. Non-fatal.
-            output_root = self._output_root()
-            for rid in targeted_ids:
-                job_dir = output_root / rid
-                if not job_dir.exists():
-                    continue
-                try:
-                    for f in job_dir.iterdir():
-                        try:
-                            f.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                    job_dir.rmdir()
-                    logger.debug(f"Cron: cleaned archive dir for removed job {rid}")
-                except OSError as e:
-                    logger.debug(f"Cron: could not clean archive for {rid}: {e}")
+        self._save_store()
+        self._arm_timer()
+        return True
 
-            logger.info(f"Cron: removed job {job_id}")
-
-        return removed
-    
     def enable_job(self, job_id: str, enabled: bool = True) -> CronJob | None:
-        """Enable or disable a job."""
+        """Pause/resume an active schedule; terminal jobs need rescheduling."""
         store = self._load_store()
         for job in store.jobs:
             if job.id == job_id:
-                job.enabled = enabled
                 job.updated_at_ms = _now_ms()
                 if enabled:
-                    job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+                    if job.lifecycle in {"completed", "archived"}:
+                        raise ValueError("completed or archived jobs must be rescheduled")
+                    next_run = _compute_next_run(job.schedule, _now_ms())
+                    if next_run is None:
+                        raise ValueError("job schedule has no future run; reschedule it")
+                    job.lifecycle = "scheduled"
+                    job.enabled = True
+                    job.state.next_run_at_ms = next_run
                 else:
+                    if job.lifecycle != "scheduled":
+                        return job
+                    job.lifecycle = "paused"
+                    job.enabled = False
                     job.state.next_run_at_ms = None
                 self._save_store()
                 self._arm_timer()
                 return job
         return None
-    
-    async def run_job(self, job_id: str, force: bool = False) -> bool:
-        """Manually run a job. job_id can be the job UUID or name."""
+
+    async def run_job(
+        self,
+        job_id: str,
+        force: bool = False,
+        *,
+        reserved_run: dict[str, Any] | None = None,
+    ) -> bool:
+        """Run once without changing the job's scheduling lifecycle."""
         store = self._load_store()
         for job in store.jobs:
             if job.id == job_id or job.name == job_id:
+                if job.lifecycle == "archived":
+                    return False
                 if not force and not job.enabled:
                     return False
-                await self._execute_job(job)
-                self._save_store()
+                run = reserved_run or self.reserve_run(job, manual=True)
+                if run is None or self._active_runs.get(job.id) is not run:
+                    return False
+                ok = await self._execute_job(job, run=run, manual=True)
                 self._arm_timer()
-                return True
+                return ok
         return False
-    
+
     def status(self) -> dict:
         """Get service status."""
         store = self._load_store()
         return {
             "enabled": self._running,
             "jobs": len(store.jobs),
+            "scheduledJobs": sum(1 for j in store.jobs if j.lifecycle == "scheduled"),
+            "pausedJobs": sum(1 for j in store.jobs if j.lifecycle == "paused"),
+            "completedJobs": sum(1 for j in store.jobs if j.lifecycle == "completed"),
+            "archivedJobs": sum(1 for j in store.jobs if j.lifecycle == "archived"),
             "next_wake_at_ms": self._get_next_wake_ms(),
             "running": self.running_runs(),
         }
@@ -1340,13 +2133,15 @@ class CronService:
         store = self._load_store()
         now = _now_ms()
         total = len(store.jobs)
-        enabled_count = sum(1 for j in store.jobs if j.enabled)
+        enabled_count = sum(
+            1 for j in store.jobs if j.lifecycle == "scheduled" and j.enabled
+        )
 
         warnings: list[dict] = []
         affected_ids: set[str] = set()
 
         for j in store.jobs:
-            if not j.enabled:
+            if j.lifecycle != "scheduled" or not j.enabled:
                 continue
 
             if j.state.consecutive_failures > 0:

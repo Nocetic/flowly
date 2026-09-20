@@ -431,7 +431,7 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                     "method": "cron.list",
                     "params": {},
                 })
-                assert routines == {"jobs": [], "running": []}
+                assert routines == {"jobs": [], "running": [], "retentionDays": 30}
                 added = await rpc("profiles.rpc", {
                     "name": "writer",
                     "method": "cron.add",
@@ -454,7 +454,7 @@ async def test_authenticated_gateway_exposes_profile_lifecycle_and_proxy_rpc(
                     "method": "cron.remove",
                     "params": {"id": job_id},
                 })
-                assert removed == {"ok": True}
+                assert removed == {"ok": True, "archived": True, "purged": False}
                 stopped = await rpc("profiles.stop", {"name": "writer"})
                 assert stopped["status"]["state"] == "stopped"
     finally:

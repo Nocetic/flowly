@@ -215,7 +215,9 @@ class CronTool(Tool):
     def description(self) -> str:
         return (
             "Manage scheduled tasks and reminders. "
-            "Use 'list' to see jobs, 'add' to create new ones, 'update' to modify, 'remove' to delete. "
+            "Use 'list' to see jobs/history, 'add' to create, 'update' to modify, "
+            "'remove' to archive, 'purge' to permanently delete cron history, "
+            "and 'run' for one manual attempt without reactivating a schedule. "
             "Schedules: 'every 30m', 'every 1d', 'at 14:30', 'at tomorrow 09:00', "
             "or cron expressions like '0 9 * * *'. "
             "EXCEPTION — reminders tied to a flowlet (a tracker/mini-screen): do NOT "
@@ -235,7 +237,7 @@ class CronTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "add", "update", "remove", "enable", "disable", "status"],
+                    "enum": ["list", "add", "update", "remove", "purge", "run", "enable", "disable", "status"],
                     "description": "Action to perform"
                 },
                 "name": {
@@ -316,9 +318,14 @@ class CronTool(Tool):
                 "repeat_times": {
                     "type": "integer",
                     "description": (
-                        "Optional repeat limit. Job runs this many times then "
-                        "auto-deletes. Omit (or 0) for forever / default."
+                        "Optional repeat limit. The schedule completes after "
+                        "this many terminal runs and remains in History. "
+                        "Omit (or 0) for forever / default."
                     )
+                },
+                "include_archived": {
+                    "type": "boolean",
+                    "description": "Include archived jobs when listing (default: false)"
                 }
             },
             "required": ["action"]
@@ -341,6 +348,7 @@ class CronTool(Tool):
         model: str | None = None,
         provider: str | None = None,
         repeat_times: int | None = None,
+        include_archived: bool = False,
         **kwargs: Any
     ) -> str:
         """Execute cron action."""
@@ -349,7 +357,7 @@ class CronTool(Tool):
 
         try:
             if action == "list":
-                return self._list_jobs()
+                return self._list_jobs(include_archived=include_archived)
 
             elif action == "add":
                 return await self._add_job(
@@ -385,7 +393,13 @@ class CronTool(Tool):
                 )
 
             elif action == "remove":
-                return self._remove_job(job_id)
+                return self._remove_job(job_id, purge=False)
+
+            elif action == "purge":
+                return self._remove_job(job_id, purge=True)
+
+            elif action == "run":
+                return await self._run_job(job_id)
 
             elif action == "enable":
                 return self._enable_job(job_id, True)
@@ -403,17 +417,25 @@ class CronTool(Tool):
             logger.error(f"Cron tool error: {e}")
             return f"Error: {str(e)}"
 
-    def _list_jobs(self) -> str:
-        """List all scheduled jobs."""
-        jobs = self._cron_service.list_jobs(include_disabled=True)
+    def _list_jobs(self, *, include_archived: bool = False) -> str:
+        """List active and historical jobs with explicit lifecycle labels."""
+        jobs = self._cron_service.list_jobs(
+            include_disabled=True,
+            include_archived=include_archived,
+        )
 
         if not jobs:
             return "No scheduled jobs."
 
-        lines = ["Scheduled Jobs:", ""]
+        lines = ["Scheduled Jobs and History:", ""]
 
         for job in jobs:
-            status = "✓" if job.enabled else "✗"
+            status = {
+                "scheduled": "scheduled",
+                "paused": "paused",
+                "completed": "completed",
+                "archived": "archived",
+            }.get(job.lifecycle, job.lifecycle)
             next_run = _format_next_run(job.state.next_run_at_ms)
 
             # Format schedule description
@@ -570,6 +592,7 @@ class CronTool(Tool):
             skills=skills,
             model=model,
             provider=provider,
+            source="agent",
         )
 
         # Fire-and-forget sync to Firestore via relay so bot-created tasks
@@ -578,7 +601,11 @@ class CronTool(Tool):
         if deliver and channel == "web" and self._on_cron_register:
             try:
                 sync_payload = {
+                    "id": job.id,
                     "name": job.name,
+                    "lifecycle": job.lifecycle,
+                    "source": job.source,
+                    "sourceId": job.source_id,
                     "message": message or "",
                     "schedule": {
                         "type": "interval" if schedule_obj.kind == "every"
@@ -707,8 +734,8 @@ class CronTool(Tool):
         changed = ", ".join(sorted(updates.keys()))
         return f"Updated job '{job.name}' ({job.id}): {changed}"
 
-    def _remove_job(self, job_id: str | None) -> str:
-        """Remove a job."""
+    def _remove_job(self, job_id: str | None, *, purge: bool) -> str:
+        """Archive a job or explicitly purge its cron history."""
         if not job_id:
             return "Error: 'job_id' is required for removing a job"
 
@@ -719,7 +746,7 @@ class CronTool(Tool):
                 removed_name = j.name
                 break
 
-        if self._cron_service.remove_job(job_id):
+        if self._cron_service.remove_job(job_id, purge=purge):
             # Fire-and-forget Firestore unregister
             if removed_name and self._on_cron_unregister:
                 try:
@@ -728,9 +755,20 @@ class CronTool(Tool):
                         asyncio.create_task(result)
                 except Exception as e:
                     logger.warning(f"Cron Firestore unregister failed (non-fatal): {e}")
-            return f"Removed job {job_id}"
+            return (
+                f"Permanently purged job and cron history {job_id}"
+                if purge else f"Archived job {job_id}; its run history is retained"
+            )
         else:
             return f"Job {job_id} not found"
+
+    async def _run_job(self, job_id: str | None) -> str:
+        """Run one manual attempt without changing the schedule lifecycle."""
+        if not job_id:
+            return "Error: 'job_id' is required for running a job"
+        if await self._cron_service.run_job(job_id, force=True):
+            return f"Ran job {job_id}; its schedule lifecycle was unchanged"
+        return f"Job {job_id} not found, archived, or already running"
 
     def _enable_job(self, job_id: str | None, enable: bool) -> str:
         """Enable or disable a job."""

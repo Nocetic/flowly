@@ -4122,6 +4122,11 @@ def _cron_job_to_dict(j, run: dict | None = None) -> dict:
         "id": j.id,
         "name": j.name,
         "enabled": j.enabled,
+        "lifecycle": j.lifecycle,
+        "completedAtMs": j.completed_at_ms,
+        "archivedAtMs": j.archived_at_ms,
+        "source": j.source,
+        "sourceId": j.source_id,
         # The session a run of this job executes under — stable, so a client
         # can subscribe to its live output via ``chat.inflight``.
         "sessionKey": f"cron:{j.id}",
@@ -4145,6 +4150,8 @@ def _cron_job_to_dict(j, run: dict | None = None) -> dict:
             "lastStatus": j.state.last_status,
             "lastError": j.state.last_error,
             "lastDeliveryError": j.state.last_delivery_error,
+            "lastOutputError": j.state.last_output_error,
+            "lastRunId": j.state.last_run_id,
             "consecutiveFailures": j.state.consecutive_failures,
             "retryAttempt": j.state.retry_attempt,
             "running": run is not None,
@@ -4182,12 +4189,27 @@ def cron_list(params: dict) -> dict:
     svc = _cron()
     if svc is None:
         raise FeatureRpcError("UNAVAILABLE", "Scheduler not configured")
+    from flowly.cron.service import _OUTPUT_RETENTION_DAYS
+
     include_disabled = bool(params.get("includeDisabled", True))
-    jobs = svc.list_jobs(include_disabled=include_disabled)
+    include_archived = bool(params.get("includeArchived", False))
+    raw_lifecycles = params.get("lifecycles")
+    lifecycles = None
+    if isinstance(raw_lifecycles, list):
+        lifecycles = {
+            str(value) for value in raw_lifecycles
+            if str(value) in {"scheduled", "paused", "completed", "archived"}
+        }
+    jobs = svc.list_jobs(
+        include_disabled=include_disabled,
+        include_archived=include_archived,
+        lifecycles=lifecycles,
+    )
     running = {r["jobId"]: r for r in svc.running_runs()}
     return {
         "jobs": [_cron_job_to_dict(j, running.get(j.id)) for j in jobs],
         "running": list(running.values()),
+        "retentionDays": max(0, _OUTPUT_RETENTION_DAYS),
     }
 
 
@@ -4239,6 +4261,15 @@ def cron_add(params: dict) -> dict:
             delete_after_run=(schedule.kind == "at"),
             model=params.get("model"),
             provider=params.get("provider"),
+            repeat_times=params.get("repeatTimes"),
+            retry_max_attempts=int(params.get("retryMaxAttempts", 0) or 0),
+            retry_backoff_ms=list(params.get("retryBackoffMs") or []),
+            failure_alert_after=int(params.get("failureAlertAfter", 3) or 0),
+            failure_alert_cooldown_ms=int(
+                params.get("failureAlertCooldownMs", 24 * 60 * 60 * 1000) or 0
+            ),
+            source=params.get("source"),
+            source_id=params.get("sourceId"),
         )
     except ValueError as e:
         raise FeatureRpcError("INVALID", str(e))
@@ -4246,14 +4277,16 @@ def cron_add(params: dict) -> dict:
 
 
 def cron_remove(params: dict) -> dict:
-    """Delete a job by id (or name)."""
+    """Archive by default; ``purge:true`` permanently deletes cron history."""
     svc = _cron()
     if svc is None:
         raise FeatureRpcError("UNAVAILABLE", "Scheduler not configured")
     jid = str(params.get("id") or "")
     if not jid:
         raise FeatureRpcError("INVALID", "id required")
-    return {"ok": svc.remove_job(jid)}
+    purge = bool(params.get("purge", False))
+    ok = svc.remove_job(jid, purge=purge)
+    return {"ok": ok, "archived": bool(ok and not purge), "purged": bool(ok and purge)}
 
 
 def cron_update(params: dict) -> dict:
@@ -4265,9 +4298,14 @@ def cron_update(params: dict) -> dict:
     if not jid:
         raise FeatureRpcError("INVALID", "id required")
     if "enabled" in params:
-        job = svc.enable_job(jid, bool(params.get("enabled")))
+        try:
+            job = svc.enable_job(jid, bool(params.get("enabled")))
+        except ValueError as e:
+            raise FeatureRpcError("INVALID", str(e)) from e
     elif isinstance(params.get("updates"), dict):
         updates = dict(params["updates"])
+        if "sourceId" in updates and "source_id" not in updates:
+            updates["source_id"] = updates.pop("sourceId")
         schedule = updates.get("schedule")
         if isinstance(schedule, dict):
             from flowly.cron.types import CronSchedule
@@ -4315,27 +4353,37 @@ async def cron_run(params: dict) -> dict:
         raise FeatureRpcError("INVALID", "id required")
     force = bool(params.get("force", True))
 
-    if bool(params.get("wait", True)):
-        ok = await svc.run_job(jid, force=force)
-        return {"ok": ok}
-
-    # Detached mode. Resolve the job up front so the caller still gets a real
-    # error instead of an "ok" that silently did nothing.
     job = next(
-        (j for j in svc.list_jobs(include_disabled=True) if j.id == jid or j.name == jid),
+        (
+            j for j in svc.list_jobs(include_disabled=True, include_archived=True)
+            if j.id == jid or j.name == jid
+        ),
         None,
     )
     if job is None:
         raise FeatureRpcError("NOT_FOUND", "job not found")
-    if svc.current_run(job.id) is not None:
-        raise FeatureRpcError("BUSY", "job is already running")
+    if job.lifecycle == "archived":
+        raise FeatureRpcError("INVALID", "archived jobs cannot be run; reschedule first")
     if not force and not job.enabled:
         return {"ok": False}
 
-    task = asyncio.create_task(svc.run_job(jid, force=force))
+    run = svc.reserve_run(job, manual=True)
+    if run is None:
+        raise FeatureRpcError("BUSY", "job is already running")
+
+    if bool(params.get("wait", True)):
+        ok = await svc.run_job(jid, force=force, reserved_run=run)
+        return {"ok": ok}
+
+    task = asyncio.create_task(svc.run_job(jid, force=force, reserved_run=run))
     _cron_run_tasks.add(task)
     task.add_done_callback(_cron_run_tasks.discard)
-    return {"ok": True, "started": True, "sessionKey": f"cron:{job.id}"}
+    return {
+        "ok": True,
+        "started": True,
+        "runId": run["runId"],
+        "sessionKey": f"cron:{job.id}",
+    }
 
 
 def cron_output(params: dict) -> dict:
@@ -4362,24 +4410,90 @@ def cron_output(params: dict) -> dict:
     # archive is keyed by id, so resolve first and fall back to the raw value
     # for a job that no longer exists.
     job = next(
-        (j for j in svc.list_jobs(include_disabled=True) if j.id == jid or j.name == jid),
+        (
+            j for j in svc.list_jobs(include_disabled=True, include_archived=True)
+            if j.id == jid or j.name == jid
+        ),
         None,
     )
     job_id = job.id if job else jid
+    requested_run_id = str(params.get("runId") or "") or None
+    try:
+        records = svc._read_run_records(job_id, include_content=True)
+    except OSError as exc:
+        raise FeatureRpcError("IO_ERROR", str(exc)) from exc
+    if requested_run_id:
+        records = [record for record in records if record.get("runId") == requested_run_id]
+    records = records[:limit]
 
-    job_dir = svc.store_path.parent / "output" / job_id
-    outputs: list[dict[str, Any]] = []
-    if job_dir.exists():
-        files = sorted(job_dir.glob("*.md"), reverse=True)[:limit]
-        for f in files:
-            try:
-                outputs.append({"name": f.stem, "content": f.read_text(encoding="utf-8")})
-            except OSError:
-                continue
+    outputs = [
+        {
+            "name": Path(str(record.get("outputFile") or record.get("runId"))).stem,
+            "runId": record.get("runId"),
+            "status": record.get("status"),
+            "startedAtMs": record.get("startedAtMs"),
+            "completedAtMs": record.get("completedAtMs"),
+            "error": record.get("error"),
+            "deliveryError": record.get("deliveryError"),
+            "expired": bool(record.get("expired")),
+            "content": record.get("content"),
+        }
+        for record in records
+    ]
+    live = _cron_live_run(svc, job_id)
+    if requested_run_id and live and live.get("runId") != requested_run_id:
+        live = None
+
+    latest_output_failed = bool(
+        job
+        and job.state.last_output_error
+        and (
+            requested_run_id is None
+            or requested_run_id == job.state.last_run_id
+        )
+    )
+    if live is not None:
+        status = "running"
+    elif latest_output_failed:
+        status = "error"
+    elif outputs and any(not output["expired"] for output in outputs):
+        status = "available"
+    elif outputs:
+        status = "expired"
+    elif requested_run_id:
+        status = "not_found"
+    elif job and job.state.last_run_at_ms is not None:
+        status = "expired"
+    elif job:
+        status = "never_run"
+    else:
+        status = "not_found"
+
+    identity = None
+    if job:
+        identity = {
+            "id": job.id,
+            "name": job.name,
+            "lifecycle": job.lifecycle,
+            "lastRunId": job.state.last_run_id,
+        }
+    elif records:
+        identity = {
+            "id": job_id,
+            "name": str(records[0].get("jobName") or job_id),
+            "lifecycle": "archived",
+            "lastRunId": records[0].get("runId"),
+        }
+
+    from flowly.cron.service import _OUTPUT_RETENTION_DAYS
 
     return {
+        "status": status,
+        "job": identity,
+        "retentionDays": max(0, _OUTPUT_RETENTION_DAYS),
+        "error": job.state.last_output_error if status == "error" and job else None,
         "outputs": outputs,
-        "live": _cron_live_run(svc, job_id),
+        "live": live,
         "artifacts": _cron_artifacts(job_id),
     }
 
