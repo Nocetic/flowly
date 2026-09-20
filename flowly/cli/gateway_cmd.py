@@ -93,10 +93,51 @@ def _should_push_persisted_cron_completion(job, data: dict) -> bool:
     )
     is_local_target = bool(
         getattr(job.payload, "to", None)
-        and origin_channel in ("cli", "tui", "desktop", "ios")
+        and origin_channel in ("cli", "tui", "desktop", "ios", "android")
     )
     has_no_target = not bool(getattr(job.payload, "to", None))
     return is_local_target or has_no_target
+
+
+async def _publish_cron_lifecycle(cron, gateway_server, event_name: str, data: dict) -> None:
+    """Publish retained completion to mobile push and connected clients."""
+    if event_name == "cron.completed":
+        job = next(
+            (
+                candidate
+                for candidate in cron.list_jobs(
+                    include_disabled=True,
+                    include_archived=True,
+                )
+                if candidate.id == data.get("jobId")
+            ),
+            None,
+        )
+        if job is not None and _should_push_persisted_cron_completion(job, data):
+            origin_channel = (
+                (job.origin.platform if job.origin else None)
+                or job.payload.channel
+                or ""
+            )
+            origin_chat_id = (
+                (job.origin.chat_id if job.origin else None)
+                or job.payload.to
+                or ""
+            )
+            conversation_id = (
+                f"{origin_channel}:{origin_chat_id}"
+                if origin_channel and origin_chat_id else ""
+            )
+            # Schedule after persistence and before the WS broadcast so a
+            # broken client connection cannot suppress a durable APNs/FCM
+            # notification.
+            _schedule_cron_push_notification(
+                job,
+                data.get("preview"),
+                conversation_id=conversation_id,
+                run_id=data.get("runId"),
+            )
+    await gateway_server.broadcast_cron_event(event_name, data)
 
 
 def _schedule_cron_push_notification(
@@ -1213,7 +1254,7 @@ def gateway(
                     # gateway WS instead (the same out-of-band path board results
                     # use). Relay ("web") and real channels (telegram/…) keep the
                     # adapter path below, so the working relay flow is untouched.
-                    _local = origin_channel in ("cli", "tui", "desktop", "ios")
+                    _local = origin_channel in ("cli", "tui", "desktop", "ios", "android")
                     _gw = getattr(agent, "_gateway_server", None)
                     if _local and _gw is not None and hasattr(_gw, "push_session_message"):
                         _sk = f"{origin_channel}:{origin_chat_id}"
@@ -2276,43 +2317,7 @@ Respond to the user now:"""
     # gateway server existed (it's needed by the agent), so the callbacks are
     # attached here once both are live.
     async def _on_cron_lifecycle(event_name: str, data: dict) -> None:
-        if event_name == "cron.completed":
-            job = next(
-                (
-                    candidate
-                    for candidate in cron.list_jobs(
-                        include_disabled=True,
-                        include_archived=True,
-                    )
-                    if candidate.id == data.get("jobId")
-                ),
-                None,
-            )
-            if job is not None and _should_push_persisted_cron_completion(job, data):
-                origin_channel = (
-                    (job.origin.platform if job.origin else None)
-                    or job.payload.channel
-                    or ""
-                )
-                origin_chat_id = (
-                    (job.origin.chat_id if job.origin else None)
-                    or job.payload.to
-                    or ""
-                )
-                conversation_id = (
-                    f"{origin_channel}:{origin_chat_id}"
-                    if origin_channel and origin_chat_id else ""
-                )
-                # Schedule after persistence and before the WS broadcast so a
-                # broken client connection cannot suppress a durable APNs/FCM
-                # notification.
-                _schedule_cron_push_notification(
-                    job,
-                    data.get("preview"),
-                    conversation_id=conversation_id,
-                    run_id=data.get("runId"),
-                )
-        await gateway_server.broadcast_cron_event(event_name, data)
+        await _publish_cron_lifecycle(cron, gateway_server, event_name, data)
 
     # Both ends of a run go out on the same broadcast: `cron.started` flips a
     # Schedule screen to "running" the instant a job fires instead of making

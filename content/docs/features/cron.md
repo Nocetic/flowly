@@ -99,7 +99,7 @@ flowly cron add --name "One-off" --message "Reminder" --at 2026-06-10T09:00:00
 flowly cron remove <job_id> [--purge]
 flowly cron output <job_id> [--run-id <run_id>] [--limit 10]
 flowly cron enable <job_id> [--disable]
-flowly cron run <job_id> [--force/--no-force --port 18790]
+flowly cron run <job_id> [--force | -f | --no-force] [--port 18790]
 ```
 
 > [!NOTE]
@@ -109,7 +109,7 @@ flowly cron run <job_id> [--force/--no-force --port 18790]
 
 `flowly cron list --all` includes paused, completed, and archived History. `flowly cron remove` archives by default; add `--purge` only when the cron definition and retained cron output should be permanently deleted. `flowly cron output` can select an exact durable run ID and reports expired bodies.
 
-`flowly cron run` delegates to a running gateway via `POST http://localhost:<port>/api/cron/run`, so a manual run goes through the same per-job locking path as a scheduled fire. It does not reactivate a paused/completed schedule.
+`flowly cron run` delegates to a running gateway via `POST http://localhost:<port>/api/cron/run`, so a manual run goes through the same per-job locking path as a scheduled fire. It does not reactivate a paused/completed schedule. The CLI preserves its legacy default (`force=false`); use `--force` or the compatible `-f` alias to run a paused/completed job once.
 
 ## Agent `cron` tool
 

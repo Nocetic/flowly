@@ -210,8 +210,9 @@ def cron_enable(
 def cron_run(
     job_id: str = typer.Argument(..., help="Job ID or name to run"),
     force: bool = typer.Option(
-        True,
+        False,
         "--force/--no-force",
+        "-f",
         help="Run paused/completed jobs without reactivating their schedule",
     ),
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),

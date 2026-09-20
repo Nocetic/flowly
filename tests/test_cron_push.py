@@ -123,3 +123,40 @@ def test_persisted_completion_push_preserves_delivery_eligibility(
     )
     data = {"outputPersisted": persisted, "silent": silent}
     assert _should_push_persisted_cron_completion(job, data) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('channel', ['desktop', 'ios', 'android'])
+async def test_real_cron_persists_exact_result_before_push_even_if_ws_fails(tmp_path, monkeypatch, channel):
+    from flowly.cli.gateway_cmd import _publish_cron_lifecycle
+    from flowly.cron.service import CronService
+    from flowly.cron.types import CronSchedule
+    from flowly.push import relay_push
+
+    pushes = []
+    async def execute(job):
+        return 'Retained completion'
+    service = CronService(tmp_path / 'jobs.json', on_job=execute)
+    job = service.add_job('Mobile result', CronSchedule(kind='at', at_ms=1), 'hello', deliver=True, channel=channel, to='conversation-1')
+    async def notify(title, body, **kwargs):
+        run_id = kwargs['data']['runId']
+        records = service._read_run_records(job.id, include_content=True)
+        assert records[0]['runId'] == run_id
+        assert 'Retained completion' in records[0]['content']
+        assert service.current_run(job.id) is None
+        pushes.append(kwargs)
+    async def broken_ws(event, data):
+        if event == 'cron.completed':
+            raise ConnectionError('client disconnected')
+    monkeypatch.setattr(relay_push, 'notify_devices', notify)
+    gateway = SimpleNamespace(broadcast_cron_event=broken_ws)
+    async def lifecycle(event, data):
+        await _publish_cron_lifecycle(service, gateway, event, data)
+    service.on_complete = lifecycle
+    assert await service.run_job(job.id, force=True)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(pushes) == 1
+    assert pushes[0]['conversation_id'] == f'{channel}:conversation-1'
+    assert pushes[0]['data']['jobId'] == job.id
+    assert CronService(service.store_path)._read_run_records(job.id, include_content=True)[0]['runId'] == pushes[0]['data']['runId']
