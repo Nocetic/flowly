@@ -219,6 +219,7 @@ _PROFILE_HOST_LONG_RUNNING_METHODS = frozenset({
     "profiles.configure",
     "profiles.delete.commit",
     "profiles.rpc",
+    "profiles.cron.notify",
     "profiles.stop",
 })
 _PROFILE_CLIENT_SUBSCRIPTION_LIMIT = 128

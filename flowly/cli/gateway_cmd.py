@@ -19,6 +19,7 @@ from rich.table import Table
 
 from flowly import __version__, __logo__
 from flowly.gateway.identity import GATEWAY_SERVICE_ID
+from flowly.push.cron_push import should_push_cron_completion as _should_push_persisted_cron_completion
 
 console = Console()
 
@@ -79,29 +80,11 @@ def _should_register_cron_with_relay(job) -> bool:
     )
 
 
-def _should_push_persisted_cron_completion(job, data: dict) -> bool:
-    """Preserve existing push eligibility, gated on durable non-silent output."""
-    if not data.get("outputPersisted") or data.get("silent"):
-        return False
-    if not getattr(getattr(job, "payload", None), "deliver", False):
-        return False
-    origin = getattr(job, "origin", None)
-    origin_channel = (
-        (getattr(origin, "platform", None) if origin else None)
-        or getattr(job.payload, "channel", None)
-        or ""
-    )
-    is_local_target = bool(
-        getattr(job.payload, "to", None)
-        and origin_channel in ("cli", "tui", "desktop", "ios", "android")
-    )
-    has_no_target = not bool(getattr(job.payload, "to", None))
-    return is_local_target or has_no_target
-
-
-async def _publish_cron_lifecycle(cron, gateway_server, event_name: str, data: dict) -> None:
+async def _publish_cron_lifecycle(
+    cron, gateway_server, event_name: str, data: dict, *, managed_profile: bool = False
+) -> None:
     """Publish retained completion to mobile push and connected clients."""
-    if event_name == "cron.completed":
+    if event_name == "cron.completed" and not managed_profile:
         job = next(
             (
                 candidate
@@ -2317,7 +2300,10 @@ Respond to the user now:"""
     # gateway server existed (it's needed by the agent), so the callbacks are
     # attached here once both are live.
     async def _on_cron_lifecycle(event_name: str, data: dict) -> None:
-        await _publish_cron_lifecycle(cron, gateway_server, event_name, data)
+        await _publish_cron_lifecycle(
+            cron, gateway_server, event_name, data,
+            managed_profile=local_runtime and current_profile_name() != "default",
+        )
 
     # Both ends of a run go out on the same broadcast: `cron.started` flips a
     # Schedule screen to "running" the instant a job fires instead of making

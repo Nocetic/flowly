@@ -336,6 +336,7 @@ class ProfileHost:
                 "profiles.connect",
                 "profiles.stop",
                 "profiles.rpc",
+                "profiles.cron.notify",
                 *self._rooms.methods,
             ],
             "profileRpcMethods": sorted(PROFILE_RPC_TIMEOUTS),
@@ -463,6 +464,15 @@ class ProfileHost:
             return await self.connect(_required_string(params, "name").strip())
         if method == "profiles.stop":
             return await self.stop(_required_string(params, "name").strip())
+        if method == "profiles.cron.notify":
+            from flowly.push.profile_cron_push import notify_profile_cron
+
+            return await notify_profile_cron(
+                self.host_id,
+                _required_string(params, "name").strip(),
+                _required_string(params, "jobId"),
+                _required_string(params, "runId"),
+            )
         if method == "profiles.rpc":
             return await self.rpc(
                 _required_string(params, "name").strip(),
@@ -1587,6 +1597,17 @@ class ProfileHost:
         payload = data if isinstance(data, dict) else {}
         run_id = str(payload.get("runId") or "")
         session_key = str(payload.get("sessionKey") or "")
+        if event == "cron.completed" and profile != "default":
+            # Push belongs to the primary host, independently of phone sockets
+            # or Desktop windows. Keep network I/O off the runtime reader.
+            self._spawn_background(
+                self._notify_cron_completion({
+                    "name": profile,
+                    "jobId": payload.get("jobId"),
+                    "runId": payload.get("runId"),
+                }),
+                name=f"profile-cron-push:{profile}:{run_id}",
+            )
         internal_turn = bool(self._broker_sessions.get((profile, session_key)))
         if internal_turn:
             self._capture_task_audit_event(profile, session_key, event, payload)
@@ -1698,6 +1719,13 @@ class ProfileHost:
         entry["status"] = "ok" if payload.get("success") else "error"
         duration = payload.get("durationMs")
         entry["duration_ms"] = duration if isinstance(duration, int) else None
+
+    async def _notify_cron_completion(self, params: dict[str, Any]) -> None:
+        try:
+            await self.dispatch("profiles.cron.notify", params)
+        except Exception:
+            # Notification failures must not break the runtime event reader.
+            logger.warning("Profile cron push could not be dispatched for {}", params.get("name"))
 
     def _spawn_background(self, coroutine: Awaitable[Any], *, name: str) -> None:
         task = asyncio.create_task(coroutine, name=name)

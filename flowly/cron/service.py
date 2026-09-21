@@ -1149,6 +1149,7 @@ class CronService:
         error: str | None = None,
         actions: list[str] | None = None,
         files: list[str] | None = None,
+        terminal: bool = True,
     ) -> Path:
         """Write a single-run transcript to the per-job archive directory.
 
@@ -1205,6 +1206,8 @@ class CronService:
                 pass
             raise
 
+        from flowly.push.cron_push import cron_notification_snapshot
+
         metadata = {
             "version": 1,
             "runId": run_id,
@@ -1222,6 +1225,9 @@ class CronService:
             "nextRunAtMs": job.state.next_run_at_ms,
             "retryAttempt": job.state.retry_attempt,
             "repeatCompleted": job.repeat_completed,
+            "mobileNotification": cron_notification_snapshot(
+                job, response, silent=is_silent_response(response), terminal=terminal
+            ),
         }
         self._write_run_metadata(output_dir, metadata)
         return output_file
@@ -1695,6 +1701,7 @@ class CronService:
                 error=error_text,
                 actions=run.get("actions"),
                 files=run.get("files"),
+                terminal=not retrying,
             )
             archive_ok = True
             job.state.last_output_error = None
