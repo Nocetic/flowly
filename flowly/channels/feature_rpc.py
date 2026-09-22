@@ -1825,19 +1825,33 @@ async def resolve_voice_access(params: dict, *, inherit: bool = False):
 
 async def voice_call(method: str, params: dict) -> dict:
     from flowly.live_voice.authority import request_owner_scope
+    from flowly.live_voice.diagnostics import voice_rpc_diagnostic
     from flowly.live_voice.sessions import VoiceError
     from flowly.session.ownership import SessionAccessError
+    import time
 
+    started = time.monotonic()
+    outcome, reason_code = 'ok', None
     service = _voice_provider() if _voice_provider is not None else None
     if service is None:
+        voice_rpc_diagnostic(method, params, started, 'failed', 'UNAVAILABLE')
         raise FeatureRpcError("UNAVAILABLE", "Live Voice is not ready on this runtime.")
-    owner, clean = await resolve_voice_owner(params, inherit=True)
     try:
+        owner, clean = await resolve_voice_owner(params, inherit=True)
         with request_owner_scope(owner):
             result = service.for_owner(owner).call(method, clean)
             return await result if _inspect.isawaitable(result) else result
     except (VoiceError, SessionAccessError) as exc:
+        outcome, reason_code = 'failed', exc.code
         raise FeatureRpcError(exc.code, str(exc)) from exc
+    except FeatureRpcError as exc:
+        outcome, reason_code = 'failed', exc.code
+        raise
+    except Exception:
+        outcome, reason_code = 'failed', 'INTERNAL'
+        raise
+    finally:
+        voice_rpc_diagnostic(method, params, started, outcome, reason_code)
 
 
 def task_request_call(method: str, params: dict) -> dict:
