@@ -6,6 +6,7 @@ from typing import Callable, Awaitable
 from loguru import logger
 
 from flowly.bus.events import InboundMessage, OutboundMessage
+from flowly.live_voice.bus_authority import bind_bus_message, bus_message_scope
 
 
 class MessageBus:
@@ -24,7 +25,7 @@ class MessageBus:
     
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
-        await self.inbound.put(msg)
+        await self.inbound.put(bind_bus_message(msg, inbound=True))
     
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""
@@ -32,7 +33,7 @@ class MessageBus:
     
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
-        await self.outbound.put(msg)
+        await self.outbound.put(bind_bus_message(msg, inbound=False))
     
     async def consume_outbound(self) -> OutboundMessage:
         """Consume the next outbound message (blocks until available)."""
@@ -60,7 +61,9 @@ class MessageBus:
                 subscribers = self._outbound_subscribers.get(msg.channel, [])
                 for callback in subscribers:
                     try:
-                        await callback(msg)
+                        with bus_message_scope(msg) as allowed:
+                            if allowed:
+                                await callback(msg)
                     except Exception as e:
                         logger.error(f"Error dispatching to {msg.channel}: {e}")
             except asyncio.TimeoutError:

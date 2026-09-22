@@ -1,0 +1,24 @@
+{
+  "handshake": {
+    "version": 1,
+    "linkId": "link-a",
+    "serverId": "server-a",
+    "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "frame": {
+    "type": "relay.browser",
+    "authority": {
+      "userId": "account-a",
+      "serverId": "server-a",
+      "sessionId": "browser-a",
+      "conversationId": "desktop:voice-work:task",
+      "expiresAt": 1300,
+      "version": 1,
+      "linkId": "link-a",
+      "sequence": 1,
+      "kind": "request"
+    },
+    "body": "{\"type\":\"rpc\",\"id\":\"cross-language\",\"method\":\"health\",\"params\":{\"text\":\"İstanbul 💬\",\"number\":1},\"sessionId\":\"browser-a\"}",
+    "mac": "085b089944a497fc6022b433ef9882b319c7f574057ddba069ff8c8899b9ca25"
+  }
+}

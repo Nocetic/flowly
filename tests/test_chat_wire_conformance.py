@@ -41,8 +41,9 @@ TERMINAL_STATES = {"final", "error"}
 
 
 @pytest.fixture
-def channel():
+def channel(tmp_path, monkeypatch):
     """A WebChannel whose transport is captured instead of sent."""
+    monkeypatch.setenv('FLOWLY_HOME', str(tmp_path / 'home'))
     ch = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
     capture: list[dict] = []
 
@@ -224,6 +225,7 @@ class _FakeSocket:
 
 def _bind_relay_session(channel, session_key: str = "web:conv-1") -> _FakeSocket:
     socket = _FakeSocket()
+    channel._send_or_queue = WebChannel._send_or_queue.__get__(channel, WebChannel)
     channel._ws = socket
     channel._session_key_to_relay_id[session_key] = "relay-sess-1"
     return socket

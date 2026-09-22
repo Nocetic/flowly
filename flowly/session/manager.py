@@ -4,8 +4,9 @@ import hashlib
 import json
 import os
 import secrets
+import threading
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,6 +45,14 @@ from flowly.session.archive import (
     transaction_is_committed,
     transition_record,
 )
+from flowly.session.ownership import (
+    SessionAccessError,
+    is_owned_session,
+    owner_metadata,
+    require_session_access,
+    require_session_file,
+    session_visible,
+)
 from flowly.utils.helpers import ensure_dir, safe_filename
 
 try:  # Session persistence is local-file based on macOS/Linux in production.
@@ -69,6 +78,33 @@ class ConcurrentSessionWriteError(RuntimeError):
 
 class SessionBusyError(RuntimeError):
     """A destructive lifecycle operation raced with an active session turn."""
+
+
+_held_session_locks = threading.local()
+
+
+@contextmanager
+def session_file_lock(canonical_path: Path) -> Iterator[None]:
+    """Keep authority checks and file reads/swaps together, including nested readers."""
+    lock_path = canonical_path.parent / '.locks' / (canonical_path.stem + '.lock')
+    identity = str(lock_path.resolve())
+    held = getattr(_held_session_locks, 'paths', None)
+    if held is None:
+        held = _held_session_locks.paths = set()
+    if identity in held:
+        yield
+        return
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open('a+b') as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        held.add(identity)
+        try:
+            yield
+        finally:
+            held.remove(identity)
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True)
@@ -841,6 +877,53 @@ class SessionManager:
         self._cache: OrderedDict[str, Session] = OrderedDict()
         self._indexer: Any | None = None  # lazy-set by AgentLoop
 
+    @staticmethod
+    def read_run_result(home: Path, key: str, run_id: str, *, max_bytes: int = 32 * 1024 * 1024) -> dict | None:
+        canonical = home / 'sessions' / (safe_filename(key.replace(':', '_')) + '.jsonl')
+        if not canonical.exists() and not canonical.with_name(canonical.stem + '.full.jsonl').exists():
+            return None
+        with session_file_lock(canonical):
+            return SessionManager._read_run_result_unlocked(home, key, run_id, max_bytes=max_bytes)
+
+    @staticmethod
+    def _read_run_result_unlocked(home: Path, key: str, run_id: str, *, max_bytes: int) -> dict | None:
+        """Read one archived handoff without creating sessions or repairing state.
+
+        Recovery uses the same archive visibility rules as chat history. A
+        corrupt or oversized transcript supplies no proof of completion.
+        """
+        safe_key = safe_filename(key.replace(':', '_'))
+        require_session_file(home / 'sessions' / f'{safe_key}.jsonl', key)
+        path = home / 'sessions' / f'{safe_key}.full.jsonl'
+        if not path.exists():
+            path = home / 'sessions' / f'{safe_key}.jsonl'
+        try:
+            with path.open('rb') as handle:
+                raw = handle.read(max_bytes + 1)
+        except FileNotFoundError:
+            return None
+        if len(raw) > max_bytes:
+            raise ValueError('Task transcript exceeds the recovery read limit')
+        rows = [json.loads(line) for line in raw.decode('utf-8').splitlines() if line.strip()]
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError('Task transcript contains an invalid record')
+        states = snapshot_from_rows(rows).by_id
+        occurrences: dict[str, int] = {}
+        result = None
+        for row in rows:
+            if row.get('_type') in {'metadata', ARCHIVE_TRANSITION_TYPE, ARCHIVE_COMMIT_TYPE}:
+                continue
+            fingerprint = message_fingerprint(row)
+            occurrence = occurrences.get(fingerprint, 0)
+            occurrences[fingerprint] = occurrence + 1
+            event = states.get(str(row.get(EVENT_ID_KEY) or legacy_event_id(row, occurrence)))
+            state = event.state if event else row.get(ARCHIVE_STATE_KEY)
+            if (row.get('role') == 'assistant' and row.get('run_id') == run_id
+                    and not row.get('tool_calls') and not row.get('_display_hidden')
+                    and not row.get(ARCHIVE_SUMMARY_KEY) and state not in {'withdrawn', 'internal_hidden'}):
+                result = row
+        return result
+
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
         safe_key = safe_filename(key.replace(":", "_"))
@@ -877,16 +960,8 @@ class SessionManager:
         check and the following rename one indivisible operation.  The kernel
         drops the lock on process death.
         """
-        lock_path = self._get_write_lock_path(key)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock_path, "a+b") as handle:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with session_file_lock(self._get_session_path(key)):
+            yield
 
     @staticmethod
     def _revision(metadata: dict[str, Any] | None) -> int:
@@ -1053,7 +1128,12 @@ class SessionManager:
             yield _CompactionCommitGuard(self)
 
     def _read_full_rows(self, key: str) -> list[dict[str, Any]]:
+        with self._session_write_lock(key):
+            return self._read_full_rows_unlocked(key)
+
+    def _read_full_rows_unlocked(self, key: str) -> list[dict[str, Any]]:
         """Read valid append-only archive rows, skipping corrupt lines."""
+        require_session_file(self._get_session_path(key), key)
         path = self._get_full_path(key)
         if not path.exists():
             return []
@@ -1078,6 +1158,11 @@ class SessionManager:
         return snapshot_from_rows(self._read_full_rows(key))
 
     def _append_archive_row(self, key: str, row: dict[str, Any]) -> None:
+        with self._session_write_lock(key):
+            self._append_archive_row_unlocked(key, row)
+
+    def _append_archive_row_unlocked(self, key: str, row: dict[str, Any]) -> None:
+        require_session_file(self._get_session_path(key), key)
         path = self._get_full_path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8", newline="\n") as f:
@@ -1205,10 +1290,16 @@ class SessionManager:
     _FULL_WATERMARK_KEY = "_full_log_count"
 
     def flush_full(self, session: "Session", *, required: bool = False) -> None:
+        with self._session_write_lock(session.key):
+            self._flush_full_unlocked(session, required=required)
+
+    def _flush_full_unlocked(self, session: "Session", *, required: bool = False) -> None:
         """Mirror any not-yet-persisted tail of ``session.messages`` into the
         append-only display log. Idempotent via a per-session watermark stored in
         metadata (which survives ``Session.clear()``). Best-effort: a failure
         here never blocks the canonical save."""
+        require_session_file(self._get_session_path(session.key), session.key)
+        require_session_access(session.key, session.metadata)
         session.ensure_event_identities()
         try:
             mark = int(session.metadata.get(self._FULL_WATERMARK_KEY, 0))
@@ -1448,10 +1539,21 @@ class SessionManager:
             )
 
     def get_full_messages(self, key: str) -> list[dict[str, Any]]:
+        with self._session_write_lock(key):
+            return self._get_full_messages_unlocked(key)
+
+    def _get_full_messages_unlocked(self, key: str) -> list[dict[str, Any]]:
         """The full display transcript for a session — every real message, in
         order, unaffected by compaction. Falls back to the live (possibly
         compacted) ``session.messages`` for sessions that predate the display log
         (their early history is already gone and unrecoverable)."""
+        require_session_file(self._get_session_path(key), key)
+        # Voice transcripts never undergo agent compaction. Their canonical
+        # rows reconcile provider corrections in place; the append-only agent
+        # archive must not resurrect the earlier spelling or playback state.
+        canonical = self._load(key) if key.startswith("desktop:voice:") else None
+        if canonical is not None and canonical.metadata.get("kind") == "voice":
+            return [m for m in canonical.messages if not m.get("_display_hidden")]
         path = self._get_full_path(key)
         if path.exists():
             out: list[dict[str, Any]] = []
@@ -1493,7 +1595,37 @@ class SessionManager:
             if not m.get("_display_hidden")
         ]
 
+    def reserve_voice_work(self, key: str) -> None:
+        """Establish a task owner through the authenticated dispatcher only.
+
+        This is deliberately absent from the public session API. Both the
+        canonical owner check and first write share the normal session lock.
+        Repeated reservations do not rewrite history or adopt existing data.
+        """
+        import re
+
+        from flowly.live_voice.authority import (
+            HOST_OWNER,
+            current_request_owner,
+            request_owner_scope,
+        )
+
+        if not isinstance(key, str) or not re.fullmatch(r'desktop:voice-work:[A-Za-z0-9_.:-]{1,128}', key):
+            raise SessionAccessError()
+        owner = current_request_owner() or HOST_OWNER
+        with self._session_write_lock(key), request_owner_scope(owner):
+            canonical = require_session_file(self._get_session_path(key), key, allow_missing_work=True)
+            if canonical is not None:
+                return
+            session = Session(key=key, metadata={'voiceOwner': owner_metadata(owner)})
+            self._save_unlocked(session, _reserve_work=True)
+            self._cache.pop(key, None)
+
     def get_or_create(self, key: str) -> Session:
+        with self._session_write_lock(key):
+            return self._get_or_create_unlocked(key)
+
+    def _get_or_create_unlocked(self, key: str) -> Session:
         """
         Get an existing session or create a new one.
 
@@ -1503,8 +1635,10 @@ class SessionManager:
         Returns:
             The session.
         """
+        require_session_file(self._get_session_path(key), key)
         # Check cache (and move to end for LRU)
         if key in self._cache:
+            require_session_access(key, self._cache[key].metadata)
             self._cache.move_to_end(key)
             return self._cache[key]
 
@@ -1512,6 +1646,11 @@ class SessionManager:
         session = self._load(key)
         if session is None:
             session = Session(key=key)
+            from flowly.live_voice.authority import current_request_owner
+
+            owner = current_request_owner()
+            if owner is not None and is_owned_session(key, session.metadata):
+                session.metadata['voiceOwner'] = owner_metadata(owner)
         self._reconcile_archive_identities(session)
 
         # Add to cache with LRU eviction
@@ -1522,8 +1661,13 @@ class SessionManager:
         return session
 
     def _load(self, key: str) -> Session | None:
+        with self._session_write_lock(key):
+            return self._load_unlocked(key)
+
+    def _load_unlocked(self, key: str) -> Session | None:
         """Load a session from disk with robust error handling."""
         path = self._get_session_path(key)
+        require_session_file(path, key)
 
         if not path.exists():
             return None
@@ -1575,6 +1719,24 @@ class SessionManager:
             logger.warning(f"Failed to load session {key}: {e}")
             return None
 
+    def read(self, key: str) -> Session | None:
+        """Read one canonical snapshot without creating or caching a session."""
+        with self._session_write_lock(key):
+            return self._load(key)
+
+    def mutate(self, key: str, operation: Callable[[Session], Any]) -> Any:
+        """Apply a synchronous metadata/transcript mutation under the file lock.
+
+        Load a fresh object so a failed operation or save cannot contaminate
+        the agent's cached session. The callback must not run an agent turn.
+        """
+        with self._session_write_lock(key):
+            session = self._load(key) or Session(key=key)
+            result = operation(session)
+            self._save_unlocked(session)
+            self._cache[key] = session
+            return result
+
     def save(self, session: Session, extra_messages: list[dict[str, Any]] | None = None) -> None:
         """Compare-and-swap the canonical session under its process lock."""
         with self._session_write_lock(session.key):
@@ -1584,6 +1746,8 @@ class SessionManager:
         self,
         session: Session,
         extra_messages: list[dict[str, Any]] | None = None,
+        *,
+        _reserve_work: bool = False,
     ) -> None:
         """Save a session to disk atomically.
 
@@ -1596,6 +1760,18 @@ class SessionManager:
         loop). The final ``save(session)`` at turn end omits the extra and
         rewrites the file canonically.
         """
+        from flowly.live_voice.authority import current_request_owner
+
+        canonical = require_session_file(self._get_session_path(session.key), session.key,
+                                         allow_missing_work=_reserve_work)
+        owner = current_request_owner()
+        if owner is not None:
+            if canonical is not None and (is_owned_session(session.key, canonical) or is_owned_session(session.key, session.metadata)):
+                if canonical.get('voiceOwner', {'kind': 'host'}) != session.metadata.get('voiceOwner', {'kind': 'host'}):
+                    raise SessionAccessError()
+            if canonical is None and is_owned_session(session.key, session.metadata) and 'voiceOwner' not in session.metadata:
+                session.metadata['voiceOwner'] = owner_metadata(owner)
+            require_session_access(session.key, session.metadata)
         expected_revision = self._revision(session.metadata)
         current_revision = self._disk_revision_unlocked(session.key)
         if current_revision != expected_revision:
@@ -1605,7 +1781,7 @@ class SessionManager:
             )
 
         session.ensure_event_identities()
-        if not session.metadata.get("_pending_archive_transaction"):
+        if not session.metadata.get("_pending_archive_transaction") and not (_reserve_work and canonical is None):
             self._withdraw_removed_active_events(session)
         path = self._get_session_path(session.key)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1701,6 +1877,7 @@ class SessionManager:
         """
 
         with self._session_write_lock(key):
+            require_session_file(self._get_session_path(key), key)
             # Creation takes this same lease before persisting an external key.
             # Withdraw authority first: a failed durable write must abort deletion,
             # and recreating this session key must never revive its old credentials.
@@ -1725,6 +1902,25 @@ class SessionManager:
                     logger.debug("Session index cleanup failed for {}: {}", key, exc)
             return existed
 
+    def delete_archive(self, key: str) -> bool:
+        """Delete only the append-only display transcript for a live session.
+
+        The canonical session remains available for metadata-only ownership
+        links such as work chats. Callers must scrub its messages first.
+        """
+        with self._session_write_lock(key):
+            canonical = require_session_file(self._get_session_path(key), key)
+            require_session_access(key, canonical)
+            display = self._get_full_path(key)
+            existed = display.exists()
+            display.unlink(missing_ok=True)
+            if self._indexer is not None:
+                try:
+                    self._indexer.delete_session(key)
+                except Exception as exc:
+                    logger.debug("Session index cleanup failed for {}: {}", key, exc)
+            return existed
+
     def list_sessions(self) -> list[dict[str, Any]]:
         """
         List all sessions.
@@ -1732,6 +1928,8 @@ class SessionManager:
         Returns:
             List of session info dicts.
         """
+        from flowly.session.keys import session_key_from_header
+
         sessions = []
 
         for path in iter_session_files(self.sessions_dir):
@@ -1742,8 +1940,11 @@ class SessionManager:
                     if first_line:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
+                            key = session_key_from_header(path, data)
+                            if not session_visible(key, data.get('metadata')):
+                                continue
                             sessions.append({
-                                "key": data.get("session_key") or path.stem.replace("_", ":", 1),
+                                "key": key,
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
                                 # Auto-generated descriptive title (see
@@ -1751,6 +1952,13 @@ class SessionManager:
                                 # exchange is titled. Clients fall back to the
                                 # key suffix when absent.
                                 "title": (data.get("metadata") or {}).get("title"),
+                                **({
+                                    "kind": "voice",
+                                    "voiceConversationId": (data.get("metadata") or {}).get("voiceConversationId"),
+                                    "voiceProfile": ((data.get("metadata") or {}).get("voice") or {}).get("profile"),
+                                    "voiceBotId": ((data.get("metadata") or {}).get("voice") or {}).get("botId"),
+                                    "voiceOwner": (data.get("metadata") or {}).get("voiceOwner", {"kind": "host"}),
+                                } if (data.get("metadata") or {}).get("kind") == "voice" else {}),
                                 "last_assistant_run_id": (
                                     data.get("metadata") or {}
                                 ).get("last_assistant_run_id"),

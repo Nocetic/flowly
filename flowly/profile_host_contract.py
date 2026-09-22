@@ -13,11 +13,13 @@ from urllib.parse import urlsplit
 class ProfileHostError(RuntimeError):
     """Stable error returned by the profile-host RPC boundary."""
 
-    def __init__(self, code: str, message: str, *, retryable: bool = False):
+    def __init__(self, code: str, message: str, *, retryable: bool = False,
+                 terminal_state: str | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.terminal_state = terminal_state
 
 
 MAX_REQUEST_BYTES = 40 * 1024 * 1024
@@ -70,6 +72,7 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "gmail.setup.status": 30_000,
     "gmail.setup.cancel": 30_000,
     "gmail.disconnect": 30_000,
+    "voice.context": 10_000,
     "provider.list": 30_000,
     "provider.active": 30_000,
     "model.list": 60_000,
@@ -78,6 +81,11 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "sessions.model.get": 30_000,
     "sessions.model.set": 30_000,
     "chat.history": 30_000,
+    "chat.command": 30_000,
+    "chat.requests": 30_000,
+    "chat.respond": 30_000,
+    "chat.outputs.list": 30_000,
+    "chat.outputs.read": 30_000,
     "chat.inflight": 30_000,
     "chat.send": 60_000,
     "chat.abort": 30_000,
@@ -342,6 +350,27 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
             event_version(value)
         except ValueError as exc:
             raise ProfileHostError("INVALID_PARAMS", str(exc)) from exc
+    if method == 'goal.get' and 'goalId' in value:
+        goal_id = value['goalId']
+        if (not isinstance(goal_id, str) or not 1 <= len(goal_id) <= 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in goal_id)):
+            raise ProfileHostError('INVALID_PARAMS', 'A valid goal identity is required.')
+    if method in {"chat.outputs.list", "chat.outputs.read"}:
+        from flowly.live_voice.outputs import validate_output_request
+        from flowly.live_voice.sessions import VoiceError
+
+        try:
+            value = validate_output_request(method, value)
+        except VoiceError as exc:
+            raise ProfileHostError(exc.code, str(exc)) from exc
+    if method == "voice.context":
+        from flowly.live_voice.context import validate_context
+        from flowly.live_voice.sessions import VoiceError
+
+        try:
+            value = validate_context(value)
+        except VoiceError as exc:
+            raise ProfileHostError(exc.code, str(exc)) from exc
     session_key_methods = {
         "chat.history",
         "chat.inflight",

@@ -138,7 +138,8 @@ def _python_command() -> list[str]:
         module_index = original.index("-m")
         if module_index + 1 < len(original):
             return [sys.executable, *original[1:module_index + 2], *sys.argv[1:]]
-    return [sys.executable, *sys.argv]
+    # Preserve interpreter flags and the console-script path as launched.
+    return [sys.executable, *original[1:]] if len(original) > 1 else [sys.executable, *sys.argv]
 
 
 def _reexec_macos(env: "os._Environ[str]") -> None:

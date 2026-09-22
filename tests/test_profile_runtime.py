@@ -534,6 +534,25 @@ def test_runtime_lease_rejects_invalid_attach_endpoint(
     profiles.release_runtime_lease(instance_id)
 
 
+def test_voice_parent_authority_is_an_owner_only_lease_field(profile_roots, monkeypatch):
+    created = profiles.create_profile('voice-parent', local_runtime=True)
+    monkeypatch.setenv('FLOWLY_HOME', str(created))
+    instance = 'runtime-voice-parent'
+    path = profiles.claim_runtime_lease(instance)
+    profiles.update_runtime_lease(instance, port=19191, auth_token='t' * 48,
+                                  voice_parent_key='a' * 64, capabilities=['voice-owner-hop-v1'])
+    lease = profiles.read_runtime_lease(created)
+    assert lease['voiceParentKey'] == 'a' * 64
+    assert path.stat().st_mode & 0o777 == 0o600
+    for key, capabilities in (('', ['voice-owner-hop-v1']), ('bad', ['voice-owner-hop-v1']), ('a' * 64, [])):
+        with pytest.raises(ValueError, match='authority configuration'):
+            profiles.update_runtime_lease(instance, port=19191, auth_token='t' * 48,
+                                          voice_parent_key=key, capabilities=capabilities)
+        assert profiles.read_runtime_lease(created) == lease
+    profiles.release_runtime_lease(instance)
+    assert not path.exists()
+
+
 def test_corrupt_runtime_lease_fails_closed_before_profile_mutation(profile_roots) -> None:
     _default, _root = profile_roots
     created = profiles.create_profile("writer", local_runtime=True)

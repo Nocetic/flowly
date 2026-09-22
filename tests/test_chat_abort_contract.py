@@ -197,6 +197,7 @@ async def test_gateway_abort_uses_cooperative_callback_without_cancelling_turn()
         return True
 
     server.on_chat_abort = on_chat_abort
+    server.sessions = None
     server._ws_rpc_reply = AsyncMock()
 
     sleeper = asyncio.create_task(asyncio.sleep(60))

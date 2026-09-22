@@ -14,6 +14,7 @@ the list in its metadata; this file pins:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -255,6 +256,7 @@ async def test_final_keeps_message_id_distinct_from_stream_lifecycle_id(channel)
 
 @pytest.mark.asyncio
 async def test_cooperative_abort_acks_without_early_terminal_event(channel) -> None:
+    channel.chat_commands.accept('web:sess-1', 'run-stopped', {'message': 'Work'})
     stopped: list[str] = []
     channel.set_abort_callback(stopped.append)
     ws = AsyncMock()
@@ -275,15 +277,21 @@ async def test_cooperative_abort_acks_without_early_terminal_event(channel) -> N
 
 @pytest.mark.asyncio
 async def test_legacy_abort_keeps_terminal_event_for_old_embedders(channel) -> None:
+    channel.chat_commands.accept('web:sess-1', 'run-stopped', {'message': 'Work'})
     ws = AsyncMock()
-
-    await channel._handle_rpc(ws, {
-        "type": "rpc",
-        "id": "rpc-1",
-        "sessionId": "sess-1",
-        "method": "chat.abort",
-        "params": {"runId": "run-stopped"},
-    })
+    task = asyncio.create_task(asyncio.sleep(60))
+    channel._active_tasks['run-stopped'] = task
+    try:
+        await channel._handle_rpc(ws, {
+            "type": "rpc",
+            "id": "rpc-1",
+            "sessionId": "reconnected-client",
+            "method": "chat.abort",
+            "params": {"runId": "run-stopped"},
+        })
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     assert ws.send.await_count == 2
     terminal = json.loads(ws.send.await_args_list[1].args[0])

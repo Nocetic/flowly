@@ -22,7 +22,6 @@ from loguru import logger
 
 from flowly.agent.subagent_registry import SubagentRegistry
 from flowly.agent.subagent_observation import client_event, event_version
-from flowly.artifacts.context import is_internal_context_artifact
 from flowly.artifacts.summary import artifact_summary
 from flowly.browser_annotations import append_browser_annotation_context
 from flowly.channels import feature_rpc
@@ -36,6 +35,13 @@ from flowly.gateway.auth import (
     token_matches,
 )
 from flowly.gateway.identity import health_identity
+from flowly.live_voice.events import (
+    EventAccess,
+    EventRecipients,
+    ScopedEvent,
+    current_event_access,
+    event_access_scope,
+)
 from flowly.media.assets import ASSETS_META_KEY
 from flowly.profile import get_flowly_home
 from flowly.profile_collaboration import (
@@ -84,7 +90,7 @@ async def _cors_middleware(request: web.Request, handler: Callable) -> web.Strea
                 # ``Range`` is here for the media streaming route — a player
                 # that preflights a byte-range request is refused without it.
                 "Access-Control-Allow-Headers": (
-                    "Content-Type, Authorization, X-Flowly-Token, Range"
+                    "Content-Type, Authorization, X-Flowly-Token, X-Flowly-Voice-Access, Range"
                 ),
                 "Access-Control-Expose-Headers": (
                     "Content-Range, Accept-Ranges, Content-Length, Content-Type"
@@ -96,6 +102,31 @@ async def _cors_middleware(request: web.Request, handler: Callable) -> web.Strea
     response.headers.setdefault("Access-Control-Allow-Origin", "*")
     response.headers.setdefault("Vary", "Origin")
     return response
+
+
+@web.middleware
+async def _request_owner_middleware(request: web.Request, handler: Callable) -> web.StreamResponse:
+    """HTTP credentials establish host access; an optional scoped certificate identifies the account."""
+    from flowly.live_voice.authority import request_owner_scope
+
+    certificates = request.headers.getall('X-Flowly-Voice-Access', [])
+    if len(certificates) > 1:
+        return web.json_response({'code': 'VOICE_AUTH_REQUIRED', 'error': 'Voice access could not be verified.'},
+                                 status=401, headers={'Cache-Control': 'no-store'})
+    try:
+        owner, _ = await feature_rpc.resolve_voice_owner({'voiceAccess': certificates[0]} if certificates else {})
+    except feature_rpc.FeatureRpcError as error:
+        return web.json_response({'code': error.code, 'error': error.message},
+                                 status=503 if error.code == 'VOICE_AUTH_UNAVAILABLE' else 401,
+                                 headers={'Cache-Control': 'no-store'})
+    with request_owner_scope(owner):
+        # WebSocket frames authenticate separately. The HTTP upgrade never
+        # grants an account to later frames that omit their certificate.
+        response = await handler(request)
+        if (request.path in {'/api/board', '/api/board/action'}
+                or request.path == '/api/artifacts' or request.path.startswith('/api/artifacts/')):
+            response.headers['Cache-Control'] = 'no-store'
+        return response
 
 
 # Type alias for the chat callback used by the /ws endpoint.
@@ -256,6 +287,10 @@ def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
     without any decoding or copying.  Otherwise the base64 ``content`` is decoded
     and written to *media_dir*.
     """
+    from flowly.media.authority import capture_media_access, media_visible, publish_media_bytes
+    from flowly.session.ownership import SessionAccessError
+
+    access = capture_media_access()
     media_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for att in attachments:
@@ -267,6 +302,8 @@ def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
         # Prefer native file path (desktop local optimisation)
         file_path = att.get("filePath", "")
         if file_path and Path(file_path).is_file():
+            if not media_visible(Path(file_path)):
+                raise SessionAccessError()
             paths.append(str(Path(file_path)))
             continue
 
@@ -295,7 +332,7 @@ def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
         filename = att.get("fileName", "")
         ext = Path(filename).suffix if filename else (mimetypes.guess_extension(mime) or "")
         fpath = media_dir / f"{uuid.uuid4().hex}{ext}"
-        fpath.write_bytes(data)
+        fpath = publish_media_bytes(data, fpath, access=access)
         paths.append(str(fpath))
     return paths
 
@@ -583,6 +620,7 @@ class GatewayServer:
         self._ws_clients: dict[str, web.WebSocketResponse] = {}
         self._subagent_event_versions: WeakKeyDictionary[web.WebSocketResponse, int] = WeakKeyDictionary()
         self._profile_subagent_event_versions: WeakKeyDictionary = WeakKeyDictionary()
+        self._event_recipients = EventRecipients()
         self._active_tasks: dict[str, asyncio.Task] = {}
         # Named profile gateways may be shared by two authenticated managers
         # (Desktop and the primary Gateway).  Only the runtime itself can
@@ -590,8 +628,10 @@ class GatewayServer:
         # process owns it.  The CLI installs this control only for an
         # authenticated, loopback-only managed runtime.
         self._managed_runtime_instance_id = ""
+        self._voice_parent_authority = None
         self._managed_runtime_stop: ManagedRuntimeStopCallback | None = None
         self._managed_runtime_stopping = False
+
         # session_key -> the WS that should currently receive this session's live
         # stream (deltas / iteration_step / final). A run streams to the socket
         # that STARTED it, but if the client leaves and re-enters mid-stream it
@@ -697,11 +737,22 @@ class GatewayServer:
         self._managed_runtime_stop = stop_callback
         self._managed_runtime_stopping = False
 
+        from flowly.live_voice.authority import ProfileHopVerifier
+
+        self._voice_parent_authority = ProfileHopVerifier(instance_id)
+
+    @property
+    def voice_parent_key(self) -> str:
+        """Owner-only runtime lease field; never include in public status/ready data."""
+        authority = self._voice_parent_authority
+        return authority.key if authority is not None else ''
+
     def _create_app(self) -> web.Application:
         """Create the aiohttp application."""
         middlewares = [_cors_middleware]
         if self._require_auth:
             middlewares.append(self._make_auth_middleware())
+        middlewares.append(_request_owner_middleware)
         app = web.Application(
             client_max_size=_MAX_BODY_SIZE,
             middlewares=middlewares,
@@ -1102,7 +1153,10 @@ class GatewayServer:
                 return web.json_response({"error": "Board not configured"}, status=500)
             return web.json_response(self.board_store.snapshot())
         except Exception as e:
-            logger.error(f"Error building board snapshot: {e}")
+            if feature_rpc.has_voice_account():
+                logger.error('Board snapshot failed ({})', type(e).__name__)
+            else:
+                logger.error(f"Error building board snapshot: {e}")
             return web.json_response({"error": "Internal server error"}, status=500)
 
     async def _handle_board_action(self, request: web.Request) -> web.Response:
@@ -1272,9 +1326,11 @@ class GatewayServer:
             # reconnect case we're trying to support). Drop the stale ref.
             if client_id in self._ws_clients:
                 logger.info(f"[WS] Reattaching client_id={client_id}: replacing stale ws")
+                self.event_recipients.retire(self._ws_clients[client_id])
         else:
             client_id = str(uuid.uuid4())
         self._ws_clients[client_id] = ws
+        self.event_recipients.get(ws)
         logger.info(f"[WS] Desktop client connected: {client_id}")
 
         long_rpc_tasks: set[asyncio.Task[None]] = set()
@@ -1347,6 +1403,7 @@ class GatewayServer:
             # Cleanup from the stale socket must not evict the replacement or
             # unregister its browser provider.
             is_current_connection = self._ws_clients.get(client_id) is ws
+            self.event_recipients.retire(ws)
             if is_current_connection:
                 self._ws_clients.pop(client_id, None)
                 self._remove_profile_client_subscription(client_id)
@@ -1394,7 +1451,92 @@ class GatewayServer:
         return ws
 
     async def _handle_ws_rpc(self, ws: web.WebSocketResponse, client_id: str, data: dict) -> None:
+        from flowly.live_voice.authority import VoiceAuthorityError, request_owner_scope
+
+        # The private in-process socket preserves the caller's scope. Identity
+        # is checked by object identity, never by a client-supplied clientId.
+        internal = getattr(self, '_profile_host_socket', None)
+        if internal is not None and ws is internal:
+            if data.get('method') == 'runtime.voice.reserve':
+                await self._reserve_voice_work(ws, data.get('id', ''), data.get('params') or {})
+                return
+            await self._dispatch_ws_rpc(ws, client_id, data)
+            return
+        params = data.get('params') or {}
+        lease_method = data.get('method') in {'voice.events.bind', 'voice.events.clear'}
+        binding = lease_method or (isinstance(params, dict) and 'voiceAccess' in params)
+        sequence = self.event_recipients.begin(ws) if binding else None
+        principal = None
+        try:
+            if 'voiceAuthority' in data:
+                authority = getattr(self, '_voice_parent_authority', None)
+                if authority is None or not isinstance(params, dict) or 'voiceAccess' in params:
+                    raise VoiceAuthorityError()
+                owner = authority.verify(data.get('id'), data.get('method'), params, data['voiceAuthority'])
+                clean_params = dict(params)
+                state = self.event_recipients.get(ws)
+                async with state.lock:
+                    state.parent = True
+            else:
+                if data.get('method') == 'runtime.voice.reserve':
+                    raise VoiceAuthorityError()
+                owner, clean_params, principal = await feature_rpc.resolve_voice_access(params)
+            if lease_method and (clean_params or (data['method'] == 'voice.events.bind' and principal is None)):
+                raise VoiceAuthorityError()
+            if sequence is not None and not await self.event_recipients.bind(
+                ws, sequence, None if data.get('method') == 'voice.events.clear' else principal,
+            ):
+                raise VoiceAuthorityError()
+        except (feature_rpc.FeatureRpcError, VoiceAuthorityError) as error:
+            if sequence is not None:
+                await self.event_recipients.bind(ws, sequence, None)
+            await self._ws_rpc_error(ws, data.get('id', ''), error.code, str(error))
+            return
+        clean = {key: value for key, value in data.items() if key != 'voiceAuthority'}
+        clean['params'] = clean_params
+        with request_owner_scope(owner), event_access_scope(None):
+            if lease_method:
+                # Clear replies carry no private result and may follow a
+                # lease downgrade to host authority on this same socket.
+                if data['method'] == 'voice.events.clear':
+                    from flowly.live_voice.authority import HOST_OWNER
+
+                    with request_owner_scope(HOST_OWNER):
+                        await self._ws_rpc_reply(ws, data.get('id', ''), {'cleared': True})
+                else:
+                    await self._ws_rpc_reply(ws, data.get('id', ''), {'bound': True, 'expiresAt': principal.expires_at})
+                return
+            if data.get('method') == 'runtime.voice.reserve':
+                await self._reserve_voice_work(ws, data.get('id', ''), clean_params)
+                return
+            await self._dispatch_ws_rpc(ws, client_id, clean)
+
+    async def _reserve_voice_work(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
+        """Private parent operation, never reachable through feature/profile RPC."""
+        from flowly.session.commands import validate_chat_target
+        from flowly.session.ownership import SessionAccessError
+
+        if (self.sessions is None or not isinstance(params, dict)
+                or set(params) - {'sessionKey', 'expectedBotId'}):
+            await self._ws_rpc_error(ws, rpc_id, 'VOICE_AUTH_UNAVAILABLE', 'Task session reservation is unavailable.')
+            return
+        try:
+            validate_chat_target(params)
+            self.sessions.reserve_voice_work(params.get('sessionKey'))
+        except SessionAccessError as error:
+            await self._ws_rpc_error(ws, rpc_id, error.code, str(error))
+        except ValueError:
+            await self._ws_rpc_error(ws, rpc_id, 'TASK_TARGET_CHANGED', 'The assigned agent identity has changed.')
+        except Exception as error:
+            logger.warning('Voice work reservation failed ({})', type(error).__name__)
+            await self._ws_rpc_error(ws, rpc_id, 'VOICE_AUTH_UNAVAILABLE', 'Task session reservation is unavailable.')
+        else:
+            await self._ws_rpc_reply(ws, rpc_id, {'sessionKey': params['sessionKey'], 'reserved': True})
+
+    async def _dispatch_ws_rpc(self, ws: web.WebSocketResponse, client_id: str, data: dict) -> None:
         """Dispatch an RPC call to the appropriate handler."""
+        from flowly.session.ownership import SessionAccessError, require_rpc_session
+
         method = data.get("method", "")
         rpc_id = data.get("id", "")
         params = data.get("params") or {}
@@ -1410,6 +1552,7 @@ class GatewayServer:
                 return
 
         try:
+            require_rpc_session(method, params, sessions_dir=self.sessions.sessions_dir if self.sessions else None)
             if method == "health":
                 await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
 
@@ -1443,6 +1586,15 @@ class GatewayServer:
 
             elif method == "chat.history":
                 await self._ws_rpc_chat_history(ws, rpc_id, params)
+
+            elif method == "chat.command":
+                from flowly.session.commands import command_status
+                try:
+                    receipt = command_status(self.chat_commands, params)
+                except ValueError as exc:
+                    await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", str(exc))
+                else:
+                    await self._ws_send(ws, {"type": "rpc", "id": rpc_id, "result": receipt})
 
             elif method == "media.read":
                 await self._ws_rpc_media_read(ws, rpc_id, params)
@@ -1646,6 +1798,8 @@ class GatewayServer:
 
             else:
                 await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", f"Unknown method: {method}")
+        except SessionAccessError as error:
+            await self._ws_rpc_error(ws, rpc_id, error.code, error.message)
         except Exception as e:
             # Only unexpected failures reach here: every deliberate one above
             # reports itself through `_ws_rpc_error` with its own code and a
@@ -1658,9 +1812,12 @@ class GatewayServer:
             # The traceback goes to the log, which is where this failure left
             # nothing at all before — the message named a path and never said
             # which line reached for it.
-            logger.opt(exception=True).error(
-                "[WS] RPC {} failed for client {}: {}", method, client_id, e
-            )
+            if feature_rpc.has_voice_account():
+                logger.error('[WS] account RPC {} failed ({})', method, type(e).__name__)
+            else:
+                logger.opt(exception=True).error(
+                    "[WS] RPC {} failed for client {}: {}", method, client_id, e
+                )
             await self._ws_rpc_error(
                 ws,
                 rpc_id,
@@ -1718,8 +1875,11 @@ class GatewayServer:
         except ValueError as exc:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_PARAMS", str(exc))
             return
-        except RuntimeError:
-            logger.exception("[Gateway] profile host operation failed: {}", method)
+        except RuntimeError as exc:
+            if feature_rpc.has_voice_account():
+                logger.error('[Gateway] profile RPC {} failed ({})', method, type(exc).__name__)
+            else:
+                logger.exception("[Gateway] profile host operation failed: {}", method)
             await self._ws_rpc_error(
                 ws,
                 rpc_id,
@@ -1728,8 +1888,11 @@ class GatewayServer:
                 retryable=True,
             )
             return
-        except Exception:
-            logger.exception("[Gateway] unexpected profile host failure: {}", method)
+        except Exception as exc:
+            if feature_rpc.has_voice_account():
+                logger.error('[Gateway] profile RPC {} failed ({})', method, type(exc).__name__)
+            else:
+                logger.exception("[Gateway] unexpected profile host failure: {}", method)
             await self._ws_rpc_error(
                 ws,
                 rpc_id,
@@ -1744,11 +1907,12 @@ class GatewayServer:
             if profile in versions or len(versions) < _PROFILE_PROFILES_PER_CLIENT_LIMIT:
                 versions[profile] = event_version(inner_params) if "eventVersion" in inner_params else versions.get(profile, 1)
         if (
-            inner_method == "chat.send"
+            inner_method in {"chat.send", "chat.inflight"}
             and inner_session_key
             and isinstance(result, dict)
         ):
-            run_id = str(result.get("runId") or "")
+            receipt = result if inner_method == "chat.send" else result.get("inflight")
+            run_id = str(receipt.get("runId") or "") if isinstance(receipt, dict) else ""
             if run_id:
                 key = (profile, run_id)
                 self._profile_run_subscriptions[key] = inner_session_key
@@ -1899,8 +2063,7 @@ class GatewayServer:
             "event": "agent.clarify.requested",
             "data": clarify_to_wire(pending),
         }
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        await self._broadcast_clients(event)
 
     async def broadcast_clarify_closed(
         self,
@@ -1921,8 +2084,7 @@ class GatewayServer:
             "event": "agent.clarify.closed",
             "data": clarify_closed_to_wire(clarify_id, reason, session_key),
         }
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        await self._broadcast_clients(event)
 
     # exec.policy.* (standing approval policy) is served from the shared
     # flowly.channels.feature_rpc surface — dispatched at the top of
@@ -2012,8 +2174,7 @@ class GatewayServer:
             "event": "exec.approval.requested",
             "data": approval_to_wire(pending),
         }
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        await self._broadcast_clients(event)
 
     async def broadcast_approval_closed(
         self,
@@ -2036,8 +2197,7 @@ class GatewayServer:
             "event": "exec.approval.closed",
             "data": approval_closed_to_wire(approval_id, reason, session_key),
         }
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        await self._broadcast_clients(event)
 
     # --- RPC: commands.list ---
 
@@ -2728,6 +2888,8 @@ class GatewayServer:
             # same pair, so both transports look identical to a client.
             if m.get("kind"):
                 msg["kind"] = m["kind"]
+            if m.get("kind") == "voice" and isinstance(m.get("voice"), dict):
+                msg["voice"] = m["voice"]
             if m.get("boundaryKind"):
                 msg["boundaryKind"] = m["boundaryKind"]
             if m.get("compactionId"):
@@ -2802,6 +2964,19 @@ class GatewayServer:
 
     # --- RPC: chat.send ---
 
+    @property
+    def chat_commands(self):
+        from flowly.session.commands import ChatCommandStore
+
+        if getattr(self, "_chat_commands", None) is None:
+            sessions = getattr(self, "sessions", None)
+            path = (
+                sessions.sessions_dir / "chat_commands.sqlite3"
+                if isinstance(sessions, SessionManager) else ":memory:"
+            )
+            self._chat_commands = ChatCommandStore(path)
+        return self._chat_commands
+
     async def _ws_rpc_chat_send(
         self,
         ws: web.WebSocketResponse,
@@ -2809,6 +2984,19 @@ class GatewayServer:
         rpc_id: str,
         params: dict,
     ) -> None:
+        from flowly.session.commands import validate_chat_target
+        try:
+            validate_chat_target(params)
+        except ValueError as exc:
+            await self._ws_rpc_error(ws, rpc_id, "TASK_TARGET_CHANGED", str(exc))
+            return
+        queued = params.get('queueForNextTurn', False)
+        if type(queued) is not bool:
+            await self._ws_rpc_error(ws, rpc_id, 'INVALID_REQUEST', 'queueForNextTurn must be a boolean')
+            return
+        if queued and getattr(self.on_chat_message, 'supports_turn_start', False) is not True:
+            await self._ws_rpc_error(ws, rpc_id, 'CHAT_QUEUE_UNAVAILABLE', 'This runtime does not support queued chat turns.')
+            return
         message = params.get("message", "")
         attachments = params.get("attachments") or []
         if not message and not attachments:
@@ -2817,6 +3005,9 @@ class GatewayServer:
         message = append_browser_annotation_context(message, attachments)
 
         session_key = params.get("sessionKey") or f"desktop:{client_id}"
+        if isinstance(session_key, str) and session_key.startswith("desktop:voice:"):
+            await self._ws_rpc_error(ws, rpc_id, "VOICE_TRANSCRIPT_ONLY", "Resume voice to continue this conversation.")
+            return
         idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
         run_id = idempotency_key
 
@@ -3015,14 +3206,33 @@ class GatewayServer:
         voice_mode = bool(params.get("voiceMode", False))
         render_capabilities = normalize_render_capabilities(params.get("renderCapabilities"))
 
-        # Save attachments to disk
+        from flowly.session.commands import ChatCommandConflictError
+
+        try:
+            created, receipt = self.chat_commands.accept(session_key, run_id, params)
+        except (ChatCommandConflictError, ValueError, TypeError) as exc:
+            code = "IDEMPOTENCY_CONFLICT" if isinstance(exc, ChatCommandConflictError) else "INVALID_REQUEST"
+            await self._ws_rpc_error(ws, rpc_id, code, str(exc))
+            return
+        if not created:
+            self.bind_session_ws(session_key, ws)
+            await self._ws_rpc_reply(ws, rpc_id, receipt)
+            return
+
+        # Save attachments only for the first accepted command.
         media: list[str] = []
         if attachments:
-            media_dir = get_flowly_home() / "media"
-            media = _save_attachments(attachments, media_dir)
-
-        # ACK immediately with runId so the client can track the run.
-        await self._ws_rpc_reply(ws, rpc_id, {"runId": run_id, "status": "accepted"})
+            try:
+                media_dir = get_flowly_home() / "media"
+                source = self.chat_commands.control_scope(run_id)
+                access = EventAccess(scopes=(source,)) if source is not None else EventAccess(blocked=True)
+                with event_access_scope(access):
+                    media = _save_attachments(attachments, media_dir)
+            except Exception:
+                self.chat_commands.settle(session_key, run_id, 'error')
+                logger.exception('Could not prepare attachments for chat run {}', run_id)
+                await self._ws_rpc_error(ws, rpc_id, 'CHAT_INPUT_FAILED', 'The attached files could not be prepared. Please try again.')
+                return
 
         # This socket now owns the session's live stream until a re-entry on a
         # different socket rebinds it (see chat.inflight in _handle_feature_rpc).
@@ -3063,7 +3273,20 @@ class GatewayServer:
             )
         )
         self._active_tasks[run_id] = task
-        task.add_done_callback(lambda _: self._active_tasks.pop(run_id, None))
+
+        def finished(completed: asyncio.Task) -> None:
+            self._active_tasks.pop(run_id, None)
+            if completed.cancelled():
+                self.chat_commands.settle(session_key, run_id, 'aborted')
+            elif completed.exception() is not None:
+                self.chat_commands.settle(session_key, run_id, 'error')
+
+        task.add_done_callback(finished)
+        # Schedule before awaiting the socket: losing the ACK must not lose
+        # the accepted turn, and a concurrent retry sees the same receipt.
+        if getattr(self.on_chat_message, 'supports_turn_start', False) is not True:
+            self.chat_commands.settle(session_key, run_id, "running")
+        await self._ws_rpc_reply(ws, rpc_id, {"runId": run_id, "status": "accepted"})
 
     async def run_autonomous_turn(
         self,
@@ -3126,9 +3349,16 @@ class GatewayServer:
                 },
             )
 
+        self.chat_commands.accept(session_key, run_id, {
+            'turnOrigin': 'goal', 'goalId': goal_metadata.get('_goal_continuation_goal_id'),
+        })
         started = goal_metadata.pop("on_run_started", None)
-        if started is not None:
-            started(run_id)
+        try:
+            if started is not None:
+                started(run_id)
+        except BaseException as exc:
+            self.chat_commands.settle(session_key, run_id, 'aborted' if isinstance(exc, asyncio.CancelledError) else 'error')
+            raise
         await self._run_chat(
             ws,
             "",
@@ -3169,7 +3399,19 @@ class GatewayServer:
         # mid-run can fetch the partial via the chat.inflight RPC.
         from flowly.agent import inflight
 
-        inflight.begin(session_key, run_id, message)
+        supports_turn_start = getattr(self.on_chat_message, 'supports_turn_start', False) is True
+        turn_started = False
+
+        async def on_turn_started(text: str) -> None:
+            nonlocal turn_started
+            self.chat_commands.settle(session_key, run_id, 'running')
+            inflight.begin(session_key, run_id, text, goal_run=bool((extra_metadata or {}).get('goal_run')))
+            turn_started = True
+
+        if supports_turn_start:
+            extra_metadata = {**(extra_metadata or {}), '_on_turn_started': on_turn_started}
+        else:
+            inflight.begin(session_key, run_id, message)
 
         # Wrap the stream callback to accumulate full text for the final event.
         async def tracking_callback(delta: str) -> None:
@@ -3262,6 +3504,13 @@ class GatewayServer:
             else:
                 pending = self.on_chat_message(*call_args)
             result = await pending
+            if supports_turn_start and not turn_started:
+                if (extra_metadata or {}).get('_goal_continuation_goal_id'):
+                    # A superseded autonomous prompt was rejected inside the
+                    # turn lock. It never owned the stream and has no reply.
+                    self.chat_commands.settle(session_key, run_id, 'aborted')
+                    return
+                raise RuntimeError('The chat host did not acknowledge the turn boundary.')
             # Back-compat: older callbacks returned bare text. Detect the
             # tuple form and fall back to ``{}`` metadata otherwise so
             # any third-party gateway wiring keeps working.
@@ -3297,6 +3546,7 @@ class GatewayServer:
             # crashes. Emit the native error event with stable machine fields
             # and safe copy; never place a wrapped SDK payload on the wire.
             if isinstance(provider_error, dict):
+                self.chat_commands.settle(session_key, run_id, "error")
                 await self._session_send(
                     session_key,
                     ws,
@@ -3379,6 +3629,11 @@ class GatewayServer:
                     int((asyncio.get_running_loop().time() - run_started_at) * 1000),
                 )
 
+            self.chat_commands.settle(
+                session_key, run_id,
+                "aborted" if final_data.get("aborted") else
+                "error" if isinstance((metadata or {}).get("error"), dict) else "completed",
+            )
             await self._session_send(
                 session_key,
                 ws,
@@ -3403,6 +3658,7 @@ class GatewayServer:
                     completed_at=final_data["completedAt"],
                 )
         except asyncio.CancelledError:
+            self.chat_commands.settle(session_key, run_id, "aborted")
             await self._session_send(
                 session_key,
                 ws,
@@ -3417,6 +3673,7 @@ class GatewayServer:
             # operators, but the gateway wire contract never exposes reprs,
             # SDK payloads, filesystem paths, or provider internals.
             logger.exception(f"[WS] chat.send run {run_id} failed: {e}")
+            self.chat_commands.settle(session_key, run_id, "error")
             await self._session_send(
                 session_key,
                 ws,
@@ -3448,14 +3705,31 @@ class GatewayServer:
     async def _ws_rpc_chat_abort(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
+        from flowly.session.commands import validate_command_control
+        try:
+            validate_command_control(self.chat_commands, params)
+        except ValueError as exc:
+            await self._ws_rpc_error(ws, rpc_id, 'TASK_TARGET_CHANGED', str(exc))
+            return
         run_id = params.get("runId", "")
+        from flowly.session.control_access import run_control_guard
+
+        with run_control_guard(self.chat_commands, params, sessions_dir=self.sessions.sessions_dir if self.sessions else None):
+            cancelled = self._abort_chat_run(run_id)
+        await self._ws_rpc_reply(ws, rpc_id, {"ok": True, "cancelled": cancelled})
+
+    def _abort_chat_run(self, run_id: str) -> bool:
+        """Synchronous mutation while the actual session owner is locked."""
         cancelled = False
         abort_callback = getattr(self, "on_chat_abort", None)
         if abort_callback is not None:
             try:
                 cancelled = bool(abort_callback(run_id))
-            except Exception:
-                logger.exception(f"[GatewayWS] chat.abort callback failed run_id={run_id}")
+            except Exception as error:
+                if feature_rpc.has_voice_account():
+                    logger.error('[GatewayWS] account chat.abort failed ({})', type(error).__name__)
+                else:
+                    logger.exception(f"[GatewayWS] chat.abort callback failed run_id={run_id}")
         else:
             # Backward compatibility for embedders that provide a chat
             # callback but have not wired the cooperative abort callback yet.
@@ -3463,7 +3737,7 @@ class GatewayServer:
             if task and not task.done():
                 task.cancel()
                 cancelled = True
-        await self._ws_rpc_reply(ws, rpc_id, {"ok": True, "cancelled": cancelled})
+        return cancelled
 
     async def _ws_rpc_runtime_stop(
         self,
@@ -3552,6 +3826,15 @@ class GatewayServer:
     # RPC: chat.compact / chat.clear
     # ------------------------------------------------------------------
 
+    async def _ws_rpc_chat_callback_error(self, ws, rpc_id: str, method: str, error: Exception) -> None:
+        if feature_rpc.has_voice_account():
+            logger.error('[WS] account RPC {} failed ({})', method, type(error).__name__)
+            message = 'The request could not be completed.'
+        else:
+            logger.error('[WS] {} error: {}', method, error)
+            message = str(error)
+        await self._ws_rpc_error(ws, rpc_id, 'INTERNAL', message)
+
     async def _ws_rpc_chat_compact(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
@@ -3563,8 +3846,7 @@ class GatewayServer:
             result = await self.on_compact(session_key, instructions)
             await self._ws_rpc_reply(ws, rpc_id, result)
         except Exception as e:
-            logger.error(f"[WS] chat.compact error: {e}")
-            await self._ws_rpc_error(ws, rpc_id, "INTERNAL", str(e))
+            await self._ws_rpc_chat_callback_error(ws, rpc_id, 'chat.compact', e)
 
     async def _ws_rpc_chat_clear(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
@@ -3576,8 +3858,7 @@ class GatewayServer:
             result = await self.on_clear(session_key)
             await self._ws_rpc_reply(ws, rpc_id, result)
         except Exception as e:
-            logger.error(f"[WS] chat.clear error: {e}")
-            await self._ws_rpc_error(ws, rpc_id, "INTERNAL", str(e))
+            await self._ws_rpc_chat_callback_error(ws, rpc_id, 'chat.clear', e)
 
     async def _ws_rpc_chat_retry(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
@@ -3589,8 +3870,7 @@ class GatewayServer:
             result = await self.on_retry(session_key)
             await self._ws_rpc_reply(ws, rpc_id, result)
         except Exception as e:
-            logger.error(f"[WS] chat.retry error: {e}")
-            await self._ws_rpc_error(ws, rpc_id, "INTERNAL", str(e))
+            await self._ws_rpc_chat_callback_error(ws, rpc_id, 'chat.retry', e)
 
     async def _ws_rpc_chat_undo(self, ws: web.WebSocketResponse, rpc_id: str, params: dict) -> None:
         if not self.on_undo:
@@ -3600,18 +3880,137 @@ class GatewayServer:
             result = await self.on_undo(session_key)
             await self._ws_rpc_reply(ws, rpc_id, result)
         except Exception as e:
-            logger.error(f"[WS] chat.undo error: {e}")
-            await self._ws_rpc_error(ws, rpc_id, "INTERNAL", str(e))
+            await self._ws_rpc_chat_callback_error(ws, rpc_id, 'chat.undo', e)
 
     # ------------------------------------------------------------------
     # WebSocket helpers
     # ------------------------------------------------------------------
 
+    @property
+    def event_recipients(self) -> EventRecipients:
+        if getattr(self, '_event_recipients', None) is None:
+            self._event_recipients = EventRecipients()
+        return self._event_recipients
+
+    def _scoped_event(self, payload: dict, *, session_key: str | None = None) -> ScopedEvent:
+        from dataclasses import replace
+
+        from flowly.session.ownership import SessionAccessError
+
+        if isinstance(payload, ScopedEvent):
+            return payload
+        access = current_event_access()
+        name = str(payload.get('event') or '')
+        data = payload.get('data')
+        data = data if isinstance(data, dict) else {}
+        directory = self.sessions.sessions_dir if getattr(self, 'sessions', None) is not None else None
+        profile = None
+        if name == 'profile.event':
+            profile = data.get('profile')
+            inner = data.get('data')
+            data = inner if isinstance(inner, dict) else {}
+            if profile and profile != 'default' and access is None:
+                try:
+                    from flowly.profile import describe_profile
+
+                    directory = describe_profile(profile).path / 'sessions'
+                except (FileNotFoundError, ValueError):
+                    access = EventAccess(blocked=True)
+        key = data.get('sessionKey') or data.get('session_key') or session_key
+        if session_key and key != session_key:
+            access = EventAccess(blocked=True)
+        if access is None:
+            try:
+                if name.startswith('artifact.'):
+                    store = getattr(self, 'artifact_store', None)
+                    scope = store.control_scope(data.get('id')) if store is not None else None
+                    access = EventAccess(scopes=(scope,)) if scope is not None else EventAccess(blocked=True)
+                else:
+                    run_id = data.get('runId')
+                    scopes = []
+                    if run_id and profile in (None, 'default'):
+                        from flowly.agent import inflight
+
+                        accepted = self.chat_commands.control_scope(run_id, sessions_dir=directory)
+                        live = inflight.control_scope(run_id)
+                        scopes = [scope for scope in (accepted, live) if scope is not None]
+                    if scopes:
+                        if (any(key and scope.key != key for scope in scopes)
+                                or any(scope.key != scopes[0].key or scope.owner != scopes[0].owner for scope in scopes)):
+                            access = EventAccess(blocked=True)
+                        else:
+                            access = EventAccess(scopes=tuple(scopes))
+                    else:
+                        access = EventAccess.capture(key, sessions_dir=directory)
+            except (SessionAccessError, OSError, ValueError):
+                access = EventAccess(blocked=True)
+        if name in {'exec.approval.closed', 'agent.clarify.closed', 'artifact.deleted'}:
+            # An ID-only retirement still belongs to the original owner after
+            # deletion. It must never be adopted by the new canonical owner.
+            access = replace(access, canonical=False)
+        return ScopedEvent(payload, access)
+
+    async def _broadcast_clients(self, data: dict) -> None:
+        event = self._scoped_event(data) if data.get('type') == 'event' else data
+        for ws in list(self._ws_clients.values()):
+            await self._ws_send(ws, event)
+
     async def _ws_send(self, ws: web.WebSocketResponse, data: dict) -> None:
-        """Send JSON to a WebSocket client, silently ignoring closed connections."""
+        """Serialize delivery with account changes and check each recipient."""
+        from flowly.live_voice.authority import current_request_owner
+
+        state = self.event_recipients.get(ws)
         try:
-            if not ws.closed:
-                await ws.send_json(data)
+            internal = getattr(self, '_profile_host_socket', None)
+            if internal is not None and ws is internal:
+                if ws.closed:
+                    return
+                # This callback may synchronously make another primary RPC.
+                # It has no account lease and must not hold a socket send lock.
+                if data.get('type') == 'event':
+                    data = self._scoped_event(data)
+                    with event_access_scope(data.access):
+                        await ws.send_json(data)
+                else:
+                    await ws.send_json(data)
+                return
+            async with state.lock:
+                if ws.closed or state.retired:
+                    return
+                parent = state.parent
+                if data.get('type') == 'event':
+                    data = self._scoped_event(data)
+                    if parent:
+                        from flowly.live_voice.authority import VoiceAuthorityError
+                        from flowly.live_voice.event_transport import sign_profile_event
+                        from flowly.profile import get_flowly_home
+
+                        authority = self._voice_parent_authority
+                        directory = self.sessions.sessions_dir if self.sessions is not None else get_flowly_home() / 'sessions'
+                        try:
+                            frame = sign_profile_event(authority.key, authority.instance_id, data, data.access, sessions_dir=directory)
+                        except VoiceAuthorityError:
+                            return
+                        await asyncio.wait_for(ws.send_json(frame), timeout=getattr(self, '_event_send_timeout', 5.0))
+                        return
+                    if not data.access.permits(self.event_recipients.owner(state)):
+                        return
+                elif not parent:
+                    owner = current_request_owner()
+                    if owner is not None and owner.uid is not None and owner != self.event_recipients.owner(state):
+                        if data.get('type') != 'rpc':
+                            return
+                        data = {'type': 'rpc', 'id': data.get('id', ''), 'error': {
+                            'code': 'VOICE_AUTH_REQUIRED', 'message': 'The account connection changed or expired.'}}
+                await asyncio.wait_for(ws.send_json(data), timeout=getattr(self, '_event_send_timeout', 5.0))
+        except asyncio.TimeoutError:
+            self.event_recipients.retire(ws)
+            close = getattr(ws, 'close', None)
+            if close is not None:
+                try:
+                    await asyncio.wait_for(close(), timeout=1.0)
+                except (asyncio.TimeoutError, ConnectionResetError, RuntimeError):
+                    pass
         except (ConnectionResetError, RuntimeError):
             pass
 
@@ -3629,7 +4028,7 @@ class GatewayServer:
         to the originating socket when nothing is registered. ``_ws_send`` no-ops
         on a closed socket, so a stale registration just drops silently."""
         target = self._session_ws.get(session_key) or fallback_ws
-        await self._ws_send(target, data)
+        await self._ws_send(target, self._scoped_event(data, session_key=session_key))
 
     def bind_session_ws(self, session_key: str, ws: web.WebSocketResponse) -> None:
         """Point a session's live stream at ``ws`` (transport-rebind)."""
@@ -3710,8 +4109,14 @@ class GatewayServer:
             await self._ws_rpc_error(ws, rpc_id, e.code, e.message)
             return
         except Exception as e:
-            logger.exception(f"[Gateway] feature rpc {method} failed")
-            await self._ws_rpc_error(ws, rpc_id, "INTERNAL", str(e))
+            if method.startswith('voice.') or 'voiceAccess' in params or feature_rpc.has_voice_account():
+                # Traceback diagnostics may contain bearer-bearing frame locals.
+                logger.error('[Gateway] voice feature RPC {} failed ({})', method, type(e).__name__)
+                message = 'Voice request could not be completed.'
+            else:
+                logger.exception(f"[Gateway] feature rpc {method} failed")
+                message = str(e)
+            await self._ws_rpc_error(ws, rpc_id, "INTERNAL", message)
             return
         # chat.inflight is the re-entry handshake: the client just (re)opened
         # this session, so rebind its live stream to THIS socket — any run still
@@ -4432,12 +4837,12 @@ class GatewayServer:
             "event": "goal.updated",
             "data": {"sessionKey": session_key, "goal": goal},
         }
+        payload = self._scoped_event(payload)
         target = self._session_ws.get(session_key) or fallback_ws
         if target is not None and not target.closed:
             await self._ws_send(target, payload)
             return
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, payload)
+        await self._broadcast_clients(payload)
 
     async def push_session_message(
         self,
@@ -4503,7 +4908,7 @@ class GatewayServer:
                 data["model"] = str(metadata["model"])
             if metadata.get("goal_run") is True:
                 data["goalRun"] = True
-            payload = {"type": "event", "event": "chat", "data": data}
+            payload = self._scoped_event({"type": "event", "event": "chat", "data": data})
             if metadata.get("goal_run") is True:
                 await self._push_session_chat_event(session_key, data)
             else:
@@ -4554,6 +4959,7 @@ class GatewayServer:
             "event": "chat",
             "data": data,
         }
+        payload = self._scoped_event(payload)
         if metadata.get("goal_run") is True:
             await self._push_session_chat_event(session_key, data)
         else:
@@ -4570,7 +4976,7 @@ class GatewayServer:
         session_key: str,
         data: dict[str, Any],
     ) -> None:
-        payload = {"type": "event", "event": "chat", "data": data}
+        payload = self._scoped_event({"type": "event", "event": "chat", "data": data})
         target = self._session_ws.get(session_key)
         if target is not None and not target.closed:
             await self._ws_send(target, payload)
@@ -4599,6 +5005,7 @@ class GatewayServer:
             "event": "agent_state",
             "data": {"state": state},
         }
+        payload = self._scoped_event(payload)
         for client_id in list(self._extension_clients):
             ws = self._ws_clients.get(client_id)
             if ws is None or ws.closed:
@@ -4669,24 +5076,18 @@ class GatewayServer:
     ) -> None:
         if not self.artifact_store:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Artifacts not enabled")
-        limit = int(params.get("limit", 50))
+        limit = max(1, min(int(params.get("limit", 50)), 200))
         include_internal = bool(params.get("includeInternal", False))
         include_content = bool(params.get("includeContent", True))
-        # Fetch extra rows so we can drop internal artifacts without
-        # shrinking the visible page below the caller's limit. Matches
-        # the pattern ArtifactTool._list already uses for its own filter.
-        fetch_limit = limit if include_internal else max(limit * 5, 100)
         results = self.artifact_store.list(
             type=params.get("type"),
             pinned=params.get("pinned"),
             search=params.get("search"),
             session_key=params.get("sessionKey"),
-            limit=fetch_limit,
+            limit=limit,
             offset=params.get("offset", 0),
+            include_internal=include_internal,
         )
-        if not include_internal:
-            results = [a for a in results if not is_internal_context_artifact(a)]
-        results = results[:limit]
         if not include_content:
             results = [artifact_summary(a) for a in results]
         await self._ws_rpc_reply(ws, rpc_id, {"artifacts": results})
@@ -4754,10 +5155,13 @@ class GatewayServer:
         artifact_id = params.get("id", "")
         if not artifact_id:
             return await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "id required")
+        scope = self.artifact_store.control_scope(artifact_id)
         deleted = self.artifact_store.delete(artifact_id)
         if not deleted:
             return await self._ws_rpc_error(ws, rpc_id, "NOT_FOUND", "Artifact not found")
-        await self._broadcast_artifact_event("artifact.deleted", {"id": artifact_id})
+        access = EventAccess(scopes=(scope,), canonical=False) if scope is not None else EventAccess(blocked=True)
+        with event_access_scope(access):
+            await self._broadcast_artifact_event("artifact.deleted", {"id": artifact_id})
         await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
 
     async def _ws_rpc_artifacts_pin(
@@ -4816,8 +5220,7 @@ class GatewayServer:
         # hasn't sent yet, or a rebind in flight). Fall back to everyone —
         # a redundant notice beats a missing one, and clients filter on
         # sessionKey anyway.
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        await self._broadcast_clients(event)
 
     async def broadcast_tool_event(self, event_name: str, data: dict) -> None:
         """Push tool lifecycle event (``tool.start`` / ``tool.complete``)
@@ -4825,14 +5228,12 @@ class GatewayServer:
         ``agent.tool_callback`` by the gateway bootstrapper.
         """
         event = {"type": "event", "event": event_name, "data": data}
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        await self._broadcast_clients(event)
 
     async def _broadcast_artifact_event(self, event_name: str, data: dict) -> None:
         """Push artifact event to all connected WS clients."""
         event = {"type": "event", "event": event_name, "data": data}
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        await self._broadcast_clients(event)
 
     async def broadcast_cron_event(self, event_name: str, data: dict) -> None:
         """Push a cron lifecycle event (``cron.completed``) to all connected
@@ -4842,8 +5243,7 @@ class GatewayServer:
         never affect cron execution (the caller wraps it in try/except).
         """
         event = {"type": "event", "event": event_name, "data": data}
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        await self._broadcast_clients(event)
 
     async def broadcast_event(self, event_name: str, data: dict) -> None:
         """Push a generic event to all connected WS clients.
@@ -4852,8 +5252,7 @@ class GatewayServer:
         the web relay channel forwarding lightweight chat liveness to desktop.
         """
         event = {"type": "event", "event": event_name, "data": data}
-        for ws in list(self._ws_clients.values()):
-            await self._ws_send(ws, event)
+        await self._broadcast_clients(event)
 
     @staticmethod
     def _profile_subscription_uses_default(
@@ -4979,6 +5378,10 @@ class GatewayServer:
             session_key = self._profile_run_subscriptions.get(
                 (profile, run_id), ""
             )
+            if session_key:
+                # Preserve the canonical scope for clients sharing one host
+                # socket across multiple profile conversations.
+                data = {**data, "data": {**event_data, "sessionKey": session_key}}
 
         targets: set[str] = set()
         for client_id, subscription in tuple(
@@ -5012,7 +5415,7 @@ class GatewayServer:
                        if client_id in targets or profile in self._profile_subagent_event_versions.get(ws, {})]
             await asyncio.gather(*(send_task(ws) for ws in sockets), return_exceptions=True)
             return
-        event = {"type": "event", "event": "profile.event", "data": data}
+        event = self._scoped_event({"type": "event", "event": "profile.event", "data": data})
         for client_id in sorted(targets):
             ws = self._ws_clients.get(client_id)
             if ws is not None:
@@ -5050,6 +5453,15 @@ class GatewayServer:
 
     async def _handle_profile_host_internal_frame(self, frame: dict[str, Any]) -> None:
         """Resolve private default-profile RPCs or forward their live events."""
+        if frame.get('type') == 'event':
+            from flowly.live_voice.authority import VoiceAuthorityError
+
+            frame = self._scoped_event(frame)
+            try:
+                if not frame.access.permits(frame.access.producer()):
+                    return
+            except VoiceAuthorityError:
+                return
         if frame.get("type") == "rpc":
             future = self._profile_host_rpc_pending.get(str(frame.get("id") or ""))
             if future is None or future.done():
@@ -5166,21 +5578,18 @@ class GatewayServer:
 
     async def _handle_artifacts_list(self, request: web.Request) -> web.Response:
         params = dict(request.query)
-        limit = int(params.get("limit", 50))
+        limit = max(1, min(int(params.get("limit", 50)), 200))
         include_internal = params.get("includeInternal") == "true"
         include_content = params.get("includeContent", "true").lower() == "true"
-        fetch_limit = limit if include_internal else max(limit * 5, 100)
         results = self.artifact_store.list(
             type=params.get("type"),
             pinned=params.get("pinned") == "true" if "pinned" in params else None,
             search=params.get("search"),
             session_key=params.get("sessionKey"),
-            limit=fetch_limit,
+            limit=limit,
             offset=int(params.get("offset", 0)),
+            include_internal=include_internal,
         )
-        if not include_internal:
-            results = [a for a in results if not is_internal_context_artifact(a)]
-        results = results[:limit]
         if not include_content:
             results = [artifact_summary(a) for a in results]
         return web.json_response({"artifacts": results})
@@ -5312,8 +5721,11 @@ class GatewayServer:
             except asyncio.CancelledError:
                 pass
         # Cancel any in-flight chat tasks.
-        for task in self._active_tasks.values():
+        active_tasks = list(self._active_tasks.values())
+        for task in active_tasks:
             task.cancel()
+        await asyncio.gather(*active_tasks, return_exceptions=True)
+        self._active_tasks.clear()
         # Close all WebSocket connections.
         for ws in list(self._ws_clients.values()):
             await ws.close()

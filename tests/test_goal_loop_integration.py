@@ -49,6 +49,15 @@ def _bare_loop() -> AgentLoop:
     return loop
 
 
+def test_delivered_goal_turn_keeps_the_real_transport_run_identity():
+    loop = _bare_loop()
+    turn = loop._goal_turn_from_outbound('web:chat', OutboundMessage(
+        channel='web', chat_id='chat', content='Verified result',
+        metadata={'stream_run_id': 'worker-result', '_goal_eligible': True},
+    ), user_epoch=1)
+    assert turn.run_id == 'worker-result'
+
+
 @pytest.mark.asyncio
 async def test_goal_continuation_uses_the_surfaces_own_turn_entry() -> None:
     """A registered surface runs the turn; the delivery never runs its own."""

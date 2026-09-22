@@ -63,6 +63,10 @@ def resolve_media_id(
         return None, "forbidden", 403
     if not target.is_file():
         return None, "not found", 404
+    from flowly.media.authority import media_visible
+
+    if not media_visible(media_dir / name):
+        return None, "not found", 404
     return target, "", 0
 
 

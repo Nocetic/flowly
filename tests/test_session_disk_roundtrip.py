@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from flowly.session.manager import Session, SessionManager
+from flowly.session.manager import SessionManager
 
 
 @pytest.fixture
@@ -250,6 +250,54 @@ def test_list_sessions_excludes_full_display_mirror(temp_flowly_home):
     keys = [s["key"] for s in mgr.list_sessions()]
     assert keys == ["desktop:abc"]
     assert not any(".full" in k for k in keys)
+
+
+@pytest.mark.parametrize('key', ['desktop:voice-work:c_ab12', 'desktop:user_report_1'])
+def test_listing_preserves_exact_persisted_session_key(temp_flowly_home, key):
+    from flowly.channels.feature_rpc import sessions_list
+
+    manager = SessionManager(workspace=temp_flowly_home)
+    if key.startswith('desktop:voice-work:'):
+        manager.reserve_voice_work(key)
+    session = manager.get_or_create(key)
+    session.add_message('user', 'Continue this exact conversation.')
+    manager.save(session)
+    restarted = SessionManager(workspace=temp_flowly_home)
+    assert [row['key'] for row in restarted.list_sessions()] == [key]
+    assert [row['key'] for row in sessions_list()['sessions']] == [key]
+    assert restarted.get_full_messages(key)[0]['content'] == 'Continue this exact conversation.'
+
+
+def test_legacy_voice_work_listing_preserves_card_id(temp_flowly_home):
+    import json
+
+    from flowly.channels.feature_rpc import sessions_list
+
+    manager = SessionManager(workspace=temp_flowly_home)
+    key = 'desktop:voice-work:c_ab12'
+    manager.reserve_voice_work(key)
+    path = manager._get_session_path(key)
+    rows = path.read_text().splitlines()
+    metadata = json.loads(rows[0])
+    metadata.pop('session_key')
+    path.write_text('\n'.join([json.dumps(metadata), *rows[1:]]) + '\n')
+    assert [row['key'] for row in manager.list_sessions()] == [key]
+    assert [row['key'] for row in sessions_list()['sessions']] == [key]
+
+
+def test_listing_never_redirects_a_stored_key_to_another_file(temp_flowly_home):
+    import json
+
+    from flowly.channels.feature_rpc import sessions_list
+
+    manager = SessionManager(workspace=temp_flowly_home)
+    manager.save(manager.get_or_create('desktop:original'))
+    path = manager._get_session_path('desktop:original')
+    metadata = json.loads(path.read_text().splitlines()[0])
+    metadata['session_key'] = 'desktop:different'
+    path.write_text(json.dumps(metadata) + '\n')
+    assert manager.list_sessions() == []
+    assert sessions_list()['sessions'] == []
 
 
 def test_iter_session_files_skips_full_mirror(tmp_path):

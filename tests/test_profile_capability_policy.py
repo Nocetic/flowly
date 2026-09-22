@@ -58,7 +58,10 @@ def test_local_runtime_handshake_advertises_required_security_contract() -> None
         "cooperative-stop-v1",
         "profile-cron-v1",
         "shared-services-v1",
+        "voice-owner-hop-v1",
+        "voice-owner-events-v1",
     }
+    assert 'voiceParentKey' not in payload
 
 
 def test_runtime_capabilities_keep_shared_services_on_primary() -> None:

@@ -20,6 +20,7 @@ Storage location: the primary runtime's ``get_flowly_home() / "board.db"``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -31,6 +32,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from loguru import logger
+
+from flowly.live_voice.authority import current_request_owner
 
 # --------------------------------------------------------------------------
 # Status model
@@ -128,6 +131,11 @@ class Card:
     created_at: float = 0.0
     updated_at: float = 0.0
     notes: list[CardNote] = field(default_factory=list)
+    execution_mode: str = "background"
+    voice_conversation_id: str = ""
+    session_key: str = ""
+    request_fingerprint: str = ""
+    voice_owner_uid: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -150,6 +158,12 @@ class Card:
         d["createdAt"] = self.created_at
         d["updatedAt"] = self.updated_at
         d["notes"] = [n.to_dict() for n in self.notes]
+        d["executionMode"] = self.execution_mode
+        d["voiceConversationId"] = self.voice_conversation_id
+        d["sessionKey"] = self.session_key
+        # Internal deduplication material is not a client capability.
+        d.pop("request_fingerprint", None)
+        d.pop('voice_owner_uid', None)
         return d
 
 
@@ -256,10 +270,16 @@ _CARD_COLUMNS = (
     "id, title, body, status, origin_channel, origin_chat_id, created_by, "
     "assignee_profile, assignee_bot_id, priority, scheduled_at, idempotency_key, "
     "revision, run_id, claim_token, lease_expires_at, heartbeat_at, attempt_count, "
-    "max_attempts, parent_id, result, error, created_at, updated_at"
+    "max_attempts, parent_id, result, error, created_at, updated_at, "
+    "execution_mode, voice_conversation_id, session_key, request_fingerprint, voice_owner_uid"
 )
 
 _ADDITIVE_CARD_COLUMNS = {
+    "execution_mode": "TEXT NOT NULL DEFAULT 'background'",
+    "voice_conversation_id": "TEXT NOT NULL DEFAULT ''",
+    "session_key": "TEXT NOT NULL DEFAULT ''",
+    "request_fingerprint": "TEXT NOT NULL DEFAULT ''",
+    "voice_owner_uid": "TEXT NOT NULL DEFAULT ''",
     "assignee_profile": "TEXT NOT NULL DEFAULT ''",
     "assignee_bot_id": "TEXT NOT NULL DEFAULT ''",
     "priority": "INTEGER NOT NULL DEFAULT 0",
@@ -292,12 +312,18 @@ class BoardStore:
             str(self.db_path), check_same_thread=False
         )
         self._conn.row_factory = sqlite3.Row
+        from flowly.board.voice_commands import SCHEMA as VOICE_COMMAND_SCHEMA
+        from flowly.board.voice_commands import VoiceCommands
+
+        self.voice_commands = VoiceCommands(self)
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
             self._migrate_schema_locked()
             self._conn.executescript(_POST_MIGRATION_SCHEMA)
+            self._conn.executescript(VOICE_COMMAND_SCHEMA)
+            self.voice_commands.migrate_locked()
             self._conn.commit()
         logger.debug(f"[board] store ready at {self.db_path}")
 
@@ -322,6 +348,8 @@ class BoardStore:
             self._conn.execute("ALTER TABLE card_runs ADD COLUMN worker_run_id TEXT")
 
     def _row_to_card(self, row: sqlite3.Row, *, with_notes: bool = False) -> Card:
+        if not self._row_visible(row):
+            raise BoardError('card not found')
         card = Card(
             id=row["id"],
             title=row["title"],
@@ -342,17 +370,24 @@ class BoardStore:
             heartbeat_at=row["heartbeat_at"],
             attempt_count=int(row["attempt_count"] or 0),
             max_attempts=max(1, int(row["max_attempts"] or 2)),
-            parent_id=row["parent_id"],
+            parent_id=row['parent_id'] if not row['parent_id'] or self._id_visible_locked(row['parent_id']) else None,
             result=row["result"],
             error=row["error"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            execution_mode=row["execution_mode"],
+            voice_conversation_id=row["voice_conversation_id"],
+            session_key=row["session_key"],
+            request_fingerprint=row["request_fingerprint"],
+            voice_owner_uid=row['voice_owner_uid'],
         )
         if with_notes:
             card.notes = self._get_notes_locked(card.id)
         return card
 
     def _get_notes_locked(self, card_id: str) -> list[CardNote]:
+        if not self._id_visible_locked(card_id):
+            return []
         cur = self._conn.execute(
             "SELECT id, card_id, author, text, created_at FROM card_notes "
             "WHERE card_id = ? ORDER BY created_at ASC, id ASC",
@@ -369,12 +404,41 @@ class BoardStore:
             for r in cur.fetchall()
         ]
 
+    @staticmethod
+    def _visibility_sql(alias: str = '') -> tuple[str, list[str]]:
+        owner = current_request_owner()
+        if owner is None:
+            return '1', []
+        prefix = alias + '.' if alias else ''
+        uid = prefix + 'voice_owner_uid'
+        if owner.uid is None:
+            return f"{uid} = ''", []
+        return f"({uid} = ? OR ({uid} = '' AND {prefix}execution_mode <> 'voice'))", [owner.uid]
+
+    @staticmethod
+    def _row_visible(row) -> bool:
+        owner = current_request_owner()
+        if owner is None:
+            return True
+        uid = row['voice_owner_uid']
+        if owner.uid is None:
+            return uid == ''
+        return uid == owner.uid or (uid == '' and row['execution_mode'] != 'voice')
+
+    def _id_visible_locked(self, card_id: str) -> bool:
+        row = self._conn.execute('SELECT execution_mode, voice_owner_uid FROM cards WHERE id = ?', (card_id,)).fetchone()
+        return row is not None and self._row_visible(row)
+
+    def _require_card_locked(self, card_id: str) -> None:
+        if not self._id_visible_locked(card_id):
+            raise BoardError('card not found')
+
     def _get_card_locked(self, card_id: str, *, with_notes: bool = False) -> Optional[Card]:
         cur = self._conn.execute(
             f"SELECT {_CARD_COLUMNS} FROM cards WHERE id = ?", (card_id,)
         )
         row = cur.fetchone()
-        if row is None:
+        if row is None or not self._row_visible(row):
             return None
         return self._row_to_card(row, with_notes=with_notes)
 
@@ -417,6 +481,9 @@ class BoardStore:
         idempotency_key: str = "",
         max_attempts: int = 2,
         parent_id: Optional[str] = None,
+        execution_mode: str = "background",
+        voice_conversation_id: str = "",
+        voice_open_only: bool = False,
     ) -> Card:
         if not isinstance(title, str):
             raise BoardError("card title must be a string")
@@ -469,18 +536,48 @@ class BoardStore:
                 raise BoardError("scheduled time is invalid") from exc
             if not math.isfinite(scheduled_at):
                 raise BoardError("scheduled time is invalid")
+        if execution_mode not in ("background", "voice"):
+            raise BoardError("execution mode is invalid")
+        if not isinstance(voice_conversation_id, str) or len(voice_conversation_id) > 128:
+            raise BoardError("voice conversation identity is invalid")
+        if any(ord(c) < 32 or ord(c) == 127 for c in voice_conversation_id):
+            raise BoardError("voice conversation identity is invalid")
+        if execution_mode == "voice" and (
+            not voice_conversation_id or not idempotency_key or not assignee_profile
+        ):
+            raise BoardError("voice dispatch requires conversation, command and profile identities")
+        if not isinstance(voice_open_only, bool) or (voice_open_only and (
+            execution_mode != 'voice' or status != STATUS_TODO or body
+        )):
+            raise BoardError('an empty voice chat must be parked without an instruction')
+        owner = current_request_owner()
+        voice_owner_uid = owner.uid if execution_mode == 'voice' and owner is not None and owner.uid is not None else ''
+        fingerprint = hashlib.sha256(json.dumps({
+            "title": title, "body": body, "profile": assignee_profile,
+            "botId": assignee_bot_id, "conversationId": voice_conversation_id,
+            "mode": execution_mode,
+            **({"openOnly": True} if voice_open_only else {}),
+            **({'ownerUid': voice_owner_uid} if voice_owner_uid else {}),
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if execution_mode == "voice" else ""
         now = time.time()
         card_id = _new_card_id()
-        with self._lock:
+        session_key = f"desktop:voice-work:{card_id}" if execution_mode == "voice" else ""
+        with self._lock, self._conn:
             if idempotency_key:
                 existing = self._conn.execute(
                     f"SELECT {_CARD_COLUMNS} FROM cards WHERE idempotency_key = ?",
                     (idempotency_key,),
                 ).fetchone()
                 if existing is not None:
+                    if (fingerprint or existing["request_fingerprint"]) and existing["request_fingerprint"] != fingerprint:
+                        raise BoardError("command identity already belongs to a different request")
                     return self._row_to_card(existing, with_notes=True)
-            if parent_id is not None and self._get_card_locked(parent_id) is None:
-                raise BoardError(f"parent card not found: {parent_id!r}")
+            if parent_id is not None:
+                parent = self._get_card_locked(parent_id)
+                if parent is None:
+                    raise BoardError('parent card not found')
+                if parent.voice_owner_uid != voice_owner_uid:
+                    raise BoardError('cards with different owners cannot be linked')
             self._conn.execute(
                 f"INSERT INTO cards ({_CARD_COLUMNS}) VALUES "
                 f"({', '.join('?' for _ in _CARD_COLUMNS.split(','))})",
@@ -489,6 +586,7 @@ class BoardStore:
                     created_by, assignee_profile, assignee_bot_id, priority,
                     scheduled_at, idempotency_key, 0, None, None, None, None,
                     0, max_attempts, parent_id, None, None, now, now,
+                    execution_mode, voice_conversation_id, session_key, fingerprint, voice_owner_uid,
                 ),
             )
             self._record_event_locked(
@@ -501,6 +599,10 @@ class BoardStore:
                 },
                 now=now,
             )
+            if execution_mode == "voice" and not voice_open_only:
+                # The card title is metadata; the canonical chat turn contains
+                # only the message the user asked to send.
+                self.voice_commands.seed_locked(card_id, body if body else title, now)
             self._conn.commit()
             card = self._get_card_locked(card_id, with_notes=True)
         assert card is not None
@@ -835,10 +937,14 @@ class BoardStore:
             raise BoardError("a card cannot depend on itself")
         now = time.time()
         with self._lock:
-            if self._get_card_locked(parent_id) is None:
+            parent = self._get_card_locked(parent_id)
+            child = self._get_card_locked(child_id)
+            if parent is None:
                 raise BoardError(f"parent card not found: {parent_id!r}")
-            if self._get_card_locked(child_id) is None:
+            if child is None:
                 raise BoardError(f"child card not found: {child_id!r}")
+            if parent.voice_owner_uid != child.voice_owner_uid:
+                raise BoardError('cards with different owners cannot be linked')
             would_cycle = self._conn.execute(
                 "WITH RECURSIVE descendants(id) AS ("
                 " SELECT child_id FROM card_links WHERE parent_id = ?"
@@ -883,7 +989,7 @@ class BoardStore:
         now = time.time()
         token = "claim_" + uuid.uuid4().hex
         run_id = "board_run_" + uuid.uuid4().hex
-        with self._lock:
+        with self._lock, self._conn:
             existing = self._get_card_locked(card_id)
             if existing is None:
                 raise BoardError(f"card not found: {card_id!r}")
@@ -903,6 +1009,9 @@ class BoardStore:
                 (card_id, STATUS_DONE),
             ).fetchone()
             if blocked_parent is not None:
+                return None
+            command = self.voice_commands.next_locked(existing) if existing.execution_mode == "voice" else None
+            if existing.execution_mode == "voice" and command is None:
                 return None
             attempt = existing.attempt_count + 1
             cur = self._conn.execute(
@@ -932,6 +1041,8 @@ class BoardStore:
                 "VALUES (?, ?, ?, ?, ?, 'running', ?)",
                 (run_id, card_id, attempt, worker, token, now),
             )
+            if command is not None:
+                self.voice_commands.claim_locked(command['command_id'], token, now)
             self._record_event_locked(
                 card_id,
                 "claimed",
@@ -1015,6 +1126,8 @@ class BoardStore:
                 "AND claim_token = ?",
                 (worker_run_id, card_id, claim_token),
             )
+            if existing.execution_mode == "voice":
+                self.voice_commands.applied_locked(card_id, claim_token, worker_run_id, now)
             if repaired:
                 self._record_event_locked(
                     card_id,
@@ -1036,6 +1149,7 @@ class BoardStore:
         error: str | None = None,
         retry_delay: float = 0.0,
         actor: str = "system",
+        uncertain: bool = False,
     ) -> Card:
         """Finish exactly the currently claimed run; stale workers fail closed."""
         if outcome not in {"done", "failed", "cancelled", "review", "blocked"}:
@@ -1043,7 +1157,7 @@ class BoardStore:
         result = result[:_MAX_RESULT_CHARS] if result is not None else None
         error = error[:_MAX_ERROR_CHARS] if error is not None else None
         now = time.time()
-        with self._lock:
+        with self._lock, self._conn:
             existing = self._get_card_locked(card_id)
             if existing is None:
                 raise BoardError(f"card not found: {card_id!r}")
@@ -1062,6 +1176,13 @@ class BoardStore:
                 next_status = STATUS_BLOCKED
             else:
                 next_status = STATUS_READY if existing.assignee_profile else STATUS_TODO
+
+            if existing.execution_mode == "voice":
+                has_next = self.voice_commands.finish_locked(existing, outcome, now, uncertain=uncertain)
+                if uncertain or outcome == "failed":
+                    next_status = STATUS_BLOCKED
+                elif has_next:
+                    next_status = STATUS_READY
 
             scheduled_at = (
                 now + max(0.0, float(retry_delay))
@@ -1122,11 +1243,12 @@ class BoardStore:
         """
         current = time.time() if now is None else float(now)
         recovered = 0
+        visible, owner_args = self._visibility_sql()
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {_CARD_COLUMNS} FROM cards WHERE claim_token IS NOT NULL "
-                "AND (status <> ? OR lease_expires_at IS NULL OR lease_expires_at <= ?)",
-                (STATUS_IN_PROGRESS, current),
+                f"AND (status <> ? OR lease_expires_at IS NULL OR lease_expires_at <= ?) AND ({visible})",
+                (STATUS_IN_PROGRESS, current, *owner_args),
             ).fetchall()
             for row in rows:
                 card = self._row_to_card(row)
@@ -1164,9 +1286,11 @@ class BoardStore:
                     continue
                 next_status = (
                     STATUS_BLOCKED
-                    if card.attempt_count >= card.max_attempts
+                    if card.execution_mode == "voice" or card.attempt_count >= card.max_attempts
                     else (STATUS_READY if card.assignee_profile else STATUS_TODO)
                 )
+                if card.execution_mode == "voice":
+                    self.voice_commands.finish_locked(card, "failed", current, uncertain=True)
                 self._conn.execute(
                     "UPDATE cards SET status = ?, run_id = NULL, claim_token = NULL, "
                     "lease_expires_at = NULL, heartbeat_at = NULL, error = ?, "
@@ -1200,6 +1324,8 @@ class BoardStore:
     def delete_card(self, card_id: str) -> bool:
         with self._lock:
             existing = self._get_card_locked(card_id)
+            if existing is None:
+                return False
             if existing is not None and (
                 existing.claim_token or existing.status == STATUS_IN_PROGRESS
             ):
@@ -1214,16 +1340,17 @@ class BoardStore:
             raise BoardError(f"invalid status: {status!r}")
         if status == STATUS_IN_PROGRESS:
             raise BoardError("running cards cannot be cleared")
+        visible, owner_args = self._visibility_sql()
         with self._lock:
             claimed = self._conn.execute(
-                "SELECT 1 FROM cards WHERE status = ? AND claim_token IS NOT NULL LIMIT 1",
-                (status,),
+                f"SELECT 1 FROM cards WHERE status = ? AND claim_token IS NOT NULL AND ({visible}) LIMIT 1",
+                (status, *owner_args),
             ).fetchone()
             if claimed is not None:
                 raise BoardError("running cards cannot be cleared")
             cur = self._conn.execute(
-                "DELETE FROM cards WHERE status = ? AND claim_token IS NULL",
-                (status,),
+                f"DELETE FROM cards WHERE status = ? AND claim_token IS NULL AND ({visible})",
+                (status, *owner_args),
             )
             self._conn.commit()
             return cur.rowcount
@@ -1237,10 +1364,11 @@ class BoardStore:
         """
         now = time.time()
         reset = 0
+        visible, owner_args = self._visibility_sql()
         with self._lock:
             cur = self._conn.execute(
-                f"SELECT {_CARD_COLUMNS} FROM cards WHERE status = ?",
-                (STATUS_IN_PROGRESS,),
+                f"SELECT {_CARD_COLUMNS} FROM cards WHERE status = ? AND ({visible})",
+                (STATUS_IN_PROGRESS, *owner_args),
             )
             rows = cur.fetchall()
             for r in rows:
@@ -1322,7 +1450,7 @@ class BoardStore:
             ).fetchone()
             return (
                 self._row_to_card(row, with_notes=with_notes)
-                if row is not None
+                if row is not None and self._row_visible(row)
                 else None
             )
 
@@ -1337,8 +1465,9 @@ class BoardStore:
     ) -> list[Card]:
         if status is not None and status not in VALID_STATUSES:
             raise BoardError(f"invalid status: {status!r}")
-        clauses = []
-        args: list[Any] = []
+        visible, owner_args = self._visibility_sql()
+        clauses = [f'({visible})']
+        args: list[Any] = list(owner_args)
         if status is not None:
             clauses.append("status = ?")
             args.append(status)
@@ -1351,12 +1480,25 @@ class BoardStore:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         args.append(int(limit))
         with self._lock:
+            if parent_id is not None and not self._id_visible_locked(parent_id):
+                return []
             cur = self._conn.execute(
                 f"SELECT {_CARD_COLUMNS} FROM cards{where} "
                 "ORDER BY created_at ASC, id ASC LIMIT ?",
                 args,
             )
             return [self._row_to_card(r, with_notes=with_notes) for r in cur.fetchall()]
+
+    def list_voice_work(self, *, offset: int = 0, limit: int = 100) -> list[Card]:
+        """Newest canonical voice work, with the same account visibility as cards."""
+        visible, owner_args = self._visibility_sql()
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_CARD_COLUMNS} FROM cards WHERE execution_mode = 'voice' "
+                f"AND ({visible}) ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+                (*owner_args, limit, offset),
+            ).fetchall()
+            return [self._row_to_card(row, with_notes=False) for row in rows]
 
     def list_dispatchable(
         self,
@@ -1365,12 +1507,11 @@ class BoardStore:
         now: float | None = None,
         exclude_profiles: tuple[str, ...] = (),
     ) -> list[Card]:
-        """Return the next eligible card for each available named profile.
+        """Return eligible independent voice chats and available profile work.
 
-        Selecting at most one card per profile keeps a busy bot from filling
-        the global dispatcher with tasks that are merely queued behind its
-        per-profile semaphore. That preserves capacity and priority fairness
-        for every other bot.
+        Legacy Board jobs still serialize per profile. Voice work serializes
+        per canonical chat instead, with the same global execution budget,
+        owner visibility, scheduling, dependency and priority rules.
         """
         current = time.time() if now is None else float(now)
         excluded = tuple(
@@ -1382,18 +1523,20 @@ class BoardStore:
         args: list[Any] = [STATUS_READY, current, STATUS_DONE]
         if excluded:
             exclusion_sql = (
-                "AND c.assignee_profile NOT IN ("
+                "AND (c.execution_mode = 'voice' OR c.assignee_profile NOT IN ("
                 + ", ".join("?" for _ in excluded)
-                + ") "
+                + ")) "
             )
             args.extend(excluded)
+        visible, owner_args = self._visibility_sql('c')
+        args.extend(owner_args)
         args.append(max(1, int(limit)))
         with self._lock:
             rows = self._conn.execute(
                 "WITH ranked AS ("
                 f" SELECT {_CARD_COLUMNS}, "
                 " ROW_NUMBER() OVER ("
-                "   PARTITION BY c.assignee_profile "
+                "   PARTITION BY c.assignee_profile, CASE WHEN c.execution_mode = 'voice' THEN c.id ELSE '' END "
                 "   ORDER BY c.priority DESC, c.created_at ASC, c.id ASC"
                 " ) AS profile_rank "
                 " FROM cards c "
@@ -1402,7 +1545,7 @@ class BoardStore:
                 " AND NOT EXISTS ("
                 "   SELECT 1 FROM card_links l JOIN cards p ON p.id = l.parent_id "
                 "   WHERE l.child_id = c.id AND p.status <> ?"
-                f" ) {exclusion_sql}"
+                f" ) {exclusion_sql} AND ({visible})"
                 ") "
                 f"SELECT {_CARD_COLUMNS} FROM ranked WHERE profile_rank = 1 "
                 "ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?",
@@ -1412,6 +1555,8 @@ class BoardStore:
 
     def get_runs(self, card_id: str) -> list[dict[str, Any]]:
         with self._lock:
+            if not self._id_visible_locked(card_id):
+                return []
             rows = self._conn.execute(
                 "SELECT id, card_id, attempt, profile, worker_run_id, status, "
                 "started_at, completed_at, error FROM card_runs WHERE card_id = ? "
@@ -1435,6 +1580,8 @@ class BoardStore:
 
     def get_events(self, card_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
+            if not self._id_visible_locked(card_id):
+                return []
             rows = self._conn.execute(
                 "SELECT id, kind, actor, payload, created_at FROM card_events "
                 "WHERE card_id = ? ORDER BY id DESC LIMIT ?",
@@ -1455,22 +1602,91 @@ class BoardStore:
             })
         return events
 
-    def get_dependencies(self, card_id: str) -> dict[str, list[str]]:
+    def voice_event(self, conversation_id: str, event_id: int) -> dict[str, Any] | None:
+        """Look up one immutable event through its owning conversation."""
+        visible, owner_args = self._visibility_sql('c')
         with self._lock:
+            row = self._conn.execute(
+                "SELECT e.id, e.card_id, e.kind, e.payload FROM card_events e "
+                f"JOIN cards c ON c.id = e.card_id WHERE e.id = ? AND c.voice_conversation_id = ? AND ({visible})",
+                (event_id, conversation_id, *owner_args),
+            ).fetchone()
+        return ({"id": row["id"], "cardId": row["card_id"], "kind": row["kind"],
+                 "payload": json.loads(row["payload"])} if row else None)
+
+    def voice_events(self, conversation_id: str, *, after: int = 0, limit: int = 100) -> dict[str, Any]:
+        if not isinstance(conversation_id, str) or not conversation_id or len(conversation_id) > 128:
+            raise BoardError("voice conversation identity is invalid")
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise BoardError("event cursor is invalid")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise BoardError("event limit must be between 1 and 200")
+        visible, owner_args = self._visibility_sql('c')
+        plain_visible, plain_args = self._visibility_sql()
+        with self._lock, self._conn:
+            self._conn.execute('BEGIN')
+            rows = self._conn.execute(
+                f"""SELECT e.* FROM card_events e JOIN cards c ON c.id = e.card_id
+                   WHERE c.voice_conversation_id = ? AND e.id > ? AND ({visible})
+                   ORDER BY e.id LIMIT ?""", (conversation_id, after, *owner_args, limit + 1),
+            ).fetchall()
+            events = [{
+                "id": row["id"], "cardId": row["card_id"], "kind": row["kind"],
+                "actor": row["actor"], "payload": json.loads(row["payload"]),
+                "createdAt": row["created_at"],
+            } for row in rows[:limit]]
+            cards = self._conn.execute(
+                f"SELECT {_CARD_COLUMNS} FROM cards WHERE voice_conversation_id = ? AND ({plain_visible}) ORDER BY created_at, id",
+                (conversation_id, *plain_args),
+            ).fetchall()
+            latest = self.voice_commands.latest_instructions(conversation_id)
+            # Reconcile completion from the same snapshot as the cards, even
+            # when progress events were missed or the client has no cursor.
+            completions = self._conn.execute(
+                f"""SELECT e.id, e.card_id, e.payload FROM card_events e
+                   JOIN cards c ON c.id = e.card_id
+                   WHERE c.voice_conversation_id = ? AND ({visible})
+                     AND c.status IN ('done', 'cancelled', 'blocked', 'review')
+                     AND e.id = (SELECT MAX(latest.id) FROM card_events latest
+                                 WHERE latest.card_id = c.id AND latest.kind = 'run_finished')""",
+                (conversation_id, *owner_args),
+            ).fetchall()
+            by_card = {row['id']: row for row in cards}
+            completion_events = {}
+            for event in completions:
+                payload = json.loads(event['payload'])
+                card = by_card[event['card_id']]
+                if payload.get('attempt') == card['attempt_count'] and payload.get('status') == card['status']:
+                    completion_events[event['card_id']] = {'id': event['id'], 'attempt': payload['attempt']}
+            return {
+                "events": events, "cursor": events[-1]["id"] if events else after,
+                "hasMore": len(rows) > limit,
+                "cards": [{
+                    **self._row_to_card(row).to_dict(),
+                    **({'latestInstruction': latest[row['id']]} if row['id'] in latest else {}),
+                    **({'completionEvent': completion_events[row['id']]} if row['id'] in completion_events else {}),
+                } for row in cards],
+            }
+
+    def get_dependencies(self, card_id: str) -> dict[str, list[str]]:
+        visible, owner_args = self._visibility_sql('c')
+        with self._lock:
+            if not self._id_visible_locked(card_id):
+                return {'parents': [], 'children': []}
             parents = [
                 row["parent_id"]
                 for row in self._conn.execute(
-                    "SELECT parent_id FROM card_links WHERE child_id = ? "
-                    "ORDER BY created_at, parent_id",
-                    (card_id,),
+                    "SELECT l.parent_id FROM card_links l JOIN cards c ON c.id = l.parent_id "
+                    f"WHERE l.child_id = ? AND ({visible}) ORDER BY l.created_at, l.parent_id",
+                    (card_id, *owner_args),
                 ).fetchall()
             ]
             children = [
                 row["child_id"]
                 for row in self._conn.execute(
-                    "SELECT child_id FROM card_links WHERE parent_id = ? "
-                    "ORDER BY created_at, child_id",
-                    (card_id,),
+                    "SELECT l.child_id FROM card_links l JOIN cards c ON c.id = l.child_id "
+                    f"WHERE l.parent_id = ? AND ({visible}) ORDER BY l.created_at, l.child_id",
+                    (card_id, *owner_args),
                 ).fetchall()
             ]
         return {"parents": parents, "children": children}
@@ -1490,9 +1706,10 @@ class BoardStore:
               "timestampMs": 1234567890123
             }
         """
+        visible, owner_args = self._visibility_sql()
         with self._lock:
             cur = self._conn.execute(
-                f"SELECT {_CARD_COLUMNS} FROM cards ORDER BY created_at ASC, id ASC"
+                f"SELECT {_CARD_COLUMNS} FROM cards WHERE {visible} ORDER BY created_at ASC, id ASC", owner_args,
             )
             all_cards = [self._row_to_card(r, with_notes=with_notes) for r in cur.fetchall()]
 

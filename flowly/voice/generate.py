@@ -17,7 +17,9 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from flowly.live_voice.events import EventAccess
 from flowly.media.assets import MediaAsset
+from flowly.media.authority import capture_media_access, publish_media_bytes
 
 __all__ = [
     "MODE_MUSIC",
@@ -58,7 +60,7 @@ def _extension_for(output_format: str) -> str:
     return _EXTENSION_FOR_CODEC.get(codec, ".mp3")
 
 
-def save_audio(data: bytes, *, output_format: str, stem: str = "") -> Path:
+def save_audio(data: bytes, *, output_format: str, stem: str = "", access: EventAccess | None = None) -> Path:
     """Write generated audio into the media directory and return its path.
 
     Written under a temporary name and renamed into place, so a crash halfway
@@ -71,13 +73,12 @@ def save_audio(data: bytes, *, output_format: str, stem: str = "") -> Path:
 
     directory = media_dir()
     name = stem or f"voice_{uuid.uuid4().hex[:12]}"
-    tmp = directory / f".{name}.part"
+    if not name or Path(name).name != name or any(char in name for char in ('/', '\\', '\x00')):
+        raise VoiceGenerationError("the audio filename is invalid.")
     try:
-        tmp.write_bytes(data)
         final = directory / f"{name}{_extension_for(output_format)}"
-        tmp.replace(final)
+        final = publish_media_bytes(data, final, access=access)
     except OSError as exc:
-        tmp.unlink(missing_ok=True)
         raise VoiceGenerationError(f"could not save the audio: {exc}") from exc
     return final
 
@@ -118,6 +119,7 @@ async def generate_elevenlabs(
     """
     from flowly.voice.providers import elevenlabs
 
+    access = capture_media_access()
     try:
         if mode == MODE_MUSIC:
             if not settings.music_ready:
@@ -151,5 +153,6 @@ async def generate_elevenlabs(
         data,
         output_format=elevenlabs.DEFAULT_OUTPUT_FORMAT,
         stem=f"{'music' if mode == MODE_MUSIC else 'speech'}_{uuid.uuid4().hex[:10]}",
+        access=access,
     )
     return await _finish(path, provider="elevenlabs", model=model, prompt=prompt)

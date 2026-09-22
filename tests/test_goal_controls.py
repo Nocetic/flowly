@@ -3,6 +3,7 @@ status is chip state — never a chat bubble."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 import pytest
@@ -18,6 +19,11 @@ class _Manager:
     def __init__(self) -> None:
         self.state = GoalState(session_key="web:c1", goal="ship it")
         self.calls: list[str] = []
+        self.store = Mock()
+        self.store.control_guard.side_effect = lambda _: nullcontext()
+
+    def get(self, session_key: str) -> GoalState:
+        return self.state
 
     def pause(self, session_key: str, reason: str = "") -> GoalState:
         self.calls.append(f"pause:{reason}")

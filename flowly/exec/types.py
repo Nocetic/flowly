@@ -104,3 +104,4 @@ class PendingApproval:
     # — e.g. sending an email — so surfaces must NOT offer "Always allow"
     # there (it would be a silent no-op that re-asks every time).
     supports_always: bool = True
+    run_id: str | None = None
