@@ -47,6 +47,47 @@ returning `willRestart: False` — no process bounce. Channel changes
 and the gateway restarts itself.
 
 
+## Live Voice RPC diagnostic identity
+
+The current Live Voice worktree emits bounded, content-free diagnostics for the
+mutating Voice RPC methods handled through `voice_call`, plus tool-tagged task
+read/focus RPCs. Each owned voice connection persists its
+immutable `diagnosticRunId` when opened. A diagnostic lookup binds to the exact stored
+`connectionId`, including an ended connection; it does not guess from the newest
+connection or repair a missing run ID from a client claim.
+
+For account-owned connections, Core computes the same references as Web:
+`runRef` is SHA-256 of compact JSON
+`['live-voice-run-v1', uid, lowercaseRunId]`, and `sessionRef` is SHA-256 of
+compact JSON `[uid, connectionId]`. When the stored run ID is present, these rows
+use `correlation: session_verified`; older connections without it can be partial
+or unbound. Local host-only ownership has no cloud owner hash and uses
+`correlation: host_verified` when both stored IDs are available. Neither raw IDs
+nor references grant access; the RPC's existing owner/session checks remain
+authoritative.
+
+Desktop may send `_voiceDiagnostic.operationId` with a tool RPC so the RPC row
+can be joined to the same operation in Desktop and Relay. Core validates its
+bounded format when emitting an allowlisted RPC diagnostic, and removes
+`_voiceDiagnostic` before invoking business handlers or recording command
+receipts/fingerprints. The operation ID is already the durable tool command or
+screen capture ID. A Core row's method/outcome describes the RPC; check the
+durable task or Board result to determine whether accepted work finished.
+
+Coverage is intentionally limited. Profile `voice.context` is dispatched
+outside the owned `voice_call` trace and accepts only `query`/`limit`; Desktop
+deliberately preserves that payload and omits both scope and `_voiceDiagnostic`,
+so no owned Core trace is produced even if Desktop and Relay have an operation
+observation. Background polls are omitted. Missing Core telemetry at these
+boundaries does not mean the operation did not happen.
+
+Rows use the `live_voice_stage` event and `core_rpc` stage with a fixed method,
+outcome, bounded duration, safe reason code, and verified identity when one can
+be read. They exclude account IDs, credentials, provider arguments, transcripts,
+screens and RPC result contents. A missing row or reference can reflect an old
+client/server or a connection that could not be resolved; it is not evidence that
+the RPC or task failed.
+
 ## Petdex floating pet RPCs
 
 The optional desktop pet is exposed through the same Feature RPC surface as
