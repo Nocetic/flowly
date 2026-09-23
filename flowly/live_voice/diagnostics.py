@@ -25,16 +25,17 @@ def records_voice_method(method: str, params: dict | None = None) -> bool:
 
 def voice_rpc_diagnostic(method: str, params: dict[str, Any], started: float,
                          outcome: str, reason_code: str | None = None,
-                         binding: dict[str, str] | None = None) -> None:
-    if not records_voice_method(method, params):
+                         binding: dict[str, str] | None = None, *, stage: str = 'core_rpc',
+                         finished: float | None = None) -> None:
+    if stage not in {'core_rpc', 'core_auth', 'core_handler'} or not records_voice_method(method, params):
         return
     try:
         connection_id = (binding or {}).get('connectionId')
         run_id = (binding or {}).get('runId')
         row: dict[str, Any] = {
             'event': 'live_voice_stage', 'component': 'core', 'version': 1,
-            'stage': 'core_rpc', 'method': method, 'outcome': outcome,
-            'durationMs': max(0, min(300_000, round((time.monotonic() - started) * 1000))),
+            'stage': stage, 'method': method, 'outcome': outcome,
+            'durationMs': max(0, min(300_000, round(((finished if finished is not None else time.monotonic()) - started) * 1000))),
         }
         if isinstance(connection_id, str) and _UUID.fullmatch(connection_id):
             row['connectionId'] = connection_id.lower()

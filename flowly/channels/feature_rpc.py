@@ -1833,12 +1833,14 @@ async def voice_call(method: str, params: dict) -> dict:
     started = time.monotonic()
     outcome, reason_code = 'ok', None
     diagnostic_binding = {}
+    authorized_at = None
     service = _voice_provider() if _voice_provider is not None else None
     if service is None:
         voice_rpc_diagnostic(method, params, started, 'failed', 'UNAVAILABLE')
         raise FeatureRpcError("UNAVAILABLE", "Live Voice is not ready on this runtime.")
     try:
         owner, clean = await resolve_voice_owner(params, inherit=True)
+        authorized_at = time.monotonic()
         # Diagnostic fields never enter command fingerprint/receipt payloads.
         clean.pop('_voiceDiagnostic', None)
         with request_owner_scope(owner):
@@ -1866,7 +1868,14 @@ async def voice_call(method: str, params: dict) -> dict:
         outcome, reason_code = 'failed', 'INTERNAL'
         raise
     finally:
-        voice_rpc_diagnostic(method, params, started, outcome, reason_code, diagnostic_binding)
+        finished = time.monotonic()
+        voice_rpc_diagnostic(method, params, started, outcome, reason_code, diagnostic_binding, finished=finished)
+        voice_rpc_diagnostic(method, params, started, 'ok' if authorized_at is not None else outcome,
+                             None if authorized_at is not None else reason_code, diagnostic_binding,
+                             stage='core_auth', finished=authorized_at if authorized_at is not None else finished)
+        if authorized_at is not None:
+            voice_rpc_diagnostic(method, params, authorized_at, outcome, reason_code, diagnostic_binding,
+                                 stage='core_handler', finished=finished)
 
 
 def task_request_call(method: str, params: dict) -> dict:
