@@ -16,16 +16,17 @@ _METHODS = frozenset({
     'voice.tasks.prepare', 'voice.tasks.steer', 'voice.tasks.cancel',
     'voice.tasks.respond', 'voice.chats.open', 'voice.notice',
 })
+_TOOL_READS = frozenset({'voice.tasks.events', 'voice.tasks.get', 'voice.tasks.requests', 'voice.focus'})
 
 
-def records_voice_method(method: str) -> bool:
-    return method in _METHODS
+def records_voice_method(method: str, params: dict | None = None) -> bool:
+    return method in _METHODS or (method in _TOOL_READS and isinstance(params, dict) and isinstance(params.get('_voiceDiagnostic'), dict))
 
 
 def voice_rpc_diagnostic(method: str, params: dict[str, Any], started: float,
                          outcome: str, reason_code: str | None = None,
                          binding: dict[str, str] | None = None) -> None:
-    if method not in _METHODS:
+    if not records_voice_method(method, params):
         return
     try:
         connection_id = (binding or {}).get('connectionId')
@@ -39,11 +40,17 @@ def voice_rpc_diagnostic(method: str, params: dict[str, Any], started: float,
             row['connectionId'] = connection_id.lower()
         if isinstance(run_id, str) and _UUID.fullmatch(run_id):
             row['runId'] = run_id.lower()
+        session_ref = (binding or {}).get('sessionRef')
+        if isinstance(session_ref, str) and re.fullmatch(r'[a-f0-9]{64}', session_ref):
+            row['sessionRef'] = session_ref
+        run_ref = (binding or {}).get('runRef')
+        if isinstance(run_ref, str) and re.fullmatch(r'[a-f0-9]{64}', run_ref):
+            row['runRef'] = run_ref
         diagnostic = params.get('_voiceDiagnostic')
         operation_id = diagnostic.get('operationId') if isinstance(diagnostic, dict) else None
-        if connection_id and isinstance(operation_id, str) and _OPERATION.fullmatch(operation_id):
+        if 'connectionId' in row and isinstance(operation_id, str) and _OPERATION.fullmatch(operation_id):
             row['operationId'] = operation_id.lower()
-        row['correlation'] = 'session_verified' if run_id and connection_id else 'unbound'
+        row['correlation'] = ('session_verified' if 'sessionRef' in row else 'host_verified') if 'runId' in row and 'connectionId' in row else 'unbound'
         if isinstance(reason_code, str) and _CODE.fullmatch(reason_code):
             row['reasonCode'] = reason_code
         logger.info('Live Voice diagnostic {}', json.dumps(row, separators=(',', ':')))

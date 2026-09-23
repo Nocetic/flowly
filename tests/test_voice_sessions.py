@@ -33,17 +33,23 @@ def test_diagnostic_binding_is_owned_immutable_and_survives_reconnect(voice):
     first = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     second = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
     params = {'conversationId': 'conversation-1', 'connectionId': first}
+    expected = {'runId': run, 'connectionId': first,
+                'runRef': '120a0c73eef5846dc9691db137cc4043682d25b656d7274f9346f9041e0c61c1',
+                'sessionRef': 'b8b944ecc0f08de10e2f89816ad2c4228225b358b6fb91618533dd050505e576'}
     open_call(owner, connectionId=first, voiceRunId=run)
     # Retrying open cannot relabel an existing connection's trace.
     open_call(owner, connectionId=first, voiceRunId=second)
-    assert owner.diagnostic_identity(params) == {'runId': run, 'connectionId': first}
+    assert owner.diagnostic_identity(params) == expected
     owner.end(params)
     open_call(owner, connectionId=second, voiceRunId=run)
-    assert owner.diagnostic_identity(params) == {'runId': run, 'connectionId': first}
-    assert owner.diagnostic_identity({**params, 'connectionId': second}) == {'runId': run, 'connectionId': second}
+    assert owner.diagnostic_identity(params) == expected
+    next_binding = owner.diagnostic_identity({**params, 'connectionId': second})
+    assert next_binding['runId'] == run and next_binding['connectionId'] == second
+    assert next_binding['runRef'] == expected['runRef']
+    assert next_binding['sessionRef'] != expected['sessionRef']
     restarted = VoiceSessions(SessionManager(voice.sessions.workspace)).for_principal(
         VoicePrincipal('account-a', 'host-1', 9999999999, 'new-credential'))
-    assert restarted.diagnostic_identity(params) == {'runId': run, 'connectionId': first}
+    assert restarted.diagnostic_identity(params) == expected
     with pytest.raises(VoiceError):
         account_voice(voice, 'account-b').diagnostic_identity(params)
     assert owner.diagnostic_identity({**params, 'connectionId': run}) == {}

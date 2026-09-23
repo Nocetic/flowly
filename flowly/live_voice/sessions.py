@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -145,8 +146,15 @@ class VoiceSessions:
         if not connection:
             return {}
         run_id = connection.get('diagnosticRunId')
-        return {key: value.lower() for key, value in {'runId': run_id, 'connectionId': connection_id}.items()
-                if isinstance(value, str) and _DIAGNOSTIC_ID.fullmatch(value)}
+        binding = {key: value.lower() for key, value in {'runId': run_id, 'connectionId': connection_id}.items()
+                   if isinstance(value, str) and _DIAGNOSTIC_ID.fullmatch(value)}
+        if binding.get('connectionId') and self._owner.get('kind') == 'account':
+            material = json.dumps([self._owner['uid'], connection_id], ensure_ascii=False, separators=(',', ':'))
+            binding['sessionRef'] = hashlib.sha256(material.encode()).hexdigest()
+            if binding.get('runId'):
+                run_material = json.dumps(['live-voice-run-v1', self._owner['uid'], binding['runId']], ensure_ascii=False, separators=(',', ':'))
+                binding['runRef'] = hashlib.sha256(run_material.encode()).hexdigest()
+        return binding
 
     def get(self, conversation_id: Any) -> dict:
         return _public(self._read(conversation_id))

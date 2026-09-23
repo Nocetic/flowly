@@ -1843,7 +1843,7 @@ async def voice_call(method: str, params: dict) -> dict:
         clean.pop('_voiceDiagnostic', None)
         with request_owner_scope(owner):
             owned_service = service.for_owner(owner)
-            if records_voice_method(method) and method != 'voice.open':
+            if records_voice_method(method, params) and method != 'voice.open':
                 try:
                     diagnostic_binding = owned_service.sessions.diagnostic_identity(clean)
                 except Exception:
