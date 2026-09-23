@@ -12,6 +12,7 @@ from flowly.live_voice.authority import RequestOwner
 from flowly.session.manager import Session, SessionManager
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$")
+_DIAGNOSTIC_ID = re.compile(r"^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$", re.I)
 MAX_MESSAGES = 4000
 MAX_CONNECTIONS = 100
 
@@ -89,6 +90,8 @@ class VoiceSessions:
     def open(self, params: dict, *, profile: str, bot_id: str) -> dict:
         key = session_key(params.get("conversationId"))
         connection_id = identity(params.get("connectionId"), "connectionId")
+        candidate_run_id = params.get('voiceRunId')
+        diagnostic_run_id = candidate_run_id.lower() if isinstance(candidate_run_id, str) and _DIAGNOSTIC_ID.fullmatch(candidate_run_id) else None
         language = params.get("language", "en")
         if not isinstance(language, str) or language not in {"en", "tr", "es"}:
             raise VoiceError("INVALID_PARAMS", "Unsupported conversation language.")
@@ -120,6 +123,7 @@ class VoiceSessions:
             voice["connections"].append({
                 "id": connection_id, "generation": len(voice["connections"]) + 1,
                 "language": language, "openedAt": _now(), "endedAt": None,
+                **({'diagnosticRunId': diagnostic_run_id} if diagnostic_run_id else {}),
             })
             voice["revision"] += 1
             session.updated_at = datetime.now()
@@ -127,6 +131,22 @@ class VoiceSessions:
             return _public(session)
 
         return self.sessions.mutate(key, update)
+
+    def diagnostic_identity(self, params: dict) -> dict:
+        """Resolve from owned storage, including retired connections; never latest.
+
+        Optional diagnostics must not change command acceptance or idempotency.
+        Callers isolate lookup failures from the actual RPC result.
+        """
+        session = self._read(params.get('conversationId'))
+        voice = self._metadata(session)
+        connection_id = params.get('connectionId')
+        connection = next((c for c in voice['connections'] if c['id'] == connection_id), None)
+        if not connection:
+            return {}
+        run_id = connection.get('diagnosticRunId')
+        return {key: value.lower() for key, value in {'runId': run_id, 'connectionId': connection_id}.items()
+                if isinstance(value, str) and _DIAGNOSTIC_ID.fullmatch(value)}
 
     def get(self, conversation_id: Any) -> dict:
         return _public(self._read(conversation_id))

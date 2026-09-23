@@ -45,6 +45,35 @@ def request(profile, **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_voice_diagnostics_use_owned_binding_and_strip_operation_metadata(runtime, monkeypatch):
+    service, profile, _, _ = runtime
+    run = '11111111-1111-4111-8111-111111111111'
+    connection = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    operation = 'b' * 64
+    rows = []
+    sink = logger.add(lambda message: rows.append(str(message)))
+    try:
+        await feature_rpc.voice_call('voice.open', request(profile, connectionId=connection, voiceRunId=run))
+        # The service receives business arguments only, while finally logs the
+        # stored run even when the caller supplies a different run identity.
+        original_call = LiveVoiceService.call
+        received = []
+        def observe(self, method, params):
+            received.append(dict(params))
+            return original_call(self, method, params)
+        monkeypatch.setattr(LiveVoiceService, 'call', observe)
+        await feature_rpc.voice_call('voice.end', request(profile, connectionId=connection,
+            voiceRunId=connection, _voiceDiagnostic={'operationId': operation, 'text': 'private speech'}))
+        assert '_voiceDiagnostic' not in received[-1]
+        end_log = next(row for row in rows if '"method":"voice.end"' in row)
+        assert f'"runId":"{run}"' in end_log
+        assert f'"operationId":"{operation}"' in end_log
+        assert 'private speech' not in end_log
+    finally:
+        logger.remove(sink)
+
+
+@pytest.mark.asyncio
 async def test_verified_account_owns_voice_transcript_over_both_transports(runtime, monkeypatch):
     _, profile, _, sessions = runtime
     token, _, fetch, _, _ = access_fixture()

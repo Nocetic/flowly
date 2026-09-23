@@ -1825,22 +1825,37 @@ async def resolve_voice_access(params: dict, *, inherit: bool = False):
 
 async def voice_call(method: str, params: dict) -> dict:
     from flowly.live_voice.authority import request_owner_scope
-    from flowly.live_voice.diagnostics import voice_rpc_diagnostic
+    from flowly.live_voice.diagnostics import records_voice_method, voice_rpc_diagnostic
     from flowly.live_voice.sessions import VoiceError
     from flowly.session.ownership import SessionAccessError
     import time
 
     started = time.monotonic()
     outcome, reason_code = 'ok', None
+    diagnostic_binding = {}
     service = _voice_provider() if _voice_provider is not None else None
     if service is None:
         voice_rpc_diagnostic(method, params, started, 'failed', 'UNAVAILABLE')
         raise FeatureRpcError("UNAVAILABLE", "Live Voice is not ready on this runtime.")
     try:
         owner, clean = await resolve_voice_owner(params, inherit=True)
+        # Diagnostic fields never enter command fingerprint/receipt payloads.
+        clean.pop('_voiceDiagnostic', None)
         with request_owner_scope(owner):
-            result = service.for_owner(owner).call(method, clean)
-            return await result if _inspect.isawaitable(result) else result
+            owned_service = service.for_owner(owner)
+            if records_voice_method(method) and method != 'voice.open':
+                try:
+                    diagnostic_binding = owned_service.sessions.diagnostic_identity(clean)
+                except Exception:
+                    pass  # Missing/deleted sessions have no trusted binding.
+            result = owned_service.call(method, clean)
+            result = await result if _inspect.isawaitable(result) else result
+            if method == 'voice.open':
+                try:
+                    diagnostic_binding = owned_service.sessions.diagnostic_identity(clean)
+                except Exception:
+                    pass
+            return result
     except (VoiceError, SessionAccessError) as exc:
         outcome, reason_code = 'failed', exc.code
         raise FeatureRpcError(exc.code, str(exc)) from exc
@@ -1851,7 +1866,7 @@ async def voice_call(method: str, params: dict) -> dict:
         outcome, reason_code = 'failed', 'INTERNAL'
         raise
     finally:
-        voice_rpc_diagnostic(method, params, started, outcome, reason_code)
+        voice_rpc_diagnostic(method, params, started, outcome, reason_code, diagnostic_binding)
 
 
 def task_request_call(method: str, params: dict) -> dict:

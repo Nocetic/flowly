@@ -27,6 +27,34 @@ def account_voice(voice, uid):
     return voice.for_principal(VoicePrincipal(uid, 'host-1', 9999999999, 'credential-1'))
 
 
+def test_diagnostic_binding_is_owned_immutable_and_survives_reconnect(voice):
+    owner = account_voice(voice, 'account-a')
+    run = '11111111-1111-4111-8111-111111111111'
+    first = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    second = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    params = {'conversationId': 'conversation-1', 'connectionId': first}
+    open_call(owner, connectionId=first, voiceRunId=run)
+    # Retrying open cannot relabel an existing connection's trace.
+    open_call(owner, connectionId=first, voiceRunId=second)
+    assert owner.diagnostic_identity(params) == {'runId': run, 'connectionId': first}
+    owner.end(params)
+    open_call(owner, connectionId=second, voiceRunId=run)
+    assert owner.diagnostic_identity(params) == {'runId': run, 'connectionId': first}
+    assert owner.diagnostic_identity({**params, 'connectionId': second}) == {'runId': run, 'connectionId': second}
+    restarted = VoiceSessions(SessionManager(voice.sessions.workspace)).for_principal(
+        VoicePrincipal('account-a', 'host-1', 9999999999, 'new-credential'))
+    assert restarted.diagnostic_identity(params) == {'runId': run, 'connectionId': first}
+    with pytest.raises(VoiceError):
+        account_voice(voice, 'account-b').diagnostic_identity(params)
+    assert owner.diagnostic_identity({**params, 'connectionId': run}) == {}
+
+
+def test_legacy_and_invalid_diagnostics_do_not_change_open_acceptance(voice):
+    opened = open_call(voice, voiceRunId='private arbitrary text')
+    assert 'diagnosticRunId' not in opened['lastConnection']
+    assert voice.diagnostic_identity({'conversationId': 'conversation-1', 'connectionId': 'connection-1'}) == {}
+
+
 def test_account_owned_conversations_are_not_adopted_or_listed_by_other_accounts(voice):
     owner = account_voice(voice, 'account-a')
     other = account_voice(voice, 'account-b')
