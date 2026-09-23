@@ -27,6 +27,35 @@ def account_voice(voice, uid):
     return voice.for_principal(VoicePrincipal(uid, 'host-1', 9999999999, 'credential-1'))
 
 
+def test_resumed_speech_link_survives_history_reload_and_corrections(voice):
+    open_call(voice)
+    append(voice, role='assistant', text='Merhaba!')
+    voice.end({'conversationId': 'conversation-1', 'connectionId': 'connection-1'})
+    open_call(voice, connectionId='connection-2')
+    linked = {'connectionId': 'connection-2', 'role': 'assistant', 'text': 'Nasılsın?',
+              'continuesMessageId': 'connection-1:message-1'}
+    append(voice, **linked)
+    append(voice, **{**linked, 'text': 'Sen nasılsın?', 'revision': 2})
+    restarted = VoiceSessions(SessionManager(voice.sessions.workspace))
+    messages = restarted.history({'conversationId': 'conversation-1'})['messages']
+    assert len(messages) == 2
+    assert messages[1]['voice']['continuesMessageId'] == 'connection-1:message-1'
+    assert messages[1]['content'] == 'Sen nasılsın?'
+    with pytest.raises(VoiceError):
+        append(voice, **{**linked, 'continuesMessageId': None, 'revision': 3})
+
+
+@pytest.mark.parametrize('parent,role', [('missing:message', 'assistant'),
+                                       ('connection-1:message-1', 'assistant'),
+                                       ('connection-1:message-1', 'user')])
+def test_invalid_resume_links_do_not_mutate_history(voice, parent, role):
+    open_call(voice)
+    append(voice, role='assistant')
+    with pytest.raises(VoiceError):
+        append(voice, messageId='other', ordinal=2, role=role, continuesMessageId=parent)
+    assert len(voice.history({'conversationId': 'conversation-1'})['messages']) == 1
+
+
 def test_diagnostic_binding_is_owned_immutable_and_survives_reconnect(voice):
     owner = account_voice(voice, 'account-a')
     run = '11111111-1111-4111-8111-111111111111'

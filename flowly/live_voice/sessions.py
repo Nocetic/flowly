@@ -256,6 +256,13 @@ class VoiceSessions:
         role = params.get("role")
         if role not in {"user", "assistant"}:
             raise VoiceError("INVALID_PARAMS", "Voice transcripts accept only user and assistant speech.")
+        continuation = params.get("continuesMessageId")
+        if continuation is not None:
+            if role != "assistant" or not isinstance(continuation, str) or continuation.count(":") != 1:
+                raise VoiceError("INVALID_PARAMS", "Invalid speech continuation.")
+            parent_connection, parent_message = continuation.split(":")
+            identity(parent_connection, "continuation connection")
+            identity(parent_message, "continuation message")
         delivery = params.get("delivery", "unknown")
         text = bounded_text(params.get("text"), "text", maximum=8000,
                             empty=role == "assistant" and delivery == "interrupted")
@@ -274,8 +281,17 @@ class VoiceSessions:
             old = next((m for m in session.messages if m.get("voice", {}).get("messageId") == row_id), None)
             current = {"connectionId": connection_id, "messageId": row_id, "providerMessageId": message_id,
                        "generation": connection["generation"], "ordinal": ordinal, "revision": revision, "delivery": delivery}
+            if continuation is not None:
+                parent = next((m for m in session.messages
+                               if m.get("voice", {}).get("connectionId") == parent_connection
+                               and m["voice"].get("providerMessageId") == parent_message), None)
+                if not parent or parent["role"] != "assistant" or parent["voice"]["generation"] >= connection["generation"]:
+                    raise VoiceError("CONFLICT", "Continuation must reference an earlier assistant connection.")
+                current["continuesMessageId"] = continuation
             if old:
                 previous = old["voice"]
+                if previous.get("continuesMessageId") != continuation:
+                    raise VoiceError("CONFLICT", "Speech continuation identity cannot change.")
                 if old["role"] != role or previous["ordinal"] != ordinal:
                     raise VoiceError("CONFLICT", "Message identity belongs to another transcript position.")
                 if revision < previous["revision"]:
