@@ -26,10 +26,10 @@ def fixture():
 def test_committed_lifecycle_has_durations_without_content_or_claims():
     db = fixture()
     try:
-        with patch('flowly.live_voice.task_diagnostics.logger') as log:
+        with patch('flowly.live_voice.task_diagnostics.emit_voice_diagnostic') as emit:
             for stage in ('accepted', 'worker_accepted', 'finished'):
                 observe_voice_task(db, 'card-private', stage)
-            rows = [json.loads(call.args[1]) for call in log.info.call_args_list]
+            rows = [call.args[0] for call in emit.call_args_list]
             assert [r['stage'] for r in rows] == ['accepted', 'worker_accepted', 'finished']
             assert rows[-1]['acceptToWorkerMs'] == 2000
             assert rows[-1]['workerToFinishMs'] == 3000
@@ -39,7 +39,7 @@ def test_committed_lifecycle_has_durations_without_content_or_claims():
             assert 'private' not in json.dumps(rows)
             assert 'secret-claim' not in json.dumps(rows)
             observe_voice_task(db, 'card-private', 'finished')
-            assert json.loads(log.info.call_args.args[1])['eventId'] == rows[-1]['eventId']
+            assert emit.call_args.args[0]['eventId'] == rows[-1]['eventId']
     finally:
         db.close()
 
@@ -48,17 +48,17 @@ def test_missing_start_is_unknown_not_zero_and_broken_sink_is_nonfatal():
     db = fixture()
     try:
         db.execute('DELETE FROM card_events')
-        with patch('flowly.live_voice.task_diagnostics.logger') as log:
+        with patch('flowly.live_voice.task_diagnostics.emit_voice_diagnostic') as emit:
             observe_voice_task(db, 'card-private', 'finished')
-            row = json.loads(log.info.call_args.args[1])
+            row = emit.call_args.args[0]
             assert 'workerToFinishMs' not in row
             assert 'acceptToWorkerMs' not in row
-            log.info.side_effect = RuntimeError('sink offline')
+            emit.side_effect = RuntimeError('sink offline')
             observe_voice_task(db, 'card-private', 'finished')
         db.execute("UPDATE cards SET execution_mode = 'normal'")
-        with patch('flowly.live_voice.task_diagnostics.logger') as log:
+        with patch('flowly.live_voice.task_diagnostics.emit_voice_diagnostic') as emit:
             observe_voice_task(db, 'card-private', 'finished')
-            log.info.assert_not_called()
+            emit.assert_not_called()
     finally:
         db.close()
 
@@ -68,9 +68,9 @@ def test_reconciliation_pins_old_attempt_and_invalid_clock_is_not_zero():
     try:
         db.execute('UPDATE cards SET attempt_count = 2')
         db.execute('UPDATE card_runs SET completed_at = 9')
-        with patch('flowly.live_voice.task_diagnostics.logger') as log:
+        with patch('flowly.live_voice.task_diagnostics.emit_voice_diagnostic') as emit:
             observe_voice_task(db, 'card-private', 'finished', expected_attempt=1)
-            row = json.loads(log.info.call_args.args[1])
+            row = emit.call_args.args[0]
             assert row['attempt'] == 1
             assert row['clockInvalid'] is True
             assert 'workerToFinishMs' not in row

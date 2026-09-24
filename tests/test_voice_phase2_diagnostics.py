@@ -5,7 +5,7 @@ from flowly.live_voice import diagnostics
 
 def test_auth_and_handler_timings_use_explicit_boundaries(monkeypatch):
     rows = []
-    monkeypatch.setattr(diagnostics.logger, 'info', lambda _message, payload: rows.append(json.loads(payload)))
+    monkeypatch.setattr(diagnostics, 'emit_voice_diagnostic', lambda row: rows.append(row))
     params = {'voiceAccess': 'secret', 'text': 'private speech'}
     diagnostics.voice_rpc_diagnostic('voice.open', params, 10.0, 'ok', stage='core_auth', finished=10.125)
     diagnostics.voice_rpc_diagnostic('voice.open', params, 10.125, 'failed', 'UNAVAILABLE',
@@ -19,7 +19,7 @@ def test_auth_and_handler_timings_use_explicit_boundaries(monkeypatch):
 
 def test_unknown_stages_and_background_reads_are_not_logged(monkeypatch):
     rows = []
-    monkeypatch.setattr(diagnostics.logger, 'info', lambda *args: rows.append(args))
+    monkeypatch.setattr(diagnostics, 'emit_voice_diagnostic', lambda row: rows.append(row))
     diagnostics.voice_rpc_diagnostic('voice.open', {}, 0, 'ok', stage='private_stage')
     diagnostics.voice_rpc_diagnostic('voice.history', {}, 0, 'ok')
     assert rows == []
@@ -28,5 +28,5 @@ def test_unknown_stages_and_background_reads_are_not_logged(monkeypatch):
 def test_logger_failure_cannot_change_rpc_outcome(monkeypatch):
     def failed(*_args):
         raise RuntimeError('sink unavailable')
-    monkeypatch.setattr(diagnostics.logger, 'info', failed)
+    monkeypatch.setattr(diagnostics, 'emit_voice_diagnostic', failed)
     diagnostics.voice_rpc_diagnostic('voice.open', {}, 0, 'failed', 'UNAVAILABLE', stage='core_auth')

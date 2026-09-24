@@ -1,12 +1,11 @@
 """Bounded, content-free diagnostics for the shared Voice RPC facade."""
 from __future__ import annotations
 
-import json
 import re
 import time
 from typing import Any
 
-from loguru import logger
+from flowly.live_voice.telemetry_sink import emit_voice_diagnostic
 
 _UUID = re.compile(r"^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$", re.I)
 _CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -54,6 +53,6 @@ def voice_rpc_diagnostic(method: str, params: dict[str, Any], started: float,
         row['correlation'] = ('session_verified' if 'sessionRef' in row else 'host_verified') if 'runId' in row and 'connectionId' in row else 'unbound'
         if isinstance(reason_code, str) and _CODE.fullmatch(reason_code):
             row['reasonCode'] = reason_code
-        logger.info('Live Voice diagnostic {}', json.dumps(row, separators=(',', ':')))
+        emit_voice_diagnostic(row)
     except Exception:
         pass  # Logging must never alter an RPC result.

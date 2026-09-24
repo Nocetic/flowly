@@ -6,10 +6,9 @@ cannot be established are absent, never zero-filled.
 """
 from __future__ import annotations
 import hashlib
-import json
 import math
 import re
-from loguru import logger
+from flowly.live_voice.telemetry_sink import emit_voice_diagnostic
 
 
 def observe_voice_task(db, card_id: str, stage: str, *, expected_attempt: int | None = None) -> None:
@@ -68,6 +67,6 @@ def observe_voice_task(db, card_id: str, stage: str, *, expected_attempt: int | 
                     row['clockInvalid'] = True
         if row['outcome'] not in {'ok', 'done', 'failed', 'cancelled', 'review', 'blocked', 'unknown'}:
             row['outcome'] = 'unknown'
-        logger.info('Live Voice diagnostic {}', json.dumps(row, separators=(',', ':')))
+        emit_voice_diagnostic(row)
     except Exception:
         pass  # Neither reads nor logging may affect committed work.
