@@ -15,6 +15,12 @@ from flowly.gateway.server import GatewayServer
 from flowly.goals.models import GoalState
 
 
+@pytest.fixture(autouse=True)
+def isolated_session_storage(tmp_path, monkeypatch):
+    # Goal event authority consults canonical session files, even in unit tests.
+    monkeypatch.setenv('FLOWLY_HOME', str(tmp_path / 'flowly'))
+
+
 class _Manager:
     def __init__(self) -> None:
         self.state = GoalState(session_key="web:c1", goal="ship it")

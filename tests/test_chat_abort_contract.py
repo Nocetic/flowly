@@ -13,6 +13,12 @@ from flowly.gateway.server import GatewayServer
 from flowly.providers.base import LLMErrorInfo, LLMResponse
 
 
+@pytest.fixture(autouse=True)
+def isolated_session_storage(tmp_path, monkeypatch):
+    # Never bind a fake run to a developer's real canonical conversation.
+    monkeypatch.setenv('FLOWLY_HOME', str(tmp_path / 'flowly'))
+
+
 class _FakeWS:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []

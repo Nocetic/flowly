@@ -276,6 +276,7 @@ async def test_broker_terminal_result_does_not_depend_on_ack_timing(
             source_profile="default", target="writer",
             target_session="desktop:profile-inbox:writer:default",
             message="Prepare a report", correlation_id="terminal-command",
+            request_id="terminal-request",
             hop=1, available={"default", "writer"},
         )
     task = asyncio.create_task(call)
