@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -24,6 +25,45 @@ from flowly.push.cron_push import should_push_cron_completion as _should_push_pe
 console = Console()
 
 _GATEWAY_FILE_SINK_ID: int | None = None
+_GATEWAY_LOG_MAX_BYTES = 10 * 1024 * 1024
+_GATEWAY_LOG_KEEP = 7
+_GATEWAY_LOG_DAY = None
+
+
+def _rotate_gateway_log(message, file) -> bool:
+    """Rotate at midnight or 10 MiB, whichever arrives first."""
+    global _GATEWAY_LOG_DAY
+    try:
+        if _GATEWAY_LOG_DAY is None:
+            _GATEWAY_LOG_DAY = datetime.fromtimestamp(Path(file.name).stat().st_mtime).date()
+        written = file.tell()
+        incoming = len(str(message).encode('utf-8'))
+        today = message.record['time'].date()
+        if written + incoming >= _GATEWAY_LOG_MAX_BYTES or _GATEWAY_LOG_DAY < today:
+            _GATEWAY_LOG_DAY = today
+            return True
+        return False
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _retain_gateway_logs(paths: list[str]) -> None:
+    """Bound compressed archives by age and count after each rotation."""
+    now = datetime.now()
+    candidates = []
+    for path in paths:
+        try:
+            item = Path(path)
+            candidates.append((item.stat().st_mtime, item))
+        except OSError:
+            continue
+    candidates.sort(reverse=True)
+    for index, (modified, item) in enumerate(candidates):
+        if index >= _GATEWAY_LOG_KEEP or datetime.fromtimestamp(modified) < now - timedelta(days=30):
+            try:
+                item.unlink()
+            except OSError:
+                pass
 _LOCAL_RUNTIME_CAPABILITIES = (
     "profile-rpc-v2",
     "allowed-tools-v1",
@@ -175,7 +215,7 @@ def _install_gateway_file_sink(level: str = "INFO") -> None:
     Additive — the default loguru stderr sink stays, so the service manager
     still captures stdout/stderr as before. This guarantees day-by-day local
     operational logs (``~/.flowly/logs/gateway.log`` + dated ``.gz`` archives,
-    30-day retention) regardless of service manager (launchd/systemd/Windows),
+    30-day/7-archive retention) regardless of service manager (launchd/systemd/Windows),
     and survives background mode where the inherited stdio pipes are ignored.
 
     ``enqueue=False`` is intentional: on Python 3.14 loguru's enqueue worker
@@ -192,8 +232,8 @@ def _install_gateway_file_sink(level: str = "INFO") -> None:
         log_dir = _get_log_dir()
         _GATEWAY_FILE_SINK_ID = logger.add(
             str(log_dir / "gateway.log"),
-            rotation="00:00",          # new file at midnight
-            retention="30 days",
+            rotation=_rotate_gateway_log,
+            retention=_retain_gateway_logs,
             compression="gz",
             enqueue=False,             # avoid multiprocessing fork on Python 3.14
             backtrace=False,
