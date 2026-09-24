@@ -463,6 +463,13 @@ class BoardStore:
             ),
         )
 
+    def _observe_voice_task(self, card_id: str, stage: str, *, expected_attempt: int | None = None) -> None:
+        try:
+            from flowly.live_voice.task_diagnostics import observe_voice_task
+            observe_voice_task(self._conn, card_id, stage, expected_attempt=expected_attempt)
+        except Exception:
+            pass
+
     # -- writes -------------------------------------------------------------
 
     def add_card(
@@ -605,6 +612,7 @@ class BoardStore:
                 self.voice_commands.seed_locked(card_id, body if body else title, now)
             self._conn.commit()
             card = self._get_card_locked(card_id, with_notes=True)
+            self._observe_voice_task(card_id, "accepted")
         assert card is not None
         logger.debug(f"[board] add_card {card_id} status={status} title={title!r}")
         return card
@@ -1137,6 +1145,7 @@ class BoardStore:
                     now=now,
                 )
             self._conn.commit()
+            self._observe_voice_task(card_id, "worker_accepted")
             return True
 
     def finish_claim(
@@ -1227,6 +1236,7 @@ class BoardStore:
                     (card_id, f"run failed: {error or 'unknown error'}", now),
                 )
             self._conn.commit()
+            self._observe_voice_task(card_id, "finished")
             card = self._get_card_locked(card_id, with_notes=True)
         assert card is not None
         return card

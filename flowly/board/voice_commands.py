@@ -325,7 +325,10 @@ class VoiceCommands:
                 'commandId': candidate['commandId'], 'workerRunId': candidate['runId'],
                 'completedRunId': completed_run_id, 'reconciled': True,
             }, now=now)
-            return self.store._get_card_locked(candidate['cardId'], with_notes=True)
+            completed_card = self.store._get_card_locked(candidate['cardId'], with_notes=True)
+        with self.store._lock:
+            self.store._observe_voice_task(candidate['cardId'], 'finished', expected_attempt=candidate['attempt'])
+        return completed_card
 
     def _pending_stop_locked(self, card_id: str):
         self.store._require_card_locked(card_id)
