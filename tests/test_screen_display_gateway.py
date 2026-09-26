@@ -54,14 +54,15 @@ async def display_gateway(tmp_path, monkeypatch):
             authority = ScreenAuthority(tmp_path / f"authority-{profile}")
             generation = f"generation-{profile}"
             authority.start(generation)
-            registries.append(ObserverRegistry(authority, generation, sockets))
-            input_services[profile] = InputService(authority, generation, sockets, observers=registries[-1])
+            registries.append(ObserverRegistry(authority, generation, sockets, viewers=service.viewers))
+            input_services[profile] = InputService(authority, generation, sockets, observers=registries[-1],
+                                                  viewers=service.viewers)
             service._runtime = SimpleNamespace(
                 socket_directory=sockets, authority=authority,
                 status=lambda gen=generation: {
                     "phase": "running", "generation": gen,
                     "socket": "/must-not-use-manifest-path", "cdpPort": 9999,
-                    "observerServiceVersion": 2, "inputServiceVersion": 2,
+                    "observerServiceVersion": 3, "inputServiceVersion": 3,
                 },
             )
 
@@ -397,3 +398,28 @@ async def test_supervisor_takeover_ack_follows_gateway_capture_cleanup(display_g
     assert display_gateway.received
     await holder.close()
     await other.close()
+
+
+async def test_public_terminal_close_revokes_capture_and_retry_cannot_release_new_holder(display_gateway):
+    fixture = display_gateway
+    view, headers = await observe(fixture)
+    acquired = (await fixture.rpc("display.control.acquire", control_params(view, 1, "acquire")))["result"]["control"]
+    close = control_params(view, acquired["epoch"], "terminal-close")
+    async with fixture.client.ws_connect(fixture.server.make_url(STREAM_PATH), headers=headers) as screen:
+        await RfbSocket(screen).handshake()
+        # Consume close concurrently: server must finish this capture before ACK.
+        close_frame = asyncio.create_task(screen.receive(timeout=5))
+        closed = (await fixture.rpc("display.viewer.close", close))["result"]
+        assert closed["control"]["control"] == "agent"
+        assert (await close_frame).type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED}
+    resume = {key: value for key, value in close.items() if key not in {"epoch", "operationId"}}
+    assert (await fixture.rpc("display.observe", resume))["error"]["code"] == "VIEWER_REVOKED"
+    assert (await fixture.rpc("display.control.acquire", control_params(view, closed["control"]["epoch"], "late")))["error"]["code"] == "VIEWER_REVOKED"
+    other, _ = await observe(fixture)
+    human = (await fixture.rpc("display.control.acquire", control_params(other, closed["control"]["epoch"], "other")))["result"]["control"]
+    # A new session object simulates gateway reconstruction against the same DB.
+    session = _resolve(fixture.gateway, {"profileId": "default"})
+    session._viewers = None
+    assert (await fixture.rpc("display.viewer.close", close))["result"] == closed
+    assert (await fixture.rpc("display.status"))["result"]["control"] == human
+    assert (await fixture.rpc("display.viewer.close", {**close, "operationId": "different"}))["error"]["code"] == "OPERATION_CONFLICT"

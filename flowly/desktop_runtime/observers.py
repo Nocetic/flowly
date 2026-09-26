@@ -21,8 +21,9 @@ from flowly.desktop_runtime.input_service import _receive, _send
 
 
 class ObserverRegistry:
-    def __init__(self, authority: ScreenAuthority, generation: str, directory: Path):
+    def __init__(self, authority: ScreenAuthority, generation: str, directory: Path, *, viewers=None):
         self.authority, self.generation = authority, generation
+        self.viewers = viewers
         self.path = directory / "observers.sock"
         self._condition = threading.Condition()
         self._entries: dict[socket.socket, tuple[str, bool, str | None]] = {}
@@ -87,6 +88,8 @@ class ObserverRegistry:
         viewer = _identity(request["viewer"])
         stream = _identity(request["stream"]) if "stream" in request else None
         with self._condition:
+            if self.viewers is not None and not self.viewers.available(viewer, self.generation):
+                raise ScreenError("VIEWER_REVOKED")
             if self._stopping.is_set() or not self.authority.may_observe(viewer, self.generation):
                 raise ScreenError("HUMAN_HAS_CONTROL")
             if len(self._entries) >= 4:
@@ -103,7 +106,8 @@ class ObserverRegistry:
         connection.settimeout(0.2)
         while not self._stopping.is_set():
             with self._condition:
-                if not self.authority.may_observe(viewer, self.generation):
+                if (not self.authority.may_observe(viewer, self.generation)
+                        or self.viewers is not None and not self.viewers.available(viewer, self.generation)):
                     self._revoke(connection)
             try:
                 # EOF is the gateway's acknowledgement after teardown.
@@ -129,6 +133,12 @@ class ObserverRegistry:
             return self.is_alive and any(entry == (viewer, False, stream) for entry in self._entries.values())
 
     def drain_except(self, viewer: str, *, timeout: float = 2) -> bool:
+        return self._drain(viewer, exclude=True, timeout=timeout)
+
+    def drain_viewer(self, viewer: str, *, timeout: float = 2) -> bool:
+        return self._drain(viewer, exclude=False, timeout=timeout)
+
+    def _drain(self, viewer: str, *, exclude: bool, timeout: float) -> bool:
         _identity(viewer)
         if not 0 <= timeout <= 5:
             raise ScreenError("INVALID_PARAMS")
@@ -137,7 +147,7 @@ class ObserverRegistry:
             while True:
                 if not self.is_alive:
                     return False
-                others = [connection for connection, entry in self._entries.items() if entry[0] != viewer]
+                others = [connection for connection, entry in self._entries.items() if (entry[0] != viewer) == exclude]
                 if not others:
                     return True
                 for connection in others:

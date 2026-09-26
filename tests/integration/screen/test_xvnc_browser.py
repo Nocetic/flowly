@@ -210,6 +210,8 @@ def test_supervisor_keeps_input_after_gateway_worker_exit(tmp_path, login_site):
     from playwright.sync_api import sync_playwright
 
     from flowly.desktop_runtime.input_service import InputServiceClient
+    from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
+    from flowly.desktop_runtime.viewers import ViewerCredentials
 
     with running_screen(tmp_path / "supervisor-input") as runtime, sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(runtime["endpoint"])
@@ -227,10 +229,12 @@ def test_supervisor_keeps_input_after_gateway_worker_exit(tmp_path, login_site):
         }""")
         authority = runtime["runtime"].authority
         generation = runtime["state"]["generation"]
-        human = authority.acquire("viewer", generation, authority.snapshot()["epoch"])
-        identity = dict(generation=generation, viewer="viewer", epoch=human["epoch"])
+        viewers = ViewerCredentials(StreamTickets(runtime["profile"].parent / "admission"))
+        viewer = viewers.create(StreamScope("owner", "host", "default", generation), "bot")["viewerId"]
+        human = authority.acquire(viewer, generation, authority.snapshot()["epoch"])
+        identity = dict(generation=generation, viewer=viewer, epoch=human["epoch"])
         path = runtime["runtime"].socket_directory / "input.sock"
-        assert runtime["state"]["inputServiceVersion"] == 2
+        assert runtime["state"]["inputServiceVersion"] == 3
         client = InputServiceClient(path)
         opened = client.request("open", **identity)
         clicks = b"".join(struct.pack("!BBHH", 5, mask, point["x"], point["y"]) for mask in (0, 1, 0))
@@ -253,8 +257,11 @@ print(json.dumps(InputServiceClient(Path(value['path'])).request(**value['reques
         resumed = InputServiceClient(path).request("open", **identity)
         assert resumed["handle"] == opened["handle"] and resumed["nextSequence"] == 2
         assert client.request(**request) == {"nextSequence": 2}
-        released = client.request("finish", **identity, handle=opened["handle"], release=True)
+        released = client.request("viewer.close", **identity, operationId="terminal-close")
         assert released["control"] == "agent" and not released["inputDrainRequired"]
+        assert client.request("viewer.close", **identity, operationId="terminal-close") == released
+        with pytest.raises(ScreenError, match="VIEWER_REVOKED"):
+            client.request("open", **identity)
         page.wait_for_function("window.shiftUps === 1")
         assert page.evaluate("window.shiftDowns") == 1
         assert all(is_alive(process) for process in runtime["processes"])
@@ -635,6 +642,7 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                             await chat.send_json({"type": "rpc", "id": "takeover",
                                                   "method": "display.control.acquire", "params": control_params})
                             human = (await chat.receive_json())["result"]["control"]
+                            terminal_closed = False
                             try:
                                 assert human["control"] == "human"
                                 assert (await other.receive(timeout=5)).type in {
@@ -676,9 +684,20 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                                     async with input_stream(human["epoch"]) as replacement:
                                         await replacement.send(key("z"))
                                         await page.wait_for_function("document.querySelector('#code').value === 'hz'")
+                                        await replacement.send(struct.pack("!BBHI", 4, 1, 0, 0xFFE1))
+                                        await page.wait_for_function("window.keys.filter(e => e[0] === 'keydown' && e[1] === 'Shift').length === 2")
+                                        released = await control("display.viewer.close", human["epoch"])
+                                        terminal_closed = True
+                                        assert released["control"] == "agent" and not released["inputDrainRequired"]
+                                        await page.wait_for_function("window.keys.filter(e => e[0] === 'keyup' && e[1] === 'Shift').length === 2")
+                                        assert (await replacement.ws.receive(timeout=5)).type in {
+                                            aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED,
+                                        }
+                                        assert await control("display.viewer.close", human["epoch"]) == released
                             finally:
-                                released = await control("display.control.release", human["epoch"])
-                                assert released["control"] == "agent"
+                                if not terminal_closed:
+                                    released = await control("display.control.release", human["epoch"])
+                                    assert released["control"] == "agent"
                     assert runtime.status()["generation"] == state["generation"]
                     assert is_alive(state["supervisor"])
                     assert await page.locator("body").inner_text() == f"{profile} browser fixture"

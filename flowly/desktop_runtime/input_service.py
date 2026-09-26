@@ -88,9 +88,10 @@ class InputServiceClient:
 class InputService:
     """One runtime's input broker; no control release on client EOF/shutdown."""
 
-    def __init__(self, authority: ScreenAuthority, generation: str, socket_directory: Path, *, observers=None):
+    def __init__(self, authority: ScreenAuthority, generation: str, socket_directory: Path, *, observers=None, viewers=None):
         self.authority, self.generation = authority, generation
         self.observers = observers
+        self.viewers = viewers
         self.path = socket_directory / "input.sock"
         self.rfb = socket_directory / "rfb.sock"
         self._broker: ScreenInputBroker | None = None
@@ -177,7 +178,7 @@ class InputService:
         extras = {"open": set(), "attach": {"stream"}, "send": {"handle", "sequence", "data"},
                   "finish": {"handle", "release"}, "acquire": set(),
                   "control.acquire": {"operationId"}, "control.release": {"operationId"},
-                  "control.reclaim": {"operationId"}}
+                  "control.reclaim": {"operationId"}, "viewer.close": {"operationId"}}
         if not isinstance(method, str) or method not in extras or set(request) != fields | extras[method]:
             raise ScreenError("INVALID_PARAMS")
         viewer = _identity(request["viewer"])
@@ -186,6 +187,10 @@ class InputService:
             raise ScreenError("INVALID_PARAMS")
         if request["generation"] != self.generation:
             raise ScreenError("STALE_GENERATION")
+        if method == "viewer.close":
+            return self._close_viewer(viewer, epoch, _identity(request["operationId"]))
+        if self.viewers is not None and not self.viewers.available(viewer, self.generation):
+            raise ScreenError("VIEWER_REVOKED")
         if method.startswith("control."):
             return self._control(method, viewer, epoch, _identity(request["operationId"]))
         if method == "acquire":
@@ -262,6 +267,36 @@ class InputService:
             self._finished.pop(next(iter(self._finished)))
         self._broker = None
         return result
+
+    def _close_viewer(self, viewer: str, epoch: int, operation: str) -> dict:
+        if self.viewers is None or self.observers is None or not self.observers.is_alive:
+            raise ScreenError("CONTROL_UNAVAILABLE")
+        receipt = self.viewers.close_record(viewer, self.generation, operation, epoch)
+        if receipt is not None and receipt["result"] is not None:
+            return receipt["result"]
+        state = self.authority.snapshot()
+        if state["generation"] != self.generation or not state["running"]:
+            raise ScreenError("STALE_GENERATION")
+        if receipt is None:
+            if state["epoch"] != epoch:
+                raise ScreenError("STALE_EPOCH")
+            self.viewers.begin_close(viewer, operation, epoch)
+        # Persisted intent blocks delayed commands, stream tickets and new
+        # captures. A failed drain retains ownership and is explicitly retryable.
+        if not self.observers.drain_viewer(viewer):
+            raise ScreenError("CLOSE_PENDING")
+        if state["holderHash"] == hashlib.sha256(viewer.encode()).hexdigest():
+            if self._broker is not None:
+                if self._viewer != viewer or self._epoch != state["epoch"]:
+                    raise ScreenError("VIEWER_MISMATCH")
+                state = self._finish(True)
+            else:
+                state = self.authority.release(viewer, self.generation, state["epoch"])
+        # A retry after release but before receipt persistence, or after another
+        # owner explicitly reclaimed, closes only this viewer. No other holder
+        # is released and the original run is never implicitly resumed.
+        self.viewers.complete_close(viewer, operation, epoch, state)
+        return state
 
     def _control(self, method: str, viewer: str, epoch: int, operation: str) -> dict:
         fingerprint = (method, viewer, epoch)

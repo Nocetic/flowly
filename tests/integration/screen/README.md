@@ -73,7 +73,7 @@ pause/resume RPC or Desktop UI. No model is invoked.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
-The expanded Linux screen suite passed **232 tests** on the environment above.
+The expanded Linux screen suite passed **240 tests** on the environment above.
 The authenticated direct display endpoint also delivers real Xvnc pixels for
 the default and named profiles. Its single-use tickets are bound to the host,
 profile and runtime generation; gateway credentials and tickets use headers.
@@ -102,7 +102,7 @@ The service keeps a bounded cache of completed handbacks. Replaying an old
 handback cannot release a newer holder; an evicted handle fails without mutation.
 The real Linux test exits a separate worker after pressing Shift, adopts its
 broker from another client, deduplicates the retry and releases Shift. New
-runtime manifests advertise `inputServiceVersion: 2`; an already-running older
+runtime manifests advertise `inputServiceVersion: 3`; an already-running older
 supervisor does not gain this capability by gateway reconnect alone.
 
 The supervisor also tracks capture leases across gateway workers. Takeover first
@@ -113,7 +113,7 @@ holder's original capture remains open. The real default/named-profile gateway
 tests exercise this with two Xvnc streams. Public WebSocket close waits are
 bounded independently of remote close acknowledgements; an idle client must not
 hold a healthy gateway's capture lease open. Runtime manifests now additionally
-advertise `observerServiceVersion: 2`. A new attachment for the same viewer
+advertise `observerServiceVersion: 3`. A new attachment for the same viewer
 retires the previous input source. It cannot regain input permission after the
 newer connection disappears. Reattachment drains the previous broker before
 admitting input from the new source, without releasing human ownership.
@@ -129,8 +129,19 @@ operation receipts; old replies never reapply transitions. Pending acquisition
 needs a fresh operation/current epoch to confirm after an agent action completes.
 The default/named-profile real-Xvnc tests now acquire/release through authenticated
 public RPC. Broker tests prove release/reclaim drains held input before handback.
-Terminal viewer-close/revocation, events and original-run
-resume are still open; this is not a completed product sidebar.
+Version-three supervisors add authenticated `display.viewer.close`. A durable
+close intent revokes new captures, late control requests and input before
+waiting for this viewer's capture EOF and draining held input. Only then is
+human ownership released. Unresponsive captures retain ownership and return
+`CLOSE_PENDING`; a retry must use the same operation/epoch. Bounded hashed
+credentials retain close receipts across gateway reconstruction. A lost reply
+or failed receipt write never lets a retry release a newer holder. Read-only
+viewer closure never releases another owner's control. Closed receipts do not
+consume active viewer capacity. Existing viewer databases migrate transactionally.
+The real Linux gateway tests close with Shift held, verify key-up and browser
+survival, and replay the same close. Synthetic tests also cover delayed admission,
+missing capture EOF, stale epochs, receipt eviction and lost persistence replies.
+Status events and original-run resume remain open; the product sidebar is unfinished.
 
 The `epoch-u64-v1` input protocol is selected with `X-Flowly-Screen-Input`.
 Each client binary frame starts with an unsigned big-endian 64-bit control epoch

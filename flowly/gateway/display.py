@@ -26,7 +26,7 @@ from flowly.desktop_runtime.viewers import ViewerCredentials
 from flowly.gateway.auth import host_origin_allowed
 from flowly.gateway.mcp_management import _protected_socket
 
-METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create",
+METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create", "display.viewer.close",
                      "display.control.acquire", "display.control.release", "display.control.reclaim"})
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
@@ -35,8 +35,8 @@ INPUT_PROTOCOL = "epoch-u64-v1"
 
 
 def _supports_input(state: dict | None) -> bool:
-    return bool(state and state.get("phase") == "running" and state.get("inputServiceVersion") == 2
-                and state.get("observerServiceVersion") == 2)
+    return bool(state and state.get("phase") == "running" and state.get("inputServiceVersion") in (2, 3)
+                and state.get("observerServiceVersion") in (2, 3))
 
 
 class DisplaySession:
@@ -67,6 +67,8 @@ class DisplaySession:
         return {**self.identity, "protocolVersion": 1, **capability,
                 "transports": ["direct"] if capability["supported"] else [],
                 "view": capability["supported"], "input": _supports_input(state),
+                "viewerClose": bool(state and state.get("inputServiceVersion") == 3
+                                    and state.get("observerServiceVersion") == 3),
                 "lifecycle": False, "installSupported": False}
 
     @property
@@ -136,9 +138,15 @@ class DisplaySession:
 
     def control(self, method: str, generation: str, token: str, epoch: int, operation: str) -> dict:
         state = self.running(generation)
-        if state.get("observerServiceVersion") not in (1, 2) or state.get("inputServiceVersion") not in (1, 2):
+        if state.get("observerServiceVersion") not in (1, 2, 3) or state.get("inputServiceVersion") not in (1, 2, 3):
             raise ScreenError("SCREEN_UPGRADE_REQUIRED")
-        viewer = self.authenticate_viewer(generation, token)
+        if method == "display.viewer.close":
+            if state.get("observerServiceVersion") != 3 or state.get("inputServiceVersion") != 3:
+                raise ScreenError("SCREEN_UPGRADE_REQUIRED")
+            viewer = self.viewers.authenticate(token, self.scope(generation), self.identity["botId"],
+                                               close=(operation, epoch))
+        else:
+            viewer = self.authenticate_viewer(generation, token)
         result = InputServiceClient(self.runtime.socket_directory / "input.sock").request(
             method.removeprefix("display."), generation=generation, viewer=viewer,
             epoch=epoch, operationId=operation,
@@ -212,7 +220,7 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             allowed.add("generation")
         if method == "display.observe":
             allowed.add("viewerToken")
-        if method.startswith("display.control."):
+        if method.startswith("display.control.") or method == "display.viewer.close":
             allowed.update({"viewerToken", "epoch", "operationId"})
         if not isinstance(params, dict) or set(params) - allowed:
             raise ScreenError("INVALID_PARAMS")
@@ -283,12 +291,12 @@ def register_display(app: web.Application, gateway) -> None:
         tasks = []
         stream_id = secrets.token_urlsafe(24)
         try:
-            if state.get("observerServiceVersion") in (1, 2):
+            if state.get("observerServiceVersion") in (1, 2, 3):
                 async with asyncio.timeout(3):
                     observer_reader, observer_writer = await asyncio.open_unix_connection(
                         session.runtime.socket_directory / "observers.sock", limit=4096)
                     registration = {"viewer": viewer, "generation": generation}
-                    if state["observerServiceVersion"] == 2:
+                    if state["observerServiceVersion"] in (2, 3):
                         registration["stream"] = stream_id
                     hello = json.dumps(registration).encode()
                     observer_writer.write(len(hello).to_bytes(4, "big") + hello)

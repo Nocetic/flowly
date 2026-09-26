@@ -238,3 +238,91 @@ def test_service_caps_incomplete_connections_and_recovers_capacity(service):
         time.sleep(0.005)
     opened = client.request("open", **IDENTITY)
     assert opened["nextSequence"] == 0
+
+
+@pytest.fixture
+def closing_service(service, tmp_path):
+    from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
+    from flowly.desktop_runtime.viewers import ViewerCredentials
+
+    authority, peer, server, client = service
+    viewers = ViewerCredentials(StreamTickets(tmp_path / "admission"))
+    scope = StreamScope("owner", "host", "default", "generation")
+    viewer = viewers.create(scope, "bot")["viewerId"]
+    authority.release("viewer", "generation", 2)
+    human = authority.acquire(viewer, "generation", 3)
+    server.viewers = server.observers.viewers = viewers
+    yield authority, peer, server, client, dict(generation="generation", viewer=viewer, epoch=human["epoch"]), scope
+
+
+def test_terminal_close_waits_for_capture_teardown_and_drains_held_keys(closing_service):
+    authority, peer, server, client, identity, _ = closing_service
+    opened = client.request("open", **identity)
+    client.request("send", **identity, handle=opened["handle"], sequence=0, data=base64.b64encode(KEY).decode())
+    with socket.socket(socket.AF_UNIX) as capture:
+        capture.connect(str(server.observers.path))
+        _send(capture, {"viewer": identity["viewer"], "generation": "generation", "stream": "capture"})
+        assert _receive(capture) == {"ok": True}
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            closing = worker.submit(client.request, "viewer.close", **identity, operationId="close")
+            assert capture.recv(1) == b"R"
+            assert not closing.done()
+            assert authority.snapshot()["control"] == "human"
+            capture.close()
+            result = closing.result(3)
+    assert result["control"] == "agent" and not result["inputDrainRequired"]
+    assert len(peer.events) == 2 and peer.events[-1][1] == 0
+    assert client.request("viewer.close", **identity, operationId="close") == result
+    # Simulates an RPC authenticated by an earlier worker, queued before close.
+    with pytest.raises(ScreenError, match="VIEWER_REVOKED"):
+        client.request("control.acquire", **{**identity, "epoch": result["epoch"]}, operationId="late")
+    assert authority.snapshot() == result
+    with socket.socket(socket.AF_UNIX) as stale:
+        stale.connect(str(server.observers.path))
+        _send(stale, {"viewer": identity["viewer"], "generation": "generation"})
+        assert _receive(stale)["code"] == "VIEWER_REVOKED"
+
+
+def test_unacknowledged_capture_keeps_close_pending_and_human_ownership(closing_service):
+    authority, _, server, client, identity, _ = closing_service
+    with socket.socket(socket.AF_UNIX) as capture:
+        capture.connect(str(server.observers.path))
+        _send(capture, {"viewer": identity["viewer"], "generation": "generation"})
+        assert _receive(capture) == {"ok": True}
+        with pytest.raises(ScreenError, match="CLOSE_PENDING"):
+            client.request("viewer.close", **identity, operationId="close")
+        assert capture.recv(1) == b"R"
+        assert authority.snapshot()["control"] == "human"
+        assert not server.viewers.available(identity["viewer"], "generation")
+    assert client.request("viewer.close", **identity, operationId="close")["control"] == "agent"
+
+
+def test_failed_receipt_write_retry_never_releases_a_new_owner(closing_service, monkeypatch):
+    authority, _, server, client, identity, scope = closing_service
+    save = server.viewers.complete_close
+    with monkeypatch.context() as patch:
+        def fail(*_args):
+            raise ScreenError("CONTROL_UNAVAILABLE")
+        patch.setattr(server.viewers, "complete_close", fail)
+        with pytest.raises(ScreenError, match="CONTROL_UNAVAILABLE"):
+            client.request("viewer.close", **identity, operationId="close")
+    assert authority.snapshot()["control"] == "agent"
+    replacement = server.viewers.create(scope, "bot")["viewerId"]
+    human = client.request("control.acquire", generation="generation", viewer=replacement,
+                           epoch=authority.snapshot()["epoch"], operationId="new-owner")
+    assert server.viewers.complete_close == save
+    closed = client.request("viewer.close", **identity, operationId="close")
+    assert closed == human == authority.snapshot()
+    assert client.request("viewer.close", **identity, operationId="close") == closed
+
+
+def test_stale_close_is_rejected_before_revocation_and_observer_close_preserves_other_holder(closing_service):
+    authority, _, server, client, identity, scope = closing_service
+    with pytest.raises(ScreenError, match="STALE_EPOCH"):
+        client.request("viewer.close", **{**identity, "epoch": identity["epoch"] - 1}, operationId="old")
+    assert server.viewers.available(identity["viewer"], "generation")
+    observer = server.viewers.create(scope, "bot")["viewerId"]
+    before = authority.snapshot()
+    closed = client.request("viewer.close", **{**identity, "viewer": observer}, operationId="observer-close")
+    assert closed == before == authority.snapshot()
+    assert server.viewers.available(identity["viewer"], "generation")

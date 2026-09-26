@@ -25,6 +25,8 @@ from flowly.desktop_runtime.launcher import (
     write_state,
 )
 from flowly.desktop_runtime.observers import ObserverRegistry
+from flowly.desktop_runtime.tickets import StreamTickets
+from flowly.desktop_runtime.viewers import ViewerCredentials
 
 
 def write_xauthority(path: Path) -> None:
@@ -143,10 +145,11 @@ def run(directory: Path, generation: str) -> None:
             runtime.authority.start(generation)
             (sockets / "input.sock").unlink(missing_ok=True)
             (sockets / "observers.sock").unlink(missing_ok=True)
-            observers = ObserverRegistry(runtime.authority, generation, sockets)
-            input_service = InputService(runtime.authority, generation, sockets, observers=observers)
+            viewers = ViewerCredentials(StreamTickets(directory / "admission"))
+            observers = ObserverRegistry(runtime.authority, generation, sockets, viewers=viewers)
+            input_service = InputService(runtime.authority, generation, sockets, observers=observers, viewers=viewers)
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
-                         cdpPort=port, inputServiceVersion=2, observerServiceVersion=2, error=None)
+                         cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, error=None)
             write_state(runtime.manifest, state)
             while not stopping:
                 if (not input_service.is_alive or not observers.is_alive
