@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -51,7 +52,14 @@ async def test_voice_diagnostics_use_owned_binding_and_strip_operation_metadata(
     connection = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     operation = 'b' * 64
     rows = []
-    sink = logger.add(lambda message: rows.append(str(message)))
+    loop = asyncio.get_running_loop()
+    end_received = asyncio.Event()
+    def collect(message):
+        row = str(message)
+        rows.append(row)
+        if '"method":"voice.end"' in row and f'"operationId":"{operation}"' in row:
+            loop.call_soon_threadsafe(end_received.set)
+    sink = logger.add(collect)
     try:
         await feature_rpc.voice_call('voice.open', request(profile, connectionId=connection, voiceRunId=run))
         # The service receives business arguments only, while finally logs the
@@ -65,6 +73,8 @@ async def test_voice_diagnostics_use_owned_binding_and_strip_operation_metadata(
         await feature_rpc.voice_call('voice.end', request(profile, connectionId=connection,
             voiceRunId=connection, _voiceDiagnostic={'operationId': operation, 'text': 'private speech'}))
         assert '_voiceDiagnostic' not in received[-1]
+        # Diagnostics leave the RPC through a nonblocking background queue.
+        await asyncio.wait_for(end_received.wait(), timeout=2)
         end_log = next(row for row in rows if '"method":"voice.end"' in row)
         assert f'"runId":"{run}"' in end_log
         assert f'"operationId":"{operation}"' in end_log

@@ -27,13 +27,18 @@ async def test_prepare_many_chats_without_claiming_or_sending(runtime, monkeypat
             profile, commandId=f'chat-{i}', title=f'Chat {i}', body=f'Instruction {i}',
         ))
         cards.append(result['card'])
-    monkeypatch.setenv('FLOWLY_HOME', str(profile.path))
-    sessions = SessionManager(profile.path / 'workspace')
+    # Only the simulated child runtime uses the profile home. Public dispatch
+    # below still runs on the primary host, as it does in production.
+    with monkeypatch.context() as child:
+        child.setenv('FLOWLY_HOME', str(profile.path))
+        sessions = SessionManager(profile.path / 'workspace')
 
     async def reserve(name, method, params, timeout):
         assert name == profile.name and method == 'runtime.voice.reserve'
         assert params['expectedBotId'] == profile.bot_id
-        sessions.reserve_voice_work(params['sessionKey'])
+        with monkeypatch.context() as child:
+            child.setenv('FLOWLY_HOME', str(profile.path))
+            sessions.reserve_voice_work(params['sessionKey'])
         return {'reserved': True, 'sessionKey': params['sessionKey']}
 
     host = type('Host', (), {})()
