@@ -682,3 +682,27 @@ application-environment tests; complete Core suite 6,602 passed, 34 skipped,
 12 deselected, 13 warnings in 294.70 seconds. The real Electron/TLS/Linux review,
 start, mouse/keyboard login, handback, same-run resume and stop smoke passed.
 Targeted Ruff and diff checks passed. Desktop production code is unchanged.
+
+
+## Root runtime account provenance foundation
+
+The internal fixed account worker can provision `flowly-screen` with a system UID,
+a private primary group, locked password, `/nonexistent` home and `nologin` shell.
+It accepts no caller-provided account fields or paths. A root-owned private receipt
+under `/var/lib/flowly-screen-runtime` binds the UID/GID to this installation.
+Pre-existing users/groups without that receipt are rejected. A durable pending
+reservation precedes user creation; interrupted/failed creation requires explicit
+recovery rather than automatic adoption or replay. A host account lock serializes
+provisioners. Worker timeouts kill the unreaped child process group.
+
+The read-only verifier checks trusted ancestors, no-follow private regular receipts,
+UID/GID/name/home/shell agreement and absence of supplementary groups or group
+members. Changed identities and unsafe files fail closed. These helpers are not yet
+connected to CLI/RPC installation or runtime launch: root capability remains disabled
+until application ownership, private D-Bus and runtime lifecycle integration are done.
+No host accounts were created during development; actual provisioning ran only inside
+a fresh disposable Debian container. The final Linux account suite passed 50 tests, including actual provisioning,
+receipt replay, account privilege changes, concurrent admission and linked files.
+The macOS verifier subset passed 39 tests. Targeted Ruff and diff checks passed.
+The previously recorded full Core run preceded these independent helper modules;
+no additional full-suite result is claimed for this increment.
