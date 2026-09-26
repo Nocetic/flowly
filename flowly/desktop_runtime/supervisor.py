@@ -23,6 +23,7 @@ from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.browser_lifecycle import BROWSER_MANAGER_SOURCE
 from flowly.desktop_runtime.desktop_defaults import DESKTOP_DEFAULTS_SOURCE
 from flowly.desktop_runtime.input_service import InputService
+from flowly.desktop_runtime.installation_gate import environment_activity
 from flowly.desktop_runtime.launcher import (
     ScreenRuntime,
     private_directory,
@@ -104,7 +105,7 @@ def run(directory: Path, generation: str) -> None:
     # before spawning: group cleanup relies on retaining each child PID.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     runtime = ScreenRuntime(directory, create=False)
-    with FileLock(directory / "supervisor.lock", timeout=0, mode=0o600):
+    with environment_activity(), FileLock(directory / "supervisor.lock", timeout=0, mode=0o600):
         state = runtime.read_manifest()
         if not state or state["generation"] != generation or state["phase"] != "starting":
             raise ScreenError("RUNTIME_STATE_INVALID")

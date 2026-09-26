@@ -954,3 +954,18 @@ async def test_close_browser_keeps_runtime_and_reopen_reconnects_provider(tmp_pa
             assert runtime.status()["generation"] == generation
         finally:
             await provider.disconnect()
+
+
+def test_detached_supervisor_holds_environment_activity_until_stop(tmp_path):
+    from flowly.desktop_runtime.installation_gate import environment_activity
+
+    with running_screen(tmp_path / "maintenance") as screen:
+        # start() has returned, so only the detached supervisor holds the lease.
+        with pytest.raises(ScreenError, match="INSTALL_BUSY"):
+            with environment_activity(exclusive=True):
+                pytest.fail("installation entered while detached desktop was running")
+        assert screen["runtime"].status()["phase"] == "running"
+    with environment_activity(exclusive=True):
+        with pytest.raises(ScreenError, match="INSTALL_BUSY"):
+            screen["runtime"].start()
+    assert screen["runtime"].status()["phase"] == "stopped"

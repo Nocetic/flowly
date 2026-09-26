@@ -251,11 +251,20 @@ class ScreenRuntime:
 
     def start(self, *, expected_generation: str | None | object = _UNPINNED,
               identity_guard: Callable[[], None] | None = None) -> dict:
-        from flowly.desktop_runtime.profile_lifecycle import assert_not_retired
+        # Parent holds activity until the detached supervisor owns its lease;
+        # an installer cannot enter the gap between admission and readiness.
+        from flowly.desktop_runtime.installation_gate import environment_activity
 
         capabilities = self.capabilities()
         if not capabilities["supported"]:
             raise ScreenError(capabilities["reason"])
+        with environment_activity():
+            return self._start_with_activity(expected_generation=expected_generation, identity_guard=identity_guard)
+
+    def _start_with_activity(self, *, expected_generation: str | None | object = _UNPINNED,
+                             identity_guard: Callable[[], None] | None = None) -> dict:
+        from flowly.desktop_runtime.profile_lifecycle import assert_not_retired
+
         self.assert_current_directory()
         assert_not_retired(self.directory)
         with self._lock:
