@@ -1,0 +1,12 @@
+# Full locked Core environment for gateway + browser integration. Build the
+# base screen runner first, then build this file with the repository as context.
+FROM flowly-screen-test:bookworm
+USER root
+WORKDIR /opt/flowly
+COPY pyproject.toml uv.lock ./
+RUN pip install --no-cache-dir uv==0.9.11 \
+    && uv sync --frozen --extra screen --extra dev --no-default-groups --no-install-project
+ENV PATH="/opt/flowly/.venv/bin:${PATH}"
+ENV FLOWLY_SEMANTIC_MODEL_DOWNLOAD=0
+WORKDIR /workspace
+USER screen-test

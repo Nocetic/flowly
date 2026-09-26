@@ -4,6 +4,7 @@ import typer
 from rich.console import Console
 
 from flowly import __version__, __logo__
+from flowly.cli.screen_cmd import screen_app
 
 # NOTE: We used to force WindowsSelectorEventLoopPolicy here "for
 # uvicorn/aiohttp compatibility" — that hint is outdated. Modern uvicorn
@@ -117,6 +118,8 @@ app.add_typer(profile_app, name="profile")
 
 from flowly.cli.service_cmd import service_app
 app.add_typer(service_app, name="service")
+
+app.add_typer(screen_app, name="screen")
 
 from flowly.cli.channels_cmd import channels_app
 app.add_typer(channels_app, name="channels")

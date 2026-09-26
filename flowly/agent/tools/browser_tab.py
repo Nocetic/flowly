@@ -97,6 +97,15 @@ class BrowserTabTool(Tool):
     # find with no impact on outer agent flow.
     SEMANTIC_FIND_MODEL = "anthropic/claude-haiku-4.5"
 
+    def _validate_screen_result(self, result: Any) -> Any:
+        if isinstance(result, dict) and "_screenObservation" in result:
+            check = getattr(self._gateway, "validate_browser_tool_result", None)
+            if check is None or not check(result):
+                return {"error": "Screen control changed. Read the page again after control is returned.",
+                        "error_code": "STALE_OBSERVATION"}
+            return {key: value for key, value in result.items() if key != "_screenObservation"}
+        return result
+
     def __init__(self, gateway_server: Any = None, provider: Any = None, registry: Any = None):
         self._gateway = gateway_server
         # Optional. When set, the `find` action transparently upgrades
@@ -654,6 +663,7 @@ class BrowserTabTool(Tool):
                 self._gateway.send_browser_tool_request(request_id, action, params),
                 timeout=timeout,
             )
+            result = self._validate_screen_result(result)
 
             # Transparent semantic fallback for click(text=X) on
             # localized UIs. Pattern from production logs: agent calls
@@ -678,7 +688,7 @@ class BrowserTabTool(Tool):
                     tab_id=params.get("tabId"),
                 )
                 if fallback is not None:
-                    result = fallback
+                    result = self._validate_screen_result(fallback)
 
             # Screenshot: keep base64 inline so the agent's vision can
             # actually see it. Loop detects the `_render_as_image` flag
@@ -857,6 +867,7 @@ class BrowserTabTool(Tool):
             ),
             timeout=20.0,
         )
+        tree_result = self._validate_screen_result(tree_result)
         if not isinstance(tree_result, dict) or "elements" not in tree_result:
             raise RuntimeError(
                 f"read_page returned no elements: {tree_result!r}"

@@ -219,3 +219,183 @@ def test_runtime_survives_starting_client_exit_and_concurrent_adoption(tmp_path,
         page = browser.contexts[0].pages[0]
         page.goto(login_site)
         assert page.evaluate("document.cookie") == "session=persisted"
+
+
+@pytest.mark.asyncio
+async def test_agent_provider_uses_human_browser_and_fences_old_references(tmp_path, login_site):
+    import asyncio
+    import re
+
+    from playwright.async_api import async_playwright
+
+    from flowly.desktop_runtime.browser_provider import HostBrowserProvider
+
+    runtime = ScreenRuntime(tmp_path / "provider")
+    state = await asyncio.to_thread(runtime.start)
+    provider = HostBrowserProvider(runtime)
+    generation = state["generation"]
+    run_id = "origin-chat-run"
+    count = 0
+
+    async def call(action, **params):
+        nonlocal count
+        count += 1
+        return await provider.request(run_id, str(count), generation, action, params)
+
+    try:
+        assert (await call("navigate", url=login_site))["success"]
+        snapshot = await call("read_page")
+        ref = re.search(r'(ref_\d+) textbox "Test code"', snapshot["elements"])[1]
+        assert (await call("type", ref=ref, text="agent-before-human"))["success"]
+        assert (await call("screenshot"))["screenshot"].startswith("data:image/jpeg;base64,")
+        human = await provider.execution.acquire("test-viewer", generation, 1)
+        assert human["control"] == "human"
+        for action in ("read_page", "screenshot", "get_page_text"):
+            assert (await call(action))["error_code"] == "HUMAN_HAS_CONTROL"
+        # Independent attachment to the browser represents the already-tested
+        # human RFB path. The provider must see its resulting session intact.
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{state['cdpPort']}")
+            page = browser.contexts[0].pages[0]
+            await page.locator("#code").fill("human-login-code")
+            await page.locator("#login").click()
+            assert await page.evaluate("document.cookie") == "session=test-login"
+        runtime.authority.release("test-viewer", generation, human["epoch"])
+        assert (await call("type", ref=ref, text="must-not-type"))["error_code"] == "STALE_REFERENCE"
+        result = await call("get_page_text")
+        assert "Signed in" in result["text"]
+        assert "human-login-code" not in result["text"]
+        fresh = await call("read_page")
+        assert ref not in fresh["elements"]
+        assert "human-login-code" not in fresh["elements"]
+        assert (await call("evaluate", code="document.cookie"))["error_code"] == "UNSUPPORTED_ACTION"
+        assert not provider.observation_valid(snapshot)
+        assert provider.observation_valid(fresh)
+    finally:
+        control = runtime.authority.snapshot()
+        if control["control"] == "human":
+            runtime.authority.release("test-viewer", generation, control["epoch"])
+        await provider.execution.finish_run(run_id, generation)
+        await provider.disconnect()
+        await asyncio.to_thread(runtime.stop, generation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_GATEWAY_TEST") != "1", reason="requires full Core Linux runner")
+async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp_path, login_site, monkeypatch):
+    import asyncio
+
+    import aiohttp
+    from aiohttp.test_utils import TestServer
+    from playwright.async_api import async_playwright
+
+    from flowly.agent.tools.browser_tab import BrowserTabTool
+    from flowly.desktop_runtime.browser_provider import HostBrowserProvider
+    from flowly.gateway.server import GatewayServer
+
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    runtime = ScreenRuntime(tmp_path / "gateway-screen")
+    state = await asyncio.to_thread(runtime.start)
+    provider = HostBrowserProvider(runtime)
+    generation = state["generation"]
+    assert (await provider.request("setup", "navigate", generation, "navigate", {"url": login_site}))["success"]
+    await provider.execution.finish_run("setup", generation)
+    reached_handoff, continue_test_run, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    observations = []
+    gateway = GatewayServer(host="127.0.0.1", port=0, auth_token="test-gateway-token", require_loopback_auth=True)
+    gateway._host_screen_browser = provider
+    gateway._host_screen_identity = {"hostId": "test-host", "profileId": "default", "screenId": "browser"}
+    access = {**gateway._host_screen_identity, "providerId": "host-desktop-browser", "generation": generation}
+
+    async def on_chat(*_):
+        tool = BrowserTabTool(gateway)
+        observations.append(json.loads(await tool.execute("read_page")))
+        reached_handoff.set()
+        # This event is the test's orchestration point, not a production
+        # resume implementation. It keeps the same authenticated run alive.
+        await continue_test_run.wait()
+        observations.append(json.loads(await tool.execute("read_page")))
+        result = json.loads(await tool.execute("get_page_text"))
+        finished.set()
+        return result["text"], {}
+
+    gateway.on_chat_message = on_chat
+    server = TestServer(gateway._create_app())
+    await server.start_server()
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = str(server.make_url("/ws?clientId=screen-desktop")).replace("http://", "ws://", 1)
+            with pytest.raises(aiohttp.WSServerHandshakeError) as unauthenticated:
+                await session.ws_connect(url)
+            assert unauthenticated.value.status == 401
+            async with session.post(server.make_url("/api/auth/ws-ticket"),
+                                    headers={"Authorization": "Bearer test-gateway-token"}) as response:
+                assert response.status == 200
+                ticket = (await response.json())["ticket"]
+            async with session.ws_connect(url + "&ticket=" + ticket) as desktop:
+                await desktop.send_json({"type": "rpc", "id": "wrong-target", "method": "chat.send", "params": {
+                    "sessionKey": "screen:test", "message": "work", "idempotencyKey": "wrong-run",
+                    "browserAccess": {**access, "profileId": "other"},
+                }})
+                assert (await desktop.receive_json())["error"]["code"] == "BROWSER_PROVIDER_NOT_OWNED"
+                await desktop.send_json({"type": "rpc", "id": "run", "method": "chat.send", "params": {
+                    "sessionKey": "screen:test", "message": "work", "idempotencyKey": "origin-run",
+                    "browserAccess": access,
+                }})
+                assert (await desktop.receive_json())["result"]["runId"] == "origin-run"
+                await asyncio.wait_for(reached_handoff.wait(), 15)
+                human = await provider.execution.acquire("test-human", generation, 1)
+                assert human["control"] == "human"
+                assert human["runId"] == "origin-run"
+                async with async_playwright() as playwright:
+                    browser = await playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{state['cdpPort']}")
+                    page = browser.contexts[0].pages[0]
+                    await page.locator("#code").fill("human-completed-login")
+                    await page.locator("#login").click()
+                runtime.authority.release("test-human", generation, human["epoch"])
+                continue_test_run.set()
+                final = await desktop.receive_json(timeout=15)
+                assert final["data"]["state"] == "final"
+                assert final["data"]["runId"] == "origin-run"
+                assert "Signed in" in final["data"]["message"]["content"][0]["text"]
+                assert all("_screenObservation" not in result for result in observations)
+                assert observations[0]["elements"] != observations[1]["elements"]
+                assert finished.is_set()
+    finally:
+        continue_test_run.set()
+        await server.close()
+        control = runtime.authority.snapshot()
+        if control["control"] == "human":
+            runtime.authority.release("test-human", generation, control["epoch"])
+        await provider.execution.finish_run("origin-run", generation)
+        await provider.disconnect()
+        await asyncio.to_thread(runtime.stop, generation)
+
+
+@pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_GATEWAY_TEST") != "1", reason="requires full Core Linux runner")
+def test_real_cli_starts_adopts_and_stops_persistent_screen(tmp_path):
+    home = tmp_path / "cli-home"
+    env = {**os.environ, "FLOWLY_HOME": str(home)}
+    env.pop("FLOWLY_PROFILE", None)
+    runtime = ScreenRuntime(home / "desktop")
+
+    def command(name):
+        result = subprocess.run([sys.executable, "-m", "flowly.cli.entry", "screen", name],
+                                env=env, capture_output=True, text=True, timeout=40, check=True)
+        return json.loads(result.stdout)
+
+    try:
+        assert command("capabilities")["supported"]
+        started = command("start")
+        assert started["phase"] == "running"
+        assert command("status")["generation"] == started["generation"]
+        assert command("start")["generation"] == started["generation"]
+        internal = runtime.status()
+        assert is_alive(internal["supervisor"])
+        assert "socket" not in started and "cdpPort" not in started
+        assert command("stop")["phase"] == "stopped"
+        assert not is_alive(internal["supervisor"])
+    finally:
+        state = runtime.status()
+        if state is not None and state["phase"] == "running":
+            runtime.stop(state["generation"])

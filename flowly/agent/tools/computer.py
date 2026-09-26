@@ -236,6 +236,11 @@ class ComputerTool(Tool):
         }
 
     async def execute(self, action: str = "", **kwargs: Any) -> str:
+        from flowly.desktop_runtime.context import SCREEN_RUN_BINDING
+
+        if SCREEN_RUN_BINDING.get() is not None:
+            return json.dumps({"error": "This run is bound to the remote browser. Use browser_tab for screen actions.",
+                               "error_code": "BROWSER_SCOPE_ONLY"})
         if not self._config.enabled:
             return json.dumps({"error": "Computer use disabled. Enable: tools.computer.enabled = true"})
 

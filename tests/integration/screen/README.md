@@ -42,3 +42,33 @@ system packages or privilege settings automatically.
 
 The optional integration tests skip unless `FLOWLY_SCREEN_LINUX_TEST=1`. The
 normal test suite therefore does not by itself prove live screen behavior.
+
+## Full Core gateway and CLI runner
+
+The second image installs Core's **locked** dependencies, including the optional
+`screen` extra, without installing a copied version of Core. The read-only mount
+and `PYTHONPATH` keep the test source tied to this checkout.
+
+```sh
+docker build -t flowly-screen-gateway-test:bookworm -f tests/integration/screen/Dockerfile.gateway .
+docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  -e FLOWLY_SCREEN_LINUX_TEST=1 -e FLOWLY_SCREEN_GATEWAY_TEST=1 \
+  -e FLOWLY_HOME=/tmp/test-flowly-home flowly-screen-gateway-test:bookworm \
+  python -m pytest tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
+    tests/test_screen_cli.py tests/integration/screen/test_xvnc_browser.py -q \
+    --basetemp=/tmp/screen-tests -p no:cacheprovider
+```
+
+This adds the real authenticated Gateway WebSocket → browser tool → headed
+Chromium path, wrong-profile rejection, same-run target preservation across
+human interaction, and actual `flowly screen start/status/stop` subprocesses.
+The gateway test uses an explicit test event to hold the callback at handoff:
+it verifies binding and observation fencing, **not** a completed production
+pause/resume RPC or Desktop UI. No model is invoked.
+
+The `screen` Python extra adds Playwright without downloading a bundled browser;
+the runtime attaches to the installed distro Chromium. CLI lifecycle commands
+use the ordinary selected `FLOWLY_HOME`/`--profile` context. They expose no CDP
+port, Unix socket path or raw viewer capability. Mac/Windows screen lifecycle is
+unsupported; their normal CLI agent functionality remains independent.

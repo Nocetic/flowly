@@ -115,6 +115,27 @@ class ScreenshotTool(Tool):
         Returns:
             Success message with file path, or error message.
         """
+        from flowly.desktop_runtime.context import SCREEN_RUN_BINDING
+
+        binding = SCREEN_RUN_BINDING.get()
+        if binding is not None:
+            import uuid
+
+            from flowly.agent.tools.browser_tab import BrowserTabTool
+
+            result = await binding.provider.request(binding.run_id, str(uuid.uuid4()),
+                                                    binding.generation, "screenshot", {})
+            if not binding.provider.observation_valid(result):
+                return json.dumps({"error": "Screen control changed", "error_code": "STALE_OBSERVATION"})
+            if not result.get("screenshot"):
+                return json.dumps(result)
+            saved = BrowserTabTool._save_screenshot_to_file(result)
+            if not saved.get("path"):
+                return json.dumps(saved)
+            from flowly.agent.reply_media import media_envelope
+
+            return media_envelope([saved["path"]], "Browser screenshot captured, attached to this reply.")
+
         # Validate format
         format = format.lower()
         if format not in {"png", "jpg", "jpeg"}:
