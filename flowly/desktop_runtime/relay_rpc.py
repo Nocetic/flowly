@@ -35,6 +35,13 @@ class Client:
     closing: bool = False
 
 
+def _relay_capability(value):
+    if (isinstance(value, dict) and value.get("protocolVersion") == 1
+            and value.get("supported") is True and isinstance(value.get("transports"), list)):
+        return {**value, "transports": [*value["transports"], *([] if "relay" in value["transports"] else ["relay"])]}
+    return value
+
+
 class RelayScreenRpc:
     def __init__(self, *, gateway, current, send):
         self.gateway, self.current, self.send = gateway, current, send
@@ -160,8 +167,14 @@ class RelayScreenRpc:
                 return
             if message.get("type") == "rpc" and identifier(message.get("id")) and message["id"] in client.pending:
                 client.pending.pop(message["id"])
+                if isinstance(message.get("result"), dict):
+                    result = _relay_capability(message["result"])
+                    if isinstance(result.get("status"), dict):
+                        result = {**result, "status": _relay_capability(result["status"])}
+                    message = {**message, "result": result}
                 await self.emit(session, message, client)
             elif message.get("type") == "event" and message.get("event") in EVENTS:
+                message = {**message, "data": _relay_capability(message.get("data"))}
                 await self.emit(session, message, client)
             # No chat, credentials from other clients, or generic gateway events.
 

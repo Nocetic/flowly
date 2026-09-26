@@ -191,3 +191,14 @@ async def test_old_local_reader_cannot_deliver_to_replacement_browser(proxy):
     proxy.manager.connected("one")
     await proxy.manager.emit("one", {"type": "rpc", "id": "old", "result": {"ticket": "old-secret"}}, old)
     assert proxy.replies.empty()
+
+
+async def test_relay_capability_is_added_only_on_the_relay_delivery_path(proxy):
+    direct = await proxy.fixture.rpc("display.status", {"profileId": "writer"})
+    relayed = await proxy.call("display.status", {"profileId": "writer"})
+    assert direct["result"]["transports"] == ["direct"]
+    assert relayed["message"]["result"]["transports"] == ["direct", "relay"]
+    status = relayed["message"]["result"]
+    subscribed = await proxy.call("display.subscribe", {"profileId": "writer",
+        "expectedHostId": status["hostId"], "expectedBotId": status["botId"]})
+    assert subscribed["message"]["result"]["status"]["transports"] == ["direct", "relay"]
