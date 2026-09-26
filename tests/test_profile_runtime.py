@@ -264,6 +264,31 @@ def test_clone_all_does_not_copy_machine_or_runtime_identity(profile_roots) -> N
     assert not (created / ".desktop-runtime.json").exists()
 
 
+def test_full_clone_excludes_screen_credentials_before_copying_live_browser(profile_roots) -> None:
+    default, _root = profile_roots
+    browser = default / "desktop" / "browser"
+    browser.mkdir(parents=True)
+    (browser / "Cookies").write_text("private browser session", encoding="utf-8")
+    # Chromium's live singleton symlink must neither escape containment nor
+    # prevent cloning unrelated profile content when screen state is excluded.
+    (browser / "SingletonLock").symlink_to("/tmp/unrelated-process")
+    workspace_desktop = default / "workspace" / "desktop"
+    workspace_desktop.mkdir(parents=True)
+    (workspace_desktop / "document.txt").write_text("ordinary user document", encoding="utf-8")
+    created = profiles.create_profile("screen-copy", clone_from="default", clone_all=True)
+    assert not (created / "desktop").exists()
+    assert (created / "workspace" / "desktop" / "document.txt").exists()
+    assert (browser / "Cookies").read_text() == "private browser session"
+
+
+def test_import_identity_stripping_removes_old_screen_capabilities(tmp_path) -> None:
+    staged = tmp_path / "imported"
+    (staged / "desktop" / "authority").mkdir(parents=True)
+    (staged / "desktop" / "authority" / "control.json").write_text('{"viewer":"old-capability"}')
+    profiles._strip_inherited_identity(staged)
+    assert not (staged / "desktop").exists()
+
+
 def test_profile_metadata_updates_without_touching_profile_data(profile_roots) -> None:
     _default, _root = profile_roots
     created = profiles.create_profile("writer", local_runtime=True)

@@ -803,12 +803,21 @@ def create_profile(
 
     try:
         if clone_all and source_dir:
+            excluded = {"desktop"}
+            if source_dir == _DEFAULT_HOME:
+                excluded.update({"profiles", "active_profile"})
             _assert_tree_no_symlinks(
                 source_dir,
-                ignored_top_level={"profiles", "active_profile"}
-                if source_dir == _DEFAULT_HOME else set(),
+                ignored_top_level=excluded,
             )
-            ignore = shutil.ignore_patterns("profiles", "active_profile") if source_dir == _DEFAULT_HOME else None
+            base_ignore = shutil.ignore_patterns("profiles", "active_profile") if source_dir == _DEFAULT_HOME else None
+
+            def ignore(directory, names):
+                ignored = set(base_ignore(directory, names)) if base_ignore else set()
+                if Path(directory) == source_dir:
+                    ignored.add("desktop")
+                return ignored
+
             shutil.copytree(source_dir, temp_dir, dirs_exist_ok=True, ignore=ignore)
             # Strip runtime files
             for stale in _CLONE_ALL_STRIP:
@@ -941,6 +950,15 @@ def _strip_inherited_identity(profile_dir: Path) -> None:
     profile that legitimately needs the identity of the one it was copied
     from.
     """
+    # Browser login sessions, active control capabilities and runtime process
+    # identities belong to their original profile. This also covers imports
+    # of older archives that included screen runtime data.
+    screen = profile_dir / "desktop"
+    if screen.is_symlink() or screen.is_file():
+        screen.unlink()
+    elif screen.is_dir():
+        shutil.rmtree(screen)
+
     config_path = profile_dir / "config.json"
     if config_path.exists():
         try:
