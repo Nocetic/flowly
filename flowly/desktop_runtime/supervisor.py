@@ -6,6 +6,7 @@ import asyncio
 import os
 import secrets
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -27,6 +28,38 @@ from flowly.desktop_runtime.launcher import (
 from flowly.desktop_runtime.observers import ObserverRegistry
 from flowly.desktop_runtime.tickets import StreamTickets
 from flowly.desktop_runtime.viewers import ViewerCredentials
+
+
+def application_environment(directory: Path, sockets: Path) -> dict[str, str]:
+    """Explicit desktop environment; never inherit agent credentials or loaders."""
+    environment = {
+        "PATH": os.defpath,
+        "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+        "HOME": str(private_directory(directory / "home")),
+        "XAUTHORITY": str(sockets / "Xauthority"),
+        "XDG_RUNTIME_DIR": str(sockets),
+        "XDG_CONFIG_HOME": str(private_directory(directory / "config")),
+        "XDG_CACHE_HOME": str(private_directory(directory / "cache")),
+        "XDG_DATA_HOME": str(private_directory(directory / "data")),
+    }
+    # dbus-run-session creates this private runtime's Unix bus. Do not forward
+    # arbitrary alternate transports, authentication variables or loader flags.
+    address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    if address:
+        if (len(address) > 1024 or not address.startswith(("unix:path=", "unix:abstract="))
+                or any(char in address for char in ";\r\n\x00")):
+            raise ScreenError("RUNTIME_STATE_INVALID")
+        environment["DBUS_SESSION_BUS_ADDRESS"] = address
+    return environment
+
+
+def application_command(arguments: list[str]) -> list[str]:
+    # Preserve explicitly configured executable locations without passing the
+    # agent's entire PATH to the desktop processes or their descendants.
+    executable = shutil.which(arguments[0])
+    if executable is None:
+        raise ScreenError("DEPENDENCIES_MISSING")
+    return [os.path.abspath(executable), *arguments[1:]]
 
 
 def write_xauthority(path: Path) -> None:
@@ -83,7 +116,7 @@ def run(directory: Path, generation: str) -> None:
         signal.signal(signal.SIGINT, request_stop)
 
         def spawn(arguments, env, **kwargs):
-            child = subprocess.Popen(arguments, env=env, stdin=subprocess.DEVNULL,
+            child = subprocess.Popen(application_command(arguments), env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                      start_new_session=True, close_fds=True, **kwargs)
             processes.append(child)
@@ -109,9 +142,7 @@ def run(directory: Path, generation: str) -> None:
             sockets = runtime.socket_directory
             xauthority = sockets / "Xauthority"
             write_xauthority(xauthority)
-            env = {**os.environ, "XAUTHORITY": str(xauthority), "XDG_RUNTIME_DIR": str(sockets),
-                   "XDG_CONFIG_HOME": str(private_directory(directory / "config")),
-                   "XDG_CACHE_HOME": str(private_directory(directory / "cache"))}
+            env = application_environment(directory, sockets)
             rfb = sockets / "rfb.sock"
             rfb.unlink(missing_ok=True)
             read_fd, write_fd = os.pipe()

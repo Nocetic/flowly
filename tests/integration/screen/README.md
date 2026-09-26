@@ -625,3 +625,42 @@ completed. The final job/system/Python installer subset passed **83 tests** on
 macOS and **83 tests** in Linux, including 25 job tests. Targeted Ruff and diff
 checks passed. The non-POSIX job entry explicitly reports an unsupported host;
 these Linux installation tests do not certify a Windows installation runtime.
+
+
+## Screen application environment boundary
+
+Newly launched Xvnc, Openbox and Chromium processes receive an explicit environment
+instead of inheriting the agent environment. It contains a fixed system PATH and
+UTF-8 locale, profile-private HOME/config/cache/data directories, X authority/runtime
+locations and the private Unix session-bus address. DISPLAY is supplied from Xvnc's
+allocated display. Provider keys, cloud credentials, SSH agent sockets, proxy
+credentials, Python/Node/loader configuration and unrelated parent variables are
+not forwarded. Executables are resolved to absolute paths before sanitizing PATH,
+so a host-configured executable location remains usable without inheriting all
+agent PATH entries into desktop descendants.
+
+Browser cookies stay in the existing explicit `browser` profile directory. Existing
+running supervisors are not restarted by this change; the new environment applies
+after an explicit stop/start. Inherited proxy settings are intentionally not a
+screen configuration channel. An explicit per-screen proxy configuration, if needed,
+requires a separate supported contract. This environment change does not provide
+OS-level isolation between profiles running as the same Unix user.
+
+Validation: the environment/launcher unit subset passed 34 tests. The final real
+Linux browser/gateway/environment suite passed **47 tests** (2 warnings), including
+separate profile cookies, human RFB input, original-run handoff, CLI/adoption and
+public lifecycle. The environment test records only variable names and selected
+profile paths immediately before exec of each actual application; it does not log
+credential values. Reading `/proc/<pid>/environ` after startup was unsuitable for
+this assertion because a process no longer exposed HOME there. Real applications
+remain unmodified and run with Chromium's sandbox enabled. Root runtime account
+provisioning and ownership/layout changes are still pending; root capability is
+not enabled by this environment hardening.
+
+Final verification for the application environment change: complete Core suite
+**6,594 passed**, 34 skipped, 12 deselected, 13 warnings in 297.88 seconds; final
+Linux environment/browser/gateway subset **47 passed**; targeted Ruff and diff
+checks passed. The real Electron/TLS/Linux installation-review, start, mouse and
+keyboard login, plain handback, explicit original-run continuation and terminal
+stop smoke passed with the sanitized application environment. Desktop production
+code did not change in this increment.

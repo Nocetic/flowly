@@ -8,6 +8,7 @@ permission to create user namespaces (see README.md).
 import base64
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -48,6 +49,42 @@ def recv_exact(connection, size):
         assert part, "RFB peer closed"
         result.extend(part)
     return bytes(result)
+
+
+def test_desktop_processes_do_not_inherit_agent_environment(tmp_path, monkeypatch):
+    forbidden = {"OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "CUSTOM_AGENT_TOKEN", "HTTP_PROXY"}
+    for key in forbidden:
+        monkeypatch.setenv(key, "synthetic-screen-environment-secret")
+    wrappers = tmp_path / "executables"
+    wrappers.mkdir()
+    reports = []
+    for program in ("Xvnc", "openbox", "chromium"):
+        executable = shutil.which(program)
+        assert executable
+        report = tmp_path / (program + ".json")
+        reports.append(report)
+        # Some applications clear /proc environ after startup. Capture only
+        # names and profile locations at the real exec boundary, then exec the
+        # actual application in the same PID without altering its environment.
+        script = ("#!/usr/bin/python3\nimport json,os,sys\n"
+                  f"fd=os.open({str(report)!r},os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)\n"
+                  "with os.fdopen(fd,'w') as output:\n"
+                  " json.dump({'names':list(os.environ),'HOME':os.environ.get('HOME'),"
+                  "'XDG_DATA_HOME':os.environ.get('XDG_DATA_HOME'),'XAUTHORITY':os.environ.get('XAUTHORITY')},output)\n"
+                  f"os.execv({executable!r},[{executable!r},*sys.argv[1:]])\n")
+        wrapper = wrappers / program
+        wrapper.write_text(script)
+        wrapper.chmod(0o700)
+    monkeypatch.setenv("PATH", str(wrappers) + os.pathsep + os.environ["PATH"])
+    directory = tmp_path / "environment-profile"
+    with running_screen(directory) as screen:
+        for report in reports:
+            environment = json.loads(report.read_text())
+            assert not forbidden.intersection(environment["names"])
+            assert environment["HOME"] == str(directory / "home")
+            assert environment["XDG_DATA_HOME"] == str(directory / "data")
+            assert environment["XAUTHORITY"].endswith("/Xauthority")
+        assert screen["state"]["phase"] == "running"
 
 
 @pytest.mark.asyncio
