@@ -178,8 +178,6 @@ class ScreenInstallJobs:
         for step in ("system", "python"):
             if not plan[step]["supported"]:
                 raise ScreenError(plan[step]["reason"])
-        if plan["runtimeAccountRequired"]:
-            raise ScreenError("INSTALL_RUNTIME_ACCOUNT_REQUIRED")
         self.guard()
         acquired = False
         try:

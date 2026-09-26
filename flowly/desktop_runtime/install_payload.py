@@ -4,6 +4,8 @@ No package names, command fragments, paths or environment come from the caller.
 Stdlib only: the agent's Python environment is never imported with sudo.
 """
 
+from flowly.desktop_runtime.runtime_account_payload import PROVISION_SOURCE
+
 PACKAGES = (
     "tigervnc-standalone-server", "xauth", "dbus-x11",
     "chromium", "chromium-sandbox", "xdotool", "x11-utils", "fonts-dejavu-core",
@@ -13,7 +15,7 @@ PACKAGES = (
 
 # Keep this executable standalone: the elevated interpreter must not import
 # user-writable Core modules. The source itself is part of the reviewed plan.
-WORKER = r'''
+WORKER = PROVISION_SOURCE + r'''
 import fcntl
 import json
 import os
@@ -194,6 +196,11 @@ def main():
                     if code:
                         value.update(state="recovery_required", error="INSTALL_PACKAGES_FAILED")
                     else:
+                        # Root-hosted agents need a separate locked application
+                        # account. This fixed step is part of the reviewed worker
+                        # fingerprint and runs before its success receipt.
+                        if uid == "0":
+                            provision_runtime_account()
                         value.update(state="succeeded", phase="complete")
         except TimeoutError:
             value.update(state="recovery_required", error="INSTALL_TIMEOUT")

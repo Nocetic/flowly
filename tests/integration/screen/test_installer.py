@@ -18,6 +18,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_INSTALL_TEST") != 
                                 reason="requires clean disposable installer container")
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="requires unprivileged sudo fixture")
 def test_real_privileged_install_and_receipt_replay(tmp_path):
     assert os.geteuid() != 0
     assert "Xvnc" in ScreenRuntime.capabilities()["missing"]
@@ -91,3 +92,30 @@ def test_real_timeout_kills_child_that_survives_group_leader(tmp_path):
             break
         assert time.monotonic() < deadline, "package descendant survived timeout"
         time.sleep(0.05)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires clean disposable root fixture")
+def test_root_install_provisions_account_before_starting_desktop():
+    from pathlib import Path
+
+    from flowly.desktop_runtime.runtime_account import runtime_account
+
+    assert os.geteuid() == 0
+    with pytest.raises(ScreenError):
+        runtime_account()
+    plan = install_plan()
+    assert plan["runtimeAccountRequired"]
+    operation = secrets.token_hex(16)
+    result = install_system(plan["planId"], operation)
+    assert result["state"] == "succeeded", result
+    account = runtime_account()
+    assert account.uid != 0
+    assert install_system(plan["planId"], operation) == result
+    assert runtime_account() == account
+    # Root runtime intentionally rejects world-writable ancestors such as /tmp.
+    runtime = ScreenRuntime(Path("/root") / ("screen-install-" + operation))
+    state = runtime.start()
+    try:
+        assert state["phase"] == "running"
+    finally:
+        runtime.stop(state["generation"])

@@ -34,6 +34,7 @@ def worker(tmp_path, monkeypatch):
         return os.stat_result(fields)
     monkeypatch.setattr(worker.os, "fstat", lambda fd: root_info(fstat(fd)))
     monkeypatch.setattr(worker.Path, "lstat", lambda path: root_info(lstat(path)))
+    worker.provision_runtime_account = Mock()
     worker.command = Mock(return_value=(0, b""))
     return worker
 
@@ -149,3 +150,33 @@ def test_command_timeout_signals_only_its_own_process_group(tmp_path, monkeypatc
     assert [call.args[1] for call in signal.call_args_list] == [worker.signal.SIGTERM, worker.signal.SIGKILL]
     assert waitid.call_args.args[1] == 4242
     assert waitid.call_args.args[2] & worker.os.WNOWAIT
+
+
+def test_root_worker_provisions_account_before_success_and_never_replays(worker, monkeypatch, capsys):
+    monkeypatch.delenv("SUDO_UID")
+    def provision():
+        assert worker.command.call_count == 3
+        receipt = json.loads((worker.ROOT / ("0-" + OPERATION + ".json")).read_text())
+        assert receipt["state"] == "running" and receipt["phase"] == "installing"
+    worker.provision_runtime_account.side_effect = provision
+    assert worker.main() == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
+    assert worker.main() == 0
+    worker.provision_runtime_account.assert_called_once()
+
+
+def test_account_failure_is_durable_and_blocks_python_success(worker, monkeypatch, capsys):
+    monkeypatch.delenv("SUDO_UID")
+    worker.provision_runtime_account.side_effect = ValueError("private detail")
+    assert worker.main() == 1
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["state"] == "recovery_required"
+    assert receipt["error"] == "INSTALL_RECOVERY_REQUIRED"
+    assert "private" not in str(receipt)
+    assert worker.main() == 1
+    worker.provision_runtime_account.assert_called_once()
+
+
+def test_nonroot_caller_does_not_provision_an_account(worker):
+    assert worker.main() == 0
+    worker.provision_runtime_account.assert_not_called()

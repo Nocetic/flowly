@@ -93,13 +93,10 @@ def test_profiles_share_one_environment_job_and_scope_receipts(fixture):
     jobs.install_system.assert_called_once()
 
 
-@pytest.mark.parametrize("change,error", [("root", "INSTALL_RUNTIME_ACCOUNT_REQUIRED"),
-    ("system", "INSTALL_UNSUPPORTED_HOST"), ("python", "INSTALL_VIRTUALENV_REQUIRED"), ("plan", "INSTALL_PLAN_CHANGED")])
+@pytest.mark.parametrize("change,error", [("system", "INSTALL_UNSUPPORTED_HOST"), ("python", "INSTALL_VIRTUALENV_REQUIRED"), ("plan", "INSTALL_PLAN_CHANGED")])
 def test_ineligible_or_changed_plans_never_create_jobs(fixture, change, error):
     service, plan = fixture
-    if change == "root":
-        plan["runtimeAccountRequired"] = True
-    elif change == "plan":
+    if change == "plan":
         plan["planId"] = "d" * 64
     else:
         plan[change].update(supported=False, reason=error)
@@ -283,3 +280,12 @@ def test_publicly_readable_database_is_rejected(fixture):
     service.path.chmod(0o644)
     with pytest.raises(ScreenError, match="INSTALL_STATE_INVALID"):
         service.status(OP)
+
+
+def test_root_plan_uses_system_worker_for_account_provisioning(fixture):
+    service, plan = fixture
+    plan["runtimeAccountRequired"] = True
+    service.submit(PLAN, OP)
+    result = finished(service)
+    assert result["state"] == "succeeded"
+    jobs.install_system.assert_called_once_with("b" * 64, OP, password=None)
