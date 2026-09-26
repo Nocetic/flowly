@@ -257,3 +257,25 @@ def test_destructive_reset_is_blocked_only_for_named_home(agent):
     with pytest.raises(AgentHomeError) as error:
         loop.reset_conversation(HOME_SESSION)
     assert error.value.code == "PERSISTENT_CONVERSATION"
+
+
+@pytest.mark.asyncio
+async def test_delete_aliases_preserve_protection_and_legacy_compatibility(agent):
+    from unittest.mock import AsyncMock
+    from flowly.gateway.server import GatewayServer
+    from flowly.profile_host_contract import validate_profile_rpc, ProfileHostError
+    server = object.__new__(GatewayServer)
+    server.sessions = manager(agent)
+    server._ws_rpc_reply = AsyncMock()
+    server._ws_rpc_error = AsyncMock()
+    for field in ("key", "sessionKey"):
+        params = {field: HOME_SESSION}
+        validate_profile_rpc("sessions.delete", params)
+        await server._ws_rpc_sessions_delete(None, "id", params)
+        assert server._ws_rpc_error.await_args.args[2] == "PERSISTENT_CONVERSATION"
+        legacy = server.sessions.get_or_create("desktop:legacy")
+        server.sessions.save(legacy)
+        await server._ws_rpc_sessions_delete(None, "id", {field: legacy.key})
+        assert server._ws_rpc_reply.await_args.args[2]["deleted"]
+    with pytest.raises(ProfileHostError):
+        validate_profile_rpc("sessions.delete", {"key": HOME_SESSION, "sessionKey": "desktop:other"})

@@ -394,7 +394,9 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
     elif "sessionKey" in value:
         _validate_session_key(value.get("sessionKey"))
     if method == "sessions.delete":
-        _validate_session_key(value.get("key"), required=True)
+        if "key" in value and "sessionKey" in value and value["key"] != value["sessionKey"]:
+            raise ProfileHostError("INVALID_PARAMS", "Conversation targets do not match.")
+        _validate_session_key(value.get("sessionKey") or value.get("key"), required=True)
     if method == "media.read":
         media_id = value.get("mediaId")
         offset = value.get("offset", 0)

@@ -2751,7 +2751,10 @@ class GatewayServer:
     async def _ws_rpc_sessions_delete(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
-        session_key = params.get("sessionKey", "")
+        if "key" in params and "sessionKey" in params and params["key"] != params["sessionKey"]:
+            await self._ws_rpc_error(ws, rpc_id, "INVALID_PARAMS", "Conversation targets do not match.")
+            return
+        session_key = params.get("sessionKey") or params.get("key", "")
         from flowly.agent_home import is_agent_home
         if is_agent_home(session_key):
             await self._ws_rpc_error(ws, rpc_id, "PERSISTENT_CONVERSATION", "Compact this agent's context instead of deleting its conversation.")
