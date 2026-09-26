@@ -193,3 +193,34 @@ the runtime attaches to the installed distro Chromium. CLI lifecycle commands
 use the ordinary selected `FLOWLY_HOME`/`--profile` context. They expose no CDP
 port, Unix socket path or raw viewer capability. Mac/Windows screen lifecycle is
 unsupported; their normal CLI agent functionality remains independent.
+
+
+## Origin-run checkpoint foundation
+
+`RunHandoffs` now persists a versioned per-profile origin session/run mapping,
+verified process incarnation, handoff ID, reason, generation, control epoch and
+explicit resume state. Plain control release does not authorize continuation.
+Resume receipts are bounded to 128; a historical receipt never authorizes another
+handoff. A missing/corrupt initialized store fails closed. A dead/replaced process
+requires recovery, and another live gateway worker may request a resume but
+cannot execute the original continuation. Unchanged checkpoints do not rewrite
+the SQLite state.
+
+`ScreenRunCheckpoint` can bind this state to `ScreenExecution` action admission.
+After a takeover, stale planned actions cannot execute even if control has since
+returned to the agent. An explicit resume first takes a new `read_page`
+observation in the original run, clears prior references through the provider's
+epoch transition and verifies the epoch again before returning it. It never
+replays a stored write. Cancellation keeps human ownership; commands that outlive
+a cancelled waiter still drain before the run lease is retired. An unknown
+backend outcome retains its durable action fence for explicit recovery.
+
+This is **not yet connected to production chat-run admission or the agent loop**.
+The authenticated resume RPC and Desktop's separate return-and-continue action
+also remain open. Tests use real authority/SQLite files and the actual provider
+admission with mocked browser operations/process identity. They do not certify
+actual original-chat pause/resume, a real browser login, or restart recovery UX.
+The screen suite passed **273 tests** before final checkpoint-schema/persistence
+refinements; the final affected checkpoint/authority/execution/provider suite
+passed **62 tests**. The earlier full-Core and real-Linux results predate this
+checkpoint foundation and are not end-to-end resume evidence.

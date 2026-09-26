@@ -30,11 +30,25 @@ class ScreenExecution:
     def __init__(self, authority: ScreenAuthority):
         self.authority = authority
         self._pending: dict[asyncio.Task, str] = {}
+        self._run_checks: dict[str, Callable[[int | None], int]] = {}
+
+    def bind_checkpoint(self, run_id: str, check: Callable[[int | None], int]) -> None:
+        if run_id in self._run_checks:
+            raise ScreenError("SCREEN_BUSY")
+        self._run_checks[run_id] = check
+
+    def unbind_checkpoint(self, run_id: str) -> None:
+        self._run_checks.pop(run_id, None)
 
     async def action(self, run_id: str, action_id: str, generation: str,
-                     operation: Callable[[], Awaitable[T]]) -> T:
+                     operation: Callable[[], Awaitable[T]], *, refresh_epoch: int | None = None) -> T:
         async def execute() -> T:
-            admission = await asyncio.to_thread(self.authority.begin_action, run_id, action_id, generation)
+            check = self._run_checks.get(run_id)
+            if refresh_epoch is not None and check is None:
+                raise ScreenError("RESUME_NOT_AVAILABLE")
+            expected_epoch = await asyncio.to_thread(check, refresh_epoch) if check is not None else None
+            admission = await asyncio.to_thread(self.authority.begin_action, run_id, action_id, generation,
+                                                expected_epoch=expected_epoch)
             try:
                 result = await operation()
             except (asyncio.CancelledError, ActionOutcomeUnknownError):

@@ -165,7 +165,10 @@ class HostBrowserProvider:
             raise ScreenError("TARGET_NOT_FOUND" if count == 0 else "AMBIGUOUS_TARGET")
         return target
 
-    async def request(self, run_id: str, request_id: str, generation: str, action: str, params: dict) -> dict:
+    async def request(self, run_id: str, request_id: str, generation: str, action: str, params: dict, *,
+                      _refresh_epoch: int | None = None) -> dict:
+        if _refresh_epoch is not None and action != "read_page":
+            raise ScreenError("RESUME_NOT_AVAILABLE")
         if not isinstance(action, str) or action not in CAPABILITIES:
             return {"error": "This screen browser does not support that action.", "error_code": "UNSUPPORTED_ACTION"}
         if not isinstance(params, dict):
@@ -196,7 +199,7 @@ class HostBrowserProvider:
             return {**result, "_screenObservation": {"generation": generation, "epoch": self._epoch}}
 
         try:
-            return await self.execution.action(run_id, request_id, generation, operate)
+            return await self.execution.action(run_id, request_id, generation, operate, refresh_epoch=_refresh_epoch)
         except ScreenError as exc:
             return {"error": "Screen action could not complete. Observe the current state before retrying.",
                     "error_code": exc.code}

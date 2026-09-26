@@ -221,11 +221,24 @@ class ScreenAuthority:
             state.update(running=False, epoch=state["epoch"] + 1)
         return _public(state)
 
-    def begin_action(self, run_id: str, action_id: str, generation: str) -> ActionAdmission:
+    def claim_run(self, run_id: str, generation: str) -> dict:
+        """Reserve the browser before the first model/tool step of a screen run."""
+        _identity(run_id)
+        with self._transaction() as state:
+            self._check(state, generation)
+            if state["control"] != "agent":
+                raise ScreenError("HUMAN_HAS_CONTROL")
+            if state["run"] is not None or state["action"] is not None:
+                raise ScreenError("SCREEN_BUSY")
+            state["run"] = run_id
+        return _public(state)
+
+    def begin_action(self, run_id: str, action_id: str, generation: str, *,
+                     expected_epoch: int | None = None) -> ActionAdmission:
         _identity(run_id)
         _identity(action_id)
         with self._transaction() as state:
-            self._check(state, generation)
+            self._check(state, generation, expected_epoch)
             if state["control"] != "agent":
                 raise ScreenError("HUMAN_HAS_CONTROL")
             if state["run"] not in (None, run_id) or state["action"] is not None:
