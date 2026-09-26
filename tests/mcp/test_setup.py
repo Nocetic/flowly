@@ -20,12 +20,17 @@ def manager(tmp_path, monkeypatch):
 
 
 async def ready(manager, operation_id):
-    for _ in range(50):
-        op = manager.get(operation_id)
-        if op.phase != "checking":
-            return op
-        await asyncio.sleep(0)
-    pytest.fail("Setup did not progress")
+    # OAuth storage performs fsync in a worker thread. Event-loop iteration
+    # counts do not bound elapsed time or guarantee that worker has run.
+    try:
+        async with asyncio.timeout(5):
+            while True:
+                op = manager.get(operation_id)
+                if op.phase != "checking":
+                    return op
+                await asyncio.sleep(0.01)
+    except TimeoutError:
+        pytest.fail("Setup did not progress within five seconds")
 
 
 def begin(manager, **params):
