@@ -259,6 +259,9 @@ class ScreenRuntime:
         if not capabilities["supported"]:
             raise ScreenError(capabilities["reason"])
         with environment_activity():
+            from flowly.desktop_runtime.install_jobs import assert_environment_installation_idle
+
+            assert_environment_installation_idle()
             return self._start_with_activity(expected_generation=expected_generation, identity_guard=identity_guard)
 
     def _start_with_activity(self, *, expected_generation: str | None | object = _UNPINNED,

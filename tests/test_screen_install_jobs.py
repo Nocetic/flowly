@@ -289,3 +289,67 @@ def test_root_plan_uses_system_worker_for_account_provisioning(fixture):
     result = finished(service)
     assert result["state"] == "succeeded"
     jobs.install_system.assert_called_once_with("b" * 64, OP, password=None)
+
+
+def test_live_screen_blocks_job_without_receipt_or_package_execution(fixture):
+    from flowly.desktop_runtime.installation_gate import environment_activity
+
+    service, _ = fixture
+    with environment_activity():
+        with pytest.raises(ScreenError, match="INSTALL_BUSY"):
+            service.submit(PLAN, OP)
+    assert not service.path.exists()
+    jobs.install_system.assert_not_called()
+
+
+def test_worker_keeps_exclusive_reservation_after_submit_returns(fixture):
+    from flowly.desktop_runtime.installation_gate import environment_activity
+
+    service, _ = fixture
+    entered, release = threading.Event(), threading.Event()
+    def system(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return {"state": "succeeded", "error": None}
+    jobs.install_system.side_effect = system
+    try:
+        service.submit(PLAN, OP)
+        assert entered.wait(2)
+        with pytest.raises(ScreenError, match="INSTALL_BUSY"):
+            with environment_activity():
+                pytest.fail("screen entered accepted installation")
+    finally:
+        release.set()
+        assert finished(service)["state"] == "succeeded"
+    # Terminal publication precedes descriptor close. Wait only for that bounded
+    # worker cleanup, rather than mistaking the public receipt for lock ownership.
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            with environment_activity():
+                break
+        except ScreenError:
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+
+
+def test_recovery_receipt_blocks_environment_after_live_reservation_ends(fixture):
+    service, _ = fixture
+    jobs.assert_environment_installation_idle()
+    assert not service.root.exists()
+    jobs.install_python.side_effect = RuntimeError("private failure")
+    service.submit(PLAN, OP)
+    assert finished(service)["state"] == "recovery_required"
+    with pytest.raises(ScreenError, match="INSTALL_RECOVERY_REQUIRED"):
+        jobs.assert_environment_installation_idle()
+
+
+def test_rejected_executor_releases_reservation(fixture, monkeypatch):
+    from flowly.desktop_runtime.installation_gate import environment_activity
+
+    service, _ = fixture
+    monkeypatch.setattr(jobs, "_EXECUTOR", Mock(submit=Mock(side_effect=RuntimeError())))
+    with pytest.raises(ScreenError, match="CONTROL_UNAVAILABLE"):
+        service.submit(PLAN, OP)
+    with environment_activity():
+        jobs.assert_environment_installation_idle()

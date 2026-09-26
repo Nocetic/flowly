@@ -21,6 +21,7 @@ from typing import Callable
 from flowly.desktop_runtime.authority import ScreenError, _identity
 from flowly.desktop_runtime.handoff import is_alive, process_identity
 from flowly.desktop_runtime.install_plan import installation_plan
+from flowly.desktop_runtime.installation_gate import environment_activity
 from flowly.desktop_runtime.installer import _operation, install_status, install_system
 from flowly.desktop_runtime.python_install_worker import private_directory, state_root
 from flowly.desktop_runtime.python_installer import install_python
@@ -179,6 +180,8 @@ class ScreenInstallJobs:
             if not plan[step]["supported"]:
                 raise ScreenError(plan[step]["reason"])
         self.guard()
+        reservation = environment_activity(exclusive=True)
+        reservation.__enter__()
         acquired = False
         try:
             with self._transaction(create=True) as db:
@@ -203,19 +206,22 @@ class ScreenInstallJobs:
                           "restartRequired": False, "owner": owner, "deadline": int(time.time()) + 1260}
                 db.execute("INSERT INTO operations (id, value) VALUES (?, ?)", (operation, json.dumps(_validate(record))))
             try:
-                _EXECUTOR.submit(self._run, record, plan, password)
+                _EXECUTOR.submit(self._run, record, plan, password, reservation)
             except RuntimeError:
                 record.update(state="failed", error="CONTROL_UNAVAILABLE")
                 self._save(record)
                 raise ScreenError("CONTROL_UNAVAILABLE") from None
             acquired = False
+            reservation = None  # Worker owns the live lease until its final save.
             return self._public(record)
         finally:
             password = None
+            if reservation is not None:
+                reservation.__exit__(None, None, None)
             if acquired:
                 _SLOTS.release()
 
-    def _run(self, accepted, plan, password):
+    def _run(self, accepted, plan, password, reservation):
         record = {**accepted, "completedSteps": []}
         attempted = False
         try:
@@ -263,4 +269,30 @@ class ScreenInstallJobs:
             try:
                 self._save(record)
             finally:
-                _SLOTS.release()
+                try:
+                    reservation.__exit__(None, None, None)
+                finally:
+                    _SLOTS.release()
+
+
+def assert_environment_installation_idle() -> None:
+    """Read all environment receipts while the caller holds shared activity.
+
+    The sentinel identity is never used for admission or exposed: this check is
+    intentionally environment-wide, including jobs accepted for sibling profiles.
+    Missing storage is idle; malformed storage or uncertain work fails closed.
+    """
+    store = ScreenInstallJobs({"hostId": "environment", "botId": "environment", "profileId": "default"}, lambda: None)
+    try:
+        with store._transaction() as db:
+            rows = store._rows(db)
+    except ScreenError as exc:
+        if exc.code == "OPERATION_NOT_FOUND":
+            return
+        raise
+    for row in rows:
+        public = store._public(row)
+        if public["state"] in {"pending", "running"}:
+            raise ScreenError("INSTALL_BUSY")
+        if public["state"] == "recovery_required":
+            raise ScreenError("INSTALL_RECOVERY_REQUIRED")
