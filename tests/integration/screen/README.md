@@ -543,3 +543,24 @@ screen pixels. One failure cleanup also terminated Electron with SIGTRAP.
 The fixture now checks window focus, canvas hit testing and remote input focus
 separately, and captures a failure screenshot. These failures remain unresolved;
 previous successful full smoke evidence does not certify this current revision.
+
+
+## Follow-up: live input and continuation smoke
+
+The latest real Electron/TLS/Linux flow passed twice consecutively in fresh
+containers after the smoke harness waited for actionable buttons. Previously
+`HTMLButtonElement.click()` could silently do nothing while a button was disabled
+between the ownership reply and stream reattachment. The harness now waits for
+the button to be enabled and rejects a state change before clicking. It also
+logs stage transitions and synthetic mouse coordinates; the existing explicit
+window-focus, canvas-hit and remote-input-focus checks remain in place.
+
+Both runs verified installation review without runtime mutation, explicit start,
+real mouse/keyboard login, preserved cookies, plain release leaving the original
+task paused, explicit continuation with a fresh observation and no stale-click
+replay, terminal viewer acknowledgement and explicit stop. The signed-in screenshot
+was visually inspected. Production code and timeout budgets were not changed.
+The earlier one-off initial-pixel timeout and Electron failure-cleanup SIGTRAP did
+not recur in these runs; their underlying causes are not established by this
+harness correction. This evidence covers the direct primary-profile fixture on
+this host, not the still-pending relay/platform matrix or installation execution UI.
