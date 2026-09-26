@@ -196,3 +196,21 @@ def test_unchanged_checkpoint_does_not_rewrite_durable_state(handoff):
     for _ in range(5):
         store.checkpoint(execution)
     assert store.path.stat().st_mtime_ns == before
+
+
+def test_container_init_can_own_a_run_without_becoming_a_signal_target(monkeypatch):
+    from pathlib import Path
+
+    from flowly.desktop_runtime import handoff, launcher
+
+    def read(path):
+        if str(path) == "/proc/1/stat":
+            return "1 (agent) " + " ".join(["S"] + ["0"] * 18 + ["123"])
+        assert str(path) == "/proc/sys/kernel/random/boot_id"
+        return "boot-id"
+    monkeypatch.setattr(Path, "read_text", read)
+    owner = handoff.process_identity(1)
+    assert owner == {"pid": 1, "start": "123", "boot": "boot-id"}
+    assert handoff.is_alive(owner)
+    assert launcher.process_identity(1) is None
+    assert not launcher.is_alive(owner)

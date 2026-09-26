@@ -52,9 +52,9 @@ def write_state(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def process_identity(pid: int) -> dict | None:
+def process_identity(pid: int, *, allow_init: bool = False) -> dict | None:
     """Kernel boot + start ticks distinguish reused PIDs; zombies are not live."""
-    if type(pid) is not int or pid <= 1:
+    if type(pid) is not int or pid < 1 or (pid == 1 and not allow_init):
         return None
     try:
         raw = Path(f"/proc/{pid}/stat").read_text()

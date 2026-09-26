@@ -1,0 +1,121 @@
+"""Production gateway/agent-loop continuation with a deterministic local model."""
+
+import asyncio
+import copy
+from unittest.mock import AsyncMock
+
+import pytest
+
+from flowly.agent.loop import AgentLoop
+from flowly.bus.queue import MessageBus
+from flowly.config.schema import Config
+from flowly.desktop_runtime.handoff import RunHandoffs
+from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from tests.test_screen_gateway_binding import screen_gateway as gateway_fixture
+
+screen_gateway = gateway_fixture
+
+
+class LocalModel(LLMProvider):
+    def __init__(self, authority):
+        super().__init__(api_key="test")
+        self.authority = authority
+        self.calls = []
+
+    def get_default_model(self):
+        return "test/model"
+
+    async def chat(self, *args, **kwargs):
+        self.calls.append(copy.deepcopy(kwargs))
+        if len(self.calls) == 1:
+            self.authority.acquire("human", "generation", self.authority.snapshot()["epoch"])
+            return LLMResponse(content=None, tool_calls=[ToolCallRequest(id="stale-click", name="browser_tab",
+                arguments={"action": "click", "ref": "old-ref"})], usage={"completion_tokens": 10})
+        return LLMResponse(content="Continued the original task", usage={"completion_tokens": 20})
+
+
+async def wait_state(store, state):
+    async with asyncio.timeout(5):
+        while (await asyncio.to_thread(store.status) or {}).get("state") != state:
+            await asyncio.sleep(0.005)
+
+
+@pytest.fixture
+async def live_run(screen_gateway, tmp_path, monkeypatch):
+    gateway, socket, browser, access = screen_gateway
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "agent-home"))
+    monkeypatch.setattr("flowly.desktop_runtime.run_checkpoint.ScreenRunCheckpoint.INTERVAL", 0.005)
+    browser._dispatch.return_value = {"success": True, "elements": "ref_fresh button Continue"}
+    authority = browser.runtime.authority
+    model = LocalModel(authority)
+    loop = AgentLoop(bus=MessageBus(), provider=model, workspace=tmp_path / "workspace", main_config=Config(),
+                     max_iterations=4, soft_warn_at_iteration=0)
+    loop.tools.execute = AsyncMock(side_effect=AssertionError("stale model tool must never execute"))
+    result = {}
+
+    async def chat(*args):
+        result["loop"] = await loop._run_llm_tool_loop(
+            [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Continue."}],
+            action_turn=False, session_key=args[0], outbound_run_id=args[2], tools_allowed=False)
+        return result["loop"][0], {"aborted": loop.is_run_aborted(args[2])}
+
+    gateway.on_chat_message = chat
+    binding, error = gateway._browser_binding_for_chat("viewer", socket, access)
+    assert error is None
+    task = asyncio.create_task(gateway._run_chat(socket, "viewer", "original-chat", "work", "origin-run",
+                                               AsyncMock(), browser_binding=binding))
+    store = RunHandoffs(browser.runtime.directory, authority)
+    try:
+        await wait_state(store, "waiting_human")
+        yield gateway, socket, browser, loop, model, store, task, result, binding
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        loop.stop()
+
+
+async def test_same_agent_loop_waits_for_explicit_resume_and_discards_old_model_actions(live_run):
+    _, _, browser, loop, model, store, task, result, _ = live_run
+    authority = browser.runtime.authority
+    assert len(model.calls) == 1
+    held = authority.snapshot()
+    authority.release("human", "generation", held["epoch"])
+    await wait_state(store, "waiting_resume")
+    await asyncio.sleep(0.03)
+    assert len(model.calls) == 1 and not task.done()
+    status = store.status()
+    assert status["originSessionKey"] == "original-chat"
+    assert status["originRunId"] == "origin-run"
+    store.request_resume(status["handoffId"], status["controlEpoch"], "explicit-resume")
+    await asyncio.wait_for(task, 5)
+    assert len(model.calls) == 2
+    assert "ref_fresh" in str(model.calls[1]["messages"])
+    assert "untrusted page content" in str(model.calls[1]["messages"])
+    assert result["loop"][3]["completion_tokens"] == 30
+    loop.tools.execute.assert_not_awaited()
+    browser._dispatch.assert_awaited_once_with("read_page", {})
+    assert store.status()["state"] == "finished"
+    assert authority.snapshot()["runId"] is None
+
+
+async def test_stop_interrupts_the_wait_without_releasing_human_control(live_run):
+    _, _, browser, loop, model, store, task, _, _ = live_run
+    loop.mark_aborted("origin-run")
+    await asyncio.wait_for(task, 5)
+    assert len(model.calls) == 1
+    browser._dispatch.assert_not_awaited()
+    assert store.status()["state"] == "cancelled"
+    assert browser.runtime.authority.snapshot()["control"] == "human"
+    assert browser.runtime.authority.snapshot()["runId"] is None
+
+
+async def test_another_chat_cannot_release_the_original_run_on_failed_admission(live_run):
+    gateway, socket, browser, loop, model, store, task, _, binding = live_run
+    await gateway._run_chat(socket, "viewer", "another-chat", "work", "another-run", AsyncMock(), browser_binding=binding)
+    assert len(model.calls) == 1
+    assert browser.runtime.authority.snapshot()["runId"] == "origin-run"
+    assert store.status()["originSessionKey"] == "original-chat"
+    assert not task.done()
+    loop.mark_aborted("origin-run")
+    await asyncio.wait_for(task, 5)

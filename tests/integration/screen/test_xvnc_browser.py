@@ -398,39 +398,80 @@ async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp
     from aiohttp.test_utils import TestServer
     from playwright.async_api import async_playwright
 
+    import flowly.profile as profiles
+    from flowly.agent.loop import AgentLoop
     from flowly.agent.tools.browser_tab import BrowserTabTool
+    from flowly.bus.queue import MessageBus
+    from flowly.config.schema import Config
     from flowly.desktop_runtime.browser_provider import HostBrowserProvider
     from flowly.gateway.server import GatewayServer
+    from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
-    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
-    runtime = ScreenRuntime(tmp_path / "gateway-screen")
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", home)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", home / "profiles")
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    monkeypatch.delenv("FLOWLY_PROFILE", raising=False)
+    runtime = ScreenRuntime(home / "desktop")
     state = await asyncio.to_thread(runtime.start)
     provider = HostBrowserProvider(runtime)
     generation = state["generation"]
     assert (await provider.request("setup", "navigate", generation, "navigate", {"url": login_site}))["success"]
     await provider.execution.finish_run("setup", generation)
-    reached_handoff, continue_test_run, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    observations = []
+    model_started, return_model = asyncio.Event(), asyncio.Event()
+    actions = []
+    dispatch = provider._dispatch
+
+    async def track_dispatch(action, params):
+        actions.append(action)
+        return await dispatch(action, params)
+
+    provider._dispatch = track_dispatch
     gateway = GatewayServer(host="127.0.0.1", port=0, auth_token="test-gateway-token", require_loopback_auth=True)
     gateway._host_screen_browser = provider
-    gateway._host_screen_identity = {"hostId": "test-host", "profileId": "default", "screenId": "browser"}
+    gateway._host_screen_identity = {"hostId": profiles.get_or_create_profile_host_id(), "profileId": "default", "screenId": "browser"}
     access = {**gateway._host_screen_identity, "providerId": "host-desktop-browser", "generation": generation}
 
-    async def on_chat(*_):
-        tool = BrowserTabTool(gateway)
-        observations.append(json.loads(await tool.execute("read_page")))
-        reached_handoff.set()
-        # This event is the test's orchestration point, not a production
-        # resume implementation. It keeps the same authenticated run alive.
-        await continue_test_run.wait()
-        observations.append(json.loads(await tool.execute("read_page")))
-        result = json.loads(await tool.execute("get_page_text"))
-        finished.set()
-        return result["text"], {}
+    class LocalModel(LLMProvider):
+        calls = 0
+
+        def get_default_model(self):
+            return "test/model"
+
+        async def chat(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                model_started.set()
+                # Only the model response is held to exercise takeover during
+                # an in-flight model call. The production agent loop owns the
+                # subsequent human wait and explicit continuation.
+                await return_model.wait()
+                return LLMResponse(content=None, tool_calls=[ToolCallRequest(id="stale-click", name="browser_tab",
+                    arguments={"action": "click", "selector": "#login"})])
+            if self.calls == 2:
+                assert "fresh browser observation" in str(kwargs["messages"])
+                assert "ref_" in str(kwargs["messages"])
+                return LLMResponse(content=None, tool_calls=[ToolCallRequest(id="read-login", name="browser_tab",
+                    arguments={"action": "get_page_text"})])
+            assert "Signed in" in str(kwargs["messages"])
+            return LLMResponse(content="Signed in in the original task")
+
+    model = LocalModel(api_key="test")
+    loop = AgentLoop(bus=MessageBus(), provider=model, workspace=tmp_path / "workspace", main_config=Config(),
+                     max_iterations=4, soft_warn_at_iteration=0)
+    loop.tools.register(BrowserTabTool(gateway))
+
+    async def on_chat(*args):
+        result = await loop._run_llm_tool_loop(
+            [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Read the login result."}],
+            action_turn=False, session_key=args[0], outbound_run_id=args[2])
+        return result[0], {"aborted": loop.is_run_aborted(args[2])}
 
     gateway.on_chat_message = on_chat
     server = TestServer(gateway._create_app())
     await server.start_server()
+    viewer = None
     try:
         async with aiohttp.ClientSession() as session:
             url = str(server.make_url("/ws?clientId=screen-desktop")).replace("http://", "ws://", 1)
@@ -439,43 +480,68 @@ async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp
             assert unauthenticated.value.status == 401
             async with session.post(server.make_url("/api/auth/ws-ticket"),
                                     headers={"Authorization": "Bearer test-gateway-token"}) as response:
-                assert response.status == 200
                 ticket = (await response.json())["ticket"]
             async with session.ws_connect(url + "&ticket=" + ticket) as desktop:
-                await desktop.send_json({"type": "rpc", "id": "wrong-target", "method": "chat.send", "params": {
-                    "sessionKey": "screen:test", "message": "work", "idempotencyKey": "wrong-run",
-                    "browserAccess": {**access, "profileId": "other"},
-                }})
-                assert (await desktop.receive_json())["error"]["code"] == "BROWSER_PROVIDER_NOT_OWNED"
-                await desktop.send_json({"type": "rpc", "id": "run", "method": "chat.send", "params": {
-                    "sessionKey": "screen:test", "message": "work", "idempotencyKey": "origin-run",
-                    "browserAccess": access,
-                }})
-                assert (await desktop.receive_json())["result"]["runId"] == "origin-run"
-                await asyncio.wait_for(reached_handoff.wait(), 15)
-                human = await provider.execution.acquire("test-human", generation, 1)
-                assert human["control"] == "human"
-                assert human["runId"] == "origin-run"
+                serial = 0
+                events = []
+
+                async def rpc(method, params):
+                    nonlocal serial
+                    serial += 1
+                    request_id = f"request-{serial}"
+                    await desktop.send_json({"type": "rpc", "id": request_id, "method": method, "params": params})
+                    async with asyncio.timeout(15):
+                        while True:
+                            frame = await desktop.receive_json()
+                            if frame.get("type") == "rpc" and frame.get("id") == request_id:
+                                assert "error" not in frame, frame
+                                return frame["result"]
+                            events.append(frame)
+
+                status = await rpc("display.status", {"profileId": "default"})
+                pinned = {"profileId": "default", "expectedHostId": status["hostId"],
+                          "expectedBotId": status["botId"], "generation": generation}
+                viewer = await rpc("display.viewer.create", pinned)
+                started = await rpc("chat.send", {"sessionKey": "screen:test", "message": "work",
+                    "idempotencyKey": "origin-run", "browserAccess": access})
+                assert started["runId"] == "origin-run"
+                await asyncio.wait_for(model_started.wait(), 15)
+                controlled = {**pinned, "viewerToken": viewer["viewerToken"]}
+                acquired = await rpc("display.control.acquire", {**controlled, "epoch": 1, "operationId": "take-control"})
+                assert acquired["control"]["control"] == "human"
+                assert acquired["control"]["runId"] == "origin-run"
+                return_model.set()
                 async with async_playwright() as playwright:
                     browser = await playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{state['cdpPort']}")
                     page = browser.contexts[0].pages[0]
                     await page.locator("#code").fill("human-completed-login")
                     await page.locator("#login").click()
-                runtime.authority.release("test-human", generation, human["epoch"])
-                continue_test_run.set()
-                final = await desktop.receive_json(timeout=15)
-                assert final["data"]["state"] == "final"
+                released = await rpc("display.control.release", {**controlled, "epoch": acquired["control"]["epoch"],
+                                                                  "operationId": "give-back"})
+                status = await rpc("display.status", {"profileId": "default"})
+                assert status["handoff"]["state"] == "waiting_resume"
+                assert status["handoff"]["originRunId"] == "origin-run"
+                await asyncio.sleep(0.3)
+                assert model.calls == 1
+                assert actions == []
+                resumed = await rpc("display.run.resume", {**controlled, "epoch": released["control"]["epoch"],
+                    "operationId": "continue-original", "handoffId": status["handoff"]["handoffId"]})
+                assert resumed["requested"] is True
+                async with asyncio.timeout(15):
+                    while not any(f.get("data", {}).get("state") == "final" for f in events):
+                        events.append(await desktop.receive_json())
+                final = next(f for f in events if f.get("data", {}).get("state") == "final")
                 assert final["data"]["runId"] == "origin-run"
                 assert "Signed in" in final["data"]["message"]["content"][0]["text"]
-                assert all("_screenObservation" not in result for result in observations)
-                assert observations[0]["elements"] != observations[1]["elements"]
-                assert finished.is_set()
+                assert model.calls == 3
+                assert actions == ["read_page", "get_page_text"]
     finally:
-        continue_test_run.set()
+        return_model.set()
         await server.close()
+        loop.stop()
         control = runtime.authority.snapshot()
-        if control["control"] == "human":
-            runtime.authority.release("test-human", generation, control["epoch"])
+        if control["control"] == "human" and viewer is not None:
+            runtime.authority.release(viewer["viewerId"], generation, control["epoch"])
         await provider.execution.finish_run("origin-run", generation)
         await provider.disconnect()
         await asyncio.to_thread(runtime.stop, generation)

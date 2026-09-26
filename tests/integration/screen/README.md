@@ -35,7 +35,7 @@ container, TigerVNC 1.12, distro Chromium and Playwright 1.58.0:
   cookies survive restart. Killing the browser directly failed this test.
 
 Not yet certified: relay binary display transport, integrated Desktop/noVNC,
-production task pause/resume, root-host runtime provisioning, orphan recovery, host
+root-host runtime provisioning, orphan recovery, host
 resource limits/idle policy, x86_64, other distro versions. The launcher requires
 an unprivileged Linux account and installed OS dependencies; it does not change
 system packages or privilege settings automatically.
@@ -60,6 +60,7 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
     tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
     tests/test_screen_cli.py tests/test_screen_profile_binding.py tests/test_screen_display_gateway.py tests/test_screen_display_watch.py \
     tests/test_screen_input_broker.py tests/test_screen_input_service.py tests/test_screen_observers.py tests/test_screen_status.py \
+    tests/test_screen_handoff.py tests/test_screen_run_checkpoint.py tests/test_screen_agent_handoff.py tests/test_screen_resume_rpc.py \
     tests/integration/screen/test_xvnc_browser.py -q \
     --basetemp=/tmp/screen-tests -p no:cacheprovider
 ```
@@ -67,13 +68,16 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
 This adds the real authenticated Gateway WebSocket → browser tool → headed
 Chromium path, wrong-profile rejection, same-run target preservation across
 human interaction, and actual `flowly screen start/status/stop` subprocesses.
-The gateway test uses an explicit test event to hold the callback at handoff:
-it verifies binding and observation fencing, **not** a completed production
-pause/resume RPC or Desktop UI. No model is invoked.
+The gateway test runs the actual agent loop with a deterministic local model
+stub. A barrier holds its first response while the user takes control and signs
+in through a separate CDP attachment to the same Chromium session. Plain handback
+keeps the task waiting. Authenticated `display.run.resume` triggers a fresh page
+read, discards the stale planned click and continues the original run/session.
+No external model, account or Desktop UI is involved in this Linux test.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
-The expanded Linux screen suite passed **259 tests** on the environment above.
+The expanded Linux screen suite passed **291 tests** on the environment above.
 The authenticated direct display endpoint also delivers real Xvnc pixels for
 the default and named profiles. Its single-use tickets are bound to the host,
 profile and runtime generation; gateway credentials and tickets use headers.
@@ -215,12 +219,36 @@ replays a stored write. Cancellation keeps human ownership; commands that outliv
 a cancelled waiter still drain before the run lease is retired. An unknown
 backend outcome retains its durable action fence for explicit recovery.
 
-This is **not yet connected to production chat-run admission or the agent loop**.
-The authenticated resume RPC and Desktop's separate return-and-continue action
-also remain open. Tests use real authority/SQLite files and the actual provider
-admission with mocked browser operations/process identity. They do not certify
-actual original-chat pause/resume, a real browser login, or restart recovery UX.
-The screen suite passed **273 tests** before final checkpoint-schema/persistence
-refinements; the final affected checkpoint/authority/execution/provider suite
-passed **62 tests**. The earlier full-Core and real-Linux results predate this
-checkpoint foundation and are not end-to-end resume evidence.
+The foundation-only suite initially passed **273 tests**, with **62 affected
+tests** after checkpoint-schema/persistence refinements. Those tests use actual
+SQLite/authority/provider admission with mocked browser operations and process
+identity. Production activation and real-browser evidence are described below.
+
+
+## Production direct-run integration
+
+The gateway now reserves the selected browser and creates its checkpoint before
+calling the chat host. The agent loop awaits the checkpoint before a model call
+and rechecks it after a model response, preserving usage accounting while
+discarding a stale planned response. Cancellation interrupts the wait and marks
+the continuation terminal without releasing human ownership. Cancellation during
+pending checkpoint creation also retires a late successful registration.
+A failed second chat admission cannot release the original run's browser lease.
+
+Authenticated, pinned `display.run.resume` requires a valid viewer capability,
+generation, handoff ID, epoch and idempotency key. It takes the origin session/run
+from the persisted record; caller-supplied origin targets are rejected. Status
+includes a closed public handoff projection. A resume ACK means the request was
+recorded, not that execution has resumed. The live origin process must still
+complete a fresh, epoch-fenced observation. Process death surfaces recovery;
+explicit orphan recovery remains separate unfinished work.
+
+The Linux test exposed that an agent may be container PID 1. Handoff liveness now
+allows reading its kernel identity, while runtime signal-target validation still
+rejects PID 1. The dedicated test covers both sides of that distinction.
+
+After this wiring, the complete default Core suite passed **6,414 tests**, with
+25 skipped and 12 deselected. The expanded real Linux suite passed **291 tests**,
+including the actual agent-loop/RPC/Chromium continuation flow described above.
+Targeted Ruff and diff checks passed. Desktop integration has its own Electron and unit-test evidence in its worktree.
+Combined real Desktop-to-Linux, relay and recovery still require verification.

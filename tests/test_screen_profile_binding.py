@@ -114,7 +114,7 @@ async def test_screen_profile_rechecks_recreated_identity_after_runtime_start(sc
 
 
 @pytest.mark.parametrize("target", ["default", "writer"])
-async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(screen_host, tmp_path, target):
+async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(screen_host, tmp_path, target, monkeypatch):
     """Real authenticated sockets and RPC dispatch; only browser I/O is faked.
 
     Linux integration separately proves this provider operates real Chromium.
@@ -135,6 +135,9 @@ async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(scr
     from flowly.gateway.server import GatewayServer
     from flowly.profile_host import _Runtime
 
+    owner = {"pid": 42, "start": "1", "boot": "test"}
+    monkeypatch.setattr("flowly.desktop_runtime.handoff.process_identity", lambda _: owner)
+    monkeypatch.setattr("flowly.desktop_runtime.handoff.is_alive", lambda _: True)
     gateway = GatewayServer(host="127.0.0.1", port=0, auth_token="owner-test-token",
                             require_loopback_auth=True, enable_profile_host=True)
     gateway.on_chat_message = AsyncMock(side_effect=AssertionError("must not run on primary"))
@@ -144,7 +147,7 @@ async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(scr
     bound_gateway = child if target == "writer" else gateway
     authority = ScreenAuthority(tmp_path / "screen")
     authority.start("generation")
-    provider = HostBrowserProvider(Mock(authority=authority,
+    provider = HostBrowserProvider(Mock(directory=profiles.ensure_profile_bot_id(target).path / "desktop", authority=authority,
         status=lambda: {"phase": "running", "generation": "generation"}))
     provider._connect = AsyncMock()
     provider._dispatch = AsyncMock(return_value={"success": True, "text": "selected profile page"})

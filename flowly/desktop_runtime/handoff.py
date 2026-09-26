@@ -14,12 +14,23 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError, _identity
-from flowly.desktop_runtime.launcher import is_alive, private_directory, process_identity
+from flowly.desktop_runtime.launcher import private_directory
+from flowly.desktop_runtime.launcher import process_identity as _process_identity
 
 _STATES = {"ready", "waiting_human", "waiting_resume", "resume_requested", "refreshing", "finished", "cancelled"}
 _TERMINAL = {"finished", "cancelled"}
 _KEYS = {"schema", "hostId", "botId", "profileId", "originSessionKey", "originRunId", "runtimeGeneration",
          "executionId", "owner", "acceptedEpoch", "controlEpoch", "handoffId", "requestedEpoch", "state", "reason"}
+
+
+def process_identity(pid: int) -> dict | None:
+    # An agent can be container PID 1. This is read-only run ownership, not
+    # permission to signal init; runtime process signalling keeps its guard.
+    return _process_identity(pid, allow_init=True)
+
+
+def is_alive(owner: dict) -> bool:
+    return isinstance(owner, dict) and process_identity(owner.get("pid")) == owner
 
 
 def _epoch(value) -> int:

@@ -165,3 +165,31 @@ async def test_cancel_during_refresh_waits_for_real_backend_before_retiring_run(
     await asyncio.wait_for(cleanup, 2)
     assert authority.snapshot()["runId"] is None
     assert not authority.snapshot()["actionInFlight"]
+
+
+async def test_cancelled_start_cleans_late_persisted_admission(tmp_path, monkeypatch):
+    import threading
+
+    owner = {"pid": 42, "start": "100", "boot": "one"}
+    monkeypatch.setattr("flowly.desktop_runtime.handoff.process_identity", lambda _: owner)
+    monkeypatch.setattr("flowly.desktop_runtime.handoff.is_alive", lambda _: True)
+    authority = ScreenAuthority(tmp_path / "authority")
+    authority.start("gen")
+    provider = HostBrowserProvider(Mock(directory=tmp_path, authority=authority))
+    entered, release = threading.Event(), threading.Event()
+    original = RunHandoffs.start
+    def delayed(store, *args):
+        entered.set()
+        assert release.wait(5)
+        return original(store, *args)
+    monkeypatch.setattr(RunHandoffs, "start", delayed)
+    task = asyncio.create_task(ScreenRunCheckpoint.start(provider,
+        {"hostId": "host", "botId": "bot", "profileId": "default"}, "session", "run", "gen"))
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert RunHandoffs(tmp_path, authority).status()["state"] == "cancelled"
+    assert authority.snapshot()["runId"] is None
+    assert provider.execution._run_checks == {}

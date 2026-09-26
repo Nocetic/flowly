@@ -23,16 +23,20 @@ class Socket:
 
 
 @pytest.fixture
-def screen_gateway(tmp_path):
+def screen_gateway(tmp_path, monkeypatch):
+    owner = {"pid": 42, "start": "1", "boot": "test"}
+    monkeypatch.setattr("flowly.desktop_runtime.handoff.process_identity", lambda _: owner)
+    monkeypatch.setattr("flowly.desktop_runtime.handoff.is_alive", lambda _: True)
     authority = ScreenAuthority(tmp_path)
     authority.start("generation")
-    runtime = Mock(authority=authority, status=lambda: {"phase": "running", "generation": "generation"})
+    runtime = Mock(directory=tmp_path, authority=authority, status=lambda: {"phase": "running", "generation": "generation"})
     provider = HostBrowserProvider(runtime)
     provider._connect = AsyncMock()
     provider._dispatch = AsyncMock(return_value={"success": True, "text": "remote page"})
     gateway = GatewayServer(host="0.0.0.0", port=0, auth_token="test-owner-token")
     socket = Socket()
     gateway._ws_clients["viewer"] = socket
+    gateway._host_screen_checkpoint_identity = lambda: {"hostId": "host", "profileId": "default", "botId": "bot"}
     gateway._host_screen_browser = provider
     gateway._host_screen_identity = {"hostId": "host", "profileId": "default", "screenId": "browser"}
     access = {**gateway._host_screen_identity, "providerId": "host-desktop-browser", "generation": "generation"}
@@ -119,7 +123,7 @@ async def test_screen_bound_capture_cannot_fall_back_to_physical_display(screen_
 
     gateway.on_chat_message = chat
     await gateway._run_chat(socket, "viewer", "origin-session", "work", "run", AsyncMock(), browser_binding=binding)
-    assert seen["capture"]["error_code"] == "HUMAN_HAS_CONTROL"
+    assert seen["capture"]["error_code"] == "SCREEN_HANDOFF_REQUIRED"
     assert seen["computer"]["error_code"] == "BROWSER_SCOPE_ONLY"
     provider._dispatch.assert_not_awaited()
 

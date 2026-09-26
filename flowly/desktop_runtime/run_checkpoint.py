@@ -22,6 +22,30 @@ class ScreenRunCheckpoint:
         self.run_id, self.generation = run_id, generation
         self.provider.execution.bind_checkpoint(run_id, self.action_epoch)
 
+    @classmethod
+    async def start(cls, provider, identity: dict, session_key: str, run_id: str, generation: str):
+        # Retain a claimed run on a failed checkpoint write: losing persistence
+        # is not evidence that another task may inherit the browser.
+        def prepare():
+            provider.runtime.authority.claim_run(run_id, generation)
+            store = RunHandoffs(provider.runtime.directory, provider.runtime.authority)
+            execution = store.start(identity, session_key, run_id, generation)
+            return store, execution
+
+        preparation = asyncio.create_task(asyncio.to_thread(prepare))
+        try:
+            store, execution = await asyncio.shield(preparation)
+        except asyncio.CancelledError:
+            try:
+                store, execution = await asyncio.shield(preparation)
+                await asyncio.to_thread(store.finish, execution, cancelled=True)
+                await provider.execution.finish_run(run_id, generation)
+            except Exception:
+                # Failed persistence or unknown work requires explicit recovery.
+                pass
+            raise
+        return cls(provider, store, execution, run_id, generation)
+
     def action_epoch(self, refresh_epoch: int | None = None) -> int:
         status = self.store.checkpoint(self.execution)
         if refresh_epoch is None:

@@ -18,6 +18,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from flowly.desktop_runtime.authority import ScreenError
+from flowly.desktop_runtime.handoff import RunHandoffs
 from flowly.desktop_runtime.input_service import InputServiceClient
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.desktop_runtime.rfb import RfbClientGate
@@ -30,7 +31,7 @@ from flowly.gateway.mcp_management import _protected_socket
 
 METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create", "display.viewer.close",
                      "display.control.acquire", "display.control.release", "display.control.reclaim",
-                     "display.subscribe", "display.unsubscribe"})
+                     "display.subscribe", "display.unsubscribe", "display.run.resume"})
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
@@ -50,6 +51,7 @@ class DisplaySession:
         self._tickets: StreamTickets | None = None
         self._viewers: ViewerCredentials | None = None
         self._status_sequence: StatusSequence | None = None
+        self._handoffs: RunHandoffs | None = None
         self.streams: set[web.WebSocketResponse] = set()
         self.attaching = 0
 
@@ -76,7 +78,7 @@ class DisplaySession:
                 "view": capability["supported"], "input": _supports_input(state),
                 "viewerClose": bool(state and state.get("inputServiceVersion") == 3
                                     and state.get("observerServiceVersion") == 3),
-                "lifecycle": False, "installSupported": False, "statusEvents": True}
+                "lifecycle": False, "installSupported": False, "statusEvents": True, "resumeSupported": True}
 
     @property
     def viewers(self) -> ViewerCredentials:
@@ -121,7 +123,24 @@ class DisplaySession:
         return {**capability, "phase": state["phase"] if state else "stopped",
                 "generation": state["generation"] if state else None,
                 "error": state.get("error") if state else None,
-                "control": self.runtime.authority.snapshot(), "width": 1440, "height": 900}
+                "control": self.runtime.authority.snapshot(), "handoff": self.handoffs.status(), "width": 1440, "height": 900}
+
+    @property
+    def handoffs(self) -> RunHandoffs:
+        if self._handoffs is None:
+            self._handoffs = RunHandoffs(self.directory, self.runtime.authority)
+        return self._handoffs
+
+    def resume(self, generation: str, token: str, handoff_id: str, epoch: int, operation: str) -> dict:
+        self.running(generation)
+        self.authenticate_viewer(generation, token)
+        status = self.handoffs.status()
+        if status is None or any(status[key] != self.identity[key] for key in ("hostId", "botId", "profileId")):
+            raise ScreenError("HANDOFF_CHANGED")
+        if status["runtimeGeneration"] != generation:
+            raise ScreenError("STALE_GENERATION")
+        return {**self.identity, "generation": generation,
+                **self.handoffs.request_resume(handoff_id, epoch, operation)}
 
     def create_viewer(self, generation: str) -> dict:
         self.running(generation)
@@ -239,7 +258,9 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             allowed.add("generation")
         if method == "display.observe":
             allowed.add("viewerToken")
-        if method.startswith("display.control.") or method == "display.viewer.close":
+        if method == "display.run.resume":
+            allowed.add("handoffId")
+        if method.startswith("display.control.") or method in {"display.viewer.close", "display.run.resume"}:
             allowed.update({"viewerToken", "epoch", "operationId"})
         if not isinstance(params, dict) or set(params) - allowed:
             raise ScreenError("INVALID_PARAMS")
@@ -263,6 +284,9 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
                 raise ScreenError("INVALID_PARAMS")
             if method == "display.observe":
                 result = await asyncio.to_thread(session.observe, generation, params.get("viewerToken"))
+            elif method == "display.run.resume":
+                result = await asyncio.to_thread(session.resume, generation, params.get("viewerToken"),
+                    params.get("handoffId"), params.get("epoch"), params.get("operationId"))
             elif method == "display.viewer.create":
                 result = await asyncio.to_thread(session.create_viewer, generation)
             else:

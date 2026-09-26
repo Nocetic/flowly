@@ -26,6 +26,7 @@ from flowly.artifacts.context import is_internal_context_artifact
 from flowly.artifacts.summary import artifact_summary
 from flowly.browser_annotations import append_browser_annotation_context
 from flowly.channels import feature_rpc
+from flowly.desktop_runtime.authority import ScreenError as ScreenRunError
 from flowly.desktop_runtime.context import SCREEN_RUN_BINDING, ScreenRunBinding
 from flowly.gateway.auth import (
     MediaTicketStore,
@@ -3221,9 +3222,19 @@ class GatewayServer:
             _, provider = self._get_host_screen_browser()
             screen_binding = ScreenRunBinding(provider, browser_binding.screen_generation, run_id)
         screen_token = SCREEN_RUN_BINDING.set(screen_binding)
+        screen_checkpoint = None
+        screen_finished = False
         profile_binding = None
         profile_binding_token = _PROFILE_RUN_BINDING.set(None)
         try:
+            if screen_binding is not None:
+                from flowly.desktop_runtime.run_checkpoint import ScreenRunCheckpoint
+
+                identity = self._host_screen_checkpoint_identity()
+                screen_checkpoint = await ScreenRunCheckpoint.start(screen_binding.provider, identity,
+                    session_key, run_id, screen_binding.generation)
+                screen_binding = ScreenRunBinding(screen_binding.provider, screen_binding.generation, run_id, screen_checkpoint)
+                SCREEN_RUN_BINDING.set(screen_binding)
             host = getattr(self, "_profile_host", None)
             if host is not None:
                 profile_binding = host.collaboration_binding(
@@ -3411,6 +3422,7 @@ class GatewayServer:
                     goal_snapshot,
                     fallback_ws=ws,
                 )
+            screen_finished = not final_data.get("aborted") and not provider_error
             await self._notify_chat_delivered(session_key, response, metadata or {})
             if not final_data.get("aborted"):
                 self._schedule_offline_chat_push(
@@ -3429,6 +3441,14 @@ class GatewayServer:
                     "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key},
                 },
             )
+        except ScreenRunError as exc:
+            code = exc.code if exc.code in {"SCREEN_BUSY", "HUMAN_HAS_CONTROL", "STALE_GENERATION",
+                "PROFILE_IDENTITY_CHANGED", "HANDOFF_RECOVERY_REQUIRED", "HANDOFF_STATE_INVALID", "RUN_CHANGED"} else "CONTROL_UNAVAILABLE"
+            await self._session_send(session_key, ws, {"type": "event", "event": "chat", "data": {
+                "state": "error", "runId": run_id, "sessionKey": session_key, "errorCode": code,
+                "errorTitle": "The screen task needs attention",
+                "errorMessage": "Check this profile's screen before continuing the task.", "retryable": False,
+            }})
         except Exception as e:
             # Unexpected exceptions are logged with their native detail for
             # operators, but the gateway wire contract never exposes reprs,
@@ -3453,8 +3473,8 @@ class GatewayServer:
             )
         finally:
             try:
-                if screen_binding is not None:
-                    await screen_binding.provider.execution.finish_run(run_id, screen_binding.generation)
+                if screen_checkpoint is not None:
+                    await screen_checkpoint.finish(cancelled=not screen_finished)
             except (Exception, asyncio.CancelledError):
                 # A failed/unknown browser outcome deliberately retains its
                 # durable fence; do not log browser payloads during cleanup.
@@ -3791,6 +3811,16 @@ class GatewayServer:
             }
             self._host_screen_browser = HostBrowserProvider(ScreenRuntime(get_flowly_home() / "desktop"))
         return self._host_screen_identity, self._host_screen_browser
+
+    def _host_screen_checkpoint_identity(self) -> dict:
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.profile import ensure_profile_bot_id
+
+        identity, provider = self._get_host_screen_browser()
+        info = ensure_profile_bot_id(identity["profileId"])
+        if provider.runtime.directory.resolve() != (info.path / "desktop").resolve():
+            raise ScreenError("PROFILE_IDENTITY_CHANGED")
+        return {"hostId": identity["hostId"], "profileId": identity["profileId"], "botId": info.bot_id}
 
     def validate_browser_tool_result(self, result: dict) -> bool:
         binding = SCREEN_RUN_BINDING.get()
