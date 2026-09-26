@@ -36,3 +36,20 @@ def environment_activity(*, exclusive: bool = False):
         yield
     finally:
         os.close(descriptor)
+
+
+@contextmanager
+def agent_environment_activity():
+    """Keep a Linux agent turn out of optional dependency maintenance.
+
+    Other platforms do not support this installation backend. Each task gets
+    its own descriptor: a parent finishing cannot release a child's activity.
+    """
+    if sys.platform != "linux":
+        yield
+        return
+    from flowly.desktop_runtime.install_jobs import assert_environment_installation_idle
+
+    with environment_activity():
+        assert_environment_installation_idle()
+        yield

@@ -7,6 +7,7 @@ import json
 import re
 import time
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1293,7 +1294,17 @@ class SubagentManager:
         _auto_save = bool(getattr(assistant, "auto_save_artifact", False))
         _art_type = getattr(assistant, "artifact_type", "markdown") or "markdown"
 
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.installation_gate import agent_environment_activity
+
+        activity = ExitStack()
+        activity_error = None
         try:
+            try:
+                activity.enter_context(agent_environment_activity())
+            except ScreenError as exc:
+                activity_error = exc.code
+                raise
             # Wall-clock guard is opt-in: positive timeout_seconds enforces
             # a hard cap; 0 / None runs unbounded (rely on max_iter +
             # per-call + heartbeat).
@@ -1444,10 +1455,14 @@ class SubagentManager:
 
         except Exception as e:
             logger.error(f"[SubagentManager] [{run_id[:8]}] failed: {e}")
-            self._registry.finish(run_id, "error", error="Task could not finish", error_code="execution_failed")
-            final_result = "Error: Task could not finish."
+            final_result = ("Error: Agent environment maintenance must finish before this task can run."
+                            if activity_error else "Error: Task could not finish.")
+            self._registry.finish(run_id, "error", error=final_result,
+                                  error_code=activity_error or "execution_failed")
             status = "error"
             error_str = final_result
+        finally:
+            activity.close()
 
         try:
             if not skip_announce:

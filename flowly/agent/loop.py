@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7552,6 +7552,26 @@ class AgentLoop:
             logger.warning(f"Memory flush failed: {e}")
 
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
+        """Reserve the environment before admitting any turn or continuation."""
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.installation_gate import agent_environment_activity
+
+        with ExitStack() as activity:
+            try:
+                activity.enter_context(agent_environment_activity())
+            except ScreenError as exc:
+                message = (
+                    "The agent needs to restart after screen component installation."
+                    if exc.code == "INSTALL_RESTART_REQUIRED" else
+                    "Screen component installation is running. Try again when it finishes."
+                    if exc.code == "INSTALL_BUSY" else
+                    "Screen component installation needs recovery on this host before agent tasks can continue."
+                )
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=message,
+                                       metadata={"error": {"code": exc.code, "message": message}})
+            return await self._process_message_in_environment(msg)
+
+    async def _process_message_in_environment(self, msg: InboundMessage) -> OutboundMessage | None:
         """Serialize a conversation's turns and reject stale continuations."""
         synthetic_goal_id = str(msg.metadata.get(_GOAL_CONTINUATION_ID) or "")
         is_real_arrival = (
