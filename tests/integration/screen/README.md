@@ -58,7 +58,7 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
   python -m pytest tests/test_screen_authority.py tests/test_screen_rfb.py \
     tests/test_screen_tickets.py tests/test_screen_viewers.py tests/test_screen_launcher.py tests/test_screen_execution.py \
     tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
-    tests/test_screen_cli.py tests/test_screen_profile_binding.py tests/test_screen_display_gateway.py \
+    tests/test_screen_cli.py tests/test_screen_profile_binding.py tests/test_screen_display_gateway.py tests/test_screen_display_watch.py \
     tests/test_screen_input_broker.py tests/test_screen_input_service.py tests/test_screen_observers.py tests/test_screen_status.py \
     tests/integration/screen/test_xvnc_browser.py -q \
     --basetemp=/tmp/screen-tests -p no:cacheprovider
@@ -146,9 +146,18 @@ independent of the control revision/epoch. Sampling and assignment are serialize
 across gateway workers; unchanged snapshots keep their revision, and gateway
 reconstruction resumes the sequence. The real gateway tests verify stable repeated
 status and advancement after public control transitions. Phase-only failure and
-out-of-order sampling are covered by the synthetic/sequence tests. Push status
-events and original-run resume remain open. Desktop's direct Screen sidebar is
-wired, but lifecycle, profile-tab navigation and relay remain incomplete.
+out-of-order sampling are covered by the synthetic/sequence tests. Authenticated
+direct `display.subscribe/unsubscribe` now return a pinned snapshot and follow it
+with bounded status/control/runtime-failure events and scoped heartbeats. No
+pixels or viewer credentials travel in these events. Subscriptions are bound to
+the originating connection and verified profile identity, limited to four per
+connection/sixteen per gateway, and removed on disconnect, identity replacement,
+state rollback, slow delivery or explicit unsubscribe. Cleanup never releases
+human control. Pending snapshots cannot recreate a subscription after shutdown.
+The gateway/sequence tests passed **41 tests** on macOS; the expanded Linux runner
+with subscriptions still needs to run before updating its 247-test baseline.
+Desktop's direct Screen sidebar and profile-tab navigation are wired. Desktop
+event consumption, lifecycle, original-run resume and relay remain incomplete.
 
 The `epoch-u64-v1` input protocol is selected with `X-Flowly-Screen-Input`.
 Each client binary frame starts with an unsigned big-endian 64-bit control epoch

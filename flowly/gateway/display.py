@@ -25,10 +25,12 @@ from flowly.desktop_runtime.status import StatusSequence
 from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
 from flowly.desktop_runtime.viewers import ViewerCredentials
 from flowly.gateway.auth import host_origin_allowed
+from flowly.gateway.display_watch import DisplaySubscriptions
 from flowly.gateway.mcp_management import _protected_socket
 
 METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create", "display.viewer.close",
-                     "display.control.acquire", "display.control.release", "display.control.reclaim"})
+                     "display.control.acquire", "display.control.release", "display.control.reclaim",
+                     "display.subscribe", "display.unsubscribe"})
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
@@ -74,7 +76,7 @@ class DisplaySession:
                 "view": capability["supported"], "input": _supports_input(state),
                 "viewerClose": bool(state and state.get("inputServiceVersion") == 3
                                     and state.get("observerServiceVersion") == 3),
-                "lifecycle": False, "installSupported": False}
+                "lifecycle": False, "installSupported": False, "statusEvents": True}
 
     @property
     def viewers(self) -> ViewerCredentials:
@@ -225,9 +227,15 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
     try:
         if method not in METHODS:
             raise ScreenError("METHOD_NOT_ALLOWED")
+        if method == "display.unsubscribe":
+            if not isinstance(params, dict) or set(params) != {"subscriptionId"}:
+                raise ScreenError("INVALID_PARAMS")
+            await gateway._display_subscriptions.remove(ws, params["subscriptionId"])
+            await gateway._ws_rpc_reply(ws, rpc_id, {"unsubscribed": True})
+            return
         allowed = {"profileId", "expectedHostId", "expectedBotId"}
         pinned = method not in {"display.capabilities", "display.status"}
-        if pinned:
+        if pinned and method != "display.subscribe":
             allowed.add("generation")
         if method == "display.observe":
             allowed.add("viewerToken")
@@ -236,6 +244,15 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
         if not isinstance(params, dict) or set(params) - allowed:
             raise ScreenError("INVALID_PARAMS")
         session = await asyncio.to_thread(_resolve, gateway, params, pinned=pinned)
+        if method == "display.subscribe":
+            entry = await gateway._display_subscriptions.prepare(ws, client_id, params)
+            try:
+                await gateway._ws_rpc_reply(ws, rpc_id, {"subscriptionId": entry.identifier, "status": entry.snapshot})
+                gateway._display_subscriptions.activate(entry)
+            except BaseException:
+                await gateway._display_subscriptions.remove(ws, entry.identifier)
+                raise
+            return
         if method == "display.capabilities":
             result = session.capabilities()
         elif method == "display.status":
@@ -261,6 +278,7 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
 def register_display(app: web.Application, gateway) -> None:
     gateway._display_sessions = {}
     gateway._display_resolution_lock = threading.Lock()
+    gateway._display_subscriptions = DisplaySubscriptions(gateway, _resolve)
 
     async def stream(request: web.Request) -> web.StreamResponse:
         # The ordinary gateway middleware checks Authorization. Unlike /ws,
@@ -432,6 +450,7 @@ def register_display(app: web.Application, gateway) -> None:
         return ws
 
     async def shutdown(_app):
+        await gateway._display_subscriptions.close()
         await asyncio.gather(*(ws.close(code=1001) for session in list(gateway._display_sessions.values())
                                for ws in tuple(session.streams)), return_exceptions=True)
 

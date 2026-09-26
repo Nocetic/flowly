@@ -104,7 +104,7 @@ async def display_gateway(tmp_path, monkeypatch):
                 return await socket.receive_json(timeout=5)
 
             yield SimpleNamespace(server=server, client=client, gateway=gateway, rpc=rpc,
-                                  received=received, received_event=received_event, input_services=input_services)
+                                  socket=socket, received=received, received_event=received_event, input_services=input_services)
             await socket.close()
         await server.close()
         for registry in registries:
