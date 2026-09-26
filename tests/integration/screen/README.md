@@ -59,6 +59,7 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
     tests/test_screen_tickets.py tests/test_screen_launcher.py tests/test_screen_execution.py \
     tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
     tests/test_screen_cli.py tests/test_screen_profile_binding.py tests/test_screen_display_gateway.py \
+    tests/test_screen_input_broker.py \
     tests/integration/screen/test_xvnc_browser.py -q \
     --basetemp=/tmp/screen-tests -p no:cacheprovider
 ```
@@ -72,13 +73,33 @@ pause/resume RPC or Desktop UI. No model is invoked.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
-The expanded Linux screen suite passed **162 tests** on the environment above.
+The expanded Linux screen suite passed **183 tests** on the environment above.
 The authenticated direct display endpoint also delivers real Xvnc pixels for
 the default and named profiles. Its single-use tickets are bound to the host,
 profile and runtime generation; gateway credentials and tickets use headers.
 Synthetic socket tests cover input filtering, replay rejection, profile identity
 changes, observer limits and teardown. This endpoint currently advertises viewing
 only: public lifecycle, takeover and input-drain coordination remain unfinished.
+
+The input broker now uses a separate private RFB connection that never requests
+pixels. It negotiates Fence support and requires a matching BlockBefore response
+after input and after releasing pressed keys/buttons. The real Linux test holds
+Shift and a mouse button in Chromium, then checks their release and preservation
+of the original run lease through handback. Synthetic tests delay/drop/change
+acknowledgements and verify that no agent action or reclaim can bypass drain.
+Clipboard data containing a fence-shaped payload cannot substitute for an ACK.
+The durable authority schema is now version two, with exact version-one upgrade
+and a persistent input reservation containing no keystrokes or clipboard text.
+
+This proves the Xvnc input processing boundary, not arbitrary asynchronous website
+effects or completed production task resume. The broker is not yet wired to the
+supervisor's long-lived service or public display control RPCs. Worker death or
+unknown input outcome retains human ownership and requires explicit recovery;
+automatic timeout/disconnect release is intentionally absent. Extended pointer,
+QEMU key, resize and extended clipboard messages are not admitted by this basic
+input connection; viewing-stream negotiation must be aligned before enabling
+public input. See the
+[RFB Fence protocol](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#748clientfence).
 
 The `screen` Python extra adds Playwright without downloading a bundled browser;
 the runtime attaches to the installed distro Chromium. CLI lifecycle commands

@@ -35,6 +35,13 @@ class ActionAdmission:
     nonce: str
 
 
+@dataclass(frozen=True)
+class InputAdmission:
+    generation: str
+    epoch: int
+    nonce: str
+
+
 def _identity(value: object) -> str:
     if not isinstance(value, str) or not value or len(value) > 256:
         raise ScreenError("INVALID_PARAMS")
@@ -44,15 +51,20 @@ def _identity(value: object) -> str:
 
 
 def _fresh() -> dict:
-    return dict(schema=1, generation=None, epoch=0, revision=0, running=False,
-                control="agent", viewer=None, run=None, action=None)
+    return dict(schema=2, generation=None, epoch=0, revision=0, running=False,
+                control="agent", viewer=None, run=None, action=None, input=None)
 
 
 def _validate(state: object) -> dict:
     try:
+        # Version one never admitted input connections. Upgrade only its exact
+        # schema; a damaged version-two document must not lose its input fence.
+        if (isinstance(state, dict) and type(state.get("schema")) is int and state["schema"] == 1
+                and set(state) == set(_fresh()) - {"input"}):
+            state = {**state, "schema": 2, "input": None}
         if not isinstance(state, dict) or set(state) != set(_fresh()):
             raise ValueError()
-        if type(state["schema"]) is not int or state["schema"] != 1:
+        if type(state["schema"]) is not int or state["schema"] != 2:
             raise ValueError()
         for key in ("epoch", "revision"):
             if type(state[key]) is not int or not 0 <= state[key] < 2**53:
@@ -80,6 +92,15 @@ def _validate(state: object) -> dict:
                 raise ValueError()
         if not state["running"] and (state["control"] != "agent" or state["run"] is not None):
             raise ValueError()
+        if state["input"] is not None:
+            entry = state["input"]
+            if not isinstance(entry, dict) or set(entry) != {"nonce", "epoch"}:
+                raise ValueError()
+            _identity(entry["nonce"])
+            if type(entry["epoch"]) is not int or entry["epoch"] != state["epoch"]:
+                raise ValueError()
+            if not state["running"] or state["control"] != "human":
+                raise ValueError()
         return state
     except (KeyError, TypeError, ValueError, ScreenError) as exc:
         raise ScreenError("CONTROL_STATE_INVALID") from exc
@@ -92,6 +113,7 @@ def _public(state: dict) -> dict:
         "revision": state["revision"], "running": state["running"],
         "control": state["control"], "runId": state["run"],
         "actionInFlight": state["action"] is not None,
+        "inputDrainRequired": state["input"] is not None,
         "holderHash": hashlib.sha256(viewer.encode()).hexdigest() if viewer else None,
     }
 
@@ -243,6 +265,8 @@ class ScreenAuthority:
             if state["control"] != "agent" and state["viewer"] != viewer and not reclaim:
                 raise ScreenError("SCREEN_BUSY")
             if state["viewer"] != viewer:
+                if state["input"] is not None:
+                    raise ScreenError("INPUT_DRAIN_REQUIRED")
                 state.update(viewer=viewer, epoch=state["epoch"] + 1,
                              control="human-pending" if state["action"] is not None else "human")
         return _public(state)
@@ -264,7 +288,44 @@ class ScreenAuthority:
             self._check(state, generation, epoch)
             if state["viewer"] != viewer:
                 raise ScreenError("VIEWER_MISMATCH")
+            if state["input"] is not None:
+                raise ScreenError("INPUT_DRAIN_REQUIRED")
             state.update(viewer=None, control="agent", epoch=state["epoch"] + 1)
+        return _public(state)
+
+    def begin_input(self, viewer: str, generation: str, epoch: int) -> InputAdmission:
+        """Reserve one input connection until its acknowledged drain and close.
+
+        Nothing about connection loss proves that queued input has completed.
+        The durable reservation therefore survives process death and blocks
+        handback/reclaim until explicit recovery establishes that boundary.
+        """
+        _identity(viewer)
+        with self._transaction() as state:
+            self._check(state, generation, epoch)
+            if state["viewer"] != viewer:
+                raise ScreenError("VIEWER_MISMATCH")
+            if state["control"] != "human":
+                raise ScreenError("TAKEOVER_PENDING")
+            if state["input"] is not None:
+                raise ScreenError("INPUT_DRAIN_REQUIRED")
+            nonce = secrets.token_urlsafe(24)
+            state["input"] = dict(nonce=nonce, epoch=epoch)
+        return InputAdmission(generation, epoch, nonce)
+
+    def end_input(self, admission: InputAdmission, *, release: bool = False) -> dict:
+        """Called only after the broker proved input drain and closed its socket.
+
+        Optional handback is atomic with retiring the input reservation, so a
+        second input connection cannot slip between drain and agent admission.
+        """
+        with self._transaction() as state:
+            self._check(state, admission.generation, admission.epoch)
+            if state["input"] != dict(nonce=admission.nonce, epoch=admission.epoch):
+                raise ScreenError("INPUT_ADMISSION_CHANGED")
+            state["input"] = None
+            if release:
+                state.update(viewer=None, control="agent", epoch=state["epoch"] + 1)
         return _public(state)
 
     def may_input(self, viewer: str, generation: str, epoch: int) -> bool:

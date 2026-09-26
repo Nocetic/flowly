@@ -158,6 +158,53 @@ def test_human_rfb_input_and_agent_share_one_browser(tmp_path, login_site):
         assert second.contexts[0].pages[0].evaluate("document.cookie") == "session=test-login"
 
 
+def test_input_broker_drains_real_xvnc_and_releases_pressed_keys_before_handback(tmp_path, login_site):
+    from playwright.sync_api import sync_playwright
+
+    from flowly.desktop_runtime.input_broker import ScreenInputBroker
+
+    with running_screen(tmp_path / "input-broker") as runtime, sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(runtime["endpoint"])
+        page = browser.contexts[0].pages[0]
+        page.goto(login_site)
+        page.evaluate("""() => {
+            window.shiftHeld = false; window.pointerHeld = false;
+            addEventListener('keydown', e => { if (e.key === 'Shift') window.shiftHeld = true; });
+            addEventListener('keyup', e => { if (e.key === 'Shift') window.shiftHeld = false; });
+            addEventListener('mousedown', () => { window.pointerHeld = true; });
+            addEventListener('mouseup', () => { window.pointerHeld = false; });
+        }""")
+        point = page.locator("#code").evaluate("""element => {
+            const box = element.getBoundingClientRect();
+            return { x: Math.round(screenX + box.x + 10),
+                     y: Math.round(screenY + outerHeight - innerHeight + box.y + 10) };
+        }""")
+        authority = runtime["runtime"].authority
+        generation = runtime["state"]["generation"]
+        admission = authority.begin_action("original-run", "before", generation)
+        assert authority.end_action(admission)
+        human = authority.acquire("viewer", generation, authority.snapshot()["epoch"])
+        broker = ScreenInputBroker(authority, "viewer", generation, human["epoch"], runtime["socket"])
+        try:
+            broker.send(b"".join(struct.pack("!BBHH", 5, buttons, point["x"], point["y"])
+                                 for buttons in (0, 1, 0)))
+            page.wait_for_function("document.hasFocus()")
+            broker.send(struct.pack("!BBHI", 4, 1, 0, 0xFFE1)
+                        + struct.pack("!BBHH", 5, 1, point["x"], point["y"]))
+            page.wait_for_function("window.shiftHeld && window.pointerHeld")
+            with pytest.raises(ScreenError, match="INPUT_DRAIN_REQUIRED"):
+                authority.release("viewer", generation, human["epoch"])
+            released = broker.finish(release=True)
+            assert released["control"] == "agent" and released["runId"] == "original-run"
+            assert not released["inputDrainRequired"]
+            page.wait_for_function("!window.shiftHeld && !window.pointerHeld")
+            admission = authority.begin_action("original-run", "after", generation)
+            assert authority.end_action(admission)
+            authority.finish_run("original-run", generation)
+        finally:
+            broker.abandon()
+
+
 def test_two_profiles_have_separate_browser_cookies(tmp_path, login_site):
     from playwright.sync_api import sync_playwright
 
