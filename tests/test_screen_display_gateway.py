@@ -15,7 +15,9 @@ from aiohttp.test_utils import TestServer
 
 import flowly.profile as profiles
 from flowly.desktop_runtime.authority import ScreenAuthority
+from flowly.desktop_runtime.input_service import InputService, InputServiceClient
 from flowly.desktop_runtime.launcher import ScreenRuntime
+from flowly.desktop_runtime.observers import ObserverRegistry
 from flowly.gateway.display import STREAM_PATH, _resolve
 from flowly.gateway.server import GatewayServer
 
@@ -39,6 +41,8 @@ async def display_gateway(tmp_path, monkeypatch):
     server = TestServer(gateway._create_app())
     await server.start_server()
     backends = []
+    registries = []
+    input_services = {}
     tasks = set()
     received = []
     received_event = asyncio.Event()
@@ -50,11 +54,14 @@ async def display_gateway(tmp_path, monkeypatch):
             authority = ScreenAuthority(tmp_path / f"authority-{profile}")
             generation = f"generation-{profile}"
             authority.start(generation)
+            registries.append(ObserverRegistry(authority, generation, sockets))
+            input_services[profile] = InputService(authority, generation, sockets, observers=registries[-1])
             service._runtime = SimpleNamespace(
                 socket_directory=sockets, authority=authority,
                 status=lambda gen=generation: {
                     "phase": "running", "generation": gen,
                     "socket": "/must-not-use-manifest-path", "cdpPort": 9999,
+                    "observerServiceVersion": 1,
                 },
             )
 
@@ -96,9 +103,13 @@ async def display_gateway(tmp_path, monkeypatch):
                 return await socket.receive_json(timeout=5)
 
             yield SimpleNamespace(server=server, client=client, gateway=gateway, rpc=rpc,
-                                  received=received, received_event=received_event)
+                                  received=received, received_event=received_event, input_services=input_services)
             await socket.close()
         await server.close()
+        for registry in registries:
+            await asyncio.to_thread(registry.close)
+        for service in input_services.values():
+            await asyncio.to_thread(service.close)
         for backend in backends:
             backend.close()
             await backend.wait_closed()
@@ -262,3 +273,27 @@ async def test_unsupported_host_is_explicit_and_does_not_start_runtime(display_g
     assert status["phase"] == "unavailable"
     assert status["reason"] == "UNSUPPORTED_HOST"
     assert status["transports"] == []
+
+
+async def test_supervisor_takeover_ack_follows_gateway_capture_cleanup(display_gateway):
+    observed, headers = await observe(display_gateway)
+    holder = await display_gateway.client.ws_connect(display_gateway.server.make_url(STREAM_PATH), headers=headers)
+    await RfbSocket(holder).handshake()
+    _, other_headers = await observe(display_gateway)
+    other = await display_gateway.client.ws_connect(display_gateway.server.make_url(STREAM_PATH), headers=other_headers)
+    await RfbSocket(other).handshake()
+    session = _resolve(display_gateway.gateway, {})
+    client = InputServiceClient(display_gateway.input_services["default"].path)
+    state = await asyncio.to_thread(client.request, "acquire", generation=observed["generation"],
+                                    viewer=observed["viewerId"], epoch=session.runtime.authority.snapshot()["epoch"])
+    assert state["control"] == "human"
+    assert (await other.receive(timeout=3)).type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED}
+    assert session.attaching == 1
+    # The holder's view remains connected, while its input is still host-filtered.
+    display_gateway.received.clear()
+    display_gateway.received_event.clear()
+    await holder.send_bytes(struct.pack("!BBHHHH", 3, 0, 0, 0, 10, 10))
+    await asyncio.wait_for(display_gateway.received_event.wait(), 3)
+    assert display_gateway.received
+    await holder.close()
+    await other.close()

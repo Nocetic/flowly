@@ -9,6 +9,7 @@ only after the host input-drain coordinator is connected.
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import threading
 from pathlib import Path
@@ -62,7 +63,7 @@ class DisplaySession:
         return StreamScope(self.identity["hostId"], self.identity["hostId"],
                            self.identity["profileId"], generation)
 
-    def current(self, generation: str) -> dict:
+    def current(self, generation: str, viewer: str | None = None) -> dict:
         state = self.runtime.status()
         if not state or state["phase"] != "running":
             raise ScreenError("SCREEN_NOT_RUNNING")
@@ -71,7 +72,7 @@ class DisplaySession:
         control = self.runtime.authority.snapshot()
         if control["generation"] != generation or not control["running"]:
             raise ScreenError("STALE_GENERATION")
-        if control["control"] != "agent":
+        if control["control"] != "agent" and (viewer is None or not self.runtime.authority.may_observe(viewer, generation)):
             raise ScreenError("HUMAN_HAS_CONTROL")
         return state
 
@@ -199,8 +200,8 @@ def register_display(app: web.Application, gateway) -> None:
         ticket = request.headers.get("X-Flowly-Screen-Ticket", "")
         try:
             session = await asyncio.to_thread(_resolve, gateway, params, pinned=True)
-            await asyncio.to_thread(session.tickets.consume, ticket, session.scope(generation))
-            await asyncio.to_thread(session.current, generation)
+            viewer = await asyncio.to_thread(session.tickets.consume, ticket, session.scope(generation))
+            state = await asyncio.to_thread(session.current, generation, viewer)
         except ScreenError as exc:
             return _error(exc.code, 403)
         except OSError:
@@ -209,9 +210,29 @@ def register_display(app: web.Application, gateway) -> None:
             return _error("SCREEN_BUSY", 429)
         session.attaching += 1
         writer = None
+        observer_writer = None
         ws = web.WebSocketResponse(max_msg_size=MAX_FRAME, heartbeat=15, compress=False, timeout=2)
         tasks = []
         try:
+            if state.get("observerServiceVersion") == 1:
+                async with asyncio.timeout(3):
+                    observer_reader, observer_writer = await asyncio.open_unix_connection(
+                        session.runtime.socket_directory / "observers.sock", limit=4096)
+                    hello = json.dumps({"viewer": viewer, "generation": generation}).encode()
+                    observer_writer.write(len(hello).to_bytes(4, "big") + hello)
+                    await observer_writer.drain()
+                    size = int.from_bytes(await observer_reader.readexactly(4), "big")
+                    if not 0 < size <= 4096:
+                        raise ScreenError("CONTROL_UNAVAILABLE")
+                    reply = json.loads(await observer_reader.readexactly(size))
+                    if reply != {"ok": True}:
+                        raise ScreenError("CONTROL_UNAVAILABLE")
+
+                async def revoked():
+                    await observer_reader.read(1)
+                    raise ScreenError("VIEWER_REVOKED")
+
+                tasks.append(asyncio.create_task(revoked()))
             socket = session.runtime.socket_directory / "rfb.sock"
             reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(socket, limit=128 * 1024), 5)
             writer.transport.set_write_buffer_limits(high=128 * 1024, low=32 * 1024)
@@ -223,7 +244,7 @@ def register_display(app: web.Application, gateway) -> None:
                 fresh = await asyncio.to_thread(_resolve, gateway, params, pinned=True)
                 if fresh is not session:
                     raise ScreenError("PROFILE_IDENTITY_CHANGED")
-                await asyncio.to_thread(session.current, generation)
+                await asyncio.to_thread(session.current, generation, viewer)
 
             async def server_to_viewer():
                 while data := await reader.read(64 * 1024):
@@ -245,16 +266,16 @@ def register_display(app: web.Application, gateway) -> None:
                     await asyncio.sleep(0.25)
                     await check_current()
 
-            tasks = [asyncio.create_task(operation()) for operation in (server_to_viewer, viewer_to_server, monitor)]
+            tasks.extend(asyncio.create_task(operation()) for operation in (server_to_viewer, viewer_to_server, monitor))
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        except (ScreenError, OSError, asyncio.TimeoutError):
+        except (ScreenError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
             if not ws.prepared:
                 return _error("TRANSPORT_UNAVAILABLE", 503)
         finally:
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
             try:
+                await asyncio.gather(*tasks, return_exceptions=True)
                 if writer is not None:
                     writer.close()
                     try:
@@ -262,8 +283,22 @@ def register_display(app: web.Application, gateway) -> None:
                     except (OSError, asyncio.TimeoutError):
                         writer.transport.abort()
                 if ws.prepared:
-                    await ws.close(code=1000, message=b"Screen disconnected")
+                    # A viewer need not read/respond to the close frame. Give
+                    # it a short graceful window, then close the transport in
+                    # finally; remote cooperation cannot hold takeover open.
+                    try:
+                        await asyncio.wait_for(ws.close(code=1000, message=b"Screen disconnected"), 0.25)
+                    except asyncio.TimeoutError:
+                        pass
             finally:
+                # Even repeated cancellation must close both capture transports
+                # before acknowledging the observer lease's end to supervisor.
+                if writer is not None:
+                    writer.transport.abort()
+                if ws.prepared and request.transport is not None:
+                    request.transport.close()
+                if observer_writer is not None:
+                    observer_writer.close()
                 session.streams.discard(ws)
                 session.attaching -= 1
         return ws

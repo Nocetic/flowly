@@ -24,6 +24,7 @@ from flowly.desktop_runtime.launcher import (
     process_identity,
     write_state,
 )
+from flowly.desktop_runtime.observers import ObserverRegistry
 
 
 def write_xauthority(path: Path) -> None:
@@ -69,6 +70,7 @@ def run(directory: Path, generation: str) -> None:
         write_state(runtime.manifest, state)
         processes: list[subprocess.Popen] = []
         input_service = None
+        observers = None
         stopping = False
 
         def request_stop(*_):
@@ -140,12 +142,15 @@ def run(directory: Path, generation: str) -> None:
                 raise ScreenError("RUNTIME_START_FAILED")
             runtime.authority.start(generation)
             (sockets / "input.sock").unlink(missing_ok=True)
-            input_service = InputService(runtime.authority, generation, sockets)
+            (sockets / "observers.sock").unlink(missing_ok=True)
+            observers = ObserverRegistry(runtime.authority, generation, sockets)
+            input_service = InputService(runtime.authority, generation, sockets, observers=observers)
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
-                         cdpPort=port, inputServiceVersion=1, error=None)
+                         cdpPort=port, inputServiceVersion=1, observerServiceVersion=1, error=None)
             write_state(runtime.manifest, state)
             while not stopping:
-                if not input_service.is_alive or any(process_identity(child.pid) is None for child in processes):
+                if (not input_service.is_alive or not observers.is_alive
+                        or any(process_identity(child.pid) is None for child in processes)):
                     raise ScreenError("RUNTIME_FAILED")
                 time.sleep(0.2)
             state.update(phase="stopped", error=None)
@@ -154,6 +159,11 @@ def run(directory: Path, generation: str) -> None:
             # text. Health failure does not release durable human authority.
             state.update(phase="failed", error="RUNTIME_FAILED")
         finally:
+            if observers is not None:
+                try:
+                    observers.close()
+                except Exception:
+                    state.update(phase="failed", error="OBSERVER_SERVICE_CLOSE_FAILED")
             if input_service is not None:
                 try:
                     input_service.close()

@@ -88,8 +88,9 @@ class InputServiceClient:
 class InputService:
     """One runtime's input broker; no control release on client EOF/shutdown."""
 
-    def __init__(self, authority: ScreenAuthority, generation: str, socket_directory: Path):
+    def __init__(self, authority: ScreenAuthority, generation: str, socket_directory: Path, *, observers=None):
         self.authority, self.generation = authority, generation
+        self.observers = observers
         self.path = socket_directory / "input.sock"
         self.rfb = socket_directory / "rfb.sock"
         self._broker: ScreenInputBroker | None = None
@@ -172,7 +173,7 @@ class InputService:
         method = request.get("method")
         fields = {"method", "generation", "viewer", "epoch"}
         extras = {"open": set(), "send": {"handle", "sequence", "data"},
-                  "finish": {"handle", "release"}}
+                  "finish": {"handle", "release"}, "acquire": set()}
         if not isinstance(method, str) or method not in extras or set(request) != fields | extras[method]:
             raise ScreenError("INVALID_PARAMS")
         viewer = _identity(request["viewer"])
@@ -181,6 +182,17 @@ class InputService:
             raise ScreenError("INVALID_PARAMS")
         if request["generation"] != self.generation:
             raise ScreenError("STALE_GENERATION")
+        if method == "acquire":
+            if self.observers is None or not self.observers.is_alive:
+                raise ScreenError("CONTROL_UNAVAILABLE")
+            state = self.authority.acquire(viewer, self.generation, epoch, pending=True)
+            if self.observers.drain_except(viewer):
+                try:
+                    state = self.authority.confirm_acquire(viewer, self.generation, state["epoch"])
+                except ScreenError as error:
+                    if error.code != "TAKEOVER_PENDING":
+                        raise
+            return state
         if method == "open":
             if not self.authority.may_input(viewer, self.generation, epoch):
                 raise ScreenError("VIEWER_MISMATCH")

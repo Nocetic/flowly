@@ -515,6 +515,7 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
     from playwright.async_api import async_playwright
 
     import flowly.profile as profiles
+    from flowly.desktop_runtime.input_service import InputServiceClient
     from flowly.gateway.display import STREAM_PATH
     from flowly.gateway.server import GatewayServer
     from tests.test_screen_display_gateway import RfbSocket
@@ -574,6 +575,31 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                             pixels.extend(await rfb.read(width * height * 4))
                         # Real Xvnc pixels, independent of Playwright screenshots.
                         assert pixels and any(pixels)
+                        # Two real gateway captures share the supervisor registry.
+                        # Takeover must close the other capture before acknowledging.
+                        await chat.send_json({"type": "rpc", "id": "other", "method": "display.observe", "params": {
+                            "profileId": profile, "expectedHostId": status["hostId"], "expectedBotId": status["botId"],
+                            "generation": state["generation"],
+                        }})
+                        other_view = (await chat.receive_json())["result"]
+                        other_headers = {**headers, "X-Flowly-Screen-Ticket": other_view["ticket"]}
+                        async with client.ws_connect(server.make_url(STREAM_PATH), headers=other_headers) as other:
+                            await RfbSocket(other).handshake()
+                            control = InputServiceClient(runtime.socket_directory / "input.sock")
+                            human = await asyncio.to_thread(
+                                control.request, "acquire", generation=state["generation"],
+                                viewer=observed["viewerId"], epoch=runtime.authority.snapshot()["epoch"],
+                            )
+                            try:
+                                assert human["control"] == "human"
+                                assert (await other.receive(timeout=5)).type in {
+                                    aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED,
+                                }
+                                # The holder's original capture remains usable.
+                                await screen.send_bytes(struct.pack("!BBHHHH", 3, 0, 200, 300, 8, 8))
+                                assert (await rfb.read(4))[0] == 0
+                            finally:
+                                runtime.authority.release(observed["viewerId"], state["generation"], human["epoch"])
                     assert runtime.status()["generation"] == state["generation"]
                     assert is_alive(state["supervisor"])
                     assert await page.locator("body").inner_text() == f"{profile} browser fixture"

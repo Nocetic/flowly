@@ -59,7 +59,7 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
     tests/test_screen_tickets.py tests/test_screen_launcher.py tests/test_screen_execution.py \
     tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
     tests/test_screen_cli.py tests/test_screen_profile_binding.py tests/test_screen_display_gateway.py \
-    tests/test_screen_input_broker.py tests/test_screen_input_service.py \
+    tests/test_screen_input_broker.py tests/test_screen_input_service.py tests/test_screen_observers.py \
     tests/integration/screen/test_xvnc_browser.py -q \
     --basetemp=/tmp/screen-tests -p no:cacheprovider
 ```
@@ -73,7 +73,7 @@ pause/resume RPC or Desktop UI. No model is invoked.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
-The expanded Linux screen suite passed **198 tests** on the environment above.
+The expanded Linux screen suite passed **205 tests** on the environment above.
 The authenticated direct display endpoint also delivers real Xvnc pixels for
 the default and named profiles. Its single-use tickets are bound to the host,
 profile and runtime generation; gateway credentials and tickets use headers.
@@ -103,6 +103,17 @@ The real Linux test exits a separate worker after pressing Shift, adopts its
 broker from another client, deduplicates the retry and releases Shift. New
 runtime manifests advertise `inputServiceVersion: 1`; an already-running older
 supervisor does not gain this capability by gateway reconnect alone.
+
+The supervisor also tracks capture leases across gateway workers. Takeover first
+fences agent actions, then revokes other viewers and waits for the gateway to
+close both its RFB source and public WebSocket before confirming human control.
+A live worker that cannot acknowledge teardown leaves takeover pending. The
+holder's original capture remains open. The real default/named-profile gateway
+tests exercise this with two Xvnc streams. Public WebSocket close waits are
+bounded independently of remote close acknowledgements; an idle client must not
+hold a healthy gateway's capture lease open. Runtime manifests now additionally
+advertise `observerServiceVersion: 1`. This is still private control integration,
+not the completed public control RPC or product sidebar.
 
 Supervisor death or unknown input outcome retains human ownership and requires explicit recovery;
 automatic timeout/disconnect release is intentionally absent. Extended pointer,

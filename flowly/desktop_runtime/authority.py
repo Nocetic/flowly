@@ -258,7 +258,8 @@ class ScreenAuthority:
                 raise ScreenError("SCREEN_BUSY")
             state["run"] = None
 
-    def acquire(self, viewer: str, generation: str, epoch: int, *, reclaim: bool = False) -> dict:
+    def acquire(self, viewer: str, generation: str, epoch: int, *, reclaim: bool = False,
+                pending: bool = False) -> dict:
         _identity(viewer)
         with self._transaction() as state:
             self._check(state, generation, epoch)
@@ -268,7 +269,7 @@ class ScreenAuthority:
                 if state["input"] is not None:
                     raise ScreenError("INPUT_DRAIN_REQUIRED")
                 state.update(viewer=viewer, epoch=state["epoch"] + 1,
-                             control="human-pending" if state["action"] is not None else "human")
+                             control="human-pending" if pending or state["action"] is not None else "human")
         return _public(state)
 
     def confirm_acquire(self, viewer: str, generation: str, epoch: int) -> dict:
@@ -334,5 +335,14 @@ class ScreenAuthority:
             with self._transaction() as state:
                 self._check(state, generation, epoch)
                 return state["control"] == "human" and state["viewer"] == viewer
+        except ScreenError:
+            return False
+
+    def may_observe(self, viewer: str, generation: str) -> bool:
+        try:
+            _identity(viewer)
+            with self._transaction() as state:
+                self._check(state, generation)
+                return state["control"] == "agent" or state["viewer"] == viewer
         except ScreenError:
             return False
