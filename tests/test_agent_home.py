@@ -6,7 +6,13 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import flowly.profile as profiles
-from flowly.agent_home import HOME_SESSION, AgentHomeError, finish_setup, resolve_home, setup_guidance
+from flowly.agent_home import (
+    HOME_SESSION,
+    AgentHomeError,
+    finish_setup,
+    resolve_home,
+    setup_guidance,
+)
 from flowly.session.manager import SessionManager
 
 
@@ -78,7 +84,9 @@ def test_crash_after_transcript_before_state_recovers_without_duplicate(agent):
     assert len(manager(agent).get_full_messages(HOME_SESSION)) == 1
 
 
-@pytest.mark.parametrize("content", ["", "garbage", '{"_type":"metadata","metadata":{}}\nnot-json\n'])
+@pytest.mark.parametrize(
+    "content", ["", "garbage", '{"_type":"metadata","metadata":{}}\nnot-json\n']
+)
 def test_corruption_never_becomes_an_empty_home(agent, content):
     sm = manager(agent)
     path = sm._get_session_path(HOME_SESSION)
@@ -109,7 +117,13 @@ def test_profile_identity_change_is_not_adopted(agent):
 
 def test_internal_sessions_and_default_never_get_introduction(agent, monkeypatch):
     resolve_home({})
-    for key in ["desktop:profile-room:r", "desktop:profile-inbox:a", "cron:task", "desktop:voice-work:x", "desktop:chat-old"]:
+    for key in [
+        "desktop:profile-room:r",
+        "desktop:profile-inbox:a",
+        "cron:task",
+        "desktop:voice-work:x",
+        "desktop:chat-old",
+    ]:
         assert setup_guidance(key) is None
     monkeypatch.setenv("FLOWLY_HOME", str(profiles._DEFAULT_HOME))
     assert setup_guidance(HOME_SESSION) is None
@@ -137,12 +151,38 @@ def test_full_clone_keeps_transcript_but_not_original_setup(agent, monkeypatch):
     assert len(manager(cloned).get_full_messages(HOME_SESSION)) == 1
 
 
+@pytest.mark.parametrize("opened", [False, True])
+def test_duplicate_import_does_not_restart_original_setup(agent, monkeypatch, tmp_path, opened):
+    if opened:
+        resolve_home({})
+    archive = profiles.export_profile("marketing", str(tmp_path / "backup"))
+    imported = profiles.import_profile(str(archive), name="imported")
+    monkeypatch.setenv("FLOWLY_HOME", str(imported))
+    assert resolve_home({})["setup"] == "not_required"
+    assert len(manager(imported).get_full_messages(HOME_SESSION)) == int(opened)
+
+
+def test_backup_restore_preserves_setup_and_transcript(agent, monkeypatch, tmp_path):
+    expected = resolve_home({})
+    expected = finish_setup({"state": "skipped"})
+    messages = manager(agent).get_full_messages(HOME_SESSION)
+    archive = profiles.export_profile("marketing", str(tmp_path / "backup"))
+    profiles.delete_profile("marketing")
+    restored = profiles.import_profile(str(archive), name="restored", identity="restore")
+    monkeypatch.setenv("FLOWLY_HOME", str(restored))
+    assert resolve_home({}) == expected
+    assert manager(restored).get_full_messages(HOME_SESSION) == messages
+
+
 @pytest.mark.asyncio
 async def test_persistent_home_stream_fans_out_without_changing_other_sessions(agent):
     from unittest.mock import AsyncMock
+
     from flowly.gateway.server import GatewayServer
+
     class Socket:
         closed = False
+
     server = object.__new__(GatewayServer)
     server._session_ws = {}
     server._ws_send = AsyncMock()
@@ -164,12 +204,16 @@ async def test_persistent_home_stream_fans_out_without_changing_other_sessions(a
 @pytest.mark.asyncio
 async def test_identity_envelope_is_verified_before_gmail_schema(agent, monkeypatch):
     from unittest.mock import AsyncMock
-    from flowly.channels import feature_rpc
+
     import flowly.integrations.gmail_rpc as gmail
+    from flowly.channels import feature_rpc
+
     handler = AsyncMock(return_value={"ok": True})
     monkeypatch.setattr(gmail, "gmail_rpc", handler)
     bot_id = resolve_home({})["botId"]
-    assert (await feature_rpc.dispatch("gmail.capabilities", {"expectedBotId": bot_id}))[0] == {"ok": True}
+    assert (await feature_rpc.dispatch("gmail.capabilities", {"expectedBotId": bot_id}))[0] == {
+        "ok": True
+    }
     handler.assert_awaited_once_with("gmail.capabilities", {})
     with pytest.raises(feature_rpc.FeatureRpcError) as error:
         await feature_rpc.dispatch("gmail.capabilities", {"expectedBotId": "replaced"})
@@ -180,7 +224,9 @@ async def test_identity_envelope_is_verified_before_gmail_schema(agent, monkeypa
 @pytest.mark.asyncio
 async def test_gateway_paging_preserves_legacy_contract_and_validates_cursor(agent):
     from unittest.mock import AsyncMock
+
     from flowly.gateway.server import GatewayServer
+
     resolve_home({})
     sm = manager(agent)
     session = sm.get_or_create(HOME_SESSION)
@@ -199,7 +245,9 @@ async def test_gateway_paging_preserves_legacy_contract_and_validates_cursor(age
     await server._ws_rpc_chat_history(None, "legacy", {"sessionKey": HOME_SESSION})
     assert len(server._ws_rpc_reply.await_args.args[2]["messages"]) == 101
     assert "historyPageVersion" not in server._ws_rpc_reply.await_args.args[2]
-    await server._ws_rpc_chat_history(None, "invalid", {"sessionKey": HOME_SESSION, "limit": 10, "before": "bad"})
+    await server._ws_rpc_chat_history(
+        None, "invalid", {"sessionKey": HOME_SESSION, "limit": 10, "before": "bad"}
+    )
     assert server._ws_rpc_error.await_args.args[2] == "INVALID_HISTORY_CURSOR"
 
 
@@ -207,6 +255,7 @@ async def test_gateway_paging_preserves_legacy_contract_and_validates_cursor(age
 async def test_tool_cannot_finish_setup_from_another_session(agent):
     from flowly.agent.tool_context import tool_execution_scope
     from flowly.agent.tools.agent_setup import AgentSetupFinishTool
+
     resolve_home({})
     tool = AgentSetupFinishTool()
     with tool_execution_scope("desktop:profile-room:room"):
@@ -219,8 +268,12 @@ async def test_tool_cannot_finish_setup_from_another_session(agent):
 @pytest.mark.asyncio
 async def test_profile_rpc_dispatch_and_validation(agent):
     from flowly.channels.feature_rpc import dispatch
-    from flowly.profile_host_contract import validate_profile_rpc, ProfileHostError
-    for method, params in [("agent.home.get", {"locale": "en"}), ("agent.home.setup", {"state": "complete"})]:
+    from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
+
+    for method, params in [
+        ("agent.home.get", {"locale": "en"}),
+        ("agent.home.setup", {"state": "complete"}),
+    ]:
         validate_profile_rpc(method, params)
         result, restart = await dispatch(method, params)
         assert result["sessionKey"] == HOME_SESSION
@@ -237,22 +290,44 @@ async def test_profile_rpc_dispatch_and_validation(agent):
 @pytest.mark.asyncio
 async def test_gateway_identity_pins_native_history_but_not_outer_profile_routing(agent):
     from unittest.mock import AsyncMock
+
     from flowly.gateway.server import GatewayServer
+
     server = GatewayServer(advertise_control=False)
     server._ws_rpc_chat_history = AsyncMock()
     server._ws_rpc_error = AsyncMock()
     server._handle_profile_host_rpc = AsyncMock()
-    await server._dispatch_ws_rpc(None, "client", {"id": "one", "method": "chat.history",
-        "params": {"expectedBotId": "wrong", "sessionKey": HOME_SESSION}})
+    await server._dispatch_ws_rpc(
+        None,
+        "client",
+        {
+            "id": "one",
+            "method": "chat.history",
+            "params": {"expectedBotId": "wrong", "sessionKey": HOME_SESSION},
+        },
+    )
     assert server._ws_rpc_error.await_args.args[2] == "PROFILE_IDENTITY_CHANGED"
     server._ws_rpc_chat_history.assert_not_awaited()
-    await server._dispatch_ws_rpc(None, "client", {"id": "two", "method": "profiles.rpc",
-        "params": {"name": "other", "expectedBotId": "other-id", "method": "agent.home.get", "params": {}}})
+    await server._dispatch_ws_rpc(
+        None,
+        "client",
+        {
+            "id": "two",
+            "method": "profiles.rpc",
+            "params": {
+                "name": "other",
+                "expectedBotId": "other-id",
+                "method": "agent.home.get",
+                "params": {},
+            },
+        },
+    )
     server._handle_profile_host_rpc.assert_awaited_once()
 
 
 def test_destructive_reset_is_blocked_only_for_named_home(agent):
     from flowly.agent.loop import AgentLoop
+
     loop = object.__new__(AgentLoop)
     with pytest.raises(AgentHomeError) as error:
         loop.reset_conversation(HOME_SESSION)
@@ -262,8 +337,10 @@ def test_destructive_reset_is_blocked_only_for_named_home(agent):
 @pytest.mark.asyncio
 async def test_delete_aliases_preserve_protection_and_legacy_compatibility(agent):
     from unittest.mock import AsyncMock
+
     from flowly.gateway.server import GatewayServer
-    from flowly.profile_host_contract import validate_profile_rpc, ProfileHostError
+    from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
+
     server = object.__new__(GatewayServer)
     server.sessions = manager(agent)
     server._ws_rpc_reply = AsyncMock()
@@ -278,4 +355,6 @@ async def test_delete_aliases_preserve_protection_and_legacy_compatibility(agent
         await server._ws_rpc_sessions_delete(None, "id", {field: legacy.key})
         assert server._ws_rpc_reply.await_args.args[2]["deleted"]
     with pytest.raises(ProfileHostError):
-        validate_profile_rpc("sessions.delete", {"key": HOME_SESSION, "sessionKey": "desktop:other"})
+        validate_profile_rpc(
+            "sessions.delete", {"key": HOME_SESSION, "sessionKey": "desktop:other"}
+        )

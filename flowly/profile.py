@@ -2326,6 +2326,7 @@ def _import_profile_archive(
             # The copied transcript is retained; optional setup belongs to the
             # original identity and must not resume on the duplicate.
             (extracted / "agent-home.json").unlink(missing_ok=True)
+            metadata.pop("agentHomeVersion", None)
         _atomic_write_json(extracted / _PROFILE_METADATA_FILE, metadata)
         _harden_profile_tree_permissions(extracted)
         with _profile_mutation_lock():

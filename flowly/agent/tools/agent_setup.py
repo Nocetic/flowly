@@ -1,4 +1,5 @@
 """Finish optional introduction without changing identity, memory or access."""
+
 import json
 
 from flowly.agent.tools.base import Tool
@@ -16,7 +17,9 @@ class AgentSetupFinishTool(Tool):
 
         origin = current_tool_origin()
         if origin is None or not is_agent_home(origin.session_key):
-            return json.dumps({"error": "Only the agent's own direct conversation can finish setup."})
+            return json.dumps(
+                {"error": "Only the agent's own direct conversation can finish setup."}
+            )
         try:
             return json.dumps(finish_setup({"state": "complete"}))
         except AgentHomeError as exc:

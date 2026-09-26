@@ -1,4 +1,5 @@
 """Additive display-history paging with stable, session-bound cursors."""
+
 from __future__ import annotations
 
 import base64
@@ -30,16 +31,27 @@ def history_page(rows: list[dict], session_key: str, params: dict) -> tuple[list
         try:
             if not isinstance(before, str) or not 1 <= len(before) <= 2048:
                 raise ValueError()
-            cursor = json.loads(base64.b64decode(before.encode("ascii"), altchars=b"-_", validate=True))
+            cursor = json.loads(
+                base64.b64decode(before.encode("ascii"), altchars=b"-_", validate=True)
+            )
             if not isinstance(cursor, list) or len(cursor) != 3 or cursor[:2] != [1, session_key]:
                 raise ValueError()
             end = identities.index(cursor[2])
         except (ValueError, UnicodeError, TypeError) as exc:
-            raise HistoryPageError("This history page is no longer available. Reopen the conversation to refresh it.") from exc
+            raise HistoryPageError(
+                "This history page is no longer available. Reopen the conversation to refresh it."
+            ) from exc
     start = max(0, end - limit)
     # Avoid splitting ordinary tool chains, but bound pathological long turns.
     while start > max(0, end - 200) and rows[start].get("role") != "user":
         start -= 1
-    page = [{**row, "id": row.get("id") or identities[index]} for index, row in enumerate(rows[start:end], start)]
-    cursor = base64.urlsafe_b64encode(json.dumps([1, session_key, identities[start]]).encode()).decode() if start > 0 else None
+    page = [
+        {**row, "id": row.get("id") or identities[index]}
+        for index, row in enumerate(rows[start:end], start)
+    ]
+    cursor = (
+        base64.urlsafe_b64encode(json.dumps([1, session_key, identities[start]]).encode()).decode()
+        if start > 0
+        else None
+    )
     return page, {"historyPageVersion": 1, "hasOlder": start > 0, "before": cursor}
