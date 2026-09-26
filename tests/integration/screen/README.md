@@ -282,7 +282,17 @@ The generated fixture token is not a product credential.
 Scope limits: the local model is deterministic and the page/account is synthetic;
 the browser, display, input, TLS and gateway are real. This single-profile gateway
 does not enable profile hosting, so Desktop exercises its Main Flowly fallback
-when `profiles.list` returns `PROFILE_HOST_UNAVAILABLE`. The explicit test-run
-browser grant is sent through generic RPC; the product chat composer selector is
-still required. This does not certify named-profile navigation, relay, packaged
-Windows/macOS, crash recovery or real third-party authentication.
+when `profiles.list` returns `PROFILE_HOST_UNAVAILABLE`. The upgraded smoke now
+uses the production composer: select Server browser, wait for identity discovery,
+then click Send. The actual chat hook, preload and main handler send the grant;
+opening Screen does not select it or start a task. The screenshot includes the
+selected browser in the composer. This does not certify named-profile navigation,
+relay, packaged Windows/macOS, crash recovery or third-party authentication.
+
+Browser grants now require immutable `botId` alongside host/profile/runtime
+identity. `display.capabilities`/status advertise `browserGrantVersion: 2`;
+Desktop refuses an older host for explicit server-browser selection. Core checks
+the identity again before claiming the run, closing replacement between chat
+admission and execution. Stream and input protocol versions remain unchanged.
+The expanded Linux suite passed **294 tests**, with two warnings, after this
+change. Complete Core/Desktop suite results are in Desktop's progress document.

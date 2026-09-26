@@ -39,11 +39,12 @@ def screen_gateway(tmp_path, monkeypatch):
     gateway._host_screen_checkpoint_identity = lambda: {"hostId": "host", "profileId": "default", "botId": "bot"}
     gateway._host_screen_browser = provider
     gateway._host_screen_identity = {"hostId": "host", "profileId": "default", "screenId": "browser"}
-    access = {**gateway._host_screen_identity, "providerId": "host-desktop-browser", "generation": "generation"}
+    access = {"botId": "bot", **gateway._host_screen_identity, "providerId": "host-desktop-browser", "generation": "generation"}
     return gateway, socket, provider, access
 
 
 @pytest.mark.parametrize(("field", "value", "code"), [
+    ("botId", "replacement", "BROWSER_PROVIDER_NOT_OWNED"),
     ("hostId", "other-host", "BROWSER_PROVIDER_NOT_OWNED"),
     ("profileId", "research", "BROWSER_PROVIDER_NOT_OWNED"),
     ("screenId", "other-screen", "INVALID_REQUEST"),
@@ -161,3 +162,15 @@ async def test_host_screenshot_preserves_reply_attachment_contract(tmp_path, mon
         assert "data:image" not in result
     finally:
         SCREEN_RUN_BINDING.reset(token)
+
+
+async def test_profile_identity_change_between_binding_and_run_does_not_claim_browser(screen_gateway):
+    gateway, socket, provider, access = screen_gateway
+    binding, error = gateway._browser_binding_for_chat("viewer", socket, access)
+    assert error is None
+    gateway._host_screen_checkpoint_identity = lambda: {"hostId": "host", "profileId": "default", "botId": "replacement"}
+    gateway.on_chat_message = AsyncMock()
+    await gateway._run_chat(socket, "viewer", "original-session", "work", "original-run", AsyncMock(), browser_binding=binding)
+    gateway.on_chat_message.assert_not_awaited()
+    assert provider.runtime.authority.snapshot()["runId"] is None
+    assert socket.messages[-1]["data"]["errorCode"] == "PROFILE_IDENTITY_CHANGED"

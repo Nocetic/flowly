@@ -6,7 +6,7 @@ from flowly.desktop_runtime.authority import ScreenError
 
 
 def validate_browser_grant(value: Any) -> dict[str, str]:
-    fields = {"providerId", "hostId", "profileId", "screenId", "generation"}
+    fields = {"providerId", "hostId", "botId", "profileId", "screenId", "generation"}
     if not isinstance(value, dict) or set(value) != fields:
         raise ScreenError("INVALID_PARAMS")
     for item in value.values():

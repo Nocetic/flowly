@@ -844,6 +844,7 @@ class ProfileHost:
             self._check_rpc_profile_identity(name, expected_bot_id)
         if screen_grant is not None and (
             screen_grant["hostId"] != self.host_id or screen_grant["profileId"] != name
+            or screen_grant["botId"] != expected_bot_id
         ):
             raise ProfileHostError(
                 "PROFILE_IDENTITY_CHANGED", "The screen does not belong to the selected profile.",

@@ -182,6 +182,7 @@ class _BrowserRunBinding:
     provider_id: str | None = None
     registration_id: str | None = None
     screen_generation: str | None = None
+    screen_bot_id: str | None = None
 
 
 _BROWSER_RUN_BINDING: ContextVar[_BrowserRunBinding | None] = ContextVar(
@@ -3231,6 +3232,8 @@ class GatewayServer:
                 from flowly.desktop_runtime.run_checkpoint import ScreenRunCheckpoint
 
                 identity = self._host_screen_checkpoint_identity()
+                if identity["botId"] != browser_binding.screen_bot_id:
+                    raise ScreenRunError("PROFILE_IDENTITY_CHANGED")
                 screen_checkpoint = await ScreenRunCheckpoint.start(screen_binding.provider, identity,
                     session_key, run_id, screen_binding.generation)
                 screen_binding = ScreenRunBinding(screen_binding.provider, screen_binding.generation, run_id, screen_checkpoint)
@@ -3863,6 +3866,7 @@ class GatewayServer:
                 return denied, {"code": "INVALID_REQUEST", "message": "The screen grant is invalid"}
             try:
                 identity, screen_provider = self._get_host_screen_browser()
+                identity = {**identity, **self._host_screen_checkpoint_identity()}
                 state = screen_provider.runtime.status()
             except (ScreenError, OSError):
                 return denied, {"code": "CONTROL_UNAVAILABLE", "message": "The screen runtime needs recovery"}
@@ -3873,7 +3877,7 @@ class GatewayServer:
             if raw_access.get("generation") != state["generation"]:
                 return denied, {"code": "STALE_GENERATION", "message": "The screen restarted; select the current session"}
             return _BrowserRunBinding(client_id=client_id, provider_id=provider_id,
-                                      screen_generation=state["generation"]), None
+                                      screen_generation=state["generation"], screen_bot_id=identity["botId"]), None
         registration_id = raw_access.get("registrationId")
         if not isinstance(provider_id, str) or not provider_id:
             return denied, {

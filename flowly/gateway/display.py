@@ -78,7 +78,8 @@ class DisplaySession:
                 "view": capability["supported"], "input": _supports_input(state),
                 "viewerClose": bool(state and state.get("inputServiceVersion") == 3
                                     and state.get("observerServiceVersion") == 3),
-                "lifecycle": False, "installSupported": False, "statusEvents": True, "resumeSupported": True}
+                "lifecycle": False, "installSupported": False, "statusEvents": True, "resumeSupported": True,
+                "browserGrantVersion": 2}
 
     @property
     def viewers(self) -> ViewerCredentials:

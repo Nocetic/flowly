@@ -431,7 +431,7 @@ async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp
     gateway = GatewayServer(host="127.0.0.1", port=0, auth_token="test-gateway-token", require_loopback_auth=True)
     gateway._host_screen_browser = provider
     gateway._host_screen_identity = {"hostId": profiles.get_or_create_profile_host_id(), "profileId": "default", "screenId": "browser"}
-    access = {**gateway._host_screen_identity, "providerId": "host-desktop-browser", "generation": generation}
+    access = {"botId": profiles.ensure_profile_bot_id("default").bot_id, **gateway._host_screen_identity, "providerId": "host-desktop-browser", "generation": generation}
 
     class LocalModel(LLMProvider):
         calls = 0

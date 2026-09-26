@@ -10,9 +10,9 @@ from flowly.profile_host import ProfileHost
 from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
 
 
-def grant(host_id="host", profile="writer"):
+def grant(host_id="host", profile="writer", bot_id="bot"):
     return {"providerId": "host-desktop-browser", "hostId": host_id,
-            "profileId": profile, "screenId": "browser", "generation": "generation"}
+            "profileId": profile, "botId": bot_id, "screenId": "browser", "generation": "generation"}
 
 
 def message(access):
@@ -63,15 +63,17 @@ async def test_screen_profile_requires_pinned_identities_before_starting_runtime
     host._target_rpc.assert_not_awaited()
 
 
-@pytest.mark.parametrize("mismatch", ["host", "profile", "bot", "expected-host"])
+@pytest.mark.parametrize("mismatch", ["host", "profile", "bot", "grant-bot", "expected-host"])
 async def test_screen_profile_rejects_target_drift_before_starting_runtime(screen_host, mismatch):
     host, bot_id = screen_host
-    access = grant(host.host_id)
+    access = grant(host.host_id, bot_id=bot_id)
     expected_host = host.host_id
     if mismatch == "host":
         access["hostId"] = "other"
     elif mismatch == "profile":
         access["profileId"] = "default"
+    elif mismatch == "grant-bot":
+        access["botId"] = "replacement"
     elif mismatch == "bot":
         bot_id = "deleted-and-recreated"
     else:
@@ -85,7 +87,7 @@ async def test_screen_profile_rejects_target_drift_before_starting_runtime(scree
 
 async def test_screen_profile_forwards_exact_grant_with_startup_identity_guard(screen_host):
     host, bot_id = screen_host
-    access = grant(host.host_id)
+    access = grant(host.host_id, bot_id=bot_id)
     assert await host.rpc("writer", "chat.send", message(access),
                           expected_host_id=host.host_id, expected_bot_id=bot_id) == {"runId": "run"}
     forwarded = host._target_rpc.await_args
@@ -107,7 +109,7 @@ async def test_screen_profile_rechecks_recreated_identity_after_runtime_start(sc
     host._ensure_runtime = start
     host._rpc = AsyncMock()
     with pytest.raises(ProfileHostError) as error:
-        await host.rpc("writer", "chat.send", message(grant(host.host_id)),
+        await host.rpc("writer", "chat.send", message(grant(host.host_id, bot_id=bot_id)),
                        expected_host_id=host.host_id, expected_bot_id=bot_id)
     assert error.value.code == "PROFILE_IDENTITY_CHANGED"
     host._rpc.assert_not_awaited()
@@ -192,7 +194,7 @@ async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(scr
                             if frame.get("type") == "rpc" and frame.get("id") == request_id:
                                 return frame
 
-                access = grant(host.host_id, target)
+                access = grant(host.host_id, target, bot_id)
                 stale = await send({**access, "generation": "old-generation"}, "stale")
                 assert stale["error"]["code"] == "STALE_GENERATION"
                 provider._dispatch.assert_not_awaited()
