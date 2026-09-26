@@ -131,3 +131,25 @@ def test_cli_never_falls_back_to_echoing_sudo_password(monkeypatch):
     result = CliRunner().invoke(screen_cmd.screen_app, ["install-system", "--plan-id", "a" * 64, "--operation-id", "b" * 32, "--ask-sudo"])
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {"error": "INSTALL_TERMINAL_REQUIRED"}
+
+
+def test_python_plan_and_receipt_are_readonly(monkeypatch):
+    monkeypatch.setattr(screen_cmd, "python_plan", lambda: {"scope": "agent-python"})
+    read = Mock(return_value={"state": "running"})
+    monkeypatch.setattr(screen_cmd, "python_status", read)
+    monkeypatch.setattr(screen_cmd, "install_python", lambda *a: pytest.fail("read-only"))
+    assert json.loads(CliRunner().invoke(screen_cmd.screen_app, ["install-python-plan"]).stdout) == {"scope": "agent-python"}
+    result = CliRunner().invoke(screen_cmd.screen_app, ["install-python-status", "--operation-id", "b" * 32])
+    assert json.loads(result.stdout) == {"state": "running"}
+    read.assert_called_once_with("b" * 32)
+
+
+@pytest.mark.parametrize("state,exit_code", [("succeeded", 0), ("recovery_required", 1)])
+def test_python_install_requires_explicit_plan_and_operation(monkeypatch, state, exit_code):
+    install = Mock(return_value={"state": state, "restartRequired": True})
+    monkeypatch.setattr(screen_cmd, "install_python", install)
+    monkeypatch.setattr(screen_cmd.getpass, "getpass", lambda *a: pytest.fail("never sudo"))
+    result = CliRunner().invoke(screen_cmd.screen_app, ["install-python", "--plan-id", "a" * 64, "--operation-id", "b" * 32])
+    assert result.exit_code == exit_code
+    install.assert_called_once_with("a" * 64, "b" * 32)
+    assert json.loads(result.stdout)["restartRequired"]

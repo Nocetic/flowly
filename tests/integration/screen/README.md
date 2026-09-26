@@ -457,3 +457,53 @@ Targeted Ruff and diff checks passed. The macOS CLI plan/help smoke reported an
 unsupported install host without executing the Linux worker. The Desktop changed
 only its engineering progress document in this increment; its prior screen UI
 verification is not being relabeled as installer UI verification.
+
+
+## Optional Python dependencies in the agent environment
+
+`flowly screen install-python-plan` previews a fixed, hash-locked recipe without
+creating state or launching a subprocess. `install-python --plan-id <planId>
+--operation-id <32-hex-id>` installs in the current agent virtualenv;
+`install-python-status --operation-id <id>` reads its durable receipt. These
+commands do not use sudo, target system Python, restart the agent, or launch a
+browser. Frozen builds require their own managed build update instead.
+
+The bundled requirements contain the complete Playwright dependency closure,
+with exact versions and Linux/pure wheel hashes checked against `uv.lock` by a
+test. The worker disables dependency resolution, source builds, Python downloads,
+configuration discovery and persistent uv caching. It uses the explicit PyPI
+index and a minimal environment without inherited credentials. Verification
+requires both exact package metadata and a fresh Playwright driver start/stop.
+A changed environment reports `restartRequired`; restart coordination remains a
+separate integration task and must preserve active tasks.
+
+One private lock and at most 128 receipts belong to each virtualenv, shared by
+its profiles. Accepted work survives loss of its invoking process. Same-ID
+retries return the recorded result; interrupted or partially installed work
+requires explicit recovery instead of automatic replay. Recovery and receipt
+maintenance are still pending. Installation has a 300-second command timeout,
+driver verification 15 seconds, and the caller a 330-second observation timeout;
+timeout cleanup preserves the process-group leader until signals are sent.
+
+The opt-in integration tests create disposable virtualenvs inside the Linux
+fixture and leave the fixture's existing agent environment unchanged:
+
+```sh
+docker run --rm \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  -e FLOWLY_SCREEN_PYTHON_INSTALL_TEST=1 flowly-screen-gateway-test:bookworm \
+  python -m pytest tests/integration/screen/test_python_installer.py \
+    tests/test_screen_python_install.py tests/test_screen_cli.py \
+    -q --basetemp=/tmp/screen-python-install-tests -p no:cacheprovider
+```
+
+This final Linux subset passed **41 tests** in 17.87 seconds, including real
+installation after caller loss, durable replay, fresh driver startup, and an
+intentionally wrong wheel hash rejected with the actual hash-mismatch diagnostic.
+The matching local Python installer/CLI subset passed 39 tests. This does not
+certify a Desktop installation UI, root-host runtime provisioning or relay install
+admission; `installSupported` remains false until the complete flow is connected.
+
+The complete Core suite after this Python installer change passed **6,556 tests**,
+with 32 skipped, 12 deselected and 13 warnings in 298.01 seconds. Targeted Ruff
+and whitespace checks passed. Opt-in Linux evidence is recorded separately above.

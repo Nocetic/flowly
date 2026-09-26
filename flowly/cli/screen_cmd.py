@@ -11,6 +11,7 @@ from filelock import Timeout
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.installer import install_plan, install_status, install_system
 from flowly.desktop_runtime.launcher import ScreenRuntime
+from flowly.desktop_runtime.python_installer import install_python, python_plan, python_status
 from flowly.profile import current_profile_name, get_flowly_home
 
 screen_app = typer.Typer(help="Manage this profile's remote browser screen (Linux).", no_args_is_help=True)
@@ -67,6 +68,37 @@ def doctor() -> None:
 def installation_plan() -> None:
     """Preview the fixed host package plan; does not install or request sudo."""
     _print(install_plan())
+
+
+@screen_app.command("install-python-plan")
+def installation_python_plan() -> None:
+    """Preview the locked screen packages for this agent's Python environment."""
+    _print(python_plan())
+
+
+@screen_app.command("install-python-status")
+def installation_python_status(operation_id: str = typer.Option(...)) -> None:
+    """Read a Python installation receipt without changing the environment."""
+    try:
+        _print(python_status(operation_id))
+    except ScreenError as exc:
+        _error(exc)
+
+
+@screen_app.command("install-python")
+def installation_python(plan_id: str = typer.Option(...), operation_id: str = typer.Option(...)) -> None:
+    """Install reviewed wheel hashes into this virtualenv without sudo.
+
+    A successful receipt reports restartRequired if existing agent processes
+    need restarting to use changed packages. This command does not restart them.
+    """
+    try:
+        receipt = install_python(plan_id, operation_id)
+        _print(receipt)
+        if receipt["state"] != "succeeded":
+            raise typer.Exit(1)
+    except ScreenError as exc:
+        _error(exc)
 
 
 @screen_app.command("install-status")
