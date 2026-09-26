@@ -20,6 +20,7 @@ from aiohttp import WSMsgType, web
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.handoff import RunHandoffs
 from flowly.desktop_runtime.input_service import InputServiceClient
+from flowly.desktop_runtime.install_jobs import ScreenInstallJobs
 from flowly.desktop_runtime.install_plan import installation_plan
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.desktop_runtime.lifecycle import ScreenLifecycle
@@ -35,7 +36,7 @@ from flowly.gateway.mcp_management import _protected_socket
 METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create", "display.viewer.close",
                      "display.control.acquire", "display.control.release", "display.control.reclaim",
                      "display.subscribe", "display.unsubscribe", "display.run.resume",
-                     "display.start", "display.stop", "display.operation.status", "display.doctor", "display.install.plan"})
+                     "display.start", "display.stop", "display.operation.status", "display.doctor", "display.install.plan", "display.install.status"})
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
@@ -276,9 +277,9 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             return
         allowed = {"profileId", "expectedHostId", "expectedBotId"}
         pinned = method not in {"display.capabilities", "display.status"}
-        if pinned and method not in {"display.subscribe", "display.operation.status", "display.doctor", "display.install.plan"}:
+        if pinned and method not in {"display.subscribe", "display.operation.status", "display.doctor", "display.install.plan", "display.install.status"}:
             allowed.add("generation")
-        if method in {"display.start", "display.stop", "display.operation.status"}:
+        if method in {"display.start", "display.stop", "display.operation.status", "display.install.status"}:
             allowed.add("operationId")
         if method == "display.observe":
             allowed.add("viewerToken")
@@ -292,6 +293,15 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
         if method == "display.install.plan":
             result = await asyncio.to_thread(installation_plan, session.identity)
             await asyncio.to_thread(_resolve, gateway, params, pinned=True)
+            await gateway._ws_rpc_reply(ws, rpc_id, result)
+            return
+        if method == "display.install.status":
+            def installation_status():
+                jobs = ScreenInstallJobs(session.identity, lambda: _resolve(gateway, params, pinned=True))
+                result = jobs.status(params.get("operationId"))
+                _resolve(gateway, params, pinned=True)
+                return result
+            result = await asyncio.to_thread(installation_status)
             await gateway._ws_rpc_reply(ws, rpc_id, result)
             return
         if method == "display.doctor":
