@@ -564,3 +564,64 @@ The earlier one-off initial-pixel timeout and Electron failure-cleanup SIGTRAP d
 not recur in these runs; their underlying causes are not established by this
 harness correction. This evidence covers the direct primary-profile fixture on
 this host, not the still-pending relay/platform matrix or installation execution UI.
+
+
+## Durable installation orchestration
+
+`ScreenInstallJobs` composes the fixed system-package and current-virtualenv Python
+installers behind a bounded background worker. It is an internal admission target;
+this increment does not enable installation RPCs, accept remote passwords or flip
+`installSupported`/`applySupported`. The authenticated capability and UI execution
+flow, root-host runtime account, restart coordination and recovery remain pending.
+
+The environment owns a private SQLite job store beneath its existing screen
+installer directory. Profiles in the same environment share its single active-job
+rule; different environment processes are also fenced by persisted active records.
+The privileged package worker still serializes package-manager access host-wide.
+One process worker slot is available, with no unbounded executor queue. At most
+128 receipts are retained without pruning, so forgotten IDs cannot replay installs.
+
+A job is pinned to host/bot/profile/screen and the combined reviewed recipe. It
+records system/Python phases, completed steps and restart requirements. Submission
+returns after durable admission; recreating the calling controller does not own or
+cancel work. Same-ID retries return the existing result even after package versions
+change. A lost gateway process or expired observation deadline reports recovery;
+it cannot automatically resume the pipeline. The underlying system/Python worker
+receipt can still exist after that process loss. Recovering and reconciling those
+receipts is separate required work.
+
+Passwords are validated before admission, passed only in memory to the fixed
+system installer, and excluded from the database and public result. Dropping a
+Python reference is not a secure-erasure guarantee. Privilege errors only permit a
+new attempt when the privileged worker has no accepted receipt; ambiguous output
+or a partially completed pipeline remains recovery-required. Identity is rechecked
+before mutation and between stages. Deadline expiry prevents beginning a new stage.
+No browser or agent restart is performed by the installation job.
+
+The clean orchestration fixture starts without the OS screen packages and without
+Playwright/pyee/greenlet in its user-owned agent environment:
+
+```sh
+docker build -t flowly-screen-install-jobs-test:bookworm \
+  -f tests/integration/screen/Dockerfile.install-jobs .
+docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  -e FLOWLY_SCREEN_INSTALL_JOBS_TEST=1 flowly-screen-install-jobs-test:bookworm \
+  python -m pytest tests/integration/screen/test_install_jobs.py \
+    tests/test_screen_install_jobs.py -q --basetemp=/tmp/screen-install-jobs-tests -p no:cacheprovider
+```
+
+The integration test requires prompt asynchronous admission, recreates its status
+controller during installation, checks both underlying receipts, verifies replay
+without executing another pipeline, checks password absence in the database, and
+explicitly starts/stops sandboxed Chromium after installation has completed.
+
+
+Validation for this increment: real clean Debian orchestration plus its then-current
+unit suite passed **23 tests** in 185.62 seconds. The complete Core run passed
+**6,584 tests**, 33 skipped, 12 deselected and 13 warnings in 294.28 seconds.
+After that run collected tests, final deadline/capacity/private-file checks were
+completed. The final job/system/Python installer subset passed **83 tests** on
+macOS and **83 tests** in Linux, including 25 job tests. Targeted Ruff and diff
+checks passed. The non-POSIX job entry explicitly reports an unsupported host;
+these Linux installation tests do not certify a Windows installation runtime.

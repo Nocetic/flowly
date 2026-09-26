@@ -1,0 +1,8 @@
+# User-owned source-install environment with both optional dependency groups absent.
+FROM flowly-screen-gateway-test:bookworm AS tools
+FROM flowly-screen-installer-test:bookworm
+USER root
+COPY --from=tools /usr/local/bin/uv /usr/local/bin/uv
+RUN chown -R install-test:install-test /opt/flowly/.venv
+USER install-test
+RUN uv --no-config pip uninstall --python /opt/flowly/.venv/bin/python playwright pyee greenlet
