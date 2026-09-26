@@ -248,6 +248,8 @@ class WebChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: WebChannelConfig = config
         self._ws = None
+        self._screen_gateway = None
+        self._screen_streams = None
         self._reconnect_delay = 5  # seconds
         self._max_reconnect_delay = 60
         # Track active browser sessions: sessionId → asyncio.Event (response ready)
@@ -315,6 +317,10 @@ class WebChannel(BaseChannel):
         self._profile_run_bindings: dict[
             tuple[str, str], tuple[str, float]
         ] = {}
+
+    def set_screen_gateway(self, gateway) -> None:
+        """Bind the owned local gateway; relay requests can never choose an endpoint."""
+        self._screen_gateway = gateway
 
     @property
     def cron_session_id(self) -> str | None:
@@ -1487,13 +1493,24 @@ class WebChannel(BaseChannel):
             self._subagent_event_versions.clear()
             self._clear_profile_subagent_observers()
             self._ws = ws
+            if self._screen_gateway is not None:
+                from flowly.desktop_runtime.relay_stream import RelayScreenStreams
+                def stream_token():
+                    issued = int(time.time())
+                    return jwt.encode({**payload, "iat": issued, "exp": issued + 60}, jwt_secret, algorithm="HS256")
+                try:
+                    self._screen_streams = RelayScreenStreams(
+                        relay_url=self.config.relay_url, server_id=self.config.server_id,
+                        token=stream_token, gateway=self._screen_gateway,
+                        current=lambda: self._ws is ws, ssl_context=ssl_ctx,
+                    )
+                except ValueError:
+                    self._screen_streams = None
             logger.info("[WebChannel] Connected to relay proxy")
 
             # Replay anything that piled up while disconnected. Done before
             # entering the recv loop so a fresh inbound message can't race
             # against a stale outbound one.
-            await self._flush_outbound_queue()
-
             long_rpc_tasks: set[asyncio.Task[None]] = set()
 
             def _long_rpc_done(task: asyncio.Task[None]) -> None:
@@ -1508,6 +1525,7 @@ class WebChannel(BaseChannel):
                     )
 
             try:
+                await self._flush_outbound_queue()
                 async for raw in ws:
                     if not self._running:
                         break
@@ -1540,6 +1558,9 @@ class WebChannel(BaseChannel):
                     task.cancel()
                 if pending_long_rpcs:
                     await asyncio.gather(*pending_long_rpcs, return_exceptions=True)
+                if self._screen_streams is not None:
+                    await self._screen_streams.close()
+                    self._screen_streams = None
                 self._clear_profile_subscriptions()
                 self._subagent_observers.clear()
                 self._subagent_event_versions.clear()
@@ -1597,6 +1618,10 @@ class WebChannel(BaseChannel):
         msg_type = msg.get("type")
 
         if msg_type == "ready":
+            from flowly.desktop_runtime.relay_stream import PROTOCOL
+            if (ws is self._ws and self._screen_streams is not None and self._screen_streams.available
+                    and PROTOCOL in (msg.get("capabilities") or [])):
+                await ws.send(json.dumps({"type": "screen.transport.ready", "protocol": PROTOCOL}))
             cron_session_id = msg.get("cronSessionId")
             if cron_session_id:
                 self._cron_session_id = cron_session_id
@@ -1612,6 +1637,10 @@ class WebChannel(BaseChannel):
                         asyncio.create_task(result)
                 except Exception as e:
                     logger.warning(f"[WebChannel] on_ready callback failed: {e}")
+
+        elif msg_type == "screen.stream.open":
+            if ws is self._ws and self._screen_streams is not None:
+                self._screen_streams.open(msg)
 
         elif msg_type == "browser-connected":
             session_id = msg.get("sessionId", "")

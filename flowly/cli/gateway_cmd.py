@@ -1968,6 +1968,8 @@ Respond to the user now:"""
         web.set_local_event_callback(gateway_server.broadcast_event)
     if web and hasattr(web, "set_profile_host"):
         web.set_profile_host(gateway_server.profile_host)
+    if web and hasattr(web, "set_screen_gateway"):
+        web.set_screen_gateway(gateway_server)
 
     # Wire artifact broadcast callback — push to desktop (gateway) AND relay (web channel)
     if artifact_store:
