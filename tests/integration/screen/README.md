@@ -507,3 +507,39 @@ admission; `installSupported` remains false until the complete flow is connected
 The complete Core suite after this Python installer change passed **6,556 tests**,
 with 32 skipped, 12 deselected and 13 warnings in 298.01 seconds. Targeted Ruff
 and whitespace checks passed. Opt-in Linux evidence is recorded separately above.
+
+
+## Authenticated installation review
+
+The direct gateway now exposes read-only `display.install.plan`. Like doctor,
+it requires an authenticated protected socket and expected host/bot identity.
+Only profile/identity parameters are accepted; passwords, packages, commands and
+runtime generations are rejected. The profile identity is checked again after
+inspection, so deletion/recreation cannot publish a plan for the old target.
+No screen runtime is constructed by this handler.
+
+The combined plan contains system-package and agent-Python recipes plus the
+root-runtime-account requirement. Its fingerprint binds both recipe IDs and the
+host/bot/profile/screen identity. Live Python `upToDate` observations do not change
+that fingerprint. This is a review identifier, not an execution capability.
+`installPlanVersion: 1` advertises review support independently of installation:
+`installSupported` and the plan's `applySupported` remain false until job admission,
+root-runtime provisioning and the password/recovery flow are integrated.
+
+The focused real gateway suite passed 32 tests covering the new plan, doctor and
+existing display behavior. Default and named profiles, invalid pins/extra fields,
+identity changes during inspection, authentication and transport rejection were
+exercised. Desktop provides a dedicated trusted-frame IPC and captured gateway
+lease for review; no plan/start button or password input is claimed by this step.
+
+The final default Core suite passed **6,562 tests**, 32 skipped, 12 deselected,
+13 warnings in 310.14 seconds. Desktop's full suite passed 3,882 tests (3 skipped),
+main/preload and renderer typechecks passed, and the production build passed.
+The real Electron/TLS/Linux smoke successfully read the combined plan through
+preload/IPC/main and verified supported system/Python recipes without starting a
+runtime in its first two runs. **The full smoke did not pass:** both runs timed
+out at keyboard entry; a diagnostic follow-up timed out waiting for initial
+screen pixels. One failure cleanup also terminated Electron with SIGTRAP.
+The fixture now checks window focus, canvas hit testing and remote input focus
+separately, and captures a failure screenshot. These failures remain unresolved;
+previous successful full smoke evidence does not certify this current revision.

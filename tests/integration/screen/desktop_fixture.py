@@ -108,6 +108,7 @@ async def main():
                     y:screenY+outerHeight-innerHeight+r.y+r.height/2}; };
                 return {code:point('#code'), login:point('#login'), result:point('#result'),
                   codeMatches:document.querySelector('#code').value==='flowly-screen-fixture',
+                  codeFocused:document.activeElement===document.querySelector('#code'),
                   signedIn:document.querySelector('#result').textContent==='Signed in',
                   cookieMatches:document.cookie==='session=desktop-login'};
             }""") if page is not None and not page.is_closed() else None})
