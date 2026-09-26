@@ -251,4 +251,38 @@ After this wiring, the complete default Core suite passed **6,414 tests**, with
 25 skipped and 12 deselected. The expanded real Linux suite passed **291 tests**,
 including the actual agent-loop/RPC/Chromium continuation flow described above.
 Targeted Ruff and diff checks passed. Desktop integration has its own Electron and unit-test evidence in its worktree.
-Combined real Desktop-to-Linux, relay and recovery still require verification.
+The direct primary-profile Desktop-to-Linux flow is now verified below. Relay,
+additional platform/profile cases and recovery still require verification.
+
+
+## Actual Desktop-to-Linux login and continuation
+
+`desktop_fixture.py` is a disposable TLS gateway host for Desktop's
+`tests/smoke/run-screen-linux.sh`. Run the script from the Desktop worktree with
+the Core checkout path; see its smoke README for the command. Build the images
+above first. The fixture uses the container user's normal `~/.flowly` directory
+so production identity resolution is exercised without patching profile globals.
+
+The passing run uses the actual Electron panel, production preload, trusted-frame
+IPC, captured gateway lease, gateway client, public display RPC/stream, Xvnc input
+broker and sandboxed Chromium. Electron mouse and keyboard events enter the
+noVNC canvas to fill a generated test code and click Sign in. Inspection through
+an independent CDP attachment is read-only after setup; it confirms the page and
+cookie and provides coordinates. The Desktop test also waits for the changed
+signed-in pixels before capturing its screenshot. Plain release keeps model
+calls at one; explicit continuation completes the original run/session after a
+fresh observation. The stale planned click is never dispatched.
+
+The shell runner creates a short-lived self-signed fixture certificate, keeps TLS
+verification enabled, publishes only a loopback port and removes its container
+and temporary certificate directory on exit. No system trust is modified. The
+expanded Docker security setting is test-only; it is not a deployment recipe.
+The generated fixture token is not a product credential.
+
+Scope limits: the local model is deterministic and the page/account is synthetic;
+the browser, display, input, TLS and gateway are real. This single-profile gateway
+does not enable profile hosting, so Desktop exercises its Main Flowly fallback
+when `profiles.list` returns `PROFILE_HOST_UNAVAILABLE`. The explicit test-run
+browser grant is sent through generic RPC; the product chat composer selector is
+still required. This does not certify named-profile navigation, relay, packaged
+Windows/macOS, crash recovery or real third-party authentication.
