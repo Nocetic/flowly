@@ -19,6 +19,7 @@ from loguru import logger
 
 from flowly.bus.events import InboundMessage, OutboundMessage
 from flowly.bus.queue import MessageBus
+from flowly.desktop_runtime.agent_activity import background_agent_activity, run_agent_worker
 from flowly.providers.base import (
     PROVIDER_REPLAY_KEY,
     LLMErrorInfo,
@@ -1612,6 +1613,7 @@ class AgentLoop:
                 return
             await self._maybe_consolidate("timer")
 
+    @background_agent_activity
     async def _maybe_consolidate(self, trigger: str) -> None:
         """Run a background consolidation pass if there's anything new and no
         other pass is in flight. Fire-and-forget; never blocks a user turn."""
@@ -1700,7 +1702,7 @@ class AgentLoop:
             )
             try:
                 res = await asyncio.to_thread(
-                    self._dreamer.run, max_messages=self._dreamer_max_messages
+                    run_agent_worker, self._dreamer.run, max_messages=self._dreamer_max_messages
                 )
             except Exception as exc:
                 logger.warning(f"[dreamer] ✗ {trigger} run failed: {exc}")
@@ -1859,6 +1861,7 @@ class AgentLoop:
                 return
             await self._maybe_skill_pass(mode)
 
+    @background_agent_activity
     async def _maybe_skill_pass(self, mode: str) -> None:
         """Background mine/curate pass; curate gated on dirty. Fire-and-forget."""
         if self._skill_gov is None or self._skill_improve_tool is None:
@@ -2001,6 +2004,7 @@ class AgentLoop:
             logger.debug("[title] schedule failed", exc_info=True)
             # titling is best-effort; never disturb the turn
 
+    @background_agent_activity
     async def _autotitle_session(self, session: Any, user_content: str, final_content: str) -> None:
         from flowly.session.title import generate_title
 
@@ -10900,6 +10904,7 @@ class AgentLoop:
         except Exception as e:  # noqa: BLE001 — already logged inside the pass
             logger.debug(f"Post-turn compaction ended with: {e}")
 
+    @background_agent_activity
     async def _post_turn_compaction(self, msg: InboundMessage) -> None:
         """Background twin of the pre-turn compaction block.
 
