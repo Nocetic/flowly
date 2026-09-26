@@ -18,7 +18,9 @@ from urllib.parse import urlsplit
 
 from filelock import FileLock
 
+from flowly.desktop_runtime.application_layout import read_browser_port
 from flowly.desktop_runtime.authority import ScreenError
+from flowly.desktop_runtime.browser_lifecycle import BROWSER_MANAGER_SOURCE
 from flowly.desktop_runtime.desktop_defaults import DESKTOP_DEFAULTS_SOURCE
 from flowly.desktop_runtime.input_service import InputService
 from flowly.desktop_runtime.launcher import (
@@ -232,14 +234,15 @@ def run(directory: Path, generation: str) -> None:
                 for pattern in ("^xfce4-panel$", "^xfdesktop$")))
             port_file = browser_profile / "DevToolsActivePort"
             port_file.unlink(missing_ok=True)
-            spawn(["chromium", f"--user-data-dir={browser_profile}", "--remote-debugging-address=127.0.0.1",
-                   "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check",
-                   "--window-position=20,20", "--window-size=1360,780", "about:blank"], env)
-            if application:
-                port = wait_for(lambda: application.read_browser_port() if rfb.exists() else None)
-            else:
-                wait_for(lambda: port_file.exists() and port_file.stat().st_size > 0 and rfb.exists())
-                port = int(port_file.read_text().splitlines()[0])
+            (application_sockets / "browser-open.sock").unlink(missing_ok=True)
+            spawn(["python3", "-I", "-c", BROWSER_MANAGER_SOURCE, browser_command, str(browser_profile)], env)
+
+            def browser_port():
+                if application:
+                    return application.read_browser_port()
+                return read_browser_port(browser_profile, os.geteuid())
+
+            port = wait_for(lambda: browser_port() if rfb.exists() else None)
             if not 0 < port < 65536:
                 raise ScreenError("RUNTIME_START_FAILED")
             runtime.authority.start(generation)
@@ -256,6 +259,10 @@ def run(directory: Path, generation: str) -> None:
                 if (not input_service.is_alive or not observers.is_alive
                         or any(process_identity(child.pid) is None for child in processes)):
                     raise ScreenError("RUNTIME_FAILED")
+                current_port = browser_port()
+                if state.get("cdpPort") != current_port:
+                    state["cdpPort"] = current_port
+                    write_state(runtime.manifest, state)
                 time.sleep(0.2)
             state.update(phase="stopped", error=None)
         except BaseException:
@@ -276,9 +283,10 @@ def run(directory: Path, generation: str) -> None:
             if state["phase"] == "stopped" and state.get("cdpPort"):
                 try:
                     asyncio.run(close_browser(state["cdpPort"]))
-                    # Keep the child unreaped until final process-group cleanup.
+                    # Manager stays alive; wait for it to observe browser exit
+                    # and remove the port record before terminating its group.
                     deadline = time.monotonic() + 5
-                    while process_identity(processes[-1].pid) is not None:
+                    while browser_port() is not None:
                         if time.monotonic() >= deadline:
                             raise ScreenError("RUNTIME_STOP_TIMEOUT")
                         time.sleep(0.05)

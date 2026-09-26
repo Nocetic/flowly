@@ -4,7 +4,9 @@ The standalone payload needs only system Python: a root agent's checkout or
 virtualenv may be deliberately unreadable by the desktop account.
 """
 
-DESKTOP_DEFAULTS_SOURCE = r"""
+from flowly.desktop_runtime.browser_lifecycle import BROWSER_OPEN_SOURCE
+
+DESKTOP_DEFAULTS_SOURCE = "BROWSER_OPEN_SOURCE = " + repr(BROWSER_OPEN_SOURCE) + "\n" + r"""
 import os
 import shlex
 import stat
@@ -22,7 +24,7 @@ def directory(path):
         raise ValueError("invalid application directory")
     return path
 
-def seed(path, content, mode=0o600):
+def seed(path, content, mode=0o600, *, managed=False):
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -30,7 +32,8 @@ def seed(path, content, mode=0o600):
     else:
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
             raise ValueError("invalid desktop configuration")
-        return
+        if not managed:
+            return
     fd, temporary = tempfile.mkstemp(prefix=".flowly-seed-", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as output:
@@ -38,14 +41,17 @@ def seed(path, content, mode=0o600):
             output.flush()
             os.fchmod(output.fileno(), mode)
             os.fsync(output.fileno())
-        os.link(temporary, path, follow_symlinks=False)
+        if managed:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path, follow_symlinks=False)
         parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(parent)
         finally:
             os.close(parent)
     finally:
-        os.unlink(temporary)
+        Path(temporary).unlink(missing_ok=True)
 
 config = directory(Path(os.environ["XDG_CONFIG_HOME"]))
 data = directory(Path(os.environ["XDG_DATA_HOME"]))
@@ -66,9 +72,8 @@ seed(launcher, "#!/bin/sh\n"
      "    *_NET_WM_WINDOW_TYPE_NORMAL*)\n"
      "      /usr/bin/xdotool windowmap \"$window\" windowactivate --sync \"$window\" && exit 0;;\n"
      "  esac\n"
-     "done\nexec " + shlex.join([browser, "--user-data-dir=" + profile,
-         "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
-         "--no-first-run", "--no-default-browser-check"]) + "\n", 0o700)
+     "done\nexec " + shlex.join(["/usr/bin/python3", "-I", "-c", BROWSER_OPEN_SOURCE]) + "\n",
+     0o700, managed=True)
 
 for name, label, icon, command in (
     ("browser", "Browser", "web-browser", str(launcher)),

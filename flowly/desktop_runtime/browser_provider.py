@@ -95,7 +95,7 @@ class HostBrowserProvider:
             return
         await self.disconnect()
         state = await asyncio.to_thread(self.runtime.status)
-        if not state or state["phase"] != "running" or state["generation"] != generation:
+        if not state or state["phase"] != "running" or state["generation"] != generation or not state.get("cdpPort"):
             raise ScreenError("BROWSER_UNAVAILABLE")
         try:
             from playwright.async_api import async_playwright

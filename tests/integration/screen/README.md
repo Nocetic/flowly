@@ -1,7 +1,7 @@
 # Linux screen integration runner
 
 This disposable runner exercises the product launcher and supervisor against
-Xvnc, Openbox and sandboxed Chromium. It uses generated local test credentials;
+Xvnc, Xfce with a three-launcher dock, and sandboxed Chromium. It uses generated local test credentials;
 no external accounts or model calls are needed.
 
 ```sh
@@ -807,3 +807,21 @@ and actual noVNC/Electron acceptance remain required. The final seed payload
 must run after UID/GID drop on root hosts; system Python can execute its fixed
 standalone source even when the agent checkout is unreadable by that account.
 Do not run account-provisioning experiments outside a fresh disposable container.
+
+
+## Browser close and reopen lifecycle
+
+The application-account browser manager remains in a supervisor-owned process
+group when Chromium exits. A private Unix datagram socket accepts only `open`;
+dock clicks cannot supply a command, URL or profile. The fixed launcher focuses
+an existing normal Chromium window or requests a new process in the same
+persistent browser profile. Runtime status has a null CDP port while the browser
+is closed; the provider reports `BROWSER_UNAVAILABLE` and reconnects after reopen.
+The desktop generation and input ownership do not change during this transition.
+Managed launcher code is refreshed on startup; user desktop preferences are not.
+
+Verified in the disposable Linux runner: close Chromium, retain the desktop,
+reopen from the launcher, reconnect the provider, preserve a persistent cookie,
+then stop normally. Root-account runtime regressions also pass. This does not
+certify browser crashes during an in-flight agent action, arbitrary terminal
+child-process cleanup, resource limits, or packaged-client behavior.

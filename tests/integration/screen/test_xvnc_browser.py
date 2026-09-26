@@ -908,3 +908,49 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
     finally:
         await server.close()
         await asyncio.to_thread(runtime.stop, state["generation"])
+
+
+@pytest.mark.asyncio
+async def test_close_browser_keeps_runtime_and_reopen_reconnects_provider(tmp_path):
+    import asyncio
+    import time
+
+    from flowly.desktop_runtime.browser_provider import HostBrowserProvider
+    from flowly.desktop_runtime.supervisor import application_environment
+
+    async def settled(predicate):
+        for _ in range(100):
+            if predicate():
+                return
+            await asyncio.sleep(0.1)
+        pytest.fail("browser/runtime transition did not settle")
+
+    with running_screen(tmp_path / "reopen") as screen:
+        runtime, generation = screen["runtime"], screen["state"]["generation"]
+        provider = HostBrowserProvider(runtime)
+        try:
+            await provider._connect(generation)
+            first = provider._browser
+            await first.contexts[0].add_cookies([{
+                "url": "http://screen.test", "name": "persistent", "value": "same-profile",
+                "expires": time.time() + 3600,
+            }])
+            cdp = await first.new_browser_cdp_session()
+            await cdp.send("Browser.close")
+            await settled(lambda: runtime.status().get("cdpPort") is None)
+            assert runtime.status()["phase"] == "running"
+            assert runtime.status()["generation"] == generation
+            with pytest.raises(ScreenError, match="BROWSER_UNAVAILABLE"):
+                await provider._connect(generation)
+            env = application_environment(runtime.directory, runtime.application_socket_directory)
+            env["DISPLAY"] = screen["state"]["display"]
+            subprocess.run([str(runtime.application_socket_directory / "launch-browser")],
+                           env=env, check=True, timeout=5)
+            await settled(lambda: runtime.status().get("cdpPort") is not None)
+            await provider._connect(generation)
+            assert provider._browser is not first
+            cookies = await provider._browser.contexts[0].cookies("http://screen.test")
+            assert any(c["name"] == "persistent" and c["value"] == "same-profile" for c in cookies)
+            assert runtime.status()["generation"] == generation
+        finally:
+            await provider.disconnect()

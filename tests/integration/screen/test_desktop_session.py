@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from flowly.desktop_runtime.browser_lifecycle import BROWSER_MANAGER_SOURCE
 from flowly.desktop_runtime.desktop_defaults import DESKTOP_DEFAULTS_SOURCE
 from flowly.desktop_runtime.supervisor import write_xauthority
 
@@ -101,9 +102,8 @@ def desktop(tmp_path):
         spawn(["xfdesktop"])
         spawn(["xfce4-panel"])
         panel = wait_for(lambda: window("^xfce4-panel$"))
-        spawn(["chromium", "--user-data-dir=" + str(browser_profile),
-               "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
-               "--no-first-run", "--no-default-browser-check", "--window-size=1100,700", "about:blank"])
+        spawn(["/usr/bin/python3", "-I", "-c", BROWSER_MANAGER_SOURCE,
+               "/usr/bin/chromium", str(browser_profile)])
         wait_for(lambda: window("^chromium$"))
         yield dict(env=environment, command=command, wait_for=wait_for, window=window,
                    panel=panel, profile=browser_profile, root=tmp_path)
@@ -180,3 +180,17 @@ def test_dock_opens_terminal_and_settings_and_focuses_same_browser(desktop):
         wait_for(browser_focused)
         assert len(context.pages) == pages
         assert context.cookies("http://screen.test")[0]["value"] == "same-browser"
+
+        # Closing Chromium must leave the desktop and manager alive. The dock
+        # reopens the same persistent profile, without creating another screen.
+        context.add_cookies([{"url": "http://screen.test", "name": "durable",
+                             "value": "after-reopen", "expires": time.time() + 3600}])
+        browser.new_browser_cdp_session().send("Browser.close")
+        wait_for(lambda: not port_file.exists())
+        assert window("^xfce4-panel$")
+        click_launcher(0)
+        wait_for(lambda: port_file.exists() and port_file.stat().st_size)
+        reopened_port = int(port_file.read_text().splitlines()[0])
+        reopened = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{reopened_port}")
+        cookies = reopened.contexts[0].cookies("http://screen.test")
+        assert any(c["name"] == "durable" and c["value"] == "after-reopen" for c in cookies)

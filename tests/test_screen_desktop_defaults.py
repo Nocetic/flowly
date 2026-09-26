@@ -47,14 +47,25 @@ def test_preferences_survive_repeated_seeding(application):
     assert settings.read_text() == changed
 
 
-def test_browser_launcher_preserves_literal_paths(application):
-    assert seed(application).returncode == 0
+def test_browser_launcher_requests_only_the_managed_browser(application):
+    import socket
+    import tempfile
+
     environment, _, profile = application
-    launcher = Path(environment["XDG_RUNTIME_DIR"]) / "launch-browser"
-    result = subprocess.run([str(launcher)], env=environment, capture_output=True, text=True, timeout=10)
-    assert result.returncode == 0, result.stderr
-    assert "--user-data-dir=" + str(profile) in result.stdout.splitlines()
-    assert not (profile.parent / "attacked").exists()
+    with tempfile.TemporaryDirectory(prefix="fl-launcher-", dir="/tmp") as runtime:
+        environment["XDG_RUNTIME_DIR"] = runtime
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as server:
+            server.bind(str(Path(runtime) / "browser-open.sock"))
+            server.settimeout(2)
+            assert seed(application).returncode == 0
+            launcher = Path(runtime) / "launch-browser"
+            result = subprocess.run([str(launcher)], env=environment, capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0, result.stderr
+            assert server.recv(32) == b"open"
+            assert not (profile.parent / "attacked").exists()
+            launcher.write_text("obsolete launcher")
+            assert seed(application).returncode == 0
+            assert "obsolete launcher" not in launcher.read_text()
 
 
 @pytest.mark.parametrize("target", ["config", "launcher"])
