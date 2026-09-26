@@ -79,3 +79,55 @@ def test_cli_doctor_checks_selected_profile_without_runtime(tmp_path, monkeypatc
     doctor.assert_called_once_with(home / "desktop")
     assert json.loads(result.stdout) == {"profileId": "writer", "doctorVersion": 1, "ready": ready}
     assert not home.exists()
+
+
+def test_cli_install_plan_and_status_never_prompt_or_install(monkeypatch):
+    monkeypatch.setattr(screen_cmd, "install_plan", lambda: {"supported": True, "planId": "a" * 64})
+    status = Mock(return_value={"state": "running"})
+    monkeypatch.setattr(screen_cmd, "install_status", status)
+    monkeypatch.setattr(screen_cmd, "install_system", lambda *a, **kw: pytest.fail("read-only"))
+    monkeypatch.setattr(screen_cmd.getpass, "getpass", lambda *a: pytest.fail("no prompt"))
+    assert CliRunner().invoke(screen_cmd.screen_app, ["install-plan"]).exit_code == 0
+    result = CliRunner().invoke(screen_cmd.screen_app, ["install-status", "--operation-id", "b" * 32])
+    assert json.loads(result.stdout) == {"state": "running"}
+    status.assert_called_once_with("b" * 32)
+
+
+def test_cli_install_refuses_stale_plan_before_prompt(monkeypatch):
+    monkeypatch.setattr(screen_cmd, "install_plan", lambda: {"supported": True, "planId": "a" * 64})
+    monkeypatch.setattr(screen_cmd.getpass, "getpass", lambda *a: pytest.fail("stale plan"))
+    result = CliRunner().invoke(screen_cmd.screen_app, ["install-system", "--plan-id", "c" * 64, "--operation-id", "b" * 32, "--ask-sudo"])
+    assert result.exit_code == 1 and json.loads(result.stdout)["error"] == "INSTALL_PLAN_CHANGED"
+
+
+def test_cli_secret_prompt_requires_terminal(monkeypatch):
+    monkeypatch.setattr(screen_cmd, "install_plan", lambda: {"supported": True, "planId": "a" * 64})
+    monkeypatch.setattr(screen_cmd.getpass, "getpass", lambda *a: pytest.fail("must not echo a secret"))
+    result = CliRunner().invoke(screen_cmd.screen_app, ["install-system", "--plan-id", "a" * 64, "--operation-id", "b" * 32, "--ask-sudo"])
+    assert result.exit_code == 1 and json.loads(result.stdout)["error"] == "INSTALL_TERMINAL_REQUIRED"
+
+
+def test_cli_explicit_system_install_passes_only_plan_and_operation(monkeypatch):
+    monkeypatch.setattr(screen_cmd, "install_plan", lambda: {"supported": True, "planId": "a" * 64})
+    install = Mock(return_value={"state": "succeeded"})
+    monkeypatch.setattr(screen_cmd, "install_system", install)
+    result = CliRunner().invoke(screen_cmd.screen_app, ["install-system", "--plan-id", "a" * 64, "--operation-id", "b" * 32])
+    assert result.exit_code == 0
+    install.assert_called_once_with("a" * 64, "b" * 32, password=None)
+
+
+def test_cli_never_falls_back_to_echoing_sudo_password(monkeypatch):
+    import warnings
+    monkeypatch.setattr(screen_cmd, "install_plan", lambda: {"supported": True, "planId": "a" * 64})
+    def unavailable(*args):
+        warnings.warn("terminal echo cannot be disabled", screen_cmd.getpass.GetPassWarning)
+        pytest.fail("must not continue to echoed input")
+    monkeypatch.setattr(screen_cmd.getpass, "getpass", unavailable)
+    # CliRunner replaces sys.stdin; emulate a terminal inside the plan callback.
+    def plan():
+        monkeypatch.setattr(screen_cmd.sys.stdin, "isatty", lambda: True)
+        return {"supported": True, "planId": "a" * 64}
+    monkeypatch.setattr(screen_cmd, "install_plan", plan)
+    result = CliRunner().invoke(screen_cmd.screen_app, ["install-system", "--plan-id", "a" * 64, "--operation-id", "b" * 32, "--ask-sudo"])
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {"error": "INSTALL_TERMINAL_REQUIRED"}

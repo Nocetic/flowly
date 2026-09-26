@@ -1,11 +1,15 @@
 """Explicit lifecycle commands for the selected profile's Linux browser."""
 
+import getpass
 import json
+import sys
+import warnings
 
 import typer
 from filelock import Timeout
 
 from flowly.desktop_runtime.authority import ScreenError
+from flowly.desktop_runtime.installer import install_plan, install_status, install_system
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.profile import current_profile_name, get_flowly_home
 
@@ -57,6 +61,56 @@ def doctor() -> None:
     _print({"profileId": current_profile_name(), **report})
     if not report["ready"]:
         raise typer.Exit(1)
+
+
+@screen_app.command("install-plan")
+def installation_plan() -> None:
+    """Preview the fixed host package plan; does not install or request sudo."""
+    _print(install_plan())
+
+
+@screen_app.command("install-status")
+def installation_status(operation_id: str = typer.Option(...)) -> None:
+    """Read the durable receipt for an explicit system-package installation."""
+    try:
+        _print(install_status(operation_id))
+    except ScreenError as exc:
+        _error(exc)
+
+
+@screen_app.command("install-system")
+def installation_system(plan_id: str = typer.Option(...), operation_id: str = typer.Option(...),
+                        ask_sudo: bool = typer.Option(False)) -> None:
+    """Apply a reviewed plan ID. Reuse the operation ID to inspect a lost reply.
+
+    Installs OS packages only. Install the screen Python extra in the agent's
+    virtualenv too; root agents still need unprivileged runtime provisioning.
+    """
+    try:
+        # Validate a stale plan before asking for a secret. getpass reads the
+        # controlling terminal; no password flag, environment variable or log.
+        plan = install_plan()
+        if not plan["supported"]:
+            raise ScreenError(plan["reason"])
+        if plan_id != plan["planId"]:
+            raise ScreenError("INSTALL_PLAN_CHANGED")
+        if ask_sudo and not sys.stdin.isatty():
+            raise ScreenError("INSTALL_TERMINAL_REQUIRED")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            try:
+                secret = getpass.getpass("Sudo password: ") if ask_sudo else None
+            except (getpass.GetPassWarning, EOFError):
+                raise ScreenError("INSTALL_TERMINAL_REQUIRED") from None
+        try:
+            receipt = install_system(plan_id, operation_id, password=secret)
+        finally:
+            secret = None
+        _print(receipt)
+        if receipt["state"] != "succeeded":
+            raise typer.Exit(1)
+    except ScreenError as exc:
+        _error(exc)
 
 
 @screen_app.command("start")

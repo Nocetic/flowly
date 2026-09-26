@@ -377,3 +377,83 @@ The real Electron/TLS/Linux smoke also passed with the readiness card, explicit
 start, login, same-run continuation and explicit stop. These results do not
 certify the pending distro/architecture, packaging, relay or root-provisioning
 matrix.
+
+## Fixed system-package installation
+
+The first installer recipe targets Debian 12 (arm64 and x86_64); the real image
+verification currently covers arm64. Ubuntu's Chromium packaging and other
+versions are not inferred from Debian. `flowly screen install-plan` is read-only
+and returns a fixed package list, a plan fingerprint and a system-package scope.
+The reviewed fingerprint must be supplied to `flowly screen install-system
+--plan-id <planId> --operation-id <32-hex-id>`. Keep that operation ID to query
+`flowly screen install-status --operation-id <same-id>` or safely retry a lost
+reply. A new ID means a new explicit operation. `--ask-sudo` reads a hidden
+password only from a terminal; there is no password argument or environment
+variable. Without it, sudo is noninteractive. Root callers do not use sudo.
+
+The elevated worker runs fixed stdlib source with `/usr/bin/python3 -I`; it never
+imports Core or the agent's virtualenv as root. No caller-supplied package names,
+commands, shell fragments or paths are accepted. Password input only goes to
+sudo stdin, package output is discarded, and receipts contain fixed phase/error
+fields. Assigning Python password references to None does not promise secure
+memory erasure. An authenticated Desktop password path is still pending and is
+not enabled by these CLI commands.
+
+The root-owned `/var/lib/flowly-screen-installer` holds one host-wide flock and
+at most 128 receipts, partitioned by installing UID. Receipts are deliberately
+not pruned: forgetting an operation could replay it. Reading status never asks
+sudo, invokes apt or rewrites an interrupted record. A running record with no
+actual held lock is reported as recovery-required. Interrupted or partial
+operations block new package work until explicit operator recovery; automatic
+recovery/receipt maintenance remains to be implemented.
+
+The worker checks `dpkg --audit`, updates package indexes with a 180-second
+limit, then installs the fixed packages with a 600-second limit. Audit has a
+30-second limit. Apt package-lock waiting and network retries are bounded;
+failed index refresh, package failure and timeout have distinct public codes.
+The recipe uses no-remove/no-upgrade and retains existing configuration files.
+Distro dependencies can still be installed as needed. A timed-out package group
+is terminated while its leader remains unreaped, preventing PID reuse before
+the final group signal. An outer observation timeout does not imply cancellation
+and is never permission to start another installation. Slow/uninterruptible
+kernel I/O is outside a strict wall-clock guarantee.
+
+This command installs **system packages**, not the `screen` Python extra or a
+root-host runtime account. Source installations need the optional extra in the
+same virtualenv as the agent (for example, the existing installer's uv environment
+with the checkout's `[screen]` extra). Do not run the entire user-writable agent
+installation with sudo to install packages. Root agents still report
+`UNPRIVILEGED_RUNTIME_REQUIRED`; the installer never adds `--no-sandbox`.
+
+The dedicated clean fixture has only Python/sudo and Core's locked Python
+environment before the product installer runs. Its sudo password is generated
+fixture data, not an external credential. No developer-host packages are changed:
+
+```sh
+docker build -t flowly-screen-installer-test:bookworm \
+  -f tests/integration/screen/Dockerfile.installer .
+docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  -e FLOWLY_SCREEN_INSTALL_TEST=1 flowly-screen-installer-test:bookworm \
+  python -m pytest tests/integration/screen/test_installer.py \
+    tests/test_screen_installer.py tests/test_screen_install_worker.py tests/test_screen_cli.py \
+    -q --basetemp=/tmp/screen-install-tests -p no:cacheprovider
+```
+
+The test rejects an incorrect sudo password, starts installation, verifies lock
+contention, kills the unprivileged invoking process while the privileged worker
+continues, observes the durable result, retries without reinstalling and starts
+then stops real sandboxed Chromium. The Docker seccomp exception remains specific
+to the disposable test VM, as described above.
+
+Installer validation: the complete Core run passed 6,528 tests, 30 skipped,
+12 deselected, 13 warnings. The final child-reaping reset and malformed/oversized
+Unicode password checks were added after that run collected its tests; the final
+installer/worker/CLI subset passed 62 tests on macOS and, together with the real
+Linux process-group timeout case, 63 tests in the Linux fixture. The clean Debian
+installation/disconnect/replay/browser-start run plus its then-current unit tests
+passed 60 tests in 131 seconds. The earlier direct clean installation also passed.
+Targeted Ruff and diff checks passed. The macOS CLI plan/help smoke reported an
+unsupported install host without executing the Linux worker. The Desktop changed
+only its engineering progress document in this increment; its prior screen UI
+verification is not being relabeled as installer UI verification.
