@@ -77,6 +77,19 @@ def test_setup_is_terminal_and_does_not_mutate_preferences_or_permissions(agent)
     assert not (agent / "workspace" / "USER.md").exists()
 
 
+def test_setup_choices_use_existing_clarification_without_implicit_consent(agent):
+    resolve_home({})
+    guidance = setup_guidance(HOME_SESSION)
+    assert "existing clarify tool with 2-3" in guidance
+    assert "not a permission grant" in guidance
+    assert "timeout is not consent" in guidance
+    assert "internal bookkeeping" in guidance
+    assert "If finishing setup fails" in guidance
+    assert "existing connection request and owner consent flow" in guidance
+    finish_setup({"state": "complete"})
+    assert setup_guidance(HOME_SESSION) is None
+
+
 def test_crash_after_transcript_before_state_recovers_without_duplicate(agent):
     first = resolve_home({})
     (agent / "agent-home.json").unlink()
