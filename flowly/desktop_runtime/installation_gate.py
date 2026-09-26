@@ -33,7 +33,7 @@ def environment_activity(*, exclusive: bool = False):
             fcntl.flock(descriptor, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ScreenError('INSTALL_BUSY') from None
-        yield
+        yield descriptor
     finally:
         os.close(descriptor)
 
@@ -50,6 +50,6 @@ def agent_environment_activity():
         return
     from flowly.desktop_runtime.install_jobs import assert_environment_installation_idle
 
-    with environment_activity():
+    with environment_activity() as descriptor:
         assert_environment_installation_idle()
-        yield
+        yield descriptor
