@@ -141,6 +141,24 @@ class ScreenRuntime:
         key = hashlib.sha256(os.fsencode(self.directory)).hexdigest()[:24]
         return private_directory(parent / key)
 
+    @property
+    def application_socket_directory(self) -> Path:
+        # Keep Xvnc/X authority separate from the agent's input/observer brokers.
+        # Ownership is still the current account until root provisioning supplies
+        # an explicitly validated runtime-account layout.
+        parent = private_directory(Path("/tmp") / f"flowly-screen-{os.getuid()}")
+        key = hashlib.sha256(os.fsencode(self.directory)).hexdigest()[:24]
+        return private_directory(parent / (key + "-apps"))
+
+    def rfb_socket_for(self, state: dict) -> Path:
+        version = state.get("socketLayoutVersion", 1)
+        if type(version) is not int or version not in (1, 2):
+            raise ScreenError("RUNTIME_STATE_INVALID")
+        # Existing supervisors keep their original socket until explicit stop.
+        # Never follow a path supplied by a manifest or public RPC parameter.
+        directory = self.application_socket_directory if version == 2 else self.socket_directory
+        return directory / "rfb.sock"
+
     def read_manifest(self) -> dict | None:
         try:
             fd = os.open(self.manifest, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -207,7 +225,7 @@ class ScreenRuntime:
     def _spawn(self) -> dict:
         """Called with both profile lifecycle and account startup locks held."""
         generation = secrets.token_hex(16)
-        write_state(self.manifest, dict(schema=1, generation=generation, phase="starting",
+        write_state(self.manifest, dict(schema=1, socketLayoutVersion=2, generation=generation, phase="starting",
                                        supervisor=None, children=[], error=None))
         # No parent pipe survives. Gateway/viewer disconnects do not end the
         # browser, and a restarted gateway adopts its original generation.

@@ -40,6 +40,23 @@ def test_reconnect_adopts_runtime_without_spawning(runtime, monkeypatch):
     assert runtime.authority.snapshot()["control"] == "human"
 
 
+def test_application_sockets_are_separate_and_legacy_paths_remain_pinned(runtime):
+    broker = runtime.socket_directory
+    applications = runtime.application_socket_directory
+    assert broker != applications and broker.parent == applications.parent
+    assert applications.stat().st_mode & 0o777 == 0o700
+    assert runtime.rfb_socket_for({"socket": "/private/untrusted.sock"}) == broker / "rfb.sock"
+    assert runtime.rfb_socket_for({"socketLayoutVersion": 2, "socket": "/private/untrusted.sock"}) == applications / "rfb.sock"
+    other = ScreenRuntime(runtime.directory.parent / "other")
+    assert other.application_socket_directory not in (broker, applications)
+
+
+@pytest.mark.parametrize("version", [None, True, "2", 0, 3, {}, []])
+def test_unknown_socket_layout_is_not_a_path_fallback(runtime, version):
+    with pytest.raises(ScreenError, match="RUNTIME_STATE_INVALID"):
+        runtime.rfb_socket_for({"socketLayoutVersion": version})
+
+
 @pytest.mark.parametrize("reason", ["INSUFFICIENT_RESOURCES", "RESOURCE_CHECK_UNAVAILABLE"])
 def test_failed_budget_does_not_reserve_generation_or_spawn(runtime, monkeypatch, reason):
     from filelock import FileLock

@@ -664,3 +664,21 @@ checks passed. The real Electron/TLS/Linux installation-review, start, mouse and
 keyboard login, plain handback, explicit original-run continuation and terminal
 stop smoke passed with the sanitized application environment. Desktop production
 code did not change in this increment.
+
+
+## Separate application and control sockets
+
+New supervisors use socket layout version 2. Xvnc's RFB socket and X authority
+live in a profile-specific application directory; input and observer brokers stay
+in a separate agent control directory. Gateway streaming derives the RFB location
+from the closed layout version and trusted runtime identity, never the manifest's
+arbitrary socket string. Missing version means the legacy layout, so already-running
+supervisors remain attachable until an explicit stop/start. Unknown versions fail
+closed. Both directories remain current-account-owned and private in this increment;
+this does not yet enable a root-owned agent's unprivileged application runtime.
+
+Validation: 87 focused tests on macOS; 100 Linux runtime, input, gateway and
+application-environment tests; complete Core suite 6,602 passed, 34 skipped,
+12 deselected, 13 warnings in 294.70 seconds. The real Electron/TLS/Linux review,
+start, mouse/keyboard login, handback, same-run resume and stop smoke passed.
+Targeted Ruff and diff checks passed. Desktop production code is unchanged.

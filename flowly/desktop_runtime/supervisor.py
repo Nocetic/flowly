@@ -140,10 +140,11 @@ def run(directory: Path, generation: str) -> None:
 
         try:
             sockets = runtime.socket_directory
-            xauthority = sockets / "Xauthority"
+            rfb = runtime.rfb_socket_for(state)
+            application_sockets = rfb.parent
+            xauthority = application_sockets / "Xauthority"
             write_xauthority(xauthority)
-            env = application_environment(directory, sockets)
-            rfb = sockets / "rfb.sock"
+            env = application_environment(directory, application_sockets)
             rfb.unlink(missing_ok=True)
             read_fd, write_fd = os.pipe()
             try:
@@ -178,7 +179,8 @@ def run(directory: Path, generation: str) -> None:
             (sockets / "observers.sock").unlink(missing_ok=True)
             viewers = ViewerCredentials(StreamTickets(directory / "admission"))
             observers = ObserverRegistry(runtime.authority, generation, sockets, viewers=viewers)
-            input_service = InputService(runtime.authority, generation, sockets, observers=observers, viewers=viewers)
+            input_service = InputService(runtime.authority, generation, sockets, observers=observers, viewers=viewers,
+                                         rfb_socket=rfb)
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
                          cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, error=None)
             write_state(runtime.manifest, state)

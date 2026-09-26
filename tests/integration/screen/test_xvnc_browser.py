@@ -78,6 +78,14 @@ def test_desktop_processes_do_not_inherit_agent_environment(tmp_path, monkeypatc
     monkeypatch.setenv("PATH", str(wrappers) + os.pathsep + os.environ["PATH"])
     directory = tmp_path / "environment-profile"
     with running_screen(directory) as screen:
+        runtime = screen["runtime"]
+        assert screen["state"]["socketLayoutVersion"] == 2
+        assert screen["socket"].parent == runtime.application_socket_directory
+        assert (runtime.socket_directory / "input.sock").is_socket()
+        assert (runtime.socket_directory / "observers.sock").is_socket()
+        assert not (runtime.socket_directory / "rfb.sock").exists()
+        assert not (runtime.application_socket_directory / "input.sock").exists()
+        assert not (runtime.application_socket_directory / "observers.sock").exists()
         for report in reports:
             environment = json.loads(report.read_text())
             assert not forbidden.intersection(environment["names"])

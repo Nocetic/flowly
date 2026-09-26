@@ -59,6 +59,7 @@ async def display_gateway(tmp_path, monkeypatch):
                                                   viewers=service.viewers)
             service._runtime = SimpleNamespace(
                 socket_directory=sockets, authority=authority,
+                rfb_socket_for=lambda state, directory=sockets: directory / "rfb.sock",
                 status=lambda gen=generation: {
                     "phase": "running", "generation": gen,
                     "socket": "/must-not-use-manifest-path", "cdpPort": 9999,

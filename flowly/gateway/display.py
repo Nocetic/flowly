@@ -406,7 +406,7 @@ def register_display(app: web.Application, gateway) -> None:
                     raise ScreenError("VIEWER_REVOKED")
 
                 tasks.append(asyncio.create_task(revoked()))
-            socket = session.runtime.socket_directory / "rfb.sock"
+            socket = session.runtime.rfb_socket_for(state)
             reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(socket, limit=128 * 1024), 5)
             writer.transport.set_write_buffer_limits(high=128 * 1024, low=32 * 1024)
             await ws.prepare(request)
