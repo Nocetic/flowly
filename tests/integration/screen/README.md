@@ -73,7 +73,7 @@ pause/resume RPC or Desktop UI. No model is invoked.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
-The expanded Linux screen suite passed **247 tests** on the environment above.
+The expanded Linux screen suite passed **259 tests** on the environment above.
 The authenticated direct display endpoint also delivers real Xvnc pixels for
 the default and named profiles. Its single-use tickets are bound to the host,
 profile and runtime generation; gateway credentials and tickets use headers.
@@ -155,9 +155,13 @@ connection/sixteen per gateway, and removed on disconnect, identity replacement,
 state rollback, slow delivery or explicit unsubscribe. Cleanup never releases
 human control. Pending snapshots cannot recreate a subscription after shutdown.
 The gateway/sequence tests passed **41 tests** on macOS; the expanded Linux runner
-with subscriptions still needs to run before updating its 247-test baseline.
-Desktop's direct Screen sidebar and profile-tab navigation are wired. Desktop
-event consumption, lifecycle, original-run resume and relay remain incomplete.
+with subscriptions passed **259 tests**, including ten real-runtime tests.
+Core's full default suite passed **6,382 tests**, with 25 skipped and 12 deselected.
+Desktop's direct Screen sidebar, profile-tab navigation and status event
+consumption are wired. Its synthetic-host Electron test now covers a pushed
+phase-only failure while hidden and subscription cleanup through the actual
+preload. Combined real Linux/Desktop, lifecycle, original-run resume and relay
+remain incomplete.
 
 The `epoch-u64-v1` input protocol is selected with `X-Flowly-Screen-Input`.
 Each client binary frame starts with an unsigned big-endian 64-bit control epoch
