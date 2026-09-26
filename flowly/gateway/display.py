@@ -33,7 +33,7 @@ from flowly.gateway.mcp_management import _protected_socket
 METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create", "display.viewer.close",
                      "display.control.acquire", "display.control.release", "display.control.reclaim",
                      "display.subscribe", "display.unsubscribe", "display.run.resume",
-                     "display.start", "display.stop", "display.operation.status"})
+                     "display.start", "display.stop", "display.operation.status", "display.doctor"})
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
@@ -81,7 +81,7 @@ class DisplaySession:
                 "viewerClose": bool(state and state.get("inputServiceVersion") == 3
                                     and state.get("observerServiceVersion") == 3),
                 "lifecycle": capability["supported"], "lifecycleVersion": 1, "installSupported": False, "statusEvents": True, "resumeSupported": True,
-                "browserGrantVersion": 2}
+                "browserGrantVersion": 2, "doctorVersion": 1}
 
     @property
     def viewers(self) -> ViewerCredentials:
@@ -263,7 +263,7 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             return
         allowed = {"profileId", "expectedHostId", "expectedBotId"}
         pinned = method not in {"display.capabilities", "display.status"}
-        if pinned and method not in {"display.subscribe", "display.operation.status"}:
+        if pinned and method not in {"display.subscribe", "display.operation.status", "display.doctor"}:
             allowed.add("generation")
         if method in {"display.start", "display.stop", "display.operation.status"}:
             allowed.add("operationId")
@@ -276,6 +276,13 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
         if not isinstance(params, dict) or set(params) - allowed:
             raise ScreenError("INVALID_PARAMS")
         session = await asyncio.to_thread(_resolve, gateway, params, pinned=pinned)
+        if method == "display.doctor":
+            result = await asyncio.to_thread(ScreenRuntime.doctor, session.directory)
+            # Profile deletion/recreation during the read must not publish a
+            # diagnostic under a stale identity. No runtime is constructed here.
+            await asyncio.to_thread(_resolve, gateway, params, pinned=True)
+            await gateway._ws_rpc_reply(ws, rpc_id, {**session.identity, **result})
+            return
         if method in {"display.start", "display.stop", "display.operation.status"}:
             def lifecycle():
                 capability = ScreenRuntime.capabilities()

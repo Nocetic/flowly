@@ -2,6 +2,8 @@
 
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -30,11 +32,110 @@ def test_reconnect_adopts_runtime_without_spawning(runtime, monkeypatch):
     runtime.authority.start("generation-1")
     monkeypatch.setattr(launcher, "is_alive", lambda value: bool(value))
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: pytest.fail("must adopt"))
+    monkeypatch.setattr(launcher, "resource_report", lambda *a: pytest.fail("must not gate running browser"))
     assert runtime.start() == expected
     # Human control survives controller reconnect too.
     runtime.authority.acquire("viewer", "generation-1", 1)
     assert runtime.start() == expected
     assert runtime.authority.snapshot()["control"] == "human"
+
+
+@pytest.mark.parametrize("reason", ["INSUFFICIENT_RESOURCES", "RESOURCE_CHECK_UNAVAILABLE"])
+def test_failed_budget_does_not_reserve_generation_or_spawn(runtime, monkeypatch, reason):
+    from filelock import FileLock
+    startup = FileLock(runtime.directory / "test-startup.lock")
+    monkeypatch.setattr(runtime, "_startup_lock", lambda: startup)
+    def report(directory):
+        assert runtime._lock.is_locked and startup.is_locked
+        assert directory == runtime.directory
+        return {"ready": False, "reason": reason}
+    monkeypatch.setattr(launcher, "resource_report", report)
+    monkeypatch.setattr(runtime, "_spawn", lambda: pytest.fail("insufficient budget"))
+    with pytest.raises(ScreenError, match=reason):
+        runtime.start()
+    assert runtime.read_manifest() is None
+    assert not runtime.authority.snapshot()["running"]
+
+
+def test_new_spawn_holds_both_locks_and_rechecks_identity(runtime, monkeypatch):
+    from filelock import FileLock
+    startup = FileLock(runtime.directory / "test-startup.lock")
+    monkeypatch.setattr(runtime, "_startup_lock", lambda: startup)
+    calls = []
+    def guard():
+        calls.append(startup.is_locked)
+    def spawn():
+        assert runtime._lock.is_locked and startup.is_locked
+        return {"generation": "new"}
+    monkeypatch.setattr(launcher, "resource_report", lambda path: {"ready": True})
+    monkeypatch.setattr(runtime, "_spawn", spawn)
+    assert runtime.start(identity_guard=guard) == {"generation": "new"}
+    assert calls == [False, True]
+
+
+def test_profiles_do_not_concurrently_spend_the_same_startup_budget(runtime, tmp_path, monkeypatch):
+    other = ScreenRuntime(tmp_path / "other/desktop")
+    account = tmp_path / "account"
+    private = launcher.private_directory
+    def directory(path):
+        return private(account if path == launcher.Path("/tmp") / f"flowly-screen-{os.getuid()}" else path)
+    monkeypatch.setattr(launcher, "private_directory", directory)
+    started, release, second_waiting = threading.Event(), threading.Event(), threading.Event()
+    allocated = False
+    def report(path):
+        return {"ready": not allocated, "reason": "INSUFFICIENT_RESOURCES" if allocated else None}
+    def spawn():
+        nonlocal allocated
+        started.set()
+        assert release.wait(3)
+        allocated = True
+        return {"generation": "first"}
+    second_lock = other._startup_lock
+    def lock():
+        second_waiting.set()
+        return second_lock()
+    monkeypatch.setattr(other, "_startup_lock", lock)
+    monkeypatch.setattr(runtime, "_spawn", spawn)
+    monkeypatch.setattr(other, "_spawn", lambda: pytest.fail("already spent budget"))
+    monkeypatch.setattr(launcher, "resource_report", report)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(runtime.start)
+        try:
+            assert started.wait(3)
+            second = pool.submit(other.start)
+            assert second_waiting.wait(3)
+        finally:
+            release.set()
+        assert first.result(timeout=3) == {"generation": "first"}
+        with pytest.raises(ScreenError, match="INSUFFICIENT_RESOURCES"):
+            second.result(timeout=3)
+    assert other.read_manifest() is None
+
+
+def test_doctor_does_not_construct_runtime_or_write_profile(tmp_path, monkeypatch):
+    directory = tmp_path / "missing/desktop"
+    monkeypatch.setattr(ScreenRuntime, "capabilities", staticmethod(lambda: {
+        "supported": False, "reason": "DEPENDENCIES_MISSING", "missing": ["Xvnc"]}))
+    monkeypatch.setattr(launcher, "resource_report", lambda path: {"ready": True, "reason": None})
+    result = ScreenRuntime.doctor(directory)
+    assert result == {"doctorVersion": 1, "ready": False, "reason": "DEPENDENCIES_MISSING",
+                      "missing": ["Xvnc"], "resources": {"ready": True, "reason": None}}
+    assert not directory.parent.exists()
+
+
+def test_unsupported_doctor_never_reads_linux_resources(tmp_path, monkeypatch):
+    monkeypatch.setattr(ScreenRuntime, "capabilities", staticmethod(lambda: {
+        "supported": False, "reason": "UNSUPPORTED_HOST", "missing": []}))
+    monkeypatch.setattr(launcher, "resource_report", lambda path: pytest.fail("unsupported platform"))
+    assert ScreenRuntime.doctor(tmp_path)["resources"] is None
+
+
+def test_capabilities_require_optional_browser_dependency(monkeypatch):
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher.os, "pidfd_open", lambda pid: 1, raising=False)
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(launcher.importlib.util, "find_spec", lambda name: None)
+    assert ScreenRuntime.capabilities() == {"supported": False, "reason": "DEPENDENCIES_MISSING", "missing": ["playwright"]}
 
 
 def test_shutdown_in_progress_cannot_be_adopted_as_healthy(runtime, monkeypatch):

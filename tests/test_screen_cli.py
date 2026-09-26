@@ -2,6 +2,7 @@ import json
 from unittest.mock import Mock
 
 import pytest
+from filelock import Timeout
 from typer.testing import CliRunner
 
 from flowly.cli import screen_cmd
@@ -47,6 +48,14 @@ def test_cli_stop_cannot_override_human_ownership(runtime):
     assert json.loads(result.stdout) == {"error": "HUMAN_HAS_CONTROL"}
 
 
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_cli_lock_timeout_returns_public_busy_error(runtime, action):
+    getattr(runtime, action).side_effect = Timeout("/private/account/startup.lock")
+    result = CliRunner().invoke(screen_cmd.screen_app, [action])
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {"error": "LIFECYCLE_BUSY"}
+
+
 def test_cli_unsupported_platform_never_constructs_runtime(monkeypatch):
     monkeypatch.setattr(screen_cmd.ScreenRuntime, "capabilities", lambda: {"supported": False, "reason": "UNSUPPORTED_HOST", "missing": []})
     monkeypatch.setattr(screen_cmd, "get_flowly_home", lambda: pytest.fail("must not create local screen"))
@@ -55,3 +64,18 @@ def test_cli_unsupported_platform_never_constructs_runtime(monkeypatch):
         assert result.exit_code == 1
         assert json.loads(result.stdout)["error"] == "UNSUPPORTED_HOST"
     assert CliRunner().invoke(screen_cmd.screen_app, ["capabilities"]).exit_code == 0
+
+
+@pytest.mark.parametrize("ready", [True, False])
+def test_cli_doctor_checks_selected_profile_without_runtime(tmp_path, monkeypatch, ready):
+    home = tmp_path / "not-created"
+    monkeypatch.setattr(screen_cmd, "get_flowly_home", lambda: home)
+    monkeypatch.setattr(screen_cmd, "current_profile_name", lambda: "writer")
+    monkeypatch.setattr(screen_cmd, "_runtime", lambda: pytest.fail("read-only doctor"))
+    doctor = Mock(return_value={"doctorVersion": 1, "ready": ready})
+    monkeypatch.setattr(screen_cmd.ScreenRuntime, "doctor", doctor)
+    result = CliRunner().invoke(screen_cmd.screen_app, ["doctor"])
+    assert result.exit_code == (0 if ready else 1)
+    doctor.assert_called_once_with(home / "desktop")
+    assert json.loads(result.stdout) == {"profileId": "writer", "doctorVersion": 1, "ready": ready}
+    assert not home.exists()

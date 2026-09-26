@@ -642,6 +642,9 @@ def test_real_cli_starts_adopts_and_stops_persistent_screen(tmp_path):
 
     try:
         assert command("capabilities")["supported"]
+        report = command("doctor")
+        assert report["ready"] and report["doctorVersion"] == 1
+        assert report["resources"]["memory"]["availableBytes"] >= report["resources"]["memory"]["requiredBytes"]
         started = command("start")
         assert started["phase"] == "running"
         assert command("status")["generation"] == started["generation"]

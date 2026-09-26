@@ -333,3 +333,47 @@ restart and reject a stale stop without affecting the other profile. Complete
 Core suite: **6,434 passed**, 27 skipped, 12 deselected. The Desktop fixture now
 waits for the real panel to start its screen; test-only background setup then
 navigates the generated login page once. Inspection remains read-only.
+
+## Startup resource diagnostics
+
+`flowly screen doctor` inspects dependencies, available memory and free disk
+without creating a runtime. Exit zero means the measured admission requirements
+are met; exit one returns a typed reason and fixed resource issues. Authenticated
+`display.doctor` adds a pinned host/profile identity to the same snapshot.
+
+New launches measure again under a per-account startup lock. Initial floors are
+1.5 GiB available memory and 1 GiB free on both the profile and temporary
+filesystems. Memory uses host MemAvailable and the tightest visible cgroup v1/v2
+ancestor headroom. Unreadable or inconsistent readings block new starts. These
+floors are not a memory reservation, cache quota or calibrated minimum VPS size;
+hidden cgroup ancestors and unrelated concurrent allocations remain limits.
+A live runtime is adopted without applying the floors again and is never killed
+because a later reading is low.
+
+A separate disposable test verifies admission against an actual 1 GiB cgroup
+limit, without launching a browser:
+
+```sh
+docker run --rm --memory=1g --memory-swap=1g \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  -e FLOWLY_SCREEN_RESOURCE_LIMIT_TEST=1 flowly-screen-gateway-test:bookworm \
+  python -m pytest tests/integration/screen/test_resource_limit.py -q \
+    --basetemp=/tmp/screen-tests -p no:cacheprovider
+```
+
+The regular Linux CLI integration also executes doctor before a real start.
+Synthetic proc/cgroup tests cover v1, v2, hybrid membership, ancestor constraints,
+namespace/mount roots, missing counters, permissions, over-limit usage and disk
+failures. Only the real constrained-container test proves the live kernel limit
+path; synthetic tests are not certification of every distribution layout.
+
+Verification on the dedicated Debian 12 arm64 runner: the expanded screen suite
+passed 354 tests (four warnings), and the separate real 1 GiB cgroup test passed.
+The Core full suite passed 6,475 tests (28 skipped, 12 deselected, 13 warnings).
+CLI lock-timeout handling and three regression cases landed after full-suite
+collection; the final CLI/launcher/resource subset passed 66 tests, including
+concurrent profile startup budgeting. Targeted Ruff and diff checks passed.
+The real Electron/TLS/Linux smoke also passed with the readiness card, explicit
+start, login, same-run continuation and explicit stop. These results do not
+certify the pending distro/architecture, packaging, relay or root-provisioning
+matrix.

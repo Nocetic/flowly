@@ -8,6 +8,7 @@ Uncertain process ownership fails closed instead of killing an unrelated PID.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import secrets
@@ -23,6 +24,7 @@ from typing import Callable
 from filelock import FileLock
 
 from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError
+from flowly.desktop_runtime.resources import resource_report
 
 REQUIRED_PROGRAMS = ("Xvnc", "openbox", "dbus-run-session", "chromium")
 _UNPINNED = object()
@@ -106,6 +108,8 @@ class ScreenRuntime:
         if sys.platform != "linux" or not hasattr(os, "pidfd_open"):
             return dict(supported=False, reason="UNSUPPORTED_HOST", missing=[])
         missing = [program for program in REQUIRED_PROGRAMS if shutil.which(program) is None]
+        if importlib.util.find_spec("playwright") is None:
+            missing.append("playwright")
         if missing:
             return dict(supported=False, reason="DEPENDENCIES_MISSING", missing=missing)
         # Chromium's sandbox requires an unprivileged runtime account. Never
@@ -113,6 +117,22 @@ class ScreenRuntime:
         if os.geteuid() == 0:
             return dict(supported=False, reason="UNPRIVILEGED_RUNTIME_REQUIRED", missing=[])
         return dict(supported=True, reason=None, missing=[])
+
+    @staticmethod
+    def doctor(directory: Path) -> dict:
+        """Inspect an uncreated profile without constructing a runtime or authority."""
+        capability = ScreenRuntime.capabilities()
+        resources = resource_report(directory) if capability["reason"] != "UNSUPPORTED_HOST" else None
+        return {"doctorVersion": 1, "ready": capability["supported"] and bool(resources and resources["ready"]),
+                "reason": capability["reason"] or (resources["reason"] if resources else "RESOURCE_CHECK_UNAVAILABLE"),
+                "missing": capability["missing"], "resources": resources}
+
+    def _startup_lock(self) -> FileLock:
+        # Serialize profile starts for this runtime account until the new browser
+        # is ready and its memory is visible. Other accounts/external allocations
+        # remain outside this budget check; it is not a memory reservation.
+        parent = private_directory(Path("/tmp") / f"flowly-screen-{os.getuid()}")
+        return FileLock(parent / "startup.lock", timeout=15, mode=0o600)
 
     @property
     def socket_directory(self) -> Path:
@@ -176,28 +196,38 @@ class ScreenRuntime:
                 raise ScreenError("HUMAN_HAS_CONTROL")
             if control["runId"] is not None:
                 raise ScreenError("SCREEN_BUSY")
-            generation = secrets.token_hex(16)
-            write_state(self.manifest, dict(schema=1, generation=generation, phase="starting",
-                                           supervisor=None, children=[], error=None))
-            # No parent pipe survives. Gateway/viewer disconnects do not end the
-            # browser, and a restarted gateway adopts its original generation.
-            try:
-                process = subprocess.Popen(
-                    ["dbus-run-session", "--", sys.executable, "-m", "flowly.desktop_runtime.supervisor",
-                     str(self.directory), generation],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True, close_fds=True,
-                )
-            except OSError as exc:
-                write_state(self.manifest, dict(schema=1, generation=generation, phase="failed",
-                                               supervisor=None, children=[], error="RUNTIME_START_FAILED"))
-                raise ScreenError("RUNTIME_START_FAILED") from exc
-            try:
-                return self._await_start(generation, process)
-            finally:
-                # Popen instances are reaped by subprocess on the next spawn;
-                # do not wait for a deliberately persistent healthy worker.
-                process.poll()
+            with self._startup_lock():
+                if identity_guard:
+                    identity_guard()
+                resources = resource_report(self.directory)
+                if not resources["ready"]:
+                    raise ScreenError(resources["reason"])
+                return self._spawn()
+
+    def _spawn(self) -> dict:
+        """Called with both profile lifecycle and account startup locks held."""
+        generation = secrets.token_hex(16)
+        write_state(self.manifest, dict(schema=1, generation=generation, phase="starting",
+                                       supervisor=None, children=[], error=None))
+        # No parent pipe survives. Gateway/viewer disconnects do not end the
+        # browser, and a restarted gateway adopts its original generation.
+        try:
+            process = subprocess.Popen(
+                ["dbus-run-session", "--", sys.executable, "-m", "flowly.desktop_runtime.supervisor",
+                 str(self.directory), generation],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True,
+            )
+        except OSError as exc:
+            write_state(self.manifest, dict(schema=1, generation=generation, phase="failed",
+                                           supervisor=None, children=[], error="RUNTIME_START_FAILED"))
+            raise ScreenError("RUNTIME_START_FAILED") from exc
+        try:
+            return self._await_start(generation, process)
+        finally:
+            # Popen instances are reaped by subprocess on the next spawn;
+            # do not wait for a deliberately persistent healthy worker.
+            process.poll()
 
     def _await_start(self, generation: str, process: subprocess.Popen | None = None) -> dict:
         deadline = time.monotonic() + self.START_TIMEOUT

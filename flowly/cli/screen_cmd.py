@@ -3,6 +3,7 @@
 import json
 
 import typer
+from filelock import Timeout
 
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.launcher import ScreenRuntime
@@ -49,6 +50,15 @@ def status() -> None:
         _error(exc)
 
 
+@screen_app.command("doctor")
+def doctor() -> None:
+    """Check screen dependencies and startup resources without creating a runtime."""
+    report = ScreenRuntime.doctor(get_flowly_home() / "desktop")
+    _print({"profileId": current_profile_name(), **report})
+    if not report["ready"]:
+        raise typer.Exit(1)
+
+
 @screen_app.command("start")
 def start() -> None:
     """Start or reconnect to this profile's persistent browser screen."""
@@ -58,6 +68,8 @@ def start() -> None:
         _print(_status(runtime))
     except ScreenError as exc:
         _error(exc)
+    except Timeout:
+        _error(ScreenError("LIFECYCLE_BUSY"))
 
 
 @screen_app.command("stop")
@@ -71,3 +83,5 @@ def stop() -> None:
         _print(_status(runtime))
     except ScreenError as exc:
         _error(exc)
+    except Timeout:
+        _error(ScreenError("LIFECYCLE_BUSY"))
