@@ -706,3 +706,68 @@ receipt replay, account privilege changes, concurrent admission and linked files
 The macOS verifier subset passed 39 tests. Targeted Ruff and diff checks passed.
 The previously recorded full Core run preceded these independent helper modules;
 no additional full-suite result is claimed for this increment.
+
+
+## Root-owned agent with unprivileged screen applications
+
+A Linux root agent can now start a screen when the fixed runtime account's private
+provenance validates. Missing or changed account state still fails closed. The
+supervisor, input/observer brokers and authority remain root-owned; private D-Bus,
+Xvnc, Openbox and sandboxed Chromium run with the validated non-root UID/GID, no
+supplementary groups, a private umask and `/` as their working directory. Root
+applications resolve programs only from system directories and receive an explicit
+environment, not the agent's PATH, credentials or root session bus.
+
+Socket layout version 3 maps the profile to application data under the fixed
+system runtime directory and application sockets under `/run`. A private root-owned
+mapping binds a random storage ID to the source directory and runtime UID/GID.
+It remains inaccessible to the application account. Parent directory entries are
+root-owned; only home/config/cache/data/browser and socket leaves belong to the
+application account. Existing unsafe ownership/modes/links are rejected rather than
+recursively repaired. Copying a mapping to another profile is rejected; a recreated
+profile gets fresh storage rather than inheriting the previous browser's login.
+Browser port reads are bounded, no-follow, regular-file and owner checked. Root
+resource admission measures the application-data filesystem. Current root profile
+paths require trusted root-owned ancestors; arbitrary writable/symlinked homes are
+not accepted. Profiles sharing the service account are not OS-isolated from one
+another.
+
+The account worker is still internal: CLI/RPC installation orchestration does not
+yet provision it. The disposable root test fixture explicitly provisions the account;
+this is not a completed Desktop installation flow. Profile deletion/restore cleanup,
+crash recovery and migration of external application storage remain required before
+production readiness. Existing normal-user runtimes keep their version-1/2 layouts.
+Desktop diagnostics now accept account-integrity failures and the private D-Bus
+dependency, showing the existing host-recovery message without private paths.
+
+Validation: 115 focused Core tests; 64 real Debian account/layout/runtime tests,
+including real UID boundaries, agent-directory denial, immutable parent entries,
+link/FIFO/oversized port records, root agent PATH rejection, real RFB mouse/keyboard,
+control handback, restart and persistent cookies. The normal-user Linux runtime and
+gateway regression passed 100 tests. The real Electron/TLS/root-Linux smoke passed
+installation review, explicit start, composer target, login, handback, same-run
+continuation, terminal viewer ACK and stop, including the rebuilt Desktop. The
+first root test's `/proc/<other-uid>/environ` probe was rejected by container process
+permissions; environment construction is checked directly, while actual process
+UIDs and sandbox flags are inspected without adding ptrace privileges. The final
+strict D-Bus address validation was followed by another passing 64-test Linux run.
+Desktop passed 77 focused tests and its full suite (3,889 passed, 3 skipped), build
+and main/preload/renderer type checks. Initial transport tests needed socket
+permissions; rerunning with those permissions passed. Targeted Ruff, shell syntax
+and diff checks passed. The complete Core suite passed 6,645 tests, 59 skipped,
+12 deselected and 13 warnings in 302.95 seconds. No merge, push or deployment
+was performed.
+
+Root fixture reproduction (fresh disposable container only):
+
+```sh
+docker run --rm --user 0 --security-opt seccomp=unconfined --shm-size=512m \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  -e FLOWLY_SCREEN_ACCOUNT_TEST=1 flowly-screen-gateway-test:bookworm \
+  python -m pytest tests/integration/screen/test_runtime_account.py \
+    tests/test_screen_runtime_account.py -q -p no:cacheprovider
+```
+
+The Desktop runner accepts `FLOWLY_SCREEN_ROOT_TEST=1` to select the root fixture;
+without it the existing unprivileged fixture is unchanged. Its test-only bootstrap
+requires the container marker and does not provision the user's own computer.

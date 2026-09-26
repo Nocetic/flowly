@@ -2,11 +2,14 @@
 
 import json
 import os
+import struct
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
+from flowly.desktop_runtime.application_layout import root_application_layout
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.runtime_account import ROOT, runtime_account
 from flowly.desktop_runtime.runtime_account_payload import PROVISION_SOURCE
@@ -134,3 +137,186 @@ def test_linked_privileged_files_are_not_followed(provisioned, name):
     finally:
         path.unlink()
         backup.rename(path)
+
+
+@pytest.fixture
+def layout(provisioned, request):
+    # /root is deliberately unreadable by the runtime account; actual app data
+    # must live elsewhere while the agent retains its authority/control files.
+    directory = Path("/root/screen-layout-tests") / request.node.name
+    directory.mkdir(parents=True, mode=0o700)
+    directory.chmod(0o700)
+    result = root_application_layout(directory, create=True)
+    return directory, result
+
+
+def test_root_layout_keeps_privileged_entries_outside_application_ownership(layout):
+    directory, application = layout
+    assert root_application_layout(directory) == application
+    assert (directory / "application-layout.json").stat().st_uid == 0
+    assert application.directory.stat().st_uid == 0
+    assert application.sockets.parent.stat().st_uid == 0
+    assert application.browser.stat().st_uid == application.account.uid
+    assert application.sockets.stat().st_uid == application.account.uid
+    code = "import pathlib,sys;pathlib.Path(sys.argv[1]).write_text('application write')"
+    child = subprocess.run(["/usr/bin/python3", "-I", "-c", code, str(application.browser / "test")],
+                           user=application.account.uid, group=application.account.gid,
+                           extra_groups=[], cwd="/", capture_output=True, env=application.environment())
+    assert child.returncode == 0
+    denied = subprocess.run(["/usr/bin/python3", "-I", "-c", code, str(directory / "authority-write")],
+                            user=application.account.uid, group=application.account.gid,
+                            extra_groups=[], cwd="/", capture_output=True, env=application.environment())
+    assert denied.returncode != 0 and not (directory / "authority-write").exists()
+    replacement = subprocess.run(["/usr/bin/python3", "-I", "-c",
+                                 "import os,sys;os.rename(sys.argv[1],sys.argv[1]+'-moved')",
+                                 str(application.browser)], user=application.account.uid,
+                                group=application.account.gid, extra_groups=[], cwd="/",
+                                capture_output=True, env=application.environment())
+    assert replacement.returncode != 0 and application.browser.is_dir()
+
+
+def test_readonly_layout_does_not_create_state(provisioned):
+    directory = Path("/root/screen-layout-readonly")
+    directory.mkdir(mode=0o700)
+    with pytest.raises(ScreenError, match="RUNTIME_STATE_INVALID"):
+        root_application_layout(directory)
+    assert list(directory.iterdir()) == []
+
+
+def test_recreated_profile_gets_new_application_storage(layout):
+    directory, previous = layout
+    (directory / "application-layout.json").unlink()
+    current = root_application_layout(directory, create=True)
+    assert current.directory != previous.directory and current.sockets != previous.sockets
+
+
+def test_copied_mapping_cannot_share_original_browser(layout):
+    directory, original = layout
+    target = directory.with_name(directory.name + "-copy")
+    target.mkdir(mode=0o700)
+    mapping = target / "application-layout.json"
+    mapping.write_bytes((directory / "application-layout.json").read_bytes())
+    mapping.chmod(0o600)
+    for create in (False, True):
+        with pytest.raises(ScreenError, match="RUNTIME_STATE_INVALID"):
+            root_application_layout(target, create=create)
+    assert original.browser.exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "public", "wrong-owner"])
+def test_unsafe_app_directory_is_not_followed_or_repaired(layout, kind):
+    directory, application = layout
+    path = application.browser
+    if kind == "symlink":
+        path.rmdir()
+        path.symlink_to("/root")
+    elif kind == "public":
+        path.chmod(0o777)
+    else:
+        os.chown(path, 0, 0)
+    for create in (False, True):
+        with pytest.raises(ScreenError, match="RUNTIME_STATE_INVALID"):
+            root_application_layout(directory, create=create)
+    if kind == "symlink":
+        assert path.is_symlink()
+
+
+@pytest.mark.parametrize("kind", ["regular", "symlink", "fifo", "large", "wrong-owner", "invalid"])
+def test_browser_port_read_is_bounded_and_does_not_follow_links(layout, kind):
+    _, application = layout
+    path = application.browser / "DevToolsActivePort"
+    assert application.read_browser_port() is None
+    if kind == "symlink":
+        path.symlink_to("/etc/passwd")
+    elif kind == "fifo":
+        os.mkfifo(path)
+    else:
+        path.write_text("12345\n/devtools/browser/test" if kind != "large" else "1" * 129)
+        if kind == "invalid":
+            path.write_text("65536\n")
+    if kind != "wrong-owner":
+        os.chown(path, application.account.uid, application.account.gid, follow_symlinks=False)
+    if kind == "regular":
+        assert application.read_browser_port() == 12345
+    else:
+        with pytest.raises(ScreenError, match="RUNTIME_STATE_INVALID"):
+            application.read_browser_port()
+
+
+def test_root_agent_runs_real_browser_and_input_as_unprivileged_account(layout, monkeypatch):
+    from playwright.sync_api import sync_playwright
+
+    from flowly.desktop_runtime.input_broker import ScreenInputBroker
+    from flowly.desktop_runtime.launcher import ScreenRuntime, is_alive
+
+    directory, application = layout
+    monkeypatch.setenv("CUSTOM_AGENT_TOKEN", "synthetic-root-agent-secret")
+    assert "CUSTOM_AGENT_TOKEN" not in application.environment()
+    assert "DBUS_SESSION_BUS_ADDRESS" not in application.environment()
+    fake_programs = directory / "agent-path"
+    fake_programs.mkdir()
+    fake_browser = fake_programs / "chromium"
+    fake_browser.write_text("#!/bin/sh\nexit 91\n")
+    fake_browser.chmod(0o700)
+    monkeypatch.setenv("PATH", str(fake_programs) + os.pathsep + os.environ["PATH"])
+    runtime = ScreenRuntime(directory)
+    assert runtime.capabilities()["supported"]
+    state = runtime.start()
+    generation = state["generation"]
+    try:
+        assert state["socketLayoutVersion"] == 3
+        assert len(state["children"]) == 4  # private D-Bus, Xvnc, Openbox, Chromium
+        assert Path(state["socket"]) == application.sockets / "rfb.sock"
+        assert (application.sockets / "bus").stat().st_uid == application.account.uid
+        assert (runtime.socket_directory / "input.sock").stat().st_uid == 0
+        for identity in state["children"]:
+            status = Path(f"/proc/{identity['pid']}/status").read_text()
+            uid = next(line for line in status.splitlines() if line.startswith("Uid:"))
+            assert set(uid.split()[1:]) == {str(application.account.uid)}
+            command = Path(f"/proc/{identity['pid']}/cmdline").read_bytes()
+            assert b"--no-sandbox" not in command
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{state['cdpPort']}")
+            context = browser.contexts[0]
+            page = context.pages[0]
+            page.goto("data:text/html,<input id='code' autofocus>")
+            point = page.locator("#code").evaluate("""element => {
+                const r = element.getBoundingClientRect();
+                return {x: Math.round(screenX + r.x + 10),
+                        y: Math.round(screenY + outerHeight - innerHeight + r.y + 10)};
+            }""")
+            authority = runtime.authority
+            action = authority.begin_action("root-original-run", "before", generation)
+            assert authority.end_action(action)
+            human = authority.acquire("root-viewer", generation, authority.snapshot()["epoch"])
+            broker = ScreenInputBroker(authority, "root-viewer", generation, human["epoch"], Path(state["socket"]))
+            try:
+                broker.send(b"".join(struct.pack("!BBHH", 5, buttons, point["x"], point["y"])
+                                     for buttons in (0, 1, 0)))
+                page.wait_for_function("document.hasFocus() && document.activeElement.id === 'code'")
+                broker.send(b"".join(struct.pack("!BBHI", 4, down, 0, ord(letter))
+                                     for letter in "246810" for down in (1, 0)))
+                page.wait_for_function("document.querySelector('#code').value === '246810'")
+                released = broker.finish(release=True)
+                assert released["control"] == "agent" and released["runId"] == "root-original-run"
+                action = authority.begin_action("root-original-run", "after", generation)
+                assert authority.end_action(action)
+                authority.finish_run("root-original-run", generation)
+            finally:
+                broker.abandon()
+            assert page.screenshot().startswith(b"\x89PNG")
+            context.add_cookies([{"url": "http://screen.test", "name": "session", "value": "root-fixture",
+                                  "expires": 2000000000}])
+        assert runtime.start()["generation"] == generation
+    finally:
+        runtime.stop(generation)
+    assert not any(is_alive(identity) for identity in state["children"])
+    restarted = runtime.start()
+    try:
+        assert restarted["generation"] != generation
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{restarted['cdpPort']}")
+            cookies = browser.contexts[0].cookies("http://screen.test")
+            assert any(cookie["name"] == "session" and cookie["value"] == "root-fixture" for cookie in cookies)
+    finally:
+        runtime.stop(restarted["generation"])

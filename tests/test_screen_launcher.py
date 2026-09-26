@@ -51,10 +51,57 @@ def test_application_sockets_are_separate_and_legacy_paths_remain_pinned(runtime
     assert other.application_socket_directory not in (broker, applications)
 
 
-@pytest.mark.parametrize("version", [None, True, "2", 0, 3, {}, []])
+@pytest.mark.parametrize("version", [None, True, "2", 0, 4, {}, []])
 def test_unknown_socket_layout_is_not_a_path_fallback(runtime, version):
     with pytest.raises(ScreenError, match="RUNTIME_STATE_INVALID"):
         runtime.rfb_socket_for({"socketLayoutVersion": version})
+
+
+@pytest.mark.parametrize("code", ["UNPRIVILEGED_RUNTIME_REQUIRED", "RUNTIME_STATE_INVALID"])
+def test_root_capability_requires_valid_account_without_provisioning(monkeypatch, code):
+    from flowly.desktop_runtime import runtime_account as accounts
+
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher.os, "pidfd_open", lambda pid: None, raising=False)
+    monkeypatch.setattr(launcher.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(launcher.shutil, "which", lambda *a, **kw: "/usr/bin/test-program")
+    monkeypatch.setattr(launcher.importlib.util, "find_spec", lambda name: object())
+
+    def verify():
+        raise ScreenError(code)
+
+    monkeypatch.setattr(accounts, "runtime_account", verify)
+    assert ScreenRuntime.capabilities() == {"supported": False, "reason": code, "missing": []}
+
+
+def test_root_capability_requires_private_bus_program(monkeypatch):
+    from flowly.desktop_runtime import runtime_account as accounts
+
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher.os, "pidfd_open", lambda pid: None, raising=False)
+    monkeypatch.setattr(launcher.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(launcher.shutil, "which", lambda name, **kw: None if name == "dbus-daemon" else "/usr/bin/test")
+    monkeypatch.setattr(launcher.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(accounts, "runtime_account", lambda: accounts.RuntimeAccount(991, 992))
+    assert ScreenRuntime.capabilities() == {"supported": False, "reason": "DEPENDENCIES_MISSING", "missing": ["dbus-daemon"]}
+
+
+def test_root_budget_uses_actual_application_filesystem(monkeypatch, tmp_path):
+    from flowly.desktop_runtime.runtime_account import ROOT
+
+    monkeypatch.setattr(launcher.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(ScreenRuntime, "capabilities", staticmethod(lambda: {
+        "supported": True, "reason": None, "missing": []}))
+    inspected = []
+
+    def report(path):
+        inspected.append(path)
+        return {"ready": True, "reason": None}
+
+    monkeypatch.setattr(launcher, "resource_report", report)
+    assert ScreenRuntime.doctor(tmp_path / "does-not-exist")["ready"]
+    assert inspected == [ROOT]
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("reason", ["INSUFFICIENT_RESOURCES", "RESOURCE_CHECK_UNAVAILABLE"])

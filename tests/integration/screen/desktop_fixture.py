@@ -11,6 +11,7 @@ import asyncio
 import os
 import signal
 import ssl
+import subprocess
 from pathlib import Path
 
 from aiohttp import web
@@ -40,8 +41,16 @@ document.querySelector('#result').style.backgroundColor='#16803c';
 
 
 async def main():
-    if os.environ.get("FLOWLY_SCREEN_LINUX_TEST") != "1" or os.getuid() == 0:
-        raise RuntimeError("Requires the isolated unprivileged Linux screen runner")
+    if os.environ.get("FLOWLY_SCREEN_LINUX_TEST") != "1":
+        raise RuntimeError("Requires the isolated Linux screen runner")
+    if os.getuid() == 0:
+        if os.environ.get("FLOWLY_SCREEN_ROOT_TEST") != "1" or not Path("/.dockerenv").is_file():
+            raise RuntimeError("Root fixture requires explicit disposable-container opt-in")
+        from flowly.desktop_runtime.runtime_account_payload import PROVISION_SOURCE
+
+        subprocess.run(["/usr/bin/python3", "-I", "-c", PROVISION_SOURCE + "\nprovision_runtime_account()\n"],
+                       check=True, timeout=35, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"})
     home = Path(os.environ["FLOWLY_HOME"])
     if home != Path.home() / ".flowly":
         raise RuntimeError("Use the disposable container user's default profile home")

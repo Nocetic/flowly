@@ -115,14 +115,29 @@ class ScreenRuntime:
         # Chromium's sandbox requires an unprivileged runtime account. Never
         # silently add --no-sandbox to make a root installation appear healthy.
         if os.geteuid() == 0:
-            return dict(supported=False, reason="UNPRIVILEGED_RUNTIME_REQUIRED", missing=[])
+            from flowly.desktop_runtime.runtime_account import runtime_account
+
+            try:
+                runtime_account()
+            except ScreenError as exc:
+                return dict(supported=False, reason=exc.code, missing=[])
+            if shutil.which("dbus-daemon", path="/usr/bin:/bin") is None:
+                return dict(supported=False, reason="DEPENDENCIES_MISSING", missing=["dbus-daemon"])
         return dict(supported=True, reason=None, missing=[])
+
+    @staticmethod
+    def resource_directory(directory: Path) -> Path:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            from flowly.desktop_runtime.runtime_account import ROOT
+
+            return ROOT
+        return directory
 
     @staticmethod
     def doctor(directory: Path) -> dict:
         """Inspect an uncreated profile without constructing a runtime or authority."""
         capability = ScreenRuntime.capabilities()
-        resources = resource_report(directory) if capability["reason"] != "UNSUPPORTED_HOST" else None
+        resources = resource_report(ScreenRuntime.resource_directory(directory)) if capability["reason"] != "UNSUPPORTED_HOST" else None
         return {"doctorVersion": 1, "ready": capability["supported"] and bool(resources and resources["ready"]),
                 "reason": capability["reason"] or (resources["reason"] if resources else "RESOURCE_CHECK_UNAVAILABLE"),
                 "missing": capability["missing"], "resources": resources}
@@ -143,16 +158,24 @@ class ScreenRuntime:
 
     @property
     def application_socket_directory(self) -> Path:
+        if os.geteuid() == 0:
+            from flowly.desktop_runtime.application_layout import root_application_layout
+
+            return root_application_layout(self.directory).sockets
         # Keep Xvnc/X authority separate from the agent's input/observer brokers.
-        # Ownership is still the current account until root provisioning supplies
-        # an explicitly validated runtime-account layout.
         parent = private_directory(Path("/tmp") / f"flowly-screen-{os.getuid()}")
         key = hashlib.sha256(os.fsencode(self.directory)).hexdigest()[:24]
         return private_directory(parent / (key + "-apps"))
 
     def rfb_socket_for(self, state: dict) -> Path:
         version = state.get("socketLayoutVersion", 1)
-        if type(version) is not int or version not in (1, 2):
+        if type(version) is not int or version not in (1, 2, 3):
+            raise ScreenError("RUNTIME_STATE_INVALID")
+        if version == 3:
+            from flowly.desktop_runtime.application_layout import root_application_layout
+
+            return root_application_layout(self.directory).sockets / "rfb.sock"
+        if version == 2 and os.geteuid() == 0:
             raise ScreenError("RUNTIME_STATE_INVALID")
         # Existing supervisors keep their original socket until explicit stop.
         # Never follow a path supplied by a manifest or public RPC parameter.
@@ -217,22 +240,27 @@ class ScreenRuntime:
             with self._startup_lock():
                 if identity_guard:
                     identity_guard()
-                resources = resource_report(self.directory)
+                resources = resource_report(self.resource_directory(self.directory))
                 if not resources["ready"]:
                     raise ScreenError(resources["reason"])
                 return self._spawn()
 
     def _spawn(self) -> dict:
         """Called with both profile lifecycle and account startup locks held."""
+        root = os.geteuid() == 0
+        if root:
+            from flowly.desktop_runtime.application_layout import root_application_layout
+
+            root_application_layout(self.directory, create=True)
         generation = secrets.token_hex(16)
-        write_state(self.manifest, dict(schema=1, socketLayoutVersion=2, generation=generation, phase="starting",
+        write_state(self.manifest, dict(schema=1, socketLayoutVersion=3 if root else 2, generation=generation, phase="starting",
                                        supervisor=None, children=[], error=None))
         # No parent pipe survives. Gateway/viewer disconnects do not end the
         # browser, and a restarted gateway adopts its original generation.
         try:
+            command = [sys.executable, "-m", "flowly.desktop_runtime.supervisor", str(self.directory), generation]
             process = subprocess.Popen(
-                ["dbus-run-session", "--", sys.executable, "-m", "flowly.desktop_runtime.supervisor",
-                 str(self.directory), generation],
+                command if root else ["dbus-run-session", "--", *command],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, close_fds=True,
             )

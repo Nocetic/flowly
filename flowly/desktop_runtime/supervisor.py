@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import secrets
 import select
 import shutil
@@ -53,23 +54,26 @@ def application_environment(directory: Path, sockets: Path) -> dict[str, str]:
     return environment
 
 
-def application_command(arguments: list[str]) -> list[str]:
+def application_command(arguments: list[str], *, system: bool = False) -> list[str]:
     # Preserve explicitly configured executable locations without passing the
     # agent's entire PATH to the desktop processes or their descendants.
-    executable = shutil.which(arguments[0])
+    executable = shutil.which(arguments[0], path="/usr/bin:/bin" if system else None)
     if executable is None:
         raise ScreenError("DEPENDENCIES_MISSING")
     return [os.path.abspath(executable), *arguments[1:]]
 
 
-def write_xauthority(path: Path) -> None:
+def write_xauthority(path: Path, *, account=None) -> None:
     # FamilyWild lets Xvnc allocate the display atomically through -displayfd.
     # The cookie is private to this runtime and X11 TCP is disabled.
     data = struct.pack("!H", 65535)
     for field in (b"", b"", b"MIT-MAGIC-COOKIE-1", secrets.token_bytes(16)):
         data += struct.pack("!H", len(field)) + field
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    path.unlink(missing_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as target:
+        if account is not None:
+            os.fchown(target.fileno(), account.uid, account.gid)
         target.write(data)
 
 
@@ -107,6 +111,7 @@ def run(directory: Path, generation: str) -> None:
         input_service = None
         observers = None
         stopping = False
+        application = None
 
         def request_stop(*_):
             nonlocal stopping
@@ -116,9 +121,11 @@ def run(directory: Path, generation: str) -> None:
         signal.signal(signal.SIGINT, request_stop)
 
         def spawn(arguments, env, **kwargs):
-            child = subprocess.Popen(application_command(arguments), env=env, stdin=subprocess.DEVNULL,
+            privileges = ({"user": application.account.uid, "group": application.account.gid,
+                           "extra_groups": [], "umask": 0o077, "cwd": "/"} if application else {})
+            child = subprocess.Popen(application_command(arguments, system=application is not None), env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     start_new_session=True, close_fds=True, **kwargs)
+                                     start_new_session=True, close_fds=True, **privileges, **kwargs)
             processes.append(child)
             identity = process_identity(child.pid)
             if identity is None:
@@ -139,12 +146,39 @@ def run(directory: Path, generation: str) -> None:
             raise ScreenError("RUNTIME_START_TIMEOUT")
 
         try:
+            if os.geteuid() == 0:
+                from flowly.desktop_runtime.application_layout import root_application_layout
+
+                if state.get("socketLayoutVersion") != 3:
+                    raise ScreenError("RUNTIME_STATE_INVALID")
+                application = root_application_layout(directory)
             sockets = runtime.socket_directory
             rfb = runtime.rfb_socket_for(state)
             application_sockets = rfb.parent
             xauthority = application_sockets / "Xauthority"
-            write_xauthority(xauthority)
-            env = application_environment(directory, application_sockets)
+            write_xauthority(xauthority, account=application.account if application else None)
+            env = application.environment() if application else application_environment(directory, application_sockets)
+            if application:
+                # The root supervisor keeps its own control sockets. Only this
+                # private unprivileged bus is forwarded to the applications.
+                bus = application_sockets / "bus"
+                bus.unlink(missing_ok=True)
+                read_fd, write_fd = os.pipe()
+                try:
+                    address = "unix:path=" + str(bus)
+                    spawn(["dbus-daemon", "--session", "--nofork", "--nopidfile",
+                           "--address=" + address, "--print-address=" + str(write_fd)], env, pass_fds=(write_fd,))
+                    os.close(write_fd)
+                    write_fd = -1
+                    wait_for(lambda: select.select([read_fd], [], [], 0)[0])
+                    actual = os.read(read_fd, 1024).strip().decode("ascii")
+                    if re.fullmatch(re.escape(address) + r",guid=[a-f0-9]{32}", actual) is None:
+                        raise ScreenError("RUNTIME_START_FAILED")
+                    env["DBUS_SESSION_BUS_ADDRESS"] = actual
+                finally:
+                    os.close(read_fd)
+                    if write_fd >= 0:
+                        os.close(write_fd)
             rfb.unlink(missing_ok=True)
             read_fd, write_fd = os.pipe()
             try:
@@ -164,14 +198,17 @@ def run(directory: Path, generation: str) -> None:
                 if write_fd >= 0:
                     os.close(write_fd)
             spawn(["openbox"], env)
-            browser_profile = private_directory(directory / "browser")
+            browser_profile = application.browser if application else private_directory(directory / "browser")
             port_file = browser_profile / "DevToolsActivePort"
             port_file.unlink(missing_ok=True)
             spawn(["chromium", f"--user-data-dir={browser_profile}", "--remote-debugging-address=127.0.0.1",
                    "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check",
                    "--window-position=0,0", "--window-size=1440,900", "about:blank"], env)
-            wait_for(lambda: port_file.exists() and port_file.stat().st_size > 0 and rfb.exists())
-            port = int(port_file.read_text().splitlines()[0])
+            if application:
+                port = wait_for(lambda: application.read_browser_port() if rfb.exists() else None)
+            else:
+                wait_for(lambda: port_file.exists() and port_file.stat().st_size > 0 and rfb.exists())
+                port = int(port_file.read_text().splitlines()[0])
             if not 0 < port < 65536:
                 raise ScreenError("RUNTIME_START_FAILED")
             runtime.authority.start(generation)
