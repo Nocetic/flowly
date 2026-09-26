@@ -36,7 +36,7 @@ from flowly.gateway.mcp_management import _protected_socket
 METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create", "display.viewer.close",
                      "display.control.acquire", "display.control.release", "display.control.reclaim",
                      "display.subscribe", "display.unsubscribe", "display.run.resume",
-                     "display.start", "display.stop", "display.operation.status", "display.doctor", "display.install.plan", "display.install.status", "display.install.apply"})
+                     "display.start", "display.stop", "display.operation.status", "display.doctor", "display.install.plan", "display.install.status", "display.install.apply", "display.install.verify"})
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
@@ -277,12 +277,14 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             return
         allowed = {"profileId", "expectedHostId", "expectedBotId"}
         pinned = method not in {"display.capabilities", "display.status"}
-        if pinned and method not in {"display.subscribe", "display.operation.status", "display.doctor", "display.install.plan", "display.install.status", "display.install.apply"}:
+        if pinned and method not in {"display.subscribe", "display.operation.status", "display.doctor", "display.install.plan", "display.install.status", "display.install.apply", "display.install.verify"}:
             allowed.add("generation")
-        if method in {"display.start", "display.stop", "display.operation.status", "display.install.status", "display.install.apply"}:
+        if method in {"display.start", "display.stop", "display.operation.status", "display.install.status", "display.install.apply", "display.install.verify"}:
             allowed.add("operationId")
+        if method in {"display.install.apply", "display.install.verify"}:
+            allowed.add("planId")
         if method == "display.install.apply":
-            allowed.update({"planId", "password"})
+            allowed.add("password")
         if method == "display.observe":
             allowed.add("viewerToken")
         if method == "display.run.resume":
@@ -291,7 +293,7 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             allowed.update({"viewerToken", "epoch", "operationId"})
         if not isinstance(params, dict) or set(params) - allowed:
             raise ScreenError("INVALID_PARAMS")
-        if method == "display.install.apply" and not {
+        if method in {"display.install.apply", "display.install.verify"} and not {
                 "profileId", "expectedHostId", "expectedBotId", "planId", "operationId"}.issubset(params):
             raise ScreenError("INVALID_PARAMS")
         session = await asyncio.to_thread(_resolve, gateway, params, pinned=pinned)
@@ -310,10 +312,11 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             result = await asyncio.to_thread(apply_installation)
             await gateway._ws_rpc_reply(ws, rpc_id, result)
             return
-        if method == "display.install.status":
+        if method in {"display.install.status", "display.install.verify"}:
             def installation_status():
                 jobs = ScreenInstallJobs(session.identity, lambda: _resolve(gateway, params, pinned=True))
-                result = jobs.status(params.get("operationId"))
+                result = (jobs.verify(params.get("planId"), params.get("operationId"))
+                          if method == "display.install.verify" else jobs.status(params.get("operationId")))
                 _resolve(gateway, params, pinned=True)
                 return result
             result = await asyncio.to_thread(installation_status)

@@ -7,6 +7,7 @@ receipts. Gateway loss requires recovery; accepted mutations are never replayed.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -103,6 +104,18 @@ def _assert_restarted(row: dict) -> None:
         raise ScreenError("INSTALL_RESTART_REQUIRED")
 
 
+def _installation_components_ready() -> bool:
+    from flowly.desktop_runtime.launcher import ScreenRuntime
+    from flowly.desktop_runtime.python_install_worker import ready
+
+    if not ready() or not ScreenRuntime.capabilities()["supported"]:
+        return False
+    # Metadata alone does not prove that the installed modules can be imported.
+    for name in ("playwright.async_api", "greenlet", "pyee", "typing_extensions"):
+        importlib.import_module(name)
+    return True
+
+
 class ScreenInstallJobs:
     def __init__(self, identity: dict, guard: Callable[[], None]):
         if os.name != "posix":
@@ -186,6 +199,39 @@ class ScreenInstallJobs:
                         raise ScreenError("PROFILE_IDENTITY_CHANGED")
                     return self._public(row)
         raise ScreenError("OPERATION_NOT_FOUND")
+
+    def verify(self, plan_id: str, operation: str) -> dict:
+        """Fresh observation only; no restart, package writes or runtime creation."""
+        _operation(operation)
+        if not isinstance(plan_id, str) or not re.fullmatch(r"[a-f0-9]{64}", plan_id):
+            raise ScreenError("INVALID_PARAMS")
+        self.guard()
+        # The receipt belongs to this identity even when the environment is busy.
+        receipt = self.status(operation)
+        if receipt["planId"] != plan_id:
+            raise ScreenError("OPERATION_CONFLICT")
+        reason = None
+        try:
+            with environment_activity():
+                receipt = self.status(operation)
+                if receipt["state"] in {"pending", "running"}:
+                    reason = "INSTALL_BUSY"
+                elif receipt["state"] != "succeeded":
+                    reason = "INSTALL_RECOVERY_REQUIRED" if receipt["state"] == "recovery_required" else "INSTALL_VERIFICATION_FAILED"
+                else:
+                    assert_environment_installation_idle()
+                    if not _installation_components_ready():
+                        reason = "INSTALL_VERIFICATION_FAILED"
+        except ScreenError as exc:
+            if exc.code not in {"INSTALL_BUSY", "INSTALL_STATE_INVALID", "INSTALL_RECOVERY_REQUIRED", "INSTALL_RESTART_REQUIRED"}:
+                raise
+            reason = exc.code
+        except Exception:
+            # Import failures must not expose local paths or dependency details.
+            reason = "INSTALL_VERIFICATION_FAILED"
+        self.guard()
+        return {"installVerificationVersion": 1, **self.identity, "operationId": operation,
+                "planId": plan_id, "ready": reason is None, "reason": reason}
 
     def submit(self, plan_id: str, operation: str, *, password: str | None = None):
         _operation(operation)

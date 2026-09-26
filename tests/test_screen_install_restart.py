@@ -61,6 +61,9 @@ from flowly.desktop_runtime import install_jobs
 install_jobs.state_root = lambda: Path(sys.argv[1])
 install_jobs.assert_environment_installation_idle()
 if len(sys.argv) > 2:
+    jobs = install_jobs.ScreenInstallJobs({'hostId': 'host', 'botId': 'bot', 'profileId': 'default'}, lambda: None)
+    verified = jobs.verify('a' * 64, '1' * 32)
+    assert verified['ready'] is True and verified['reason'] is None, verified
     from flowly.desktop_runtime.launcher import ScreenRuntime
     runtime = ScreenRuntime(Path(sys.argv[2]))
     state = runtime.start()
