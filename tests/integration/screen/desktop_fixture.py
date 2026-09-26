@@ -23,6 +23,7 @@ from flowly.bus.queue import MessageBus
 from flowly.config.schema import Config
 from flowly.desktop_runtime.browser_provider import HostBrowserProvider
 from flowly.desktop_runtime.launcher import ScreenRuntime
+from flowly.desktop_runtime.supervisor import application_environment
 from flowly.gateway.server import GatewayServer
 from flowly.profile import get_or_create_profile_host_id
 from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -105,12 +106,46 @@ async def main():
     app = gateway._create_app()
     page = None
 
+    def desktop_inspection():
+        state = runtime.status()
+        if not state or state["phase"] != "running":
+            return None
+        privileges = {}
+        if os.geteuid() == 0:
+            from flowly.desktop_runtime.application_layout import root_application_layout
+
+            layout = root_application_layout(runtime.directory)
+            environment = layout.environment()
+            privileges = {"user": layout.account.uid, "group": layout.account.gid, "extra_groups": []}
+        else:
+            environment = application_environment(runtime.directory, runtime.rfb_socket_for(state).parent)
+        environment["DISPLAY"] = state["display"]
+
+        def query(*args):
+            return subprocess.run(["xdotool", *args], env=environment, **privileges,
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2)
+
+        panel = query("search", "--onlyvisible", "--class", "^xfce4-panel$")
+        if panel.returncode:
+            return None
+        geometry = query("getwindowgeometry", "--shell", panel.stdout.splitlines()[-1])
+        bounds = dict(line.split("=", 1) for line in geometry.stdout.splitlines())
+        active = query("getactivewindow").stdout.strip()
+        browsers = query("search", "--onlyvisible", "--class", "^chromium$").stdout.splitlines()
+        marker = Path(environment["HOME"]) / "desktop-terminal-probe"
+        return {"panel": {key.lower(): int(bounds[key]) for key in ("X", "Y", "WIDTH", "HEIGHT")},
+                "browserActive": active in browsers,
+                "terminalVisible": query("search", "--onlyvisible", "--class", "^xfce4-terminal$").returncode == 0,
+                "settingsVisible": query("search", "--onlyvisible", "--class", "^xfce4-settings-manager$").returncode == 0,
+                "terminalCommandRan": marker.is_file() and marker.read_bytes() == b"desktop-ready\n"}
+
     async def inspection(request):
         # Test-only inspection never injects mouse/keyboard input or mutates the
         # browser. Keep values/cookies out of the response and test logs.
         if request.headers.get("Authorization") != f"Bearer {TOKEN}":
             raise web.HTTPUnauthorized()
         return web.json_response({"calls": model.calls, "actions": list(actions),
+            "desktop": await asyncio.to_thread(desktop_inspection),
             "page": await page.evaluate("""() => {
                 const point = selector => { const r=document.querySelector(selector).getBoundingClientRect();
                   return {x:screenX+(outerWidth-innerWidth)/2+r.x+r.width/2,

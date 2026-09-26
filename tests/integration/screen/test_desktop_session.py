@@ -96,7 +96,7 @@ def desktop(tmp_path):
             os.close(read_fd)
             if write_fd >= 0:
                 os.close(write_fd)
-        spawn(["xfwm4", "--compositor=off"])
+        spawn(["xfwm4", "--compositor=on", "--vblank=off"])
         spawn(["xfsettingsd"])
         spawn(["xfdesktop"])
         spawn(["xfce4-panel"])

@@ -5,8 +5,10 @@ Stdlib only: the agent's Python environment is never imported with sudo.
 """
 
 PACKAGES = (
-    "tigervnc-standalone-server", "xauth", "openbox", "dbus-x11",
+    "tigervnc-standalone-server", "xauth", "dbus-x11",
     "chromium", "chromium-sandbox", "xdotool", "x11-utils", "fonts-dejavu-core",
+    "xfwm4", "xfdesktop4", "xfce4-panel", "xfce4-settings", "xfce4-terminal", "xfconf",
+    "adwaita-icon-theme", "thunar", "python3", "bash",
 )
 
 # Keep this executable standalone: the elevated interpreter must not import
@@ -25,8 +27,10 @@ import tempfile
 import time
 from pathlib import Path
 
-PACKAGES = ("tigervnc-standalone-server", "xauth", "openbox", "dbus-x11",
-            "chromium", "chromium-sandbox", "xdotool", "x11-utils", "fonts-dejavu-core")
+PACKAGES = ("tigervnc-standalone-server", "xauth", "dbus-x11",
+            "chromium", "chromium-sandbox", "xdotool", "x11-utils", "fonts-dejavu-core",
+            "xfwm4", "xfdesktop4", "xfce4-panel", "xfce4-settings", "xfce4-terminal", "xfconf",
+            "adwaita-icon-theme", "thunar", "python3", "bash")
 ROOT = Path("/var/lib/flowly-screen-installer")
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LANG": "C.UTF-8",
        "LC_ALL": "C.UTF-8", "DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "l"}

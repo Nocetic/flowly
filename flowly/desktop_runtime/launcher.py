@@ -28,7 +28,9 @@ from filelock import FileLock
 from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError
 from flowly.desktop_runtime.resources import resource_report
 
-REQUIRED_PROGRAMS = ("Xvnc", "openbox", "dbus-run-session", "chromium")
+REQUIRED_PROGRAMS = ("Xvnc", "dbus-run-session", "chromium", "python3", "bash",
+                     "xfwm4", "xfsettingsd", "xfdesktop", "xfce4-panel", "xfce4-terminal",
+                     "xfce4-settings-manager", "xfconf-query", "xdotool", "xprop")
 _UNPINNED = object()
 
 

@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from filelock import FileLock
 
 from flowly.desktop_runtime.authority import ScreenError
+from flowly.desktop_runtime.desktop_defaults import DESKTOP_DEFAULTS_SOURCE
 from flowly.desktop_runtime.input_service import InputService
 from flowly.desktop_runtime.launcher import (
     ScreenRuntime,
@@ -120,12 +121,14 @@ def run(directory: Path, generation: str) -> None:
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
 
+        def privileges():
+            return ({"user": application.account.uid, "group": application.account.gid,
+                     "extra_groups": [], "umask": 0o077} if application else {})
+
         def spawn(arguments, env, **kwargs):
-            privileges = ({"user": application.account.uid, "group": application.account.gid,
-                           "extra_groups": [], "umask": 0o077, "cwd": "/"} if application else {})
             child = subprocess.Popen(application_command(arguments, system=application is not None), env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     start_new_session=True, close_fds=True, **privileges, **kwargs)
+                                     start_new_session=True, close_fds=True, cwd=env["HOME"], **privileges(), **kwargs)
             processes.append(child)
             identity = process_identity(child.pid)
             if identity is None:
@@ -133,6 +136,23 @@ def run(directory: Path, generation: str) -> None:
             state["children"].append(identity)
             write_state(runtime.manifest, state)
             return child
+
+        def application_check(arguments, env, *, timeout=5):
+            # Short helpers cannot inherit root credentials or outlive a timeout.
+            # In particular, seeding must not write app-owned paths as root.
+            child = subprocess.Popen(application_command(arguments, system=application is not None), env=env,
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True,
+                                     close_fds=True, cwd=env["HOME"], **privileges())
+            try:
+                return child.wait(timeout=timeout) == 0
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait(timeout=2)
+                raise
 
         def wait_for(predicate, timeout=15):
             deadline = time.monotonic() + timeout
@@ -158,6 +178,7 @@ def run(directory: Path, generation: str) -> None:
             xauthority = application_sockets / "Xauthority"
             write_xauthority(xauthority, account=application.account if application else None)
             env = application.environment() if application else application_environment(directory, application_sockets)
+            env.update(XDG_CURRENT_DESKTOP="XFCE", XDG_SESSION_TYPE="x11", SHELL="/bin/bash")
             if application:
                 # The root supervisor keeps its own control sockets. Only this
                 # private unprivileged bus is forwarded to the applications.
@@ -197,13 +218,23 @@ def run(directory: Path, generation: str) -> None:
                 os.close(read_fd)
                 if write_fd >= 0:
                     os.close(write_fd)
-            spawn(["openbox"], env)
             browser_profile = application.browser if application else private_directory(directory / "browser")
+            browser_command = application_command(["chromium"], system=application is not None)[0]
+            if not application_check(["python3", "-I", "-c", DESKTOP_DEFAULTS_SOURCE,
+                                      browser_command, str(browser_profile)], env):
+                raise ScreenError("RUNTIME_START_FAILED")
+            spawn(["xfwm4", "--compositor=on", "--vblank=off"], env)
+            spawn(["xfsettingsd"], env)
+            spawn(["xfdesktop"], env)
+            spawn(["xfce4-panel"], env)
+            wait_for(lambda: all(application_check(
+                ["xdotool", "search", "--onlyvisible", "--class", pattern], env)
+                for pattern in ("^xfce4-panel$", "^xfdesktop$")))
             port_file = browser_profile / "DevToolsActivePort"
             port_file.unlink(missing_ok=True)
             spawn(["chromium", f"--user-data-dir={browser_profile}", "--remote-debugging-address=127.0.0.1",
                    "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check",
-                   "--window-position=0,0", "--window-size=1440,900", "about:blank"], env)
+                   "--window-position=20,20", "--window-size=1360,780", "about:blank"], env)
             if application:
                 port = wait_for(lambda: application.read_browser_port() if rfb.exists() else None)
             else:

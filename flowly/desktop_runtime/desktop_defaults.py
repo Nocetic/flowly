@@ -97,13 +97,13 @@ seed(channels / "xfce4-panel.xml", '''<?xml version="1.0" encoding="UTF-8"?>
     <property name="panel-1" type="empty">
       <property name="position" type="string" value="p=10;x=0;y=0"/>
       <property name="position-locked" type="bool" value="true"/>
-      <property name="length" type="uint" value="70"/>
+      <property name="length" type="uint" value="1"/>
+      <property name="length-adjust" type="bool" value="true"/>
       <property name="size" type="uint" value="48"/>
       <property name="icon-size" type="uint" value="32"/>
       <property name="autohide-behavior" type="uint" value="0"/>
       <property name="plugin-ids" type="array">
         <value type="int" value="1"/><value type="int" value="2"/><value type="int" value="3"/>
-        <value type="int" value="4"/><value type="int" value="5"/><value type="int" value="6"/>
       </property>
     </property>
   </property>
@@ -111,10 +111,23 @@ seed(channels / "xfce4-panel.xml", '''<?xml version="1.0" encoding="UTF-8"?>
     <property name="plugin-1" type="string" value="launcher"><property name="items" type="array"><value type="string" value="flowly-browser.desktop"/></property></property>
     <property name="plugin-2" type="string" value="launcher"><property name="items" type="array"><value type="string" value="flowly-terminal.desktop"/></property></property>
     <property name="plugin-3" type="string" value="launcher"><property name="items" type="array"><value type="string" value="flowly-settings.desktop"/></property></property>
-    <property name="plugin-4" type="string" value="separator"><property name="style" type="uint" value="0"/></property>
-    <property name="plugin-5" type="string" value="tasklist"><property name="grouping" type="uint" value="1"/></property>
-    <property name="plugin-6" type="string" value="clock"/>
   </property>
 </channel>
+''')
+gtk = directory(config / "gtk-3.0")
+seed(gtk / "gtk.css", '''
+/* Only the remote desktop dock; application widgets retain their own theme. */
+.xfce4-panel {
+  background-color: #24262b;
+  border: 1px solid #41444c;
+  border-radius: 14px;
+}
+.xfce4-panel button {
+  background: transparent;
+  border: none;
+  border-radius: 10px;
+  box-shadow: none;
+}
+.xfce4-panel button:hover { background-color: #41444c; }
 ''')
 """
