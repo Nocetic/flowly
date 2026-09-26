@@ -715,6 +715,9 @@ class GatewayServer:
 
         register_mcp_management(app, self)
         register_gmail_management(app, self)
+        from flowly.gateway.display import register_display
+
+        register_display(app, self)
         # WS-upgrade ticket minter. Active only when auth is engaged; the
         # static token (checked by the auth middleware) gates this route, and
         # it hands back a single-use short-TTL ticket for the /ws upgrade.
@@ -1419,6 +1422,11 @@ class GatewayServer:
 
             elif method == "runtime.stop":
                 await self._ws_rpc_runtime_stop(ws, rpc_id, params)
+
+            elif isinstance(method, str) and method.startswith("display."):
+                from flowly.gateway.display import handle_rpc
+
+                await handle_rpc(self, ws, client_id, rpc_id, method, params)
 
             elif method.startswith("profiles."):
                 await self._handle_profile_host_rpc(

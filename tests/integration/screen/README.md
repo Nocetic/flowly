@@ -34,7 +34,7 @@ container, TigerVNC 1.12, distro Chromium and Playwright 1.58.0:
 - Explicit stop closes Chromium through CDP before stopping Xvnc so persistent
   cookies survive restart. Killing the browser directly failed this test.
 
-Not yet certified: direct/relay binary display transport, Desktop/noVNC,
+Not yet certified: relay binary display transport, integrated Desktop/noVNC,
 production task pause/resume, root-host runtime provisioning, orphan recovery, host
 resource limits/idle policy, x86_64, other distro versions. The launcher requires
 an unprivileged Linux account and installed OS dependencies; it does not change
@@ -58,7 +58,7 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
   python -m pytest tests/test_screen_authority.py tests/test_screen_rfb.py \
     tests/test_screen_tickets.py tests/test_screen_launcher.py tests/test_screen_execution.py \
     tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
-    tests/test_screen_cli.py tests/test_screen_profile_binding.py \
+    tests/test_screen_cli.py tests/test_screen_profile_binding.py tests/test_screen_display_gateway.py \
     tests/integration/screen/test_xvnc_browser.py -q \
     --basetemp=/tmp/screen-tests -p no:cacheprovider
 ```
@@ -72,7 +72,13 @@ pause/resume RPC or Desktop UI. No model is invoked.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
-The expanded Linux screen suite passed **146 tests** on the environment above.
+The expanded Linux screen suite passed **162 tests** on the environment above.
+The authenticated direct display endpoint also delivers real Xvnc pixels for
+the default and named profiles. Its single-use tickets are bound to the host,
+profile and runtime generation; gateway credentials and tickets use headers.
+Synthetic socket tests cover input filtering, replay rejection, profile identity
+changes, observer limits and teardown. This endpoint currently advertises viewing
+only: public lifecycle, takeover and input-drain coordination remain unfinished.
 
 The `screen` Python extra adds Playwright without downloading a bundled browser;
 the runtime attaches to the installed distro Chromium. CLI lifecycle commands

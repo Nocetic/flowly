@@ -399,3 +399,82 @@ def test_real_cli_starts_adopts_and_stops_persistent_screen(tmp_path):
         state = runtime.status()
         if state is not None and state["phase"] == "running":
             runtime.stop(state["generation"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["default", "writer"])
+@pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_GATEWAY_TEST") != "1", reason="requires full Core Linux runner")
+async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_path, monkeypatch, profile):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import aiohttp
+    from aiohttp.test_utils import TestServer
+    from playwright.async_api import async_playwright
+
+    import flowly.profile as profiles
+    from flowly.gateway.display import STREAM_PATH
+    from flowly.gateway.server import GatewayServer
+    from tests.test_screen_display_gateway import RfbSocket
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", home)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", home / "profiles")
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    profiles.create_profile("writer", local_runtime=True)
+    runtime = ScreenRuntime(profiles.describe_profile(profile).path / "desktop")
+    state = await asyncio.to_thread(runtime.start)
+    gateway = GatewayServer(host="127.0.0.1", port=0, auth_token="test-display-token",
+                            require_loopback_auth=True, enable_profile_host=True)
+    gateway.on_chat_message = AsyncMock()
+    server = TestServer(gateway._create_app())
+    await server.start_server()
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{state['cdpPort']}")
+            page = browser.contexts[0].pages[0]
+            await page.set_content(f"<html><body style='background:#237bb4'>{profile} browser fixture</body></html>")
+            await page.bring_to_front()
+            async with aiohttp.ClientSession() as client:
+                auth = {"Authorization": "Bearer test-display-token"}
+                async with client.post(server.make_url("/api/auth/ws-ticket"), headers=auth) as response:
+                    ticket = (await response.json())["ticket"]
+                async with client.ws_connect(server.make_url("/ws?ticket=" + ticket)) as chat:
+                    await chat.send_json({"type": "rpc", "id": "status", "method": "display.status",
+                                          "params": {"profileId": profile}})
+                    status = (await chat.receive_json())["result"]
+                    assert status["generation"] == state["generation"]
+                    assert status["profileId"] == profile
+                    assert "socket" not in status and "cdpPort" not in status
+                    await chat.send_json({"type": "rpc", "id": "observe", "method": "display.observe", "params": {
+                        "profileId": profile, "expectedHostId": status["hostId"], "expectedBotId": status["botId"],
+                        "generation": state["generation"],
+                    }})
+                    observed = (await chat.receive_json())["result"]
+                    headers = {**auth, "X-Flowly-Profile": profile, "X-Flowly-Host-Id": status["hostId"],
+                               "X-Flowly-Bot-Id": status["botId"], "X-Flowly-Screen-Generation": state["generation"],
+                               "X-Flowly-Screen-Ticket": observed["ticket"]}
+                    async with client.ws_connect(server.make_url(STREAM_PATH), headers=headers) as screen:
+                        rfb = RfbSocket(screen)
+                        init = await rfb.handshake()
+                        assert struct.unpack("!HH", init[:4]) == (1440, 900)
+                        await screen.send_bytes(struct.pack("!BBHi", 2, 0, 1, 0))
+                        await screen.send_bytes(struct.pack("!BBHHHH", 3, 0, 200, 300, 8, 8))
+                        update = await rfb.read(4)
+                        assert update[0] == 0
+                        rectangles = int.from_bytes(update[2:4], "big")
+                        assert rectangles > 0
+                        pixels = bytearray()
+                        for _ in range(rectangles):
+                            _, _, width, height, encoding = struct.unpack("!HHHHi", await rfb.read(12))
+                            assert encoding == 0
+                            pixels.extend(await rfb.read(width * height * 4))
+                        # Real Xvnc pixels, independent of Playwright screenshots.
+                        assert pixels and any(pixels)
+                    assert runtime.status()["generation"] == state["generation"]
+                    assert is_alive(state["supervisor"])
+                    assert await page.locator("body").inner_text() == f"{profile} browser fixture"
+    finally:
+        await server.close()
+        await asyncio.to_thread(runtime.stop, state["generation"])
