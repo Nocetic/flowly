@@ -3815,9 +3815,14 @@ class GatewayServer:
         provider_id = raw_access.get("providerId")
         if provider_id == "host-desktop-browser":
             from flowly.desktop_runtime.authority import ScreenError
+            from flowly.desktop_runtime.grants import validate_browser_grant
 
             if self._ws_clients.get(client_id) is not ws or ws.closed:
                 return denied, {"code": "BROWSER_ACCESS_NOT_GRANTED", "message": "The calling connection is no longer active"}
+            try:
+                raw_access = validate_browser_grant(raw_access)
+            except ScreenError:
+                return denied, {"code": "INVALID_REQUEST", "message": "The screen grant is invalid"}
             try:
                 identity, screen_provider = self._get_host_screen_browser()
                 state = screen_provider.runtime.status()

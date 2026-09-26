@@ -42,7 +42,7 @@ def screen_gateway(tmp_path):
 @pytest.mark.parametrize(("field", "value", "code"), [
     ("hostId", "other-host", "BROWSER_PROVIDER_NOT_OWNED"),
     ("profileId", "research", "BROWSER_PROVIDER_NOT_OWNED"),
-    ("screenId", "other-screen", "BROWSER_PROVIDER_NOT_OWNED"),
+    ("screenId", "other-screen", "INVALID_REQUEST"),
     ("generation", "old", "STALE_GENERATION"),
 ])
 def test_binding_rejects_target_drift(screen_gateway, field, value, code):
