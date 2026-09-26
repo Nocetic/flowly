@@ -234,7 +234,7 @@ def test_anchor_survives_a_broken_plan_manager():
     assert is_summary_message(history[0]), "plan failure must not drop the summary"
 
 
-def test_relay_compaction_event_carries_the_session_key():
+def test_relay_compaction_event_carries_the_session_key(tmp_path, monkeypatch):
     """The relay routes conversation-scoped events by data.sessionKey (as it
     does for plan.*). Without it only the origin socket is reachable, so a
     second device viewing the same chat never learns about the compaction."""
@@ -243,13 +243,18 @@ def test_relay_compaction_event_carries_the_session_key():
 
     from flowly.channels.web import WebChannel
 
+    monkeypatch.setenv('FLOWLY_HOME', str(tmp_path / 'home'))
+
     sent: list[str] = []
 
     class _WS:
         async def send(self, payload):
             sent.append(payload)
 
-    channel = WebChannel.__new__(WebChannel)
+    from flowly.bus.queue import MessageBus
+    from flowly.config.schema import WebChannelConfig
+
+    channel = WebChannel(WebChannelConfig(enabled=True), MessageBus())
     channel._ws = _WS()
     channel._session_key_to_relay_id = {"web:chat-1": "relay-abc"}
 

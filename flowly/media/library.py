@@ -431,6 +431,7 @@ class MediaLibrary:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.create_function('media_visible', 1, self._visible)
         # Writes arrive from worker threads (``record`` is called via
         # ``to_thread`` off the agent loop) while reads arrive from the RPC
         # dispatch. One lock is cheaper than reasoning about which is which.
@@ -446,6 +447,11 @@ class MediaLibrary:
             self._conn.close()
         except sqlite3.Error:
             pass
+
+    def _visible(self, media_id: str) -> bool:
+        from flowly.media.authority import media_visible
+
+        return media_visible(self._media_dir / media_id, allow_missing=True)
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
@@ -513,6 +519,8 @@ class MediaLibrary:
                 if resolved.parent != media_root:
                     continue
                 if not resolved.is_file():
+                    continue
+                if not self._visible(resolved.name):
                     continue
                 poster_id = ""
                 if asset.poster_path:
@@ -635,7 +643,7 @@ class MediaLibrary:
     def star(self, media_id: str, starred: bool = True) -> dict | None:
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE media SET starred = ?, updated_at = ? WHERE media_id = ?",
+                "UPDATE media SET starred = ?, updated_at = ? WHERE media_id = ? AND media_visible(media_id)",
                 (1 if starred else 0, time.time(), media_id),
             )
         return self.get(media_id)
@@ -676,7 +684,7 @@ class MediaLibrary:
 
     def get(self, media_id: str) -> dict | None:
         cur = self._conn.execute(
-            "SELECT * FROM media WHERE media_id = ?", (media_id,)
+            "SELECT * FROM media WHERE media_id = ? AND media_visible(media_id)", (media_id,)
         )
         row = cur.fetchone()
         return _row_to_item(row) if row else None
@@ -702,7 +710,7 @@ class MediaLibrary:
         limit = max(1, min(int(limit), 200))
         offset = max(0, int(offset))
 
-        conditions: list[str] = []
+        conditions: list[str] = ['media_visible(media.media_id)']
         params: list[Any] = []
         join = ""
 
@@ -754,7 +762,7 @@ class MediaLibrary:
         """
         cur = self._conn.execute(
             """SELECT kind, source, COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes
-               FROM media WHERE status != ? GROUP BY kind, source""",
+               FROM media WHERE status != ? AND media_visible(media_id) GROUP BY kind, source""",
             (STATUS_EXPIRED,),
         )
         by_kind: dict[str, dict[str, int]] = {}
@@ -770,7 +778,7 @@ class MediaLibrary:
             total_bytes += int(row["bytes"])
 
         expired = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM media WHERE status = ?", (STATUS_EXPIRED,)
+            "SELECT COUNT(*) AS n FROM media WHERE status = ? AND media_visible(media_id)", (STATUS_EXPIRED,)
         ).fetchone()["n"]
 
         return {
@@ -779,8 +787,21 @@ class MediaLibrary:
             "expiredItems": int(expired),
             "byKind": by_kind,
             "bySource": by_source,
-            "thumbnailBytes": _dir_size(thumbs_dir(self._media_dir)),
+            "thumbnailBytes": self._visible_thumbnail_bytes(),
         }
+
+    def _visible_thumbnail_bytes(self) -> int:
+        total = 0
+        try:
+            for path in thumbs_dir(self._media_dir).iterdir():
+                if path.name.endswith('.jpg') and self._visible(path.name[:-4]):
+                    try:
+                        total += path.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total
 
     # ── Thumbnails ────────────────────────────────────────────────────────
 
@@ -808,6 +829,8 @@ class MediaLibrary:
         budget = MAX_THUMBS_PER_LIST
         for item in items:
             media_id = item["mediaId"]
+            if not self._visible(media_id):
+                continue
             path = self._thumb_path(media_id)
             if path.is_file():
                 encoded = _read_thumb_b64(path)
@@ -864,6 +887,12 @@ class MediaLibrary:
 
         clip, _error, _status = resolve_media_id(item["mediaId"], self._media_dir)
         if clip is None:
+            return None
+        from flowly.media.authority import PRIVATE_PREFIX
+
+        # Private posters are published with their source authority by the
+        # generator. A cache rebuild cannot invent provenance for a derivative.
+        if clip.name.startswith(PRIVATE_PREFIX):
             return None
         from flowly.media.probe import extract_poster
 

@@ -146,5 +146,6 @@ async def test_turn_error_publishes_fallback_and_does_not_raise() -> None:
     await asyncio.gather(*list(loop._concurrent_turns))
 
     assert len(loop.bus.outbound) == 1
-    assert "internal error" in loop.bus.outbound[0].content.lower()
+    assert loop.bus.outbound[0].metadata['error']['code'] == 'AGENT_INTERNAL_ERROR'
+    assert 'provider exploded' not in loop.bus.outbound[0].content
     assert loop.bus.outbound[0].chat_id == "C"

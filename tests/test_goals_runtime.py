@@ -27,6 +27,22 @@ class Provider:
         return LLMResponse(content=self.responses.pop(0))
 
 
+@pytest.mark.asyncio
+async def test_goal_completion_persists_the_exact_delivered_run(tmp_path):
+    provider = Provider('{"verdict":"done","reason":"verified"}')
+    manager, runtime = _runtime(tmp_path, provider, {"s": 1})
+    manager.set("s", "ship")
+    delivery = Delivery()
+    runtime.delivered(DeliveredGoalTurn(
+        "s", "The verified handoff", user_epoch=1, run_id="worker-final",
+    ), delivery)
+    await asyncio.wait_for(delivery.finished.wait(), 1)
+    await runtime.close()
+    persisted = GoalStore(tmp_path).get("s")
+    assert persisted.status.value == "done"
+    assert persisted.to_public_dict()["lastRunId"] == "worker-final"
+
+
 class Delivery:
     def __init__(self, *continuation_responses: str):
         self.continuation_responses = list(continuation_responses)

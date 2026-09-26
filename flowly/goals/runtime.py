@@ -31,6 +31,8 @@ class DeliveredGoalTurn:
     provider_error: bool = False
     compaction_failed: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    run_id: str | None = None
+    goal_binding: dict[str, Any] | None = None
 
 
 class GoalDelivery(Protocol):
@@ -233,8 +235,20 @@ class GoalRuntime:
         if state is None or not state.is_active:
             return
 
+        binding = turn.goal_binding
+        if binding is not None and (
+            not isinstance(binding, dict) or type(binding.get('version')) is not int or binding['version'] != 1
+            or binding.get('state') != 'goal' or binding.get('goalId') != state.goal_id
+            or type(binding.get('revision')) is not int or not 0 <= binding['revision'] <= state.revision
+        ):
+            return
+        unsuccessful = (not turn.succeeded or turn.provider_error or turn.aborted
+                        or turn.compaction_failed or not turn.response.strip())
+        if unsuccessful and self._current_user_epoch(turn.session_key) != turn.user_epoch:
+            return
+
         plan_id = self._pending_plan(turn.session_key)
-        if plan_id and not state.has_wait:
+        if plan_id and not state.has_wait and not unsuccessful:
             try:
                 state = self.manager.wait_on_session(
                     turn.session_key,
@@ -256,11 +270,12 @@ class GoalRuntime:
             self._schedule_wait_wake(turn.session_key, delivery)
             return
 
-        try:
-            processes = list(await self._background_processes(turn.session_key))
-        except Exception:
-            logger.exception("goal process snapshot failed for {}", turn.session_key)
-            processes = []
+        processes = []
+        if not unsuccessful:
+            try:
+                processes = list(await self._background_processes(turn.session_key))
+            except Exception:
+                logger.exception("goal process snapshot failed for {}", turn.session_key)
         decision = await self.manager.evaluate_after_turn(
             turn.session_key,
             turn.response,
@@ -268,6 +283,9 @@ class GoalRuntime:
             aborted=turn.aborted,
             provider_error=turn.provider_error,
             compaction_failed=turn.compaction_failed,
+            run_id=turn.run_id,
+            expected_goal_id=state.goal_id,
+            expected_revision=state.revision,
             background_processes=processes,
             cwd=self._session_cwd(turn.session_key),
         )
@@ -303,16 +321,35 @@ class GoalRuntime:
         await asyncio.sleep(0)
         if self._current_user_epoch(session_key) != user_epoch:
             return
-        if not self.manager.is_generation_active(session_key, goal_id):
+        state = self.manager.get(session_key)
+        if state is None or not state.is_active or state.goal_id != goal_id:
             return
-        turn = await delivery.run_continuation(
-            session_key=session_key,
-            goal_id=goal_id,
-            user_epoch=user_epoch,
-            kickoff=kickoff,
-        )
+        try:
+            turn = await delivery.run_continuation(
+                session_key=session_key,
+                goal_id=goal_id,
+                user_epoch=user_epoch,
+                kickoff=kickoff,
+            )
+        except Exception:
+            logger.exception('Could not submit goal continuation for {}', session_key)
+            if self._current_user_epoch(session_key) != user_epoch:
+                return
+            decision = await self.manager.evaluate_after_turn(
+                session_key, '', turn_succeeded=False,
+                expected_goal_id=goal_id, expected_revision=state.revision,
+            )
+            if decision.message:
+                await delivery.deliver_notice(decision)
+            if decision.status is GoalStatus.PAUSED:
+                self.cancel_wait_timer(session_key)
+            return
         if turn is None:
             return
+        if turn.goal_binding is None:
+            # Inline adapters know which generation they were asked to run.
+            # Preserve that identity even if delivery overlaps a replacement.
+            turn.goal_binding = {'version': 1, 'state': 'goal', 'goalId': goal_id, 'revision': 0}
         await delivery.deliver_turn(turn)
         await self._after_turn(turn, delivery)
 

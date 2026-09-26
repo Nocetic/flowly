@@ -32,12 +32,14 @@ class _Socket:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('inner_method', ['chat.send', 'chat.inflight'])
 async def test_relay_profile_rpc_binds_and_routes_only_matching_conversation(
-    profile_roots,
+    profile_roots, inner_method,
 ) -> None:
     profiles.create_profile("writer", local_runtime=True)
     host = ProfileHost()
-    host.dispatch = AsyncMock(return_value={"runId": "run-1"})  # type: ignore[method-assign]
+    receipt = {"runId": "run-1"} if inner_method == 'chat.send' else {"inflight": {"runId": "run-1"}}
+    host.dispatch = AsyncMock(return_value=receipt)  # type: ignore[method-assign]
     channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
     forwarded: list[dict] = []
 
@@ -55,7 +57,7 @@ async def test_relay_profile_rpc_binds_and_routes_only_matching_conversation(
         "sessionId": "relay-a",
         "params": {
             "name": "writer",
-            "method": "chat.send",
+            "method": inner_method,
             "params": {
                 "sessionKey": "ios:thread-a",
                 "message": "Hello",
@@ -68,7 +70,7 @@ async def test_relay_profile_rpc_binds_and_routes_only_matching_conversation(
         "type": "rpc",
         "id": "rpc-1",
         "sessionId": "relay-a",
-        "result": {"runId": "run-1"},
+        "result": receipt,
     }]
 
     await host._emit("writer", "chat", {
@@ -82,6 +84,18 @@ async def test_relay_profile_rpc_binds_and_routes_only_matching_conversation(
     assert forwarded[0]["event"] == "profile.event"
     assert forwarded[0]["data"]["profile"] == "writer"
     assert forwarded[0]["data"]["data"]["delta"] == "Hi"
+
+    forwarded.clear()
+    source = {"runId": "run-1", "stream": "assistant", "delta": "Hello"}
+    await host._emit("writer", "agent", source)
+    assert [frame["sessionId"] for frame in forwarded] == ["relay-a"]
+    assert forwarded[0]["data"]["data"]["sessionKey"] == "ios:thread-a"
+    assert "sessionKey" not in source
+
+    # An explicit session never inherits a conflicting run's subscribers.
+    forwarded.clear()
+    await host._emit("writer", "agent", {**source, "sessionKey": "ios:thread-b"})
+    assert [frame["sessionId"] for frame in forwarded] == ["relay-b"]
 
     await host._emit("writer", "chat", {
         "state": "final",

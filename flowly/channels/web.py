@@ -15,7 +15,6 @@ from typing import Any, Awaitable, Callable
 
 import websockets
 from loguru import logger
-from websockets.exceptions import ConnectionClosed
 
 from flowly.browser_annotations import append_browser_annotation_context
 from flowly.bus.events import InboundMessage as _Base
@@ -25,6 +24,10 @@ from flowly.channels import feature_rpc
 from flowly.agent.subagent_observation import client_event, event_version
 from flowly.channels.base import BaseChannel
 from flowly.config.schema import WebChannelConfig
+from flowly.live_voice.events import EventAccess, current_event_access
+from flowly.live_voice.relay_events import RelayOutbound, RelayRecipients
+from flowly.live_voice.relay_transport import CAPABILITY as RELAY_VOICE_CAPABILITY
+from flowly.live_voice.relay_transport import RelayBrowserVerifier, RelayMessage, RelayPrincipal
 from flowly.profile import get_flowly_home
 from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
 from flowly.profile_rooms import PROFILE_ROOM_METHODS
@@ -59,6 +62,53 @@ _PROFILE_LONG_RUNNING_METHODS = frozenset({
 })
 
 LocalEventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
+
+
+class _AccountReplySocket:
+    """Keep a delayed account RPC reply on its authenticated relay connection."""
+
+    def __init__(self, channel, socket, principal: RelayPrincipal, expires_at: int):
+        self.channel, self.socket, self.principal, self.expires_at = channel, socket, principal, expires_at
+        self.recipient = channel._relay_recipients.browsers.get(principal.session_id)
+
+    async def send(self, payload: str) -> None:
+        if self.recipient is None:
+            return
+        async with self.channel._relay_recipients.leases.get(self.recipient).lock:
+            await self._send_locked(payload)
+
+    async def _send_locked(self, payload: str) -> None:
+        channel, source = self.channel, self.principal
+        if channel._ws is not self.socket:
+            return
+        current = channel._relay_principals.get(source.session_id)
+        verifier = channel._relay_authority
+        leases = channel._relay_recipients.leases
+        state = leases.get(self.recipient)
+        if (current is None or verifier is None or current.uid != source.uid or current.link_id != source.link_id
+                or state.retired or leases.owner(state).uid != source.uid
+                or verifier.now() >= min(self.expires_at, current.expires_at)):
+            frame = json.loads(payload)
+            if frame.get('type') != 'rpc':
+                return
+            payload = json.dumps({'type': 'rpc', 'id': frame.get('id', ''), 'sessionId': source.session_id,
+                                  'error': {'code': 'VOICE_AUTH_REQUIRED', 'message': 'The account connection changed or expired.'}})
+        else:
+            frame = json.loads(payload)
+            if frame.get('type') not in {'rpc', 'event'}:
+                return
+            # The relay checks this grant against its live JWT identity and
+            # exact agent connection before routing or persistence. Always
+            # stamp the originating session, regardless of a handler's fields.
+            frame['sessionId'] = source.session_id
+            frame['voiceDelivery'] = {'version': 1, 'linkId': source.link_id, 'userId': source.uid,
+                                      'sessionId': source.session_id,
+                                      'expiresAt': min(self.expires_at, current.expires_at, int(state.expires_at))}
+            payload = json.dumps(frame)
+        await asyncio.wait_for(self.socket.send(payload), timeout=5.0)
+
+    def __getattr__(self, name):
+        return getattr(self.socket, name)
 
 
 def _build_ssl_context() -> ssl.SSLContext | None:
@@ -192,6 +242,10 @@ def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
          under ``media_dir`` so the rest of the pipeline can read it
          like any other local file.
     """
+    from flowly.media.authority import capture_media_access, media_visible, publish_media_bytes
+    from flowly.session.ownership import SessionAccessError
+
+    access = capture_media_access()
     media_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for att in attachments:
@@ -205,6 +259,8 @@ def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
         # 2. Native file path (desktop local optimisation)
         file_path = att.get("filePath", "")
         if file_path and Path(file_path).is_file():
+            if not media_visible(Path(file_path)):
+                raise SessionAccessError()
             paths.append(str(Path(file_path)))
             continue
 
@@ -222,7 +278,7 @@ def _save_attachments(attachments: list[dict], media_dir: Path) -> list[str]:
         filename = att.get("fileName", "")
         ext = Path(filename).suffix if filename else (mimetypes.guess_extension(mime) or "")
         fpath = media_dir / f"{uuid.uuid4().hex}{ext}"
-        fpath.write_bytes(data)
+        fpath = publish_media_bytes(data, fpath, access=access)
         paths.append(str(fpath))
     return paths
 
@@ -248,6 +304,11 @@ class WebChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: WebChannelConfig = config
         self._ws = None
+        self._relay_authority: RelayBrowserVerifier | None = None
+        self._relay_authority_enabled = False
+        self._relay_principals: dict[str, RelayPrincipal] = {}
+        self._relay_recipients = RelayRecipients()
+        self._outbound_lock = asyncio.Lock()
         self._reconnect_delay = 5  # seconds
         self._max_reconnect_delay = 60
         # Track active browser sessions: sessionId → asyncio.Event (response ready)
@@ -262,7 +323,7 @@ class WebChannel(BaseChannel):
         # too large after retry, etc.) the serialised payload is parked here
         # so the next successful connection can flush it. Bounded to prevent
         # runaway growth on prolonged outages.
-        self._outbound_queue: list[str] = []
+        self._outbound_queue: list[RelayOutbound] = []
         # In-flight media.fetch replies (relay-bridged playback windows).
         # Tracked only so an exception surfaces in logs instead of vanishing
         # with the task; each one is short-lived (a single ≤4 MB disk read).
@@ -315,6 +376,21 @@ class WebChannel(BaseChannel):
         self._profile_run_bindings: dict[
             tuple[str, str], tuple[str, float]
         ] = {}
+
+    @property
+    def chat_commands(self):
+        from flowly.session.commands import ChatCommandStore
+
+        if getattr(self, "_chat_commands", None) is None:
+            self._chat_commands = ChatCommandStore(":memory:")
+        return self._chat_commands
+
+    def set_chat_commands(self, store) -> None:
+        """Share the gateway's profile-scoped durable acceptance ledger."""
+        previous = getattr(self, "_chat_commands", None)
+        if previous is not None and previous is not store:
+            previous.close()
+        self._chat_commands = store
 
     @property
     def cron_session_id(self) -> str | None:
@@ -587,10 +663,12 @@ class WebChannel(BaseChannel):
                 return
             async def send_task(session_id: str, version: int) -> None:
                 name, body = client_event(event_type, payload, version)
-                await asyncio.wait_for(self._ws.send(json.dumps({
+                frame = json.dumps({
                     "type": "event", "event": "profile.event", "sessionId": session_id,
                     "data": {**envelope, "type": name, "data": body},
-                })), timeout=1)
+                })
+                pending = RelayOutbound(frame, self._outbound_event_access(frame))
+                await asyncio.wait_for(self._deliver_relay_outbound(pending), timeout=1)
             await asyncio.gather(*(send_task(session, version)
                 for (session, candidate), (version, _expiry) in self._profile_subagent_observers.items()
                 if candidate == profile), return_exceptions=True)
@@ -617,10 +695,11 @@ class WebChannel(BaseChannel):
                 subscribers[session_id] = now
 
         run_id = str(payload.get("runId") or "")
-        if run_id:
+        if run_id and not session_key:
             bound = self._profile_run_bindings.get((profile, run_id))
             if bound is not None:
                 run_session_key, _ = bound
+                envelope = {**envelope, "data": {**payload, "sessionKey": run_session_key}}
                 self._profile_run_bindings[(profile, run_id)] = (
                     run_session_key, now
                 )
@@ -714,18 +793,22 @@ class WebChannel(BaseChannel):
             error = {"code": "PROFILE_ALREADY_EXISTS", "message": "An agent with this name already exists."}
         except ValueError as exc:
             error = {"code": "INVALID_PARAMS", "message": str(exc)[:500]}
-        except Exception:
-            logger.exception("[WebChannel] profile rpc {} failed", method)
+        except Exception as exc:
+            if feature_rpc.has_voice_account():
+                logger.error('[WebChannel] profile RPC {} failed ({})', method, type(exc).__name__)
+            else:
+                logger.exception("[WebChannel] profile rpc {} failed", method)
             error = {"code": "INTERNAL", "message": "The profile operation failed."}
         else:
             if self._profile_subagent_reads.get(read_token) == session_id and session_id:
                 self._observe_profile_subagents(session_id, profile, validated_params)
             if (
-                inner_method == "chat.send"
+                inner_method in {"chat.send", "chat.inflight"}
                 and inner_session_key
                 and isinstance(result, dict)
             ):
-                run_id = str(result.get("runId") or "")
+                receipt = result if inner_method == "chat.send" else result.get("inflight")
+                run_id = str(receipt.get("runId") or "") if isinstance(receipt, dict) else ""
                 if run_id:
                     self._profile_run_bindings[(profile, run_id)] = (
                         inner_session_key, time.monotonic()
@@ -791,9 +874,20 @@ class WebChannel(BaseChannel):
 
     async def stop(self) -> None:
         self._running = False
+        # These tasks only publish to the agent queue. A turn already handed
+        # off is owned by AgentLoop and must not be stopped with the channel.
+        pending = list(self._active_tasks.values())
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        self._active_tasks.clear()
         self._clear_profile_subscriptions()
         self._subagent_observers.clear()
         self._subagent_event_versions.clear()
+        self._relay_principals.clear()
+        self._relay_recipients.clear()
+        self._relay_authority = None
+        self._relay_authority_enabled = False
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -859,6 +953,8 @@ class WebChannel(BaseChannel):
              default of 1 MB silently rejecting frames.
         """
         session_id = msg.chat_id  # chat_id = sessionId for web channel
+        canonical_session = msg.metadata.get('session_key')
+        session_key = canonical_session if isinstance(canonical_session, str) and canonical_session else self._session_key_for_relay_id(session_id)
 
         progress = msg.metadata.get("tool_progress_event")
         if isinstance(progress, dict) and progress.get("state") == "tool_progress":
@@ -876,7 +972,6 @@ class WebChannel(BaseChannel):
             goal_snapshot = msg.metadata.get("goal")
             terminal = bool(msg.metadata.get("goalTerminal")) and bool(msg.content.strip())
             if isinstance(goal_snapshot, dict):
-                session_key = self._session_key_for_relay_id(session_id)
                 goal_event = {
                     "type": "event",
                     "sessionId": session_id,
@@ -907,7 +1002,6 @@ class WebChannel(BaseChannel):
         # tool-turn payloads.
         iter_event = msg.metadata.get("iteration_event")
         if isinstance(iter_event, dict) and iter_event:
-            session_key = self._session_key_for_relay_id(session_id)
             event_msg = {
                 "type": "event",
                 "sessionId": session_id,
@@ -1020,7 +1114,7 @@ class WebChannel(BaseChannel):
         data_block: dict[str, Any] = {
             "state": "final",
             "runId": run_id,
-            "sessionKey": self._session_key_for_relay_id(session_id),
+            "sessionKey": session_key,
             "source": "relay",
             "message": {
                 "content": content_blocks,
@@ -1125,6 +1219,11 @@ class WebChannel(BaseChannel):
         if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
             data_block["durationMs"] = max(0, int(duration_ms))
 
+        self.chat_commands.settle(
+            data_block["sessionKey"], str(stream_run_id or run_id),
+            "aborted" if data_block.get("aborted") else
+            "error" if data_block.get("failed") else "completed",
+        )
         event_msg = {
             "type": "event",
             "sessionId": session_id,
@@ -1162,61 +1261,149 @@ class WebChannel(BaseChannel):
         payload = json.dumps({"type": "cron.unregister", "name": name})
         await self._send_or_queue(payload)
 
-    async def _send_or_queue(self, payload: str) -> None:
-        """Send a serialised payload, or park it for replay on failure.
+    def _outbound_event_access(self, payload: str) -> EventAccess:
+        """Capture authority before a frame leaves its producer or enters replay."""
+        from flowly.live_voice.authority import VoiceAuthorityError, current_request_owner
+        from flowly.session.ownership import SessionAccessError
 
-        Failure modes covered:
-          - WS not connected yet (cold start or mid-reconnect)
-          - WS closed mid-send (1009, 1011, network drop)
-          - Frame oversized despite compression (rare, but graceful)
+        access = current_event_access()
+        if access is not None:
+            return access
+        try:
+            frame = json.loads(payload)
+            data = frame.get('data')
+            data = data if isinstance(data, dict) else {}
+            directory = None
+            if frame.get('event') == 'profile.event':
+                profile = data.get('profile')
+                if profile and profile != 'default':
+                    from flowly.profile import describe_profile
 
-        The queue is bounded; oldest entries get dropped to make room.
-        """
-        if not self._ws:
-            logger.warning("[WebChannel] Not connected — queuing payload for replay")
-            self._enqueue_payload(payload)
-            return
+                    directory = describe_profile(profile).path / 'sessions'
+                data = data.get('data') if isinstance(data.get('data'), dict) else {}
+            key = data.get('sessionKey') or data.get('session_key')
+            if not key and frame.get('sessionId'):
+                key = self._session_key_for_relay_id(frame['sessionId'])
+            run_id = data.get('runId')
+            if run_id and directory is None:
+                from flowly.agent import inflight
+
+                scopes = tuple(scope for scope in (self.chat_commands.control_scope(run_id),
+                                                    inflight.control_scope(run_id)) if scope is not None)
+                if scopes:
+                    if any(key and scope.key != key for scope in scopes):
+                        return EventAccess(blocked=True)
+                    return EventAccess(scopes=scopes)
+            if str(frame.get('event', '')).startswith('artifact.'):
+                from flowly.artifacts.store import get_store
+
+                scope = get_store().control_scope(data.get('id'))
+                return EventAccess(scopes=(scope,)) if scope is not None else EventAccess(blocked=True)
+            access = EventAccess.capture(key, sessions_dir=directory)
+            # A reader without original authority cannot attribute historical
+            # private content to whoever happens to own the session now.
+            if access.producer().uid is not None and current_request_owner() is None:
+                return EventAccess(blocked=True)
+            return access
+        except (ValueError, TypeError, OSError, SessionAccessError, VoiceAuthorityError):
+            return EventAccess(blocked=True)
+
+    async def _deliver_relay_outbound(self, pending: RelayOutbound) -> bool:
+        """True means delivered or permanently denied; False awaits a connection/lease."""
+        from flowly.live_voice.authority import VoiceAuthorityError
 
         try:
-            await self._ws.send(payload)
-        except ConnectionClosed as e:
-            logger.warning(
-                f"[WebChannel] Send failed (ConnectionClosed: code={e.code} "
-                f"reason={e.reason!r}) — queuing for replay"
-            )
-            self._enqueue_payload(payload)
-        except Exception as e:
-            logger.error(f"[WebChannel] Failed to send response: {e}")
-            self._enqueue_payload(payload)
+            owner = pending.access.producer()
+        except VoiceAuthorityError:
+            return True
+        if not pending.access.permits(owner):
+            return True
+        socket = self._ws
+        if socket is None:
+            return False
+        if owner.uid is None:
+            await asyncio.wait_for(socket.send(pending.payload), timeout=5.0)
+            return True
+        verifier = self._relay_authority
+        if verifier is None or not self._relay_authority_enabled:
+            return False
+        frame = json.loads(pending.payload)
+        if frame.get('type') not in {'rpc', 'event'}:
+            return True
+        target = frame.get('sessionId')
+        targets = {target} if target else set(self._relay_principals)
+        if target and target not in self._relay_principals:
+            data = frame.get('data') or {}
+            if frame.get('event') == 'profile.event':
+                inner = data.get('data') or {}
+                targets = set(self._profile_conversation_sessions.get((data.get('profile'), inner.get('sessionKey')), {}))
+            else:
+                key = data.get('sessionKey') or data.get('session_key')
+                replacement = self._relay_id_for(key) if key else None
+                targets = {replacement} if replacement else set()
+        self._relay_recipients.synchronize(self._relay_principals)
+        pending.delivered.intersection_update((identity.link_id, session_id)
+                                              for session_id, identity in self._relay_principals.items())
+        delivered = False
+        for session_id in sorted(targets):
+            recipient = self._relay_recipients.browsers.get(session_id)
+            if recipient is None:
+                continue
+            state = self._relay_recipients.leases.get(recipient)
+            async with state.lock:
+                identity = self._relay_principals.get(session_id)
+                if (self._ws is not socket or identity is None or state.retired
+                        or identity.uid != owner.uid or identity.link_id != verifier.link_id
+                        or identity.expires_at <= verifier.now()
+                        or self._relay_recipients.leases.owner(state) != owner
+                        or not pending.access.permits(owner)):
+                    continue
+                destination = (identity.link_id, session_id)
+                if destination not in pending.delivered:
+                    public = {**frame, 'sessionId': session_id, 'voiceDelivery': {
+                        'version': 1, 'linkId': identity.link_id, 'userId': owner.uid, 'sessionId': session_id,
+                        'expiresAt': min(int(state.expires_at), identity.expires_at)}}
+                    await asyncio.wait_for(socket.send(json.dumps(public)), timeout=5.0)
+                    pending.delivered.add(destination)
+                delivered = True
+        return delivered
 
-    def _enqueue_payload(self, payload: str) -> None:
-        """Park a payload for replay. Drops the oldest if at capacity."""
+    async def _send_or_queue(self, payload: str) -> None:
+        pending = RelayOutbound(payload, self._outbound_event_access(payload))
+        async with self._outbound_lock:
+            try:
+                if await self._deliver_relay_outbound(pending):
+                    return
+            except asyncio.CancelledError:
+                self._enqueue_payload(pending)
+                raise
+            except Exception as error:
+                logger.warning('[WebChannel] Outbound delivery deferred ({})', type(error).__name__)
+            self._enqueue_payload(pending)
+
+    def _enqueue_payload(self, pending: RelayOutbound) -> None:
         if len(self._outbound_queue) >= _OUTBOUND_QUEUE_LIMIT:
-            dropped = self._outbound_queue.pop(0)
-            logger.warning(
-                f"[WebChannel] Outbound queue full ({_OUTBOUND_QUEUE_LIMIT}) — "
-                f"dropping oldest payload ({len(dropped)} bytes)"
-            )
-        self._outbound_queue.append(payload)
+            self._outbound_queue.pop(0)
+            logger.warning('[WebChannel] Outbound queue full; oldest event discarded')
+        self._outbound_queue.append(pending)
 
     async def _flush_outbound_queue(self) -> None:
-        """Replay any queued payloads after a successful reconnect."""
-        if not self._outbound_queue or not self._ws:
-            return
-        # Snapshot + clear so any send-induced re-enqueues don't double-replay.
-        pending = self._outbound_queue
-        self._outbound_queue = []
-        logger.info(f"[WebChannel] Flushing {len(pending)} queued payload(s)")
-        for payload in pending:
-            try:
-                await self._ws.send(payload)
-            except Exception as e:
-                # Connection dropped mid-flush — re-park remainder and bail.
-                logger.warning(f"[WebChannel] Flush interrupted: {e}")
-                idx = pending.index(payload)
-                for remaining in pending[idx:]:
-                    self._enqueue_payload(remaining)
-                return
+        """Replay original authority, without capturing the reconnecting account."""
+        async with self._outbound_lock:
+            pending, self._outbound_queue = self._outbound_queue, []
+            for index, item in enumerate(pending):
+                try:
+                    if not await self._deliver_relay_outbound(item):
+                        self._enqueue_payload(item)
+                except BaseException as error:
+                    for remaining in pending[index:]:
+                        self._enqueue_payload(remaining)
+                    if isinstance(error, asyncio.CancelledError):
+                        raise
+                    if not isinstance(error, Exception):
+                        raise
+                    logger.warning('[WebChannel] Outbound replay deferred ({})', type(error).__name__)
+                    return
 
     def _relay_id_for(self, session_key: str) -> str | None:
         """Map a bot session key to the relay session id (browser UUID)."""
@@ -1406,8 +1593,7 @@ class WebChannel(BaseChannel):
             },
         }
         try:
-            await self._ws.send(json.dumps(event_msg))
-            logger.info(f"[WebChannel] Sent compaction event to relay session {relay_id}")
+            await self._send_or_queue(json.dumps(event_msg))
         except Exception as e:
             logger.debug(f"[WebChannel] Failed to send compaction event: {e}")
 
@@ -1435,8 +1621,7 @@ class WebChannel(BaseChannel):
             "title": title,
         }
         try:
-            await self._ws.send(json.dumps(event_msg))
-            logger.info(f"[WebChannel] Sent auto-title to relay session {relay_id}: {title!r}")
+            await self._send_or_queue(json.dumps(event_msg))
         except Exception as e:
             logger.debug(f"[WebChannel] Failed to send title event: {e}")
 
@@ -1487,6 +1672,10 @@ class WebChannel(BaseChannel):
             self._subagent_event_versions.clear()
             self._clear_profile_subagent_observers()
             self._ws = ws
+            self._relay_authority = None
+            self._relay_authority_enabled = False
+            self._relay_principals.clear()
+            self._relay_recipients.clear()
             logger.info("[WebChannel] Connected to relay proxy")
 
             # Replay anything that piled up while disconnected. Done before
@@ -1512,7 +1701,9 @@ class WebChannel(BaseChannel):
                     if not self._running:
                         break
                     try:
-                        msg = json.loads(raw)
+                        msg = self._decode_relay_message(ws, json.loads(raw))
+                        if msg is None:
+                            continue
                         if (
                             msg.get("type") == "rpc"
                             and (
@@ -1540,10 +1731,15 @@ class WebChannel(BaseChannel):
                     task.cancel()
                 if pending_long_rpcs:
                     await asyncio.gather(*pending_long_rpcs, return_exceptions=True)
-                self._clear_profile_subscriptions()
-                self._subagent_observers.clear()
-                self._subagent_event_versions.clear()
-                self._ws = None
+                if self._ws is ws:
+                    self._clear_profile_subscriptions()
+                    self._subagent_observers.clear()
+                    self._subagent_event_versions.clear()
+                    self._relay_principals.clear()
+                    self._relay_recipients.clear()
+                    self._relay_authority = None
+                    self._relay_authority_enabled = False
+                    self._ws = None
 
     async def _serve_media_fetch(self, ws, msg: dict) -> None:
         """Answer one relay-bridged media window request.
@@ -1564,13 +1760,18 @@ class WebChannel(BaseChannel):
             from flowly.media.serving import read_media_window
 
             def _read():
+                from flowly.live_voice.authority import HOST_OWNER, request_owner_scope
+
                 offset = msg.get("offset")
                 length = msg.get("length")
-                return read_media_window(
-                    str(msg.get("mediaId") or ""),
-                    offset=int(offset) if isinstance(offset, (int, float)) else 0,
-                    length=int(length) if isinstance(length, (int, float)) else 0,
-                )
+                # This legacy transport has no signed account certificate.
+                # It must not inherit an internal worker's private authority.
+                with request_owner_scope(HOST_OWNER):
+                    return read_media_window(
+                        str(msg.get("mediaId") or ""),
+                        offset=int(offset) if isinstance(offset, (int, float)) else 0,
+                        length=int(length) if isinstance(length, (int, float)) else 0,
+                    )
 
             window = await asyncio.to_thread(_read)
             if not window.ok:
@@ -1592,11 +1793,67 @@ class WebChannel(BaseChannel):
         except Exception as exc:  # noqa: BLE001 - socket may have dropped
             logger.debug(f"[WebChannel] media.result send failed: {exc}")
 
+    def _decode_relay_message(self, ws, msg: object) -> dict | None:
+        """Verify in receive order, before long RPCs run concurrently."""
+        from flowly.live_voice.authority import VoiceAuthorityError
+
+        if isinstance(msg, RelayMessage):
+            return msg
+        if not isinstance(msg, dict) or not isinstance(msg.get('type'), str):
+            return None
+        if msg.get('type') == 'relay.browser':
+            if self._ws is not ws or self._relay_authority is None or not self._relay_authority_enabled:
+                return None
+            try:
+                verified = self._relay_authority.verify(msg)
+            except VoiceAuthorityError:
+                logger.warning('[WebChannel] Relay browser identity could not be verified')
+                return None
+            identity = verified.principal
+            if verified.kind == 'disconnected':
+                self._relay_principals.pop(identity.session_id, None)
+            else:
+                self._relay_principals = {key: value for key, value in self._relay_principals.items()
+                                          if value.expires_at > self._relay_authority.now()}
+                if identity.session_id not in self._relay_principals and len(self._relay_principals) >= _PROFILE_BINDING_LIMIT:
+                    self._relay_principals.pop(next(iter(self._relay_principals)))
+                self._relay_principals[identity.session_id] = identity
+            self._relay_recipients.synchronize(self._relay_principals)
+            if verified.kind == 'request':
+                params = verified.get('params')
+                if (verified.get('method') in {'voice.events.bind', 'voice.events.clear'}
+                        or isinstance(params, dict) and 'voiceAccess' in params):
+                    # Reserve receive order before asynchronous certificate
+                    # verification; a slow old bind cannot undo a later clear.
+                    verified.recipient_binding = self._relay_recipients.begin(identity)
+            return verified
+        # Old relays stamp sessionId onto every browser-forwarded frame. It
+        # therefore cannot impersonate an agent-only handshake or media call.
+        if 'sessionId' in msg and msg.get('type') in {'ready', 'relay.authority.enabled', 'media.fetch'}:
+            return None
+        if self._relay_authority_enabled and msg.get('type') in {'rpc', 'browser-connected', 'browser-disconnected'}:
+            return None
+        return msg
+
     async def _handle_relay_message(self, ws, msg: dict) -> None:
         """Handle a message forwarded by the relay proxy."""
+        msg = self._decode_relay_message(ws, msg)
+        if msg is None:
+            return
         msg_type = msg.get("type")
 
         if msg_type == "ready":
+            if (self._ws is ws and self._relay_authority is None and isinstance(msg.get('capabilities'), list)
+                    and RELAY_VOICE_CAPABILITY in msg['capabilities']):
+                from flowly.live_voice.authority import VoiceAuthorityError
+
+                try:
+                    self._relay_authority = RelayBrowserVerifier(msg.get('relayAuthority'), server_id=self.config.server_id)
+                except VoiceAuthorityError:
+                    logger.warning('[WebChannel] Relay identity handshake could not be verified')
+                    return
+                await ws.send(json.dumps({'type': 'relay.authority.enable', 'version': 1,
+                                          'linkId': self._relay_authority.link_id}))
             cron_session_id = msg.get("cronSessionId")
             if cron_session_id:
                 self._cron_session_id = cron_session_id
@@ -1612,6 +1869,11 @@ class WebChannel(BaseChannel):
                         asyncio.create_task(result)
                 except Exception as e:
                     logger.warning(f"[WebChannel] on_ready callback failed: {e}")
+
+        elif msg_type == 'relay.authority.enabled':
+            if (self._ws is ws and self._relay_authority is not None and type(msg.get('version')) is int and msg['version'] == 1
+                    and msg.get('linkId') == self._relay_authority.link_id):
+                self._relay_authority_enabled = True
 
         elif msg_type == "browser-connected":
             session_id = msg.get("sessionId", "")
@@ -1657,6 +1919,66 @@ class WebChannel(BaseChannel):
             logger.debug(f"[WebChannel] Unhandled relay message type: {msg_type}")
 
     async def _handle_rpc(self, ws, msg: dict) -> None:
+        from flowly.live_voice.authority import request_owner_scope
+        from flowly.live_voice.events import event_access_scope
+        from flowly.session.ownership import SessionAccessError, require_rpc_session
+
+        binding = getattr(msg, 'recipient_binding', None)
+        lease_method = msg.get('method') in {'voice.events.bind', 'voice.events.clear'}
+        raw_socket = ws
+        try:
+            if 'voiceAuthority' in msg:
+                raise feature_rpc.FeatureRpcError('VOICE_AUTH_REQUIRED', 'Profile authority is not accepted over relay.')
+            source = msg.principal if isinstance(msg, RelayMessage) else None
+            original_params = msg.get('params') or {}
+            if isinstance(original_params, dict) and 'voiceAccess' in original_params and source is None:
+                raise feature_rpc.FeatureRpcError('VOICE_AUTH_UNAVAILABLE', 'Update the relay before opening account-owned voice work.')
+            owner, params, certificate = await feature_rpc.resolve_voice_access(original_params)
+            if owner.uid is not None:
+                if source is None or source.uid != owner.uid or self._ws is not ws:
+                    raise feature_rpc.FeatureRpcError('VOICE_AUTH_REQUIRED', 'The relay account does not match this request.')
+                current = self._relay_principals.get(source.session_id)
+                if (current is None or self._relay_authority is None or current.uid != owner.uid
+                        or current.link_id != source.link_id or current.expires_at <= self._relay_authority.now()):
+                    raise feature_rpc.FeatureRpcError('VOICE_AUTH_REQUIRED', 'The account connection changed or expired.')
+            if lease_method and (binding is None or params or (msg['method'] == 'voice.events.bind' and certificate is None)):
+                raise feature_rpc.FeatureRpcError('VOICE_AUTH_REQUIRED', 'A verified account is required for this event lease.')
+            if binding is not None and not await self._relay_recipients.bind(
+                    binding, None if msg.get('method') == 'voice.events.clear' else certificate):
+                raise feature_rpc.FeatureRpcError('VOICE_AUTH_REQUIRED', 'The account connection changed or expired.')
+            if owner.uid is not None and msg.get('method') != 'voice.events.clear':
+                ws = _AccountReplySocket(self, ws, source, certificate.expires_at)
+        except feature_rpc.FeatureRpcError as error:
+            if binding is not None:
+                await self._relay_recipients.bind(binding, None)
+            await ws.send(json.dumps({'type': 'rpc', 'id': msg.get('id', ''), 'sessionId': msg.get('sessionId', ''),
+                                      'error': {'code': error.code, 'message': error.message}}))
+            return
+        if lease_method:
+            result = ({'cleared': True} if msg['method'] == 'voice.events.clear'
+                      else {'bound': True, 'expiresAt': certificate.expires_at})
+            await ws.send(json.dumps({'type': 'rpc', 'id': msg.get('id', ''), 'sessionId': msg.get('sessionId', ''), 'result': result}))
+            await self._flush_outbound_queue()
+            return
+        with request_owner_scope(owner), event_access_scope(None):
+            try:
+                require_rpc_session(msg.get('method'), params)
+                await self._dispatch_rpc(ws, {**msg, 'params': params})
+            except (feature_rpc.FeatureRpcError, SessionAccessError) as error:
+                await ws.send(json.dumps({'type': 'rpc', 'id': msg.get('id', ''), 'sessionId': msg.get('sessionId', ''),
+                                          'error': {'code': error.code, 'message': error.message}}))
+            except Exception as error:
+                if not feature_rpc.has_voice_account():
+                    raise
+                # Keep private exception text and traceback locals out of the
+                # outer relay listener after this account scope has unwound.
+                logger.error('[WebChannel] account RPC {} failed ({})', msg.get('method'), type(error).__name__)
+                await ws.send(json.dumps({'type': 'rpc', 'id': msg.get('id', ''), 'sessionId': msg.get('sessionId', ''),
+                                          'error': {'code': 'INTERNAL', 'message': 'The request could not be completed.'}}))
+        if binding is not None and self._ws is raw_socket:
+            await self._flush_outbound_queue()
+
+    async def _dispatch_rpc(self, ws, msg: dict) -> None:
         """Handle an RPC call from the browser (forwarded by proxy)."""
         method = msg.get("method", "")
         rpc_id = msg.get("id", "")
@@ -1664,6 +1986,24 @@ class WebChannel(BaseChannel):
         session_id = msg.get("sessionId", "")
 
         if method == "chat.send":
+            from flowly.session.commands import validate_chat_target
+            try:
+                validate_chat_target(params)
+            except ValueError as exc:
+                await ws.send(json.dumps({
+                    "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                    "error": {"code": "TASK_TARGET_CHANGED", "message": str(exc)},
+                }))
+                return
+            queued = params.get('queueForNextTurn', False)
+            queue_error = None
+            if type(queued) is not bool:
+                queue_error = {'code': 'INVALID_REQUEST', 'message': 'queueForNextTurn must be a boolean'}
+            elif queued and getattr(self, 'supports_turn_start', False) is not True:
+                queue_error = {'code': 'CHAT_QUEUE_UNAVAILABLE', 'message': 'This runtime does not support queued chat turns.'}
+            if queue_error is not None:
+                await ws.send(json.dumps({'type': 'rpc', 'id': rpc_id, 'sessionId': session_id, 'error': queue_error}))
+                return
             message_text = params.get("message", "")
             # A stable sessionKey (the chat document id, not the
             # short-lived WebSocket session_id) is what keeps the same
@@ -1675,6 +2015,12 @@ class WebChannel(BaseChannel):
             # my first message" after a page refresh — two jsonl
             # files were actually created).
             session_key = params.get("sessionKey") or f"web:{session_id}"
+            if isinstance(session_key, str) and session_key.startswith("desktop:voice:"):
+                await ws.send(json.dumps({
+                    "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                    "error": {"code": "VOICE_TRANSCRIPT_ONLY", "message": "Resume voice to continue this conversation."},
+                }))
+                return
             if not params.get("sessionKey"):
                 logger.warning(
                     "[WebChannel] chat.send without sessionKey; using "
@@ -1683,6 +2029,24 @@ class WebChannel(BaseChannel):
                     "should send a stable sessionKey (chat document id)."
                 )
             idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
+            from flowly.session.commands import ChatCommandConflictError
+
+            try:
+                created, receipt = self.chat_commands.accept(session_key, idempotency_key, params)
+            except (ChatCommandConflictError, ValueError, TypeError) as exc:
+                code = "IDEMPOTENCY_CONFLICT" if isinstance(exc, ChatCommandConflictError) else "INVALID_REQUEST"
+                await ws.send(json.dumps({
+                    "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                    "error": {"code": code, "message": str(exc)},
+                }))
+                return
+            if not created:
+                self._session_key_to_relay_id[session_key] = session_id
+                await ws.send(json.dumps({
+                    "type": "rpc", "id": rpc_id, "sessionId": session_id,
+                    "result": receipt,
+                }))
+                return
 
             # Optional per-session runtime cwd (Desktop sends the project
             # folder the user opened in the right-rail). Pin it before
@@ -1727,19 +2091,24 @@ class WebChannel(BaseChannel):
             # Save attachments to disk
             media: list[str] = []
             attachments = params.get("attachments") or []
-            message_text = append_browser_annotation_context(message_text, attachments)
-            if attachments:
-                media_dir = get_flowly_home() / "media"
-                media = _save_attachments(attachments, media_dir)
+            try:
+                message_text = append_browser_annotation_context(message_text, attachments)
+                if attachments:
+                    from flowly.live_voice.events import EventAccess, event_access_scope
 
-            # ACK immediately with runId
-            ack = {
-                "type": "rpc",
-                "id": rpc_id,
-                "sessionId": session_id,
-                "result": {"runId": run_id},
-            }
-            await ws.send(json.dumps(ack))
+                    media_dir = get_flowly_home() / "media"
+                    source = self.chat_commands.control_scope(run_id)
+                    access = EventAccess(scopes=(source,)) if source is not None else EventAccess(blocked=True)
+                    with event_access_scope(access):
+                        media = _save_attachments(attachments, media_dir)
+            except Exception:
+                self.chat_commands.settle(session_key, run_id, 'error')
+                logger.exception('Could not prepare attachments for chat run {}', run_id)
+                await ws.send(json.dumps({
+                    'type': 'rpc', 'id': rpc_id, 'sessionId': session_id,
+                    'error': {'code': 'CHAT_INPUT_FAILED', 'message': 'The attached files could not be prepared. Please try again.'},
+                }))
+                return
 
             # Track the in-flight stream so a client that leaves and re-enters
             # this chat mid-run can fetch the partial via the chat.inflight RPC
@@ -1750,7 +2119,8 @@ class WebChannel(BaseChannel):
             # so relay/cloud chats had no resume.
             from flowly.agent import inflight
 
-            inflight.begin(session_key, run_id, message_text)
+            if getattr(self, 'supports_turn_start', False) is not True:
+                inflight.begin(session_key, run_id, message_text)
 
             # ONE streaming implementation, shared with autonomous goal turns
             # (see ``_make_stream_callback``). Two copies drifted before: the
@@ -1777,25 +2147,39 @@ class WebChannel(BaseChannel):
                     render_capabilities,
                 )
             )
-            self._active_tasks[run_id] = task
+            self._track_chat_publish(task, session_key, run_id)
+            if getattr(self, 'supports_turn_start', False) is not True:
+                self.chat_commands.settle(session_key, run_id, "running")
+            # ACK immediately with runId
+            ack = {
+                "type": "rpc",
+                "id": rpc_id,
+                "sessionId": session_id,
+                "result": {"runId": run_id},
+            }
+            await ws.send(json.dumps(ack))
 
-            # Auto-drain when the task completes. NOTE: this task only PUBLISHES
-            # the message to the bus and returns almost immediately — the real
-            # turn runs later in the agent loop. So we must NOT finish the
-            # in-flight partial here: doing so dropped the entry milliseconds
-            # after begin(), before the run had even started, leaving
-            # chat.inflight returning null for the whole tool phase (a client
-            # re-entering mid tool-loop saw nothing). The agent loop finishes
-            # the partial at true run completion instead (see AgentLoop
-            # ._process_turn). Here we only reclaim the task slot.
-            def _on_done(_t: object, _rid: str = run_id) -> None:
-                self._active_tasks.pop(_rid, None)
-
-            task.add_done_callback(_on_done)
+        elif method == "chat.command":
+            from flowly.session.commands import command_status
+            try:
+                response = {"result": command_status(self.chat_commands, params)}
+            except ValueError as exc:
+                response = {"error": {"code": "INVALID_REQUEST", "message": str(exc)}}
+            await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id, **response}))
 
         elif method == "chat.abort":
+            from flowly.session.commands import validate_command_control
+            try:
+                validate_command_control(self.chat_commands, params)
+            except ValueError as exc:
+                await ws.send(json.dumps({
+                    'type': 'rpc', 'id': rpc_id, 'sessionId': session_id,
+                    'error': {'code': 'TASK_TARGET_CHANGED', 'message': str(exc)},
+                }))
+                return
             run_id = params.get("runId", "")
-            cooperative_abort = False
+            cancelled = False
+            legacy_cancelled = False
             # ``task.cancel()`` used to be the heart of this handler,
             # but ``self._active_tasks[run_id]`` only ever held the
             # short-lived task that pushes the inbound to the bus —
@@ -1812,23 +2196,31 @@ class WebChannel(BaseChannel):
             # the agent eventually publishes carries ``aborted: true``
             # in its metadata so the relay + client UI can render the
             # partial with an [Aborted] marker.
-            if self._abort_callback is not None:
-                try:
-                    self._abort_callback(run_id)
-                    cooperative_abort = True
-                    logger.info(
-                        f"[WebChannel] chat.abort marked run_id={run_id} for cooperative interrupt"
+            from flowly.session.control_access import run_control_guard
+
+            with run_control_guard(self.chat_commands, params) as actual_session:
+                if self._abort_callback is not None:
+                    try:
+                        # Older callbacks return None after accepting a stop;
+                        # an explicit rejection must remain a failed request.
+                        cancelled = self._abort_callback(run_id) is not False
+                        logger.info(
+                            f"[WebChannel] chat.abort marked run_id={run_id} for cooperative interrupt"
+                        )
+                    except Exception as error:
+                        if feature_rpc.has_voice_account():
+                            logger.error('[WebChannel] account chat.abort failed ({})', type(error).__name__)
+                        else:
+                            logger.exception(f"[WebChannel] abort_callback failed for run_id={run_id}")
+                else:
+                    logger.warning(
+                        f"[WebChannel] chat.abort: no abort_callback registered "
+                        f"(run_id={run_id}) — falling back to legacy task.cancel()"
                     )
-                except Exception:
-                    logger.exception(f"[WebChannel] abort_callback failed for run_id={run_id}")
-            else:
-                logger.warning(
-                    f"[WebChannel] chat.abort: no abort_callback registered "
-                    f"(run_id={run_id}) — falling back to legacy task.cancel()"
-                )
-                task = self._active_tasks.get(run_id)
-                if task is not None and not task.done():
-                    task.cancel()
+                    task = self._active_tasks.get(run_id)
+                    if task is not None and not task.done():
+                        legacy_cancelled = task.cancel()
+                        cancelled = legacy_cancelled
             # ACK only. The run remains in-flight until AgentLoop persists its
             # partial transcript and emits the single authoritative
             # state:"final", aborted:true event. Sending a second terminal
@@ -1838,10 +2230,10 @@ class WebChannel(BaseChannel):
                 "type": "rpc",
                 "id": rpc_id,
                 "sessionId": session_id,
-                "result": {"ok": True, "cancelled": True},
+                "result": {"ok": True, "cancelled": cancelled},
             }
             await ws.send(json.dumps(ack))
-            if not cooperative_abort:
+            if legacy_cancelled:
                 # A legacy embedder without AgentLoop.mark_aborted cannot
                 # produce the authoritative partial final. Preserve its old
                 # terminal event so existing clients do not remain busy
@@ -1858,7 +2250,7 @@ class WebChannel(BaseChannel):
                             "data": {
                                 "state": "aborted",
                                 "runId": run_id,
-                                "sessionKey": self._session_key_for_relay_id(session_id),
+                                "sessionKey": actual_session or self._session_key_for_relay_id(session_id),
                             },
                         }
                     )
@@ -1987,14 +2379,19 @@ class WebChannel(BaseChannel):
             )
             return
         except Exception as e:
-            logger.exception(f"[WebChannel] feature rpc {method} failed")
+            if method.startswith('voice.') or 'voiceAccess' in params or feature_rpc.has_voice_account():
+                logger.error('[WebChannel] voice feature RPC {} failed ({})', method, type(e).__name__)
+                message = 'Voice request could not be completed.'
+            else:
+                logger.exception(f"[WebChannel] feature rpc {method} failed")
+                message = str(e)
             await ws.send(
                 json.dumps(
                     {
                         "type": "rpc",
                         "id": rpc_id,
                         "sessionId": session_id,
-                        "error": {"code": "INTERNAL", "message": str(e)},
+                        "error": {"code": "INTERNAL", "message": message},
                     }
                 )
             )
@@ -2071,7 +2468,9 @@ class WebChannel(BaseChannel):
         async def send(session_id: str) -> None:
             name, body = client_event(event_name, data, self._subagent_event_versions.get(session_id, 1))
             payload = {"type": "event", "event": name, "data": body, "sessionId": session_id}
-            await asyncio.wait_for(self._ws.send(json.dumps(payload)), timeout=1)
+            frame = json.dumps(payload)
+            pending = RelayOutbound(frame, self._outbound_event_access(frame))
+            await asyncio.wait_for(self._deliver_relay_outbound(pending), timeout=1)
         await asyncio.gather(*(send(key) for key in self._subagent_observers), return_exceptions=True)
 
     def _schedule_feature_restart(self) -> None:
@@ -2151,10 +2550,14 @@ class WebChannel(BaseChannel):
             logger.debug("[WebChannel] no relay session for {}", session_key)
             return False
         run_id = str(uuid.uuid4())
+        self.chat_commands.accept(session_key, run_id, {
+            'turnOrigin': 'goal', 'goalId': goal_metadata.get('_goal_continuation_goal_id'),
+        })
 
         from flowly.agent import inflight
 
-        inflight.begin(session_key, run_id, "")
+        if getattr(self, 'supports_turn_start', False) is not True:
+            inflight.begin(session_key, run_id, "")
 
         async def announce_user(text: str) -> None:
             """Publish the agent-authored prompt as this run's user turn."""
@@ -2178,8 +2581,13 @@ class WebChannel(BaseChannel):
             asyncio.create_task(self._emit_local_event("chat", {**data, "source": "relay"}))
 
         started = goal_metadata.pop("on_run_started", None)
-        if started is not None:
-            started(run_id)
+        try:
+            if started is not None:
+                started(run_id)
+        except BaseException as exc:
+            self.chat_commands.settle(session_key, run_id, 'aborted' if isinstance(exc, asyncio.CancelledError) else 'error')
+            inflight.finish(session_key, run_id)
+            raise
         metadata = {**goal_metadata, "on_user_message": announce_user}
         task = asyncio.create_task(self._process_message(
             session_id,
@@ -2189,9 +2597,28 @@ class WebChannel(BaseChannel):
             self._make_stream_callback(session_id, session_key, run_id),
             extra_metadata=metadata,
         ))
-        self._active_tasks[run_id] = task
-        task.add_done_callback(lambda _t, _rid=run_id: self._active_tasks.pop(_rid, None))
+        self._track_chat_publish(task, session_key, run_id)
         return True
+
+    def _track_chat_publish(self, task: asyncio.Task, session_key: str, run_id: str) -> None:
+        self._active_tasks[run_id] = task
+
+        def finished(completed: asyncio.Task) -> None:
+            self._active_tasks.pop(run_id, None)
+            # Successful publication is only a handoff to the agent queue;
+            # its receipt and live partial must remain until the actual turn.
+            if completed.cancelled():
+                status = 'aborted'
+            elif completed.exception() is not None:
+                status = 'error'
+            else:
+                return
+            from flowly.agent import inflight
+
+            self.chat_commands.settle(session_key, run_id, status)
+            inflight.finish(session_key, run_id)
+
+        task.add_done_callback(finished)
 
     async def _process_message(
         self,
@@ -2213,6 +2640,24 @@ class WebChannel(BaseChannel):
         }
         if extra_metadata:
             metadata.update(extra_metadata)
+        if getattr(self, 'supports_turn_start', False) is True:
+            from flowly.agent import inflight
+
+            async def on_turn_started(text: str) -> None:
+                self.chat_commands.settle(session_key, run_id, 'running')
+                inflight.begin(session_key, run_id, text, goal_run=bool(metadata.get('goal_run')))
+
+            metadata['_on_turn_started'] = on_turn_started
+
+            async def on_iteration(event: dict) -> None:
+                wrapped = {**event, 'runId': run_id, 'state': 'iteration_step'}
+                inflight.append_iteration(session_key, run_id, wrapped)
+                await self.send(OutboundMessage(
+                    channel='web', chat_id=session_id, content='',
+                    metadata={'iteration_event': wrapped, 'session_key': session_key},
+                ))
+
+            metadata['on_iteration'] = on_iteration
         if voice_mode:
             metadata["voice_mode"] = True
         if render_capabilities:
@@ -2228,7 +2673,26 @@ class WebChannel(BaseChannel):
             _session_key=session_key,
         )
 
-        await self.bus.publish_inbound(inbound_with_session)
+        try:
+            await self.bus.publish_inbound(inbound_with_session)
+        except asyncio.CancelledError:
+            self.chat_commands.settle(session_key, run_id, 'aborted')
+            raise
+        except Exception:
+            from flowly.agent import inflight
+
+            self.chat_commands.settle(session_key, run_id, 'error')
+            inflight.finish(session_key, run_id)
+            logger.exception('Could not publish chat run {} to the agent queue', run_id)
+            try:
+                await self.send(OutboundMessage(
+                    channel='web', chat_id=session_id,
+                    content='The message could not be queued. Please try again.',
+                    metadata={'run_id': run_id, 'session_key': session_key,
+                              'error': {'code': 'CHAT_DISPATCH_FAILED'}},
+                ))
+            except Exception:
+                logger.exception('Could not deliver the dispatch failure for run {}', run_id)
 
 
 # ---------------------------------------------------------------------------

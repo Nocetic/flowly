@@ -255,7 +255,7 @@ async def test_aborted_failed_and_provider_error_turn_guards(tmp_path: Path) -> 
         decision = await manager.evaluate_after_turn(
             session, "" if session == "empty" else "error text", **kwargs
         )
-        assert decision.verdict is GoalVerdict.SKIPPED
+        assert decision.verdict is (GoalVerdict.SKIPPED if session == 'compact' else GoalVerdict.NEEDS_INPUT)
         assert manager.get(session).turns_used == 0  # type: ignore[union-attr]
     assert provider.calls == []
 

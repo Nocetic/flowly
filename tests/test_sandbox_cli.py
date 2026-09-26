@@ -48,6 +48,27 @@ class TestPythonReexecution:
         monkeypatch.setattr(sys, "argv", ["/bin/flowly", "agent", "-m", "hello"])
         assert cli_wrap._python_command() == [sys.executable, "/bin/flowly", "agent", "-m", "hello"]
 
+@pytest.mark.parametrize('platform_name', ['macos', 'linux'])
+@pytest.mark.parametrize('invocation', [
+    ['python3', '-X', 'utf8', '-m', 'flowly.cli.entry', '--profile', 'writer', 'serve'],
+    ['python3', '/opt/flowly/bin/flowly', '--profile', 'writer', 'serve'],
+])
+def test_sandbox_reexec_keeps_interpreter_flags_and_module_resolution(monkeypatch, platform_name, invocation):
+    monkeypatch.setattr(sys, 'orig_argv', invocation)
+    monkeypatch.setattr(sys, 'argv', ['/checkout/flowly/cli/entry.py', '--profile', 'writer', 'serve'])
+    monkeypatch.setattr(Path, 'exists', lambda _path: True)
+    monkeypatch.setattr(cli_wrap, '_write_profile', lambda _profile: '/tmp/test-profile.sb')
+    monkeypatch.setattr(cli_wrap, '_find_bwrap', lambda: '/usr/bin/bwrap')
+    monkeypatch.setattr(cli_wrap, '_build_bwrap_args', lambda _home: ['--unshare-pid'])
+    with mock.patch('os.execve') as execve:
+        getattr(cli_wrap, f'_reexec_{platform_name}')({'FLOWLY_TEST': '1'})
+    executable, argv, env = execve.call_args.args
+    expected_prefix = (['/usr/bin/sandbox-exec', '-f', '/tmp/test-profile.sb'] if platform_name == 'macos'
+                       else ['/usr/bin/bwrap', '--unshare-pid', '--'])
+    assert executable == expected_prefix[0]
+    assert argv == [*expected_prefix, sys.executable, *invocation[1:]]
+    assert env == {'FLOWLY_TEST': '1', 'FLOWLY_SANDBOX_WRAPPED': '1'}
+
 
 # ── Gate decision: env var precedence ────────────────────────────────
 

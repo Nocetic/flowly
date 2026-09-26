@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -24,6 +25,45 @@ from flowly.push.cron_push import should_push_cron_completion as _should_push_pe
 console = Console()
 
 _GATEWAY_FILE_SINK_ID: int | None = None
+_GATEWAY_LOG_MAX_BYTES = 10 * 1024 * 1024
+_GATEWAY_LOG_KEEP = 7
+_GATEWAY_LOG_DAY = None
+
+
+def _rotate_gateway_log(message, file) -> bool:
+    """Rotate at midnight or 10 MiB, whichever arrives first."""
+    global _GATEWAY_LOG_DAY
+    try:
+        if _GATEWAY_LOG_DAY is None:
+            _GATEWAY_LOG_DAY = datetime.fromtimestamp(Path(file.name).stat().st_mtime).date()
+        written = file.tell()
+        incoming = len(str(message).encode('utf-8'))
+        today = message.record['time'].date()
+        if written + incoming >= _GATEWAY_LOG_MAX_BYTES or _GATEWAY_LOG_DAY < today:
+            _GATEWAY_LOG_DAY = today
+            return True
+        return False
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _retain_gateway_logs(paths: list[str]) -> None:
+    """Bound compressed archives by age and count after each rotation."""
+    now = datetime.now()
+    candidates = []
+    for path in paths:
+        try:
+            item = Path(path)
+            candidates.append((item.stat().st_mtime, item))
+        except OSError:
+            continue
+    candidates.sort(reverse=True)
+    for index, (modified, item) in enumerate(candidates):
+        if index >= _GATEWAY_LOG_KEEP or datetime.fromtimestamp(modified) < now - timedelta(days=30):
+            try:
+                item.unlink()
+            except OSError:
+                pass
 _LOCAL_RUNTIME_CAPABILITIES = (
     "profile-rpc-v2",
     "allowed-tools-v1",
@@ -31,6 +71,8 @@ _LOCAL_RUNTIME_CAPABILITIES = (
     "cooperative-stop-v1",
     "profile-cron-v1",
     "shared-services-v1",
+    "voice-owner-hop-v1",
+    "voice-owner-events-v1",
 )
 
 
@@ -173,7 +215,7 @@ def _install_gateway_file_sink(level: str = "INFO") -> None:
     Additive — the default loguru stderr sink stays, so the service manager
     still captures stdout/stderr as before. This guarantees day-by-day local
     operational logs (``~/.flowly/logs/gateway.log`` + dated ``.gz`` archives,
-    30-day retention) regardless of service manager (launchd/systemd/Windows),
+    30-day/7-archive retention) regardless of service manager (launchd/systemd/Windows),
     and survives background mode where the inherited stdio pipes are ignored.
 
     ``enqueue=False`` is intentional: on Python 3.14 loguru's enqueue worker
@@ -190,8 +232,8 @@ def _install_gateway_file_sink(level: str = "INFO") -> None:
         log_dir = _get_log_dir()
         _GATEWAY_FILE_SINK_ID = logger.add(
             str(log_dir / "gateway.log"),
-            rotation="00:00",          # new file at midnight
-            retention="30 days",
+            rotation=_rotate_gateway_log,
+            retention=_retain_gateway_logs,
             compression="gz",
             enqueue=False,             # avoid multiprocessing fork on Python 3.14
             backtrace=False,
@@ -1675,6 +1717,10 @@ Respond to the user now:"""
         )
         return text, (metadata or {})
 
+    # The runner can defer its in-flight ownership until AgentLoop acquires
+    # the session turn lock; accepted instructions may be queued behind work.
+    on_chat_message.supports_turn_start = True
+
     # Artifact store for gateway
     artifact_store = None
     if config.tools.artifact.enabled:
@@ -1846,6 +1892,31 @@ Respond to the user now:"""
         _feature_rpc.set_board_provider(
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None))
         )
+        from flowly.live_voice.service import LiveVoiceService
+        from flowly.live_voice.sessions import VoiceSessions
+
+        live_voice = LiveVoiceService(
+            VoiceSessions(agent.sessions),
+            lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None)),
+            worker=lambda: getattr(getattr(agent, '_gateway_server', None), 'profile_host', None),
+        )
+        _feature_rpc.set_voice_provider(lambda: live_voice)
+        from flowly.live_voice.context import VoiceContext
+        from flowly.profile import current_profile_name, ensure_profile_bot_id
+
+        def _voice_scope():
+            profile_name = current_profile_name()
+            return profile_name, ensure_profile_bot_id(profile_name).bot_id
+
+        voice_context = VoiceContext(
+            agent.workspace, state_db=_feature_rpc.state_db, profile=_voice_scope,
+            index=lambda: getattr(agent, "_memory_manager", None),
+        )
+        _feature_rpc.set_voice_context_provider(lambda: voice_context)
+        from flowly.live_voice.outputs import WorkOutputs
+
+        work_outputs = WorkOutputs(agent.workspace, agent.sessions, _feature_rpc._artifact_store)
+        _feature_rpc.set_work_output_provider(lambda: work_outputs)
         # Subagent registry — read-only, for board.card's run/tool-trace audit.
         _feature_rpc.set_registry_provider(
             lambda: getattr(getattr(agent, "subagents", None), "registry", None)
@@ -1865,6 +1936,12 @@ Respond to the user now:"""
                 agent.goal_manager.get(session_key)
                 if agent.goal_manager is not None
                 else None
+            )
+        )
+        _feature_rpc.set_goal_generation_provider(
+            lambda session_key, goal_id: (
+                agent.goal_manager.store.get_generation(session_key, goal_id)
+                if agent.goal_manager is not None else None
             )
         )
         # Chip pause/play buttons — the control must run through the agent so
@@ -1958,6 +2035,7 @@ Respond to the user now:"""
     agent.register_goal_turn_submitter("direct", gateway_server.run_autonomous_turn)
     _web_channel = channels.get_channel("web")
     if _web_channel is not None and hasattr(_web_channel, "run_autonomous_turn"):
+        _web_channel.supports_turn_start = True
         agent.register_goal_turn_submitter("web", _web_channel.run_autonomous_turn)
 
     # Mirror relay/web chat liveness to local desktop gateway clients. This
@@ -1968,66 +2046,34 @@ Respond to the user now:"""
         web.set_local_event_callback(gateway_server.broadcast_event)
     if web and hasattr(web, "set_profile_host"):
         web.set_profile_host(gateway_server.profile_host)
+    if web and hasattr(web, "set_chat_commands"):
+        web.set_chat_commands(gateway_server.chat_commands)
 
-    # Wire artifact broadcast callback — push to desktop (gateway) AND relay (web channel)
+    # Freeze original authority once, then let each transport enforce its own
+    # recipients. Relay mirrors must never write to the raw agent socket.
+    from flowly.channels import feature_rpc as _artifact_rpc
+    from flowly.live_voice.event_mirror import mirror_event
+
+    async def _broadcast_artifact(event_name: str, data: dict) -> None:
+        await mirror_event(gateway_server, channels.get_channel("web"), event_name, data)
+
+    _artifact_rpc.set_artifact_change_callback(_broadcast_artifact if artifact_store else None)
     if artifact_store:
+        gateway_server.set_shared_artifact_on_change(_broadcast_artifact)
+        agent.subagents._artifact_on_change = _broadcast_artifact
         artifact_tool = agent.tools.get("artifact")
         if artifact_tool:
-            async def _broadcast_artifact(event_name: str, data: dict) -> None:
-                # Desktop clients (direct WS)
-                await gateway_server._broadcast_artifact_event(event_name, data)
-                # Relay (web channel) — so relay can sync to S3 + Firestore
-                web = channels.get_channel("web")
-                if web and hasattr(web, "_ws") and web._ws:
-                    import json as _json
-                    try:
-                        await web._ws.send(_json.dumps({
-                            "type": "event",
-                            "event": event_name,
-                            "data": data,
-                        }))
-                    except Exception:
-                        pass  # Non-critical — relay sync is best-effort
             artifact_tool.set_on_change(_broadcast_artifact)
-            gateway_server.set_shared_artifact_on_change(_broadcast_artifact)
-            # Share with SubagentManager so subagent artifacts also sync to S3
-            agent.subagents._artifact_on_change = _broadcast_artifact
 
-    # Wire media-library broadcast — the same desktop(gateway)+relay fan-out.
-    # Without it a Library grid would only learn about a new image by polling,
-    # which is exactly the difference between a gallery that feels live and one
-    # that feels stale. The relay leg carries no bytes: it is a "something
-    # changed" ping, and the client re-reads the page it is on.
     from flowly.media.library import set_on_change as _set_media_on_change
 
     async def _broadcast_media(event_name: str, data: dict) -> None:
-        await gateway_server.broadcast_event(event_name, data)
-        _web = channels.get_channel("web")
-        if _web and hasattr(_web, "_ws") and _web._ws:
-            import json as _json
-            try:
-                await _web._ws.send(_json.dumps({
-                    "type": "event", "event": event_name, "data": data,
-                }))
-            except Exception:
-                pass  # relay fan-out is best-effort
+        await mirror_event(gateway_server, channels.get_channel("web"), event_name, data)
 
     _set_media_on_change(_broadcast_media)
 
-    # Wire flowlet broadcast + agent-action runner — same desktop(gateway)+relay
-    # fan-out as artifacts. The broadcast callback also backs feature_rpc's
-    # flowlets.action / flowlets.delete so a tap on one client updates the rest.
     async def _broadcast_flowlet(event_name: str, data: dict) -> None:
-        await gateway_server.broadcast_event(event_name, data)
-        _web = channels.get_channel("web")
-        if _web and hasattr(_web, "_ws") and _web._ws:
-            import json as _json
-            try:
-                await _web._ws.send(_json.dumps({
-                    "type": "event", "event": event_name, "data": data,
-                }))
-            except Exception:
-                pass  # relay sync is best-effort
+        await mirror_event(gateway_server, channels.get_channel("web"), event_name, data)
 
     async def _flowlet_agent_runner(flowlet: dict, message: str) -> None:
         """Run an agent turn for a flowlet `agent` action and deliver the reply
@@ -2444,6 +2490,7 @@ Respond to the user now:"""
                     port=gateway_server.port,
                     auth_token=auth_token,
                     capabilities=_LOCAL_RUNTIME_CAPABILITIES,
+                    voice_parent_key=gateway_server.voice_parent_key,
                 )
                 typer.echo(
                     "FLOWLY_LOCAL_RUNTIME_READY "

@@ -19,6 +19,7 @@ import signal
 import sys
 import time
 import uuid
+from weakref import WeakValueDictionary
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -185,6 +186,25 @@ def _profile_reply_text(value: Any) -> str:
     ).strip()
 
 
+def _profile_terminal_state(payload: dict[str, Any]) -> str:
+    """The gateway emits interrupted turns as final + aborted, with partial text."""
+    if payload.get("aborted") is True or payload.get("state") == "aborted":
+        return "aborted"
+    if payload.get("failed") is True:
+        return "error"
+    return str(payload.get("state") or "error")
+
+
+def _check_profile_terminal(payload: dict[str, Any]) -> None:
+    state = _profile_terminal_state(payload)
+    if state != "final":
+        raise ProfileHostError(
+            "PROFILE_COLLABORATION_FAILED",
+            f"Profile collaboration ended with {state}.",
+            terminal_state=state,
+        )
+
+
 def _safe_startup_message(value: str) -> str:
     plain = _ANSI_ESCAPE_RE.sub("", value).strip()
     if "Profile runtime is already active" in plain:
@@ -231,10 +251,14 @@ class _Runtime:
     reader_task: asyncio.Task[None] | None = None
     stdout_task: asyncio.Task[None] | None = None
     stderr_task: asyncio.Task[None] | None = None
+    voice_parent_key: str = field(default='', repr=False)
+    event_authority: Any = field(default=None, repr=False)
 
 
 class ProfileHost:
     """Own and proxy named profile gateways for authenticated clients."""
+
+    TASK_GOAL_POLL_SECONDS = 1.0
 
     def __init__(
         self,
@@ -256,12 +280,14 @@ class ProfileHost:
         self._locks: dict[str, asyncio.Lock] = {}
         self._delete_confirmations: dict[str, tuple[str, float]] = {}
         self._broker_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
+        self._interactive_task_sessions: dict[tuple[str, str], str] = {}
         self._terminal_events: dict[tuple[str, str], dict[str, Any]] = {}
         self._broker_target_locks: dict[str, asyncio.Lock] = {}
         self._profile_message_requests: dict[
             tuple[str, str], tuple[str, str, asyncio.Task[Any]]
         ] = {}
         self._task_target_locks: dict[str, asyncio.Lock] = {}
+        self._voice_task_locks: WeakValueDictionary[tuple[str, str], asyncio.Lock] = WeakValueDictionary()
         self._shared_service_locks: dict[str, asyncio.Lock] = {}
         self._broker_sessions: dict[tuple[str, str], str] = {}
         # Private, bounded audit state for hidden Board worker turns.  These
@@ -323,6 +349,9 @@ class ProfileHost:
         room_capabilities = self._rooms.capabilities()
         return {
             "version": 2,
+            "identityGuardVersion": 1,
+            "workOutputVersion": 1,
+            "goalBindingVersion": 1,
             "hostId": self.host_id,
             "methods": [
                 "profiles.capabilities",
@@ -841,6 +870,7 @@ class ProfileHost:
             if expected_host_id != self.host_id:
                 raise ProfileHostError("PROFILE_IDENTITY_CHANGED", "The selected host identity changed.")
             self._check_rpc_profile_identity(name, expected_bot_id)
+            safe['expectedBotId'] = expected_bot_id
         if method == "chat.send":
             directory = [profile.name for profile in list_profiles()]
             mentions = safe.get("profileMentions")
@@ -861,6 +891,8 @@ class ProfileHost:
         result = await self._target_rpc(
             name, method, safe, bounded_timeout(method, timeout_ms), **identity_options
         )
+        if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
+            raise ProfileHostError('PROFILE_IDENTITY_CHANGED', 'The selected agent has changed.')
         if method == "sessions.list" and isinstance(result, dict):
             sessions = result.get("sessions")
             if isinstance(sessions, list):
@@ -886,15 +918,21 @@ class ProfileHost:
         idempotency_key: str,
         timeout: float = 1800.0,
         on_started: TaskStartedCallback | None = None,
+        interactive: bool = False,
+        expected_bot_id: str | None = None,
+        on_next_instruction: Callable[[str], dict | None] | None = None,
     ) -> dict[str, Any]:
-        """Run one dispatcher-owned task in a hidden named-profile session.
+        """Run a dispatcher-owned task in the selected profile.
 
         This is an internal broker operation, deliberately absent from the
         public profile-host method table. The primary Board owns identity,
         retries, and completion; the worker receives only task text and its
         ordinary sandboxed profile capabilities.
+        Interactive voice work uses a visible session, including on the
+        default profile, and keeps ordinary user questions and approvals.
         """
-        _validate_named_profile(name)
+        if name != "default" or not interactive:
+            _validate_named_profile(name)
         task_id = str(task_id or "").strip()
         prompt = str(prompt or "").strip()
         idempotency_key = str(idempotency_key or "").strip()
@@ -907,7 +945,7 @@ class ProfileHost:
             "verification, and any blocker. Do not delegate this task to "
             "another profile.\n\nTask:\n"
         )
-        task_message = f"{task_prefix}{prompt}"
+        task_message = prompt if interactive else f"{task_prefix}{prompt}"
         if not prompt or len(task_message) > MAX_PROFILE_MESSAGE_CHARS:
             raise ProfileHostError(
                 "TASK_INVALID",
@@ -927,11 +965,32 @@ class ProfileHost:
             raise ProfileHostError("TASK_INVALID", "The task timeout is invalid.")
         timeout = max(30.0, min(timeout, 3600.0))
         session_suffix = hashlib.sha256(task_id.encode()).hexdigest()[:24]
-        session_key = f"desktop:profile-task:{session_suffix}"
+        session_key = f"desktop:voice-work:{task_id}" if interactive else f"desktop:profile-task:{session_suffix}"
         correlation_id = f"task:{task_id}:{idempotency_key}"
+        task_scope = {
+            "sessionKey": session_key,
+            **({"expectedBotId": expected_bot_id} if expected_bot_id is not None else {}),
+        }
 
-        async with self._task_target_locks.setdefault(name, asyncio.Lock()):
-            self._broker_sessions[(name, session_key)] = correlation_id
+        # Keep repeated instructions for one chat ordered, while independent
+        # chats on this agent can run together. Weak entries retire idle chats.
+        task_lock = (self._voice_task_locks.setdefault((name, session_key), asyncio.Lock())
+                     if interactive else self._task_target_locks.setdefault(name, asyncio.Lock()))
+        async with task_lock:
+            if expected_bot_id is not None:
+                try:
+                    matches = ensure_profile_bot_id(name).bot_id == expected_bot_id
+                except (ValueError, FileNotFoundError):
+                    matches = False
+                if not matches:
+                    raise ProfileHostError("TASK_TARGET_CHANGED", "The assigned agent identity has changed.")
+            if interactive:
+                reservation = await self._target_rpc(name, 'runtime.voice.reserve', task_scope, 30)
+                if (not isinstance(reservation, dict) or reservation.get('reserved') is not True
+                        or reservation.get('sessionKey') != session_key):
+                    raise ProfileHostError('VOICE_AUTH_UNAVAILABLE', 'The task session owner could not be established.')
+            tracked_sessions = self._interactive_task_sessions if interactive else self._broker_sessions
+            tracked_sessions[(name, session_key)] = correlation_id
             try:
                 model = str(_public_settings(name).get("model") or "") or None
             except Exception:
@@ -944,88 +1003,391 @@ class ProfileHost:
                 "error": None,
                 "model": model,
                 "toolTrace": [],
+                "awaitingGoal": interactive,
             }
             self._task_audit_sessions[(name, session_key)] = audit
             run_id = ""
             try:
-                accepted = await self._target_rpc(name, "chat.send", {
-                    "sessionKey": session_key,
-                    "message": task_message,
-                    "thinking": False,
-                    "idempotencyKey": idempotency_key,
-                    "profileDirectory": [],
-                    "profileMentions": [],
-                    "disabledTools": list(_PROFILE_TASK_DISABLED_TOOLS),
-                    "turnOrigin": "task",
-                }, 60)
-                run_id = str((accepted or {}).get("runId") or "")
-                if not run_id:
-                    raise ProfileHostError(
-                        "TASK_START_FAILED",
-                        "The assigned bot did not accept the task.",
-                        retryable=True,
-                    )
-                audit["runId"] = run_id
-                self._task_audits[(name, run_id)] = audit
-                while len(self._task_audits) > 256:
-                    self._task_audits.pop(next(iter(self._task_audits)))
-                if on_started is not None:
-                    try:
-                        started_result = on_started(run_id)
-                        if asyncio.iscoroutine(started_result):
-                            await started_result
-                    except Exception as exc:
-                        # Audit linkage is best-effort and must never abort an
-                        # already accepted worker turn. The completion path
-                        # performs the same link again as a fallback.
-                        logger.warning(
-                            "Could not link Board task {} to worker run {}: {}",
-                            task_id,
-                            run_id,
-                            exc,
-                        )
-                key = (name, run_id)
-                terminal = self._terminal_events.pop(key, None)
-                if terminal is None:
-                    waiter = asyncio.get_running_loop().create_future()
-                    self._broker_waiters[key] = waiter
-                    try:
-                        terminal = await asyncio.wait_for(waiter, timeout=timeout)
-                    except asyncio.TimeoutError as exc:
-                        await self._target_rpc(name, "chat.abort", {"runId": run_id}, 30)
+                while True:
+                    deadline = asyncio.get_running_loop().time() + timeout
+                    accepted = await self._target_rpc(name, "chat.send", {
+                        "sessionKey": session_key,
+                        "message": task_message,
+                        "thinking": False,
+                        **({"queueForNextTurn": True} if interactive else {}),
+                        "idempotencyKey": idempotency_key,
+                        "profileDirectory": [],
+                        "profileMentions": [],
+                        "disabledTools": [] if interactive else list(_PROFILE_TASK_DISABLED_TOOLS),
+                        "turnOrigin": "user" if interactive else "task",
+                        **({"expectedBotId": expected_bot_id} if expected_bot_id is not None else {}),
+                    }, 60)
+                    run_id = str((accepted or {}).get("runId") or "")
+                    if not run_id:
                         raise ProfileHostError(
-                            "TASK_TIMEOUT",
-                            "The assigned bot did not finish before the task timeout.",
+                            "TASK_START_FAILED",
+                            "The assigned bot did not accept the task.",
                             retryable=True,
-                        ) from exc
-                    finally:
-                        self._broker_waiters.pop(key, None)
-                        self._terminal_events.pop(key, None)
-                response = _profile_reply_text(terminal.get("message"))
+                        )
+                    audit["runId"] = run_id
+                    self._task_audits[(name, run_id)] = audit
+                    while len(self._task_audits) > 256:
+                        self._task_audits.pop(next(iter(self._task_audits)))
+                    receipt_status = (accepted or {}).get("status")
+                    if receipt_status == "status_unknown":
+                        raise ProfileHostError(
+                            "TASK_RESULT_UNKNOWN",
+                            "The accepted task's outcome could not be verified. Check its work conversation.",
+                        )
+                    key = (name, run_id)
+                    if interactive:
+                        if receipt_status not in {None, 'accepted', 'running', 'completed', 'aborted', 'error'}:
+                            raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The queued task receipt is not supported.')
+                        while receipt_status in {None, 'accepted'} and key not in self._terminal_events:
+                            remaining = deadline - asyncio.get_running_loop().time()
+                            if remaining <= 0:
+                                await self._target_rpc(name, 'chat.abort', {**task_scope, 'runId': run_id}, 30)
+                                raise ProfileHostError('TASK_TIMEOUT', 'The queued task did not start before its timeout.')
+                            await asyncio.sleep(min(self.TASK_GOAL_POLL_SECONDS, remaining))
+                            receipt = await self._target_rpc(name, 'chat.command', {**task_scope, 'runId': run_id}, 30)
+                            receipt_status = receipt.get('status')
+                            if receipt_status not in {'accepted', 'running', 'completed', 'aborted', 'error'}:
+                                raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The queued task could not be verified.')
+                    cached_terminal = self._terminal_events.get(key)
+                    can_ack_start = not interactive or (
+                        receipt_status not in {'aborted', 'error'}
+                        and (cached_terminal is None or _profile_terminal_state(cached_terminal) == 'final')
+                    )
+                    if on_started is not None and can_ack_start:
+                        try:
+                            started_result = on_started(run_id)
+                            if asyncio.iscoroutine(started_result):
+                                await started_result
+                        except Exception as exc:
+                            # Audit linkage is best-effort and must never abort an
+                            # already accepted worker turn. The completion path
+                            # performs the same link again as a fallback.
+                            logger.warning(
+                                "Could not link Board task {} to worker run {}: {}",
+                                task_id,
+                                run_id,
+                                exc,
+                            )
+                    key = (name, run_id)
+                    terminal = self._terminal_events.pop(key, None)
+                    if receipt_status in ("aborted", "error"):
+                        terminal = {"state": receipt_status}
+                    if receipt_status == "completed" and terminal is None:
+                        history = await self._target_rpc(name, "chat.history", task_scope, 30)
+                        messages = history.get("messages", []) if isinstance(history, dict) else []
+                        completed = next((m for m in reversed(messages) if isinstance(m, dict)
+                            and m.get("role") == "assistant" and m.get("runId") == run_id), None)
+                        if completed is None:
+                            raise ProfileHostError("TASK_RESULT_UNKNOWN", "The completed task's response is unavailable.")
+                        terminal = {"state": "final", "message": completed, "aborted": completed.get("aborted", False)}
+                    if terminal is None:
+                        waiter = asyncio.get_running_loop().create_future()
+                        self._broker_waiters[key] = waiter
+                        try:
+                            terminal = await asyncio.wait_for(waiter, timeout=timeout)
+                        except asyncio.TimeoutError as exc:
+                            await self._target_rpc(name, "chat.abort", {**task_scope, "runId": run_id}, 30)
+                            raise ProfileHostError(
+                                "TASK_TIMEOUT",
+                                "The assigned bot did not finish before the task timeout.",
+                                retryable=True,
+                            ) from exc
+                        finally:
+                            self._broker_waiters.pop(key, None)
+                            self._terminal_events.pop(key, None)
+                    _check_profile_terminal(terminal)
+                    response = _profile_reply_text(terminal.get("message"))
+                    if not response:
+                        raise ProfileHostError('TASK_EMPTY_RESPONSE', 'The assigned agent completed without a task handoff.')
+                    completed_run_id = run_id
+                    if interactive:
+                        goal_binding = await self._task_goal_binding(name, task_scope, run_id)
+                        response, completed_run_id, next_command = await self._follow_task_goal(
+                            name, task_scope, goal_binding=goal_binding,
+                            run_id=run_id, response=response, deadline=deadline,
+                            next_instruction=(lambda: on_next_instruction(idempotency_key)) if on_next_instruction else None,
+                        )
+                        if next_command is not None:
+                            idempotency_key = next_command['commandId']
+                            task_message = next_command['text']
+                            continue
+                    break
                 if not response:
                     raise ProfileHostError(
                         "TASK_EMPTY_RESPONSE",
                         "The assigned bot completed without a task handoff.",
                     )
-                return {"runId": run_id, "response": response}
+                if audit["endedAt"] is None:
+                    audit.update({"outcome": "ok", "endedAt": time.time()})
+                return {
+                    "runId": run_id, "response": response,
+                    **({"completedRunId": completed_run_id} if completed_run_id != run_id else {}),
+                }
+            except ProfileHostError as exc:
+                if audit["endedAt"] is None:
+                    audit.update({
+                        "outcome": exc.terminal_state or (
+                            "unknown" if exc.code == "TASK_RESULT_UNKNOWN" else "error"
+                        ),
+                        "endedAt": time.time(), "error": exc.code,
+                    })
+                raise
             except asyncio.CancelledError:
                 if run_id:
                     try:
-                        await self._target_rpc(name, "chat.abort", {"runId": run_id}, 30)
+                        await self._target_rpc(name, "chat.abort", {**task_scope, "runId": run_id}, 30)
                     except Exception:
                         logger.debug("Could not abort cancelled Board task {}", task_id)
                 raise
             finally:
-                self._broker_sessions.pop((name, session_key), None)
+                tracked_sessions.pop((name, session_key), None)
                 self._task_audit_sessions.pop((name, session_key), None)
 
+    async def _task_goal_snapshot(self, profile: str, scope: dict) -> dict | None:
+        result = await self._target_rpc(profile, 'goal.get', scope, 30)
+        if not isinstance(result, dict) or 'goal' not in result:
+            raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The task goal could not be verified.')
+        goal = result['goal']
+        if goal is not None and (
+            not isinstance(goal, dict) or not isinstance(goal.get('goalId'), str)
+            or not goal['goalId'] or goal.get('status') not in {'active', 'paused', 'done', 'cleared'}
+            or type(goal.get('revision')) is not int or goal['revision'] < 0
+        ):
+            raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The task goal could not be verified.')
+        return goal
+
+    async def _follow_task_goal(
+        self, profile: str, scope: dict, *, goal_binding: dict,
+        run_id: str, response: str, deadline: float,
+        next_instruction: Callable[[], dict | None] | None = None,
+    ) -> tuple[str, str, dict | None]:
+        """Keep the task open beyond its first reply, using durable goal proof.
+
+        Audio/connection state is irrelevant here. A goal cleared or replaced
+        by another surface is never inferred to have succeeded, and history
+        fallback resolves only the run the goal evaluator actually consumed.
+        """
+        def next_command() -> dict | None:
+            command = next_instruction() if next_instruction else None
+            if command is not None and (
+                not isinstance(command, dict) or not isinstance(command.get('commandId'), str)
+                or not 1 <= len(command['commandId']) <= 128
+                or not isinstance(command.get('text'), str) or not command['text'].strip()
+                or len(command['text']) > MAX_PROFILE_MESSAGE_CHARS
+            ):
+                raise ProfileHostError('TASK_INVALID', 'The queued task instruction is invalid.')
+            return command
+
+        command = next_command()
+        if command is not None:
+            return response, run_id, command
+        if goal_binding['state'] == 'none':
+            return response, run_id, None
+        goal_id = goal_binding['goalId']
+
+        async def bound_goal() -> dict:
+            current = await self._task_goal_snapshot(profile, scope)
+            if current is None or current['goalId'] != goal_id:
+                current = await self._task_goal_snapshot(profile, {**scope, 'goalId': goal_id})
+                if current is None or current['status'] not in {'done', 'cleared'}:
+                    raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The task goal changed. Check its work conversation.')
+            if current['goalId'] != goal_id or current['revision'] < goal_binding['revision']:
+                raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The task goal could not be verified.')
+            return current
+
+        goal = await bound_goal()
+        while True:
+            if goal is None or goal['goalId'] != goal_id:
+                raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The task goal changed. Check its work conversation.')
+            if goal['status'] == 'paused':
+                raise ProfileHostError('TASK_GOAL_PAUSED', 'The task goal is paused. Review its work conversation before continuing.')
+            if goal['status'] == 'cleared':
+                raise ProfileHostError('TASK_GOAL_CANCELLED', 'The task goal was stopped.', terminal_state='aborted')
+            if goal['status'] == 'done':
+                final_run_id = goal.get('lastRunId')
+                if not isinstance(final_run_id, str) or not final_run_id:
+                    raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The completed goal has no verified response identity.')
+                final_binding = await self._task_goal_binding(profile, scope, final_run_id)
+                if final_binding.get('goalId') != goal_id or final_binding['state'] != 'goal':
+                    raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The goal response belongs to a different execution.')
+                terminal = ({'state': 'final', 'message': {'content': response}} if final_run_id == run_id else
+                            self._terminal_events.pop((profile, final_run_id), None))
+                if terminal is None:
+                    history = await self._target_rpc(profile, 'chat.history', scope, 30)
+                    messages = history.get('messages', []) if isinstance(history, dict) else []
+                    message = next((m for m in reversed(messages) if isinstance(m, dict)
+                        and m.get('role') == 'assistant' and m.get('runId') == final_run_id), None)
+                    if message is None:
+                        raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The completed goal response is unavailable.')
+                    terminal = {
+                        'state': 'final', 'message': message,
+                        'aborted': message.get('aborted', False), 'failed': message.get('failed', False),
+                    }
+                _check_profile_terminal(terminal)
+                fresh = await bound_goal()
+                if (fresh['revision'] == goal['revision'] and fresh['status'] == 'done'
+                        and fresh.get('lastRunId') == final_run_id):
+                    return _profile_reply_text(terminal.get('message')), final_run_id, None
+                goal = fresh
+                continue
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The task goal is still active. Check its work conversation.')
+            await asyncio.sleep(min(self.TASK_GOAL_POLL_SECONDS, remaining))
+            command = next_command()
+            if command is not None:
+                return response, run_id, command
+            goal = await bound_goal()
+
+    async def _task_goal_binding(self, profile: str, scope: dict, run_id: str) -> dict:
+        receipt = await self._target_rpc(profile, 'chat.command', {**scope, 'runId': run_id}, 30)
+        if not isinstance(receipt, dict) or receipt.get('runId') != run_id:
+            raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The task execution receipt could not be verified.')
+        if receipt.get('status') in {'error', 'aborted'}:
+            _check_profile_terminal({'state': receipt['status']})
+        binding = receipt.get('goalBinding')
+        if (receipt.get('status') != 'completed' or not isinstance(binding, dict)
+                or type(binding.get('version')) is not int or binding['version'] != 1
+                or binding.get('state') not in {'none', 'goal'}):
+            raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The task goal binding is unavailable. Check its work conversation.')
+        if binding['state'] == 'goal' and (
+            not isinstance(binding.get('goalId'), str) or not binding['goalId'] or len(binding['goalId']) > 512
+            or type(binding.get('revision')) is not int or binding['revision'] < 0
+        ):
+            raise ProfileHostError('TASK_RESULT_UNKNOWN', 'The task goal binding could not be verified.')
+        return binding
+
+    async def reconcile_task(self, *, profile: str, task_id: str, run_id: str, expected_bot_id: str) -> dict:
+        """Inspect a voice task without starting a profile, model or new command."""
+        from flowly.live_voice.recovery import read_task_result
+        from flowly.profile import describe_profile
+
+        if (not isinstance(task_id, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', task_id)
+                or not isinstance(run_id, str) or not 1 <= len(run_id) <= 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in run_id)):
+            raise ProfileHostError('TASK_INVALID', 'Task identity is invalid.')
+        before = describe_profile(profile)
+        if not expected_bot_id or before.bot_id != expected_bot_id:
+            raise ProfileHostError('TASK_TARGET_CHANGED', 'The assigned agent identity has changed.')
+        try:
+            result = await asyncio.to_thread(read_task_result, before.path, f'desktop:voice-work:{task_id}', run_id)
+        except Exception:
+            logger.debug('Could not verify durable evidence for task {}', task_id, exc_info=True)
+            result = {'runId': run_id, 'status': 'status_unknown'}
+        after = describe_profile(profile)
+        if after.bot_id != expected_bot_id or before.path != after.path:
+            raise ProfileHostError('TASK_TARGET_CHANGED', 'The assigned agent identity has changed.')
+        return result
+
+    async def stop_task(self, *, profile: str, task_id: str, run_id: str | None,
+                        expected_bot_id: str, goal_binding: dict | None = None,
+                        on_goal_binding: Callable[[dict], dict] | None = None) -> dict:
+        """Stop the task's goal and verify its worker, without cancelling its waiter."""
+        if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', task_id):
+            raise ProfileHostError('TASK_INVALID', 'Task identity is invalid.')
+        if ensure_profile_bot_id(profile).bot_id != expected_bot_id:
+            raise ProfileHostError('TASK_TARGET_CHANGED', 'The assigned agent identity has changed.')
+        params = {'sessionKey': f'desktop:voice-work:{task_id}', 'expectedBotId': expected_bot_id}
+        if not run_id:
+            return {'status': 'status_unknown'}
+        lookup = {**params, 'runId': run_id}
+        receipt = await self._target_rpc(profile, 'chat.command', lookup, 30)
+        if receipt.get('status') == 'not_found':
+            return {'status': 'status_unknown'}
+        if receipt.get('status') in {'accepted', 'running'}:
+            await self._target_rpc(profile, 'chat.abort', lookup, 30)
+            receipt = await self._target_rpc(profile, 'chat.command', lookup, 30)
+        goal = await self._task_goal_snapshot(profile, params)
+        execution = receipt.get('goalBinding')
+        if (isinstance(execution, dict) and type(execution.get('version')) is int
+                and execution['version'] == 1 and execution.get('state') in {'none', 'goal', 'pending'}):
+            if execution['state'] == 'none':
+                if goal_binding is not None and goal_binding.get('goalId') is not None:
+                    return {'status': 'status_unknown'}
+                # This command never owned a standing goal. A later goal or
+                # independent user turn must neither be stopped nor adopted.
+                snapshot = await self._target_rpc(profile, 'chat.inflight', params, 30)
+                active = snapshot.get('inflight')
+                if active and active.get('runId') == run_id:
+                    return {'status': 'stopping'}
+                worker_status = receipt.get('status')
+                if worker_status in {'completed', 'aborted', 'error'}:
+                    return {'status': 'stopped', 'workerStatus': worker_status}
+                return {'status': 'stopping' if worker_status in {'accepted', 'running'} else 'status_unknown'}
+            bound_id = execution.get('goalId')
+            if execution['state'] == 'pending' and not bound_id and goal and goal.get('createdByRunId') == run_id:
+                bound_id = goal['goalId']
+            if not isinstance(bound_id, str) or not bound_id or len(bound_id) > 512:
+                return {'status': 'stopping' if receipt.get('status') in {'accepted', 'running'} else 'status_unknown'}
+            if goal_binding is not None and goal_binding.get('goalId') != bound_id:
+                return {'status': 'status_unknown'}
+            if goal is None or goal['goalId'] != bound_id:
+                proof = await self._task_goal_snapshot(profile, {**params, 'goalId': bound_id})
+                if (proof is None or proof['goalId'] != bound_id or proof['status'] not in {'done', 'cleared'}
+                        or receipt.get('status') not in {'completed', 'aborted', 'error'}):
+                    return {'status': 'status_unknown'}
+                if proof['status'] == 'done':
+                    final_run = proof.get('lastRunId')
+                    if not isinstance(final_run, str) or not final_run:
+                        return {'status': 'status_unknown'}
+                    final_binding = await self._task_goal_binding(profile, params, final_run)
+                    if final_binding.get('goalId') != bound_id:
+                        return {'status': 'status_unknown'}
+                    return {'status': 'stopped', 'workerStatus': 'completed'}
+                return {'status': 'stopped', 'workerStatus': 'aborted'}
+        elif goal_binding is None:
+            # A legacy receipt cannot authorize stopping whatever goal happens
+            # to be current. Already persisted cancellation bindings stay pinned.
+            return {'status': 'status_unknown'}
+        if goal_binding is None:
+            candidate = {
+                'goalId': goal['goalId'] if goal else None,
+                'statusAtRequest': goal['status'] if goal else None,
+            }
+            goal_binding = on_goal_binding(candidate) if on_goal_binding else candidate
+        if (goal['goalId'] if goal else None) != goal_binding.get('goalId'):
+            return {'status': 'status_unknown'}
+        if goal and goal['status'] in {'active', 'paused'}:
+            try:
+                await self._target_rpc(profile, 'goal.stop', {
+                    **params, 'expectedGoalId': goal['goalId'], 'expectedRevision': goal['revision'],
+                }, 30)
+            except ProfileHostError as exc:
+                if exc.code in {'GOAL_NOT_FOUND', 'GOAL_STATE_CHANGED'}:
+                    # Reconciliation may re-read the pinned generation. It
+                    # must never retry by silently adopting a replacement.
+                    return {'status': 'status_unknown'}
+                raise
+        snapshot = await self._target_rpc(profile, 'chat.inflight', params, 30)
+        goal = snapshot.get('goal')
+        if (goal.get('goalId') if goal else None) != goal_binding.get('goalId'):
+            return {'status': 'status_unknown'}
+        active = snapshot.get('inflight')
+        owns_active_turn = active and (active.get('runId') == run_id or active.get('goalRun') is not False)
+        if owns_active_turn or (goal and goal.get('status') not in {'done', 'cleared'}):
+            return {'status': 'stopping'}
+        worker_status = receipt.get('status')
+        if goal and goal.get('status') == 'cleared' and worker_status == 'completed':
+            if goal_binding.get('statusAtRequest') not in {'active', 'paused'}:
+                return {'status': 'status_unknown'}
+            # The first turn finished but the task's standing goal was stopped.
+            worker_status = 'aborted'
+        if worker_status in {'completed', 'aborted', 'error'}:
+            return {'status': 'stopped', 'workerStatus': worker_status}
+        return {'status': 'stopping' if worker_status in {'accepted', 'running'} else 'status_unknown'}
+
     def task_audit(self, profile: str, run_id: str) -> dict[str, Any] | None:
-        """Return the content-free audit projection for one hidden Board run."""
+        """Return the content-free audit projection for one Board run."""
         audit = self._task_audits.get((profile, run_id))
         if audit is None:
             return None
         return {
-            "runId": audit.get("runId"),
+            "runId": run_id,
             "startedAt": audit.get("startedAt"),
             "endedAt": audit.get("endedAt"),
             "outcome": audit.get("outcome"),
@@ -1253,6 +1615,7 @@ class ProfileHost:
             for capability in raw_capabilities
             if isinstance(capability, str) and capability
         ) if isinstance(raw_capabilities, list) and len(raw_capabilities) <= 64 else frozenset()
+        parent_key = self._parent_authority_key(lease, capabilities)
         try:
             port = int(lease.get("port") or 0)
         except (TypeError, ValueError):
@@ -1286,6 +1649,7 @@ class ProfileHost:
                 or not secrets.compare_digest(
                     str(current.get("authToken") or ""), token
                 )
+                or (parent_key and not secrets.compare_digest(str(current.get('voiceParentKey') or ''), parent_key))
             ):
                 raise ProfileHostError(
                     "PROFILE_RUNTIME_CHANGED",
@@ -1299,6 +1663,7 @@ class ProfileHost:
                 ws=ws,
                 instance_id=instance_id,
                 capabilities=capabilities,
+                voice_parent_key=parent_key,
                 owned=False,
             )
             runtime.reader_task = asyncio.create_task(
@@ -1385,6 +1750,16 @@ class ProfileHost:
             port = int(ready.get("port") or 0)
             if not token or not 1 <= port <= 65535:
                 raise ProfileHostError("STARTUP_INVALID", "Profile runtime returned invalid startup data.")
+            raw_capabilities = ready.get('capabilities')
+            capabilities = frozenset(value for value in raw_capabilities if isinstance(value, str)) if isinstance(raw_capabilities, list) else frozenset()
+            parent_key = ''
+            if 'voice-owner-hop-v1' in capabilities:
+                lease = reconcile_runtime_lease(describe_profile(name).path, profile_name=name)
+                if (not lease or lease.get('instanceId') != ready.get('instanceId')
+                        or lease.get('pid') != process.pid or lease.get('port') != port
+                        or not secrets.compare_digest(str(lease.get('authToken') or ''), token)):
+                    raise ProfileHostError('PROFILE_RUNTIME_CHANGED', 'The profile runtime identity changed during startup.')
+                parent_key = self._parent_authority_key(lease, capabilities)
             session, ws = await self._open_runtime_transport(
                 port=port,
                 token=token,
@@ -1397,11 +1772,8 @@ class ProfileHost:
                 session=session,
                 ws=ws,
                 instance_id=str(ready.get("instanceId") or ""),
-                capabilities=frozenset(
-                    capability
-                    for capability in ready.get("capabilities", [])
-                    if isinstance(capability, str) and capability
-                ) if isinstance(ready.get("capabilities"), list) else frozenset(),
+                voice_parent_key=parent_key,
+                capabilities=capabilities,
                 stderr_task=stderr_task,
             )
             runtime.stdout_task = asyncio.create_task(
@@ -1485,15 +1857,45 @@ class ProfileHost:
         while await stream.read(4096):
             pass
 
+    @staticmethod
+    def _parent_authority_key(lease: dict, capabilities: frozenset[str]) -> str:
+        from flowly.live_voice.authority import valid_parent_key
+
+        if 'voice-owner-hop-v1' not in capabilities:
+            return ''
+        key = lease.get('voiceParentKey')
+        if not valid_parent_key(key):
+            raise ProfileHostError('VOICE_AUTH_UNAVAILABLE', 'The profile runtime cannot preserve voice account identity. Restart it after updating.')
+        return key
+
     async def _rpc(self, runtime: _Runtime, method: str, params: dict[str, Any], timeout: float) -> Any:
+        from flowly.live_voice.authority import (
+            VoiceAuthorityError,
+            current_request_owner,
+            sign_profile_hop,
+        )
+
         if runtime.ws.closed:
             raise ProfileHostError("PROFILE_OFFLINE", "The profile runtime is offline.", retryable=True)
         runtime.last_used_at = time.time()
         request_id = secrets.token_urlsafe(18)
+        frame = {'type': 'rpc', 'id': request_id, 'method': method, 'params': params}
+        owner = current_request_owner()
+        if ((method == 'runtime.voice.reserve' or (owner is not None and owner.uid is not None))
+                and 'voice-owner-events-v1' not in runtime.capabilities):
+            raise ProfileHostError('VOICE_AUTH_UNAVAILABLE', 'Update the profile runtime before opening account-owned voice work.')
+        if 'voice-owner-hop-v1' in runtime.capabilities:
+            try:
+                frame['voiceAuthority'] = sign_profile_hop(runtime.voice_parent_key, runtime.instance_id,
+                                                         request_id, method, params, owner)
+            except VoiceAuthorityError as exc:
+                raise ProfileHostError(exc.code, str(exc)) from None
+        elif method == 'runtime.voice.reserve' or (owner is not None and owner.uid is not None):
+            raise ProfileHostError('VOICE_AUTH_UNAVAILABLE', 'Update the profile runtime before opening account-owned voice work.')
         future = asyncio.get_running_loop().create_future()
         runtime.pending[request_id] = future
         try:
-            await runtime.ws.send_json({"type": "rpc", "id": request_id, "method": method, "params": params})
+            await runtime.ws.send_json(frame)
             return await asyncio.wait_for(future, timeout)
         except asyncio.TimeoutError as exc:
             raise ProfileHostError("PROFILE_RPC_TIMEOUT", "The profile operation timed out.", retryable=True) from exc
@@ -1505,6 +1907,8 @@ class ProfileHost:
     async def _read_runtime(self, runtime: _Runtime) -> None:
         try:
             async for message in runtime.ws:
+                if self._runtimes.get(runtime.profile) is not runtime:
+                    break
                 if message.type != aiohttp.WSMsgType.TEXT:
                     if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                         break
@@ -1518,7 +1922,7 @@ class ProfileHost:
                 if frame.get("type") == "rpc":
                     self._resolve_rpc(runtime, frame)
                 elif frame.get("type") == "event":
-                    await self._handle_event(runtime, str(frame.get("event") or ""), frame.get("data"))
+                    await self._handle_runtime_event(runtime, frame)
                 elif frame.get("type") == "profile_message_request":
                     self._spawn_background(
                         self._handle_broker_request(runtime, frame),
@@ -1565,8 +1969,68 @@ class ProfileHost:
     async def _handle_event(self, runtime: _Runtime, event: str, data: Any) -> None:
         await self._handle_profile_event(runtime.profile, event, data, runtime=runtime)
 
+    async def _handle_runtime_event(self, runtime: _Runtime, frame: dict) -> None:
+        """Validate the source before it can update waiters, audits or rooms."""
+        from flowly.live_voice.authority import HOST_OWNER, VoiceAuthorityError, request_owner_scope
+        from flowly.live_voice.event_transport import ProfileEventVerifier
+        from flowly.live_voice.events import EventAccess, event_access_scope
+        from flowly.profile import describe_profile
+        from flowly.session.ownership import SessionAccessError
+
+        try:
+            directory = describe_profile(runtime.profile).path / 'sessions'
+            if 'voice-owner-events-v1' in runtime.capabilities:
+                if runtime.event_authority is None:
+                    runtime.event_authority = ProfileEventVerifier(runtime.instance_id, key=runtime.voice_parent_key)
+                event = runtime.event_authority.verify(frame, sessions_dir=directory)
+                access = event.access
+            else:
+                # A legacy runtime cannot attest any owned session. Shared
+                # sessions continue to work without projecting reader identity.
+                data = frame.get('data')
+                key = (data.get('sessionKey') or data.get('session_key')) if isinstance(data, dict) else None
+                with request_owner_scope(HOST_OWNER):
+                    access = EventAccess.capture(key, sessions_dir=directory) if key else EventAccess(owner=HOST_OWNER)
+                if any(scope.owner is not None for scope in access.scopes):
+                    return
+                event = frame
+            owner = access.producer()
+            if not access.permits(owner):
+                return
+        except (VoiceAuthorityError, SessionAccessError, OSError, ValueError):
+            logger.warning('Profile event authority could not be verified for {}', runtime.profile)
+            return
+        with request_owner_scope(owner), event_access_scope(access):
+            await self._handle_event(runtime, str(event.get('event') or ''), event.get('data'))
+
     async def handle_primary_frame(self, frame: dict[str, Any]) -> None:
         """Consume a frame from the host gateway's private in-process client."""
+        from flowly.live_voice.authority import HOST_OWNER, VoiceAuthorityError, request_owner_scope
+        from flowly.live_voice.events import (
+            EventAccess,
+            ScopedEvent,
+            current_event_access,
+            event_access_scope,
+        )
+
+        if frame.get('type') != 'event':
+            return
+        access = frame.access if isinstance(frame, ScopedEvent) else current_event_access()
+        if access is None:
+            data = frame.get('data')
+            key = (data.get('sessionKey') or data.get('session_key')) if isinstance(data, dict) else None
+            with request_owner_scope(HOST_OWNER):
+                access = EventAccess.capture(key)
+        try:
+            owner = access.producer()
+            if not access.permits(owner):
+                return
+        except VoiceAuthorityError:
+            return
+        with request_owner_scope(owner), event_access_scope(access):
+            await self._handle_primary_frame_event(frame)
+
+    async def _handle_primary_frame_event(self, frame: dict[str, Any]) -> None:
         if frame.get("type") == "event":
             payload = frame.get("data")
             if not isinstance(payload, dict):
@@ -1575,6 +2039,7 @@ class ProfileHost:
             run_id = str(payload.get("runId") or "")
             if not self._default_event_leases and (
                 ("default", session_key) not in self._broker_sessions
+                and ("default", session_key) not in self._interactive_task_sessions
                 and ("default", run_id) not in self._broker_waiters
                 and ("default", run_id) not in self._terminal_events
                 and not self._rooms.accepts_event("default", session_key, run_id)
@@ -1609,7 +2074,7 @@ class ProfileHost:
                 name=f"profile-cron-push:{profile}:{run_id}",
             )
         internal_turn = bool(self._broker_sessions.get((profile, session_key)))
-        if internal_turn:
+        if internal_turn or (profile, session_key) in self._interactive_task_sessions:
             self._capture_task_audit_event(profile, session_key, event, payload)
         if runtime is not None and event == "agent" and run_id:
             runtime.active_runs.add(run_id)
@@ -1621,18 +2086,15 @@ class ProfileHost:
                     self._capacity_changed.set()
                 key = (profile, run_id)
                 waiter = self._broker_waiters.get(key)
-                if waiter is not None or (profile, session_key) in self._broker_sessions:
+                if (waiter is not None or (profile, session_key) in self._broker_sessions
+                        or (profile, session_key) in self._interactive_task_sessions):
                     self._terminal_events[key] = payload
                     if len(self._terminal_events) > 256:
                         self._terminal_events.pop(next(iter(self._terminal_events)))
                 if waiter is not None and not waiter.done():
-                    if payload.get("state") == "final":
-                        waiter.set_result(payload)
-                    else:
-                        waiter.set_exception(ProfileHostError(
-                            "PROFILE_COLLABORATION_FAILED",
-                            f"Profile collaboration ended with {payload.get('state')}.",
-                        ))
+                    # Cached and awaited terminals must use the same consumer
+                    # validation, regardless of whether the event beat the ACK.
+                    waiter.set_result(payload)
             elif runtime is not None:
                 runtime.active_runs.add(run_id)
         if runtime is not None:
@@ -1674,12 +2136,18 @@ class ProfileHost:
         event: str,
         payload: dict[str, Any],
     ) -> None:
-        """Accumulate sanitized lifecycle metadata for a hidden Board turn."""
+        """Accumulate sanitized lifecycle metadata for a Board turn."""
         audit = self._task_audit_sessions.get((profile, session_key))
         if audit is None:
             return
         if event == "chat" and payload.get("state") in ("final", "aborted", "error"):
-            state = str(payload.get("state") or "error")
+            if audit.get("awaitingGoal"):
+                # A turn terminal is not a task terminal while a standing goal
+                # may still be evaluating or scheduling its next turn.
+                return
+            state = _profile_terminal_state(payload)
+            if state == "final" and not _profile_reply_text(payload.get("message")):
+                state = "error"
             audit["endedAt"] = time.time()
             audit["outcome"] = "ok" if state == "final" else state
             if state != "final":
@@ -1981,11 +2449,7 @@ class ProfileHost:
                 finally:
                     self._broker_waiters.pop(key, None)
                     self._terminal_events.pop(key, None)
-            if terminal.get("state") != "final":
-                raise ProfileHostError(
-                    "PROFILE_COLLABORATION_FAILED",
-                    f"Profile collaboration ended with {terminal.get('state')}.",
-                )
+            _check_profile_terminal(terminal)
             response = _profile_reply_text(terminal.get("message"))
             if not response:
                 raise ProfileHostError(
@@ -2030,6 +2494,9 @@ class ProfileHost:
         *,
         expected_bot_id: str | None = None,
     ) -> Any:
+        expected = params.get('expectedBotId')
+        if expected is not None and ensure_profile_bot_id(target).bot_id != expected:
+            raise ProfileHostError('PROFILE_IDENTITY_CHANGED', 'The selected agent has changed.')
         if target == "default":
             if expected_bot_id is not None:
                 self._check_rpc_profile_identity(target, expected_bot_id)
@@ -2051,6 +2518,8 @@ class ProfileHost:
         # Recheck immediately before sending to the captured runtime socket.
         if expected_bot_id is not None:
             self._check_rpc_profile_identity(target, expected_bot_id)
+        if expected is not None and ensure_profile_bot_id(target).bot_id != expected:
+            raise ProfileHostError('PROFILE_IDENTITY_CHANGED', 'The selected agent has changed.')
         result = await self._rpc(target_runtime, method, params, timeout)
         if method == "chat.send" and isinstance(result, dict):
             run_id = str(result.get("runId") or "")

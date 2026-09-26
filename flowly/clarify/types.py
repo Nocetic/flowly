@@ -28,3 +28,4 @@ class ClarifyRequest:
     created_at: float = 0.0
     expires_at: float = 0.0
     risk_reasons: list[str] = field(default_factory=list)
+    run_id: str | None = None

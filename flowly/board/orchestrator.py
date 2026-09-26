@@ -21,6 +21,9 @@ component LLM-free and fully unit-testable with a fake ``spawn_fn``.
 from __future__ import annotations
 
 import asyncio
+import json
+import uuid
+from contextlib import nullcontext
 from typing import Any, Awaitable, Callable, Optional
 
 from loguru import logger
@@ -72,6 +75,8 @@ class BoardOrchestrator:
         notify: Optional[NotifyFn] = None,
         on_finished: Optional[Callable[[Any, str], Awaitable[None]]] = None,
         model: Optional[str] = None,
+        voice_control: Callable[..., Awaitable[dict]] | None = None,
+        voice_reconcile: Callable[..., Awaitable[dict]] | None = None,
     ):
         self._store = store
         self._spawn = spawn_fn
@@ -81,6 +86,11 @@ class BoardOrchestrator:
         # board UI's task result reaches the phone when it's closed).
         self._on_finished = on_finished
         self._model = model
+        self._voice_control = voice_control
+        self._voice_reconcile = voice_reconcile
+        self._recovery_tasks: dict[str, asyncio.Task] = {}
+        self._recovery_cursor = 0
+        self._control_tasks: dict[str, asyncio.Task] = {}
         self._sem = asyncio.Semaphore(self.MAX_PARALLEL)
         # card_id -> the asyncio task running its spawn (for cancellation)
         self._tasks: dict[str, asyncio.Task] = {}
@@ -167,7 +177,9 @@ class BoardOrchestrator:
                 return ("cancelled", None)
 
             worker = card.assignee_profile or "default"
-            async with self._profile_semaphore(worker):
+            # Interactive chats have independent session locks. Keep the global
+            # execution budget, without parking them behind another chat's turn.
+            async with (nullcontext() if card.execution_mode == 'voice' else self._profile_semaphore(worker)):
                 claimed = self._store.claim_card(
                     card_id,
                     worker=worker,
@@ -188,9 +200,24 @@ class BoardOrchestrator:
                         "task_id": claimed.id,
                         "claim_token": claimed.claim_token,
                     })
-                task: asyncio.Task = asyncio.ensure_future(
-                    self._spawn(self._task_text(claimed), **spawn_kwargs)
+                prompt = self._task_text(claimed)
+                if claimed.execution_mode == "voice":
+                    command = self._store.voice_commands.claimed(claimed.id, claimed.claim_token)
+                    prompt = command['text']
+                    spawn_kwargs.update({
+                        "interactive": True,
+                        "command_id": command['commandId'],
+                        "expected_bot_id": claimed.assignee_bot_id,
+                    })
+                from flowly.live_voice.authority import (
+                    RequestOwner,
+                    current_request_owner,
+                    request_owner_scope,
                 )
+
+                worker_owner = RequestOwner(claimed.voice_owner_uid or None) if claimed.execution_mode == 'voice' else current_request_owner()
+                with request_owner_scope(worker_owner):
+                    task: asyncio.Task = asyncio.ensure_future(self._spawn(prompt, **spawn_kwargs))
                 heartbeat = asyncio.create_task(
                     self._heartbeat(claimed.id, claimed.claim_token),
                     name=f"board-heartbeat:{claimed.id}",
@@ -216,19 +243,27 @@ class BoardOrchestrator:
                         outcome=outcome,
                         error=message,
                         actor=worker,
+                        uncertain=claimed.execution_mode == "voice",
                     )
                     return (outcome, None if user_cancelled else message)
                 except Exception as exc:
                     retry_delay = min(300.0, 5.0 * (2 ** max(0, claimed.attempt_count - 1)))
+                    terminal_state = getattr(exc, "terminal_state", None)
+                    outcome = "cancelled" if claimed.execution_mode == "voice" and terminal_state == "aborted" else "failed"
                     self._store.finish_claim(
                         card_id,
                         claimed.claim_token,
-                        outcome="failed",
+                        outcome=outcome,
                         error=str(exc),
                         retry_delay=retry_delay,
                         actor=worker,
+                        uncertain=claimed.execution_mode == "voice" and terminal_state not in {"aborted", "error"}
+                        and getattr(exc, "code", "") not in {
+                            "TASK_INVALID", "TASK_TARGET_CHANGED", "TASK_EMPTY_RESPONSE", "TASK_GOAL_PAUSED",
+                            "CHAT_QUEUE_UNAVAILABLE",
+                        },
                     )
-                    return ("failed", str(exc))
+                    return (outcome, str(exc))
                 finally:
                     heartbeat.cancel()
                     await asyncio.gather(heartbeat, return_exceptions=True)
@@ -312,7 +347,8 @@ class BoardOrchestrator:
         title = card.title if card else card_id
         # Out-of-band finish hook (push, etc.) — fires regardless of deliver, so
         # a UI-run card (deliver=False) still wakes the phone when it completes.
-        await self._on_finished_safe(card, outcome)
+        if card is None or card.execution_mode != 'voice' or card.status in {'done', 'cancelled', 'blocked', 'review'}:
+            await self._on_finished_safe(card, outcome)
         if deliver:
             if outcome == "done":
                 await self._notify_safe(
@@ -413,6 +449,16 @@ class BoardOrchestrator:
         card is written to ``cancelled`` before this returns — callers (e.g.
         the gateway) can then read back an accurate status immediately.
         """
+        voice_card = self._store.get_card(card_id)
+        if voice_card is None:
+            return False
+        if voice_card is not None and voice_card.execution_mode == 'voice':
+            self._store.voice_commands.cancel(
+                conversation_id=voice_card.voice_conversation_id, card_id=card_id,
+                command_id=uuid.uuid4().hex, expected_revision=voice_card.revision,
+            )
+            self.wake_dispatcher()
+            return True
         task = self._manual_tasks.get(card_id) or self._tasks.get(card_id)
         if task is not None and not task.done():
             self._cancel_requests.add(card_id)
@@ -489,6 +535,37 @@ class BoardOrchestrator:
         )
         return card
 
+    def dispatch_voice(
+        self, *, conversation_id: str, command_id: str, profile: str,
+        title: str, body: str = "", expected_bot_id: str | None = None,
+        open_only: bool = False,
+    ):
+        """Persist runnable work, or park an empty chat until an explicit instruction."""
+        from flowly.profile import ensure_profile_bot_id, profile_exists, validate_profile_name
+
+        if not isinstance(profile, str) or not profile:
+            raise BoardError("a target profile is required")
+        if profile != "default":
+            try:
+                validate_profile_name(profile)
+            except ValueError as exc:
+                raise BoardError("target profile is invalid") from exc
+        if not profile_exists(profile):
+            raise BoardError("the selected profile does not exist")
+        descriptor = ensure_profile_bot_id(profile)
+        if expected_bot_id is not None and descriptor.bot_id != expected_bot_id:
+            raise BoardError('the selected agent identity has changed')
+        card = self._store.add_card(
+            title, body=body, status="todo" if open_only else STATUS_READY, assignee_profile=profile,
+            assignee_bot_id=descriptor.bot_id, origin_channel="voice",
+            origin_chat_id=conversation_id, idempotency_key=command_id,
+            max_attempts=1, execution_mode="voice", voice_conversation_id=conversation_id,
+            voice_open_only=open_only,
+        )
+        if not open_only:
+            self.wake_dispatcher()
+        return card
+
     def unassign_card(
         self,
         card_id: str,
@@ -530,9 +607,101 @@ class BoardOrchestrator:
             task.cancel()
         await asyncio.gather(*manual, return_exceptions=True)
         self._manual_tasks.clear()
+        controls = list(self._control_tasks.values())
+        for task in controls:
+            task.cancel()
+        await asyncio.gather(*controls, return_exceptions=True)
+        self._control_tasks.clear()
+        recovery = list(self._recovery_tasks.values())
+        for task in recovery:
+            task.cancel()
+        await asyncio.gather(*recovery, return_exceptions=True)
+        self._recovery_tasks.clear()
+
+    async def _control_voice(self, command: dict) -> None:
+        card = self._store.get_card(command['cardId'])
+        if card is None or self._voice_control is None:
+            return
+        try:
+            payload = json.loads(command['text'])
+            from flowly.live_voice.authority import RequestOwner, request_owner_scope
+
+            with request_owner_scope(RequestOwner(card.voice_owner_uid or None)):
+                result = await self._voice_control(
+                    profile=card.assignee_profile, task_id=card.id,
+                    expected_bot_id=card.assignee_bot_id,
+                    run_id=payload.get('runId'), goal_binding=payload.get('goalBinding'),
+                    on_goal_binding=lambda binding: self._store.voice_commands.bind_stop_goal(command['commandId'], binding),
+                )
+            self._store.voice_commands.settle_stop(
+                command['commandId'], status=result['status'], worker_status=result.get('workerStatus'),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The intent remains durable. Reconnecting checks the same worker;
+            # no task or instruction is resubmitted to infer its outcome.
+            self._store.voice_commands.settle_stop(command['commandId'], status='status_unknown')
+
+    def _dispatch_voice_controls(self) -> None:
+        if self._voice_control is None:
+            return
+        for command in self._store.voice_commands.pending_stops():
+            command_id = command['commandId']
+            if command_id in self._control_tasks:
+                continue
+            task = asyncio.create_task(self._control_voice(command), name=f'voice-control:{command_id}')
+            self._control_tasks[command_id] = task
+            task.add_done_callback(lambda _task, key=command_id: self._control_tasks.pop(key, None))
+
+    async def _reconcile_voice(self, candidate: dict) -> None:
+        try:
+            from flowly.live_voice.authority import RequestOwner, request_owner_scope
+
+            stored = self._store.get_card(candidate['cardId'])
+            if stored is None or stored.execution_mode != 'voice':
+                return
+            with request_owner_scope(RequestOwner(stored.voice_owner_uid or None)):
+                result = await asyncio.wait_for(self._voice_reconcile(
+                    profile=candidate['profile'], task_id=candidate['cardId'],
+                    run_id=candidate['runId'], expected_bot_id=candidate['expectedBotId'],
+                ), timeout=15)
+            card = self._store.voice_commands.settle_reconciliation(candidate, result)
+            if card is not None:
+                outcome = {'done': 'done', 'cancelled': 'cancelled', 'blocked': 'failed'}[card.status]
+                await self._on_finished_safe(card, outcome)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Missing, corrupt or offline evidence leaves the original command
+            # unknown. Only a later read can resolve it; no execution retry.
+            logger.debug('Voice task recovery remains unresolved for {}', candidate['cardId'], exc_info=True)
+
+    def _dispatch_voice_recovery(self) -> None:
+        if self._voice_reconcile is None or self._stopping:
+            return
+        available = self.MAX_PARALLEL - len(self._recovery_tasks)
+        if available <= 0:
+            return
+        candidates = self._store.voice_commands.pending_reconciliations(after_seq=self._recovery_cursor, limit=available)
+        if not candidates and self._recovery_cursor:
+            self._recovery_cursor = 0
+            candidates = self._store.voice_commands.pending_reconciliations(limit=available)
+        for candidate in candidates:
+            self._recovery_cursor = candidate['seq']
+            card_id = candidate['cardId']
+            if card_id in self._recovery_tasks:
+                continue
+            task = asyncio.create_task(self._reconcile_voice(candidate), name=f'voice-recovery:{card_id}')
+            self._recovery_tasks[card_id] = task
+            # Unchanged evidence waits for the normal recovery interval. It
+            # must not wake the dispatcher into a tight read loop.
+            task.add_done_callback(lambda _task, key=card_id: self._recovery_tasks.pop(key, None))
 
     async def dispatch_once(self) -> int:
         self._store.recover_expired_claims()
+        self._dispatch_voice_controls()
+        self._dispatch_voice_recovery()
         available = max(0, self.MAX_PARALLEL - len(self._dispatch_tasks))
         if available == 0:
             return 0
@@ -541,6 +710,7 @@ class BoardOrchestrator:
             for card_id in self._dispatch_tasks
             if (card := self._store.get_card(card_id)) is not None
             and card.assignee_profile
+            and card.execution_mode != 'voice'
         }
         started = 0
         for card in self._store.list_dispatchable(

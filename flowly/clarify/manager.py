@@ -15,6 +15,7 @@ from typing import Awaitable, Callable
 from loguru import logger
 
 from flowly.clarify.types import ClarifyRequest
+from flowly.session.control_access import SessionControlScope, pending_control_guard
 
 
 # Type for surface notification callback
@@ -41,6 +42,7 @@ class ClarifyManager:
     def __init__(self) -> None:
         self._futures: dict[str, asyncio.Future[str]] = {}
         self._pending: dict[str, ClarifyRequest] = {}
+        self._control_scopes: dict[str, SessionControlScope] = {}
         self._notify_callbacks: list[NotifyCallback] = []
         self._close_callbacks: list[CloseCallback] = []
 
@@ -72,7 +74,14 @@ class ClarifyManager:
             )
             return None
 
+        if pending.id in self._pending:
+            raise ValueError('This request is already pending.')
         loop = asyncio.get_running_loop()
+        from flowly.agent.run_abort import CURRENT_RUN_ID
+
+        pending.run_id = CURRENT_RUN_ID.get()
+        scope = SessionControlScope.capture(pending.session_key)
+        self._control_scopes[pending.id] = scope
         future: asyncio.Future[str] = loop.create_future()
         self._futures[pending.id] = future
         self._pending[pending.id] = pending
@@ -85,9 +94,12 @@ class ClarifyManager:
                 )
                 for cb in self._notify_callbacks:
                     try:
-                        await cb(pending)
+                        from flowly.live_voice.events import event_access_scope
+
+                        with event_access_scope(scope):
+                            await cb(pending)
                     except Exception as e:
-                        logger.error(f"[ClarifyManager] Notify callback failed: {e}", exc_info=True)
+                        logger.error('[ClarifyManager] Notify callback failed ({})', type(e).__name__)
                 answer = await future
             reason = "answered"
             logger.info(f"[ClarifyManager] {pending.id} answered")
@@ -101,7 +113,11 @@ class ClarifyManager:
                 future.cancel()
             self._futures.pop(pending.id, None)
             self._pending.pop(pending.id, None)
-            await self._fire_close(pending, reason)
+            self._control_scopes.pop(pending.id, None)
+            from flowly.live_voice.events import EventAccess, event_access_scope
+
+            with event_access_scope(EventAccess(scopes=(scope,), canonical=False)):
+                await self._fire_close(pending, reason)
 
     async def _fire_close(self, pending: ClarifyRequest, reason: str) -> None:
         """Tell every surface the question is over so it can drop its prompt.
@@ -112,11 +128,8 @@ class ClarifyManager:
         for cb in self._close_callbacks:
             try:
                 await cb(pending.id, reason, pending.session_key or "")
-            except Exception as e:
-                logger.error(
-                    f"[ClarifyManager] Close callback failed: {e}",
-                    exc_info=True,
-                )
+            except Exception as error:
+                logger.error('[ClarifyManager] Close callback failed ({})', type(error).__name__)
 
     @staticmethod
     def _in_cron_context() -> bool:
@@ -134,17 +147,25 @@ class ClarifyManager:
         Returns True if the clarify was found and resolved.
         """
         future = self._futures.get(clarify_id)
-        if future is None or future.done():
+        pending = self._pending.get(clarify_id)
+        if future is None or future.done() or pending is None or pending.expires_at <= time.time():
             return False
-        future.set_result(answer)
-        return True
+        with pending_control_guard(self._control_scopes, pending) as allowed:
+            if not allowed:
+                return False
+            future.set_result(answer)
+            return True
 
     def get_pending(self, clarify_id: str) -> ClarifyRequest | None:
-        return self._pending.get(clarify_id)
+        pending = self._pending.get(clarify_id)
+        if pending is None:
+            return None
+        with pending_control_guard(self._control_scopes, pending) as allowed:
+            return pending if allowed else None
 
     def list_pending(self) -> list[ClarifyRequest]:
         now = time.time()
-        return [p for p in self._pending.values() if p.expires_at > now]
+        return [p for p in self._pending.values() if p.expires_at > now and self.get_pending(p.id) is not None]
 
 
 # Module-level singleton — shared across agent loop, channels, and gateway

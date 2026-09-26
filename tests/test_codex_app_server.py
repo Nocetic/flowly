@@ -98,6 +98,11 @@ def _make_fake_codex(script_body: str) -> Path:
         assert req is not None, "client closed before initialize"
         assert req["method"] == "initialize", f"first msg must be initialize, got {req!r}"
         write_msg({"id": req["id"], "result": {"serverInfo": {"name": "fake-codex"}}})
+        # Complete both halves before a test body may exit or send events.
+        # Otherwise the minimal server can close stdin before the client's
+        # initialized notification, making the spawn test scheduler-dependent.
+        initialized = json.loads(sys.stdin.readline())
+        assert initialized.get("method") == "initialized" and "id" not in initialized
 
     """) + script_body
 

@@ -1701,6 +1701,7 @@ def update_runtime_lease(
     port: int,
     auth_token: str,
     capabilities: tuple[str, ...] | list[str] = (),
+    voice_parent_key: str = '',
 ) -> None:
     """Publish the owner-only endpoint used by sibling Flowly managers.
 
@@ -1720,6 +1721,11 @@ def update_runtime_lease(
     ):
         raise ValueError("Profile runtime endpoint is invalid.")
     capability_list = list(dict.fromkeys(capabilities))
+    from flowly.live_voice.authority import valid_parent_key
+
+    if (bool(voice_parent_key) != ('voice-owner-hop-v1' in capability_list)
+            or (voice_parent_key and not valid_parent_key(voice_parent_key))):
+        raise ValueError('Profile voice authority configuration is invalid.')
     if (
         len(capability_list) > 64
         or any(
@@ -1738,6 +1744,10 @@ def update_runtime_lease(
     lease["port"] = port
     lease["authToken"] = token
     lease["capabilities"] = capability_list
+    if voice_parent_key:
+        lease['voiceParentKey'] = voice_parent_key
+    else:
+        lease.pop('voiceParentKey', None)
     lease["readyAt"] = _utc_now()
     _atomic_write_json(path, lease)
 

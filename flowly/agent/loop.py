@@ -1,6 +1,7 @@
 """Agent loop: the core processing engine."""
 
 import asyncio
+import inspect
 import copy
 import json
 import os
@@ -234,6 +235,42 @@ class _AgentGoalDelivery(GoalDelivery):
         user_epoch: int,
         kickoff: bool,
     ) -> DeliveredGoalTurn | None:
+        from flowly.goals.models import GoalState
+        from flowly.live_voice.authority import VoiceAuthorityError, request_owner_scope
+        from flowly.live_voice.events import EventAccess, event_access_scope
+        from flowly.session.control_access import SessionControlScope
+        from flowly.session.ownership import SessionAccessError
+
+        manager = getattr(self.agent, 'goal_manager', None)
+        try:
+            # This is an internal scheduler callback. Read the durable source
+            # independently of the long-lived worker's ambient account, then
+            # validate its original owner against the current canonical file.
+            with request_owner_scope(None):
+                state = manager.get(session_key) if manager is not None else None
+            if isinstance(state, GoalState) and state.goal_id != goal_id:
+                return None
+            scope = getattr(state, '_session_control_scope', None)
+            if isinstance(scope, SessionControlScope):
+                if scope.key != session_key:
+                    return None
+                access = EventAccess(scopes=(scope,))
+            else:
+                access = EventAccess.capture(session_key)
+                if access.producer().uid is not None:
+                    return None
+            owner = access.producer()
+            if not access.permits(owner):
+                return None
+        except (SessionAccessError, VoiceAuthorityError, OSError):
+            return None
+        with request_owner_scope(owner), event_access_scope(access):
+            return await self._run_scoped_continuation(session_key=session_key, goal_id=goal_id,
+                                                      user_epoch=user_epoch, kickoff=kickoff)
+
+    async def _run_scoped_continuation(
+        self, *, session_key: str, goal_id: str, user_epoch: int, kickoff: bool,
+    ) -> DeliveredGoalTurn | None:
         metadata = self.agent.goal_turn_metadata(
             goal_id, user_epoch=user_epoch, kickoff=kickoff,
         )
@@ -260,15 +297,24 @@ class _AgentGoalDelivery(GoalDelivery):
         # run identity — an unidentified run is one pause/stop cannot end.
         fallback_run_id = uuid.uuid4().hex
         metadata["run_id"] = fallback_run_id
-        self.agent.note_autonomous_run(fallback_run_id)
-        await self.agent.bus.publish_inbound(_GoalInboundMessage(
-            channel=self.channel,
-            sender_id="goal",
-            chat_id=self.chat_id,
-            content="",
-            metadata=metadata,
-            _stable_session_key=session_key,
-        ))
+        commands = getattr(getattr(self.agent, '_gateway_server', None), 'chat_commands', None)
+        if commands is not None:
+            commands.accept(session_key, fallback_run_id, {'turnOrigin': 'goal', 'goalId': goal_id})
+        try:
+            self.agent.note_autonomous_run(fallback_run_id)
+            await self.agent.bus.publish_inbound(_GoalInboundMessage(
+                channel=self.channel,
+                sender_id="goal",
+                chat_id=self.chat_id,
+                content="",
+                metadata=metadata,
+                _stable_session_key=session_key,
+            ))
+        except BaseException as exc:
+            if commands is not None:
+                commands.settle(session_key, fallback_run_id,
+                                'aborted' if isinstance(exc, asyncio.CancelledError) else 'error')
+            raise
         return None
 
     async def deliver_turn(self, turn: DeliveredGoalTurn) -> None:
@@ -2765,12 +2811,15 @@ class AgentLoop:
                     profile=None,
                     task_id=None,
                     claim_token=None,
+                    interactive=False,
+                    command_id=None,
+                    expected_bot_id=None,
                 ):
                     # Run a full agent turn on the card text and return its
                     # result. wait=True executes inline; silent=True suppresses
                     # the per-child parent announce because the orchestrator
                     # sends one consolidated notification.
-                    if profile and profile != "default":
+                    if interactive or (profile and profile != "default"):
                         gateway = self._gateway_server
                         profile_host = (
                             getattr(gateway, "profile_host", None)
@@ -2792,8 +2841,14 @@ class AgentLoop:
                             profile,
                             task_id=str(task_id or label or ""),
                             prompt=task,
-                            idempotency_key=str(claim_token or ""),
+                            idempotency_key=(str(command_id or f"voice:{task_id}:initial") if interactive else str(claim_token or "")),
                             on_started=_worker_started,
+                            **({
+                                "interactive": True, "expected_bot_id": expected_bot_id,
+                                "on_next_instruction": lambda completed: self._board_store.voice_commands.advance_boundary(
+                                    str(task_id or label), str(claim_token), completed,
+                                ),
+                            } if interactive else {}),
                         )
                         worker_run_id = str(task_result.get("runId") or "")
                         # Compatibility fallback for a custom ProfileHost that
@@ -2849,9 +2904,24 @@ class AgentLoop:
                     if self._on_board_finished is not None:
                         await self._on_board_finished(card, outcome)
 
+                async def _voice_control(**kwargs):
+                    gateway = self._gateway_server
+                    host = getattr(gateway, 'profile_host', None) if gateway else None
+                    if host is None:
+                        raise RuntimeError('The assigned agent host is unavailable.')
+                    return await host.stop_task(**kwargs)
+
+                async def _voice_reconcile(**kwargs):
+                    gateway = self._gateway_server
+                    host = getattr(gateway, 'profile_host', None) if gateway else None
+                    if host is None:
+                        raise RuntimeError('The assigned agent host is unavailable.')
+                    return await host.reconcile_task(**kwargs)
+
                 self._board_orchestrator = BoardOrchestrator(
                     self._board_store, _board_spawn,
                     notify=_board_notify, on_finished=_board_on_finished, model=self.model,
+                    voice_control=_voice_control, voice_reconcile=_voice_reconcile,
                 )
                 # Claimed work is lease-owned and may be running in an
                 # isolated profile process.  The dispatcher recovers only
@@ -3559,6 +3629,13 @@ class AgentLoop:
         task.add_done_callback(self._concurrent_turns.discard)
 
     async def _process_turn(self, msg: "InboundMessage") -> None:
+        from flowly.live_voice.bus_authority import bus_message_scope
+
+        with bus_message_scope(msg) as allowed:
+            if allowed:
+                await self._process_scoped_turn(msg)
+
+    async def _process_scoped_turn(self, msg: "InboundMessage") -> None:
         """Process a single inbound message and publish its response.
 
         Wrapped in active→idle agent_state notifications so connected
@@ -3568,18 +3645,14 @@ class AgentLoop:
         """
         await self._notify_agent_state("active")
         try:
-            response = await self._process_message(msg)
+            try:
+                response = await self._process_message(msg)
+            except Exception:
+                logger.exception('Error processing message in {}', msg.session_key)
+                response = self._failed_turn_outbound(msg)
             if response:
                 await self.bus.publish_outbound(response)
                 self._goal_after_delivery(msg, response, direct=False)
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            # Send error response
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="Sorry, I encountered an internal error. Please try again."
-            ))
         finally:
             await self._notify_agent_state("idle")
             # Settle the in-flight partial now that the turn is FULLY processed.
@@ -3598,6 +3671,19 @@ class AgentLoop:
                         inflight.finish(msg.session_key, run_id)
                     except Exception:
                         logger.debug("[loop] inflight.finish failed", exc_info=True)
+
+    def _failed_turn_outbound(self, msg: InboundMessage) -> OutboundMessage:
+        """Keep unexpected execution errors attached to their real turn."""
+        text = 'The agent could not finish this turn. Please try again.'
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=text, metadata={
+            'session_key': msg.session_key, 'stream_run_id': msg.metadata.get('run_id'),
+            'goal_run': bool(msg.metadata.get('goal_run')),
+            'error': {'code': 'AGENT_INTERNAL_ERROR', 'title': 'The turn could not finish',
+                      'message': text, 'retryable': True},
+            '_goal_eligible': not _is_goal_control_message(msg) and _is_user_activity_channel(msg.channel),
+            _GOAL_USER_EPOCH: msg.metadata.get(_GOAL_USER_EPOCH, self.goal_user_epoch(msg.session_key)),
+            '_goal_execution_binding': msg.metadata.get('_goal_execution_binding', {'version': 1, 'state': 'unknown'}),
+        })
 
     def _goal_turn_from_outbound(
         self,
@@ -3630,6 +3716,8 @@ class AgentLoop:
             aborted=aborted,
             provider_error=provider_error,
             compaction_failed=compaction_failed,
+            run_id=metadata.get("stream_run_id"),
+            goal_binding=metadata.get('_goal_execution_binding'),
             metadata={"outbound": outbound},
         )
 
@@ -3642,6 +3730,24 @@ class AgentLoop:
         state: Any,
         *,
         terminal: bool = False,
+    ) -> None:
+        from flowly.live_voice.authority import VoiceAuthorityError, request_owner_scope
+        from flowly.live_voice.events import EventAccess, event_access_scope
+        from flowly.session.control_access import SessionControlScope
+
+        scope = getattr(state, '_session_control_scope', None)
+        access = EventAccess(scopes=(scope,)) if isinstance(scope, SessionControlScope) else EventAccess.capture(session_key)
+        try:
+            owner = access.producer()
+        except VoiceAuthorityError:
+            return
+        if (scope is None and owner.uid is not None) or (scope is not None and scope.key != session_key) or not access.permits(owner):
+            return
+        with request_owner_scope(owner), event_access_scope(access):
+            await self._publish_scoped_goal_snapshot(session_key, channel, chat_id, text, state, terminal=terminal)
+
+    async def _publish_scoped_goal_snapshot(
+        self, session_key: str, channel: str, chat_id: str, text: str, state: Any, *, terminal: bool = False,
     ) -> None:
         """Publish goal state to every surface this conversation may be on.
 
@@ -3657,7 +3763,7 @@ class AgentLoop:
         finished — while routine progress remains chip state only.
         """
         snapshot = state.to_public_dict()
-        metadata: dict[str, Any] = {"goalStatus": True, "goal": snapshot}
+        metadata: dict[str, Any] = {"goalStatus": True, "goal": snapshot, "session_key": session_key}
         if terminal:
             metadata["goalTerminal"] = True
 
@@ -3770,7 +3876,9 @@ class AgentLoop:
             "goal_run": True,
         }
 
-    async def goal_control(self, session_key: str, action: str) -> dict[str, Any]:
+    async def goal_control(self, session_key: str, action: str, *,
+                           expected_goal_id: str | None = None,
+                           expected_revision: int | None = None) -> dict[str, Any]:
         """Pause/resume a standing goal from a client control (the chip button).
 
         Chat surfaces drive this over feature RPC, so it must do everything the
@@ -3782,30 +3890,31 @@ class AgentLoop:
         runtime = getattr(self, "goal_runtime", None)
         if manager is None:
             raise ValueError("goals are not available on this agent")
-        if action == "pause":
-            state = manager.pause(session_key, reason="paused by user")
-            if state is not None:
-                # Stopping a goal stops its work: the queued continuation goes,
-                # and so does the turn currently streaming. Leaving that turn
-                # running is what made pause look like it had done nothing.
+        guard = {}
+        if expected_goal_id is not None or expected_revision is not None:
+            guard = {"expected_goal_id": expected_goal_id, "expected_revision": expected_revision}
+        with manager.store.control_guard(session_key):
+            if action == "pause":
+                state = manager.pause(session_key, reason="paused by user", **guard)
+                if state is not None:
+                    # Commit and cancel while the original session owner is
+                    # locked; no awaited delivery belongs inside this guard.
+                    if runtime is not None:
+                        runtime.cancel_session(session_key)
+                    self.abort_autonomous_run(session_key)
+            elif action == "resume":
+                state = manager.resume(session_key, **guard)
+            elif action == "stop":
+                state = manager.clear(
+                    session_key,
+                    conversation_epoch=self.context_epoch(session_key),
+                    **guard,
+                )
                 if runtime is not None:
                     runtime.cancel_session(session_key)
                 self.abort_autonomous_run(session_key)
-        elif action == "resume":
-            state = manager.resume(session_key)
-        elif action == "stop":
-            # Finish for good: drop queued work and the in-flight turn first so
-            # no continuation can slip through between cancel and the cleared
-            # write.
-            if runtime is not None:
-                runtime.cancel_session(session_key)
-            self.abort_autonomous_run(session_key)
-            state = manager.clear(
-                session_key,
-                conversation_epoch=self.context_epoch(session_key),
-            )
-        else:
-            raise ValueError(f"unsupported goal action: {action}")
+            else:
+                raise ValueError(f"unsupported goal action: {action}")
         if state is None:
             return {"sessionKey": session_key, "goal": None}
         snapshot = state.to_public_dict()
@@ -3834,7 +3943,16 @@ class AgentLoop:
                 chat_id=chat_id,
                 direct=direct,
             )
-            runtime.wake(session_key, delivery)
+            # Publishing can yield to a stop, replacement or account change.
+            # Wake only the exact generation/revision we just resumed.
+            with manager.store.control_guard(session_key):
+                current = manager.get(session_key)
+                if (current is None or not current.is_active
+                        or current.goal_id != state.goal_id or current.revision != state.revision):
+                    from flowly.goals.store import GoalStoreConflictError
+
+                    raise GoalStoreConflictError('goal changed before continuation could be scheduled')
+                runtime.wake(session_key, delivery)
         return {"sessionKey": session_key, "goal": snapshot}
 
     def _goal_after_delivery(
@@ -6771,7 +6889,7 @@ class AgentLoop:
                                 "session_search",
                                 "goal",
                             )
-                            and "session_key" not in call_args
+                            and ("session_key" not in call_args or _effective_tool_name == "artifact")
                         ):
                             call_args["session_key"] = _current_session_key
 
@@ -7539,14 +7657,40 @@ class AgentLoop:
             self._session_turn_locks = {}
         lock = self._session_turn_locks.setdefault(msg.session_key, asyncio.Lock())
         async with lock:
+            from flowly.goals.provenance import goal_turn_scope
+
+            run_id = msg.metadata.get('run_id')
+            run_id = run_id if isinstance(run_id, str) else ''
+            commands = getattr(getattr(self, '_gateway_server', None), 'chat_commands', None) if run_id else None
+            if commands is not None and synthetic_goal_id and commands.lookup(msg.session_key, run_id) is None:
+                commands.accept(msg.session_key, run_id, {'turnOrigin': 'goal', 'goalId': synthetic_goal_id})
+
+            def skipped_goal() -> None:
+                msg.metadata['_goal_turn_skipped'] = True
+                if commands is not None:
+                    commands.settle(msg.session_key, run_id, 'aborted')
+
+            def observe_goal() -> dict:
+                manager = getattr(self, 'goal_manager', None)
+                if manager is None:
+                    return {'available': False, 'goal': None}
+                try:
+                    current = manager.get(msg.session_key)
+                    return {'available': True, 'goal': current.to_public_dict() if current else None}
+                except Exception:
+                    logger.exception('Could not capture command goal evidence for {}', msg.session_key)
+                    return {'available': False, 'goal': None}
+
             if synthetic_goal_id:
                 if (
                     getattr(self, "goal_runtime", None) is None
                     or getattr(self, "goal_manager", None) is None
                 ):
+                    skipped_goal()
                     return None
                 base_epoch = int(msg.metadata.get(_GOAL_BASE_USER_EPOCH, -1))
                 if self.goal_user_epoch(msg.session_key) != base_epoch:
+                    skipped_goal()
                     return None
                 state = self.goal_manager.get(msg.session_key)
                 if (
@@ -7554,6 +7698,7 @@ class AgentLoop:
                     or not state.is_active
                     or state.goal_id != synthetic_goal_id
                 ):
+                    skipped_goal()
                     return None
                 msg.content = (
                     state.goal
@@ -7600,7 +7745,48 @@ class AgentLoop:
                 msg.metadata["profile_directory"] = []
                 msg.metadata.pop("profile_display_names", None)
             try:
-                return await self._process_message_unlocked(msg)
+                before_goal = observe_goal()
+                if synthetic_goal_id:
+                    # Announcing the prompt can yield to goal controls. Recheck
+                    # the generation and user epoch before the actual turn begins.
+                    observed = self.goal_manager.get(msg.session_key)
+                    if (observed is None or observed.goal_id != synthetic_goal_id
+                            or not observed.is_active
+                            or self.goal_user_epoch(msg.session_key) != base_epoch):
+                        skipped_goal()
+                        return None
+                if commands is not None:
+                    commands.begin_execution(msg.session_key, run_id, before_goal)
+                outcome = 'error'
+                response = None
+                with goal_turn_scope(msg.session_key, run_id):
+                    try:
+                        on_started = msg.metadata.get('_on_turn_started')
+                        if on_started is not None:
+                            result = on_started(msg.content)
+                            if inspect.isawaitable(result):
+                                await result
+                        response = await self._process_message_unlocked(msg)
+                        if response is not None and msg.channel != 'system':
+                            # The transport session id can be reused or have legacy
+                            # aliases. The run's own stable conversation is authoritative.
+                            response.metadata['session_key'] = msg.session_key
+                        outcome = ('aborted' if response is None or response.metadata.get('aborted') else
+                                   'error' if isinstance(response.metadata.get('error'), dict) else 'completed')
+                        return response
+                    except asyncio.CancelledError:
+                        outcome = 'aborted'
+                        raise
+                    finally:
+                        from flowly.session.commands import _goal_binding, _goal_observation
+
+                        after_goal = observe_goal()
+                        goal_binding = _goal_binding(_goal_observation(before_goal), _goal_observation(after_goal), run_id)
+                        msg.metadata['_goal_execution_binding'] = goal_binding
+                        if response is not None:
+                            response.metadata['_goal_execution_binding'] = goal_binding
+                        if commands is not None:
+                            commands.finish_execution(msg.session_key, run_id, after_goal, outcome)
             finally:
                 if binding is not None:
                     binding.close()
@@ -9580,7 +9766,11 @@ class AgentLoop:
             metadata=metadata,
         )
 
-        response = await self._process_message(msg)
+        try:
+            response = await self._process_message(msg)
+        except Exception:
+            logger.exception('Error processing direct turn in {}', msg.session_key)
+            response = self._failed_turn_outbound(msg)
         if response is not None and not defer_goal_delivery:
             asyncio.get_running_loop().call_soon(
                 self._goal_after_delivery,
@@ -9591,6 +9781,8 @@ class AgentLoop:
         text = response.content if response else ""
         if return_metadata:
             meta = dict(response.metadata) if response and response.metadata else {}
+            if msg.metadata.get('_goal_turn_skipped'):
+                meta['_goal_turn_skipped'] = True
             # Surface reply media (image_generate / screenshot) so the direct
             # gateway WS path can attach it to the final event — same as the
             # channel path does via OutboundMessage.media. Without this, media

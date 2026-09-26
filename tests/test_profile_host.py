@@ -32,6 +32,23 @@ def test_remote_gateway_requires_authentication() -> None:
 
 
 @pytest.mark.asyncio
+async def test_profile_rpc_pins_identity_before_read_or_mutation(profile_roots):
+    profiles.create_profile('writer', local_runtime=True)
+    bot_id = profiles.ensure_profile_bot_id('writer').bot_id
+    host = ProfileHost()
+    host._target_rpc = AsyncMock(return_value={'messages': []})
+    params = {'name': 'writer', 'expectedHostId': host.host_id, 'expectedBotId': 'previous-agent', 'method': 'chat.history',
+              'params': {'sessionKey': 'desktop:voice-work:task-1'}}
+    with pytest.raises(ProfileHostError) as error:
+        await host.dispatch('profiles.rpc', params)
+    assert error.value.code == 'PROFILE_IDENTITY_CHANGED'
+    host._target_rpc.assert_not_awaited()
+    assert host.capabilities()['identityGuardVersion'] == 1
+    await host.dispatch('profiles.rpc', {**params, 'expectedBotId': bot_id})
+    assert host._target_rpc.call_args.args[2]['expectedBotId'] == bot_id
+
+
+@pytest.mark.asyncio
 async def test_profile_directory_and_statuses_are_public_and_stable(profile_roots) -> None:
     profiles.create_profile("writer", local_runtime=True, model="openai/gpt-5")
     host = ProfileHost()
@@ -213,6 +230,73 @@ async def test_internal_board_task_is_scoped_and_hidden_from_public_contract(
     with pytest.raises(ProfileHostError) as public:
         await host.dispatch("profiles.task.run", {})
     assert public.value.code == "METHOD_NOT_ALLOWED"
+
+
+@pytest.mark.parametrize("before_ack", [True, False], ids=["before-ack", "after-ack"])
+@pytest.mark.parametrize("kind", ["task", "collaboration"])
+@pytest.mark.parametrize(
+    "state,aborted,failed,successful",
+    [("final", False, False, True), ("final", True, False, False),
+     ("error", False, False, False), ("aborted", False, False, False),
+     ("final", False, True, False)],
+)
+@pytest.mark.asyncio
+async def test_broker_terminal_result_does_not_depend_on_ack_timing(
+    profile_roots, before_ack, kind, state, aborted, failed, successful,
+) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    host = ProfileHost()
+    accepted = asyncio.Event()
+    terminal = {}
+
+    async def deliver():
+        await host._handle_profile_event("writer", "chat", terminal)
+
+    async def target_rpc(target, method, params, timeout):
+        assert method == "chat.send"
+        terminal.update({
+            "runId": "terminal-run", "sessionKey": params["sessionKey"],
+            "state": state, "aborted": aborted, "failed": failed,
+            # Interrupted and failed turns can contain useful partial text.
+            "message": {"content": "Useful partial output"},
+        })
+        if before_ack:
+            await deliver()
+        accepted.set()
+        return {"runId": "terminal-run"}
+
+    host._target_rpc = target_rpc
+    if kind == "task":
+        call = host.run_task(
+            "writer", task_id="terminal-task", prompt="Prepare a report",
+            idempotency_key="terminal-command",
+        )
+    else:
+        call = host._run_broker_turn(
+            source_profile="default", target="writer",
+            target_session="desktop:profile-inbox:writer:default",
+            message="Prepare a report", correlation_id="terminal-command",
+            request_id="terminal-request",
+            hop=1, available={"default", "writer"},
+        )
+    task = asyncio.create_task(call)
+    await asyncio.wait_for(accepted.wait(), 1)
+    if not before_ack:
+        assert ("writer", "terminal-run") in host._broker_waiters
+        await deliver()
+
+    if successful:
+        assert (await asyncio.wait_for(task, 1))["response"] == "Useful partial output"
+    else:
+        with pytest.raises(ProfileHostError) as error:
+            await asyncio.wait_for(task, 1)
+        assert error.value.code == "PROFILE_COLLABORATION_FAILED"
+    assert not host._broker_sessions
+    assert not host._broker_waiters
+    assert not host._terminal_events
+    if kind == "task":
+        audit = host.task_audit("writer", "terminal-run")
+        assert audit["outcome"] == ("ok" if successful else "aborted" if aborted else "error" if failed else state)
 
 
 @pytest.mark.asyncio
@@ -840,6 +924,14 @@ async def test_profile_events_are_scoped_to_bound_conversation(profile_roots) ->
     assert writer_b.messages == []
     assert directory.messages == []
 
+    server._profile_run_subscriptions[("writer", "run-a")] = "ios:a"
+    source = {"profile": "writer", "botId": "bot", "type": "agent",
+              "data": {"runId": "run-a", "stream": "assistant", "delta": "Hello"}}
+    await server._broadcast_profile_host_event(source)
+    assert writer_a.messages[-1]["data"]["data"]["sessionKey"] == "ios:a"
+    assert "sessionKey" not in source["data"]
+    assert writer_b.messages == []
+
     await server._broadcast_profile_host_event({
         "hostId": "host",
         "profile": "writer",
@@ -847,7 +939,7 @@ async def test_profile_events_are_scoped_to_bound_conversation(profile_roots) ->
         "type": "connection",
         "data": {"state": "connected"},
     })
-    assert len(writer_a.messages) == 2
+    assert len(writer_a.messages) == 3
     assert len(writer_b.messages) == 1
     assert len(directory.messages) == 1
 
@@ -942,3 +1034,156 @@ async def test_broker_still_refuses_a_name_that_identifies_nobody(profile_roots)
             "hop": 1,
         })
     assert error.value.code == "PROFILE_NOT_FOUND"
+
+
+@pytest.mark.parametrize('profile', ['default', 'writer'])
+@pytest.mark.asyncio
+async def test_interactive_task_uses_visible_session_and_preserves_questions(profile_roots, profile):
+    from flowly.session.manager import SessionManager
+
+    profiles.create_profile('writer', local_runtime=True)
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    host = ProfileHost(on_event=on_event)
+    sent = {}
+
+    async def target_rpc(target, method, params, timeout):
+        assert target == profile
+        if method == 'runtime.voice.reserve':
+            if profile == 'default':
+                SessionManager(profiles.get_flowly_home() / 'workspace').reserve_voice_work(params['sessionKey'])
+            return {'sessionKey': params['sessionKey'], 'reserved': True}
+        if method == 'goal.get':
+            return {'goal': None}
+        if method == 'chat.command':
+            return {'runId': params['runId'], 'status': 'completed', 'goalBinding': {'version': 1, 'state': 'none'}}
+        # An internal headless task would auto-answer/deny these; interactive
+        # work must leave them for the user in the visible work conversation.
+        assert method == 'chat.send'
+        sent.update(params)
+        for event, data in [
+            ('agent.clarify.requested', {'id': 'question-1', 'question': 'Which report?'}),
+            ('exec.approval.requested', {'id': 'approval-1'}),
+            ('chat', {'runId': 'voice-run', 'state': 'final', 'message': {'content': 'Report ready'}}),
+        ]:
+            payload = {**data, 'sessionKey': params['sessionKey']}
+            if profile == 'default':
+                await host.handle_primary_frame({'type': 'event', 'event': event, 'data': payload})
+            else:
+                await host._handle_profile_event(profile, event, payload)
+        return {'runId': 'voice-run'}
+
+    host._target_rpc = target_rpc
+    result = await host.run_task(profile, task_id='c_voice', prompt='Prepare the report',
+                                 idempotency_key='voice:c_voice:initial', interactive=True)
+    await asyncio.sleep(0)
+    assert sent['sessionKey'] == 'desktop:voice-work:c_voice'
+    assert sent['turnOrigin'] == 'user'
+    assert sent['disabledTools'] == []
+    assert result['response'] == 'Report ready'
+    assert len(events) == 3
+    assert not host._interactive_task_sessions
+    assert host.task_audit(profile, 'voice-run')['outcome'] == 'ok'
+
+
+@pytest.mark.asyncio
+async def test_interactive_task_replay_reads_verified_handoff(profile_roots):
+    host = ProfileHost()
+
+    async def target_rpc(target, method, params, timeout):
+        if method == 'runtime.voice.reserve':
+            return {'sessionKey': params['sessionKey'], 'reserved': True}
+        if method == 'goal.get':
+            return {'goal': None}
+        if method == 'chat.send':
+            return {'runId': 'voice-run', 'status': 'completed', 'replayed': True}
+        if method == 'chat.command':
+            return {'runId': params['runId'], 'status': 'completed', 'goalBinding': {'version': 1, 'state': 'none'}}
+        assert method == 'chat.history'
+        return {'messages': [
+            {'role': 'assistant', 'runId': 'other-run', 'content': 'Unrelated reply'},
+            {'role': 'assistant', 'runId': 'voice-run', 'content': 'Verified handoff'},
+        ]}
+
+    host._target_rpc = target_rpc
+    result = await host.run_task('default', task_id='c_voice', prompt='Prepare the report',
+                                 idempotency_key='voice:c_voice:initial', interactive=True)
+    assert result['response'] == 'Verified handoff'
+
+
+@pytest.mark.asyncio
+async def test_interactive_task_uncertain_receipt_does_not_start_or_abort_again(profile_roots):
+    host = ProfileHost()
+    host._target_rpc = AsyncMock(side_effect=[
+        {'sessionKey': 'desktop:voice-work:c_voice', 'reserved': True},
+        {'runId': 'voice-run', 'status': 'status_unknown'},
+    ])
+    started = []
+    with pytest.raises(ProfileHostError) as error:
+        await host.run_task('default', task_id='c_voice', prompt='Prepare the report',
+                            idempotency_key='voice:c_voice:initial', interactive=True, on_started=started.append)
+    assert error.value.code == 'TASK_RESULT_UNKNOWN'
+    assert [c.args[1] for c in host._target_rpc.await_args_list] == ['runtime.voice.reserve', 'chat.send']
+    assert started == []
+
+
+@pytest.mark.asyncio
+async def test_interactive_task_rejects_recreated_target_before_sending(profile_roots):
+    host = ProfileHost()
+    host._target_rpc = AsyncMock()
+    with pytest.raises(ProfileHostError) as error:
+        await host.run_task('default', task_id='c_voice', prompt='Prepare the report',
+                            idempotency_key='voice:c_voice:initial', interactive=True,
+                            expected_bot_id='previous-agent-identity')
+    assert error.value.code == 'TASK_TARGET_CHANGED'
+    host._target_rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('worker_status,active,expected', [
+    ('aborted', False, 'stopped'), ('completed', False, 'stopped'),
+    ('error', False, 'stopped'), ('running', False, 'stopping'),
+    ('status_unknown', False, 'status_unknown'), ('not_found', False, 'status_unknown'),
+    ('completed', True, 'stopped'),
+])
+async def test_task_stop_requires_worker_terminal_and_no_active_goal_turn(profile_roots, worker_status, active, expected):
+    host = ProfileHost()
+    calls = []
+
+    async def rpc(profile, method, params, timeout):
+        calls.append(method)
+        assert params['sessionKey'] == 'desktop:voice-work:c_voice'
+        assert params['expectedBotId'] == profiles.ensure_profile_bot_id('default').bot_id
+        if method == 'goal.stop':
+            return {'goal': {'status': 'cleared'}}
+        if method == 'goal.get':
+            return {'goal': None}
+        if method == 'chat.command':
+            return {'runId': 'worker-1', 'status': worker_status, 'goalBinding': {'version': 1, 'state': 'none'}}
+        if method == 'chat.abort':
+            return {'ok': True, 'cancelled': True}  # Accepted abort is not terminal proof.
+        assert method == 'chat.inflight'
+        return {'inflight': {'runId': 'goal-turn'} if active else None, 'goal': None}
+
+    host._target_rpc = rpc
+    result = await host.stop_task(profile='default', task_id='c_voice', run_id='worker-1',
+                                  expected_bot_id=profiles.ensure_profile_bot_id('default').bot_id)
+    assert result['status'] == expected
+    assert calls[0] == 'chat.command'
+    assert 'goal.stop' not in calls
+    assert 'chat.send' not in calls
+    assert ('chat.abort' in calls) == (worker_status == 'running')
+
+
+@pytest.mark.parametrize('content', ['', '   ', []])
+def test_empty_terminal_is_not_a_successful_board_audit(profile_roots, content):
+    host = ProfileHost()
+    audit = {}
+    host._task_audit_sessions[('writer', 'desktop:voice-work:task-1')] = audit
+    host._capture_task_audit_event('writer', 'desktop:voice-work:task-1', 'chat', {
+        'state': 'final', 'message': {'content': content},
+    })
+    assert audit['outcome'] == 'error'
