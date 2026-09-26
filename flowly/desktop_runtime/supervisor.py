@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from filelock import FileLock
 
 from flowly.desktop_runtime.authority import ScreenError
+from flowly.desktop_runtime.input_service import InputService
 from flowly.desktop_runtime.launcher import (
     ScreenRuntime,
     private_directory,
@@ -67,6 +68,7 @@ def run(directory: Path, generation: str) -> None:
         state["supervisor"] = process_identity(os.getpid())
         write_state(runtime.manifest, state)
         processes: list[subprocess.Popen] = []
+        input_service = None
         stopping = False
 
         def request_stop(*_):
@@ -137,11 +139,13 @@ def run(directory: Path, generation: str) -> None:
             if not 0 < port < 65536:
                 raise ScreenError("RUNTIME_START_FAILED")
             runtime.authority.start(generation)
+            (sockets / "input.sock").unlink(missing_ok=True)
+            input_service = InputService(runtime.authority, generation, sockets)
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
-                         cdpPort=port, error=None)
+                         cdpPort=port, inputServiceVersion=1, error=None)
             write_state(runtime.manifest, state)
             while not stopping:
-                if any(process_identity(child.pid) is None for child in processes):
+                if not input_service.is_alive or any(process_identity(child.pid) is None for child in processes):
                     raise ScreenError("RUNTIME_FAILED")
                 time.sleep(0.2)
             state.update(phase="stopped", error=None)
@@ -150,6 +154,11 @@ def run(directory: Path, generation: str) -> None:
             # text. Health failure does not release durable human authority.
             state.update(phase="failed", error="RUNTIME_FAILED")
         finally:
+            if input_service is not None:
+                try:
+                    input_service.close()
+                except Exception:
+                    state.update(phase="failed", error="INPUT_SERVICE_CLOSE_FAILED")
             if state["phase"] == "stopped" and state.get("cdpPort"):
                 try:
                     asyncio.run(close_browser(state["cdpPort"]))

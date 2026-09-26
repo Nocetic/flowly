@@ -100,6 +100,10 @@ class Peer:
 
     def close(self):
         self.proceed.set()
+        try:
+            self.listener.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.listener.close()
         self.thread.join(6)
         assert not self.thread.is_alive()

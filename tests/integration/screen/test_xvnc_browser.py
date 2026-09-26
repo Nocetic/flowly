@@ -5,6 +5,7 @@ Chromium runs with its sandbox enabled. The disposable Docker runner needs
 permission to create user namespaces (see README.md).
 """
 
+import base64
 import json
 import os
 import socket
@@ -203,6 +204,60 @@ def test_input_broker_drains_real_xvnc_and_releases_pressed_keys_before_handback
             authority.finish_run("original-run", generation)
         finally:
             broker.abandon()
+
+
+def test_supervisor_keeps_input_after_gateway_worker_exit(tmp_path, login_site):
+    from playwright.sync_api import sync_playwright
+
+    from flowly.desktop_runtime.input_service import InputServiceClient
+
+    with running_screen(tmp_path / "supervisor-input") as runtime, sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(runtime["endpoint"])
+        page = browser.contexts[0].pages[0]
+        page.goto(login_site)
+        page.evaluate("""() => {
+            window.shiftDowns = 0; window.shiftUps = 0;
+            addEventListener('keydown', e => { if (e.key === 'Shift') window.shiftDowns++; });
+            addEventListener('keyup', e => { if (e.key === 'Shift') window.shiftUps++; });
+        }""")
+        point = page.locator("#code").evaluate("""element => {
+            const box = element.getBoundingClientRect();
+            return {x: Math.round(screenX + box.x + 10),
+                    y: Math.round(screenY + outerHeight - innerHeight + box.y + 10)};
+        }""")
+        authority = runtime["runtime"].authority
+        generation = runtime["state"]["generation"]
+        human = authority.acquire("viewer", generation, authority.snapshot()["epoch"])
+        identity = dict(generation=generation, viewer="viewer", epoch=human["epoch"])
+        path = runtime["runtime"].socket_directory / "input.sock"
+        assert runtime["state"]["inputServiceVersion"] == 1
+        client = InputServiceClient(path)
+        opened = client.request("open", **identity)
+        clicks = b"".join(struct.pack("!BBHH", 5, mask, point["x"], point["y"]) for mask in (0, 1, 0))
+        client.request("send", **identity, handle=opened["handle"], sequence=0, data=base64.b64encode(clicks).decode())
+        page.wait_for_function("document.hasFocus()")
+        shift = base64.b64encode(struct.pack("!BBHI", 4, 1, 0, 0xFFE1)).decode()
+        request = dict(method="send", **identity, handle=opened["handle"], sequence=1, data=shift)
+        script = """import json, sys
+from pathlib import Path
+from flowly.desktop_runtime.input_service import InputServiceClient
+value = json.load(sys.stdin)
+print(json.dumps(InputServiceClient(Path(value['path'])).request(**value['request'])))
+"""
+        child = subprocess.run([sys.executable, "-c", script], input=json.dumps(dict(path=str(path), request=request)),
+                               text=True, capture_output=True, timeout=10, check=True)
+        assert json.loads(child.stdout) == {"nextSequence": 2}
+        page.wait_for_function("window.shiftDowns === 1")
+        # The worker has exited. A new worker/client adopts the same broker;
+        # replay of its acknowledged input does not press Shift again.
+        resumed = InputServiceClient(path).request("open", **identity)
+        assert resumed["handle"] == opened["handle"] and resumed["nextSequence"] == 2
+        assert client.request(**request) == {"nextSequence": 2}
+        released = client.request("finish", **identity, handle=opened["handle"], release=True)
+        assert released["control"] == "agent" and not released["inputDrainRequired"]
+        page.wait_for_function("window.shiftUps === 1")
+        assert page.evaluate("window.shiftDowns") == 1
+        assert all(is_alive(process) for process in runtime["processes"])
 
 
 def test_two_profiles_have_separate_browser_cookies(tmp_path, login_site):
