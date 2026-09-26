@@ -1050,6 +1050,21 @@ def goal_get(params: dict) -> dict:
 
 # ── Compaction ──────────────────────────────────────────────────────────────
 
+async def agent_home_get(params: dict) -> dict:
+    from flowly.agent_home import AgentHomeError, resolve_home
+    try:
+        return await asyncio.to_thread(resolve_home, params)
+    except AgentHomeError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+
+
+async def agent_home_setup(params: dict) -> dict:
+    from flowly.agent_home import AgentHomeError, finish_setup
+    try:
+        return await asyncio.to_thread(finish_setup, params)
+    except AgentHomeError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+
 # Coroutine the host registers so ``chat.compact`` can reach the agent.
 # Signature: ``async (session_key, instructions) -> dict``.
 _compact_cb = None
@@ -5102,6 +5117,8 @@ _DISPATCH: dict[str, tuple] = {
     "goal.resume": (goal_resume, True, False),
     "goal.stop": (goal_stop, True, False),
     "chat.compact": (chat_compact, True, False),
+    "agent.home.get": (agent_home_get, True, False),
+    "agent.home.setup": (agent_home_setup, True, False),
     "plan.get": (plan_get, True, False),
     "plan.list": (plan_list, True, False),
     "plan.resolve": (plan_resolve, True, False),
@@ -5234,7 +5251,9 @@ _DISPATCH.update({method: (_partial(work_output_call, method), True, False)
 def _gmail_handler(method: str):
     async def handle(params: dict) -> dict:
         from flowly.integrations.gmail_rpc import gmail_rpc
-        return await gmail_rpc(method, params)
+        # dispatch already verified the transport's identity pin. It is not
+        # part of the closed Gmail feature schema or an account permission.
+        return await gmail_rpc(method, {key: value for key, value in params.items() if key != "expectedBotId"})
     return handle
 
 

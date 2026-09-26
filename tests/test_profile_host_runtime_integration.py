@@ -215,9 +215,27 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
         assert default_credentials.read_bytes() == default_credentials_before
         assert (primary_config.read_bytes() if primary_config.exists() else None) == primary_before
 
+        # Public RPC and a real child process agree on one persistent home;
+        # resolving twice and restarting must not create another greeting.
+        agent_home = await host.rpc("writer", "agent.home.get", {"locale": "tr"}, **identity)
+        assert agent_home["setup"] == "active"
+        assert await host.rpc("writer", "agent.home.get", {}, **identity) == agent_home
+        history_params = {"sessionKey": agent_home["sessionKey"], "limit": 10}
+        page = await host.rpc("writer", "chat.history", history_params, **identity)
+        assert len(page["messages"]) == 1
+        assert page["historyPageVersion"] == 1
+        assert not page["hasOlder"]
+        skipped = await host.rpc("writer", "agent.home.setup", {"state": "skipped"}, **identity)
+        assert skipped["setup"] == "skipped"
+        with pytest.raises(ProfileHostError) as protected:
+            await host.rpc("writer", "sessions.delete", {"sessionKey": agent_home["sessionKey"]}, **identity)
+        assert protected.value.code == "PERSISTENT_CONVERSATION"
+
         stopped = await host.stop("writer")
         assert stopped["status"]["state"] == "stopped"
         assert profiles.read_runtime_lease(root / "writer") is None
+        assert await host.rpc("writer", "agent.home.get", {}, **identity) == skipped
+        assert await host.rpc("writer", "chat.history", history_params, **identity) == page
     finally:
         await host.shutdown()
 

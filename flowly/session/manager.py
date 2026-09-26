@@ -489,7 +489,10 @@ class Session:
                 if len(self.messages) > max_messages
                 else self.messages
             )
-        projected = [_project_for_llm(m) for m in recent]
+        # The optional introduction is app-authored display copy, not a model
+        # turn. In particular, providers requiring an initial user turn must
+        # not receive an unsolicited leading assistant message.
+        projected = [_project_for_llm(m) for m in recent if m.get("kind") != "agent_introduction"]
         return _repair_tool_sequence(projected)
 
     def get_history_with_checkpoint(
@@ -1876,6 +1879,9 @@ class SessionManager:
         check and recreate the conversation after this method returns.
         """
 
+        from flowly.agent_home import AgentHomeError, is_agent_home
+        if is_agent_home(key):
+            raise AgentHomeError("PERSISTENT_CONVERSATION", "Keep this agent's conversation. Compact its context instead of deleting it.")
         with self._session_write_lock(key):
             require_session_file(self._get_session_path(key), key)
             # Creation takes this same lease before persisting an external key.

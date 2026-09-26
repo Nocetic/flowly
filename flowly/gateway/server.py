@@ -641,6 +641,7 @@ class GatewayServer:
         # at the calling socket, so the live stream follows the latest viewer
         # (transport-rebind, mirroring the reference gateway).
         self._session_ws: dict[str, web.WebSocketResponse] = {}
+        self._agent_home_ws: set[web.WebSocketResponse] = set()
         # Tick task for periodic health pings to connected clients.
         self._tick_task: asyncio.Task | None = None
         # Browser provider tracking. Chrome extensions and the desktop's
@@ -1432,6 +1433,7 @@ class GatewayServer:
             # anyway; _ws_send already no-ops on a closed socket).
             for _sk in [k for k, v in self._session_ws.items() if v is ws]:
                 self._session_ws.pop(_sk, None)
+            getattr(self, "_agent_home_ws", set()).discard(ws)
             if is_current_connection and client_id in self._extension_clients:
                 cancelled = self._unregister_browser_provider(client_id)
                 logger.info(
@@ -1553,6 +1555,13 @@ class GatewayServer:
 
         try:
             require_rpc_session(method, params, sessions_dir=self.sessions.sessions_dir if self.sessions else None)
+            if not method.startswith("profiles.") and isinstance(params, dict) and "expectedBotId" in params:
+                from flowly.session.commands import validate_chat_target
+                try:
+                    validate_chat_target(params)
+                except ValueError as exc:
+                    await self._ws_rpc_error(ws, rpc_id, "PROFILE_IDENTITY_CHANGED", str(exc))
+                    return
             if method == "health":
                 await self._ws_rpc_reply(ws, rpc_id, {"ok": True})
 
@@ -2743,6 +2752,10 @@ class GatewayServer:
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
         session_key = params.get("sessionKey", "")
+        from flowly.agent_home import is_agent_home
+        if is_agent_home(session_key):
+            await self._ws_rpc_error(ws, rpc_id, "PERSISTENT_CONVERSATION", "Compact this agent's context instead of deleting its conversation.")
+            return
         if not session_key or not self.sessions:
             await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", "sessionKey is required")
             return
@@ -2865,6 +2878,12 @@ class GatewayServer:
         # latter is the compacted LLM working context (just [summary]+recent
         # after a /compact), which would drop the early turns from the chat UI.
         source_messages = self.sessions.get_full_messages(session_key)
+        from flowly.session.history_page import HistoryPageError, history_page
+        try:
+            source_messages, page_info = history_page(source_messages, session_key, params)
+        except HistoryPageError as exc:
+            await self._ws_rpc_error(ws, rpc_id, exc.code, str(exc))
+            return
         messages = []
         for m in source_messages:
             msg: dict[str, Any] = {"role": m["role"]}
@@ -2959,6 +2978,7 @@ class GatewayServer:
                 "messages": messages,
                 "thinkingLevel": session.metadata.get("thinkingLevel"),
                 "modelOverride": session.metadata.get("model_override"),
+                **page_info,
             },
         )
 
@@ -3301,7 +3321,7 @@ class GatewayServer:
         The prompt is resolved inside the agent (from the standing goal) and
         announced through ``on_user_message`` after its guards pass.
         """
-        ws = self._session_ws.get(session_key)
+        ws = next((target for target in self._session_targets(session_key) if not target.closed), None)
         if ws is None or ws.closed:
             # No client bound to this conversation right now. Report it so the
             # caller can still run the turn through the channel layer instead
@@ -3851,6 +3871,10 @@ class GatewayServer:
     async def _ws_rpc_chat_clear(
         self, ws: web.WebSocketResponse, rpc_id: str, params: dict
     ) -> None:
+        from flowly.agent_home import is_agent_home
+        if is_agent_home(params.get("sessionKey", "")):
+            await self._ws_rpc_chat_compact(ws, rpc_id, params)
+            return
         if not self.on_clear:
             return await self._ws_rpc_error(ws, rpc_id, "UNAVAILABLE", "Clear not available")
         session_key = params.get("sessionKey", "desktop:default")
@@ -4020,20 +4044,36 @@ class GatewayServer:
         fallback_ws: web.WebSocketResponse,
         data: dict,
     ) -> None:
-        """Send a live stream event to the session's CURRENT socket.
+        """Send to current observers (one socket except the persistent agent home).
 
         Routes via ``_session_ws`` (the latest socket that ran chat.send or
         called chat.inflight for this session) so a client that re-entered
         mid-stream on a fresh socket keeps receiving forward events. Falls back
         to the originating socket when nothing is registered. ``_ws_send`` no-ops
         on a closed socket, so a stale registration just drops silently."""
+        payload = self._scoped_event(data, session_key=session_key)
+        targets = self._session_targets(session_key, fallback_ws)
+        await asyncio.gather(*(self._ws_send(target, payload) for target in targets))
+
+    def _session_targets(self, session_key: str, fallback_ws=None) -> list:
+        from flowly.agent_home import is_agent_home
+        if is_agent_home(session_key):
+            targets = getattr(self, "_agent_home_ws", set())
+            targets.difference_update(ws for ws in list(targets) if ws.closed)
+            if targets:
+                return list(targets)
         target = self._session_ws.get(session_key) or fallback_ws
-        await self._ws_send(target, self._scoped_event(data, session_key=session_key))
+        return [target] if target is not None else []
 
     def bind_session_ws(self, session_key: str, ws: web.WebSocketResponse) -> None:
         """Point a session's live stream at ``ws`` (transport-rebind)."""
         if session_key:
             self._session_ws[session_key] = ws
+            from flowly.agent_home import is_agent_home
+            if is_agent_home(session_key):
+                if not hasattr(self, "_agent_home_ws"):
+                    self._agent_home_ws = set()
+                self._agent_home_ws.add(ws)
 
     def _session_has_live_ws(
         self,
@@ -4041,8 +4081,7 @@ class GatewayServer:
         fallback_ws: web.WebSocketResponse | None = None,
     ) -> bool:
         """Whether a session currently has an open direct-gateway socket."""
-        target = self._session_ws.get(session_key) or fallback_ws
-        return bool(target is not None and not target.closed)
+        return any(not target.closed for target in self._session_targets(session_key, fallback_ws))
 
     def _schedule_offline_chat_push(
         self,
@@ -4128,6 +4167,8 @@ class GatewayServer:
             self._subagent_event_versions[ws] = event_version(params)
         if method == "chat.inflight":
             self.bind_session_ws(str(params.get("sessionKey") or ""), ws)
+        if method == "agent.home.get":
+            self.bind_session_ws(str(result.get("sessionKey") or ""), ws)
         if method == "system.capabilities" and self._profile_host is not None:
             result = {**result, "profileHost": self._profile_host.capabilities()}
         await self._ws_rpc_reply(ws, rpc_id, result)
@@ -4838,9 +4879,9 @@ class GatewayServer:
             "data": {"sessionKey": session_key, "goal": goal},
         }
         payload = self._scoped_event(payload)
-        target = self._session_ws.get(session_key) or fallback_ws
-        if target is not None and not target.closed:
-            await self._ws_send(target, payload)
+        targets = [ws for ws in self._session_targets(session_key, fallback_ws) if not ws.closed]
+        if targets:
+            await asyncio.gather(*(self._ws_send(ws, payload) for ws in targets))
             return
         await self._broadcast_clients(payload)
 
@@ -4977,9 +5018,9 @@ class GatewayServer:
         data: dict[str, Any],
     ) -> None:
         payload = self._scoped_event({"type": "event", "event": "chat", "data": data})
-        target = self._session_ws.get(session_key)
-        if target is not None and not target.closed:
-            await self._ws_send(target, payload)
+        targets = [ws for ws in self._session_targets(session_key) if not ws.closed]
+        if targets:
+            await asyncio.gather(*(self._ws_send(ws, payload) for ws in targets))
             return
         for ws in list(self._ws_clients.values()):
             try:
@@ -5212,9 +5253,9 @@ class GatewayServer:
         """
         event = {"type": "event", "event": "compaction", "data": data}
         session_key = str(data.get("sessionKey") or "")
-        target = self._session_ws.get(session_key) if session_key else None
-        if target is not None and not target.closed:
-            await self._ws_send(target, event)
+        targets = [ws for ws in self._session_targets(session_key) if not ws.closed] if session_key else []
+        if targets:
+            await asyncio.gather(*(self._ws_send(ws, event) for ws in targets))
             return
         # No live socket bound to this session (a client that connected but
         # hasn't sent yet, or a rebind in flight). Fall back to everyone —

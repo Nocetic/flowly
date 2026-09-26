@@ -19,6 +19,7 @@ async def test_profile_rpc_identity_boundary(monkeypatch, tmp_path, case):
     monkeypatch.setattr(profiles, "_PROFILES_ROOT", tmp_path / "profiles")
     current = {"botId": "original"}
     monkeypatch.setattr(module, "_public_profile", lambda name: current)
+    monkeypatch.setattr(module, "ensure_profile_bot_id", lambda name: SimpleNamespace(bot_id=current["botId"]))
     host = ProfileHost()
     runtime = SimpleNamespace(active_runs=set())
 

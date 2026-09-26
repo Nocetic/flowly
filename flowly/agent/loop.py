@@ -2356,6 +2356,10 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
+        from flowly.profile import current_profile_name
+        if current_profile_name() != "default":
+            from flowly.agent.tools.agent_setup import AgentSetupFinishTool
+            self.tools.register(AgentSetupFinishTool())
         # File tools (sandboxed to workspace + ~/.flowly)
         self.tools.register(ReadFileTool(workspace=self.workspace))
         self.tools.register(WriteFileTool(workspace=self.workspace))
@@ -7982,6 +7986,11 @@ class AgentLoop:
                 command_args = parts[1] if len(parts) > 1 else ""
 
         if is_command and command in ("new", "clear"):
+            from flowly.agent_home import is_agent_home
+            if is_agent_home(msg.session_key):
+                result = await self.compact_session(msg.session_key)
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                       content=result.get("message") or "Conversation context refreshed. History was kept.")
             msg_count = self.reset_conversation(msg.session_key)
             session = self.sessions.get_or_create(msg.session_key)
             session.metadata["persona"] = self.context.persona
@@ -8915,6 +8924,10 @@ class AgentLoop:
         self._inject_recent_artifacts_hint(
             messages, session_key=msg.session_key,
         )
+        from flowly.agent_home import setup_guidance
+        introduction = setup_guidance(msg.session_key)
+        if introduction and messages and messages[0].get("role") == "system":
+            messages[0]["content"] += "\n\n" + introduction
         self._inject_render_capability_hint(
             messages,
             capabilities=msg.metadata.get("render_capabilities"),
@@ -10354,6 +10367,9 @@ class AgentLoop:
         epoch it captured, sees this reset, and drops its result instead of
         committing the old conversation over the new one.
         """
+        from flowly.agent_home import AgentHomeError, is_agent_home
+        if is_agent_home(session_key):
+            raise AgentHomeError("PERSISTENT_CONVERSATION", "Compact this agent's context instead of resetting its conversation.")
         session = self.sessions.get_or_create(session_key)
         self.sessions.refresh(session)
         removed = len(session.messages)

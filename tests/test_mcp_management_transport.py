@@ -152,6 +152,7 @@ async def test_profile_management_reaches_identity_guarded_runtime(monkeypatch):
     from flowly.profile_host import ProfileHost
 
     monkeypatch.setattr(profile_module, "_public_profile", lambda name: {"name": name, "botId": "bot-id"})
+    monkeypatch.setattr(profile_module, "ensure_profile_bot_id", lambda name: SimpleNamespace(bot_id="bot-id"))
     host = ProfileHost()
     host._target_rpc = AsyncMock(return_value={"servers": []})
     app = web.Application()
@@ -164,7 +165,7 @@ async def test_profile_management_reaches_identity_guarded_runtime(monkeypatch):
         assert response.status == 200
         assert (await response.json())["result"] == {"servers": []}
     host._target_rpc.assert_awaited_once_with(
-        "work", "mcp.connections.list", {}, 30.0, expected_bot_id="bot-id",
+        "work", "mcp.connections.list", {"expectedBotId": "bot-id"}, 30.0, expected_bot_id="bot-id",
     )
 
 

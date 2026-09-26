@@ -63,6 +63,7 @@ _CLONE_WORKSPACE_FILES = [
 ]
 
 _CLONE_ALL_STRIP = [
+    "agent-home.json", ".agent-home.lock",
     "session_index.sqlite", "session_index.sqlite-wal",
     "session_index.sqlite-shm", "logs", "subagents", ".machine-id",
     ".desktop-runtime.json",
@@ -872,6 +873,7 @@ def create_profile(
             "updatedAt": now,
             "localRuntime": bool(local_runtime),
             "credentialPolicy": _NAMED_PROFILE_CREDENTIAL_POLICY,
+            "agentHomeVersion": 1,
         })
 
         # Publishing the completed directory is the commit point. A crash
@@ -2320,6 +2322,10 @@ def _import_profile_archive(
             "localRuntime": bool(local_runtime or metadata.get("localRuntime")),
             "credentialPolicy": _NAMED_PROFILE_CREDENTIAL_POLICY,
         })
+        if identity != "restore":
+            # The copied transcript is retained; optional setup belongs to the
+            # original identity and must not resume on the duplicate.
+            (extracted / "agent-home.json").unlink(missing_ok=True)
         _atomic_write_json(extracted / _PROFILE_METADATA_FILE, metadata)
         _harden_profile_tree_permissions(extracted)
         with _profile_mutation_lock():
