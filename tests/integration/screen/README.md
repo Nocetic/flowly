@@ -771,3 +771,39 @@ docker run --rm --user 0 --security-opt seccomp=unconfined --shm-size=512m \
 The Desktop runner accepts `FLOWLY_SCREEN_ROOT_TEST=1` to select the root fixture;
 without it the existing unprivileged fixture is unchanged. Its test-only bootstrap
 requires the container marker and does not provision the user's own computer.
+
+## Lightweight desktop candidate
+
+The required final screen includes a dock, Terminal, Browser and Settings.
+`Dockerfile.desktop` extends the disposable gateway runner with candidate Xfce
+packages. It does not alter the product installer recipe or enable a production
+desktop runtime. Build the gateway image above first, then:
+
+```sh
+docker build -f tests/integration/screen/Dockerfile.desktop \
+  -t flowly-screen-desktop-test:bookworm .
+docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  -e FLOWLY_SCREEN_DESKTOP_TEST=1 flowly-screen-desktop-test:bookworm \
+  python -m pytest tests/integration/screen/test_desktop_session.py \
+    tests/test_screen_desktop_defaults.py -q -p no:cacheprovider
+```
+
+The candidate uses the actual Xfce panel, window manager, settings daemon and
+desktop, with a private D-Bus/Xvnc session. Its dock opens an interactive Terminal
+and Settings window. Keyboard input executes a synthetic terminal command;
+the browser launcher focuses the existing normal Chromium window instead of
+its invisible helper window. A minimized window can be restored without a new
+page or cookie jar. A changed font preference is written by Xfconf and survives
+re-seeding. This test changes the preference through Xfconf, not by clicking the
+Settings dialog controls. First-run configuration is executed with the
+application UID, preserves existing preferences, rejects symlinks and quotes
+browser/profile paths literally.
+
+This is a component integration test, not a substitute for the real Desktop
+viewer. Production supervisor/readiness integration, browser-last-window
+closure/reopening, installation package admission, application process cleanup
+and actual noVNC/Electron acceptance remain required. The final seed payload
+must run after UID/GID drop on root hosts; system Python can execute its fixed
+standalone source even when the agent checkout is unreadable by that account.
+Do not run account-provisioning experiments outside a fresh disposable container.

@@ -1,0 +1,9 @@
+# Disposable desktop development runner. The production recipe is updated only
+# together with runtime admission and Desktop's reviewed package allowlist.
+FROM flowly-screen-gateway-test:bookworm
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xfwm4 xfdesktop4 xfce4-panel xfce4-settings xfce4-terminal xfconf \
+    adwaita-icon-theme thunar \
+    && rm -rf /var/lib/apt/lists/*
+USER screen-test
