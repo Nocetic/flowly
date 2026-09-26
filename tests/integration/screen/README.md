@@ -59,7 +59,7 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
     tests/test_screen_tickets.py tests/test_screen_viewers.py tests/test_screen_launcher.py tests/test_screen_execution.py \
     tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
     tests/test_screen_cli.py tests/test_screen_profile_binding.py tests/test_screen_display_gateway.py \
-    tests/test_screen_input_broker.py tests/test_screen_input_service.py tests/test_screen_observers.py \
+    tests/test_screen_input_broker.py tests/test_screen_input_service.py tests/test_screen_observers.py tests/test_screen_status.py \
     tests/integration/screen/test_xvnc_browser.py -q \
     --basetemp=/tmp/screen-tests -p no:cacheprovider
 ```
@@ -73,7 +73,7 @@ pause/resume RPC or Desktop UI. No model is invoked.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
-The expanded Linux screen suite passed **240 tests** on the environment above.
+The expanded Linux screen suite passed **247 tests** on the environment above.
 The authenticated direct display endpoint also delivers real Xvnc pixels for
 the default and named profiles. Its single-use tickets are bound to the host,
 profile and runtime generation; gateway credentials and tickets use headers.
@@ -141,7 +141,14 @@ consume active viewer capacity. Existing viewer databases migrate transactionall
 The real Linux gateway tests close with Shift held, verify key-up and browser
 survival, and replay the same close. Synthetic tests also cover delayed admission,
 missing capture EOF, stale epochs, receipt eviction and lost persistence replies.
-Status events and original-run resume remain open; the product sidebar is unfinished.
+The public status projection now carries a durable per-profile `statusRevision`,
+independent of the control revision/epoch. Sampling and assignment are serialized
+across gateway workers; unchanged snapshots keep their revision, and gateway
+reconstruction resumes the sequence. The real gateway tests verify stable repeated
+status and advancement after public control transitions. Phase-only failure and
+out-of-order sampling are covered by the synthetic/sequence tests. Push status
+events and original-run resume remain open. Desktop's direct Screen sidebar is
+wired, but lifecycle, profile-tab navigation and relay remain incomplete.
 
 The `epoch-u64-v1` input protocol is selected with `X-Flowly-Screen-Input`.
 Each client binary frame starts with an unsigned big-endian 64-bit control epoch

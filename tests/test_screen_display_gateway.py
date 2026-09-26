@@ -266,6 +266,25 @@ async def test_status_is_public_projection_without_private_endpoints(display_gat
     assert "must-not-use" not in json.dumps(result)
 
 
+async def test_status_phase_has_own_durable_revision_without_control_change(display_gateway):
+    fixture = display_gateway
+    first = (await fixture.rpc("display.status"))["result"]
+    assert first["statusRevision"] == 1
+    assert (await fixture.rpc("display.status"))["result"] == first
+    session = _resolve(fixture.gateway, {})
+    running = session.runtime.status()
+    session.runtime.status = lambda: {**running, "phase": "failed", "error": "RUNTIME_FAILED"}
+    failed = (await fixture.rpc("display.status"))["result"]
+    assert failed["control"] == first["control"]
+    assert failed["statusRevision"] == 2
+    session._status_sequence = None  # A newly constructed gateway resumes the same sequence.
+    assert (await fixture.rpc("display.status"))["result"] == failed
+    session.runtime.status = lambda: running
+    recovered = (await fixture.rpc("display.status"))["result"]
+    assert recovered["control"] == first["control"]
+    assert recovered["statusRevision"] == 3
+
+
 @pytest.mark.parametrize("profile", ["default", "writer"])
 async def test_authenticated_binary_stream_uses_only_selected_profile_and_drops_input(display_gateway, profile):
     observed, headers = await observe(display_gateway, profile)

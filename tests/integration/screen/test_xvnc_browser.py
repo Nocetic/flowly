@@ -560,7 +560,11 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                     status = (await chat.receive_json())["result"]
                     assert status["generation"] == state["generation"]
                     assert status["profileId"] == profile
+                    assert status["statusRevision"] >= 1
                     assert "socket" not in status and "cdpPort" not in status
+                    await chat.send_json({"type": "rpc", "id": "status-repeat", "method": "display.status",
+                                          "params": {"profileId": profile}})
+                    assert (await chat.receive_json())["result"] == status
                     await chat.send_json({"type": "rpc", "id": "observe", "method": "display.observe", "params": {
                         "profileId": profile, "expectedHostId": status["hostId"], "expectedBotId": status["botId"],
                         "generation": state["generation"],
@@ -701,6 +705,11 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                     assert runtime.status()["generation"] == state["generation"]
                     assert is_alive(state["supervisor"])
                     assert await page.locator("body").inner_text() == f"{profile} browser fixture"
+                    await chat.send_json({"type": "rpc", "id": "status-after-close", "method": "display.status",
+                                          "params": {"profileId": profile}})
+                    after_close = (await chat.receive_json())["result"]
+                    assert after_close["statusRevision"] > status["statusRevision"]
+                    assert after_close["generation"] == status["generation"]
     finally:
         await server.close()
         await asyncio.to_thread(runtime.stop, state["generation"])

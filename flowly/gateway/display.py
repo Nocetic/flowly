@@ -21,6 +21,7 @@ from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.input_service import InputServiceClient
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.desktop_runtime.rfb import RfbClientGate
+from flowly.desktop_runtime.status import StatusSequence
 from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
 from flowly.desktop_runtime.viewers import ViewerCredentials
 from flowly.gateway.auth import host_origin_allowed
@@ -46,6 +47,7 @@ class DisplaySession:
         self._runtime: ScreenRuntime | None = None
         self._tickets: StreamTickets | None = None
         self._viewers: ViewerCredentials | None = None
+        self._status_sequence: StatusSequence | None = None
         self.streams: set[web.WebSocketResponse] = set()
         self.attaching = 0
 
@@ -64,6 +66,9 @@ class DisplaySession:
     def capabilities(self) -> dict:
         capability = ScreenRuntime.capabilities()
         state = self.runtime.status() if capability["supported"] else None
+        return self._capabilities(capability, state)
+
+    def _capabilities(self, capability: dict, state: dict | None) -> dict:
         return {**self.identity, "protocolVersion": 1, **capability,
                 "transports": ["direct"] if capability["supported"] else [],
                 "view": capability["supported"], "input": _supports_input(state),
@@ -101,10 +106,16 @@ class DisplaySession:
         return state
 
     def status(self) -> dict:
-        capability = self.capabilities()
+        if self._status_sequence is None:
+            self._status_sequence = StatusSequence(self.directory)
+        return self._status_sequence.snapshot(self._status_snapshot)
+
+    def _status_snapshot(self) -> dict:
+        available = ScreenRuntime.capabilities()
+        state = self.runtime.status() if available["supported"] else None
+        capability = self._capabilities(available, state)
         if not capability["supported"]:
             return {**capability, "phase": "unavailable", "generation": None, "control": None}
-        state = self.runtime.status()
         return {**capability, "phase": state["phase"] if state else "stopped",
                 "generation": state["generation"] if state else None,
                 "error": state.get("error") if state else None,
