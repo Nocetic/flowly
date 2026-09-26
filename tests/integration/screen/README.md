@@ -73,14 +73,14 @@ pause/resume RPC or Desktop UI. No model is invoked.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
-The expanded Linux screen suite passed **219 tests** on the environment above.
+The expanded Linux screen suite passed **232 tests** on the environment above.
 The authenticated direct display endpoint also delivers real Xvnc pixels for
 the default and named profiles. Its single-use tickets are bound to the host,
 profile and runtime generation; gateway credentials and tickets use headers.
 Synthetic socket tests cover input filtering, replay rejection, profile identity
-changes, observer limits and teardown. This endpoint currently advertises viewing
-only for pixel transport: public control RPCs now coordinate takeover/handback,
-but routing viewer input through the supervisor and public lifecycle remain unfinished.
+changes, observer limits and teardown. New version-two supervisors support basic
+public input through the acknowledged broker. Legacy raw RFB streams remain
+viewing-only, even when the viewer owns human control. Public lifecycle remains unfinished.
 
 The input broker now uses a separate private RFB connection that never requests
 pixels. It negotiates Fence support and requires a matching BlockBefore response
@@ -102,7 +102,7 @@ The service keeps a bounded cache of completed handbacks. Replaying an old
 handback cannot release a newer holder; an evicted handle fails without mutation.
 The real Linux test exits a separate worker after pressing Shift, adopts its
 broker from another client, deduplicates the retry and releases Shift. New
-runtime manifests advertise `inputServiceVersion: 1`; an already-running older
+runtime manifests advertise `inputServiceVersion: 2`; an already-running older
 supervisor does not gain this capability by gateway reconnect alone.
 
 The supervisor also tracks capture leases across gateway workers. Takeover first
@@ -113,7 +113,10 @@ holder's original capture remains open. The real default/named-profile gateway
 tests exercise this with two Xvnc streams. Public WebSocket close waits are
 bounded independently of remote close acknowledgements; an idle client must not
 hold a healthy gateway's capture lease open. Runtime manifests now additionally
-advertise `observerServiceVersion: 1`.
+advertise `observerServiceVersion: 2`. A new attachment for the same viewer
+retires the previous input source. It cannot regain input permission after the
+newer connection disappears. Reattachment drains the previous broker before
+admitting input from the new source, without releasing human ownership.
 
 Authenticated `display.control.acquire/release/reclaim` require a server-issued
 viewer capability, pinned host/profile/bot/generation, expected epoch and operation
@@ -126,14 +129,32 @@ operation receipts; old replies never reapply transitions. Pending acquisition
 needs a fresh operation/current epoch to confirm after an agent action completes.
 The default/named-profile real-Xvnc tests now acquire/release through authenticated
 public RPC. Broker tests prove release/reclaim drains held input before handback.
-Terminal viewer-close/revocation, public input framing, events and original-run
+Terminal viewer-close/revocation, events and original-run
 resume are still open; this is not a completed product sidebar.
+
+The `epoch-u64-v1` input protocol is selected with `X-Flowly-Screen-Input`.
+Each client binary frame starts with an unsigned big-endian 64-bit control epoch
+(limited to safe integers); zero is observation-only. Server pixel frames remain
+ordinary RFB. Input is separated from capture metadata and sent only to the
+supervisor. Stale epochs are dropped; partial RFB messages cannot cross an epoch
+boundary. Basic input batches retain broker acknowledgement/sequence semantics.
+The real gateway tests type into Chromium, hand back with Shift held, reject
+input from the previous epoch both before and after reacquisition, then continue
+in the same input field through a fresh attachment. The test waits for actual
+DOM focus between click and typing: an Xvnc input ACK does not imply completion
+of asynchronous browser focus handling.
+
+Desktop uses a constant epoch per attachment. After a control transition it
+creates a fresh bridge/noVNC connection, retaining the same viewer capability
+and VPS browser. Looking up the latest epoch as old bytes arrive would retag
+queued input; this protocol deliberately avoids that. Fullscreen/resize does not
+change ownership and must retain the existing connection.
 
 Supervisor death or unknown input outcome retains human ownership and requires explicit recovery;
 automatic timeout/disconnect release is intentionally absent. Extended pointer,
 QEMU key, resize and extended clipboard messages are not admitted by this basic
-input connection; viewing-stream negotiation must be aligned before enabling
-public input. See the
+input connection. Framed streams strip their negotiation and reject unsolicited
+extended input. Plain key/pointer/paste remain supported. See the
 [RFB Fence protocol](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#748clientfence).
 
 The `screen` Python extra adds Playwright without downloading a bundled browser;

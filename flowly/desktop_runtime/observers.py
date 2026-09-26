@@ -25,7 +25,7 @@ class ObserverRegistry:
         self.authority, self.generation = authority, generation
         self.path = directory / "observers.sock"
         self._condition = threading.Condition()
-        self._entries: dict[socket.socket, tuple[str, bool]] = {}
+        self._entries: dict[socket.socket, tuple[str, bool, str | None]] = {}
         self._connections: set[socket.socket] = set()
         self._stopping = threading.Event()
         self._slots = threading.BoundedSemaphore(8)
@@ -82,15 +82,22 @@ class ObserverRegistry:
             if uid != os.getuid():
                 return
         request = _receive(connection)
-        if set(request) != {"generation", "viewer"} or request["generation"] != self.generation:
+        if set(request) not in ({"generation", "viewer"}, {"generation", "viewer", "stream"}) or request["generation"] != self.generation:
             raise ScreenError("STALE_GENERATION")
         viewer = _identity(request["viewer"])
+        stream = _identity(request["stream"]) if "stream" in request else None
         with self._condition:
             if self._stopping.is_set() or not self.authority.may_observe(viewer, self.generation):
                 raise ScreenError("HUMAN_HAS_CONTROL")
             if len(self._entries) >= 4:
                 raise ScreenError("SCREEN_BUSY")
-            self._entries[connection] = (viewer, False)
+            if stream is not None:
+                # Reattach retires this viewer's previous input source. It
+                # cannot become current again when the newer stream closes.
+                for previous, entry in self._entries.items():
+                    if entry[0] == viewer:
+                        self._revoke(previous)
+            self._entries[connection] = (viewer, False, stream)
             # A revoke cannot be sent ahead of the framed admission.
             _send(connection, {"ok": True})
         connection.settimeout(0.2)
@@ -107,15 +114,19 @@ class ObserverRegistry:
                 continue
 
     def _revoke(self, connection: socket.socket) -> None:
-        viewer, revoked = self._entries[connection]
+        viewer, revoked, stream = self._entries[connection]
         if not revoked:
-            self._entries[connection] = (viewer, True)
+            self._entries[connection] = (viewer, True, stream)
             try:
                 connection.sendall(b"R")
             except OSError:
                 # Retain until the reader confirms EOF. A send failure alone
                 # does not establish that the gateway finished its teardown.
                 pass
+
+    def is_current(self, viewer: str, stream: str) -> bool:
+        with self._condition:
+            return self.is_alive and any(entry == (viewer, False, stream) for entry in self._entries.values())
 
     def drain_except(self, viewer: str, *, timeout: float = 2) -> bool:
         _identity(viewer)

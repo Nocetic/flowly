@@ -16,6 +16,7 @@ from flowly.desktop_runtime.input_service import (
     InputService,
     InputServiceClient,
     _receive,
+    _send,
 )
 from flowly.desktop_runtime.observers import ObserverRegistry
 from tests.test_screen_input_broker import KEY, Peer
@@ -66,6 +67,36 @@ def test_pending_acquire_requires_fresh_operation_after_original_action_finishes
     assert client.request("control.acquire", **params) == pending
     confirmed = client.request("control.acquire", **{**params, "epoch": pending["epoch"], "operationId": "confirm"})
     assert confirmed["control"] == "human" and confirmed["runId"] == "origin-run"
+
+
+def test_replaced_attachment_cannot_send_even_with_current_control_epoch(service):
+    authority, peer, server, client = service
+    connections = []
+
+    def attach(stream):
+        connection = socket.socket(socket.AF_UNIX)
+        connections.append(connection)
+        connection.connect(str(server.observers.path))
+        _send(connection, dict(generation="generation", viewer="viewer", stream=stream))
+        assert _receive(connection) == {"ok": True}
+        return connection
+
+    try:
+        first = attach("first")
+        opened = client.request("attach", **IDENTITY, stream="first")
+        client.request("send", **IDENTITY, handle=opened["handle"], sequence=0, data=base64.b64encode(KEY).decode())
+        attach("second")
+        assert first.recv(1) == b"R"
+        with pytest.raises(ScreenError, match="VIEWER_REVOKED"):
+            client.request("send", **IDENTITY, handle=opened["handle"], sequence=1, data=base64.b64encode(KEY).decode())
+        with pytest.raises(ScreenError, match="VIEWER_REVOKED"):
+            client.request("attach", **IDENTITY, stream="first")
+        client.request("control.release", **IDENTITY, operationId="handback")
+        assert peer.events == [KEY, struct.pack("!BBHI", 4, 0, 0, 0xFFE1)]
+        assert authority.snapshot()["control"] == "agent"
+    finally:
+        for connection in connections:
+            connection.close()
 
 
 def test_worker_reconnect_keeps_one_broker_and_deduplicates_the_last_input(service):

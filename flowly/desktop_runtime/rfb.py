@@ -16,18 +16,22 @@ class RfbClientGate:
     MAX_CHUNK = 256 * 1024
     _FIXED = {0: 20, 3: 10, 4: 8, 5: 6, 150: 10, 255: 12}
     _INPUT = {4, 5, 6, 251, 255}
+    # noVNC 1.7: QEMU keys, extended mouse, desktop resize and extended clipboard.
+    _UNSUPPORTED = {value & 0xffffffff for value in (-258, -316, -308, 0xc0a1e5ce)}
 
     def __init__(self):
         self._buffer = bytearray()
         self._stage = 0
         self._failed = False
+        self._buffer_epoch: int | None = None
 
     def _reject(self) -> None:
         self._failed = True
         self._buffer.clear()
         raise ScreenError("INVALID_RFB_STREAM")
 
-    def feed(self, chunk: bytes, allow_input: Callable[[], bool]) -> bytes:
+    def feed(self, chunk: bytes, allow_input: Callable[[], bool], *, epoch: int | None = None,
+             on_input: Callable[[bytes], None] | None = None) -> bytes:
         """Filter complete messages; callers serialize output with lease changes.
 
         A partial input message is checked when completed, never when its first
@@ -35,8 +39,13 @@ class RfbClientGate:
         """
         if self._failed or len(chunk) > self.MAX_CHUNK:
             self._reject()
+        if self._buffer and self._buffer_epoch != epoch:
+            # Never finish an old partial key/paste under a newer permission.
+            self._reject()
+        self._buffer_epoch = epoch
         self._buffer.extend(chunk)
         output = bytearray()
+        inputs = []
         while self._buffer:
             if self._stage == 0:
                 if len(self._buffer) < 12:
@@ -69,16 +78,34 @@ class RfbClientGate:
                 break
             message = bytes(self._buffer[:size])
             del self._buffer[:size]
-            if kind not in self._INPUT or allow_input():
+            if on_input is not None and kind == 2:
+                encodings = [message[index:index + 4] for index in range(4, len(message), 4)
+                             if int.from_bytes(message[index:index + 4], "big") not in self._UNSUPPORTED]
+                output.extend(b"\x02\x00" + len(encodings).to_bytes(2, "big") + b"".join(encodings))
+            elif on_input is not None and kind in self._INPUT:
+                if (kind in {251, 255} or (kind == 5 and message[1] & 0x80)
+                        or (kind == 6 and message[4] & 0x80)):
+                    self._reject()
+                if allow_input():
+                    inputs.append(message)
+            elif kind not in self._INPUT or allow_input():
                 output.extend(message)
         if len(self._buffer) > self.MAX_CLIPBOARD + 8:
             self._reject()
+        # An invalid chunk must not dispatch an otherwise valid prefix.
+        if on_input is not None:
+            for message in inputs:
+                on_input(message)
         return bytes(output)
 
     def _message_size(self, kind: int) -> int | None:
         if kind in self._FIXED:
             if kind == 255 and len(self._buffer) >= 2 and self._buffer[1] != 0:
                 self._reject()
+            if kind == 5:
+                if len(self._buffer) < 2:
+                    return None
+                return 7 if self._buffer[1] & 0x80 else 6
             return self._FIXED[kind]
         if kind == 2:
             if len(self._buffer) < 4:

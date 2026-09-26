@@ -76,3 +76,36 @@ def test_bad_handshake_and_oversized_chunk_are_rejected():
     for value in (b"RFB 003.003\n", bytes(RfbClientGate.MAX_CHUNK + 1)):
         with pytest.raises(ScreenError, match="INVALID_RFB_STREAM"):
             RfbClientGate().feed(value, lambda: True)
+
+
+def test_routed_input_never_reaches_capture_socket_and_strips_unsupported_encodings():
+    gate, inputs = RfbClientGate(), []
+    gate.feed(HELLO, lambda: False, epoch=0, on_input=inputs.append)
+    encodings = struct.pack("!BBHiiiiI", 2, 0, 5, 0, -258, -316, -308, 0xc0a1e5ce)
+    output = gate.feed(encodings + KEY + REQUEST + POINTER, lambda: True, epoch=2, on_input=inputs.append)
+    assert output == struct.pack("!BBHi", 2, 0, 1, 0) + REQUEST
+    assert inputs == [KEY, POINTER]
+
+
+def test_partial_input_cannot_be_retagged_at_a_control_epoch_boundary():
+    gate, inputs = RfbClientGate(), []
+    gate.feed(HELLO + KEY[:3], lambda: False, epoch=0, on_input=inputs.append)
+    with pytest.raises(ScreenError, match="INVALID_RFB_STREAM"):
+        gate.feed(KEY[3:], lambda: True, epoch=2, on_input=inputs.append)
+    assert inputs == []
+
+
+@pytest.mark.parametrize("message", [EXTENDED_KEY, RESIZE, b"\x05\x80\0\0\0\0\x01",
+                                    b"\x06\0\0\0\xff\xff\xff\xfc" + bytes(4), b"\x99"])
+def test_unnegotiated_input_rejects_whole_chunk_without_dispatch(message):
+    gate, inputs = RfbClientGate(), []
+    gate.feed(HELLO, lambda: False, epoch=0, on_input=inputs.append)
+    with pytest.raises(ScreenError, match="INVALID_RFB_STREAM"):
+        gate.feed(KEY + message, lambda: True, epoch=2, on_input=inputs.append)
+    assert inputs == []
+
+
+def test_extended_pointer_is_parsed_as_seven_bytes_even_when_dropped():
+    gate = RfbClientGate()
+    gate.feed(HELLO, lambda: False)
+    assert gate.feed(b"\x05\x80\0\0\0\0\x01" + REQUEST, lambda: False) == REQUEST

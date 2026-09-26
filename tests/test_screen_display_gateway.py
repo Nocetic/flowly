@@ -61,7 +61,7 @@ async def display_gateway(tmp_path, monkeypatch):
                 status=lambda gen=generation: {
                     "phase": "running", "generation": gen,
                     "socket": "/must-not-use-manifest-path", "cdpPort": 9999,
-                    "observerServiceVersion": 1, "inputServiceVersion": 1,
+                    "observerServiceVersion": 2, "inputServiceVersion": 2,
                 },
             )
 
@@ -190,10 +190,49 @@ async def test_public_control_capability_cannot_cross_profiles_or_older_runtime(
     assert rejected["error"]["code"] == "SCREEN_UPGRADE_REQUIRED"
 
 
+@pytest.mark.parametrize("framed", [False, True])
+async def test_unframed_or_stale_epoch_input_cannot_bypass_human_authority(display_gateway, framed):
+    fixture = display_gateway
+    view, headers = await observe(fixture)
+    if framed:
+        headers["X-Flowly-Screen-Input"] = "epoch-u64-v1"
+    async with fixture.client.ws_connect(fixture.server.make_url(STREAM_PATH), headers=headers) as ws:
+        rfb = RfbSocket(ws, epoch=0 if framed else None)
+        await rfb.handshake()
+        human = (await fixture.rpc("display.control.acquire", control_params(view, 1, "acquire")))["result"]["control"]
+        assert human["epoch"] == 2 and human["control"] == "human"
+        key = struct.pack("!BBHI", 4, 1, 0, ord("x"))
+        update = struct.pack("!BBHHHH", 3, 1, 0, 0, 64, 48)
+        await rfb.send(key + update, epoch=1 if framed else None)
+        await asyncio.wait_for(fixture.received_event.wait(), 5)
+        assert fixture.received == [("default", update)]
+        assert fixture.input_services["default"]._broker is None
+
+
+async def test_a_partial_key_cannot_cross_a_takeover_epoch(display_gateway):
+    fixture = display_gateway
+    view, headers = await observe(fixture)
+    headers["X-Flowly-Screen-Input"] = "epoch-u64-v1"
+    async with fixture.client.ws_connect(fixture.server.make_url(STREAM_PATH), headers=headers) as ws:
+        rfb = RfbSocket(ws, epoch=0)
+        await rfb.handshake()
+        key = struct.pack("!BBHI", 4, 1, 0, ord("x"))
+        await rfb.send(key[:3])
+        await fixture.rpc("display.control.acquire", control_params(view, 1, "acquire"))
+        await rfb.send(key[3:], epoch=2)
+        assert (await ws.receive(timeout=5)).type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED}
+        assert fixture.input_services["default"]._broker is None
+
+
 class RfbSocket:
-    def __init__(self, ws):
+    def __init__(self, ws, epoch=None):
         self.ws = ws
+        self.epoch = epoch
         self.buffer = bytearray()
+
+    async def send(self, data, *, epoch=None):
+        selected = self.epoch if epoch is None else epoch
+        await self.ws.send_bytes((selected.to_bytes(8, "big") if selected is not None else b"") + data)
 
     async def read(self, length):
         while len(self.buffer) < length:
@@ -206,12 +245,12 @@ class RfbSocket:
 
     async def handshake(self):
         assert await self.read(12) == b"RFB 003.008\n"
-        await self.ws.send_bytes(b"RFB 003.008\n")
+        await self.send(b"RFB 003.008\n")
         assert await self.read(2) == b"\x01\x01"
-        await self.ws.send_bytes(b"\x01")
+        await self.send(b"\x01")
         assert await self.read(4) == bytes(4)
         # Unshared requests must be converted to shared by the product gate.
-        await self.ws.send_bytes(b"\x00")
+        await self.send(b"\x00")
         init = await self.read(24)
         await self.read(int.from_bytes(init[20:24], "big"))
         return init

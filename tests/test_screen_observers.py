@@ -21,12 +21,12 @@ def environment(tmp_path):
         registry = ObserverRegistry(authority, "generation", Path(directory))
         service = InputService(authority, "generation", Path(directory), observers=registry)
 
-        def observe(viewer="other", generation="generation"):
+        def observe(viewer="other", generation="generation", stream=None):
             connection = socket.socket(socket.AF_UNIX)
             connection.settimeout(3)
             peers.append(connection)
             connection.connect(str(registry.path))
-            _send(connection, dict(viewer=viewer, generation=generation))
+            _send(connection, dict(viewer=viewer, generation=generation, **({"stream": stream} if stream else {})))
             reply = _receive(connection)
             if reply != {"ok": True}:
                 raise ScreenError(reply["code"])
@@ -113,3 +113,15 @@ def test_registry_shutdown_and_viewer_eof_never_release_human_ownership(environm
     assert authority.snapshot() == state
     with pytest.raises(ScreenError, match="CONTROL_UNAVAILABLE"):
         client.request("acquire", generation="generation", viewer="holder", epoch=state["epoch"])
+
+
+def test_new_attachment_permanently_retires_previous_input_source(environment):
+    _, registry, _, observe = environment
+    old = observe("viewer", stream="first")
+    assert registry.is_current("viewer", "first")
+    new = observe("viewer", stream="second")
+    assert old.recv(1) == b"R"
+    assert not registry.is_current("viewer", "first")
+    assert registry.is_current("viewer", "second")
+    new.close()
+    assert not registry.is_current("viewer", "first")

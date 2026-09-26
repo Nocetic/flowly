@@ -2,14 +2,16 @@
 
 The installed host, profile directory and Unix socket are server-resolved.
 Stream credentials travel in headers, not URLs, chat events or access logs.
-This first transport slice is viewing-only; input/control RPCs are advertised
-only after the host input-drain coordinator is connected.
+Input travels in epoch-tagged frames and only through the supervisor's broker.
+Legacy raw RFB streams remain viewing-only even when a viewer holds control.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import secrets
 import threading
 from pathlib import Path
 
@@ -29,6 +31,12 @@ METHODS = frozenset({"display.capabilities", "display.status", "display.observe"
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
+INPUT_PROTOCOL = "epoch-u64-v1"
+
+
+def _supports_input(state: dict | None) -> bool:
+    return bool(state and state.get("phase") == "running" and state.get("inputServiceVersion") == 2
+                and state.get("observerServiceVersion") == 2)
 
 
 class DisplaySession:
@@ -55,9 +63,10 @@ class DisplaySession:
 
     def capabilities(self) -> dict:
         capability = ScreenRuntime.capabilities()
+        state = self.runtime.status() if capability["supported"] else None
         return {**self.identity, "protocolVersion": 1, **capability,
                 "transports": ["direct"] if capability["supported"] else [],
-                "view": capability["supported"], "input": False,
+                "view": capability["supported"], "input": _supports_input(state),
                 "lifecycle": False, "installSupported": False}
 
     @property
@@ -122,11 +131,12 @@ class DisplaySession:
         ticket = self.tickets.issue(self.scope(generation), viewer)
         return {**credentials, **self.identity, "protocolVersion": 1, "generation": generation,
                 "viewerId": viewer, "ticket": ticket, "expiresInMs": 30_000,
-                "streamPath": STREAM_PATH, "viewOnly": True}
+                "streamPath": STREAM_PATH, "viewOnly": True,
+                "inputProtocol": INPUT_PROTOCOL if _supports_input(self.running(generation)) else None}
 
     def control(self, method: str, generation: str, token: str, epoch: int, operation: str) -> dict:
         state = self.running(generation)
-        if state.get("observerServiceVersion") != 1 or state.get("inputServiceVersion") != 1:
+        if state.get("observerServiceVersion") not in (1, 2) or state.get("inputServiceVersion") not in (1, 2):
             raise ScreenError("SCREEN_UPGRADE_REQUIRED")
         viewer = self.authenticate_viewer(generation, token)
         result = InputServiceClient(self.runtime.socket_directory / "input.sock").request(
@@ -247,6 +257,9 @@ def register_display(app: web.Application, gateway) -> None:
                   "expectedBotId": request.headers.get("X-Flowly-Bot-Id")}
         generation = request.headers.get("X-Flowly-Screen-Generation", "")
         ticket = request.headers.get("X-Flowly-Screen-Ticket", "")
+        input_protocol = request.headers.get("X-Flowly-Screen-Input")
+        if input_protocol not in (None, INPUT_PROTOCOL):
+            return _error("INVALID_PARAMS")
         try:
             session = await asyncio.to_thread(_resolve, gateway, params, pinned=True)
             viewer = await asyncio.to_thread(session.tickets.consume, ticket, session.scope(generation))
@@ -254,6 +267,8 @@ def register_display(app: web.Application, gateway) -> None:
                                            session.identity["botId"]):
                 raise ScreenError("VIEWER_EXPIRED")
             state = await asyncio.to_thread(session.current, generation, viewer)
+            if input_protocol and not _supports_input(state):
+                raise ScreenError("SCREEN_UPGRADE_REQUIRED")
         except ScreenError as exc:
             return _error(exc.code, 403)
         except OSError:
@@ -263,14 +278,19 @@ def register_display(app: web.Application, gateway) -> None:
         session.attaching += 1
         writer = None
         observer_writer = None
-        ws = web.WebSocketResponse(max_msg_size=MAX_FRAME, heartbeat=15, compress=False, timeout=2)
+        ws = web.WebSocketResponse(max_msg_size=MAX_FRAME + (8 if input_protocol else 0), heartbeat=15,
+                                   compress=False, timeout=2)
         tasks = []
+        stream_id = secrets.token_urlsafe(24)
         try:
-            if state.get("observerServiceVersion") == 1:
+            if state.get("observerServiceVersion") in (1, 2):
                 async with asyncio.timeout(3):
                     observer_reader, observer_writer = await asyncio.open_unix_connection(
                         session.runtime.socket_directory / "observers.sock", limit=4096)
-                    hello = json.dumps({"viewer": viewer, "generation": generation}).encode()
+                    registration = {"viewer": viewer, "generation": generation}
+                    if state["observerServiceVersion"] == 2:
+                        registration["stream"] = stream_id
+                    hello = json.dumps(registration).encode()
                     observer_writer.write(len(hello).to_bytes(4, "big") + hello)
                     await observer_writer.drain()
                     size = int.from_bytes(await observer_reader.readexactly(4), "big")
@@ -304,19 +324,56 @@ def register_display(app: web.Application, gateway) -> None:
                     await asyncio.wait_for(ws.send_bytes(data), 5)
 
             async def viewer_to_server():
+                input_client = InputServiceClient(session.runtime.socket_directory / "input.sock")
+                input_state = None
+                input_epoch = None
                 async for message in ws:
                     if message.type != WSMsgType.BINARY:
                         raise ScreenError("INVALID_RFB_STREAM")
                     await check_current()
-                    data = gate.feed(message.data, lambda: False)
+                    payload = message.data
+                    epoch = None
+                    if input_protocol:
+                        if not 8 < len(payload) <= MAX_FRAME + 8:
+                            raise ScreenError("INVALID_RFB_STREAM")
+                        epoch = int.from_bytes(payload[:8], "big")
+                        if epoch >= 2**53:
+                            raise ScreenError("INVALID_RFB_STREAM")
+                        payload = payload[8:]
+                    inputs = []
+                    allowed = bool(input_protocol and epoch and await asyncio.to_thread(
+                        session.runtime.authority.may_input, viewer, generation, epoch))
+                    data = gate.feed(payload, lambda: allowed, epoch=epoch,
+                                     on_input=inputs.append if input_protocol else None)
                     if data:
                         writer.write(data)
                         await asyncio.wait_for(writer.drain(), 5)
+                    if inputs:
+                        if input_epoch != epoch:
+                            input_state = await asyncio.to_thread(
+                                input_client.request, "attach", viewer=viewer, generation=generation,
+                                epoch=epoch, stream=stream_id,
+                            )
+                            input_epoch = epoch
+                        batch = bytearray()
+                        for item in [*inputs, b""]:
+                            if batch and (not item or len(batch) + len(item) > 64 * 1024 + 8):
+                                result = await asyncio.to_thread(
+                                    input_client.request, "send", viewer=viewer, generation=generation, epoch=epoch,
+                                    handle=input_state["handle"], sequence=input_state["nextSequence"],
+                                    data=base64.b64encode(batch).decode(),
+                                )
+                                input_state["nextSequence"] = result["nextSequence"]
+                                batch.clear()
+                            batch.extend(item)
 
             async def monitor():
                 while True:
                     await asyncio.sleep(0.25)
                     await check_current()
+                    if not await asyncio.to_thread(session.viewers.active, viewer, session.scope(generation),
+                                                   session.identity["botId"]):
+                        raise ScreenError("VIEWER_EXPIRED")
 
             tasks.extend(asyncio.create_task(operation()) for operation in (server_to_viewer, viewer_to_server, monitor))
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

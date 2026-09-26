@@ -97,6 +97,7 @@ class InputService:
         self._viewer: str | None = None
         self._epoch = 0
         self._handle: str | None = None
+        self._stream: str | None = None
         self._sequence = 0
         self._last_digest: bytes | None = None
         self._finished: dict[str, tuple[str, int, bool, dict]] = {}
@@ -173,7 +174,7 @@ class InputService:
     def _dispatch(self, request: dict) -> dict:
         method = request.get("method")
         fields = {"method", "generation", "viewer", "epoch"}
-        extras = {"open": set(), "send": {"handle", "sequence", "data"},
+        extras = {"open": set(), "attach": {"stream"}, "send": {"handle", "sequence", "data"},
                   "finish": {"handle", "release"}, "acquire": set(),
                   "control.acquire": {"operationId"}, "control.release": {"operationId"},
                   "control.reclaim": {"operationId"}}
@@ -198,14 +199,23 @@ class InputService:
                     if error.code != "TAKEOVER_PENDING":
                         raise
             return state
-        if method == "open":
+        if method in {"open", "attach"}:
             if not self.authority.may_input(viewer, self.generation, epoch):
                 raise ScreenError("VIEWER_MISMATCH")
+            stream = _identity(request["stream"]) if method == "attach" else None
+            if stream is not None:
+                if self.observers is None or not self.observers.is_current(viewer, stream):
+                    raise ScreenError("VIEWER_REVOKED")
+                if self._broker is not None and self._stream != stream:
+                    # Reconnect drains the old socket before admitting another
+                    # input source, while leaving human ownership unchanged.
+                    self._finish(False)
             if self._broker is None:
                 self._broker = ScreenInputBroker(self.authority, viewer, self.generation, epoch, self.rfb)
                 self._viewer, self._epoch = viewer, epoch
                 self._handle, self._sequence = secrets.token_urlsafe(32), 0
                 self._last_digest = None
+                self._stream = stream
             elif self._viewer != viewer or self._epoch != epoch:
                 raise ScreenError("VIEWER_MISMATCH")
             return {"handle": self._handle, "nextSequence": self._sequence, "generation": self.generation}
@@ -223,6 +233,8 @@ class InputService:
                 or self._viewer != viewer or epoch != self._epoch):
             raise ScreenError("VIEWER_MISMATCH")
         if method == "send":
+            if self._stream is not None and not self.observers.is_current(viewer, self._stream):
+                raise ScreenError("VIEWER_REVOKED")
             sequence, data = request["sequence"], request["data"]
             if type(sequence) is not int or not 0 <= sequence < 2**53 or not isinstance(data, str):
                 raise ScreenError("INVALID_PARAMS")

@@ -146,7 +146,7 @@ def run(directory: Path, generation: str) -> None:
             observers = ObserverRegistry(runtime.authority, generation, sockets)
             input_service = InputService(runtime.authority, generation, sockets, observers=observers)
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
-                         cdpPort=port, inputServiceVersion=1, observerServiceVersion=1, error=None)
+                         cdpPort=port, inputServiceVersion=2, observerServiceVersion=2, error=None)
             write_state(runtime.manifest, state)
             while not stopping:
                 if (not input_service.is_alive or not observers.is_alive

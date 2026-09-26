@@ -230,7 +230,7 @@ def test_supervisor_keeps_input_after_gateway_worker_exit(tmp_path, login_site):
         human = authority.acquire("viewer", generation, authority.snapshot()["epoch"])
         identity = dict(generation=generation, viewer="viewer", epoch=human["epoch"])
         path = runtime["runtime"].socket_directory / "input.sock"
-        assert runtime["state"]["inputServiceVersion"] == 1
+        assert runtime["state"]["inputServiceVersion"] == 2
         client = InputServiceClient(path)
         opened = client.request("open", **identity)
         clicks = b"".join(struct.pack("!BBHH", 5, mask, point["x"], point["y"]) for mask in (0, 1, 0))
@@ -508,6 +508,7 @@ def test_real_cli_starts_adopts_and_stops_persistent_screen(tmp_path):
 @pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_GATEWAY_TEST") != "1", reason="requires full Core Linux runner")
 async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_path, monkeypatch, profile):
     import asyncio
+    from contextlib import asynccontextmanager
     from unittest.mock import AsyncMock
 
     import aiohttp
@@ -536,7 +537,11 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
         async with async_playwright() as playwright:
             browser = await playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{state['cdpPort']}")
             page = browser.contexts[0].pages[0]
-            await page.set_content(f"<html><body style='background:#237bb4'>{profile} browser fixture</body></html>")
+            await page.set_content(f"<html><body style='background:#237bb4'>{profile} browser fixture<input id='code'></body></html>")
+            await page.evaluate("""() => {
+                window.keys = [];
+                for (const name of ['keydown', 'keyup']) addEventListener(name, e => window.keys.push([name, e.key]));
+            }""")
             await page.bring_to_front()
             async with aiohttp.ClientSession() as client:
                 auth = {"Authorization": "Bearer test-display-token"}
@@ -557,6 +562,43 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                     headers = {**auth, "X-Flowly-Profile": profile, "X-Flowly-Host-Id": status["hostId"],
                                "X-Flowly-Bot-Id": status["botId"], "X-Flowly-Screen-Generation": state["generation"],
                                "X-Flowly-Screen-Ticket": observed["ticket"]}
+
+                    async def control(method, epoch):
+                        await chat.send_json({"type": "rpc", "id": "control", "method": method, "params": {
+                            "profileId": profile, "expectedHostId": status["hostId"], "expectedBotId": status["botId"],
+                            "generation": state["generation"], "viewerToken": observed["viewerToken"],
+                            "epoch": epoch, "operationId": f"{method}-{epoch}",
+                        }})
+                        return (await chat.receive_json())["result"]["control"]
+
+                    @asynccontextmanager
+                    async def input_stream(epoch):
+                        await chat.send_json({"type": "rpc", "id": "resume", "method": "display.observe", "params": {
+                            "profileId": profile, "expectedHostId": status["hostId"], "expectedBotId": status["botId"],
+                            "generation": state["generation"], "viewerToken": observed["viewerToken"],
+                        }})
+                        resumed = (await chat.receive_json())["result"]
+                        assert resumed["viewerId"] == observed["viewerId"]
+                        assert resumed["inputProtocol"] == "epoch-u64-v1"
+                        framed_headers = {**headers, "X-Flowly-Screen-Ticket": resumed["ticket"],
+                                          "X-Flowly-Screen-Input": "epoch-u64-v1"}
+                        async with client.ws_connect(server.make_url(STREAM_PATH), headers=framed_headers) as ws:
+                            stream = RfbSocket(ws, epoch=epoch)
+                            await stream.handshake()
+                            await stream.send(struct.pack("!BBHi", 2, 0, 1, 0))
+                            yield stream
+
+                    async def frame_barrier(stream):
+                        await stream.send(struct.pack("!BBHHHH", 3, 0, 200, 300, 8, 8))
+                        update = await stream.read(4)
+                        assert update[0] == 0
+                        for _ in range(int.from_bytes(update[2:4], "big")):
+                            _, _, width, height, encoding = struct.unpack("!HHHHi", await stream.read(12))
+                            assert encoding == 0
+                            await stream.read(width * height * 4)
+
+                    def key(character):
+                        return b"".join(struct.pack("!BBHI", 4, down, 0, ord(character)) for down in (1, 0))
                     async with client.ws_connect(server.make_url(STREAM_PATH), headers=headers) as screen:
                         rfb = RfbSocket(screen)
                         init = await rfb.handshake()
@@ -601,13 +643,41 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                                 # The holder's original capture remains usable.
                                 await screen.send_bytes(struct.pack("!BBHHHH", 3, 0, 200, 300, 8, 8))
                                 assert (await rfb.read(4))[0] == 0
+                                point = await page.locator("#code").evaluate("""element => {
+                                    const box = element.getBoundingClientRect();
+                                    return {x: Math.round(screenX + box.x + 10),
+                                            y: Math.round(screenY + outerHeight - innerHeight + box.y + 10)};
+                                }""")
+                                async with input_stream(human["epoch"]) as active:
+                                    clicks = b"".join(struct.pack("!BBHH", 5, mask, point["x"], point["y"])
+                                                       for mask in (0, 1, 0))
+                                    await active.send(clicks)
+                                    try:
+                                        await page.wait_for_function("document.activeElement.id === 'code'", timeout=5000)
+                                    except Exception:
+                                        detail = await page.evaluate("({focused:document.hasFocus(), element:document.activeElement.tagName, keys:window.keys})")
+                                        raise AssertionError(f"RFB click did not focus input: {point}, {detail}, {runtime.authority.snapshot()}") from None
+                                    await active.send(key("h"))
+                                    await page.wait_for_function("document.querySelector('#code').value === 'h'", timeout=5000)
+                                    await active.send(struct.pack("!BBHI", 4, 1, 0, 0xFFE1))
+                                    await page.wait_for_function("window.keys.some(e => e[0] === 'keydown' && e[1] === 'Shift')")
+                                    released = await control("display.control.release", human["epoch"])
+                                    await page.wait_for_function("window.keys.some(e => e[0] === 'keyup' && e[1] === 'Shift')")
+                                    await active.send(key("x"))
+                                    await frame_barrier(active)
+                                    assert await page.locator("#code").input_value() == "h"
+                                    human = await control("display.control.acquire", released["epoch"])
+                                    assert human["control"] == "human"
+                                    # Still tagged with the previous epoch, even
+                                    # though this same viewer owns control again.
+                                    await active.send(key("q"))
+                                    await frame_barrier(active)
+                                    assert await page.locator("#code").input_value() == "h"
+                                    async with input_stream(human["epoch"]) as replacement:
+                                        await replacement.send(key("z"))
+                                        await page.wait_for_function("document.querySelector('#code').value === 'hz'")
                             finally:
-                                await chat.send_json({"type": "rpc", "id": "handback",
-                                                      "method": "display.control.release", "params": {
-                                                          **control_params, "epoch": human["epoch"],
-                                                          "operationId": "handback",
-                                                      }})
-                                released = (await chat.receive_json())["result"]["control"]
+                                released = await control("display.control.release", human["epoch"])
                                 assert released["control"] == "agent"
                     assert runtime.status()["generation"] == state["generation"]
                     assert is_alive(state["supervisor"])
