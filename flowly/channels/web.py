@@ -250,6 +250,7 @@ class WebChannel(BaseChannel):
         self._ws = None
         self._screen_gateway = None
         self._screen_streams = None
+        self._screen_rpc = None
         self._reconnect_delay = 5  # seconds
         self._max_reconnect_delay = 60
         # Track active browser sessions: sessionId → asyncio.Event (response ready)
@@ -1494,6 +1495,7 @@ class WebChannel(BaseChannel):
             self._clear_profile_subagent_observers()
             self._ws = ws
             if self._screen_gateway is not None:
+                from flowly.desktop_runtime.relay_rpc import RelayScreenRpc
                 from flowly.desktop_runtime.relay_stream import RelayScreenStreams
                 def stream_token():
                     issued = int(time.time())
@@ -1503,6 +1505,10 @@ class WebChannel(BaseChannel):
                         relay_url=self.config.relay_url, server_id=self.config.server_id,
                         token=stream_token, gateway=self._screen_gateway,
                         current=lambda: self._ws is ws, ssl_context=ssl_ctx,
+                    )
+                    self._screen_rpc = RelayScreenRpc(
+                        gateway=self._screen_gateway, current=lambda: self._ws is ws,
+                        send=lambda frame: ws.send(json.dumps(frame)),
                     )
                 except ValueError:
                     self._screen_streams = None
@@ -1558,6 +1564,9 @@ class WebChannel(BaseChannel):
                     task.cancel()
                 if pending_long_rpcs:
                     await asyncio.gather(*pending_long_rpcs, return_exceptions=True)
+                if self._screen_rpc is not None:
+                    await self._screen_rpc.close()
+                    self._screen_rpc = None
                 if self._screen_streams is not None:
                     await self._screen_streams.close()
                     self._screen_streams = None
@@ -1622,6 +1631,8 @@ class WebChannel(BaseChannel):
             if (ws is self._ws and self._screen_streams is not None and self._screen_streams.available
                     and PROTOCOL in (msg.get("capabilities") or [])):
                 await ws.send(json.dumps({"type": "screen.transport.ready", "protocol": PROTOCOL}))
+                if self._screen_rpc is not None:
+                    self._screen_rpc.enabled = True
             cron_session_id = msg.get("cronSessionId")
             if cron_session_id:
                 self._cron_session_id = cron_session_id
@@ -1645,10 +1656,14 @@ class WebChannel(BaseChannel):
         elif msg_type == "browser-connected":
             session_id = msg.get("sessionId", "")
             logger.info(f"[WebChannel] Browser connected: {session_id}")
+            if ws is self._ws and self._screen_rpc is not None:
+                self._screen_rpc.connected(session_id)
 
         elif msg_type == "browser-disconnected":
             session_id = msg.get("sessionId", "")
             logger.info(f"[WebChannel] Browser disconnected: {session_id}")
+            if ws is self._ws and self._screen_rpc is not None:
+                await self._screen_rpc.disconnected(session_id)
             self._pending.pop(session_id, None)
             self._subagent_observers.pop(session_id, None)
             self._subagent_event_versions.pop(session_id, None)
@@ -1691,6 +1706,14 @@ class WebChannel(BaseChannel):
         rpc_id = msg.get("id", "")
         params = msg.get("params", {})
         session_id = msg.get("sessionId", "")
+
+        if isinstance(method, str) and method.startswith("display."):
+            if ws is self._ws and self._screen_rpc is not None and self._screen_rpc.enabled:
+                await self._screen_rpc.submit(session_id, msg)
+            else:
+                await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id,
+                    "error": {"code": "METHOD_NOT_FOUND", "message": "Screen relay transport is unavailable."}}))
+            return
 
         if method == "chat.send":
             message_text = params.get("message", "")
