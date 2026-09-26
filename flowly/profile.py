@@ -141,6 +141,12 @@ def _profile_mutation_lock() -> FileLock:
     return FileLock(str(_PROFILES_ROOT / _PROFILE_MUTATION_LOCK_FILE))
 
 
+def _assert_profile_not_retiring(profile_dir: Path) -> None:
+    from flowly.desktop_runtime.profile_lifecycle import assert_not_retired
+
+    assert_not_retired(profile_dir / "desktop")
+
+
 # ── Path resolution ───────────────────────────────────────────────
 
 def get_flowly_home() -> Path:
@@ -773,6 +779,7 @@ def create_profile(
 
     profile_dir = _PROFILES_ROOT / name
     with _profile_mutation_lock():
+        _assert_profile_not_retiring(profile_dir)
         if profile_dir.exists() or profile_dir.is_symlink():
             raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
         _assert_named_profile_capacity()
@@ -889,6 +896,7 @@ def create_profile(
         # can both create profiles, so checking only before staging would let
         # concurrent processes race beyond the installation limit.
         with _profile_mutation_lock():
+            _assert_profile_not_retiring(profile_dir)
             if profile_dir.exists() or profile_dir.is_symlink():
                 raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
             _assert_named_profile_capacity()
@@ -1670,6 +1678,17 @@ def reconcile_runtime_lease(
 
 def claim_runtime_lease(instance_id: str) -> Path:
     """Exclusively claim the current profile for one managed runtime."""
+    from flowly.desktop_runtime.profile_lifecycle import assert_not_retired, construction_guard
+
+    home = get_flowly_home()
+    with construction_guard(home / "desktop"):
+        assert_not_retired(home / "desktop")
+        if home.parent == _PROFILES_ROOT and (not home.is_dir() or home.is_symlink()):
+            raise FileNotFoundError("The selected profile no longer exists.")
+        return _claim_runtime_lease(instance_id)
+
+
+def _claim_runtime_lease(instance_id: str) -> Path:
     if not instance_id:
         raise ValueError("runtime instance id is required")
     path = get_flowly_home() / _RUNTIME_LEASE_FILE
@@ -1771,25 +1790,45 @@ def release_runtime_lease(instance_id: str) -> None:
         path.unlink(missing_ok=True)
 
 
-def delete_profile(name: str) -> None:
+def delete_profile(name: str, *, expected_bot_id: str | None = None) -> None:
     """Delete a named profile."""
     validate_profile_name(name)
     if name == "default":
         raise ValueError("Cannot delete the default profile.")
 
+    from flowly.desktop_runtime.profile_lifecycle import (
+        begin_retirement,
+        cleanup_screen_storage,
+        finish_retirement,
+        removable_screen,
+        retirement,
+    )
+
     profile_dir = _PROFILES_ROOT / name
-    if not profile_dir.exists():
-        raise FileNotFoundError(f"Profile '{name}' does not exist.")
-    if profile_dir.is_symlink() or _PROFILES_ROOT.resolve() not in profile_dir.resolve().parents:
-        raise ValueError("Profile directory failed containment validation.")
+    with removable_screen(profile_dir) as screen, _profile_mutation_lock():
+        if profile_dir.is_symlink() or _PROFILES_ROOT.resolve() not in profile_dir.resolve().parents:
+            raise ValueError("Profile directory failed containment validation.")
+        if not profile_dir.exists():
+            if retirement(profile_dir / "desktop") is None:
+                raise FileNotFoundError(f"Profile '{name}' does not exist.")
+            # The previous deletion removed storage and the profile, then lost
+            # its final acknowledgement. Finish that receipt without replay.
+            finish_retirement(profile_dir)
+        else:
+            if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
+                from flowly.desktop_runtime.authority import ScreenError
 
-    lease = reconcile_runtime_lease(profile_dir, profile_name=name)
-    if lease:
-        raise RuntimeError(
-            f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before deletion."
-        )
-
-    shutil.rmtree(profile_dir)
+                raise ScreenError("PROFILE_IDENTITY_CHANGED")
+            lease = reconcile_runtime_lease(profile_dir, profile_name=name)
+            if lease:
+                raise RuntimeError(
+                    f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before deletion."
+                )
+            begin_retirement(profile_dir)
+            if screen is not None:
+                cleanup_screen_storage(screen)
+            shutil.rmtree(profile_dir)
+            finish_retirement(profile_dir)
 
     # Clean up active_profile if it pointed to deleted profile
     if get_active_profile() == name:
@@ -1850,7 +1889,25 @@ def _write_profile_archive(
 ) -> Path:
     import tarfile
 
-    excluded = excluded_roots or set()
+    # Machine-local browser sessions and control capabilities are never portable
+    # profile data, including in encrypted backups. Import also strips legacy
+    # copies; preventing their export avoids exposing otherwise unused secrets.
+    excluded = {"desktop", *(excluded_roots or set())}
+
+    def archive_entries():
+        # Prune before traversal: a live browser contains sockets, locks and
+        # potentially large caches. None of those entries belong in a backup.
+        def on_error(error):
+            raise error
+
+        for base, directories, files in os.walk(profile_dir, followlinks=False, onerror=on_error):
+            if Path(base) == profile_dir:
+                directories[:] = [item for item in directories if item not in excluded]
+                files = [item for item in files if item not in excluded]
+            directories.sort()
+            for item in sorted([*directories, *files]):
+                yield Path(base) / item
+
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
     )
@@ -1873,7 +1930,7 @@ def _write_profile_archive(
                 root_info.mode = 0o700
                 root_info.mtime = int(time.time())
                 bundle.addfile(root_info)
-                for candidate in sorted(profile_dir.rglob("*")):
+                for candidate in archive_entries():
                     relative = candidate.relative_to(profile_dir)
                     if relative.parts[0] in excluded:
                         continue
@@ -1917,6 +1974,7 @@ def _write_profile_archive(
 
 _TEMPLATE_EXCLUDED_ROOTS = frozenset({
     _RUNTIME_LEASE_FILE,
+    "desktop",
     ".env",
     "credentials",
     "mcp-tokens",
@@ -2276,6 +2334,7 @@ def _import_profile_archive(
     except OSError:
         pass
     with _profile_mutation_lock():
+        _assert_profile_not_retiring(profile_dir)
         if profile_dir.exists() or profile_dir.is_symlink():
             raise FileExistsError(f"Profile '{inferred}' already exists.")
         _assert_named_profile_capacity()
@@ -2331,6 +2390,7 @@ def _import_profile_archive(
         _atomic_write_json(extracted / _PROFILE_METADATA_FILE, metadata)
         _harden_profile_tree_permissions(extracted)
         with _profile_mutation_lock():
+            _assert_profile_not_retiring(profile_dir)
             if profile_dir.exists() or profile_dir.is_symlink():
                 raise FileExistsError(f"Profile '{inferred}' already exists.")
             _assert_named_profile_capacity()

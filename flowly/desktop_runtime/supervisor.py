@@ -100,7 +100,7 @@ def run(directory: Path, generation: str) -> None:
     # A daemon parent may ignore SIGCHLD. Restore normal zombie/reap semantics
     # before spawning: group cleanup relies on retaining each child PID.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-    runtime = ScreenRuntime(directory)
+    runtime = ScreenRuntime(directory, create=False)
     with FileLock(directory / "supervisor.lock", timeout=0, mode=0o600):
         state = runtime.read_manifest()
         if not state or state["generation"] != generation or state["phase"] != "starting":

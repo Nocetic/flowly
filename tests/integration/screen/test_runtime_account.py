@@ -320,3 +320,67 @@ def test_root_agent_runs_real_browser_and_input_as_unprivileged_account(layout, 
             assert any(cookie["name"] == "session" and cookie["value"] == "root-fixture" for cookie in cookies)
     finally:
         runtime.stop(restarted["generation"])
+
+
+def test_profile_delete_stops_at_live_screen_then_removes_external_storage(provisioned, monkeypatch):
+    import flowly.profile as profiles
+    from flowly.desktop_runtime.launcher import ScreenRuntime
+
+    home = Path("/root/profile-delete-test")
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", home)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", home / "profiles")
+    monkeypatch.delenv("FLOWLY_HOME", raising=False)
+    profile = profiles.create_profile("writer", local_runtime=True)
+    other = profiles.create_profile("other", local_runtime=True)
+    other_runtime = ScreenRuntime(other / "desktop")
+    other_application = root_application_layout(other_runtime.directory, create=True)
+    sentinel = other_application.browser / "keep"
+    sentinel.write_text("other profile")
+    runtime = ScreenRuntime(profile / "desktop")
+    state = runtime.start()
+    application = root_application_layout(runtime.directory)
+    try:
+        with pytest.raises(ScreenError, match="SCREEN_BUSY"):
+            profiles.delete_profile("writer")
+        assert application.browser.exists()
+    finally:
+        runtime.stop(state["generation"])
+    profiles.delete_profile("writer")
+    assert not profile.exists()
+    assert not application.directory.exists() and not application.sockets.exists()
+    assert sentinel.read_text() == "other profile"
+    with pytest.raises(ScreenError, match="PROFILE_IDENTITY_CHANGED"):
+        runtime.start()
+
+
+def test_external_cleanup_retries_and_never_follows_application_links(layout, monkeypatch):
+    import shutil
+
+    from flowly.desktop_runtime.application_layout import remove_root_application_storage
+
+    directory, application = layout
+    outside = directory / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_text("private agent file")
+    (application.browser / "link").symlink_to(outside)
+    original = shutil.rmtree
+
+    def fail_socket_once(path, *args, **kwargs):
+        if path == application.sockets:
+            raise OSError("temporary socket cleanup failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", fail_socket_once)
+    # Preserve the advertised platform implementation capability when faulting.
+    fail_socket_once.avoids_symlink_attacks = original.avoids_symlink_attacks
+    with pytest.raises(ScreenError, match="RUNTIME_STATE_INVALID"):
+        remove_root_application_storage(directory)
+    assert not application.directory.exists() and application.sockets.exists()
+    assert sentinel.read_text() == "private agent file"
+    monkeypatch.setattr(shutil, "rmtree", original)
+    remove_root_application_storage(directory)
+    remove_root_application_storage(directory)
+    assert not application.sockets.exists()
+    assert sentinel.read_text() == "private agent file"

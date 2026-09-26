@@ -23,6 +23,7 @@ from flowly.desktop_runtime.input_service import InputServiceClient
 from flowly.desktop_runtime.install_plan import installation_plan
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.desktop_runtime.lifecycle import ScreenLifecycle
+from flowly.desktop_runtime.profile_lifecycle import assert_not_retired, construction_guard
 from flowly.desktop_runtime.rfb import RfbClientGate
 from flowly.desktop_runtime.status import StatusSequence
 from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
@@ -60,15 +61,20 @@ class DisplaySession:
 
     @property
     def runtime(self) -> ScreenRuntime:
-        if self._runtime is None:
-            self._runtime = ScreenRuntime(self.directory)
-        return self._runtime
+        with construction_guard(self.directory):
+            assert_not_retired(self.directory)
+            if self._runtime is None:
+                self._runtime = ScreenRuntime(self.directory, require_parent=True)
+            self._runtime.assert_current_directory()
+            return self._runtime
 
     @property
     def tickets(self) -> StreamTickets:
-        if self._tickets is None:
-            self._tickets = StreamTickets(self.directory / "admission")
-        return self._tickets
+        with construction_guard(self.directory):
+            self.runtime.assert_current_directory()
+            if self._tickets is None:
+                self._tickets = StreamTickets(self.directory / "admission")
+            return self._tickets
 
     def capabilities(self) -> dict:
         capability = ScreenRuntime.capabilities()
@@ -86,9 +92,11 @@ class DisplaySession:
 
     @property
     def viewers(self) -> ViewerCredentials:
-        if self._viewers is None:
-            self._viewers = ViewerCredentials(self.tickets)
-        return self._viewers
+        with construction_guard(self.directory):
+            self.runtime.assert_current_directory()
+            if self._viewers is None:
+                self._viewers = ViewerCredentials(self.tickets)
+            return self._viewers
 
     def running(self, generation: str) -> dict:
         state = self.runtime.status()
@@ -114,9 +122,11 @@ class DisplaySession:
         return state
 
     def status(self) -> dict:
-        if self._status_sequence is None:
-            self._status_sequence = StatusSequence(self.directory)
-        return self._status_sequence.snapshot(self._status_snapshot)
+        with construction_guard(self.directory):
+            self.runtime.assert_current_directory()
+            if self._status_sequence is None:
+                self._status_sequence = StatusSequence(self.directory)
+            return self._status_sequence.snapshot(self._status_snapshot)
 
     def _status_snapshot(self) -> dict:
         available = ScreenRuntime.capabilities()
@@ -137,9 +147,11 @@ class DisplaySession:
 
     @property
     def handoffs(self) -> RunHandoffs:
-        if self._handoffs is None:
-            self._handoffs = RunHandoffs(self.directory, self.runtime.authority)
-        return self._handoffs
+        with construction_guard(self.directory):
+            self.runtime.assert_current_directory()
+            if self._handoffs is None:
+                self._handoffs = RunHandoffs(self.directory, self.runtime.authority)
+            return self._handoffs
 
     def resume(self, generation: str, token: str, handoff_id: str, epoch: int, operation: str) -> dict:
         self.running(generation)

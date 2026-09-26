@@ -21,7 +21,7 @@ def _runtime() -> ScreenRuntime:
     capabilities = ScreenRuntime.capabilities()
     if not capabilities["supported"]:
         raise ScreenError(capabilities["reason"])
-    return ScreenRuntime(get_flowly_home() / "desktop")
+    return ScreenRuntime(get_flowly_home() / "desktop", require_parent=True)
 
 
 def _status(runtime: ScreenRuntime) -> dict:

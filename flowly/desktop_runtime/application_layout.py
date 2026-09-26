@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,5 +161,36 @@ def root_application_layout(directory: Path, *, create: bool = False) -> RootApp
         sockets_parent = _directory(SOCKET_ROOT, 0, 0, 0o711, create=create)
         sockets = _directory(sockets_parent / value["id"], account.uid, account.gid, 0o700, create=create)
         return RootApplicationLayout(account, applications, sockets)
+    except (OSError, ValueError, KeyError, UnicodeError):
+        raise ScreenError("RUNTIME_STATE_INVALID") from None
+
+
+def remove_root_application_storage(directory: Path) -> None:
+    """Remove only the mapped storage; allow retries after partial removal.
+
+    The caller owns the screen lifecycle lock and a durable profile retirement.
+    Unprivileged leaf contents are removed with fd-based, symlink-safe traversal.
+    The immutable mapping is kept until the profile itself is removed.
+    """
+    account = runtime_account()
+    try:
+        _trusted_root(directory)
+        digest = hashlib.sha256(os.fsencode(directory.absolute())).hexdigest()
+        value = _read_mapping(directory / "application-layout.json", account, digest)
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise ValueError()
+        for parent, uid, gid, mode in ((ROOT / "screens", 0, 0, 0o711),
+                                      (SOCKET_ROOT, account.uid, account.gid, 0o700)):
+            _trusted_root(parent.parent)
+            try:
+                _directory(parent, 0, 0, 0o711, create=False)
+            except FileNotFoundError:
+                continue
+            target = parent / value["id"]
+            try:
+                _directory(target, uid, gid, mode, create=False)
+            except FileNotFoundError:
+                continue
+            shutil.rmtree(target)
     except (OSError, ValueError, KeyError, UnicodeError):
         raise ScreenError("RUNTIME_STATE_INVALID") from None

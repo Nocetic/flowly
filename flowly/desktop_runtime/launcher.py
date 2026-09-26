@@ -18,6 +18,8 @@ import stat
 import subprocess
 import sys
 import time
+import weakref
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -95,13 +97,50 @@ class ScreenRuntime:
     START_TIMEOUT = 30
     STOP_TIMEOUT = 15
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, *, create: bool = True, require_parent: bool = False):
+        from flowly.desktop_runtime.profile_lifecycle import assert_not_retired, construction_guard
+
         self.directory = directory.absolute()
-        if os.name == "posix":
-            private_directory(self.directory)
-        self.manifest = self.directory / "runtime.json"
-        self.authority = ScreenAuthority(self.directory / "authority")
-        self._lock = FileLock(self.directory / "lifecycle.lock", timeout=45, mode=0o600)
+        # Existing supervisor adoption cannot wait behind a deleting profile
+        # that itself waits for the launcher's lifecycle lock. It never creates
+        # the runtime directory; the parent has already reserved that directory.
+        with construction_guard(self.directory) if create else nullcontext():
+            try:
+                if create:
+                    assert_not_retired(self.directory)
+                if require_parent:
+                    parent = self.directory.parent.lstat()
+                    if not stat.S_ISDIR(parent.st_mode):
+                        raise ValueError()
+                if create and os.name == "posix":
+                    private_directory(self.directory)
+                elif create:
+                    self.directory.mkdir(parents=True, exist_ok=True)
+                info = self.directory.lstat()
+                if not stat.S_ISDIR(info.st_mode):
+                    raise ValueError()
+            except (OSError, ValueError):
+                raise ScreenError("PROFILE_IDENTITY_CHANGED") from None
+            self._directory_identity = (info.st_dev, info.st_ino)
+            if os.name == "posix":
+                # Retain the inode while this object exists. Removal/recreation
+                # cannot recycle it and make a stale controller look current.
+                descriptor = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                opened = os.fstat(descriptor)
+                self._directory_identity = (opened.st_dev, opened.st_ino)
+                weakref.finalize(self, os.close, descriptor)
+            self.manifest = self.directory / "runtime.json"
+            self.authority = ScreenAuthority(self.directory / "authority")
+            self._lock = FileLock(self.directory / "lifecycle.lock", timeout=45, mode=0o600)
+
+    def assert_current_directory(self) -> None:
+        try:
+            info = self.directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode)
+                    or (info.st_dev, info.st_ino) != self._directory_identity):
+                raise ValueError()
+        except (OSError, ValueError):
+            raise ScreenError("PROFILE_IDENTITY_CHANGED") from None
 
     @staticmethod
     def capabilities() -> dict:
@@ -183,6 +222,7 @@ class ScreenRuntime:
         return directory / "rfb.sock"
 
     def read_manifest(self) -> dict | None:
+        self.assert_current_directory()
         try:
             fd = os.open(self.manifest, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             with os.fdopen(fd) as source:
@@ -209,11 +249,16 @@ class ScreenRuntime:
 
     def start(self, *, expected_generation: str | None | object = _UNPINNED,
               identity_guard: Callable[[], None] | None = None) -> dict:
+        from flowly.desktop_runtime.profile_lifecycle import assert_not_retired
+
         capabilities = self.capabilities()
         if not capabilities["supported"]:
             raise ScreenError(capabilities["reason"])
-        private_directory(self.directory)
+        self.assert_current_directory()
+        assert_not_retired(self.directory)
         with self._lock:
+            self.assert_current_directory()
+            assert_not_retired(self.directory)
             if identity_guard:
                 identity_guard()
             existing = self.read_manifest()
@@ -291,7 +336,9 @@ class ScreenRuntime:
         raise ScreenError("RUNTIME_START_TIMEOUT")
 
     def stop(self, generation: str, *, identity_guard: Callable[[], None] | None = None) -> None:
+        self.assert_current_directory()
         with self._lock:
+            self.assert_current_directory()
             if identity_guard:
                 identity_guard()
             state = self.read_manifest()

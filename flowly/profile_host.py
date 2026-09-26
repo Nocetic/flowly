@@ -695,9 +695,20 @@ class ProfileHost:
                 "DELETE_CONFIRMATION_INVALID",
                 "Bot deletion confirmation expired. Review the bot and try again.",
             )
-        await self.stop(name)
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.profile_lifecycle import assert_screen_removable
+
+        try:
+            await asyncio.to_thread(assert_screen_removable, describe_profile(name).path)
+            await self.stop(name)
+            await asyncio.to_thread(delete_profile, name, expected_bot_id=current["botId"])
+        except ScreenError as exc:
+            raise ProfileHostError(
+                exc.code, ("Profile identity changed. Review the profile before trying again."
+                           if exc.code == "PROFILE_IDENTITY_CHANGED"
+                           else "Stop or recover this profile's screen before deleting the profile."), retryable=True,
+            ) from None
         await self._rooms.remove_profile(name)
-        delete_profile(name)
         await self._emit(name, "directory", {"action": "deleted", "botId": current["botId"]})
         return {"ok": True, "deleted": name, "botId": current["botId"]}
 

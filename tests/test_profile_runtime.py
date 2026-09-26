@@ -1027,6 +1027,54 @@ def test_profile_template_excludes_private_state_and_redacts_credentials(
     assert json.loads((source / "config.json").read_text(encoding="utf-8")) == source_config
 
 
+@pytest.mark.parametrize("kind", ["archive", "template", "backup"])
+def test_profile_exports_never_traverse_or_copy_screen_credentials(
+    profile_roots, tmp_path, monkeypatch, kind,
+) -> None:
+    source = profiles.create_profile("writer", local_runtime=True)
+    screen = source / "desktop"
+    screen.mkdir()
+    (screen / "cookies").write_bytes(b"screen-cookie-credential")
+    # Browser state may include socket symlinks or unreadable cache directories.
+    # It must be pruned before any recursive archive/template traversal.
+    (screen / "outside").symlink_to(tmp_path / "missing")
+    workspace = source / "workspace" / "desktop"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "notes.txt").write_text("ordinary user document")
+    original = os.scandir
+
+    def guarded(path):
+        if not isinstance(path, int) and Path(path) == screen:
+            pytest.fail("export must not traverse live screen storage")
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", guarded)
+    original_write = profiles._write_profile_archive
+    inspected = []
+
+    def inspect_archive(*args, **kwargs):
+        archive = original_write(*args, **kwargs)
+        with tarfile.open(archive) as bundle:
+            names = bundle.getnames()
+            assert not any(name == "writer/desktop" or name.startswith("writer/desktop/") for name in names)
+            assert "writer/workspace/desktop/notes.txt" in names
+        inspected.append(archive)
+        return archive
+
+    monkeypatch.setattr(profiles, "_write_profile_archive", inspect_archive)
+    target = str(tmp_path / f"export-{kind}")
+    if kind == "backup":
+        password = "test backup passphrase"
+        archive = profiles.export_profile_backup("writer", target, password)
+        # Inspect the plaintext archive before encryption: import's stripping
+        # would hide an accidental credential leak from an export regression.
+        assert archive.read_bytes().startswith(profiles._BACKUP_MAGIC)
+    else:
+        exporter = profiles.export_profile if kind == "archive" else profiles.export_profile_template
+        exporter("writer", target)
+    assert len(inspected) == 1
+
+
 def test_encrypted_profile_backup_round_trips_private_state_and_identity(
     profile_roots, tmp_path: Path,
 ) -> None:

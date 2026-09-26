@@ -3812,7 +3812,7 @@ class GatewayServer:
                 "hostId": self._profile_host.host_id if self._profile_host else get_or_create_profile_host_id(),
                 "profileId": current_profile_name(), "screenId": "browser",
             }
-            self._host_screen_browser = HostBrowserProvider(ScreenRuntime(get_flowly_home() / "desktop"))
+            self._host_screen_browser = HostBrowserProvider(ScreenRuntime(get_flowly_home() / "desktop", require_parent=True))
         return self._host_screen_identity, self._host_screen_browser
 
     def _host_screen_checkpoint_identity(self) -> dict:
