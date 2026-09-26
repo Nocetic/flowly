@@ -46,6 +46,31 @@ def test_shutdown_in_progress_cannot_be_adopted_as_healthy(runtime, monkeypatch)
         runtime.start()
 
 
+@pytest.mark.parametrize("expected", [None, "old-generation"])
+def test_delayed_remote_start_cannot_adopt_or_restart_another_generation(runtime, monkeypatch, expected):
+    manifest(runtime, phase="stopped", supervisor=None, children=[])
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: pytest.fail("stale start must not spawn"))
+    with pytest.raises(ScreenError, match="STALE_GENERATION"):
+        runtime.start(expected_generation=expected)
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_identity_is_rechecked_after_waiting_for_lifecycle_lock(runtime, monkeypatch, action):
+    manifest(runtime)
+    runtime.authority.start("generation-1")
+    def guard():
+        assert runtime._lock.is_locked
+        raise ScreenError("PROFILE_IDENTITY_CHANGED")
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: pytest.fail("wrong profile"))
+    monkeypatch.setattr(launcher, "signal_process", lambda *a: pytest.fail("wrong profile"))
+    with pytest.raises(ScreenError, match="PROFILE_IDENTITY_CHANGED"):
+        if action == "start":
+            runtime.start(expected_generation="generation-1", identity_guard=guard)
+        else:
+            runtime.stop("generation-1", identity_guard=guard)
+    assert runtime.authority.snapshot()["running"]
+
+
 def test_dead_supervisor_never_launches_over_orphaned_browser(runtime, monkeypatch):
     manifest(runtime)
     monkeypatch.setattr(launcher, "is_alive", lambda value: value == {"pid": 124})

@@ -21,6 +21,7 @@ from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.handoff import RunHandoffs
 from flowly.desktop_runtime.input_service import InputServiceClient
 from flowly.desktop_runtime.launcher import ScreenRuntime
+from flowly.desktop_runtime.lifecycle import ScreenLifecycle
 from flowly.desktop_runtime.rfb import RfbClientGate
 from flowly.desktop_runtime.status import StatusSequence
 from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
@@ -31,7 +32,8 @@ from flowly.gateway.mcp_management import _protected_socket
 
 METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create", "display.viewer.close",
                      "display.control.acquire", "display.control.release", "display.control.reclaim",
-                     "display.subscribe", "display.unsubscribe", "display.run.resume"})
+                     "display.subscribe", "display.unsubscribe", "display.run.resume",
+                     "display.start", "display.stop", "display.operation.status"})
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
@@ -78,7 +80,7 @@ class DisplaySession:
                 "view": capability["supported"], "input": _supports_input(state),
                 "viewerClose": bool(state and state.get("inputServiceVersion") == 3
                                     and state.get("observerServiceVersion") == 3),
-                "lifecycle": False, "installSupported": False, "statusEvents": True, "resumeSupported": True,
+                "lifecycle": capability["supported"], "lifecycleVersion": 1, "installSupported": False, "statusEvents": True, "resumeSupported": True,
                 "browserGrantVersion": 2}
 
     @property
@@ -118,13 +120,19 @@ class DisplaySession:
     def _status_snapshot(self) -> dict:
         available = ScreenRuntime.capabilities()
         state = self.runtime.status() if available["supported"] else None
+        control = self.runtime.authority.snapshot() if available["supported"] else None
+        if (state and state["phase"] == "running" and control
+                and control["generation"] == state["generation"] and not control["running"]):
+            # Authority is fenced before graceful Chromium/Xvnc shutdown. Do
+            # not advertise a usable running screen or premature completion.
+            state = {**state, "phase": "stopping"}
         capability = self._capabilities(available, state)
         if not capability["supported"]:
             return {**capability, "phase": "unavailable", "generation": None, "control": None}
         return {**capability, "phase": state["phase"] if state else "stopped",
                 "generation": state["generation"] if state else None,
                 "error": state.get("error") if state else None,
-                "control": self.runtime.authority.snapshot(), "handoff": self.handoffs.status(), "width": 1440, "height": 900}
+                "control": control, "handoff": self.handoffs.status(), "width": 1440, "height": 900}
 
     @property
     def handoffs(self) -> RunHandoffs:
@@ -255,8 +263,10 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             return
         allowed = {"profileId", "expectedHostId", "expectedBotId"}
         pinned = method not in {"display.capabilities", "display.status"}
-        if pinned and method != "display.subscribe":
+        if pinned and method not in {"display.subscribe", "display.operation.status"}:
             allowed.add("generation")
+        if method in {"display.start", "display.stop", "display.operation.status"}:
+            allowed.add("operationId")
         if method == "display.observe":
             allowed.add("viewerToken")
         if method == "display.run.resume":
@@ -266,6 +276,22 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
         if not isinstance(params, dict) or set(params) - allowed:
             raise ScreenError("INVALID_PARAMS")
         session = await asyncio.to_thread(_resolve, gateway, params, pinned=pinned)
+        if method in {"display.start", "display.stop", "display.operation.status"}:
+            def lifecycle():
+                capability = ScreenRuntime.capabilities()
+                if method != "display.operation.status" and not capability["supported"]:
+                    raise ScreenError(capability["reason"])
+                def guard():
+                    _resolve(gateway, params, pinned=True)
+                operations = ScreenLifecycle(session.runtime, session.identity, guard)
+                if method == "display.operation.status":
+                    return operations.status(params.get("operationId"))
+                if "generation" not in params:
+                    raise ScreenError("INVALID_PARAMS")
+                return operations.submit(method.removeprefix("display."), params["generation"], params.get("operationId"))
+            result = await asyncio.to_thread(lifecycle)
+            await gateway._ws_rpc_reply(ws, rpc_id, result)
+            return
         if method == "display.subscribe":
             entry = await gateway._display_subscriptions.prepare(ws, client_id, params)
             try:

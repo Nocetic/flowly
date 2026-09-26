@@ -50,6 +50,87 @@ def recv_exact(connection, size):
     return bytes(result)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["default", "writer"])
+@pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_GATEWAY_TEST") != "1", reason="requires full Core Linux runner")
+async def test_public_lifecycle_survives_disconnect_and_fences_old_operations(tmp_path, monkeypatch, profile):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import aiohttp
+    from aiohttp.test_utils import TestServer
+
+    import flowly.profile as profiles
+    from flowly.gateway.server import GatewayServer
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", home)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", home / "profiles")
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    profiles.create_profile("writer", local_runtime=True)
+    runtime = ScreenRuntime(profiles.describe_profile(profile).path / "desktop")
+    gateway = GatewayServer(host="127.0.0.1", port=0, auth_token="lifecycle-fixture-token",
+                            require_loopback_auth=True, enable_profile_host=True)
+    gateway.on_chat_message = AsyncMock()
+    server = TestServer(gateway._create_app())
+    await server.start_server()
+    try:
+        async with aiohttp.ClientSession() as client:
+            async def connect():
+                async with client.post(server.make_url("/api/auth/ws-ticket"),
+                                       headers={"Authorization": "Bearer lifecycle-fixture-token"}) as response:
+                    ticket = (await response.json())["ticket"]
+                return await client.ws_connect(server.make_url("/ws?ticket=" + ticket))
+            chat = await connect()
+            async def rpc(method, params):
+                await chat.send_json({"type": "rpc", "id": "lifecycle", "method": method, "params": params})
+                response = await chat.receive_json(timeout=10)
+                assert "result" in response, response
+                return response["result"]
+            async def terminal(operation):
+                async with asyncio.timeout(45):
+                    while True:
+                        result = await rpc("display.operation.status", {**target, "operationId": operation})
+                        if result["state"] not in {"pending", "running"}:
+                            return result
+                        await asyncio.sleep(0.05)
+            status = await rpc("display.status", {"profileId": profile})
+            assert status["phase"] == "stopped" and status["generation"] is None
+            target = {"profileId": profile, "expectedHostId": status["hostId"], "expectedBotId": status["botId"]}
+            original = {**target, "operationId": "start-original", "generation": None}
+            assert (await rpc("display.start", original))["state"] == "pending"
+            await chat.close()
+            chat = await connect()
+            started = await terminal("start-original")
+            assert started["state"] == "succeeded"
+            generation = started["resultGeneration"]
+            internal = runtime.status()
+            assert internal["generation"] == generation and is_alive(internal["supervisor"])
+            stopped_request = {**target, "operationId": "stop-original", "generation": generation}
+            await rpc("display.stop", stopped_request)
+            stopped = await terminal("stop-original")
+            assert stopped["state"] == "succeeded"
+            assert runtime.status()["phase"] == "stopped" and not is_alive(internal["supervisor"])
+            assert await rpc("display.start", original) == started
+            assert runtime.status()["phase"] == "stopped"
+            await rpc("display.start", {**target, "operationId": "restart", "generation": generation})
+            restarted = await terminal("restart")
+            assert restarted["state"] == "succeeded" and restarted["resultGeneration"] != generation
+            assert await rpc("display.stop", stopped_request) == stopped
+            await rpc("display.stop", {**stopped_request, "operationId": "stale-stop"})
+            assert (await terminal("stale-stop"))["error"] == "STALE_GENERATION"
+            assert runtime.status()["phase"] == "running"
+            other = ScreenRuntime(profiles.describe_profile("writer" if profile == "default" else "default").path / "desktop")
+            assert other.status() is None
+            await chat.close()
+    finally:
+        await server.close()
+        state = runtime.status()
+        if state and state["phase"] == "running":
+            await asyncio.to_thread(runtime.stop, state["generation"])
+
+
 @contextmanager
 def human_viewer(path):
     gate = RfbClientGate()

@@ -47,8 +47,6 @@ async def main():
         raise RuntimeError("Use the disposable container user's default profile home")
     home.mkdir(parents=True, exist_ok=True)
     runtime = ScreenRuntime(home / "desktop")
-    state = await asyncio.to_thread(runtime.start)
-    generation = state["generation"]
     provider = HostBrowserProvider(runtime)
     gateway = GatewayServer(host="0.0.0.0", port=8787, auth_token=TOKEN, require_loopback_auth=True)
     gateway._host_screen_browser = provider
@@ -112,7 +110,7 @@ async def main():
                   codeMatches:document.querySelector('#code').value==='flowly-screen-fixture',
                   signedIn:document.querySelector('#result').textContent==='Signed in',
                   cookieMatches:document.cookie==='session=desktop-login'};
-            }""")})
+            }""") if page is not None and not page.is_closed() else None})
 
     app.router.add_get("/fixture/inspection", inspection)
     # The login page is deliberately separate from the authenticated gateway.
@@ -128,18 +126,34 @@ async def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(sig, stopped.set)
     try:
-        assert (await provider.request("setup", "navigate", generation, "navigate", {"url": f"http://127.0.0.1:{port}/"}))["success"]
-        await provider.execution.finish_run("setup", generation)
-        provider._dispatch = track_dispatch
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{state['cdpPort']}")
-            page = browser.contexts[0].pages[0]
+            async def prepare_page():
+                nonlocal page
+                # Desktop must explicitly start the runtime. Test setup then
+                # navigates once; inspection itself remains strictly read-only.
+                async with asyncio.timeout(120):
+                    while True:
+                        state = await asyncio.to_thread(runtime.status)
+                        if state and state["phase"] == "running":
+                            break
+                        await asyncio.sleep(0.05)
+                generation = state["generation"]
+                assert (await provider.request("setup", "navigate", generation, "navigate", {"url": f"http://127.0.0.1:{port}/"}))["success"]
+                await provider.execution.finish_run("setup", generation)
+                provider._dispatch = track_dispatch
+                browser = await playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{state['cdpPort']}")
+                page = browser.contexts[0].pages[0]
+            setup_task = asyncio.create_task(prepare_page())
             await runner.setup()
             tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             tls.load_cert_chain("/fixture-tls/cert.pem", "/fixture-tls/key.pem")
             await web.TCPSite(runner, "0.0.0.0", 8787, ssl_context=tls).start()
             print("READY desktop screen fixture", flush=True)
-            await stopped.wait()
+            try:
+                await stopped.wait()
+            finally:
+                setup_task.cancel()
+                await asyncio.gather(setup_task, return_exceptions=True)
     finally:
         await runner.cleanup()
         await site_runner.cleanup()
@@ -148,8 +162,9 @@ async def main():
         # The disposable container is removed by the runner even if an
         # interrupted test deliberately leaves human ownership fenced.
         control = runtime.authority.snapshot()
-        if control["control"] == "agent" and control["runId"] is None:
-            await asyncio.to_thread(runtime.stop, generation)
+        state = runtime.status()
+        if state and state["phase"] == "running" and control["control"] == "agent" and control["runId"] is None:
+            await asyncio.to_thread(runtime.stop, state["generation"])
 
 
 if __name__ == "__main__":

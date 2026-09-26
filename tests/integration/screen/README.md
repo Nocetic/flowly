@@ -34,7 +34,7 @@ container, TigerVNC 1.12, distro Chromium and Playwright 1.58.0:
 - Explicit stop closes Chromium through CDP before stopping Xvnc so persistent
   cookies survive restart. Killing the browser directly failed this test.
 
-Not yet certified: relay binary display transport, integrated Desktop/noVNC,
+Not yet certified: relay binary display transport, packaged Desktop clients,
 root-host runtime provisioning, orphan recovery, host
 resource limits/idle policy, x86_64, other distro versions. The launcher requires
 an unprivileged Linux account and installed OS dependencies; it does not change
@@ -61,6 +61,7 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
     tests/test_screen_cli.py tests/test_screen_profile_binding.py tests/test_screen_display_gateway.py tests/test_screen_display_watch.py \
     tests/test_screen_input_broker.py tests/test_screen_input_service.py tests/test_screen_observers.py tests/test_screen_status.py \
     tests/test_screen_handoff.py tests/test_screen_run_checkpoint.py tests/test_screen_agent_handoff.py tests/test_screen_resume_rpc.py \
+    tests/test_screen_lifecycle.py tests/test_screen_lifecycle_rpc.py \
     tests/integration/screen/test_xvnc_browser.py -q \
     --basetemp=/tmp/screen-tests -p no:cacheprovider
 ```
@@ -84,7 +85,9 @@ profile and runtime generation; gateway credentials and tickets use headers.
 Synthetic socket tests cover input filtering, replay rejection, profile identity
 changes, observer limits and teardown. New version-two supervisors support basic
 public input through the acknowledged broker. Legacy raw RFB streams remain
-viewing-only, even when the viewer owns human control. Public lifecycle remains unfinished.
+viewing-only, even when the viewer owns human control. Public direct lifecycle is
+now implemented as durable operations, described below; installation and recovery
+remain unfinished.
 
 The input broker now uses a separate private RFB connection that never requests
 pixels. It negotiates Fence support and requires a matching BlockBefore response
@@ -296,3 +299,37 @@ the identity again before claiming the run, closing replacement between chat
 admission and execution. Stream and input protocol versions remain unchanged.
 The expanded Linux suite passed **294 tests**, with two warnings, after this
 change. Complete Core/Desktop suite results are in Desktop's progress document.
+
+
+## Durable public start and stop
+
+`display.start` and `display.stop` require `profileId`, `expectedHostId`,
+`expectedBotId`, `generation` and `operationId`. Only start accepts a null
+generation, for a profile that has never created a runtime. The immediate result
+is an operation receipt; `display.operation.status` takes the same identity pin
+and operation ID (no generation parameter) to read pending/running/succeeded/
+failed/recovery-required state. A receipt includes its requested generation and
+result generation but never internal process or filesystem details.
+
+Retries return the original receipt. Reusing an ID for another request is a
+conflict. Runtime mutation checks identity and generation under the lifecycle
+lock; a stale request cannot adopt or stop a replacement. One active operation
+per profile and two workers per gateway process bound concurrency. The receipt
+log retains 128 terminal operations; generation preconditions still fence an old
+mutation after pruning. A dead worker or an outstanding operation past its
+120-second observation deadline requires recovery and is never replayed. This
+deadline does not assert cancellation or permit another overlapping operation.
+Explicit recovery remains an open requirement.
+
+Stop fences authority before graceful process shutdown; public status reports
+`stopping` during that interval, then `stopped`. Human ownership, active runs and
+input reservations are not forcibly released. CLI behavior remains explicit;
+the new optional generation/identity guards serve remote lifecycle admission.
+
+The expanded real Linux package passed **313 tests**, with two warnings. New
+primary and named-profile cases start actual Xvnc/Chromium through authenticated
+RPC, disconnect/reconnect, query durable completion, stop, replay old receipts,
+restart and reject a stale stop without affecting the other profile. Complete
+Core suite: **6,434 passed**, 27 skipped, 12 deselected. The Desktop fixture now
+waits for the real panel to start its screen; test-only background setup then
+navigates the generated login page once. Inspection remains read-only.

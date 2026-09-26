@@ -18,12 +18,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 from filelock import FileLock
 
 from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError
 
 REQUIRED_PROGRAMS = ("Xvnc", "openbox", "dbus-run-session", "chromium")
+_UNPINNED = object()
 
 
 def private_directory(path: Path) -> Path:
@@ -144,13 +146,20 @@ class ScreenRuntime:
                 return {**state, "phase": "failed", "error": "RUNTIME_FAILED"}
         return state
 
-    def start(self) -> dict:
+    def start(self, *, expected_generation: str | None | object = _UNPINNED,
+              identity_guard: Callable[[], None] | None = None) -> dict:
         capabilities = self.capabilities()
         if not capabilities["supported"]:
             raise ScreenError(capabilities["reason"])
         private_directory(self.directory)
         with self._lock:
+            if identity_guard:
+                identity_guard()
             existing = self.read_manifest()
+            # Remote starts are compare-and-start operations. A delayed request
+            # must not restart a runtime the user stopped or replaced meanwhile.
+            if expected_generation is not _UNPINNED and expected_generation != (existing["generation"] if existing else None):
+                raise ScreenError("STALE_GENERATION")
             if existing and existing["phase"] == "running" and self.status()["phase"] == "running":
                 control = self.authority.snapshot()
                 if not control["running"] or control["generation"] != existing["generation"]:
@@ -205,8 +214,10 @@ class ScreenRuntime:
         # reservation intact so a later request adopts it or reports recovery.
         raise ScreenError("RUNTIME_START_TIMEOUT")
 
-    def stop(self, generation: str) -> None:
+    def stop(self, generation: str, *, identity_guard: Callable[[], None] | None = None) -> None:
         with self._lock:
+            if identity_guard:
+                identity_guard()
             state = self.read_manifest()
             if state is None or state["generation"] != generation:
                 raise ScreenError("STALE_GENERATION")
