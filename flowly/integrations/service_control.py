@@ -107,6 +107,7 @@ async def restart_gateway(
     health_check_host: str = "127.0.0.1",
     health_check_port: int = 18790,
     health_check_timeout: float = 10.0,
+    expected_pid: int | None = None,
 ) -> RestartResult:
     """Bounce the gateway service if installed; otherwise return a soft no-op.
 
@@ -114,6 +115,9 @@ async def restart_gateway(
     when the service isn't installed — caller surfaces this as a hint to
     restart the manually-launched gateway terminal. ``method='error'``
     means the restart command itself failed.
+
+    Gateway-initiated Linux requests pass expected_pid to reject a unit whose
+    main process is not this gateway. External TUI callers may omit it.
 
     After kicking the service we poll the gateway's TCP socket until it
     comes back up (or ``health_check_timeout`` elapses) so the caller
@@ -173,6 +177,14 @@ async def restart_gateway(
                 ok=False, method="no_service",
                 detail="systemctl not found — restart gateway manually",
             )
+        if expected_pid is not None:
+            from flowly.integrations.service_ownership import owns_current_gateway
+
+            if not await owns_current_gateway(label, expected_pid):
+                return RestartResult(
+                    ok=False, method="no_service",
+                    detail="Cannot verify that this service owns the gateway — restart this gateway manually",
+                )
         cmd = ["systemctl", "--user", "restart", label]
         rc, out, err = await _run(cmd)
         if rc != 0:

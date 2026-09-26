@@ -5,6 +5,7 @@ import base64
 import inspect
 import json
 import mimetypes
+import os
 import secrets
 import uuid
 from collections import OrderedDict
@@ -3786,10 +3787,13 @@ class GatewayServer:
             try:
                 from flowly.integrations.service_control import restart_gateway
 
-                await restart_gateway(
+                result = await restart_gateway(
                     health_check_host=self.host,
                     health_check_port=self.port,
+                    expected_pid=os.getpid(),
                 )
+                if not result.ok:
+                    logger.warning("[Gateway] feature restart was not completed: {}", result.detail)
             except Exception:
                 logger.exception("[Gateway] feature restart failed")
 
