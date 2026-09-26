@@ -34,8 +34,8 @@ container, TigerVNC 1.12, distro Chromium and Playwright 1.58.0:
 - Explicit stop closes Chromium through CDP before stopping Xvnc so persistent
   cookies survive restart. Killing the browser directly failed this test.
 
-Not yet certified: direct/relay WebSocket transport, Desktop/noVNC, agent tool
-binding and resume, root-host runtime provisioning, orphan recovery, host
+Not yet certified: direct/relay binary display transport, Desktop/noVNC,
+production task pause/resume, root-host runtime provisioning, orphan recovery, host
 resource limits/idle policy, x86_64, other distro versions. The launcher requires
 an unprivileged Linux account and installed OS dependencies; it does not change
 system packages or privilege settings automatically.
@@ -55,8 +55,11 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
   --mount "type=bind,source=$PWD,target=/workspace,readonly" \
   -e FLOWLY_SCREEN_LINUX_TEST=1 -e FLOWLY_SCREEN_GATEWAY_TEST=1 \
   -e FLOWLY_HOME=/tmp/test-flowly-home flowly-screen-gateway-test:bookworm \
-  python -m pytest tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
-    tests/test_screen_cli.py tests/integration/screen/test_xvnc_browser.py -q \
+  python -m pytest tests/test_screen_authority.py tests/test_screen_rfb.py \
+    tests/test_screen_tickets.py tests/test_screen_launcher.py tests/test_screen_execution.py \
+    tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
+    tests/test_screen_cli.py tests/test_screen_profile_binding.py \
+    tests/integration/screen/test_xvnc_browser.py -q \
     --basetemp=/tmp/screen-tests -p no:cacheprovider
 ```
 
@@ -66,6 +69,10 @@ human interaction, and actual `flowly screen start/status/stop` subprocesses.
 The gateway test uses an explicit test event to hold the callback at handoff:
 it verifies binding and observation fencing, **not** a completed production
 pause/resume RPC or Desktop UI. No model is invoked.
+The profile routing tests use real authenticated primary and named-gateway
+WebSockets with stubbed browser I/O. They verify closed grant validation,
+destination generation checks, and original run identity across the broker.
+The expanded Linux screen suite passed **146 tests** on the environment above.
 
 The `screen` Python extra adds Playwright without downloading a bundled browser;
 the runtime attaches to the installed distro Chromium. CLI lifecycle commands
