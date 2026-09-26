@@ -81,6 +81,15 @@ def test_runtime_refusal_is_durable_and_never_retried(operations, code):
     operations.runtime.stop.assert_called_once()
 
 
+def test_restart_requirement_is_preserved_in_durable_start_failure(operations):
+    operations.runtime.start.side_effect = ScreenError("INSTALL_RESTART_REQUIRED")
+    operations.submit("start", None, "operation")
+    result = finished(operations)
+    assert result["state"] == "failed" and result["error"] == "INSTALL_RESTART_REQUIRED"
+    assert operations.submit("start", None, "operation") == result
+    operations.runtime.start.assert_called_once()
+
+
 def test_identity_is_rechecked_before_mutation_and_private_errors_are_hidden(operations):
     operations.guard.side_effect = ScreenError("PROFILE_IDENTITY_CHANGED")
     operations.submit("start", None, "operation")

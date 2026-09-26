@@ -25,6 +25,7 @@ def fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "state_root", lambda: root / "state")
     monkeypatch.setattr(jobs, "process_identity", lambda _: {"pid": 42, "start": "1", "boot": "boot"})
     monkeypatch.setattr(jobs, "is_alive", lambda _: True)
+    monkeypatch.setattr(jobs, "_restart_boundary", lambda owner: {"boot": owner["boot"], "ticks": 100})
     plan = {"planId": PLAN, "runtimeAccountRequired": False,
             "system": {"planId": "b" * 64, "supported": True},
             "python": {"planId": "c" * 64, "supported": True}}
@@ -352,4 +353,59 @@ def test_rejected_executor_releases_reservation(fixture, monkeypatch):
     with pytest.raises(ScreenError, match="CONTROL_UNAVAILABLE"):
         service.submit(PLAN, OP)
     with environment_activity():
+        jobs.assert_environment_installation_idle()
+
+
+@pytest.mark.parametrize("current,allowed", [
+    ({"pid": 42, "start": "1", "boot": "boot"}, False),
+    ({"pid": 99, "start": "99", "boot": "boot"}, False),
+    ({"pid": 99, "start": "100", "boot": "boot"}, False),
+    ({"pid": 42, "start": "101", "boot": "boot"}, True),
+    ({"pid": 42, "start": "1", "boot": "new-boot"}, True),
+    (None, False),
+])
+def test_screen_requires_process_start_after_package_completion(fixture, monkeypatch, current, allowed):
+    service, _ = fixture
+    service.submit(PLAN, OP)
+    result = finished(service)
+    assert result["state"] == "succeeded"
+    assert "restartBoundary" not in result
+    monkeypatch.setattr(jobs, "process_identity", lambda _: current)
+    if allowed:
+        jobs.assert_environment_installation_idle()
+    else:
+        with pytest.raises(ScreenError, match="INSTALL_RESTART_REQUIRED"):
+            jobs.assert_environment_installation_idle()
+    # Process verification never edits historical receipts or replays installers.
+    assert service.status(OP) == result
+    jobs.install_python.assert_called_once()
+
+
+def test_no_package_changes_do_not_require_restart(fixture):
+    service, _ = fixture
+    jobs.install_python.return_value["restartRequired"] = False
+    service.submit(PLAN, OP)
+    assert finished(service)["state"] == "succeeded"
+    jobs.assert_environment_installation_idle()
+
+
+def test_legacy_success_without_completion_boundary_needs_recovery(fixture):
+    service, _ = fixture
+    service.submit(PLAN, OP)
+    finished(service)
+    with sqlite3.connect(service.path) as db:
+        row = json.loads(db.execute("SELECT value FROM operations").fetchone()[0])
+        del row["restartBoundary"]
+        db.execute("UPDATE operations SET value=?", (json.dumps(row),))
+    assert service.status(OP)["state"] == "succeeded"
+    with pytest.raises(ScreenError, match="INSTALL_RECOVERY_REQUIRED"):
+        jobs.assert_environment_installation_idle()
+
+
+def test_failure_to_record_completion_boundary_needs_recovery(fixture, monkeypatch):
+    service, _ = fixture
+    monkeypatch.setattr(jobs, "_restart_boundary", Mock(side_effect=ScreenError("INSTALL_RECOVERY_REQUIRED")))
+    service.submit(PLAN, OP)
+    assert finished(service)["state"] == "recovery_required"
+    with pytest.raises(ScreenError, match="INSTALL_RECOVERY_REQUIRED"):
         jobs.assert_environment_installation_idle()

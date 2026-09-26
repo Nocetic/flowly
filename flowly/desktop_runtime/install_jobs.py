@@ -29,7 +29,7 @@ from flowly.desktop_runtime.python_installer import install_python
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="screen-install")
 _SLOTS = threading.BoundedSemaphore(1)
 _TERMINAL = {"succeeded", "failed"}
-_ERRORS = {"INSTALL_BUSY", "INSTALL_STATE_INVALID", "INSTALL_PRIVILEGE_REQUIRED", "INSTALL_PLAN_CHANGED",
+_ERRORS = {"INSTALL_BUSY", "INSTALL_STATE_INVALID", "INSTALL_PRIVILEGE_REQUIRED", "INSTALL_PLAN_CHANGED", "INSTALL_RESTART_REQUIRED",
            "INSTALL_RECOVERY_REQUIRED", "INSTALL_HISTORY_FULL", "INSTALL_INDEX_FAILED", "INSTALL_PACKAGES_FAILED",
            "INSTALL_PYTHON_FAILED", "INSTALL_VERIFICATION_FAILED", "INSTALL_TIMEOUT", "INSTALL_UV_REQUIRED",
            "INSTALL_VIRTUALENV_REQUIRED", "INSTALL_UNSUPPORTED_HOST", "INSTALL_TOOLS_MISSING",
@@ -41,7 +41,7 @@ _FIELDS = {"installJobVersion", "hostId", "botId", "profileId", "screenId", "ope
 
 def _validate(value):
     try:
-        if not isinstance(value, dict) or set(value) != _FIELDS or type(value["installJobVersion"]) is not int or value["installJobVersion"] != 1:
+        if not isinstance(value, dict) or set(value) not in (_FIELDS, _FIELDS | {"restartBoundary"}) or type(value["installJobVersion"]) is not int or value["installJobVersion"] != 1:
             raise ValueError()
         for key in ("hostId", "botId", "profileId"):
             _identity(value[key])
@@ -64,9 +64,43 @@ def _validate(value):
             raise ValueError()
         _identity(owner["start"])
         _identity(owner["boot"])
+        boundary = value.get("restartBoundary")
+        if boundary is not None:
+            if (not isinstance(boundary, dict) or set(boundary) != {"boot", "ticks"}
+                    or type(boundary["ticks"]) is not int or not 0 <= boundary["ticks"] < 2**53
+                    or boundary["boot"] != owner["boot"]):
+                raise ValueError()
         return value
     except (TypeError, ValueError, ScreenError):
         raise ScreenError("INSTALL_STATE_INVALID") from None
+
+
+def _restart_boundary(owner: dict) -> dict:
+    """Kernel boot-relative completion boundary, unaffected by wall-clock jumps.
+
+    /proc process start times use SC_CLK_TCK. Requiring a strictly later tick
+    conservatively rejects a process started within the completion tick too.
+    """
+    try:
+        ticks = time.clock_gettime_ns(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK") // 1_000_000_000
+        if type(ticks) is not int or not 0 <= ticks < 2**53:
+            raise ValueError()
+        return {"boot": owner["boot"], "ticks": ticks}
+    except (AttributeError, OSError, ValueError):
+        raise ScreenError("INSTALL_RECOVERY_REQUIRED") from None
+
+
+def _assert_restarted(row: dict) -> None:
+    boundary = row.get("restartBoundary")
+    # Legacy receipts lack a trusted completion boundary. Never infer a restart
+    # from a different PID: a sibling process may have imported the old packages.
+    if boundary is None:
+        raise ScreenError("INSTALL_RECOVERY_REQUIRED")
+    current = process_identity(os.getpid())
+    if current is None or not re.fullmatch(r"[0-9]+", current.get("start", "")):
+        raise ScreenError("INSTALL_RESTART_REQUIRED")
+    if current["boot"] == boundary["boot"] and int(current["start"]) <= boundary["ticks"]:
+        raise ScreenError("INSTALL_RESTART_REQUIRED")
 
 
 class ScreenInstallJobs:
@@ -138,7 +172,7 @@ class ScreenInstallJobs:
 
     @staticmethod
     def _public(value):
-        result = {key: item for key, item in value.items() if key not in {"owner", "deadline"}}
+        result = {key: item for key, item in value.items() if key not in {"owner", "deadline", "restartBoundary"}}
         if value["state"] in {"pending", "running"} and (not is_alive(value["owner"]) or time.time() > value["deadline"]):
             result.update(state="recovery_required", error="INSTALL_RECOVERY_REQUIRED")
         return result
@@ -203,7 +237,7 @@ class ScreenInstallJobs:
                     raise ScreenError("INSTALL_BUSY")
                 record = {"installJobVersion": 1, **self.identity, "operationId": operation, "planId": plan_id,
                           "state": "pending", "phase": "pending", "completedSteps": [], "error": None,
-                          "restartRequired": False, "owner": owner, "deadline": int(time.time()) + 1260}
+                          "restartRequired": False, "restartBoundary": None, "owner": owner, "deadline": int(time.time()) + 1260}
                 db.execute("INSERT INTO operations (id, value) VALUES (?, ?)", (operation, json.dumps(_validate(record))))
             try:
                 _EXECUTOR.submit(self._run, record, plan, password, reservation)
@@ -250,6 +284,8 @@ class ScreenInstallJobs:
             record["restartRequired"] = result["restartRequired"]
             if result["state"] != "succeeded":
                 raise ScreenError(result["error"] or "INSTALL_RECOVERY_REQUIRED")
+            if record["restartRequired"]:
+                record["restartBoundary"] = _restart_boundary(record["owner"])
             record.update(state="succeeded", phase="complete", completedSteps=["system", "python"])
         except BaseException as exc:
             code = exc.code if isinstance(exc, ScreenError) and exc.code in _ERRORS else "INSTALL_RECOVERY_REQUIRED"
@@ -296,3 +332,6 @@ def assert_environment_installation_idle() -> None:
             raise ScreenError("INSTALL_BUSY")
         if public["state"] == "recovery_required":
             raise ScreenError("INSTALL_RECOVERY_REQUIRED")
+    for row in rows:
+        if row["state"] == "succeeded" and row["restartRequired"]:
+            _assert_restarted(row)

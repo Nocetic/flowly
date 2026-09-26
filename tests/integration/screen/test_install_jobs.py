@@ -2,10 +2,13 @@
 
 import os
 import secrets
+import subprocess
+import sys
 import time
 
 import pytest
 
+from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.install_jobs import ScreenInstallJobs
 from flowly.desktop_runtime.install_plan import installation_plan
 from flowly.desktop_runtime.installer import install_status
@@ -45,8 +48,17 @@ def test_real_asynchronous_installation_and_durable_replay(tmp_path):
     assert ScreenRuntime.capabilities()["supported"]
     runtime = ScreenRuntime(tmp_path / "desktop")
     assert runtime.read_manifest() is None, "installation must not start a browser"
-    state = runtime.start()
-    try:
-        assert state["phase"] == "running"
-    finally:
-        runtime.stop(state["generation"])
+    with pytest.raises(ScreenError, match="INSTALL_RESTART_REQUIRED"):
+        runtime.start()
+    time.sleep(2 / os.sysconf("SC_CLK_TCK"))
+    subprocess.run([sys.executable, "-c", """
+import sys
+from pathlib import Path
+from flowly.desktop_runtime.launcher import ScreenRuntime
+runtime = ScreenRuntime(Path(sys.argv[1]))
+state = runtime.start()
+try:
+    assert state['phase'] == 'running'
+finally:
+    runtime.stop(state['generation'])
+""", str(tmp_path / "desktop")], check=True, timeout=90)
