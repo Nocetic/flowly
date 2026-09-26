@@ -10,20 +10,22 @@ from __future__ import annotations
 
 import asyncio
 import json
-import secrets
 import threading
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
 from flowly.desktop_runtime.authority import ScreenError
+from flowly.desktop_runtime.input_service import InputServiceClient
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.desktop_runtime.rfb import RfbClientGate
 from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
+from flowly.desktop_runtime.viewers import ViewerCredentials
 from flowly.gateway.auth import host_origin_allowed
 from flowly.gateway.mcp_management import _protected_socket
 
-METHODS = frozenset({"display.capabilities", "display.status", "display.observe"})
+METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create",
+                     "display.control.acquire", "display.control.release", "display.control.reclaim"})
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
@@ -35,6 +37,7 @@ class DisplaySession:
         self.directory = directory
         self._runtime: ScreenRuntime | None = None
         self._tickets: StreamTickets | None = None
+        self._viewers: ViewerCredentials | None = None
         self.streams: set[web.WebSocketResponse] = set()
         self.attaching = 0
 
@@ -57,6 +60,20 @@ class DisplaySession:
                 "view": capability["supported"], "input": False,
                 "lifecycle": False, "installSupported": False}
 
+    @property
+    def viewers(self) -> ViewerCredentials:
+        if self._viewers is None:
+            self._viewers = ViewerCredentials(self.tickets)
+        return self._viewers
+
+    def running(self, generation: str) -> dict:
+        state = self.runtime.status()
+        if not state or state["phase"] != "running":
+            raise ScreenError("SCREEN_NOT_RUNNING")
+        if state["generation"] != generation:
+            raise ScreenError("STALE_GENERATION")
+        return state
+
     def scope(self, generation: str) -> StreamScope:
         # Every token-authenticated connection to this installation represents
         # its owner. A renderer-supplied owner/viewer ID is never authority.
@@ -64,11 +81,7 @@ class DisplaySession:
                            self.identity["profileId"], generation)
 
     def current(self, generation: str, viewer: str | None = None) -> dict:
-        state = self.runtime.status()
-        if not state or state["phase"] != "running":
-            raise ScreenError("SCREEN_NOT_RUNNING")
-        if state["generation"] != generation:
-            raise ScreenError("STALE_GENERATION")
+        state = self.running(generation)
         control = self.runtime.authority.snapshot()
         if control["generation"] != generation or not control["running"]:
             raise ScreenError("STALE_GENERATION")
@@ -86,16 +99,41 @@ class DisplaySession:
                 "error": state.get("error") if state else None,
                 "control": self.runtime.authority.snapshot(), "width": 1440, "height": 900}
 
-    def observe(self, generation: str) -> dict:
+    def create_viewer(self, generation: str) -> dict:
+        self.running(generation)
+        return {**self.identity, "generation": generation,
+                **self.viewers.create(self.scope(generation), self.identity["botId"])}
+
+    def authenticate_viewer(self, generation: str, token: str) -> str:
+        return self.viewers.authenticate(token, self.scope(generation), self.identity["botId"])
+
+    def observe(self, generation: str, token: str | None = None) -> dict:
         capability = self.capabilities()
         if not capability["supported"]:
             raise ScreenError(capability["reason"])
-        self.current(generation)
-        viewer = secrets.token_urlsafe(24)
+        credentials = {}
+        if token is None:
+            self.current(generation)
+            credentials = self.create_viewer(generation)
+            viewer = credentials["viewerId"]
+        else:
+            viewer = self.authenticate_viewer(generation, token)
+            self.current(generation, viewer)
         ticket = self.tickets.issue(self.scope(generation), viewer)
-        return {**self.identity, "protocolVersion": 1, "generation": generation,
+        return {**credentials, **self.identity, "protocolVersion": 1, "generation": generation,
                 "viewerId": viewer, "ticket": ticket, "expiresInMs": 30_000,
                 "streamPath": STREAM_PATH, "viewOnly": True}
+
+    def control(self, method: str, generation: str, token: str, epoch: int, operation: str) -> dict:
+        state = self.running(generation)
+        if state.get("observerServiceVersion") != 1 or state.get("inputServiceVersion") != 1:
+            raise ScreenError("SCREEN_UPGRADE_REQUIRED")
+        viewer = self.authenticate_viewer(generation, token)
+        result = InputServiceClient(self.runtime.socket_directory / "input.sock").request(
+            method.removeprefix("display."), generation=generation, viewer=viewer,
+            epoch=epoch, operationId=operation,
+        )
+        return {**self.identity, "generation": generation, "control": result}
 
 
 def _resolve(gateway, params: dict, *, pinned: bool = False) -> DisplaySession:
@@ -159,11 +197,16 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
         if method not in METHODS:
             raise ScreenError("METHOD_NOT_ALLOWED")
         allowed = {"profileId", "expectedHostId", "expectedBotId"}
-        if method == "display.observe":
+        pinned = method not in {"display.capabilities", "display.status"}
+        if pinned:
             allowed.add("generation")
+        if method == "display.observe":
+            allowed.add("viewerToken")
+        if method.startswith("display.control."):
+            allowed.update({"viewerToken", "epoch", "operationId"})
         if not isinstance(params, dict) or set(params) - allowed:
             raise ScreenError("INVALID_PARAMS")
-        session = await asyncio.to_thread(_resolve, gateway, params, pinned=method == "display.observe")
+        session = await asyncio.to_thread(_resolve, gateway, params, pinned=pinned)
         if method == "display.capabilities":
             result = session.capabilities()
         elif method == "display.status":
@@ -172,7 +215,13 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             generation = params.get("generation")
             if not isinstance(generation, str) or not generation or len(generation) > 256:
                 raise ScreenError("INVALID_PARAMS")
-            result = await asyncio.to_thread(session.observe, generation)
+            if method == "display.observe":
+                result = await asyncio.to_thread(session.observe, generation, params.get("viewerToken"))
+            elif method == "display.viewer.create":
+                result = await asyncio.to_thread(session.create_viewer, generation)
+            else:
+                result = await asyncio.to_thread(session.control, method, generation, params.get("viewerToken"),
+                                                 params.get("epoch"), params.get("operationId"))
         await gateway._ws_rpc_reply(ws, rpc_id, result)
     except ScreenError as exc:
         await gateway._ws_rpc_error(ws, rpc_id, exc.code, "The screen request could not be completed.")
@@ -201,6 +250,9 @@ def register_display(app: web.Application, gateway) -> None:
         try:
             session = await asyncio.to_thread(_resolve, gateway, params, pinned=True)
             viewer = await asyncio.to_thread(session.tickets.consume, ticket, session.scope(generation))
+            if not await asyncio.to_thread(session.viewers.active, viewer, session.scope(generation),
+                                           session.identity["botId"]):
+                raise ScreenError("VIEWER_EXPIRED")
             state = await asyncio.to_thread(session.current, generation, viewer)
         except ScreenError as exc:
             return _error(exc.code, 403)

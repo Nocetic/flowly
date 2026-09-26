@@ -17,6 +17,7 @@ from flowly.desktop_runtime.input_service import (
     InputServiceClient,
     _receive,
 )
+from flowly.desktop_runtime.observers import ObserverRegistry
 from tests.test_screen_input_broker import KEY, Peer
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="private Unix transport")
@@ -31,11 +32,40 @@ def service(tmp_path):
     with tempfile.TemporaryDirectory(prefix="rfb-service-") as directory:
         path = Path(directory)
         peer = Peer(path / "rfb.sock")
-        server = InputService(authority, "generation", path)
+        observers = ObserverRegistry(authority, "generation", path)
+        server = InputService(authority, "generation", path, observers=observers)
         client = InputServiceClient(server.path)
         yield authority, peer, server, client
         server.close()
+        observers.close()
         peer.close()
+
+
+@pytest.mark.parametrize("method", ["control.release", "control.reclaim"])
+def test_public_control_drains_pressed_keys_before_handback_or_reclaim(service, method):
+    authority, peer, _, client = service
+    opened = client.request("open", **IDENTITY)
+    client.request("send", **IDENTITY, handle=opened["handle"], sequence=0, data=base64.b64encode(KEY).decode())
+    params = {**IDENTITY, "viewer": "replacement" if method.endswith("reclaim") else "viewer", "operationId": "op"}
+    result = client.request(method, **params)
+    assert result["control"] == ("human" if method.endswith("reclaim") else "agent")
+    assert not result["inputDrainRequired"]
+    assert len(peer.events) == 2 and peer.events[1][1] == 0
+    assert client.request(method, **params) == result
+    assert authority.snapshot() == result
+
+
+def test_pending_acquire_requires_fresh_operation_after_original_action_finishes(service):
+    authority, _, _, client = service
+    authority.release("viewer", "generation", 2)
+    action = authority.begin_action("origin-run", "action", "generation")
+    params = dict(generation="generation", viewer="viewer", epoch=3, operationId="first")
+    pending = client.request("control.acquire", **params)
+    assert pending["control"] == "human-pending"
+    authority.end_action(action)
+    assert client.request("control.acquire", **params) == pending
+    confirmed = client.request("control.acquire", **{**params, "epoch": pending["epoch"], "operationId": "confirm"})
+    assert confirmed["control"] == "human" and confirmed["runId"] == "origin-run"
 
 
 def test_worker_reconnect_keeps_one_broker_and_deduplicates_the_last_input(service):

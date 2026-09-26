@@ -56,7 +56,7 @@ docker run --rm --security-opt seccomp=unconfined --shm-size=512m \
   -e FLOWLY_SCREEN_LINUX_TEST=1 -e FLOWLY_SCREEN_GATEWAY_TEST=1 \
   -e FLOWLY_HOME=/tmp/test-flowly-home flowly-screen-gateway-test:bookworm \
   python -m pytest tests/test_screen_authority.py tests/test_screen_rfb.py \
-    tests/test_screen_tickets.py tests/test_screen_launcher.py tests/test_screen_execution.py \
+    tests/test_screen_tickets.py tests/test_screen_viewers.py tests/test_screen_launcher.py tests/test_screen_execution.py \
     tests/test_screen_gateway_binding.py tests/test_screen_browser_provider.py \
     tests/test_screen_cli.py tests/test_screen_profile_binding.py tests/test_screen_display_gateway.py \
     tests/test_screen_input_broker.py tests/test_screen_input_service.py tests/test_screen_observers.py \
@@ -73,13 +73,14 @@ pause/resume RPC or Desktop UI. No model is invoked.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
-The expanded Linux screen suite passed **205 tests** on the environment above.
+The expanded Linux screen suite passed **219 tests** on the environment above.
 The authenticated direct display endpoint also delivers real Xvnc pixels for
 the default and named profiles. Its single-use tickets are bound to the host,
 profile and runtime generation; gateway credentials and tickets use headers.
 Synthetic socket tests cover input filtering, replay rejection, profile identity
 changes, observer limits and teardown. This endpoint currently advertises viewing
-only: public lifecycle, takeover and input-drain coordination remain unfinished.
+only for pixel transport: public control RPCs now coordinate takeover/handback,
+but routing viewer input through the supervisor and public lifecycle remain unfinished.
 
 The input broker now uses a separate private RFB connection that never requests
 pixels. It negotiates Fence support and requires a matching BlockBefore response
@@ -93,8 +94,8 @@ and a persistent input reservation containing no keystrokes or clipboard text.
 
 This proves the Xvnc input processing boundary, not arbitrary asynchronous website
 effects or completed production task resume. The supervisor now owns the broker
-through a private, bounded Unix request service; public display control RPCs are
-not connected yet. Gateway worker exit preserves the same input handle and
+through a private, bounded Unix request service. Public display control RPCs
+delegate to that same service. Gateway worker exit preserves the same input handle and
 sequence. Repeating the last acknowledged sequence with the same payload returns
 its acknowledgement without reapplying input; changed/older sequences fail.
 The service keeps a bounded cache of completed handbacks. Replaying an old
@@ -112,8 +113,21 @@ holder's original capture remains open. The real default/named-profile gateway
 tests exercise this with two Xvnc streams. Public WebSocket close waits are
 bounded independently of remote close acknowledgements; an idle client must not
 hold a healthy gateway's capture lease open. Runtime manifests now additionally
-advertise `observerServiceVersion: 1`. This is still private control integration,
-not the completed public control RPC or product sidebar.
+advertise `observerServiceVersion: 1`.
+
+Authenticated `display.control.acquire/release/reclaim` require a server-issued
+viewer capability, pinned host/profile/bot/generation, expected epoch and operation
+ID. Hashed resume credentials survive gateway restart and expire after 24 hours
+without authenticated use; expiry never releases human control. A new app can
+create a fresh capability using `display.viewer.create`, then explicitly reclaim.
+Creating that capability does not grant observation while someone else controls
+the browser. The supervisor serializes transitions with input and keeps bounded
+operation receipts; old replies never reapply transitions. Pending acquisition
+needs a fresh operation/current epoch to confirm after an agent action completes.
+The default/named-profile real-Xvnc tests now acquire/release through authenticated
+public RPC. Broker tests prove release/reclaim drains held input before handback.
+Terminal viewer-close/revocation, public input framing, events and original-run
+resume are still open; this is not a completed product sidebar.
 
 Supervisor death or unknown input outcome retains human ownership and requires explicit recovery;
 automatic timeout/disconnect release is intentionally absent. Extended pointer,

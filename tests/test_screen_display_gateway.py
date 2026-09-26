@@ -61,7 +61,7 @@ async def display_gateway(tmp_path, monkeypatch):
                 status=lambda gen=generation: {
                     "phase": "running", "generation": gen,
                     "socket": "/must-not-use-manifest-path", "cdpPort": 9999,
-                    "observerServiceVersion": 1,
+                    "observerServiceVersion": 1, "inputServiceVersion": 1,
                 },
             )
 
@@ -127,6 +127,67 @@ async def observe(fixture, profile="default"):
         "X-Flowly-Host-Id": status["hostId"], "X-Flowly-Bot-Id": status["botId"],
         "X-Flowly-Screen-Generation": status["generation"], "X-Flowly-Screen-Ticket": observed["ticket"],
     }
+
+
+def control_params(view, epoch, operation):
+    return {"profileId": view["profileId"], "expectedHostId": view["hostId"],
+            "expectedBotId": view["botId"], "generation": view["generation"],
+            "viewerToken": view["viewerToken"], "epoch": epoch, "operationId": operation}
+
+
+async def test_public_takeover_requires_capability_and_retries_do_not_release_new_control(display_gateway):
+    fixture = display_gateway
+    view, _ = await observe(fixture)
+    params = control_params(view, 1, "acquire-a")
+    rejected = await fixture.rpc("display.control.acquire", {**params, "viewerToken": view["viewerId"]})
+    assert rejected["error"]["code"] == "VIEWER_EXPIRED"
+    acquired = (await fixture.rpc("display.control.acquire", params))["result"]
+    assert acquired["control"]["control"] == "human"
+    assert (await fixture.rpc("display.control.acquire", params))["result"] == acquired
+    release = control_params(view, acquired["control"]["epoch"], "release-a")
+    released = (await fixture.rpc("display.control.release", release))["result"]
+    assert released["control"]["control"] == "agent"
+    newer = (await fixture.rpc("display.control.acquire", control_params(view, released["control"]["epoch"],
+                                                                       "acquire-b")))["result"]
+    assert (await fixture.rpc("display.control.release", release))["result"] == released
+    assert (await fixture.rpc("display.status"))["result"]["control"] == newer["control"]
+    conflict = await fixture.rpc("display.control.release", {**release, "epoch": newer["control"]["epoch"]})
+    assert conflict["error"]["code"] == "OPERATION_CONFLICT"
+
+
+async def test_public_holder_reconnect_and_explicit_reclaim_after_lost_app_capability(display_gateway):
+    fixture = display_gateway
+    view, _ = await observe(fixture)
+    acquired = (await fixture.rpc("display.control.acquire", control_params(view, 1, "acquire")))["result"]
+    target = {key: value for key, value in control_params(view, 1, "unused").items()
+              if key not in {"epoch", "operationId"}}
+    resumed = (await fixture.rpc("display.observe", target))["result"]
+    assert resumed["viewerId"] == view["viewerId"] and resumed["ticket"] != view["ticket"]
+    assert "viewerToken" not in resumed
+    # Starting another app session creates only a capability, never pixels or input.
+    replacement = (await fixture.rpc("display.viewer.create", {
+        key: value for key, value in target.items() if key != "viewerToken"
+    }))["result"]
+    busy = await fixture.rpc("display.control.acquire", control_params(replacement, acquired["control"]["epoch"], "busy"))
+    assert busy["error"]["code"] == "SCREEN_BUSY"
+    reclaimed = (await fixture.rpc("display.control.reclaim", control_params(
+        replacement, acquired["control"]["epoch"], "reclaim")))["result"]
+    assert reclaimed["control"]["control"] == "human"
+    assert (await fixture.rpc("display.observe", target))["error"]["code"] == "HUMAN_HAS_CONTROL"
+    stale = await fixture.rpc("display.control.release", control_params(view, reclaimed["control"]["epoch"], "old"))
+    assert stale["error"]["code"] == "VIEWER_MISMATCH"
+
+
+async def test_public_control_capability_cannot_cross_profiles_or_older_runtime(display_gateway):
+    fixture = display_gateway
+    default, _ = await observe(fixture)
+    writer, _ = await observe(fixture, "writer")
+    params = {**control_params(writer, 1, "wrong"), "viewerToken": default["viewerToken"]}
+    assert (await fixture.rpc("display.control.acquire", params))["error"]["code"] == "VIEWER_EXPIRED"
+    runtime = _resolve(fixture.gateway, {}).runtime
+    runtime.status = lambda: {"phase": "running", "generation": default["generation"], "inputServiceVersion": 1}
+    rejected = await fixture.rpc("display.control.acquire", control_params(default, 1, "old-runtime"))
+    assert rejected["error"]["code"] == "SCREEN_UPGRADE_REQUIRED"
 
 
 class RfbSocket:

@@ -100,6 +100,7 @@ class InputService:
         self._sequence = 0
         self._last_digest: bytes | None = None
         self._finished: dict[str, tuple[str, int, bool, dict]] = {}
+        self._operations: dict[str, tuple[tuple, dict]] = {}
         self._command = threading.Lock()
         self._connections_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
@@ -173,7 +174,9 @@ class InputService:
         method = request.get("method")
         fields = {"method", "generation", "viewer", "epoch"}
         extras = {"open": set(), "send": {"handle", "sequence", "data"},
-                  "finish": {"handle", "release"}, "acquire": set()}
+                  "finish": {"handle", "release"}, "acquire": set(),
+                  "control.acquire": {"operationId"}, "control.release": {"operationId"},
+                  "control.reclaim": {"operationId"}}
         if not isinstance(method, str) or method not in extras or set(request) != fields | extras[method]:
             raise ScreenError("INVALID_PARAMS")
         viewer = _identity(request["viewer"])
@@ -182,6 +185,8 @@ class InputService:
             raise ScreenError("INVALID_PARAMS")
         if request["generation"] != self.generation:
             raise ScreenError("STALE_GENERATION")
+        if method.startswith("control."):
+            return self._control(method, viewer, epoch, _identity(request["operationId"]))
         if method == "acquire":
             if self.observers is None or not self.observers.is_alive:
                 raise ScreenError("CONTROL_UNAVAILABLE")
@@ -235,11 +240,57 @@ class InputService:
             self._broker.send(payload)
             self._last_digest, self._sequence = digest, sequence + 1
             return {"nextSequence": self._sequence}
-        result = self._broker.finish(release=request["release"])
-        self._finished[handle] = (viewer, epoch, request["release"], result)
+        return self._finish(request["release"])
+
+    def _finish(self, release: bool) -> dict:
+        result = self._broker.finish(release=release)
+        handle, viewer, epoch = self._handle, self._viewer, self._epoch
+        self._finished[handle] = (viewer, epoch, release, result)
         if len(self._finished) > 64:
             self._finished.pop(next(iter(self._finished)))
         self._broker = None
+        return result
+
+    def _control(self, method: str, viewer: str, epoch: int, operation: str) -> dict:
+        fingerprint = (method, viewer, epoch)
+        previous = self._operations.get(operation)
+        if previous is not None:
+            if previous[0] != fingerprint:
+                raise ScreenError("OPERATION_CONFLICT")
+            # An old ACK is historical, never a new transition. Clients must
+            # compare revision/epoch with their latest authoritative snapshot.
+            return previous[1]
+        state = self.authority.snapshot()
+        if state["generation"] != self.generation or not state["running"]:
+            raise ScreenError("STALE_GENERATION")
+        if state["epoch"] != epoch:
+            raise ScreenError("STALE_EPOCH")
+        if self.observers is None or not self.observers.is_alive:
+            raise ScreenError("CONTROL_UNAVAILABLE")
+        if method == "control.release":
+            if self._broker is not None:
+                if self._viewer != viewer or self._epoch != epoch:
+                    raise ScreenError("VIEWER_MISMATCH")
+                result = self._finish(True)
+            else:
+                result = self.authority.release(viewer, self.generation, epoch)
+        else:
+            reclaim = method == "control.reclaim"
+            if reclaim and self._broker is not None and self._viewer != viewer:
+                # Never discard an input socket to force a handoff. A poisoned
+                # broker must go through explicit runtime recovery instead.
+                self._finish(False)
+            result = self.authority.acquire(viewer, self.generation, epoch, reclaim=reclaim, pending=True)
+            if self.observers.drain_except(viewer):
+                try:
+                    result = self.authority.confirm_acquire(viewer, self.generation, result["epoch"])
+                except ScreenError as error:
+                    if error.code != "TAKEOVER_PENDING":
+                        raise
+        self._operations[operation] = (fingerprint, result)
+        if len(self._operations) > 256:
+            self._operations.pop(next(iter(self._operations)))
+        # Evicted transitions cannot execute again with their previous epoch.
         return result
 
     def close(self) -> None:
