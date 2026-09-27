@@ -1893,12 +1893,25 @@ Respond to the user now:"""
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None))
         )
         from flowly.live_voice.service import LiveVoiceService
+        from flowly.live_voice.exec import VoiceExec
         from flowly.live_voice.sessions import VoiceSessions
+        from flowly.profile import current_profile_name as _voice_exec_profile
 
+        async def _voice_exec(params, session_key):
+            # The same registry entry, policy, approvals and hooks as a chat
+            # turn. "voice" honors global and wildcard toolset routing.
+            enabled_toolsets, disabled_toolsets = agent._resolve_toolset_route("voice")
+            return await agent.tools.execute(
+                "exec", {**params, "session_key": session_key}, session_key=session_key,
+                platform="voice", enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            )
+
+        voice_exec = VoiceExec(_voice_exec, _voice_exec_profile)
         live_voice = LiveVoiceService(
             VoiceSessions(agent.sessions),
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None)),
             worker=lambda: getattr(getattr(agent, '_gateway_server', None), 'profile_host', None),
+            executor=lambda: voice_exec,
         )
         _feature_rpc.set_voice_provider(lambda: live_voice)
         from flowly.live_voice.context import VoiceContext

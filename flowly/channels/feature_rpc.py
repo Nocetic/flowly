@@ -5260,6 +5260,8 @@ LONG_RUNNING_METHODS = frozenset({
 
     'voice.tasks.requests',
     'voice.tasks.respond',
+    # Waits for a possible approval card and then the command itself.
+    'voice.exec',
     "mcp.test",
     "mcp.oauth_start",
     "mcp.setup.cancel",

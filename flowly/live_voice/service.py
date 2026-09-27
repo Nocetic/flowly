@@ -14,7 +14,7 @@ METHODS = frozenset({
     'voice.open', 'voice.get', 'voice.history', 'voice.append', 'voice.end', 'voice.delete', 'voice.list',
     'voice.chats.open', 'voice.tasks.dispatch', 'voice.tasks.events', 'voice.notice', 'voice.work.list', 'voice.language',
     'voice.tasks.get', 'voice.tasks.prepare', 'voice.tasks.steer', 'voice.tasks.cancel',
-    'voice.tasks.requests', 'voice.tasks.respond', 'voice.focus',
+    'voice.tasks.requests', 'voice.tasks.respond', 'voice.focus', 'voice.exec',
 })
 
 
@@ -36,19 +36,22 @@ def target(params: dict) -> tuple[str, str]:
 
 class LiveVoiceService:
     def __init__(self, sessions: VoiceSessions, board: Callable[[], tuple[Any, Any]],
-                 worker: Callable[[], Any] | None = None):
+                 worker: Callable[[], Any] | None = None, executor: Callable[[], Any] | None = None):
         self.sessions = sessions
         self.board = board
         self.worker = worker
+        self.executor = executor
 
     def for_principal(self, principal: VoicePrincipal | None) -> LiveVoiceService:
         """Keep simultaneous account requests out of each other's mutable state."""
-        return LiveVoiceService(self.sessions.for_principal(principal), self.board, self.worker)
+        return LiveVoiceService(self.sessions.for_principal(principal), self.board, self.worker, self.executor)
 
     def for_owner(self, owner: RequestOwner) -> LiveVoiceService:
-        return LiveVoiceService(self.sessions.for_owner(owner), self.board, self.worker)
+        return LiveVoiceService(self.sessions.for_owner(owner), self.board, self.worker, self.executor)
 
     def call(self, method: str, params: dict) -> dict | Awaitable[dict]:
+        if method == 'voice.exec':
+            return self._exec(params)
         if method == 'voice.chats.open':
             return self._open_chat(params)
         if method == 'voice.tasks.prepare':
@@ -103,7 +106,7 @@ class LiveVoiceService:
         if method == 'voice.get':
             return self.sessions.get(params.get('conversationId'))
         if method == 'voice.history':
-            return self.sessions.history(params)
+            return self._history(params)
         if method == 'voice.append':
             return self.sessions.append(params)
         if method == 'voice.end':
@@ -206,6 +209,36 @@ class LiveVoiceService:
             except BoardError as exc:
                 raise VoiceError('TASK_CONFLICT', str(exc)) from exc
         raise VoiceError('UNKNOWN_METHOD', 'Unknown voice operation.')
+
+    def _history(self, params: dict) -> dict:
+        result = self.sessions.history(params)
+        runner = self.executor() if self.executor is not None else None
+        conversation_id = result['conversation']['conversationId']
+        for record in result['tools']:
+            # Only this process can execute voice commands. A running record
+            # it does not own was lost with a previous process.
+            if record['status'] == 'running' and (runner is None or not runner.running(conversation_id, record['id'])):
+                record['status'] = 'interrupted'
+        return result
+
+    async def _exec(self, params: dict) -> dict:
+        """Run one command with the selected agent's ordinary exec tool and policy."""
+        from flowly.live_voice.exec import exec_arguments
+
+        conversation = self.sessions.require_connection(params)
+        profile, bot_id = target(params)
+        if (conversation['profile'], conversation['botId']) != (profile, bot_id):
+            raise VoiceError('TARGET_CONFLICT', 'Commands run on this conversation\'s agent.')
+        runner = self.executor() if self.executor is not None else None
+        if runner is None:
+            raise VoiceError('UNAVAILABLE', 'Command execution is not ready on this agent host.')
+        if runner.profile() != profile:
+            # Voice conversations are owned by the primary runtime. A named
+            # profile's worker has no ownership record to scope approvals.
+            raise VoiceError('UNSUPPORTED_TARGET', 'Voice commands run only on the primary agent. Dispatch a task instead.')
+        arguments = exec_arguments(params)
+        record, created = self.sessions.begin_tool(params, name='exec', arguments=arguments)
+        return await runner.run(self.sessions, params['conversationId'], record, created)
 
     async def _prepare_task_chat(self, params: dict) -> dict:
         """Open an existing owned chat independently of worker capacity.

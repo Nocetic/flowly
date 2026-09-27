@@ -16,6 +16,8 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$")
 _DIAGNOSTIC_ID = re.compile(r"^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$", re.I)
 MAX_MESSAGES = 4000
 MAX_CONNECTIONS = 100
+MAX_TOOL_RECORDS = 100
+TOOL_STATUSES = frozenset({"running", "completed", "failed", "denied", "timed_out", "interrupted"})
 
 
 class VoiceError(RuntimeError):
@@ -213,7 +215,8 @@ class VoiceSessions:
             connection = current_voice["connections"][-1]
             if not connection["endedAt"]:
                 raise VoiceError("BUSY", "End the active voice connection before deleting this conversation.")
-            has_content = bool(current.messages or current_voice.get("notices") or current_voice.get("focusTaskId"))
+            has_content = bool(current.messages or current_voice.get("notices") or current_voice.get("focusTaskId")
+                               or current_voice.get("tools"))
             if empty_only and has_content:
                 raise _NotEmpty
             # The tombstone is written while holding the session lock. It
@@ -221,6 +224,7 @@ class VoiceSessions:
             # land between an emptiness check and physical deletion.
             current.messages.clear()
             current_voice.pop("notices", None)
+            current_voice.pop("tools", None)
             current_voice.pop("focusTaskId", None)
             current_voice["deletedAt"] = _now()
             current_voice["revision"] += 1
@@ -330,9 +334,76 @@ class VoiceSessions:
         rows = session.messages
         # History is a revisioned snapshot, not an append-only event cursor:
         # provider corrections can revise earlier messages.
+        tools = sorted(self._metadata(session).get("tools", {}).values(), key=lambda row: (row["createdAt"], row["id"]))
         return {"conversation": conversation, "messages": rows[offset:offset + limit],
                 "notices": copy.deepcopy(self._metadata(session).get("notices", {})) if offset == 0 else {},
+                "tools": copy.deepcopy(tools) if offset == 0 else [],
                 "nextOffset": offset + limit if offset + limit < len(rows) else None}
+
+    def begin_tool(self, params: dict, *, name: str, arguments: dict) -> tuple[dict, bool]:
+        """Durably reserve one provider tool call before any side effect.
+
+        Returns ``(record, created)``. A retry with the same command identity
+        returns the existing record, even after its connection ended, so a
+        lost receipt can never execute the action a second time.
+        """
+        key = session_key(params.get("conversationId"))
+        connection_id = identity(params.get("connectionId"), "connectionId")
+        command_id = identity(params.get("commandId"), "commandId")
+        anchor = params.get("anchorMessageId")
+        if anchor is not None:
+            if not isinstance(anchor, str) or anchor.count(":") != 1:
+                raise VoiceError("INVALID_PARAMS", "Invalid transcript anchor.")
+            for part in anchor.split(":"):
+                identity(part, "anchorMessageId")
+
+        def update(session: Session) -> tuple[dict, bool]:
+            voice = self._metadata(session)
+            if voice.get("deletedAt"):
+                raise VoiceError("NOT_FOUND", "Voice conversation not found.")
+            tools = voice.setdefault("tools", {})
+            existing = tools.get(command_id)
+            if existing:
+                if existing["name"] != name or existing["arguments"] != arguments:
+                    raise VoiceError("CONFLICT", "This command identity already has different arguments.")
+                return copy.deepcopy(existing), False
+            connection = voice["connections"][-1]
+            if connection["id"] != connection_id or connection["endedAt"]:
+                raise VoiceError("STALE_CONNECTION", "This voice connection no longer accepts commands.")
+            if len(tools) >= MAX_TOOL_RECORDS:
+                raise VoiceError("LIMIT", "Start a new voice conversation to continue.")
+            record = {"id": command_id, "name": name, "arguments": copy.deepcopy(arguments), "status": "running",
+                      "connectionId": connection_id, "anchorMessageId": anchor, "createdAt": _now(),
+                      "finishedAt": None, "output": None, "truncated": False, "exitCode": None}
+            tools[command_id] = record
+            voice["revision"] += 1
+            session.updated_at = datetime.now()
+            voice["updatedAt"] = session.updated_at.isoformat()
+            return copy.deepcopy(record), True
+
+        return self.sessions.mutate(key, update)
+
+    def finish_tool(self, conversation_id: Any, command_id: str, *, status: str, output: str | None,
+                    truncated: bool = False, exit_code: int | None = None) -> dict | None:
+        """Settle a running record once. Settled records are never rewritten."""
+        if status not in TOOL_STATUSES - {"running"}:
+            raise VoiceError("INVALID_PARAMS", "Invalid tool status.")
+        key = session_key(conversation_id)
+
+        def update(session: Session) -> dict | None:
+            voice = self._metadata(session)
+            record = voice.get("tools", {}).get(command_id)
+            if voice.get("deletedAt") or record is None:
+                return None
+            if record["status"] == "running":
+                record.update({"status": status, "output": output, "truncated": truncated,
+                               "exitCode": exit_code, "finishedAt": _now()})
+                voice["revision"] += 1
+                session.updated_at = datetime.now()
+                voice["updatedAt"] = session.updated_at.isoformat()
+            return copy.deepcopy(record)
+
+        return self.sessions.mutate(key, update)
 
     def notice(self, params: dict, *, task_id: str, event_id: int) -> dict:
         key = session_key(params.get("conversationId"))
