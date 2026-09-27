@@ -142,3 +142,28 @@ def test_stop_rejects_human_and_work(authority):
     assert not authority.stop("generation-1")["running"]
     with pytest.raises(ScreenError, match="SCREEN_NOT_RUNNING"):
         authority.begin_action("run-2", "action-2", "generation-1")
+
+
+def test_dead_generation_stop_ends_human_input_and_run_claims(authority):
+    action = authority.begin_action("run-1", "action-1", "generation-1")
+    human = authority.acquire("viewer-1", "generation-1", authority.snapshot()["epoch"])
+    assert human["control"] == "human-pending"
+    # Live screen: an ordinary stop still refuses to override the human.
+    with pytest.raises(ScreenError, match="HUMAN_HAS_CONTROL"):
+        authority.stop("generation-1")
+    with pytest.raises(ScreenError, match="STALE_GENERATION"):
+        authority.stop_dead("generation-0")
+    finished = authority.stop_dead("generation-1")
+    assert finished == {**finished, "running": False, "control": "agent", "runId": None,
+                        "actionInFlight": False, "inputDrainRequired": False, "holderHash": None}
+    assert finished["epoch"] > human["epoch"]
+    assert not authority.end_action(action), "the dead generation's action is fenced"
+    assert not authority.may_input("viewer-1", "generation-1", human["epoch"])
+    assert authority.start("generation-2")["running"]
+    assert ScreenAuthority(authority.directory).snapshot()["generation"] == "generation-2"
+
+
+def test_dead_generation_stop_needs_the_running_generation(authority):
+    authority.stop("generation-1")
+    with pytest.raises(ScreenError, match="SCREEN_NOT_RUNNING"):
+        authority.stop_dead("generation-1")

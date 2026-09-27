@@ -390,8 +390,6 @@ class ScreenRuntime:
             if state is None or state["generation"] != generation:
                 raise ScreenError("STALE_GENERATION")
             control = self.authority.snapshot()
-            if control["running"]:
-                self.authority.stop(generation)
             if not is_alive(state.get("supervisor")):
                 if any(is_alive(child) for child in state["children"]):
                     # A crashed supervisor left applications behind. A
@@ -401,6 +399,10 @@ class ScreenRuntime:
                         self._terminate_recorded(state["children"])
                     if any(is_alive(child) for child in state["children"]):
                         raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+                if control["running"] and control["generation"] == generation:
+                    # Nothing of this generation runs; its human/run claims
+                    # guard nothing and would otherwise block every restart.
+                    self.authority.stop_dead(generation)
                 if state["phase"] != "stopped":
                     # The supervisor died without recording its stop. Nothing
                     # of this generation runs now, so finish it; otherwise the
@@ -408,6 +410,8 @@ class ScreenRuntime:
                     write_state(self.manifest, {**state, "phase": "stopped", "supervisor": None,
                                                 "children": [], "error": None})
                 return
+            if control["running"]:
+                self.authority.stop(generation)
             signal_process(state["supervisor"], signal.SIGTERM)
             deadline = time.monotonic() + self.STOP_TIMEOUT
             while time.monotonic() < deadline:

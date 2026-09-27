@@ -994,3 +994,79 @@ def test_crashed_supervisor_is_recovered_by_stop_and_the_screen_starts_again(tmp
         assert restarted["phase"] == "running" and restarted["generation"] != state["generation"]
     finally:
         runtime.stop(restarted["generation"])
+
+
+def test_host_reboot_while_human_holds_control_is_recovered_by_explicit_stop(tmp_path):
+    import signal
+    import time
+
+    from flowly.desktop_runtime.launcher import signal_process
+
+    runtime = ScreenRuntime(tmp_path / "reboot")
+    state = runtime.start()
+    generation = state["generation"]
+    authority = runtime.authority
+    action = authority.begin_action("original-run", "before", generation)
+    assert authority.end_action(action)
+    human = authority.acquire("viewer", generation, authority.snapshot()["epoch"])
+    assert human["control"] == "human" and human["runId"] == "original-run"
+    # Everything of the screen dies at once, as in a host reboot or OOM kill.
+    for identity in [state["supervisor"], *state["children"]]:
+        if is_alive(identity):
+            signal_process(identity, signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while any(is_alive(identity) for identity in [state["supervisor"], *state["children"]]):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    # A release needs a running screen and a start needs agent control: without
+    # the explicit dead-generation stop the profile would be locked out forever.
+    with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED|HUMAN_HAS_CONTROL"):
+        runtime.start()
+    runtime.stop(generation)
+    assert authority.snapshot()["control"] == "agent" and authority.snapshot()["runId"] is None
+    restarted = runtime.start()
+    try:
+        assert restarted["phase"] == "running" and restarted["generation"] != generation
+    finally:
+        runtime.stop(restarted["generation"])
+
+
+def test_runtime_restored_from_another_host_never_signals_reused_pids_and_recovers(tmp_path):
+    import signal
+    import time
+
+    from flowly.desktop_runtime.launcher import process_identity, signal_process, write_state
+
+    directory = tmp_path / "restored"
+    runtime = ScreenRuntime(directory)
+    state = runtime.start()
+    generation = state["generation"]
+    runtime.authority.acquire("viewer", generation, runtime.authority.snapshot()["epoch"])
+    for identity in [state["supervisor"], *state["children"]]:
+        if is_alive(identity):
+            signal_process(identity, signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while any(is_alive(identity) for identity in [state["supervisor"], *state["children"]]):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    # A backup taken while the screen ran, restored on another host: its PIDs
+    # now name unrelated live processes there, under another kernel boot.
+    strangers = [subprocess.Popen(["sleep", "60"]) for _ in range(1 + len(state["children"]))]
+    try:
+        foreign = [dict(process_identity(p.pid), boot="00000000-0000-4000-8000-000000000000") for p in strangers]
+        write_state(directory / "runtime.json", {**state, "supervisor": foreign[0], "children": foreign[1:]})
+        restored = ScreenRuntime(directory)
+        with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED|HUMAN_HAS_CONTROL"):
+            restored.start()
+        restored.stop(generation)
+        assert all(p.poll() is None for p in strangers), "a restored manifest never signals this host's processes"
+        assert restored.authority.snapshot()["control"] == "agent"
+        again = restored.start()
+        try:
+            assert again["phase"] == "running" and again["generation"] != generation
+        finally:
+            restored.stop(again["generation"])
+    finally:
+        for p in strangers:
+            p.kill()
+            p.wait()

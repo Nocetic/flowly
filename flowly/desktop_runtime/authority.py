@@ -221,6 +221,21 @@ class ScreenAuthority:
             state.update(running=False, epoch=state["epoch"] + 1)
         return _public(state)
 
+    def stop_dead(self, generation: str) -> dict:
+        """Finish a generation whose every process the caller verified dead.
+
+        Human control, input, action and run claims protected a live screen
+        that no longer exists (crash, host reboot); keeping them would lock
+        the profile out forever, since release needs a running screen. Only
+        an explicit stop under the lifecycle lock calls this, never a viewer
+        disconnect. Anything still tied to this generation is fenced as stale.
+        """
+        with self._transaction() as state:
+            self._check(state, generation)
+            state.update(running=False, control="agent", viewer=None, run=None, action=None, input=None,
+                         epoch=state["epoch"] + 1)
+        return _public(state)
+
     def claim_run(self, run_id: str, generation: str) -> dict:
         """Reserve the browser before the first model/tool step of a screen run."""
         _identity(run_id)

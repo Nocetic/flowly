@@ -263,6 +263,7 @@ def test_start_failure_never_releases_human_control(runtime, monkeypatch):
 def test_stop_refuses_human_and_active_run_before_signalling(runtime, monkeypatch):
     manifest(runtime)
     runtime.authority.start("generation-1")
+    monkeypatch.setattr(launcher, "is_alive", lambda value: bool(value))
     monkeypatch.setattr(launcher, "signal_process", lambda *args: pytest.fail("must not signal"))
     control = runtime.authority.acquire("viewer", "generation-1", 1)
     with pytest.raises(ScreenError, match="HUMAN_HAS_CONTROL"):
@@ -275,6 +276,22 @@ def test_stop_refuses_human_and_active_run_before_signalling(runtime, monkeypatc
     with pytest.raises(ScreenError, match="SCREEN_BUSY"):
         runtime.stop("generation-1")
 
+
+
+def test_stop_of_a_dead_generation_ends_its_human_and_run_claims(runtime, monkeypatch):
+    manifest(runtime)
+    runtime.authority.start("generation-1")
+    admission = runtime.authority.begin_action("run", "action", "generation-1")
+    runtime.authority.end_action(admission)
+    runtime.authority.acquire("viewer", "generation-1", runtime.authority.snapshot()["epoch"])
+    monkeypatch.setattr(launcher, "is_alive", lambda value: False)
+    monkeypatch.setattr(launcher, "signal_process", lambda *args: pytest.fail("nothing runs to signal"))
+    runtime.stop("generation-1")
+    control = runtime.authority.snapshot()
+    assert (control["running"], control["control"], control["runId"]) == (False, "agent", None)
+    assert json.loads(runtime.manifest.read_text())["phase"] == "stopped"
+    with pytest.raises(ScreenError, match="STALE_GENERATION"):
+        runtime.stop("generation-0")
 
 @pytest.mark.parametrize("raw", ['{', '[]', '{}', '{"schema":1}', 'x' * 17000])
 def test_corrupt_state_fails_closed(runtime, raw):
