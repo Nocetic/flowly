@@ -1295,6 +1295,19 @@ class ContextBuilder:
         content = user_md.read_text(encoding="utf-8")
         return "ONBOARDING_PENDING" in content
 
+    @staticmethod
+    def _agent_setup_active(session_key: str | None) -> bool:
+        """A named agent's own setup owns the first conversation; the generic
+        getting-to-know-you offer would compete with its questions."""
+        if not session_key:
+            return False
+        try:
+            from flowly.agent_home import setup_tools_enabled
+
+            return setup_tools_enabled(session_key)
+        except Exception:  # noqa: BLE001 — prompt assembly must not fail
+            return False
+
     def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
@@ -1496,6 +1509,7 @@ class ContextBuilder:
             not skip_context_files
             and (available_tools is None or "write_file" in available_tools)
             and self._is_onboarding_pending()
+            and not self._agent_setup_active(session_key)
         ):
             parts.append(
                 "## Getting to know the user\n\n"

@@ -219,10 +219,26 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
         # resolving twice and restarting must not create another greeting.
         agent_home = await host.rpc("writer", "agent.home.get", {"locale": "tr"}, **identity)
         assert agent_home["setup"] == "active"
+        assert agent_home["introduction"] == "pending"
         assert await host.rpc("writer", "agent.home.get", {}, **identity) == agent_home
+        # The agent speaks first through a real turn in the child. This fixture
+        # has no model credentials, so the turn fails and the app's localized
+        # welcome is written instead — exactly once, never a provider error.
+        introducing = await host.rpc("writer", "agent.home.introduce", {"locale": "tr"}, **identity)
+        assert introducing["introduction"] in {"running", "fallback"}
+        for _ in range(200):
+            settled = await host.rpc("writer", "agent.home.get", {}, **identity)
+            if settled["introduction"] != "running":
+                break
+            await asyncio.sleep(0.05)
+        assert settled["introduction"] == "fallback"
+        assert settled["pendingAsk"]["options"]
+        repeated = await host.rpc("writer", "agent.home.introduce", {}, **identity)
+        assert repeated["introduction"] == "fallback"
         history_params = {"sessionKey": agent_home["sessionKey"], "limit": 10}
         page = await host.rpc("writer", "chat.history", history_params, **identity)
         assert len(page["messages"]) == 1
+        assert "Birlikte" in json.dumps(page["messages"][0], ensure_ascii=False)
         assert page["historyPageVersion"] == 1
         assert not page["hasOlder"]
         skipped = await host.rpc("writer", "agent.home.setup", {"state": "skipped"}, **identity)

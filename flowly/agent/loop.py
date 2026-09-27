@@ -167,6 +167,8 @@ _GROUP_BUFFER_MAX_MSGS = 50
 _GROUP_BUFFER_MAX_CHARS = 6000
 
 _GOAL_CONTINUATION_ID = "_goal_continuation_goal_id"
+# Mirrors flowly.agent_home.AGENT_INTRODUCTION (kept import-free here).
+_AGENT_INTRODUCTION = "_agent_introduction"
 _GOAL_BASE_USER_EPOCH = "_goal_base_user_epoch"
 _GOAL_KICKOFF = "_goal_kickoff"
 _GOAL_USER_EPOCH = "_goal_user_epoch"
@@ -2170,7 +2172,7 @@ class AgentLoop:
         not create or patch skills; that remains a main-agent path initiated by
         the user or by the active task context.
         """
-        if getattr(msg, "metadata", {}).get(_GOAL_CONTINUATION_ID):
+        if getattr(msg, "metadata", {}).get(_GOAL_CONTINUATION_ID) or getattr(msg, "metadata", {}).get(_AGENT_INTRODUCTION):
             return
         # Turn-based autonomous consolidation: every N turns, if memory has new
         # writes, kick off a background cleanup pass (independent of the
@@ -2358,7 +2360,13 @@ class AgentLoop:
         """Register the default set of tools."""
         from flowly.profile import current_profile_name
         if current_profile_name() != "default":
-            from flowly.agent.tools.agent_setup import AgentSetupFinishTool
+            from flowly.agent.tools.agent_setup import (
+                AgentSetupAskTool,
+                AgentSetupFinishTool,
+                AgentSetupProposeCardTool,
+            )
+            self.tools.register(AgentSetupAskTool())
+            self.tools.register(AgentSetupProposeCardTool())
             self.tools.register(AgentSetupFinishTool())
         # File tools (sandboxed to workspace + ~/.flowly)
         self.tools.register(ReadFileTool(workspace=self.workspace))
@@ -7640,6 +7648,7 @@ class AgentLoop:
         synthetic_goal_id = str(msg.metadata.get(_GOAL_CONTINUATION_ID) or "")
         is_real_arrival = (
             not synthetic_goal_id
+            and not msg.metadata.get(_AGENT_INTRODUCTION)
             and not _is_goal_control_message(msg)
             and _is_user_activity_channel(msg.channel)
             and msg.sender_id not in {"goal", "process", "system", "subagent"}
@@ -7791,6 +7800,15 @@ class AgentLoop:
                             response.metadata['_goal_execution_binding'] = goal_binding
                         if commands is not None:
                             commands.finish_execution(msg.session_key, run_id, after_goal, outcome)
+                        if msg.metadata.get(_AGENT_INTRODUCTION):
+                            # Still inside the turn lock: a queued owner message
+                            # cannot land between the agent's first words and a
+                            # fallback welcome.
+                            from flowly.agent_home import settle_introduction
+                            try:
+                                settle_introduction(run_id, self.sessions)
+                            except Exception:  # noqa: BLE001
+                                logger.exception("[agent-home] could not settle introduction {}", run_id)
             finally:
                 if binding is not None:
                     binding.close()
@@ -7845,6 +7863,7 @@ class AgentLoop:
         if (
             _is_user_activity_channel(msg.channel)
             and not msg.metadata.get(_GOAL_CONTINUATION_ID)
+            and not msg.metadata.get(_AGENT_INTRODUCTION)
         ):
             self._dreamer_last_user_ts = time.time()
 
@@ -8287,6 +8306,7 @@ class AgentLoop:
             and "_display_content" not in msg.metadata
             and not msg.content.strip().startswith("/")
             and not msg.metadata.get(_GOAL_CONTINUATION_ID)
+            and not msg.metadata.get(_AGENT_INTRODUCTION)
         ):
             try:
                 from flowly.plans.manager import get_plan_manager as _get_pm_sticky
@@ -8367,6 +8387,13 @@ class AgentLoop:
 
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
+        from flowly.agent_home import is_agent_home, is_introduction_turn
+        if is_agent_home(msg.session_key):
+            # Setup writes to this conversation from outside the turn (the
+            # fallback welcome). Adopt a newer canonical revision so this
+            # turn's compare-and-swap saves do not fail as stale.
+            self.sessions.refresh(session)
+        introduction_turn = is_introduction_turn(msg.session_key, msg.metadata)
         display_content = str(msg.metadata.get("_display_content") or msg.content)
         tool_policy = resolve_turn_tool_policy(msg.metadata, display_content)
         tools_allowed = tool_policy.allowed
@@ -8431,12 +8458,15 @@ class AgentLoop:
         # lands after the turn. Marked provisional so the post-turn auto-title
         # still overrides it. (Relay already seeds its own first-message title on
         # Firestore, so this is effectively the gateway's equivalent.)
-        self._set_provisional_title(session, display_content)
+        if not introduction_turn:
+            self._set_provisional_title(session, display_content)
         try:
             _pending_user: dict[str, Any] = {"role": "user", "content": display_content}
             if msg.media:
                 _pending_user["media"] = list(msg.media)
-            if msg.metadata.get(_GOAL_CONTINUATION_ID):
+            if msg.metadata.get(_GOAL_CONTINUATION_ID) or introduction_turn:
+                # The introduction's trigger is app-authored: it stays in the
+                # model context but is never shown as something the owner said.
                 _pending_user["_display_hidden"] = True
             self.sessions.save(session, extra_messages=[_pending_user])
         except Exception as exc:  # noqa: BLE001
@@ -8466,6 +8496,14 @@ class AgentLoop:
         if allowed_tools is not None:
             # The resolved list affects schema disclosure and executor lookup,
             # so a hallucinated call cannot bypass the positive grant.
+            msg.metadata["disabled_tools"] = disabled_tools
+        from flowly.agent_home import SETUP_TOOLS, setup_tools_enabled
+        if SETUP_TOOLS & set(self.tools.tool_names) and not setup_tools_enabled(msg.session_key):
+            # Setup bookkeeping exists only in the agent's own conversation
+            # while its optional setup is active.
+            disabled_tools = sorted(
+                {value for value in (disabled_tools or []) if isinstance(value, str)} | SETUP_TOOLS
+            )
             msg.metadata["disabled_tools"] = disabled_tools
         collaboration_directory = msg.metadata.get("profile_directory")
         collaboration_current = str(msg.metadata.get("profile_current") or "default")
@@ -8924,10 +8962,16 @@ class AgentLoop:
         self._inject_recent_artifacts_hint(
             messages, session_key=msg.session_key,
         )
-        from flowly.agent_home import setup_guidance
-        introduction = setup_guidance(msg.session_key)
-        if introduction and messages and messages[0].get("role") == "system":
-            messages[0]["content"] += "\n\n" + introduction
+        from flowly.agent_home import begin_turn
+        try:
+            # Classifies this turn (introduction, tapped choice, typed message)
+            # and applies a structured setup answer before the model runs.
+            setup_context = begin_turn(msg.session_key, msg.metadata)
+        except Exception:  # noqa: BLE001 — setup must never break the chat
+            logger.exception("[agent-home] setup state unavailable for {}", msg.session_key)
+            setup_context = None
+        if setup_context and messages and messages[0].get("role") == "system":
+            messages[0]["content"] += "\n\n" + setup_context
         self._inject_render_capability_hint(
             messages,
             capabilities=msg.metadata.get("render_capabilities"),
@@ -9063,33 +9107,42 @@ class AgentLoop:
         # the final summary text. See ``Session.extend_with_turn_messages``
         # for the full recipe (user + each loop message + capstone).
         turn_start_index = len(session.messages)
-        session.extend_with_turn_messages(
-            user_content=display_content,
-            new_messages=turn_messages,
-            final_content=final_content,
-            usage=usage if not provider_error and not turn_aborted else None,
-            accounting_usage=(usage if provider_error or turn_aborted else None),
-            media=msg.media or None,
-            reply_media=reply_media or None,
-            reply_media_assets=reply_media_assets or None,
-            aborted=turn_aborted,
-            duration_ms=turn_duration_ms,
-            # A goal turn is an ordinary turn whose prompt the agent authored
-            # on the user's behalf. It stays VISIBLE: the transcript must read
-            # like the conversation it is, and every client already renders a
-            # user row it did not send (chat.inflight restores one the same
-            # way). Hiding it produced replies with no visible cause.
-            user_display_hidden=False,
-            # Provider failures are terminal, but they are not successful
-            # assistant completions. Keep their visible error text in history
-            # without advancing the cross-client unread identity.
-            run_id=(outbound_run_id or None) if not provider_error else None,
+        # A failed introduction leaves no trace: its hidden trigger is withdrawn
+        # by the canonical save below and agent_home writes the static welcome.
+        # An owner must never open a new agent onto a provider error.
+        introduction_failed = introduction_turn and (
+            bool(provider_error) or turn_aborted or not str(final_content or "").strip()
         )
-        self._commit_provider_continuity(
-            session,
-            provider_state_out,
-            turn_start_index=turn_start_index,
-        )
+        if not introduction_failed:
+            session.extend_with_turn_messages(
+                user_content=display_content,
+                new_messages=turn_messages,
+                final_content=final_content,
+                usage=usage if not provider_error and not turn_aborted else None,
+                accounting_usage=(usage if provider_error or turn_aborted else None),
+                media=msg.media or None,
+                reply_media=reply_media or None,
+                reply_media_assets=reply_media_assets or None,
+                aborted=turn_aborted,
+                duration_ms=turn_duration_ms,
+                # A goal turn is an ordinary turn whose prompt the agent authored
+                # on the user's behalf. It stays VISIBLE: the transcript must read
+                # like the conversation it is, and every client already renders a
+                # user row it did not send (chat.inflight restores one the same
+                # way). Hiding it produced replies with no visible cause. The
+                # introduction's trigger is different: the owner did not ask
+                # anything, the agent speaks first.
+                user_display_hidden=introduction_turn,
+                # Provider failures are terminal, but they are not successful
+                # assistant completions. Keep their visible error text in history
+                # without advancing the cross-client unread identity.
+                run_id=(outbound_run_id or None) if not provider_error else None,
+            )
+            self._commit_provider_continuity(
+                session,
+                provider_state_out,
+                turn_start_index=turn_start_index,
+            )
         self.sessions.save(session)
         await self._index_turn_media(
             session, reply_media_assets, msg.media, msg.channel
@@ -9098,7 +9151,8 @@ class AgentLoop:
         # Auto-title the session from the first exchange so every
         # client — CLI, desktop, iOS — shows the SAME descriptive name instead
         # of a random session-key suffix. Fire-and-forget; never blocks.
-        self._maybe_autotitle_session(session, display_content, final_content)
+        if not introduction_turn:
+            self._maybe_autotitle_session(session, display_content, final_content)
 
         # Trajectory export (opt-in via config)
         if self._should_save_trajectories():
@@ -9114,7 +9168,8 @@ class AgentLoop:
             )
 
         # Self-improvement: background review trigger
-        self._maybe_spawn_review(session, _executed_tools, msg)
+        if not introduction_turn:
+            self._maybe_spawn_review(session, _executed_tools, msg)
 
         # Coalesced MEMORY.md regen: ingests during this turn only marked the
         # summary dirty; rewrite it once here (not per-write) so a turn with N

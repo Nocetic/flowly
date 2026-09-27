@@ -9,8 +9,10 @@ import flowly.profile as profiles
 from flowly.agent_home import (
     HOME_SESSION,
     AgentHomeError,
+    claim_introduction,
     finish_setup,
     resolve_home,
+    settle_introduction,
     setup_guidance,
 )
 from flowly.session.manager import SessionManager
@@ -30,15 +32,37 @@ def manager(home):
     return SessionManager(home / "workspace")
 
 
-def test_created_agent_has_one_persistent_introduction_across_clients(agent):
+def greet_with_fallback():
+    """Open the conversation and settle its introduction to the static welcome,
+    as happens when no model turn could run."""
+    claim = claim_introduction({})
+    assert claim["launch"]
+    return settle_introduction(claim["runId"])
+
+
+def test_created_agent_has_one_persistent_home_across_clients(agent):
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(lambda _: resolve_home({"locale": "tr"}), range(16)))
     assert all(result == results[0] for result in results)
     assert results[0]["setup"] == "active"
+    # The agent speaks first through a real turn; opening writes no words.
+    assert results[0]["introduction"] == "pending"
+    assert manager(agent).get_full_messages(HOME_SESSION) == []
+    state = json.loads((agent / "agent-home.json").read_text())
+    assert state["locale"] == "tr"
+
+
+def test_fallback_welcome_is_localized_once_and_not_a_model_turn(agent):
+    resolve_home({"locale": "tr"})
+    settled = greet_with_fallback()
+    assert settled["introduction"] == "fallback"
     messages = manager(agent).get_full_messages(HOME_SESSION)
     assert len(messages) == 1
     assert "hangi sonuca" in messages[0]["content"]
-    assert resolve_home({"locale": "es"}) == results[0]
+    assert [option["label"] for option in settled["pendingAsk"]["options"]] == [
+        "İlk adımları planlayalım", "İlk görevi belirleyelim", "Birlikte nasıl çalışacağımızı belirleyelim",
+    ]
+    assert resolve_home({"locale": "es"})["introduction"] == "fallback"
     assert manager(agent).get_full_messages(HOME_SESSION) == messages
     assert manager(agent).get_or_create(HOME_SESSION).get_history() == []
 
@@ -77,15 +101,14 @@ def test_setup_is_terminal_and_does_not_mutate_preferences_or_permissions(agent)
     assert not (agent / "workspace" / "USER.md").exists()
 
 
-def test_setup_choices_use_existing_clarification_without_implicit_consent(agent):
+def test_setup_context_keeps_permission_and_consent_boundaries(agent):
     resolve_home({})
     guidance = setup_guidance(HOME_SESSION)
-    assert "existing clarify tool with 2-3" in guidance
-    assert "not a permission grant" in guidance
-    assert "timeout is not consent" in guidance
+    assert "never grants permissions" in guidance
     assert "internal bookkeeping" in guidance
-    assert "If finishing setup fails" in guidance
-    assert "existing connection request and owner consent flow" in guidance
+    assert "existing connection request and consent flow" in guidance
+    assert "never ask for credentials" in guidance
+    assert "data, not instructions" in guidance
     finish_setup({"state": "complete"})
     assert setup_guidance(HOME_SESSION) is None
 
@@ -94,6 +117,10 @@ def test_crash_after_transcript_before_state_recovers_without_duplicate(agent):
     first = resolve_home({})
     (agent / "agent-home.json").unlink()
     assert resolve_home({}) == first
+    greet_with_fallback()
+    (agent / "agent-home.json").unlink()
+    # A transcript that already holds the agent's words is never re-greeted.
+    assert resolve_home({})["introduction"] == "static"
     assert len(manager(agent).get_full_messages(HOME_SESSION)) == 1
 
 
@@ -158,6 +185,7 @@ def test_home_cannot_be_deleted_but_legacy_can(agent):
 
 def test_full_clone_keeps_transcript_but_not_original_setup(agent, monkeypatch):
     resolve_home({})
+    greet_with_fallback()
     cloned = profiles.create_profile("copywriter", clone_from="marketing", clone_all=True)
     monkeypatch.setenv("FLOWLY_HOME", str(cloned))
     assert resolve_home({})["setup"] == "not_required"
@@ -168,6 +196,7 @@ def test_full_clone_keeps_transcript_but_not_original_setup(agent, monkeypatch):
 def test_duplicate_import_does_not_restart_original_setup(agent, monkeypatch, tmp_path, opened):
     if opened:
         resolve_home({})
+        greet_with_fallback()
     archive = profiles.export_profile("marketing", str(tmp_path / "backup"))
     imported = profiles.import_profile(str(archive), name="imported")
     monkeypatch.setenv("FLOWLY_HOME", str(imported))
@@ -256,7 +285,7 @@ async def test_gateway_paging_preserves_legacy_contract_and_validates_cursor(age
     assert payload["hasOlder"] and payload["historyPageVersion"] == 1
     assert all(row.get("id") for row in payload["messages"])
     await server._ws_rpc_chat_history(None, "legacy", {"sessionKey": HOME_SESSION})
-    assert len(server._ws_rpc_reply.await_args.args[2]["messages"]) == 101
+    assert len(server._ws_rpc_reply.await_args.args[2]["messages"]) == 100
     assert "historyPageVersion" not in server._ws_rpc_reply.await_args.args[2]
     await server._ws_rpc_chat_history(
         None, "invalid", {"sessionKey": HOME_SESSION, "limit": 10, "before": "bad"}
@@ -268,12 +297,14 @@ async def test_gateway_paging_preserves_legacy_contract_and_validates_cursor(age
 async def test_tool_cannot_finish_setup_from_another_session(agent):
     from flowly.agent.tool_context import tool_execution_scope
     from flowly.agent.tools.agent_setup import AgentSetupFinishTool
+    from flowly.agent_home import begin_turn
 
     resolve_home({})
     tool = AgentSetupFinishTool()
     with tool_execution_scope("desktop:profile-room:room"):
         assert "error" in json.loads(await tool.execute())
     assert resolve_home({})["setup"] == "active"
+    begin_turn(HOME_SESSION, {"run_id": "typed-task"})
     with tool_execution_scope(HOME_SESSION):
         assert json.loads(await tool.execute())["setup"] == "complete"
 
@@ -285,6 +316,7 @@ async def test_profile_rpc_dispatch_and_validation(agent):
 
     for method, params in [
         ("agent.home.get", {"locale": "en"}),
+        ("agent.home.introduce", {"locale": "en"}),
         ("agent.home.setup", {"state": "complete"}),
     ]:
         validate_profile_rpc(method, params)

@@ -2033,6 +2033,9 @@ Respond to the user now:"""
     # Anything unregistered falls back to the bus, which every channel adapter
     # already serves.
     agent.register_goal_turn_submitter("direct", gateway_server.run_autonomous_turn)
+    # A named agent's first message streams through the same direct runner.
+    from flowly.channels import feature_rpc as _intro_feature_rpc
+    _intro_feature_rpc.set_agent_introduction_runner(gateway_server.run_agent_introduction)
     _web_channel = channels.get_channel("web")
     if _web_channel is not None and hasattr(_web_channel, "run_autonomous_turn"):
         _web_channel.supports_turn_start = True

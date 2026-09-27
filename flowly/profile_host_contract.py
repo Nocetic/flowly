@@ -45,6 +45,7 @@ _NON_PUBLIC_ATTACHMENT_HOST_SUFFIXES = (
 PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "agent.home.get": 30_000,
     "agent.home.setup": 30_000,
+    "agent.home.introduce": 30_000,
     "chat.compact": 60_000,
     "subagents.list": 15_000,
     "subagents.get": 15_000,
@@ -448,6 +449,12 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
             )
         if not message and not attachments:
             raise ProfileHostError("INVALID_PARAMS", "A bot message cannot be empty.")
+        if value.get("setupAnswer") is not None:
+            from flowly.agent_home import AgentHomeError, validate_setup_answer
+            try:
+                value["setupAnswer"] = validate_setup_answer(value["setupAnswer"])
+            except AgentHomeError as exc:
+                raise ProfileHostError(exc.code, str(exc)) from exc
         idempotency_key = value.get("idempotencyKey")
         if idempotency_key is not None and (
             not isinstance(idempotency_key, str)

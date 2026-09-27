@@ -3182,6 +3182,20 @@ class GatewayServer:
             return
         collaboration_metadata["turn_origin"] = turn_origin
 
+        # A tapped setup choice carries its meaning as identifiers, validated
+        # here for shape and later, inside the turn lock, against the agent's
+        # current question. Only the agent's own conversation accepts one.
+        if params.get("setupAnswer") is not None:
+            from flowly.agent_home import AgentHomeError, is_agent_home, validate_setup_answer
+
+            try:
+                if not is_agent_home(session_key):
+                    raise AgentHomeError("INVALID_REQUEST", "setupAnswer is only valid in an agent's own conversation")
+                collaboration_metadata["setup_answer"] = validate_setup_answer(params["setupAnswer"])
+            except AgentHomeError as exc:
+                await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", str(exc))
+                return
+
         # Direct gateway runs never inherit the process-global browser
         # selection. The desktop must attach an opaque registration owned by
         # this exact WebSocket; omission is an explicit no-browser run.
@@ -3393,6 +3407,52 @@ class GatewayServer:
         )
         return True
 
+    async def run_agent_introduction(self, run_id: str, prompt: str) -> bool:
+        """Run a named agent's first message as an ordinary streamed turn.
+
+        Same runner as ``chat.send`` (streaming, tool events, chat.inflight
+        re-entry, Stop, final event), started by the server instead of a client.
+        The trigger is hidden, only the introduction tool is granted, and the
+        agent settles the introduction inside its turn lock. Returns False when
+        nobody is watching the conversation."""
+        from flowly.agent_home import AGENT_INTRODUCTION, HOME_SESSION
+
+        ws = next((target for target in self._session_targets(HOME_SESSION) if not target.closed), None)
+        if ws is None or self.on_chat_message is None:
+            return False
+
+        async def stream_callback(delta: str) -> None:
+            await self._session_send(
+                HOME_SESSION,
+                ws,
+                {
+                    "type": "event",
+                    "event": "agent",
+                    "data": {
+                        "runId": run_id,
+                        "sessionKey": HOME_SESSION,
+                        "stream": "assistant",
+                        "data": {"text": delta},
+                    },
+                },
+            )
+
+        self.chat_commands.accept(HOME_SESSION, run_id, {"turnOrigin": "agent_introduction"})
+        await self._run_chat(
+            ws,
+            "",
+            HOME_SESSION,
+            prompt,
+            run_id,
+            stream_callback,
+            extra_metadata={
+                AGENT_INTRODUCTION: True,
+                "turn_origin": "user",
+                "allowed_tools": ["agent_setup_ask"],
+            },
+        )
+        return True
+
     async def _run_chat(
         self,
         ws: web.WebSocketResponse,
@@ -3425,16 +3485,23 @@ class GatewayServer:
         supports_turn_start = getattr(self.on_chat_message, 'supports_turn_start', False) is True
         turn_started = False
 
+        # An introduction's trigger is app-authored and hidden; a client that
+        # re-enters mid-stream must restore only the agent's words.
+        from flowly.agent_home import AGENT_INTRODUCTION
+
+        hidden_prompt = bool((extra_metadata or {}).get(AGENT_INTRODUCTION))
+
         async def on_turn_started(text: str) -> None:
             nonlocal turn_started
             self.chat_commands.settle(session_key, run_id, 'running')
-            inflight.begin(session_key, run_id, text, goal_run=bool((extra_metadata or {}).get('goal_run')))
+            inflight.begin(session_key, run_id, "" if hidden_prompt else text,
+                           goal_run=bool((extra_metadata or {}).get('goal_run')))
             turn_started = True
 
         if supports_turn_start:
             extra_metadata = {**(extra_metadata or {}), '_on_turn_started': on_turn_started}
         else:
-            inflight.begin(session_key, run_id, message)
+            inflight.begin(session_key, run_id, "" if hidden_prompt else message)
 
         # Wrap the stream callback to accumulate full text for the final event.
         async def tracking_callback(delta: str) -> None:
@@ -4145,6 +4212,13 @@ class GatewayServer:
         the restart kills THIS connection, so awaiting would cut the socket
         before the reply flushed; the client reconnects on its own.
         """
+        if method == "agent.home.introduce":
+            # The introduction streams to whoever watches the conversation;
+            # the requesting client is watching by definition.
+            from flowly.agent_home import HOME_SESSION, is_agent_home
+
+            if is_agent_home(HOME_SESSION):
+                self.bind_session_ws(HOME_SESSION, ws)
         try:
             result, needs_restart = await feature_rpc.dispatch(method, params)
         except feature_rpc.FeatureRpcError as e:

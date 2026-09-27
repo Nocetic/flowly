@@ -1065,6 +1065,55 @@ async def agent_home_setup(params: dict) -> dict:
     except AgentHomeError as exc:
         raise FeatureRpcError(exc.code, str(exc)) from exc
 
+
+# Coroutine the direct gateway registers to run a named agent's introduction as
+# a real streamed turn: ``async (run_id, prompt) -> bool``. It returns False when
+# no client is watching the conversation to receive the stream; the caller then
+# settles to the static welcome.
+_introduction_runner = None
+_introduction_tasks: set[asyncio.Task] = set()
+
+
+def set_agent_introduction_runner(runner) -> None:
+    global _introduction_runner
+    _introduction_runner = runner
+
+
+async def agent_home_introduce(params: dict) -> dict:
+    """Start the agent's first message once. Transports without a streaming
+    runner (or with nobody watching) settle to the static welcome instead."""
+    from flowly.agent_home import AgentHomeError, claim_introduction, settle_introduction
+    try:
+        claim = await asyncio.to_thread(claim_introduction, params)
+    except AgentHomeError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+    if not claim["launch"]:
+        return claim["state"]
+    run_id = claim["runId"]
+    runner = _introduction_runner
+
+    async def run() -> None:
+        from loguru import logger
+
+        try:
+            if runner is not None:
+                await runner(run_id, claim["prompt"])
+        except Exception:  # noqa: BLE001 — the fallback below still greets
+            logger.exception("[agent-home] introduction turn {} failed", run_id)
+        finally:
+            # A turn that reached the agent was already settled inside its turn
+            # lock (this is then a no-op). This covers every run that did not:
+            # no runner, nobody watching, or a failure before the agent.
+            try:
+                await asyncio.to_thread(settle_introduction, run_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("[agent-home] could not settle introduction {}", run_id)
+
+    task = asyncio.create_task(run())
+    _introduction_tasks.add(task)
+    task.add_done_callback(_introduction_tasks.discard)
+    return claim["state"]
+
 # Coroutine the host registers so ``chat.compact`` can reach the agent.
 # Signature: ``async (session_key, instructions) -> dict``.
 _compact_cb = None
@@ -5119,6 +5168,7 @@ _DISPATCH: dict[str, tuple] = {
     "chat.compact": (chat_compact, True, False),
     "agent.home.get": (agent_home_get, True, False),
     "agent.home.setup": (agent_home_setup, True, False),
+    "agent.home.introduce": (agent_home_introduce, True, False),
     "plan.get": (plan_get, True, False),
     "plan.list": (plan_list, True, False),
     "plan.resolve": (plan_resolve, True, False),
