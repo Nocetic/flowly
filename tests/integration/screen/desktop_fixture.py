@@ -71,11 +71,17 @@ async def main():
 
     class LocalModel(LLMProvider):
         calls = 0
+        auxiliary: list[str] = []
 
         def get_default_model(self):
             return "test/local-screen-model"
 
         async def chat(self, *args, **kwargs):
+            if not kwargs.get("tools"):
+                # Tool-less product side calls (e.g. the session auto-title
+                # after a real bus turn) are not steps of the screen task.
+                self.auxiliary.append(str(kwargs.get("purpose") or "unknown"))
+                return LLMResponse(content="Screen fixture")
             self.calls += 1
             if self.calls == 1:
                 # Hold only the deterministic model response. The production
@@ -93,7 +99,10 @@ async def main():
             return LLMResponse(content="Signed in in the original Desktop task")
 
     model = LocalModel(api_key="test")
-    loop = AgentLoop(bus=MessageBus(), provider=model, workspace=home / "workspace", main_config=Config(),
+    # One bus: in relay mode the original task arrives as a real relay
+    # chat.send through WebChannel ingress, admission and the agent loop.
+    bus = MessageBus()
+    loop = AgentLoop(bus=bus, provider=model, workspace=home / "workspace", main_config=Config(),
                      max_iterations=4, soft_warn_at_iteration=0)
     loop.tools.register(BrowserTabTool(gateway))
 
@@ -133,13 +142,19 @@ async def main():
         bounds = dict(line.split("=", 1) for line in geometry.stdout.splitlines())
         active = query("getactivewindow").stdout.strip()
         browsers = query("search", "--onlyvisible", "--class", "^chromium$").stdout.splitlines()
+        terminals = query("search", "--onlyvisible", "--class", "^xfce4-terminal$").stdout.splitlines()
+        focus = query("getwindowfocus").stdout.strip()
         marker = Path(environment["HOME"]) / "desktop-terminal-probe"
         return {"panel": {key.lower(): int(bounds[key]) for key in ("X", "Y", "WIDTH", "HEIGHT")},
                 "browserActive": active in browsers,
                 "activeWindow": active, "browserWindows": browsers,
                 "pointer": query("getmouselocation", "--shell").stdout,
-                "focusWindow": query("getwindowfocus").stdout.strip(),
-                "terminalVisible": query("search", "--onlyvisible", "--class", "^xfce4-terminal$").returncode == 0,
+                "focusWindow": focus,
+                "terminalWindows": terminals,
+                # Keyboard input is only meaningful once the window manager has
+                # moved focus to the new Terminal, not merely mapped it.
+                "terminalFocused": active in terminals,
+                "terminalVisible": bool(terminals),
                 "settingsVisible": query("search", "--onlyvisible", "--class", "^xfce4-settings-manager$").returncode == 0,
                 "terminalCommandRan": marker.is_file() and marker.read_bytes() == b"desktop-ready\n"}
 
@@ -148,7 +163,7 @@ async def main():
         # browser. Keep values/cookies out of the response and test logs.
         if request.headers.get("Authorization") != f"Bearer {TOKEN}":
             raise web.HTTPUnauthorized()
-        return web.json_response({"calls": model.calls, "actions": list(actions),
+        return web.json_response({"calls": model.calls, "auxiliaryCalls": list(model.auxiliary), "actions": list(actions),
             "desktop": await asyncio.to_thread(desktop_inspection),
             "page": await page.evaluate("""() => {
                 const point = selector => { const r=document.querySelector(selector).getBoundingClientRect();
@@ -174,6 +189,7 @@ async def main():
     stopped = asyncio.Event()
     relay_channel = None
     relay_task = None
+    agent_tasks = []
     for sig in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(sig, stopped.set)
     try:
@@ -207,8 +223,18 @@ async def main():
                 from flowly.config.schema import WebChannelConfig
                 relay_channel = WebChannel(WebChannelConfig(enabled=True, relay_url=relay_url,
                     server_id="screen-fixture", auth_token=TOKEN,
-                    jwt_secret=os.environ["MOLTBOT_PROXY_JWT_SECRET"]), MessageBus())
+                    jwt_secret=os.environ["MOLTBOT_PROXY_JWT_SECRET"]), bus)
                 relay_channel.set_screen_gateway(gateway)
+
+                async def deliver_outbound():
+                    # The production ChannelManager dispatcher, reduced to the
+                    # one adapter this fixture runs.
+                    while True:
+                        message = await bus.consume_outbound()
+                        if message.channel == "web":
+                            await relay_channel.send(message)
+
+                agent_tasks += [asyncio.create_task(loop.run()), asyncio.create_task(deliver_outbound())]
                 relay_ready = asyncio.Event()
                 relay_channel._on_ready = relay_ready.set
                 relay_task = asyncio.create_task(relay_channel.start())
@@ -220,6 +246,9 @@ async def main():
                 setup_task.cancel()
                 await asyncio.gather(setup_task, return_exceptions=True)
     finally:
+        for task in agent_tasks:
+            task.cancel()
+        await asyncio.gather(*agent_tasks, return_exceptions=True)
         if relay_channel is not None:
             await relay_channel.stop()
         if relay_task is not None:
