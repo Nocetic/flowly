@@ -5262,6 +5262,8 @@ LONG_RUNNING_METHODS = frozenset({
     'voice.tasks.respond',
     # Waits for a possible approval card and then the command itself.
     'voice.exec',
+    # Stores up to 25 MB of inline files on this agent.
+    'voice.attachments',
     "mcp.test",
     "mcp.oauth_start",
     "mcp.setup.cancel",

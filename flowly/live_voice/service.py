@@ -14,7 +14,7 @@ METHODS = frozenset({
     'voice.open', 'voice.get', 'voice.history', 'voice.append', 'voice.end', 'voice.delete', 'voice.list',
     'voice.chats.open', 'voice.tasks.dispatch', 'voice.tasks.events', 'voice.notice', 'voice.work.list', 'voice.language',
     'voice.tasks.get', 'voice.tasks.prepare', 'voice.tasks.steer', 'voice.tasks.cancel',
-    'voice.tasks.requests', 'voice.tasks.respond', 'voice.focus', 'voice.exec',
+    'voice.tasks.requests', 'voice.tasks.respond', 'voice.focus', 'voice.exec', 'voice.attachments',
 })
 
 
@@ -52,6 +52,10 @@ class LiveVoiceService:
     def call(self, method: str, params: dict) -> dict | Awaitable[dict]:
         if method == 'voice.exec':
             return self._exec(params)
+        if method == 'voice.attachments':
+            from flowly.live_voice.attachments import store_attachments
+
+            return store_attachments(self.sessions, params)
         if method == 'voice.chats.open':
             return self._open_chat(params)
         if method == 'voice.tasks.prepare':
