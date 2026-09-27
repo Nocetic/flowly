@@ -71,13 +71,18 @@ app is its **display name**, which you can change whenever you like.
 
 ## What a bot looks like
 
-Every bot gets its own little woven symbol and its own colour. Flowly draws
-the symbol from the bot's name and the moment you made it, so no two bots get
-the same one. It never changes, which is how you tell two bots apart at a
-glance — in a group, in the sidebar, or next to a message.
+Every bot is a small animated character in its own colour. There are seven
+to choose from: Pinch, Ghost, Soft square, Mini robot, Bunny, Cloud and
+Chubby star. Pick one and a colour when you create the bot, or change them
+later in its settings. If you do not pick, Flowly chooses one for it, and the
+same bot looks the same on every device.
 
-Your main agent is the exception: it wears the Flowly symbol rather than a
-generated knot.
+The character also shows what the bot is doing. It looks around and blinks
+while it waits, moves in its own way while it works on an answer, and sleeps
+while it is switched off. It hops when you click it and when it finishes a
+piece of work.
+
+Your main agent is the exception: it wears the Flowly symbol.
 
 ## Creating a bot
 
