@@ -211,6 +211,9 @@ class LiveVoiceService:
         raise VoiceError('UNKNOWN_METHOD', 'Unknown voice operation.')
 
     def _history(self, params: dict) -> dict:
+        from flowly.exec.approval_manager import get_approval_manager
+        from flowly.exec.wire import approval_to_wire
+
         result = self.sessions.history(params)
         runner = self.executor() if self.executor is not None else None
         conversation_id = result['conversation']['conversationId']
@@ -219,6 +222,11 @@ class LiveVoiceService:
             # it does not own was lost with a previous process.
             if record['status'] == 'running' and (runner is None or not runner.running(conversation_id, record['id'])):
                 record['status'] = 'interrupted'
+        # Catch-up for every transport (Relay has no approval list RPC). The
+        # manager hides requests the calling owner may not answer.
+        key = result['conversation']['sessionKey']
+        result['pendingApprovals'] = [approval_to_wire(pending) for pending in get_approval_manager().list_pending()
+                                      if pending.session_key == key][:20] if not params.get('offset') else []
         return result
 
     async def _exec(self, params: dict) -> dict:

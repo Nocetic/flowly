@@ -287,3 +287,35 @@ async def test_restricted_policy_asks_on_the_voice_session_like_normal_chat(voic
     assert requested[0].request.command == 'echo voice-ok'
     assert result['status'] == expected
     assert ('voice-ok' in result['output']) is (decision == 'allow-once')
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='uses /bin/sh subprocess')
+@pytest.mark.asyncio
+async def test_history_returns_this_conversations_pending_approval_for_catch_up(voice, tmp_path):
+    store = ExecApprovalStore()
+    policy = store.load()
+    policy.security, policy.ask = 'full', 'always'
+    store.save()
+    manager = get_approval_manager()
+    tool = SecureExecTool(ExecConfig(security='full'), approval_callback=manager.request_and_wait, working_dir=str(tmp_path))
+    registry = ToolRegistry()
+    registry.register(tool)
+
+    async def execute(params, session_key):
+        return await registry.execute('exec', {**params, 'session_key': session_key}, session_key=session_key)
+
+    runner = VoiceExec(execute, lambda: 'default')
+    voice_service = service(voice, runner)
+    run = asyncio.create_task(runner.run(voice, CONVERSATION, *voice.begin_tool(
+        call(), name='exec', arguments={'command': 'echo later', 'timeout': 60})))
+    for _ in range(50):
+        pending = voice_service.call('voice.history', {'conversationId': CONVERSATION})['pendingApprovals']
+        if pending:
+            break
+        await asyncio.sleep(0.01)
+    assert [row['sessionKey'] for row in pending] == [f'desktop:voice:{CONVERSATION}']
+    assert pending[0]['command'] == 'echo later'
+    assert voice_service.call('voice.history', {'conversationId': CONVERSATION, 'offset': 1})['pendingApprovals'] == []
+    manager.resolve(pending[0]['id'], 'deny')
+    assert (await run)['status'] == 'denied'
+    assert voice_service.call('voice.history', {'conversationId': CONVERSATION})['pendingApprovals'] == []
