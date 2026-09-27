@@ -1,0 +1,18 @@
+# Disposable clean Debian 12 host with systemd as PID 1 for the Desktop
+# installation -> owned restart -> verification end-to-end test. Screen OS
+# packages and the optional Python screen extra are deliberately absent.
+# Build Dockerfile.gateway first; this reuses its locked dependency venv only.
+FROM flowly-screen-gateway-test:bookworm AS dependencies
+FROM python:3.12-slim-bookworm
+COPY --from=dependencies /opt/flowly/.venv /opt/flowly/.venv
+# Like install.sh: uv lives in ~/.local/bin, outside a systemd user unit's PATH.
+COPY --from=dependencies /usr/local/bin/uv /root/.local/bin/uv
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      systemd systemd-sysv dbus dbus-user-session python3 ca-certificates procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && /root/.local/bin/uv --no-config pip uninstall --python /opt/flowly/.venv/bin/python playwright pyee greenlet \
+    && systemctl mask systemd-firstboot.service getty.target console-getty.service \
+    && test ! -e /usr/bin/Xvnc && test ! -e /usr/bin/chromium
+ENV FLOWLY_SEMANTIC_MODEL_DOWNLOAD=0
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
