@@ -7573,7 +7573,22 @@ class AgentLoop:
                 )
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=message,
                                        metadata={"error": {"code": exc.code, "message": message}})
-            return await self._process_message_in_environment(msg)
+            from flowly.desktop_runtime.relay_chat import METADATA_KEY, relay_screen_scope
+
+            admission = msg.metadata.pop(METADATA_KEY, None)
+            if admission is None:
+                return await self._process_message_in_environment(msg)
+            try:
+                async with relay_screen_scope(admission, msg) as scope:
+                    response = await self._process_message_in_environment(msg)
+                    outcome = (response.metadata or {}) if response is not None else {}
+                    scope.succeeded = response is not None and not outcome.get("aborted") and not outcome.get("error")
+                    return response
+            except ScreenError as exc:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                    content="The screen task needs attention. Check the selected screen before continuing.",
+                    metadata={"run_id": msg.metadata.get("run_id"), "session_key": msg.session_key,
+                              "error": {"code": exc.code, "message": "The selected screen browser is unavailable."}})
 
     async def _process_message_in_environment(self, msg: InboundMessage) -> OutboundMessage | None:
         """Serialize a conversation's turns and reject stale continuations."""

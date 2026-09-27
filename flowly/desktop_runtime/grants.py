@@ -19,3 +19,24 @@ def validate_browser_grant(value: Any) -> dict[str, str]:
     if value["providerId"] != "host-desktop-browser" or value["screenId"] != "browser":
         raise ScreenError("INVALID_PARAMS")
     return dict(value)
+
+
+def resolve_host_browser_grant(gateway, raw_access):
+    """Resolve an already authenticated caller's grant against this gateway only."""
+    try:
+        grant = validate_browser_grant(raw_access)
+    except ScreenError as exc:
+        raise ScreenError("INVALID_REQUEST") from exc
+    try:
+        identity, provider = gateway._get_host_screen_browser()
+        identity = {**identity, **gateway._host_screen_checkpoint_identity()}
+        state = provider.runtime.status()
+    except (ScreenError, OSError) as exc:
+        raise ScreenError("CONTROL_UNAVAILABLE") from exc
+    if any(grant.get(key) != value for key, value in identity.items()):
+        raise ScreenError("BROWSER_PROVIDER_NOT_OWNED")
+    if not state or state["phase"] != "running":
+        raise ScreenError("SCREEN_NOT_RUNNING")
+    if grant["generation"] != state["generation"]:
+        raise ScreenError("STALE_GENERATION")
+    return grant, identity, provider

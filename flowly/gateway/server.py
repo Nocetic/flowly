@@ -3860,28 +3860,16 @@ class GatewayServer:
         provider_id = raw_access.get("providerId")
         if provider_id == "host-desktop-browser":
             from flowly.desktop_runtime.authority import ScreenError
-            from flowly.desktop_runtime.grants import validate_browser_grant
+            from flowly.desktop_runtime.grants import resolve_host_browser_grant
 
             if self._ws_clients.get(client_id) is not ws or ws.closed:
                 return denied, {"code": "BROWSER_ACCESS_NOT_GRANTED", "message": "The calling connection is no longer active"}
             try:
-                raw_access = validate_browser_grant(raw_access)
-            except ScreenError:
-                return denied, {"code": "INVALID_REQUEST", "message": "The screen grant is invalid"}
-            try:
-                identity, screen_provider = self._get_host_screen_browser()
-                identity = {**identity, **self._host_screen_checkpoint_identity()}
-                state = screen_provider.runtime.status()
-            except (ScreenError, OSError):
-                return denied, {"code": "CONTROL_UNAVAILABLE", "message": "The screen runtime needs recovery"}
-            if any(raw_access.get(key) != value for key, value in identity.items()):
-                return denied, {"code": "BROWSER_PROVIDER_NOT_OWNED", "message": "The requested screen belongs to another host or profile"}
-            if not state or state["phase"] != "running":
-                return denied, {"code": "SCREEN_NOT_RUNNING", "message": "Start this profile's screen before using its browser"}
-            if raw_access.get("generation") != state["generation"]:
-                return denied, {"code": "STALE_GENERATION", "message": "The screen restarted; select the current session"}
+                grant, identity, _ = resolve_host_browser_grant(self, raw_access)
+            except ScreenError as exc:
+                return denied, {"code": exc.code, "message": "The selected screen browser is unavailable."}
             return _BrowserRunBinding(client_id=client_id, provider_id=provider_id,
-                                      screen_generation=state["generation"], screen_bot_id=identity["botId"]), None
+                                      screen_generation=grant["generation"], screen_bot_id=identity["botId"]), None
         registration_id = raw_access.get("registrationId")
         if not isinstance(provider_id, str) or not provider_id:
             return denied, {
