@@ -179,6 +179,10 @@ its static welcome. Details: `docs/engineering/agent-home-setup.md`.
 setup choice sends its visible label as `message` plus
 `setupAnswer: {askId, optionId}`. The server applies its meaning inside the
 turn lock; a stale or unknown answer is treated as typed text.
+The agent's proposed working style is appended to the home transcript as an
+assistant row with `kind: "agent_setup_card"` and a `setupCard` payload
+(forwarded by `chat.history`). The row is append-only; clients derive whether
+it is offered, saved (`savedCardId`) or superseded from `agent.home.get`.
 
 ---
 

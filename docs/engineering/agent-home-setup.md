@@ -31,7 +31,10 @@ runtime process).
 4. The owner taps a choice or types. The agent asks at most one more useful
    question, then proposes a **working style** card: role, focus, style,
    notes. *Save and start* writes it into the agent's `SOUL.md`; *Edit* hands
-   them the composer to say what to change.
+   them the composer to say what to change. The card stays in the
+   conversation as the record of what was agreed (§6a).
+6. Throughout, the agent speaks as itself: an agent named James says "I'm
+   James", never "I'm Flowly" (§9).
 5. At any point: typing a real task starts the task immediately and ends
    setup; *Skip for now* ends it. Setup never repeats and never grants
    permissions, connects accounts or creates routines.
@@ -42,7 +45,7 @@ The main Flowly profile (`default`) is untouched by all of this.
 
 The first implementation let the model decide everything. A tapped
 "Planning" reached it as the bare word; the welcome it was answering was
-excluded from its context (correctly — see §6), and `agent_setup_finish`
+excluded from its context (correctly — see §4), and `agent_setup_finish`
 completed setup from any turn. The recorded sequence was:
 `Planning` → `agent_setup_finish` → `complete` → "What shall we plan?".
 
@@ -194,6 +197,27 @@ agent is told to say so and the card stays offered.
 Persona (`SOUL.md`) and knowledge about the owner are kept apart: facts about
 the owner still go through the existing USER.md/memory tools with consent.
 
+## 6a. The card as a transcript row
+
+A proposal is appended to the home transcript when the proposing turn ends
+(`publish_card`, called from `AgentLoop._process_message` inside the turn lock,
+with the agent's own `SessionManager`), so it sits right after the agent's
+words and survives reloads and other devices:
+
+```jsonc
+{ "role": "assistant", "id": "agent-setup-card:<cardId>", "kind": "agent_setup_card",
+  "content": "**Working style**\n- Role: …",   // readable where cards are not rendered
+  "setupCard": { "id": "<cardId>", "role": "…", "focus": "…", "style": "…", "notes": "…" } }
+```
+
+- **Append-only.** A row never changes. Clients derive its state:
+  *offered* while `pendingAsk` is that card, *saved* when `savedCardId` equals
+  it, otherwise *superseded* (a newer proposal, or setup ended without it).
+- **Display-only.** Excluded from the model's history like the static
+  introduction; the model already has its own tool call and result.
+- **Once.** `unpublishedCardId` marks a card awaiting its row; publishing is
+  idempotent by row id. `chat.history` forwards `setupCard` for this kind.
+
 ## 7. RPC surface
 
 | Method | Params | Returns |
@@ -230,14 +254,50 @@ each one; an omission blocks the call before it reaches Core.
 - **Older runtimes** reject `agent.home.introduce`; Desktop then re-reads the
   home and shows the existing state.
 
-## 9. Verification
+## 9. The agent's own name
 
-Automated (2026-09-27): full Core default suite 6,925 passed, 15 skipped.
+Every named profile's system prompt used to open with the hard-coded
+`# Flowly / You are Flowly…` identity. New agents have no `SOUL.md`, so nothing
+overrode it and an agent the owner named James introduced itself as Flowly —
+in its home conversation, direct chats and groups alike.
+
+`ContextBuilder._named_agent_identity()` now builds the identity header for
+named profiles from `profile.json`: the display name (one line, Markdown
+control characters stripped, ≤ 64 chars) and the owner's purpose (quoted as
+data, ≤ 300 chars). It is read on every prompt build, so a rename applies at
+once. It states that Flowly is the app the agent runs in, not its name. The
+main profile, a display name of "Flowly", unreadable metadata, and personas
+(which already replace the identity) keep their previous behaviour.
+
+## 10. Display-log watermark (storage fix found here)
+
+While testing card rows, `get_full_messages` returned earlier rows twice. The
+cause was general, not specific to this feature: `SessionManager._save_unlocked`
+wrote the canonical file and only then flushed the new tail to the append-only
+display log, advancing `_full_log_count` in memory. The persisted count lagged
+one save behind, so any fresh load — a gateway restart, `mutate`, another
+manager — appended the previous save's rows again, and `chat.history` showed
+the last turn twice after every restart, in every conversation.
+
+The flush now runs before the canonical write, inside the same lock, and the
+advanced watermark is persisted with it (`tests/test_session_display_watermark.py`).
+Existing duplicated display rows are not rewritten; the fix stops new ones.
+A read-time de-duplication of old archives would be separate work.
+
+## 11. Verification
+
+Automated (2026-09-27): full Core default suite 6,935 passed, 15 skipped
+(after the identity, card-row and watermark changes).
 Mutation check: disabling the `NOT_A_TASK` guard fails
 `test_tapped_choice_is_recorded_and_cannot_finish_setup` and the loop-level
 `test_tapped_planning_cannot_end_setup_through_the_model`. The real child
 runtime test calls `agent.home.introduce` through the profile host with no
 model credentials and observes one localized fallback welcome.
+
+The watermark regression tests fail on the previous `_save_unlocked`; the
+identity tests cover rename, sanitising and the unchanged main profile; the
+real-loop test checks the card row lands after the agent's words and
+survives saving.
 
 Not automated: live model quality of the introduction and follow-up
 questions (model dependent; live-LLM tests are excluded by default).
@@ -253,3 +313,8 @@ Manual acceptance:
 5. Skip, reopen, restart: nothing repeats.
 6. Remove the model key and create an agent: the static welcome appears, no
    error.
+7. Name an agent James: it introduces itself as James; rename it and ask
+   its name.
+8. Propose, edit, propose again, save: the first card shows as an earlier
+   suggestion, the saved one stays; restart the runtime and reload — no
+   duplicated rows.
