@@ -608,6 +608,7 @@ class ProfileHost:
                 mark_text=_optional_string(params, "markText"),
                 mark_tone=_optional_string(params, "markTone"),
                 mark_seed=params.get("markSeed"),
+                mark_shape=_optional_string(params, "markShape"),
             )
         except ProfileLimitError as exc:
             raise ProfileHostError("PROFILE_LIMIT", str(exc)) from exc
@@ -646,7 +647,8 @@ class ProfileHost:
         name = _required_string(params, "name").strip()
         _validate_profile_selector(name)
         mutable_fields = {
-            "provider", "model", "soul", "displayName", "description", "markText", "markTone"
+            "provider", "model", "soul", "displayName", "description", "markText", "markTone",
+            "markShape",
         }
         if not mutable_fields.intersection(params):
             raise ProfileHostError("INVALID_PARAMS", "No bot settings were provided.")
@@ -675,7 +677,7 @@ class ProfileHost:
             )
         if any(
             field in params
-            for field in ("displayName", "description", "markText", "markTone", "markSeed")
+            for field in ("displayName", "description", "markText", "markTone", "markSeed", "markShape")
         ):
             update_profile_metadata(
                 name,
@@ -684,6 +686,7 @@ class ProfileHost:
                 mark_text=params["markText"] if "markText" in params else None,
                 mark_tone=params["markTone"] if "markTone" in params else None,
                 mark_seed=params["markSeed"] if "markSeed" in params else None,
+                mark_shape=params["markShape"] if "markShape" in params else None,
             )
         profile = _public_profile(name)
         await self._emit(name, "directory", {"action": "updated", "profile": profile})

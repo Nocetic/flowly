@@ -89,6 +89,9 @@ _PROFILE_MARK_TONES = frozenset({
     "aqua", "violet", "rose", "amber", "lime", "sky", "slate",
 })
 _PROFILE_MARK_COLOR_RE = re.compile(r"^#[0-9a-f]{6}$")
+# The avatar body a bot wears in clients. Empty means "not chosen": clients
+# derive a shape from the mark seed, so every bot has one without a migration.
+PROFILE_MARK_SHAPES = ("pinch", "ghost", "square", "robot", "bunny", "cloud", "star")
 _NAMED_PROFILE_CREDENTIAL_POLICY = "isolated"
 # The only secrets a clone may inherit. Everything else in a parent's ``.env``
 # is dropped, because ``.env`` is where identity lives and there is no way to
@@ -331,6 +334,8 @@ class ProfileInfo:
     # Creation-order seed behind the profile's generated mark. None means a
     # profile older than the seed, which clients render from its name instead.
     mark_seed: int | None = None
+    # Chosen avatar shape, or "" when clients derive it from the seed.
+    mark_shape: str = ""
     created_at: str = ""
     updated_at: str = ""
     bot_id: str = ""
@@ -350,6 +355,7 @@ class ProfileInfo:
             "markText": self.mark_text,
             "markTone": self.mark_tone,
             "markSeed": self.mark_seed,
+            "markShape": self.mark_shape,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "botId": self.bot_id,
@@ -470,6 +476,26 @@ def _validate_mark_tone(mark_tone: str) -> str:
     return value
 
 
+def _validate_mark_shape(mark_shape: object) -> str:
+    """Strict check for a shape arriving from a client; "" clears the choice."""
+    if mark_shape is None:
+        return ""
+    if not isinstance(mark_shape, str):
+        raise ValueError("Profile avatar shape must be text.")
+    value = mark_shape.strip().lower()
+    if value and value not in PROFILE_MARK_SHAPES:
+        raise ValueError(f"Unknown profile avatar shape: {value}")
+    return value
+
+
+def _read_mark_shape(value: object) -> str:
+    """Lenient read: a hand-edited or newer shape degrades to "not chosen"."""
+    try:
+        return _validate_mark_shape(value)
+    except ValueError:
+        return ""
+
+
 _MARK_SEED_MAX = 1_000_000
 
 
@@ -584,6 +610,7 @@ def _metadata_for(name: str, profile_dir: Path, *, is_default: bool) -> dict:
         "mark_text": str(meta.get("markText") or "").strip(),
         "mark_tone": str(meta.get("markTone") or "").strip(),
         "mark_seed": _read_mark_seed(meta.get("markSeed")),
+        "mark_shape": _read_mark_shape(meta.get("markShape")),
         "created_at": str(meta.get("createdAt") or "").strip(),
         "updated_at": str(meta.get("updatedAt") or "").strip(),
         "bot_id": str(meta.get("botId") or "").strip(),
@@ -759,6 +786,7 @@ def create_profile(
     mark_text: str = "",
     mark_tone: str = "",
     mark_seed: int | None = None,
+    mark_shape: str = "",
 ) -> Path:
     """Create a new profile directory.
 
@@ -771,6 +799,7 @@ def create_profile(
     if name == "default":
         raise ValueError("Cannot create a profile named 'default'.")
     requested_seed = _validate_mark_seed(mark_seed)
+    requested_shape = _validate_mark_shape(mark_shape)
 
     profile_dir = _PROFILES_ROOT / name
     with _profile_mutation_lock():
@@ -867,6 +896,7 @@ def create_profile(
             "description": description.strip(),
             "markText": _validate_mark_text(mark_text),
             "markTone": _validate_mark_tone(mark_tone),
+            "markShape": requested_shape,
             # markSeed is written under the mutation lock below, so allocation
             # and publication are one atomic step.
             "createdAt": now,
@@ -1235,6 +1265,7 @@ def update_profile_metadata(
     mark_text: str | None = None,
     mark_tone: str | None = None,
     mark_seed: int | None = None,
+    mark_shape: str | None = None,
 ) -> ProfileInfo:
     """Atomically update renderer-facing metadata for one profile."""
     profile = describe_profile(name)
@@ -1264,6 +1295,11 @@ def update_profile_metadata(
         "markSeed": (
             _validate_mark_seed(mark_seed) if mark_seed is not None
             else _read_mark_seed(current.get("markSeed"))
+        ),
+        # None keeps the current choice; "" returns to the seed-derived shape.
+        "markShape": (
+            _validate_mark_shape(mark_shape) if mark_shape is not None
+            else _read_mark_shape(current.get("markShape"))
         ),
         "createdAt": str(current.get("createdAt") or profile.created_at or now),
         "updatedAt": now,
@@ -2317,6 +2353,9 @@ def _import_profile_archive(
             "description": str(metadata.get("description") or "").strip(),
             "markText": _validate_mark_text(str(metadata.get("markText") or "")),
             "markTone": _validate_mark_tone(str(metadata.get("markTone") or "")),
+            # Archives from a newer build may carry a shape this one does not
+            # know; that degrades to "not chosen" instead of failing the import.
+            "markShape": _read_mark_shape(metadata.get("markShape")),
             "createdAt": str(metadata.get("createdAt") or now),
             "updatedAt": now,
             "localRuntime": bool(local_runtime or metadata.get("localRuntime")),

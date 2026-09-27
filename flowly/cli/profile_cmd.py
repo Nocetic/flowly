@@ -117,6 +117,10 @@ def profile_create(
         None, "--mark-seed",
         help="Creation-order seed behind the generated mark. Allocated automatically when omitted.",
     ),
+    mark_shape: str = typer.Option(
+        "", "--mark-shape",
+        help="Avatar shape shown in clients. Derived from the mark seed when omitted.",
+    ),
     local_only: bool = typer.Option(
         False,
         "--local-only",
@@ -140,6 +144,7 @@ def profile_create(
             mark_text=mark_text,
             mark_tone=mark_tone,
             mark_seed=mark_seed,
+            mark_shape=mark_shape,
         )
         profile = describe_profile(name)
     except (ValueError, FileExistsError, FileNotFoundError, OSError) as exc:
@@ -161,6 +166,10 @@ def profile_configure(
     mark_seed: int | None = typer.Option(
         None, "--mark-seed", help="Creation-order seed behind the generated mark.",
     ),
+    mark_shape: str | None = typer.Option(
+        None, "--mark-shape",
+        help='Avatar shape shown in clients; "" returns to the seed-derived shape.',
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Update profile metadata and isolated runtime settings."""
@@ -168,7 +177,7 @@ def profile_configure(
         value is None
         for value in (
             display_name, description, provider, model, soul, soul_file,
-            mark_text, mark_tone, mark_seed,
+            mark_text, mark_tone, mark_seed, mark_shape,
         )
     ):
         raise typer.BadParameter("at least one field is required")
@@ -180,6 +189,7 @@ def profile_configure(
         if (
             display_name is not None or description is not None
             or mark_text is not None or mark_tone is not None or mark_seed is not None
+            or mark_shape is not None
         ):
             profile = update_profile_metadata(
                 name,
@@ -188,6 +198,7 @@ def profile_configure(
                 mark_text=mark_text,
                 mark_tone=mark_tone,
                 mark_seed=mark_seed,
+                mark_shape=mark_shape,
             )
         else:
             profile = describe_profile(name)
