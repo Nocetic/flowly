@@ -84,6 +84,11 @@ for name, label, icon, command in (
          "[Desktop Entry]\nVersion=1.0\nType=Application\nName=" + label +
          "\nIcon=" + icon + "\nExec=" + command + "\nTerminal=false\nStartupNotify=true\n")
 
+seed(channels / "xfce4-desktop.xml", '''<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-desktop" version="1.0">
+  <property name="desktop-icons" type="empty"><property name="style" type="int" value="0"/></property>
+</channel>
+''')
 seed(channels / "xsettings.xml", '''<?xml version="1.0" encoding="UTF-8"?>
 <channel name="xsettings" version="1.0">
   <property name="Net" type="empty">

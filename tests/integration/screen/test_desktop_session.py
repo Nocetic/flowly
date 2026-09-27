@@ -149,6 +149,7 @@ def test_dock_opens_terminal_and_settings_and_focuses_same_browser(desktop):
 
     click_launcher(2)
     wait_for(lambda: window("^xfce4-settings-manager$"))
+    assert command("xfconf-query", "-c", "xfce4-desktop", "-p", "/desktop-icons/style").stdout.strip() == "0"
     assert command("xfconf-query", "-c", "xsettings", "-p", "/Gtk/FontName", "-s", "Sans 11").returncode == 0
     assert command("xfconf-query", "-c", "xsettings", "-p", "/Gtk/FontName").stdout.strip() == "Sans 11"
     settings_file = Path(desktop["env"]["XDG_CONFIG_HOME"]) / "xfce4/xfconf/xfce-perchannel-xml/xsettings.xml"
