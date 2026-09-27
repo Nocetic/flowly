@@ -1696,32 +1696,56 @@ def reconcile_runtime_lease(
 
 
 def claim_runtime_lease(instance_id: str) -> Path:
-    """Exclusively claim the current profile for one managed runtime."""
+    """Exclusively claim the current profile for one managed runtime.
+
+    A named profile's runtime runs sandboxed: it may write only inside its
+    own directory, so it must not take the shared profile lock (that was an
+    ``[Errno 1] Operation not permitted`` at start-up). A delete is detected
+    from inside instead. The directory must still be the one this process
+    started in (``FLOWLY_PROFILE_DIR_ID``) before the lease is written and
+    again after. A delete renames the directory under its lock after reading
+    the lease, so it either sees our lease and refuses, or moved the
+    directory away and one of the two checks fails: then the lease and
+    anything our start-up recreated are removed, and the runtime stops.
+    """
     if not instance_id:
         raise ValueError("runtime instance id is required")
     home = get_flowly_home()
-    if home.parent != _PROFILES_ROOT:
-        # The default home, or an explicit FLOWLY_HOME outside the profiles.
+    started_with = os.environ.get(PROFILE_DIR_IDENTITY_ENV, "")
+    if home.parent != _PROFILES_ROOT or not started_with:
+        # The default home, an explicit FLOWLY_HOME outside the profiles, or
+        # a process not started through the CLI entry.
         home.mkdir(parents=True, exist_ok=True)
-        return _claim_runtime_lease_unlocked(home, instance_id)
-    # A named profile's lease is claimed under the same lock a delete retires
-    # the profile under, so the two can never interleave.
-    with _profile_mutation_lock():
-        started_with = os.environ.get(PROFILE_DIR_IDENTITY_ENV, "")
-        current = profile_dir_identity(home)
-        if current is None:
-            raise FileNotFoundError(f"Profile '{current_profile_name()}' does not exist.")
-        if started_with and current != started_with:
-            # Deleted after this runtime started; what is here now is only
-            # what our own start-up wrote. Remove it rather than let it pose
-            # as the bot, and refuse to run.
-            if not (home / _PROFILE_METADATA_FILE).exists():
-                shutil.rmtree(home, ignore_errors=True)
-            raise FileNotFoundError(f"Profile '{current_profile_name()}' was deleted.")
-        return _claim_runtime_lease_unlocked(home, instance_id)
+        return _write_runtime_lease(home, instance_id)
+
+    _assert_profile_unchanged(home, started_with)
+    try:
+        lease = _write_runtime_lease(home, instance_id)
+    except FileNotFoundError:
+        # The directory went away between the check and the write.
+        _assert_profile_unchanged(home, started_with)
+        raise
+    try:
+        _assert_profile_unchanged(home, started_with)
+    except FileNotFoundError:
+        lease.unlink(missing_ok=True)
+        raise
+    return lease
 
 
-def _claim_runtime_lease_unlocked(home: Path, instance_id: str) -> Path:
+def _assert_profile_unchanged(home: Path, started_with: str) -> None:
+    """Refuse a profile deleted since this process started, and clean up."""
+    current = profile_dir_identity(home)
+    if current == started_with:
+        return
+    if current is not None and not (home / _PROFILE_METADATA_FILE).exists():
+        # Only our own start-up writes can be here: the profile was retired,
+        # so this is a stray tree that would otherwise pose as the bot.
+        shutil.rmtree(home, ignore_errors=True)
+    raise FileNotFoundError(f"Profile '{current_profile_name()}' was deleted.")
+
+
+def _write_runtime_lease(home: Path, instance_id: str) -> Path:
     path = home / _RUNTIME_LEASE_FILE
     existing = reconcile_runtime_lease(
         path.parent,

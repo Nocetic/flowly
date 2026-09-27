@@ -78,7 +78,7 @@ def test_a_runtime_cannot_claim_a_deleted_profile(roots, monkeypatch) -> None:
     monkeypatch.setenv(profiles.PROFILE_DIR_IDENTITY_ENV, profiles.named_profile_identity("grace"))
     profiles.delete_profile("grace")
 
-    with pytest.raises(FileNotFoundError, match="does not exist"):
+    with pytest.raises(FileNotFoundError, match="was deleted"):
         profiles.claim_runtime_lease("instance-1")
     assert not home.exists()
 
@@ -97,6 +97,49 @@ def test_a_runtime_removes_what_it_recreated_after_a_delete(roots, monkeypatch) 
         profiles.claim_runtime_lease("instance-1")
     assert not home.exists()
     assert "hopper" not in _names()
+
+
+def test_a_sandboxed_runtime_claims_without_the_shared_lock(roots, monkeypatch) -> None:
+    """A named runtime may write only inside its own directory.
+
+    Taking the profiles lock from inside the sandbox failed every start with
+    "[Errno 1] Operation not permitted". The claim must not need it.
+    """
+    profiles.create_profile("sandboxed", local_runtime=True)
+    home = roots / "profiles" / "sandboxed"
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    monkeypatch.setenv(profiles.PROFILE_DIR_IDENTITY_ENV, profiles.named_profile_identity("sandboxed"))
+
+    def denied():
+        raise PermissionError(1, "Operation not permitted", str(roots / "profiles" / ".profiles.lock"))
+
+    monkeypatch.setattr(profiles, "_profile_mutation_lock", denied)
+    lease = profiles.claim_runtime_lease("instance-1")
+    assert lease.parent == home
+    profiles.release_runtime_lease("instance-1")
+
+
+def test_a_delete_right_after_the_lease_is_written_stops_the_runtime(roots, monkeypatch) -> None:
+    profiles.create_profile("knuth", local_runtime=True)
+    home = roots / "profiles" / "knuth"
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    monkeypatch.setenv(profiles.PROFILE_DIR_IDENTITY_ENV, profiles.named_profile_identity("knuth"))
+    write = profiles._write_runtime_lease
+
+    def write_then_lose_the_race(path, instance_id):
+        lease = write(path, instance_id)
+        # The delete read the directory before our lease landed and retired it.
+        trash = roots / "profiles" / profiles._PROFILE_TRASH_DIR
+        trash.mkdir(exist_ok=True)
+        os.rename(home, trash / "knuth.retired")
+        (home / "logs").mkdir(parents=True)  # our start-up keeps writing
+        return lease
+
+    monkeypatch.setattr(profiles, "_write_runtime_lease", write_then_lose_the_race)
+    with pytest.raises(FileNotFoundError, match="was deleted"):
+        profiles.claim_runtime_lease("instance-1")
+    assert not home.exists()
+    assert "knuth" not in _names()
 
 
 def test_a_live_profile_is_still_claimed(roots, monkeypatch) -> None:

@@ -38,13 +38,23 @@ Reproduced before the fix: `HOME=<tmp> flowly --profile ghost serve` created
    delete. `.trash` is not a valid profile name, so listings and the capacity
    count never see it.
 3. **A runtime claims its lease only for the directory it started in**
-   (`claim_runtime_lease`). For a profile under `profiles/`, the claim runs
-   under the same lock a delete retires the profile under. A missing
-   directory is refused. A directory whose identity differs from
-   `FLOWLY_PROFILE_DIR_ID` was deleted and recreated by this runtime's own
-   start-up writes: it is removed (when it has no `profile.json`) and the
-   claim is refused. The default home and an explicit `FLOWLY_HOME` outside
-   `profiles/` keep the old behaviour.
+   (`claim_runtime_lease`). A named runtime runs in Desktop's sandbox and
+   may write only inside its own directory, so it must not take the shared
+   profile lock (an earlier version did, and every start failed with
+   `[Errno 1] Operation not permitted: …/profiles/.profiles.lock`). Instead
+   the directory must still be the one the process started in
+   (`FLOWLY_PROFILE_DIR_ID`) both before the lease is written and after. A
+   delete reads the lease under its lock before renaming, so it either sees
+   the lease and refuses, or it moved the directory away and one of the two
+   checks fails: the lease and anything the start-up recreated (when there
+   is no `profile.json`) are removed and the runtime stops. The default home
+   and an explicit `FLOWLY_HOME` outside `profiles/` keep the old behaviour.
+
+Verified in the real Desktop sandbox (`buildProfileRuntimePolicy` +
+`createLauncher` from Desktop's build, a probe home outside `/tmp`): taking
+the shared lock fails with exactly that `PermissionError`; the new claim
+succeeds; the CLI entry records the identity for a live profile and exits 2
+for a missing one without creating anything.
 
 ## Tests
 
@@ -52,5 +62,7 @@ Reproduced before the fix: `HOME=<tmp> flowly --profile ghost serve` created
 ENOTEMPTY still succeeds and frees the name, and the next delete sweeps the
 leftover; retired trees never count as bots; a runtime cannot claim a
 deleted profile, and removes what it recreated; a live profile is still
-claimed; the CLI never creates a missing profile (subprocess). Each guard was
+claimed; a claim needs no access outside the profile (sandbox); a delete
+right after the lease is written stops the runtime; the CLI never creates a
+missing profile (subprocess). Each guard was
 removed once to confirm its test fails without it.
