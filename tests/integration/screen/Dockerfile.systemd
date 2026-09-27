@@ -8,7 +8,7 @@ COPY --from=dependencies /opt/flowly/.venv /opt/flowly/.venv
 # Like install.sh: uv lives in ~/.local/bin, outside a systemd user unit's PATH.
 COPY --from=dependencies /usr/local/bin/uv /root/.local/bin/uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      systemd systemd-sysv dbus dbus-user-session python3 ca-certificates procps \
+      systemd systemd-sysv dbus dbus-user-session python3 ca-certificates procps sudo socat \
     && rm -rf /var/lib/apt/lists/* \
     && /root/.local/bin/uv --no-config pip uninstall --python /opt/flowly/.venv/bin/python playwright pyee greenlet \
     && systemctl mask systemd-firstboot.service getty.target console-getty.service \
