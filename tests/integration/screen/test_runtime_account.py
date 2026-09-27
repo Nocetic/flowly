@@ -5,6 +5,7 @@ import os
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -384,3 +385,165 @@ def test_external_cleanup_retries_and_never_follows_application_links(layout, mo
     remove_root_application_storage(directory)
     assert not application.sockets.exists()
     assert sentinel.read_text() == "private agent file"
+
+
+def _as_account(application, code, *arguments):
+    return subprocess.run(["/usr/bin/python3", "-I", "-c", code, *map(str, arguments)],
+                          user=application.account.uid, group=application.account.gid, extra_groups=[],
+                          cwd="/", capture_output=True, text=True, env=application.environment(), timeout=20)
+
+
+def _owned_live(uid):
+    live = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+        if str(uid) in fields["Uid"].split() and fields["State"].split()[0] not in {"Z", "X"}:
+            live.append(int(entry.name))
+    return live
+
+
+_DAEMON = """
+import os, sys, time
+if os.fork():
+    os._exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+null = os.open(os.devnull, os.O_RDWR)
+for fd in (0, 1, 2):
+    os.dup2(null, fd)
+for fd in range(3, 256):
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+time.sleep(600)
+"""
+
+
+def test_profiles_run_under_separate_accounts_and_cannot_read_each_other(provisioned):
+    import pwd
+
+    layouts = []
+    for name in ("isolation-a", "isolation-b"):
+        directory = Path("/root/screen-isolation") / name
+        directory.mkdir(parents=True, mode=0o700)
+        directory.chmod(0o700)
+        layouts.append(root_application_layout(directory, create=True))
+    first, second = layouts
+    shared = runtime_account()
+    assert len({first.account.uid, second.account.uid, shared.uid}) == 3
+    assert first.account_name != second.account_name
+    for layout in layouts:
+        assert layout.account_name.startswith("flowly-s-")
+        assert pwd.getpwuid(layout.account.uid).pw_name == layout.account_name
+        assert (ROOT / "accounts" / (layout.account_name + ".json")).stat().st_mode & 0o777 == 0o600
+    write = "import pathlib,sys;pathlib.Path(sys.argv[1]).write_text('cookie-secret')"
+    assert _as_account(second, write, second.browser / "Cookies").returncode == 0
+    read = "import pathlib,sys;print(pathlib.Path(sys.argv[1]).read_text())"
+    stolen = _as_account(first, read, second.browser / "Cookies")
+    assert stolen.returncode != 0 and "cookie-secret" not in stolen.stdout
+    listing = _as_account(first, "import os,sys;print(os.listdir(sys.argv[1]))", second.directory / "home")
+    assert listing.returncode != 0
+    assert _as_account(first, read, second.sockets / "Xauthority").returncode != 0
+
+
+def test_recreated_profile_gets_a_new_account(layout):
+    directory, previous = layout
+    (directory / "application-layout.json").unlink()
+    current = root_application_layout(directory, create=True)
+    assert current.account.uid != previous.account.uid
+    assert current.account_name != previous.account_name
+
+
+def test_retirement_kills_daemons_clears_temporary_files_and_deletes_the_account(layout):
+    import grp
+    import pwd
+
+    from flowly.desktop_runtime.application_layout import remove_root_application_storage
+
+    directory, application = layout
+    uid = application.account.uid
+    assert _as_account(application, _DAEMON).returncode == 0
+    for _ in range(100):
+        if _owned_live(uid):
+            break
+        time.sleep(0.02)
+    assert _owned_live(uid), "the daemon left the caller's process tree"
+    touch = "import pathlib,sys;[pathlib.Path(p).write_text('left behind') for p in sys.argv[1:]]"
+    leftovers = [Path("/tmp") / f"flowly-leftover-{uid}", Path("/dev/shm") / f"flowly-leftover-{uid}"]
+    assert _as_account(application, touch, *leftovers).returncode == 0
+    remove_root_application_storage(directory)
+    assert _owned_live(uid) == []
+    assert not any(path.exists() for path in leftovers)
+    for lookup in (pwd.getpwnam, grp.getgrnam):
+        with pytest.raises(KeyError):
+            lookup(application.account_name)
+    assert not (ROOT / "accounts" / (application.account_name + ".json")).exists()
+    assert not application.directory.exists()
+    remove_root_application_storage(directory)  # Idempotent after retirement.
+
+
+def test_an_unreceipted_account_with_the_profile_name_is_never_adopted(provisioned):
+    directory = Path("/root/screen-isolation/adoption")
+    directory.mkdir(parents=True, mode=0o700)
+    directory.chmod(0o700)
+    layout_id = "ab" * 16
+    name = "flowly-s-" + layout_id[:12]
+    subprocess.run(["/usr/sbin/useradd", "--system", "--user-group", "--no-create-home", name], check=True)
+    import hashlib
+    mapping = {"layoutVersion": 2, "id": layout_id, "account": name,
+               "source": hashlib.sha256(os.fsencode(directory)).hexdigest()}
+    (directory / "application-layout.json").write_text(json.dumps(mapping))
+    (directory / "application-layout.json").chmod(0o600)
+    for create in (False, True):
+        with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED"):
+            root_application_layout(directory, create=create)
+
+
+def test_legacy_shared_layout_is_readable_but_never_started_again(provisioned):
+    import hashlib
+
+    directory = Path("/root/screen-isolation/legacy")
+    directory.mkdir(parents=True, mode=0o700)
+    directory.chmod(0o700)
+    shared = runtime_account()
+    mapping = {"layoutVersion": 1, "id": "cd" * 16, "uid": shared.uid, "gid": shared.gid,
+               "source": hashlib.sha256(os.fsencode(directory)).hexdigest()}
+    (directory / "application-layout.json").write_text(json.dumps(mapping))
+    (directory / "application-layout.json").chmod(0o600)
+    with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED"):
+        root_application_layout(directory, create=True)
+
+
+def test_stop_and_crashed_supervisor_leave_no_account_process(layout):
+    import signal as signals
+
+    from flowly.desktop_runtime.launcher import ScreenRuntime, is_alive
+
+    directory, application = layout
+    runtime = ScreenRuntime(directory)
+    state = runtime.start()
+    # A Terminal job that daemonized out of the supervisor's process tree.
+    assert _as_account(application, _DAEMON).returncode == 0
+    runtime.stop(state["generation"])
+    assert not any(is_alive(identity) for identity in state["children"])
+    assert _owned_live(application.account.uid) == []
+
+    state = runtime.start()
+    supervisor = state["supervisor"]
+    os.kill(supervisor["pid"], signals.SIGKILL)
+    for _ in range(200):
+        if not is_alive(supervisor):
+            break
+        time.sleep(0.02)
+    assert any(is_alive(identity) for identity in state["children"]), "applications outlive the crash"
+    runtime.stop(state["generation"])
+    assert not any(is_alive(identity) for identity in state["children"])
+    assert _owned_live(application.account.uid) == []

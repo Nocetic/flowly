@@ -349,6 +349,23 @@ class ScreenRuntime:
         # reservation intact so a later request adopts it or reports recovery.
         raise ScreenError("RUNTIME_START_TIMEOUT")
 
+    def _reap_account_processes(self) -> bool:
+        """Kill every process of this layout's dedicated account (root hosts).
+
+        Returns False when no dedicated account identifies them: a legacy
+        shared-account layout or an unprivileged host needs explicit recovery.
+        """
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            return False
+        from flowly.desktop_runtime.application_layout import root_application_layout
+        from flowly.desktop_runtime.profile_accounts import terminate_profile_account_processes
+
+        layout = root_application_layout(self.directory)
+        if layout.account_name is None:
+            return False
+        terminate_profile_account_processes(layout.account_name)
+        return True
+
     def stop(self, generation: str, *, identity_guard: Callable[[], None] | None = None) -> None:
         self.assert_current_directory()
         with self._lock:
@@ -363,13 +380,21 @@ class ScreenRuntime:
                 self.authority.stop(generation)
             if not is_alive(state.get("supervisor")):
                 if any(is_alive(child) for child in state["children"]):
-                    raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+                    # A crashed supervisor left applications behind. Only a
+                    # dedicated-account layout identifies every one of them.
+                    if not self._reap_account_processes():
+                        raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+                    if any(is_alive(child) for child in state["children"]):
+                        raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
                 return
             signal_process(state["supervisor"], signal.SIGTERM)
             deadline = time.monotonic() + self.STOP_TIMEOUT
             while time.monotonic() < deadline:
                 current = self.read_manifest()
                 if current and current["phase"] == "stopped" and not is_alive(state["supervisor"]):
+                    # Terminal jobs may have daemonized out of the supervisor's
+                    # process tree; none may outlive the profile's screen.
+                    self._reap_account_processes()
                     return
                 if current and current["phase"] == "failed" and not is_alive(state["supervisor"]):
                     raise ScreenError("RUNTIME_STOP_FAILED")

@@ -146,3 +146,239 @@ def provision_runtime_account():
     finally:
         os.close(lock)
 '''
+
+# Dedicated per-profile-incarnation accounts on root hosts. The name is always
+# derived server-side from a random layout id; the fixed pattern is re-checked
+# here, and the same reserve/receipt/recovery rules as the shared account apply.
+PROFILE_ACCOUNT_SOURCE = PROVISION_SOURCE + r'''
+import re
+import shutil
+import time
+
+PROFILE_ACCOUNTS = ACCOUNT_ROOT / "accounts"
+PROFILE_ACCOUNT = re.compile(r"flowly-s-[a-f0-9]{12}")
+SHARED_TEMPORARY = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
+
+def profile_account_name(name):
+    if not isinstance(name, str) or PROFILE_ACCOUNT.fullmatch(name) is None:
+        raise ValueError("INVALID_PARAMS")
+    return name
+
+def profile_account_save(path, value):
+    fd, temporary = tempfile.mkstemp(prefix=".account-", dir=PROFILE_ACCOUNTS)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(value, output, separators=(",", ":"))
+            output.flush()
+            os.fchmod(output.fileno(), 0o600)
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    profile_account_sync()
+
+def profile_account_sync():
+    fd = os.open(PROFILE_ACCOUNTS, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def profile_account_identity(name, value=None):
+    user, group = pwd.getpwnam(name), grp.getgrnam(name)
+    actual = {"accountVersion": 1, "name": name, "uid": user.pw_uid,
+              "gid": user.pw_gid, "home": user.pw_dir, "shell": user.pw_shell}
+    if (not 0 < user.pw_uid < 2**31 or not 0 < user.pw_gid < 2**31
+            or user.pw_dir != ACCOUNT_HOME or user.pw_shell != ACCOUNT_SHELL
+            or group.gr_gid != user.pw_gid or group.gr_mem
+            or pwd.getpwuid(user.pw_uid).pw_name != name
+            or grp.getgrgid(user.pw_gid).gr_name != name
+            or set(os.getgrouplist(name, user.pw_gid)) != {user.pw_gid}):
+        raise ValueError("INSTALL_STATE_INVALID")
+    if value is not None and (not isinstance(value, dict) or value != actual):
+        raise ValueError("INSTALL_STATE_INVALID")
+    return actual
+
+def profile_account_locked(work):
+    if os.geteuid() != 0:
+        raise ValueError("INSTALL_PRIVILEGE_REQUIRED")
+    # The installer-provisioned shared account is the provenance gate.
+    account_directory(ACCOUNT_ROOT)
+    account_identity(account_read(ACCOUNT_ROOT / "account.json"))
+    account_directory(PROFILE_ACCOUNTS, create=True)
+    lock = os.open(PROFILE_ACCOUNTS / "accounts.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(lock)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or info.st_nlink != 1:
+            raise ValueError("INSTALL_STATE_INVALID")
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise ValueError("INSTALL_BUSY") from None
+                time.sleep(0.05)
+        return work()
+    finally:
+        os.close(lock)
+
+def account_run(command):
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                               cwd="/", close_fds=True, start_new_session=True)
+    try:
+        return process.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=5)
+        raise ValueError("INSTALL_RECOVERY_REQUIRED") from None
+
+def provision_profile_account(name):
+    name = profile_account_name(name)
+    def work():
+        receipt, pending = PROFILE_ACCOUNTS / (name + ".json"), PROFILE_ACCOUNTS / (name + ".pending")
+        try:
+            previous = account_read(receipt)
+        except FileNotFoundError:
+            pass
+        else:
+            if previous is None:
+                raise ValueError("INSTALL_STATE_INVALID")
+            return profile_account_identity(name, previous)
+        try:
+            pending.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("INSTALL_RECOVERY_REQUIRED")
+        for lookup in (pwd.getpwnam, grp.getgrnam):
+            try:
+                lookup(name)
+            except KeyError:
+                continue
+            raise ValueError("INSTALL_RECOVERY_REQUIRED")
+        profile_account_save(pending, {"accountVersion": 1, "state": "creating"})
+        if account_run(["/usr/sbin/useradd", "--system", "--user-group", "--no-create-home", "--home-dir",
+                        ACCOUNT_HOME, "--shell", ACCOUNT_SHELL, "--password", "!", name]):
+            raise ValueError("INSTALL_RECOVERY_REQUIRED")
+        value = profile_account_identity(name)
+        profile_account_save(receipt, value)
+        pending.unlink()
+        profile_account_sync()
+        return value
+    return profile_account_locked(work)
+
+def owned_processes(uid):
+    found = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        # Zombies (already killed, awaiting a parent that may never reap them,
+        # e.g. a container's PID 1) hold no memory, files or code; skip them.
+        state, owner = None, None
+        try:
+            with open(f"/proc/{entry.name}/status") as status:
+                for line in status:
+                    if line.startswith("State:"):
+                        state = line.split()[1]
+                    elif line.startswith("Uid:"):
+                        owner = line.split()[1:]
+                        break
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        if owner is not None and str(uid) in owner and state not in {"Z", "X"}:
+            found.append(int(entry.name))
+    return found
+
+def remove_owned_temporary(uid):
+    # A retired UID may be reused by a later account; nothing it owned in
+    # shared temporary storage may survive to be inherited.
+    for base in SHARED_TEMPORARY:
+        try:
+            entries = list(os.scandir(base))
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if info.st_uid != uid:
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                if not shutil.rmtree.avoids_symlink_attacks:
+                    raise ValueError("INSTALL_STATE_INVALID")
+                shutil.rmtree(entry.path, ignore_errors=False)
+            else:
+                os.unlink(entry.path)
+
+def retire_profile_account(name):
+    name = profile_account_name(name)
+    def work():
+        receipt, pending = PROFILE_ACCOUNTS / (name + ".json"), PROFILE_ACCOUNTS / (name + ".pending")
+        try:
+            previous = account_read(receipt)
+        except FileNotFoundError:
+            try:
+                pending.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("INSTALL_RECOVERY_REQUIRED")
+            for lookup in (pwd.getpwnam, grp.getgrnam):
+                try:
+                    lookup(name)
+                except KeyError:
+                    continue
+                raise ValueError("INSTALL_RECOVERY_REQUIRED")  # never adopt an unreceipted account
+            return None
+        uid = profile_account_identity(name, previous)["uid"]
+        # Every process of this account belongs to this profile's screen,
+        # including daemonized descendants that closed inherited descriptors.
+        deadline = time.monotonic() + 10
+        while (pids := owned_processes(uid)):
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if time.monotonic() > deadline:
+                raise ValueError("INSTALL_BUSY")
+            time.sleep(0.05)
+        remove_owned_temporary(uid)
+        if account_run(["/usr/sbin/userdel", name]):
+            raise ValueError("INSTALL_RECOVERY_REQUIRED")
+        for lookup in (pwd.getpwnam, grp.getgrnam):
+            try:
+                lookup(name)
+            except KeyError:
+                continue
+            raise ValueError("INSTALL_RECOVERY_REQUIRED")
+        receipt.unlink()
+        profile_account_sync()
+        return None
+    return profile_account_locked(work)
+
+def terminate_profile_account_processes(name):
+    name = profile_account_name(name)
+    def work():
+        value = profile_account_identity(name, account_read(PROFILE_ACCOUNTS / (name + ".json")))
+        deadline = time.monotonic() + 10
+        while (pids := owned_processes(value["uid"])):
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if time.monotonic() > deadline:
+                raise ValueError("INSTALL_BUSY")
+            time.sleep(0.05)
+        return None
+    return profile_account_locked(work)
+'''

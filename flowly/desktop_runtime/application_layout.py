@@ -3,6 +3,11 @@
 The mapping and each application's directory entry remain agent-owned. Only leaf
 directories belong to the runtime account. No recursive chown or caller path is
 used. A new profile incarnation receives fresh storage even at a reused path.
+
+Layout version 2 runs each profile incarnation under its own dedicated account
+(see profile_accounts), so profiles cannot read each other's browser storage.
+Version 1 layouts shared one account; they remain readable for status and stop
+but are never started again (explicit recovery), never silently shared.
 """
 
 from __future__ import annotations
@@ -20,6 +25,12 @@ from pathlib import Path
 from filelock import FileLock
 
 from flowly.desktop_runtime.authority import ScreenError
+from flowly.desktop_runtime.profile_accounts import (
+    account_name,
+    profile_account,
+    provision_profile_account,
+    retire_profile_account,
+)
 from flowly.desktop_runtime.runtime_account import (
     ROOT,
     RuntimeAccount,
@@ -58,7 +69,7 @@ def _directory(path: Path, uid: int, gid: int, mode: int, *, create: bool) -> Pa
     return path
 
 
-def _read_mapping(path: Path, account: RuntimeAccount, digest: str) -> dict:
+def _read_mapping(path: Path, digest: str) -> dict:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd) as source:
         info = os.fstat(source.fileno())
@@ -68,14 +79,29 @@ def _read_mapping(path: Path, account: RuntimeAccount, digest: str) -> dict:
     if len(raw) > 2048:
         raise ValueError()
     value = json.loads(raw)
-    if (not isinstance(value, dict) or set(value) != {"layoutVersion", "id", "uid", "gid", "source"}
-            or type(value["layoutVersion"]) is not int or value["layoutVersion"] != 1
-            or type(value["uid"]) is not int or value["uid"] != account.uid
-            or type(value["gid"]) is not int or value["gid"] != account.gid
-            or value["source"] != digest or not isinstance(value["id"], str)
+    if (not isinstance(value, dict) or type(value.get("layoutVersion")) is not int
+            or value.get("source") != digest or not isinstance(value.get("id"), str)
             or re.fullmatch(r"[a-f0-9]{32}", value["id"]) is None):
         raise ValueError()
+    if value["layoutVersion"] == 1:
+        if (set(value) != {"layoutVersion", "id", "uid", "gid", "source"}
+                or type(value["uid"]) is not int or type(value["gid"]) is not int):
+            raise ValueError()
+    elif value["layoutVersion"] == 2:
+        if set(value) != {"layoutVersion", "id", "account", "source"} or value["account"] != account_name(value["id"]):
+            raise ValueError()
+    else:
+        raise ValueError()
     return value
+
+
+def _mapped_account(value: dict) -> RuntimeAccount:
+    if value["layoutVersion"] == 2:
+        return profile_account(value["account"])
+    shared = runtime_account()
+    if (value["uid"], value["gid"]) != (shared.uid, shared.gid):
+        raise ValueError()
+    return shared
 
 
 @dataclass(frozen=True)
@@ -83,6 +109,8 @@ class RootApplicationLayout:
     account: RuntimeAccount
     directory: Path
     sockets: Path
+    # Dedicated account of a version 2 layout; None for a legacy shared one.
+    account_name: str | None = None
 
     @property
     def browser(self) -> Path:
@@ -132,7 +160,7 @@ def root_application_layout(directory: Path, *, create: bool = False) -> RootApp
     A copied/moved mapping is rejected instead of silently sharing a browser.
     Migration and cleanup require the agent's explicit lifecycle coordination.
     """
-    account = runtime_account()
+    runtime_account()  # Installer provenance gate for every layout.
     directory = directory.absolute()
     try:
         _trusted_root(directory)
@@ -146,15 +174,21 @@ def root_application_layout(directory: Path, *, create: bool = False) -> RootApp
             # creates a mapping, lock, account or application directory.
             with FileLock(directory / "application-layout.lock", timeout=5, mode=0o600):
                 try:
-                    value = _read_mapping(mapping, account, digest)
+                    value = _read_mapping(mapping, digest)
                 except FileNotFoundError:
                     from flowly.desktop_runtime.launcher import write_state
 
-                    value = {"layoutVersion": 1, "id": secrets.token_hex(16),
-                             "uid": account.uid, "gid": account.gid, "source": digest}
+                    layout_id = secrets.token_hex(16)
+                    value = {"layoutVersion": 2, "id": layout_id, "account": account_name(layout_id), "source": digest}
+                    # The mapping names the account before it exists, so an
+                    # interrupted creation is resumed, never orphaned.
                     write_state(mapping, value)
+                if value["layoutVersion"] != 2:
+                    raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+                account = provision_profile_account(value["account"])
         else:
-            value = _read_mapping(mapping, account, digest)
+            value = _read_mapping(mapping, digest)
+            account = _mapped_account(value)
         _trusted_root(ROOT)
         _trusted_root(SOCKET_ROOT.parent)
         profiles = _directory(ROOT / "screens", 0, 0, 0o711, create=create)
@@ -163,7 +197,7 @@ def root_application_layout(directory: Path, *, create: bool = False) -> RootApp
             _directory(applications / leaf, account.uid, account.gid, 0o700, create=create)
         sockets_parent = _directory(SOCKET_ROOT, 0, 0, 0o711, create=create)
         sockets = _directory(sockets_parent / value["id"], account.uid, account.gid, 0o700, create=create)
-        return RootApplicationLayout(account, applications, sockets)
+        return RootApplicationLayout(account, applications, sockets, value.get("account"))
     except (OSError, ValueError, KeyError, UnicodeError):
         raise ScreenError("RUNTIME_STATE_INVALID") from None
 
@@ -175,15 +209,21 @@ def remove_root_application_storage(directory: Path) -> None:
     Unprivileged leaf contents are removed with fd-based, symlink-safe traversal.
     The immutable mapping is kept until the profile itself is removed.
     """
-    account = runtime_account()
+    runtime_account()
     try:
         _trusted_root(directory)
         digest = hashlib.sha256(os.fsencode(directory.absolute())).hexdigest()
-        value = _read_mapping(directory / "application-layout.json", account, digest)
+        value = _read_mapping(directory / "application-layout.json", digest)
+        try:
+            account = _mapped_account(value)
+        except ScreenError:
+            if value["layoutVersion"] != 2:
+                raise
+            account = None  # Already retired; storage removal stays retryable.
         if not shutil.rmtree.avoids_symlink_attacks:
             raise ValueError()
-        for parent, uid, gid, mode in ((ROOT / "screens", 0, 0, 0o711),
-                                      (SOCKET_ROOT, account.uid, account.gid, 0o700)):
+        sockets = ((SOCKET_ROOT, account.uid, account.gid, 0o700),) if account else ()
+        for parent, uid, gid, mode in ((ROOT / "screens", 0, 0, 0o711), *sockets):
             _trusted_root(parent.parent)
             try:
                 _directory(parent, 0, 0, 0o711, create=False)
@@ -195,5 +235,9 @@ def remove_root_application_storage(directory: Path) -> None:
             except FileNotFoundError:
                 continue
             shutil.rmtree(target)
+        if value["layoutVersion"] == 2:
+            # Kills any surviving process of this profile's account, clears its
+            # temporary files and deletes the account; idempotent once gone.
+            retire_profile_account(value["account"])
     except (OSError, ValueError, KeyError, UnicodeError):
         raise ScreenError("RUNTIME_STATE_INVALID") from None
