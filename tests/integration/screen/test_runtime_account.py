@@ -581,6 +581,7 @@ def test_account_applications_are_bounded_and_cannot_undo_their_oom_floor(layout
     runtime = ScreenRuntime(directory)
     state = runtime.start()
     try:
+        assert state["keymap"] == "seeded", "layout keys are seeded as the application account"
         for child in state["children"]:
             proc = Path("/proc") / str(child["pid"])
             assert (proc / "oom_score_adj").read_text().strip() == "500"

@@ -23,6 +23,7 @@ from flowly.desktop_runtime.application_layout import read_browser_port
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.browser_lifecycle import BROWSER_MANAGER_SOURCE
 from flowly.desktop_runtime.desktop_defaults import DESKTOP_DEFAULTS_SOURCE
+from flowly.desktop_runtime.desktop_keymap import KEYMAP_SOURCE
 from flowly.desktop_runtime.input_service import InputService
 from flowly.desktop_runtime.installation_gate import environment_activity
 from flowly.desktop_runtime.launcher import (
@@ -250,6 +251,15 @@ def run(directory: Path, generation: str) -> None:
             wait_for(lambda: all(application_check(
                 ["xdotool", "search", "--onlyvisible", "--class", pattern], env)
                 for pattern in ("^xfce4-panel$", "^xfdesktop$")))
+            # Before the browser or a terminal reads the keymap: layout
+            # characters become ordinary keys (see desktop_keymap). Without it
+            # ASCII still works; the manifest records which keymap is active.
+            try:
+                seeded = application_check(["python3", "-I", "-c", KEYMAP_SOURCE, application_command(
+                    ["xkbcomp"], system=application is not None)[0]], env, timeout=15)
+            except (ScreenError, subprocess.TimeoutExpired):
+                seeded = False
+            state["keymap"] = "seeded" if seeded else "default"
             port_file = browser_profile / "DevToolsActivePort"
             port_file.unlink(missing_ok=True)
             (application_sockets / "browser-open.sock").unlink(missing_ok=True)

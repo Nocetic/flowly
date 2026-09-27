@@ -1113,3 +1113,55 @@ def test_idle_stop_of_a_real_screen_records_why_and_starts_again(tmp_path):
         assert again["phase"] == "running" and again["error"] is None
     finally:
         runtime.stop(again["generation"])
+
+
+# Keysym sequences exactly as Desktop's noVNC 1.7 viewer sends them (pinned by
+# Desktop's screen-keyboard test). Core's gate strips QEMU extended keys, so the
+# server always receives keysyms, never the client's physical scancodes.
+SHIFT_L, MODE_SWITCH, LEVEL3 = 0xFFE1, 0xFF7E, 0xFE03
+KEYBOARD_CASES = {
+    "turkish-q-letters": ([(k, d) for k in (0x1BA, 0x2BB, 0x2B9, 0x69, 0xE7, 0xF6, 0xFC) for d in (1, 0)]
+                          + [(SHIFT_L, 1)] + [(k, d) for k in (0x1AA, 0x2AB, 0x49, 0x2A9, 0xC7, 0xD6, 0xDC)
+                                              for d in (1, 0)] + [(SHIFT_L, 0)], "şğıiçöüŞĞIİÇÖÜ"),
+    "mac-option-q-at": ([(MODE_SWITCH, 1), (0x40, 1), (0x40, 0), (MODE_SWITCH, 0)], "@"),
+    "mac-option-euro": ([(MODE_SWITCH, 1), (0x20AC, 1), (0x20AC, 0), (MODE_SWITCH, 0)], "€"),
+    "mac-option-dead-acute": ([(MODE_SWITCH, 1), (MODE_SWITCH, 0), (0xE9, 1), (0xE9, 0)], "é"),
+    "altgr-q-at": ([(LEVEL3, 1), (0x40, 1), (0x40, 0), (LEVEL3, 0)], "@"),
+    "altgr-shift-braces": ([(LEVEL3, 1), (0x7B, 1), (0x7B, 0), (0x7D, 1), (0x7D, 0), (LEVEL3, 0)], "{}"),
+    "unicode-keysyms": ([(0x01000000 | ord(c), d) for c in "ə€✓" for d in (1, 0)], "ə€✓"),
+}
+# Outside the seeded keymap Xvnc adds a keysym while it is typed and Chromium
+# reads that key with its previous keymap: the character is lost or becomes the
+# next new one. Strict, so the case is noticed once it starts to pass.
+KEYBOARD_KNOWN_FAILURES = {"unicode-keysyms"}
+
+
+@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.xfail(
+    strict=True, reason="keysym outside the seeded keymap")) if case in KEYBOARD_KNOWN_FAILURES else case
+    for case in sorted(KEYBOARD_CASES)])
+def test_viewer_keysyms_type_layout_characters_into_the_real_browser(tmp_path, login_site, case):
+    from playwright.sync_api import sync_playwright
+
+    sequence, expected = KEYBOARD_CASES[case]
+    with running_screen(tmp_path / "keys") as runtime, sync_playwright() as playwright:
+        assert runtime["state"]["keymap"] == "seeded"
+        page = playwright.chromium.connect_over_cdp(runtime["endpoint"]).contexts[0].pages[0]
+        page.goto(login_site)
+        page.evaluate("() => { window.clickedCode = false; document.querySelector('#code')"
+                      ".addEventListener('mousedown', () => { window.clickedCode = true }) }")
+        with human_viewer(runtime["socket"]) as (connection, gate):
+            point = page.locator("#code").evaluate("""element => {
+                const box = element.getBoundingClientRect();
+                return {x: Math.round(screenX + box.x + 10),
+                        y: Math.round(screenY + outerHeight - innerHeight + box.y + 10)};
+            }""")
+            for buttons in (0, 1, 0):
+                connection.sendall(gate.feed(struct.pack("!BBHH", 5, buttons, point["x"], point["y"]), lambda: True))
+            page.wait_for_function("document.hasFocus() && window.clickedCode")
+            for keysym, down in sequence:
+                connection.sendall(gate.feed(struct.pack("!BBHI", 4, down, 0, keysym), lambda: True))
+            # A trailing marker proves every earlier key was processed.
+            for down in (1, 0):
+                connection.sendall(gate.feed(struct.pack("!BBHI", 4, down, 0, ord("#")), lambda: True))
+            page.wait_for_function("document.querySelector('#code').value.endsWith('#')", timeout=10_000)
+            assert page.locator("#code").input_value() == expected + "#"
