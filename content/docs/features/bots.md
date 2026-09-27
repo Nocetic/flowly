@@ -159,8 +159,7 @@ on the most capable one you have access to.
 A bot is a whole agent, not a chat window with a different name. Each one has
 its own:
 
-- **Conversations**, listed and deleted per bot, each able to override the
-  model for that conversation alone
+- **One conversation with you**, able to override the model for itself (see [Its conversation with you](#its-conversation-with-you))
 - **Scheduled jobs** — its own cron entries, which it can list, add, change,
   remove and run, with their output visible while they run
 - **Goals** it is working towards, which you can pause, resume or stop
@@ -172,6 +171,40 @@ its own:
 
 So a bot you set up to watch something overnight keeps its schedule, its goal
 and its history to itself. Nothing about it appears in another bot's list.
+
+## Its conversation with you
+
+You talk to a bot in one place: its conversation. In Flowly Desktop, select
+the bot and you are back where you left off. The conversation lives with the
+bot, not the app, so the mobile apps will open the same one as they adopt it.
+Conversations you had with it before this existed are kept and readable; they
+are simply not where you talk to it now.
+
+It never has to start over when it gets long. Flowly summarises what the bot
+works with in the background and keeps everything you see.
+
+### Its first message
+
+A new bot speaks first. It introduces itself from its name and the purpose you
+gave it, in your app's language, and offers two or three places to start that
+fit that purpose. Tap one or write your own answer.
+
+It asks at most one more useful question, then proposes how it will work with
+you — its role, what it focuses on first, and how it delivers work. **Save
+and start** writes that into the bot's persona, where you can edit it any time
+in its settings; **Edit** lets you say what to change.
+
+None of this is required:
+
+- Give it a real task at any point and it starts on the task.
+- **Skip for now** ends the introduction for good.
+- If the bot cannot reach its model yet, it greets you with a short welcome
+  instead of an error, and you can carry on once a model is set up.
+
+Setting up a bot this way never grants it anything. It does not gain
+permissions, connect accounts, create schedules or read another bot's memory.
+When it needs an account it asks through the usual connection request, which
+only you can approve, and it never asks for a password in the chat.
 
 ## Permissions
 

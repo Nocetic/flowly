@@ -47,6 +47,18 @@ returning `willRestart: False` — no process bounce. Channel changes
 and the gateway restarts itself.
 
 
+## Named agent home and setup RPCs
+
+`agent.home.get`, `agent.home.introduce` and `agent.home.setup` serve a named
+agent's single home conversation and its optional first-run setup. They are
+served by the shared dispatch like every other feature RPC, validated by
+`flowly.agent_home.validate_request`, and listed in `PROFILE_RPC_TIMEOUTS`
+for the profile host. `agent.home.introduce` needs the direct gateway's
+introduction runner (`feature_rpc.set_agent_introduction_runner`, wired in
+`gateway_cmd`) to stream; without a runner or a watching socket it settles to
+the static welcome. The Desktop renderer IPC allowlist must list each method.
+Contract and state machine: `docs/engineering/agent-home-setup.md`.
+
 ## Live Voice RPC diagnostic identity
 
 The current Live Voice worktree emits bounded, content-free diagnostics for the
