@@ -490,6 +490,26 @@ def test_retirement_kills_daemons_clears_temporary_files_and_deletes_the_account
     remove_root_application_storage(directory)  # Idempotent after retirement.
 
 
+
+def test_profile_restored_on_a_fresh_host_provisions_its_account_again(layout):
+    """A profile backup carries its mapping but not the host's accounts/storage."""
+    import pwd
+
+    from flowly.desktop_runtime.application_layout import remove_root_application_storage
+
+    directory, previous = layout
+    mapping = (directory / "application-layout.json").read_bytes()
+    # The fresh host: no account, receipt or external storage for this layout.
+    remove_root_application_storage(directory)
+    assert (directory / "application-layout.json").read_bytes() == mapping
+    with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED|RUNTIME_STATE_INVALID"):
+        root_application_layout(directory)  # Status alone never provisions.
+    restored = root_application_layout(directory, create=True)
+    assert restored.account_name == previous.account_name
+    assert pwd.getpwnam(restored.account_name).pw_uid == restored.account.uid
+    assert restored.directory == previous.directory and restored.browser.is_dir()
+    assert root_application_layout(directory) == restored
+
 def test_an_unreceipted_account_with_the_profile_name_is_never_adopted(provisioned):
     directory = Path("/root/screen-isolation/adoption")
     directory.mkdir(parents=True, mode=0o700)
