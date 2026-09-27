@@ -36,8 +36,8 @@ class _Scripted(LLMProvider):
         return self.script.pop(0) if self.script else LLMResponse(content="Done.")
 
 
-def _call(name: str, **arguments: Any) -> LLMResponse:
-    return LLMResponse(content=None, tool_calls=[ToolCallRequest(id=f"{name}-1", name=name, arguments=arguments)])
+def _call(name: str, content: str | None = None, **arguments: Any) -> LLMResponse:
+    return LLMResponse(content=content, tool_calls=[ToolCallRequest(id=f"{name}-1", name=name, arguments=arguments)])
 
 
 @pytest.fixture
@@ -84,8 +84,8 @@ async def _introduce(loop: AgentLoop) -> str:
 @pytest.mark.asyncio
 async def test_agent_speaks_first_with_hidden_trigger_and_one_tool(agent):
     provider = _Scripted([
-        _call("agent_setup_ask", question="Where should we start?", options=["This week's priorities", "A team routine"]),
-        LLMResponse(content="Hi! I'm your planner for the team."),
+        _call("agent_setup_ask", content="Hi! I'm your planner for the team. Where should we start?",
+              question="Where should we start?", options=["This week's priorities", "A team routine"]),
     ])
     loop = _loop(agent, provider)
     try:
@@ -101,10 +101,12 @@ async def test_agent_speaks_first_with_hidden_trigger_and_one_tool(agent):
     assert [option["label"] for option in state["pendingAsk"]["options"]] == [
         "This week's priorities", "A team routine",
     ]
+    # The choices belong to the reply of the run that asked, not to "the last message".
+    assert state["pendingAsk"]["runId"] == run_id
     sm = SessionManager(agent / "workspace")
     displayed = [message for message in sm.get_full_messages(HOME_SESSION) if message.get("role") in ("user", "assistant") and not message.get("tool_calls")]
     assert [message["role"] for message in displayed] == ["assistant"]
-    assert displayed[0]["content"] == "Hi! I'm your planner for the team."
+    assert displayed[0]["content"] == "Hi! I'm your planner for the team. Where should we start?"
     # The trigger stays in the model's own context so later turns know why it spoke.
     history = sm.get_or_create(HOME_SESSION).get_history()
     assert history[0]["role"] == "user"
@@ -122,6 +124,9 @@ async def test_failed_introduction_leaves_only_the_static_welcome(agent):
     state = _state(agent)
     assert state["intro"]["state"] == "fallback"
     assert state["pendingAsk"]["options"]
+    # The app's own question belongs to the welcome it wrote.
+    assert state["pendingAsk"]["messageId"] == messages_id(agent)
+    assert "runId" not in state["pendingAsk"]
     messages = SessionManager(agent / "workspace").get_full_messages(HOME_SESSION)
     assert [message.get("kind") for message in messages] == ["agent_introduction"]
     assert "Invalid API key" not in json.dumps(messages)
@@ -130,12 +135,11 @@ async def test_failed_introduction_leaves_only_the_static_welcome(agent):
 @pytest.mark.asyncio
 async def test_tapped_planning_cannot_end_setup_through_the_model(agent):
     provider = _Scripted([
-        _call("agent_setup_ask", question="Where should we start?", options=["Planning", "Research"]),
-        LLMResponse(content="Hi!"),
+        _call("agent_setup_ask", content="Hi! Where should we start?", question="Where should we start?", options=["Planning", "Research"]),
         # The regression: the model tries to finish setup on a tapped choice.
         _call("agent_setup_finish", reason="task"),
-        _call("agent_setup_ask", question="What should we plan?", options=["Work projects", "Weekly routine"]),
-        LLMResponse(content="Planning it is. What should we plan?"),
+        _call("agent_setup_ask", content="Planning it is. What should we plan?",
+              question="What should we plan?", options=["Work projects", "Weekly routine"]),
     ])
     loop = _loop(agent, provider)
     try:
@@ -151,11 +155,11 @@ async def test_tapped_planning_cannot_end_setup_through_the_model(agent):
     finally:
         loop.stop()
 
-    system = provider.calls[2]["messages"][0]["content"]
+    system = provider.calls[1]["messages"][0]["content"]
     assert 'The owner chose "Planning"' in system
     assert "not a task" in system
     refused = next(
-        message for message in provider.calls[3]["messages"]
+        message for message in provider.calls[2]["messages"]
         if message.get("role") == "tool" and "agent_setup_finish" in str(message.get("name", "")) or "NOT_A_TASK" in str(message.get("content", ""))
     )
     assert "NOT_A_TASK" in str(refused["content"])
@@ -163,6 +167,7 @@ async def test_tapped_planning_cannot_end_setup_through_the_model(agent):
     assert state["setup"] == "active"
     assert state["answers"][-1]["choice"] == "Planning"
     assert [option["label"] for option in state["pendingAsk"]["options"]] == ["Work projects", "Weekly routine"]
+    assert state["pendingAsk"]["runId"] == "tap-planning"
 
 
 @pytest.mark.asyncio
@@ -214,3 +219,65 @@ async def test_card_row_follows_the_agents_words_and_survives_saving(agent):
     assert state["setup"] == "complete" and state["savedCardId"] == offered["id"]
     assert "## Working style" in (agent / "workspace" / "SOUL.md").read_text()
 
+
+def messages_id(home) -> str:
+    welcome = next(row for row in SessionManager(home / "workspace").get_full_messages(HOME_SESSION) if row.get("kind") == "agent_introduction")
+    return welcome["id"]
+
+
+def _home_rows(home) -> list[dict]:
+    return SessionManager(home / "workspace").get_full_messages(HOME_SESSION)
+
+
+@pytest.mark.asyncio
+async def test_a_setup_question_ends_the_turn_and_is_said_once(agent):
+    """The first message showed twice: once as narration before the question
+    call, once more in a second reply that restated it and listed the choices
+    as text. The call now ends the turn and its message is the reply."""
+    intro = "I'm your planner for the team. Where should we start?"
+    provider = _Scripted([
+        _call("agent_setup_ask", content=intro, question="Where should we start?",
+              options=["This week's priorities", "A team routine"]),
+        LLMResponse(content="I'm your planner for the team.\n\nWhere should we start?\n\n- This week's priorities"),
+    ])
+    loop = _loop(agent, provider)
+    try:
+        await _introduce(loop)
+    finally:
+        loop.stop()
+    # One model call: nothing restates the message or lists the choices.
+    assert len([call for call in provider.calls if call.get("tools")]) == 1
+    rows = _home_rows(agent)
+    said = [row for row in rows if row.get("role") == "assistant" and (row.get("content") or "").strip()]
+    assert [row["content"] for row in said] == [intro]
+    ask = next(row for row in rows if row.get("tool_calls"))
+    assert not (ask.get("content") or "").strip()
+    assert said[0].get("run_id")
+
+
+@pytest.mark.asyncio
+async def test_the_question_is_in_the_message_even_if_the_model_left_it_out(agent):
+    provider = _Scripted([
+        _call("agent_setup_ask", content="I'm your planner for the team.", question="Where should we start?",
+              options=["This week's priorities", "A team routine"]),
+    ])
+    loop = _loop(agent, provider)
+    try:
+        await _introduce(loop)
+    finally:
+        loop.stop()
+    said = [row["content"] for row in _home_rows(agent) if row.get("role") == "assistant" and (row.get("content") or "").strip()]
+    assert said == ["I'm your planner for the team.\n\nWhere should we start?"]
+
+
+
+@pytest.mark.asyncio
+async def test_an_introduction_without_a_question_gets_one_on_its_own_reply(agent):
+    provider = _Scripted([LLMResponse(content="Hi! I'm your planner for the team.")])
+    loop = _loop(agent, provider)
+    try:
+        run_id = await _introduce(loop)
+    finally:
+        loop.stop()
+    ask = _state(agent)["pendingAsk"]
+    assert ask["options"] and ask["runId"] == run_id

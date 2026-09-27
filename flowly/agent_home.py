@@ -334,7 +334,9 @@ def _public(state: dict) -> dict:
     return view
 
 
-def _default_ask(state: dict, info: dict) -> dict:
+def _default_ask(state: dict, info: dict, *, run_id: str = "", message_id: str = "") -> dict:
+    """The app's own first question. Its anchor names the message it belongs
+    to (see ``_anchor``); a legacy welcome of unknown identity has none."""
     purpose = bool(str(info.get("description") or "").strip())
     labels = _text(state, "options_purpose" if purpose else "options")
     return {
@@ -342,7 +344,27 @@ def _default_ask(state: dict, info: dict) -> dict:
         "kind": "ask",
         "question": "",
         "options": [{"id": f"o{index + 1}", "label": label} for index, label in enumerate(labels)],
+        **_anchor(run_id=run_id, message_id=message_id),
     }
+
+
+def _anchor(*, run_id: str = "", message_id: str = "") -> dict:
+    """Which transcript message a question's choices belong to.
+
+    ``runId``: the reply of the run that asked (a question ends its run, so
+    that reply is the message the choices answer). ``messageId``: a message
+    the server wrote itself (the fallback welcome). Clients render choices
+    inside that message only, never under whatever happens to be last.
+    """
+    if run_id:
+        return {"runId": run_id}
+    if message_id:
+        return {"messageId": message_id}
+    return {}
+
+
+def _greeting_id(info: dict) -> str:
+    return f"agent-introduction:{info['botId']}"
 
 
 def _has_user_turn(messages: list[dict]) -> bool:
@@ -355,7 +377,7 @@ def _greeting_text(state: dict, info: dict) -> str:
 
 
 def _write_fallback_greeting(manager: SessionManager, state: dict, info: dict) -> None:
-    identity = f"agent-introduction:{info['botId']}"
+    identity = _greeting_id(info)
 
     def append(session: Session) -> None:
         if any(message.get("id") == identity for message in session.messages):
@@ -457,7 +479,10 @@ def _settle(state: dict, info: dict, manager: SessionManager, run_id: str) -> No
         _write_fallback_greeting(manager, state, info)
         state["intro"] = {"state": "fallback", "runId": run_id}
     if state["setup"] == "active" and state.get("pendingAsk") is None and not state.get("askCount"):
-        state["pendingAsk"] = _default_ask(state, info)
+        state["pendingAsk"] = (
+            _default_ask(state, info, run_id=run_id) if answered
+            else _default_ask(state, info, message_id=_greeting_id(info))
+        )
 
 
 # ── introduction lifecycle ──────────────────────────────────────────────────
@@ -752,6 +777,9 @@ def ask(session_key: str, question: object, options: object) -> dict:
             "kind": "ask",
             "question": text,
             "options": [{"id": f"o{index + 1}", "label": label} for index, label in enumerate(labels)],
+            # The turn that asks is the one begin_turn recorded; its reply
+            # carries the choices.
+            **_anchor(run_id=str((state.get("turn") or {}).get("runId") or "")),
         }
         state["askCount"] = state.get("askCount", 0) + 1
         _write_state(home, state)

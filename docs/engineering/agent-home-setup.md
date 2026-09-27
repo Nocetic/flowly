@@ -74,7 +74,8 @@ Two files in the profile's `FLOWLY_HOME`, both written atomically under
   "intro": { "state": "pending|running|done|fallback|static",
              "runId": "agent-intro-…", "owner": "<process token>" },
   "pendingAsk": { "id": "ask-…|card-…", "kind": "ask|card",
-                  "question": "…", "options": [{ "id": "o1", "label": "…" }] } | null,
+                  "question": "…", "options": [{ "id": "o1", "label": "…" }],
+                  "runId": "…" | "messageId": "agent-introduction:<botId>" } | null,
   "askCount": 0,                      // ≤ MAX_SETUP_QUESTIONS (2)
   "answers": [{ "question": "…", "choice": "Planning" }],
   "card": { "role": "…", "focus": "…", "style": "…", "notes": "…" },
@@ -339,3 +340,31 @@ Manual acceptance:
 8. Propose, edit, propose again, save: the first card shows as an earlier
    suggestion, the saved one stays; restart the runtime and reload — no
    duplicated rows.
+
+## Follow-up (2026-09-28): a question ends its turn; choices are anchored
+
+**The first message showed twice.** Lovelace's transcript: the model wrote its
+introduction with the `agent_setup_ask` call, then a second model call wrote
+the introduction again, followed by the choices as a bullet list. Desktop
+shows narration written with a hidden setup call, so the paragraph appeared
+twice and the choices three times (narration, bullets, buttons).
+
+- **A setup question ends the turn** (`flowly/agent/loop.py`). When every call
+  in a response is `agent_setup_ask`, the text written with it is moved out of
+  the tool-call message and becomes the final reply, and the model is not
+  called again. If that text does not contain the question, the question is
+  appended so it is always in the message. Mixed batches and a steering
+  message mid-turn keep the normal loop. Prompts are unchanged.
+- **Choices name the message they belong to.** `ask()` stamps `runId` from
+  `state.turn` (recorded by `begin_turn`, so the run that asked); the default
+  question gets `runId` when the introduction answered without asking, and
+  `messageId` (the fallback welcome's fixed id) when it fell back. A legacy
+  static welcome has no known id and carries neither; clients treat only that
+  case as "the latest agent message". Clients render choices inside that
+  message and nowhere else, and never after an owner message.
+
+Tests (`tests/test_agent_home_loop.py`): one model call and the message said
+once, with no narration left on the tool-call message; the question appended
+when left out; anchors for an asked question, a tapped answer, a fallback and
+an introduction that did not ask. Each was mutation-checked.
+

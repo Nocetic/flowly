@@ -6502,8 +6502,24 @@ class AgentLoop:
                     for tc in response.tool_calls
                 ]
 
+                # A setup question ends the turn. The owner answers from the
+                # choices shown under the message, so the message written with
+                # the call is the reply itself: it becomes the final message,
+                # once. Kept as narration before a second model call, it showed
+                # twice (the narration, then a reply restating it) with the
+                # choices listed again as text.
+                setup_question = all(tc.name == "agent_setup_ask" for tc in response.tool_calls)
+                setup_question_text = ""
+                if setup_question:
+                    # The question must be in the message, not only in the
+                    # call: append it when the model left it out.
+                    setup_question_text = (response.content or "").strip()
+                    asked = str(response.tool_calls[0].arguments.get("question") or "").strip()
+                    if asked and asked not in setup_question_text:
+                        setup_question_text = f"{setup_question_text}\n\n{asked}".strip()
+
                 assistant_content = None
-                if response.content:
+                if response.content and not setup_question:
                     content_lower = response.content.lower()
                     hallucination_phrases = [
                         "i did", "i sent", "i took", "i opened", "i closed",
@@ -7158,6 +7174,10 @@ class AgentLoop:
 
                 if steering.has_pending(outbound_run_id):
                     continue
+
+                if setup_question and setup_question_text:
+                    final_content = setup_question_text
+                    break
 
                 if terminal_action_executed:
                     successful = [t for t in accumulated_tool_results if t.get("success")]
