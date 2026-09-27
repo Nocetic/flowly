@@ -1233,6 +1233,36 @@ def ensure_profile_bot_id(name: str) -> ProfileInfo:
     return profile
 
 
+def active_profile_identity() -> tuple[str, Path, str]:
+    """``(name, home, botId)`` of this process's own profile.
+
+    A custom ``FLOWLY_HOME`` outside the profile tree is its own installation:
+    its identity lives in that home, and it never borrows the default
+    install's (``~/.flowly``) botId or directory. Default and named homes keep
+    their regular profile identity.
+    """
+    name = current_profile_name()
+    home = get_flowly_home()
+    if name != "default" or home.resolve() == _DEFAULT_HOME.resolve():
+        info = ensure_profile_bot_id(name)
+        return name, info.path, info.bot_id
+    current = _profile_metadata(home)
+    raw = str(current.get("botId") or "").strip()
+    try:
+        bot_id = str(uuid.UUID(raw))
+    except (ValueError, AttributeError):
+        bot_id = str(uuid.uuid4())
+    if raw != bot_id:
+        now = _utc_now()
+        current.update({"version": 1, "botId": bot_id,
+                        "displayName": str(current.get("displayName") or "default"),
+                        "createdAt": str(current.get("createdAt") or now), "updatedAt": now,
+                        "credentialPolicy": "primary"})
+        home.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(home / _PROFILE_METADATA_FILE, current)
+    return name, home, bot_id
+
+
 def get_or_create_profile_host_id() -> str:
     """Return the installation's stable, opaque remote bot-host UUID."""
     path = _DEFAULT_HOME / _PROFILE_HOST_FILE

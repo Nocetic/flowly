@@ -3847,13 +3847,18 @@ class GatewayServer:
 
     def _host_screen_checkpoint_identity(self) -> dict:
         from flowly.desktop_runtime.authority import ScreenError
-        from flowly.profile import ensure_profile_bot_id
+        from flowly.profile import active_profile_identity, current_profile_name, ensure_profile_bot_id
 
         identity, provider = self._get_host_screen_browser()
-        info = ensure_profile_bot_id(identity["profileId"])
-        if provider.runtime.directory.resolve() != (info.path / "desktop").resolve():
+        if identity["profileId"] == current_profile_name():
+            # This process's own profile; a custom FLOWLY_HOME has its own identity.
+            _, path, bot_id = active_profile_identity()
+        else:
+            info = ensure_profile_bot_id(identity["profileId"])
+            path, bot_id = info.path, info.bot_id
+        if provider.runtime.directory.resolve() != (path / "desktop").resolve():
             raise ScreenError("PROFILE_IDENTITY_CHANGED")
-        return {"hostId": identity["hostId"], "profileId": identity["profileId"], "botId": info.bot_id}
+        return {"hostId": identity["hostId"], "profileId": identity["profileId"], "botId": bot_id}
 
     def validate_browser_tool_result(self, result: dict) -> bool:
         binding = SCREEN_RUN_BINDING.get()

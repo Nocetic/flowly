@@ -222,31 +222,42 @@ def _resolve(gateway, params: dict, *, pinned: bool = False) -> DisplaySession:
 
 def _resolve_locked(gateway, params: dict, *, pinned: bool = False) -> DisplaySession:
     from flowly.profile import (
+        active_profile_identity,
         current_profile_name,
         ensure_profile_bot_id,
         get_flowly_home,
         get_or_create_profile_host_id,
+        is_default_home,
     )
 
     profile = params.get("profileId", current_profile_name())
     if not isinstance(profile, str) or not profile or len(profile) > 64:
         raise ScreenError("INVALID_PARAMS")
-    if gateway.profile_host is None and profile != current_profile_name():
-        raise ScreenError("PROFILE_NOT_AVAILABLE")
-    try:
-        info = ensure_profile_bot_id(profile)
-    except (ValueError, FileNotFoundError):
-        raise ScreenError("PROFILE_NOT_AVAILABLE") from None
-    # A process started under a custom FLOWLY_HOME must never silently expose
-    # a different default directory. Custom-home identity migration is separate.
-    if profile == current_profile_name() and info.path.resolve() != get_flowly_home().resolve():
-        raise ScreenError("PROFILE_IDENTITY_CHANGED")
+    if profile == current_profile_name():
+        # This process's own profile, including a custom FLOWLY_HOME, which is
+        # its own installation with its own identity and directory.
+        try:
+            _, path, bot_id = active_profile_identity()
+        except (ValueError, OSError):
+            raise ScreenError("PROFILE_NOT_AVAILABLE") from None
+        if path.resolve() != get_flowly_home().resolve():
+            raise ScreenError("PROFILE_IDENTITY_CHANGED")
+    else:
+        # Named profiles belong to the default installation's profile host; a
+        # custom home never exposes that other installation's profiles.
+        if gateway.profile_host is None or not is_default_home():
+            raise ScreenError("PROFILE_NOT_AVAILABLE")
+        try:
+            info = ensure_profile_bot_id(profile)
+        except (ValueError, FileNotFoundError):
+            raise ScreenError("PROFILE_NOT_AVAILABLE") from None
+        path, bot_id = info.path, info.bot_id
     host = gateway.profile_host.host_id if gateway.profile_host else get_or_create_profile_host_id()
-    identity = {"hostId": host, "profileId": profile, "botId": info.bot_id, "screenId": "browser"}
+    identity = {"hostId": host, "profileId": profile, "botId": bot_id, "screenId": "browser"}
     guarded = pinned or "expectedHostId" in params or "expectedBotId" in params
-    if guarded and (params.get("expectedHostId") != host or params.get("expectedBotId") != info.bot_id):
+    if guarded and (params.get("expectedHostId") != host or params.get("expectedBotId") != bot_id):
         raise ScreenError("PROFILE_IDENTITY_CHANGED")
-    key = (profile, info.bot_id)
+    key = (profile, bot_id)
     sessions = gateway._display_sessions
     if key not in sessions:
         # Bound stale cached identities after profile deletion/recreation.
@@ -256,7 +267,7 @@ def _resolve_locked(gateway, params: dict, *, pinned: bool = False) -> DisplaySe
                 sessions.pop(old, None)
         if len(sessions) >= 16:
             raise ScreenError("SCREEN_BUSY")
-        sessions[key] = DisplaySession(identity, info.path / "desktop")
+        sessions[key] = DisplaySession(identity, path / "desktop")
     return sessions[key]
 
 
