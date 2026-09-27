@@ -58,7 +58,8 @@ async def main():
     home.mkdir(parents=True, exist_ok=True)
     runtime = ScreenRuntime(home / "desktop")
     provider = HostBrowserProvider(runtime)
-    gateway = GatewayServer(host="0.0.0.0", port=8787, auth_token=TOKEN, require_loopback_auth=True)
+    relay_url = os.environ.get("FLOWLY_SCREEN_FIXTURE_RELAY_URL")
+    gateway = GatewayServer(host="0.0.0.0", port=8788 if relay_url else 8787, auth_token=TOKEN, require_loopback_auth=True)
     gateway._host_screen_browser = provider
     gateway._host_screen_identity = {"hostId": get_or_create_profile_host_id(), "profileId": "default", "screenId": "browser"}
     actions = []
@@ -135,6 +136,9 @@ async def main():
         marker = Path(environment["HOME"]) / "desktop-terminal-probe"
         return {"panel": {key.lower(): int(bounds[key]) for key in ("X", "Y", "WIDTH", "HEIGHT")},
                 "browserActive": active in browsers,
+                "activeWindow": active, "browserWindows": browsers,
+                "pointer": query("getmouselocation", "--shell").stdout,
+                "focusWindow": query("getwindowfocus").stdout.strip(),
                 "terminalVisible": query("search", "--onlyvisible", "--class", "^xfce4-terminal$").returncode == 0,
                 "settingsVisible": query("search", "--onlyvisible", "--class", "^xfce4-settings-manager$").returncode == 0,
                 "terminalCommandRan": marker.is_file() and marker.read_bytes() == b"desktop-ready\n"}
@@ -168,6 +172,8 @@ async def main():
     port = site._server.sockets[0].getsockname()[1]
     runner = web.AppRunner(app, access_log=None)
     stopped = asyncio.Event()
+    relay_channel = None
+    relay_task = None
     for sig in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(sig, stopped.set)
     try:
@@ -193,6 +199,20 @@ async def main():
             tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             tls.load_cert_chain("/fixture-tls/cert.pem", "/fixture-tls/key.pem")
             await web.TCPSite(runner, "0.0.0.0", 8787, ssl_context=tls).start()
+            if relay_url:
+                # The authenticated production bridge talks only to this private
+                # loopback listener; public fixture inspection remains TLS.
+                await web.TCPSite(runner, "127.0.0.1", 8788).start()
+                from flowly.channels.web import WebChannel
+                from flowly.config.schema import WebChannelConfig
+                relay_channel = WebChannel(WebChannelConfig(enabled=True, relay_url=relay_url,
+                    server_id="screen-fixture", auth_token=TOKEN,
+                    jwt_secret=os.environ["MOLTBOT_PROXY_JWT_SECRET"]), MessageBus())
+                relay_channel.set_screen_gateway(gateway)
+                relay_ready = asyncio.Event()
+                relay_channel._on_ready = relay_ready.set
+                relay_task = asyncio.create_task(relay_channel.start())
+                await asyncio.wait_for(relay_ready.wait(), timeout=20)
             print("READY desktop screen fixture", flush=True)
             try:
                 await stopped.wait()
@@ -200,6 +220,11 @@ async def main():
                 setup_task.cancel()
                 await asyncio.gather(setup_task, return_exceptions=True)
     finally:
+        if relay_channel is not None:
+            await relay_channel.stop()
+        if relay_task is not None:
+            relay_task.cancel()
+            await asyncio.gather(relay_task, return_exceptions=True)
         await runner.cleanup()
         await site_runner.cleanup()
         loop.stop()
