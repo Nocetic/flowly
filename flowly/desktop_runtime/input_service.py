@@ -89,8 +89,9 @@ class InputService:
     """One runtime's input broker; no control release on client EOF/shutdown."""
 
     def __init__(self, authority: ScreenAuthority, generation: str, socket_directory: Path, *, observers=None, viewers=None,
-                 rfb_socket: Path | None = None):
+                 rfb_socket: Path | None = None, keymap=None):
         self.authority, self.generation = authority, generation
+        self.keymap = keymap
         self.observers = observers
         self.viewers = viewers
         self.path = socket_directory / "input.sock"
@@ -217,7 +218,8 @@ class InputService:
                     # input source, while leaving human ownership unchanged.
                     self._finish(False)
             if self._broker is None:
-                self._broker = ScreenInputBroker(self.authority, viewer, self.generation, epoch, self.rfb)
+                self._broker = ScreenInputBroker(self.authority, viewer, self.generation, epoch, self.rfb,
+                                                 keymap=self.keymap)
                 self._viewer, self._epoch = viewer, epoch
                 self._handle, self._sequence = secrets.token_urlsafe(32), 0
                 self._last_digest = None

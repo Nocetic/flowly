@@ -602,3 +602,46 @@ def test_account_applications_are_bounded_and_cannot_undo_their_oom_floor(layout
         assert (Path("/proc") / str(target) / "oom_score_adj").read_text().strip() == "500"
     finally:
         runtime.stop(state["generation"])
+
+
+def test_root_input_service_maps_unicode_as_the_application_account(layout):
+    import base64
+
+    from playwright.sync_api import sync_playwright
+
+    from flowly.desktop_runtime.input_service import InputServiceClient
+    from flowly.desktop_runtime.launcher import ScreenRuntime
+    from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
+    from flowly.desktop_runtime.viewers import ViewerCredentials
+
+    directory, _ = layout
+    runtime = ScreenRuntime(directory)
+    state = runtime.start()
+    generation = state["generation"]
+    text = "şə漢✓"
+    try:
+        with sync_playwright() as playwright:
+            page = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{state['cdpPort']}").contexts[0].pages[0]
+            page.goto("data:text/html,<input id='code' autofocus>")
+            point = page.locator("#code").evaluate("""element => {
+                const r = element.getBoundingClientRect();
+                return {x: Math.round(screenX + r.x + 10),
+                        y: Math.round(screenY + outerHeight - innerHeight + r.y + 10)};
+            }""")
+            viewers = ViewerCredentials(StreamTickets(directory / "admission"))
+            viewer = viewers.create(StreamScope("owner", "host", "default", generation), "bot")["viewerId"]
+            human = runtime.authority.acquire(viewer, generation, runtime.authority.snapshot()["epoch"])
+            identity = dict(generation=generation, viewer=viewer, epoch=human["epoch"])
+            client = InputServiceClient(runtime.socket_directory / "input.sock")
+            handle = client.request("open", **identity)["handle"]
+            clicks = b"".join(struct.pack("!BBHH", 5, mask, point["x"], point["y"]) for mask in (0, 1, 0))
+            client.request("send", **identity, handle=handle, sequence=0, data=base64.b64encode(clicks).decode())
+            page.wait_for_function("document.hasFocus() && document.activeElement.id === 'code'")
+            keysyms = [0x1BA, *(0x01000000 | ord(c) for c in text[1:]), ord("#")]
+            keys = b"".join(struct.pack("!BBHI", 4, down, 0, keysym) for keysym in keysyms for down in (1, 0))
+            client.request("send", **identity, handle=handle, sequence=1, data=base64.b64encode(keys).decode())
+            page.wait_for_function("document.querySelector('#code').value.endsWith('#')", timeout=15_000)
+            assert page.locator("#code").input_value() == text + "#"
+            client.request("viewer.close", **identity, operationId="close")
+    finally:
+        runtime.stop(generation)

@@ -16,18 +16,39 @@ import time
 from pathlib import Path
 
 from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError
+from flowly.desktop_runtime.desktop_keymap import EXTRA_SLOTS, needs_mapping
 
 REQUEST = 1 << 31
 BLOCK_BEFORE = 1
 MAX_TEXT = 64 * 1024
 
 
+def _chunks(value: bytes, limit: int):
+    """Split validated input at message boundaries so that each part presses at
+    most ``limit`` distinct keysyms that may need a keymap entry."""
+    start = offset = 0
+    pressed: list[int] = []
+    while offset < len(value):
+        kind = value[offset]
+        size = 8 if kind == 4 else 6 if kind == 5 else 8 + int.from_bytes(value[offset + 4:offset + 8], "big")
+        if kind == 4:
+            _, down, _, key = struct.unpack_from("!BBHI", value, offset)
+            if down and needs_mapping(key) and key not in pressed:
+                if len(pressed) == limit:
+                    yield value[start:offset], pressed
+                    start, pressed = offset, []
+                pressed.append(key)
+        offset += size
+    yield value[start:], pressed
+
+
 class ScreenInputBroker:
     def __init__(self, authority: ScreenAuthority, viewer: str, generation: str,
-                 epoch: int, socket_path: Path, *, timeout: float = 5):
+                 epoch: int, socket_path: Path, *, timeout: float = 5, keymap=None):
         if not 0 < timeout <= 5:
             raise ScreenError("INVALID_PARAMS")
         self.authority = authority
+        self.keymap = keymap
         self.viewer = viewer
         self.generation = generation
         self.epoch = epoch
@@ -183,16 +204,24 @@ class ScreenInputBroker:
             if self._closed:
                 raise ScreenError("INPUT_OUTCOME_UNKNOWN")
             keys, pointer = self._validate_input(value)
-            if not self.authority.may_input(self.viewer, self.generation, self.epoch):
-                raise ScreenError("VIEWER_MISMATCH")
-            try:
-                self._deadline = time.monotonic() + self.timeout
-                self._write(value)
-                self._drain()
-                self._keys, self._pointer = keys, pointer
-            except (OSError, ScreenError):
-                self._abort()
-                raise ScreenError("INPUT_OUTCOME_UNKNOWN") from None
+            parts = list(_chunks(value, EXTRA_SLOTS)) if self.keymap is not None else [(value, [])]
+            for index, (part, pressed) in enumerate(parts):
+                if pressed:
+                    # Characters outside the keymap become keys before they are typed.
+                    self.keymap.prepare(pressed)
+                if not self.authority.may_input(self.viewer, self.generation, self.epoch):
+                    if index == 0:
+                        raise ScreenError("VIEWER_MISMATCH")
+                    self._abort()  # An earlier part was delivered.
+                    raise ScreenError("INPUT_OUTCOME_UNKNOWN")
+                try:
+                    self._deadline = time.monotonic() + self.timeout
+                    self._write(part)
+                    self._drain()
+                except (OSError, ScreenError):
+                    self._abort()
+                    raise ScreenError("INPUT_OUTCOME_UNKNOWN") from None
+            self._keys, self._pointer = keys, pointer
 
     def finish(self, *, release: bool = False) -> dict:
         """Release pressed keys/buttons, prove drain, then optionally hand back."""

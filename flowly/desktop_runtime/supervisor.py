@@ -23,7 +23,7 @@ from flowly.desktop_runtime.application_layout import read_browser_port
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.browser_lifecycle import BROWSER_MANAGER_SOURCE
 from flowly.desktop_runtime.desktop_defaults import DESKTOP_DEFAULTS_SOURCE
-from flowly.desktop_runtime.desktop_keymap import KEYMAP_SOURCE
+from flowly.desktop_runtime.desktop_keymap import KEYMAP_SOURCE, RemoteKeymap
 from flowly.desktop_runtime.input_service import InputService
 from flowly.desktop_runtime.installation_gate import environment_activity
 from flowly.desktop_runtime.launcher import (
@@ -254,11 +254,16 @@ def run(directory: Path, generation: str) -> None:
             # Before the browser or a terminal reads the keymap: layout
             # characters become ordinary keys (see desktop_keymap). Without it
             # ASCII still works; the manifest records which keymap is active.
-            try:
-                seeded = application_check(["python3", "-I", "-c", KEYMAP_SOURCE, application_command(
-                    ["xkbcomp"], system=application is not None)[0]], env, timeout=15)
-            except (ScreenError, subprocess.TimeoutExpired):
-                seeded = False
+            def upload_keymap(extras):
+                try:
+                    return application_check(["python3", "-I", "-c", KEYMAP_SOURCE, application_command(
+                        ["xkbcomp"], system=application is not None)[0], *("%x" % value for value in extras)],
+                        env, timeout=15)
+                except (ScreenError, subprocess.TimeoutExpired):
+                    return False
+
+            seeded = upload_keymap([])
+            keymap = RemoteKeymap(upload_keymap) if seeded else None
             state["keymap"] = "seeded" if seeded else "default"
             port_file = browser_profile / "DevToolsActivePort"
             port_file.unlink(missing_ok=True)
@@ -279,7 +284,7 @@ def run(directory: Path, generation: str) -> None:
             viewers = ViewerCredentials(StreamTickets(directory / "admission"))
             observers = ObserverRegistry(runtime.authority, generation, sockets, viewers=viewers)
             input_service = InputService(runtime.authority, generation, sockets, observers=observers, viewers=viewers,
-                                         rfb_socket=rfb)
+                                         rfb_socket=rfb, keymap=keymap)
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
                          cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, error=None)
             write_state(runtime.manifest, state)

@@ -1128,17 +1128,10 @@ KEYBOARD_CASES = {
     "mac-option-dead-acute": ([(MODE_SWITCH, 1), (MODE_SWITCH, 0), (0xE9, 1), (0xE9, 0)], "é"),
     "altgr-q-at": ([(LEVEL3, 1), (0x40, 1), (0x40, 0), (LEVEL3, 0)], "@"),
     "altgr-shift-braces": ([(LEVEL3, 1), (0x7B, 1), (0x7B, 0), (0x7D, 1), (0x7D, 0), (LEVEL3, 0)], "{}"),
-    "unicode-keysyms": ([(0x01000000 | ord(c), d) for c in "ə€✓" for d in (1, 0)], "ə€✓"),
 }
-# Outside the seeded keymap Xvnc adds a keysym while it is typed and Chromium
-# reads that key with its previous keymap: the character is lost or becomes the
-# next new one. Strict, so the case is noticed once it starts to pass.
-KEYBOARD_KNOWN_FAILURES = {"unicode-keysyms"}
 
 
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.xfail(
-    strict=True, reason="keysym outside the seeded keymap")) if case in KEYBOARD_KNOWN_FAILURES else case
-    for case in sorted(KEYBOARD_CASES)])
+@pytest.mark.parametrize("case", sorted(KEYBOARD_CASES))
 def test_viewer_keysyms_type_layout_characters_into_the_real_browser(tmp_path, login_site, case):
     from playwright.sync_api import sync_playwright
 
@@ -1165,3 +1158,52 @@ def test_viewer_keysyms_type_layout_characters_into_the_real_browser(tmp_path, l
                 connection.sendall(gate.feed(struct.pack("!BBHI", 4, down, 0, ord("#")), lambda: True))
             page.wait_for_function("document.querySelector('#code').value.endsWith('#')", timeout=10_000)
             assert page.locator("#code").input_value() == expected + "#"
+
+
+def test_input_service_maps_other_unicode_before_typing_it(tmp_path, login_site):
+    """Outside the seeded keymap Xvnc would add a keysym while it is typed and
+    Chromium would read that key with its previous keymap (the character was
+    lost or became the next new one). The supervisor's input path maps it first."""
+    from playwright.sync_api import sync_playwright
+
+    from flowly.desktop_runtime.input_service import InputServiceClient
+    from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
+    from flowly.desktop_runtime.viewers import ViewerCredentials
+
+    text = "ə✓ə漢字テスト©ąĄ😀"
+    with running_screen(tmp_path / "unicode") as runtime, sync_playwright() as playwright:
+        page = playwright.chromium.connect_over_cdp(runtime["endpoint"]).contexts[0].pages[0]
+        page.goto(login_site)
+        page.evaluate("() => { window.clickedCode = false; document.querySelector('#code')"
+                      ".addEventListener('mousedown', () => { window.clickedCode = true }) }")
+        point = page.locator("#code").evaluate("""element => {
+            const box = element.getBoundingClientRect();
+            return {x: Math.round(screenX + box.x + 10),
+                    y: Math.round(screenY + outerHeight - innerHeight + box.y + 10)};
+        }""")
+        authority = runtime["runtime"].authority
+        generation = runtime["state"]["generation"]
+        viewers = ViewerCredentials(StreamTickets(runtime["profile"].parent / "admission"))
+        viewer = viewers.create(StreamScope("owner", "host", "default", generation), "bot")["viewerId"]
+        human = authority.acquire(viewer, generation, authority.snapshot()["epoch"])
+        identity = dict(generation=generation, viewer=viewer, epoch=human["epoch"])
+        client = InputServiceClient(runtime["runtime"].socket_directory / "input.sock")
+        handle = client.request("open", **identity)["handle"]
+        sequence = 0
+
+        def send(data):
+            nonlocal sequence
+            client.request("send", **identity, handle=handle, sequence=sequence, data=base64.b64encode(data).decode())
+            sequence += 1
+
+        send(b"".join(struct.pack("!BBHH", 5, mask, point["x"], point["y"]) for mask in (0, 1, 0)))
+        page.wait_for_function("document.hasFocus() && window.clickedCode")
+        # One burst, as Desktop's paste sends it: noVNC's legacy keysym where one
+        # exists (ą 0x1b1, Ą 0x1a1), otherwise 0x01000000 | code point.
+        legacy = {"ą": 0x1B1, "Ą": 0x1A1}
+        keysyms = [legacy.get(c, c.isascii() and ord(c) or (ord(c) if ord(c) <= 0xFF else 0x01000000 | ord(c)))
+                   for c in text + "#"]
+        send(b"".join(struct.pack("!BBHI", 4, down, 0, keysym) for keysym in keysyms for down in (1, 0)))
+        page.wait_for_function("document.querySelector('#code').value.endsWith('#')", timeout=15_000)
+        assert page.locator("#code").input_value() == text + "#"
+        client.request("viewer.close", **identity, operationId="close")
