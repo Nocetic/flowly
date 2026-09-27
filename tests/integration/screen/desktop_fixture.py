@@ -11,6 +11,7 @@ import asyncio
 import os
 import signal
 import ssl
+import struct
 import subprocess
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from flowly.agent.loop import AgentLoop
 from flowly.agent.tools.browser_tab import BrowserTabTool
 from flowly.bus.queue import MessageBus
 from flowly.config.schema import Config
+from flowly.desktop_runtime import rfb as rfb_module
 from flowly.desktop_runtime.browser_provider import HostBrowserProvider
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.desktop_runtime.supervisor import application_environment
@@ -98,6 +100,21 @@ async def main():
             assert "Signed in" in str(kwargs["messages"])
             return LLMResponse(content="Signed in in the original Desktop task")
 
+    # Test-only evidence for keyboard diagnosis: the key events that passed
+    # the product's RFB gate, in order (disposable fixture, synthetic input).
+    key_log = []
+    product_feed = rfb_module.RfbClientGate.feed
+
+    def recording_feed(self, chunk, allow_input, *, epoch=None, on_input=None):
+        def record(message):
+            if message[0] == 4:
+                _, down, _, keysym = struct.unpack("!BBHI", message[:8])
+                key_log.append(f"{'d' if down else 'u'}{keysym:x}")
+                del key_log[:-600]
+            on_input(message)
+        return product_feed(self, chunk, allow_input, epoch=epoch, on_input=record if on_input else None)
+
+    rfb_module.RfbClientGate.feed = recording_feed
     model = LocalModel(api_key="test")
     # One bus: in relay mode the original task arrives as a real relay
     # chat.send through WebChannel ingress, admission and the agent loop.
@@ -146,6 +163,7 @@ async def main():
         terminals = query("search", "--onlyvisible", "--class", "^xfce4-terminal$").stdout.splitlines()
         focus = query("getwindowfocus").stdout.strip()
         marker = Path(environment["HOME"]) / "desktop-terminal-probe"
+        unicode_marker = Path(environment["HOME"]) / "desktop-unicode-probe"
         return {"panel": {key.lower(): int(bounds[key]) for key in ("X", "Y", "WIDTH", "HEIGHT")},
                 "browserActive": active in browsers,
                 "activeWindow": active, "browserWindows": browsers,
@@ -157,14 +175,15 @@ async def main():
                 "terminalFocused": active in terminals,
                 "terminalVisible": bool(terminals),
                 "settingsVisible": query("search", "--onlyvisible", "--class", "^xfce4-settings-manager$").returncode == 0,
-                "terminalCommandRan": marker.is_file() and marker.read_bytes() == b"desktop-ready\n"}
+                "terminalCommandRan": marker.is_file() and marker.read_bytes() == b"desktop-ready\n",
+                "unicodeProbe": unicode_marker.read_bytes().decode("utf-8", "replace") if unicode_marker.is_file() else None}
 
     async def inspection(request):
         # Test-only inspection never injects mouse/keyboard input or mutates the
         # browser. Keep values/cookies out of the response and test logs.
         if request.headers.get("Authorization") != f"Bearer {TOKEN}":
             raise web.HTTPUnauthorized()
-        return web.json_response({"calls": model.calls, "auxiliaryCalls": list(model.auxiliary), "actions": list(actions),
+        return web.json_response({"keyLog": list(key_log), "calls": model.calls, "auxiliaryCalls": list(model.auxiliary), "actions": list(actions),
             "desktop": await asyncio.to_thread(desktop_inspection),
             "page": await page.evaluate("""() => {
                 const point = selector => { const r=document.querySelector(selector).getBoundingClientRect();
