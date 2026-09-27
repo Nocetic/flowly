@@ -75,6 +75,13 @@ _ROSTER_INDEX_FILE = "roster.json"
 _PROFILE_HOST_FILE = "profile-host.json"
 _RUNTIME_LEASE_FILE = ".desktop-runtime.json"
 _PROFILE_MUTATION_LOCK_FILE = ".profiles.lock"
+# Deleted profiles are renamed here first, then removed. Not a valid profile
+# name, so listings and the capacity count never see it.
+_PROFILE_TRASH_DIR = ".trash"
+# The profile directory a process started with, as "device:inode". A runtime
+# compares it before claiming its lease, so a directory deleted and recreated
+# underneath it (by its own start-up writes) is never taken for the profile.
+PROFILE_DIR_IDENTITY_ENV = "FLOWLY_PROFILE_DIR_ID"
 MAX_NAMED_PROFILES = 15
 _MAX_SOUL_BYTES = 64 * 1024
 _MAX_MODEL_LENGTH = 256
@@ -1692,8 +1699,30 @@ def claim_runtime_lease(instance_id: str) -> Path:
     """Exclusively claim the current profile for one managed runtime."""
     if not instance_id:
         raise ValueError("runtime instance id is required")
-    path = get_flowly_home() / _RUNTIME_LEASE_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
+    home = get_flowly_home()
+    if home.parent != _PROFILES_ROOT:
+        # The default home, or an explicit FLOWLY_HOME outside the profiles.
+        home.mkdir(parents=True, exist_ok=True)
+        return _claim_runtime_lease_unlocked(home, instance_id)
+    # A named profile's lease is claimed under the same lock a delete retires
+    # the profile under, so the two can never interleave.
+    with _profile_mutation_lock():
+        started_with = os.environ.get(PROFILE_DIR_IDENTITY_ENV, "")
+        current = profile_dir_identity(home)
+        if current is None:
+            raise FileNotFoundError(f"Profile '{current_profile_name()}' does not exist.")
+        if started_with and current != started_with:
+            # Deleted after this runtime started; what is here now is only
+            # what our own start-up wrote. Remove it rather than let it pose
+            # as the bot, and refuse to run.
+            if not (home / _PROFILE_METADATA_FILE).exists():
+                shutil.rmtree(home, ignore_errors=True)
+            raise FileNotFoundError(f"Profile '{current_profile_name()}' was deleted.")
+        return _claim_runtime_lease_unlocked(home, instance_id)
+
+
+def _claim_runtime_lease_unlocked(home: Path, instance_id: str) -> Path:
+    path = home / _RUNTIME_LEASE_FILE
     existing = reconcile_runtime_lease(
         path.parent,
         profile_name=current_profile_name(),
@@ -1801,25 +1830,92 @@ def release_runtime_lease(instance_id: str) -> None:
         path.unlink(missing_ok=True)
 
 
+def profile_dir_identity(path: Path) -> str | None:
+    """``device:inode`` of a real (non-symlink) directory, else None."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    return f"{info.st_dev}:{info.st_ino}"
+
+
+def named_profile_identity(name: str) -> str | None:
+    """Identity of a named profile's directory (see PROFILE_DIR_IDENTITY_ENV)."""
+    validate_profile_name(name)
+    return profile_dir_identity(_PROFILES_ROOT / name)
+
+
+def _remove_retired_profile(path: Path) -> bool:
+    """Remove a retired profile tree; True when it is gone.
+
+    A process that still held a file open (a runtime finishing its exit) can
+    add an entry while the tree is being removed, which fails with ENOTEMPTY.
+    Retry briefly; anything still left is swept by the next delete. The
+    profile itself is already gone either way: it was renamed away.
+    """
+    for delay in (0.0, 0.1, 0.3, 0.6):
+        if delay:
+            time.sleep(delay)
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _sweep_profile_trash() -> None:
+    """Best effort: remove leftovers of earlier deletes."""
+    trash = _PROFILES_ROOT / _PROFILE_TRASH_DIR
+    try:
+        entries = list(trash.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_symlink():
+            entry.unlink(missing_ok=True)
+        else:
+            _remove_retired_profile(entry)
+
+
 def delete_profile(name: str) -> None:
-    """Delete a named profile."""
+    """Delete a named profile.
+
+    The name is retired atomically: under the profile mutation lock (which a
+    starting runtime also takes to claim its lease), the directory is renamed
+    into a hidden trash folder. From that moment nothing can list, start or
+    write into the profile, and the name is free again, so a partially
+    removed tree can never be left behind as a half-alive bot. Removing the
+    renamed tree afterwards is best effort and retried on the next delete.
+    """
     validate_profile_name(name)
     if name == "default":
         raise ValueError("Cannot delete the default profile.")
 
     profile_dir = _PROFILES_ROOT / name
-    if not profile_dir.exists():
-        raise FileNotFoundError(f"Profile '{name}' does not exist.")
-    if profile_dir.is_symlink() or _PROFILES_ROOT.resolve() not in profile_dir.resolve().parents:
-        raise ValueError("Profile directory failed containment validation.")
+    _sweep_profile_trash()
+    with _profile_mutation_lock():
+        if not profile_dir.exists():
+            raise FileNotFoundError(f"Profile '{name}' does not exist.")
+        if profile_dir.is_symlink() or _PROFILES_ROOT.resolve() not in profile_dir.resolve().parents:
+            raise ValueError("Profile directory failed containment validation.")
 
-    lease = reconcile_runtime_lease(profile_dir, profile_name=name)
-    if lease:
-        raise RuntimeError(
-            f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before deletion."
-        )
+        lease = reconcile_runtime_lease(profile_dir, profile_name=name)
+        if lease:
+            raise RuntimeError(
+                f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before deletion."
+            )
 
-    shutil.rmtree(profile_dir)
+        trash = _PROFILES_ROOT / _PROFILE_TRASH_DIR
+        trash.mkdir(mode=0o700, exist_ok=True)
+        retired = trash / f"{name}.{uuid.uuid4().hex}"
+        os.rename(profile_dir, retired)
+
+    _remove_retired_profile(retired)
 
     # Clean up active_profile if it pointed to deleted profile
     if get_active_profile() == name:
