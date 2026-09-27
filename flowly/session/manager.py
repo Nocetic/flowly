@@ -1296,13 +1296,19 @@ class SessionManager:
         with self._session_write_lock(session.key):
             self._flush_full_unlocked(session, required=required)
 
-    def _flush_full_unlocked(self, session: "Session", *, required: bool = False) -> None:
+    def _flush_full_unlocked(
+        self, session: "Session", *, required: bool = False, access_checked: bool = False,
+    ) -> None:
         """Mirror any not-yet-persisted tail of ``session.messages`` into the
         append-only display log. Idempotent via a per-session watermark stored in
         metadata (which survives ``Session.clear()``). Best-effort: a failure
-        here never blocks the canonical save."""
-        require_session_file(self._get_session_path(session.key), session.key)
-        require_session_access(session.key, session.metadata)
+        here never blocks the canonical save.
+
+        ``access_checked`` is for ``_save_unlocked``, which has already applied
+        the (stricter) ownership checks for this write."""
+        if not access_checked:
+            require_session_file(self._get_session_path(session.key), session.key)
+            require_session_access(session.key, session.metadata)
         session.ensure_event_identities()
         try:
             mark = int(session.metadata.get(self._FULL_WATERMARK_KEY, 0))
@@ -1789,6 +1795,13 @@ class SessionManager:
         path = self._get_session_path(session.key)
         path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Mirror the new tail into the append-only display transcript BEFORE the
+        # canonical write, so the advanced watermark is persisted with it.
+        # Flushing afterwards advanced it only in memory: any fresh load (a
+        # restart, ``mutate``, another manager) saw the stale count and appended
+        # the previous save's rows to the display log a second time.
+        self._flush_full_unlocked(session, access_checked=True)
+
         # Write to temp file first, then atomic rename
         tmp_path = path.with_suffix(f".tmp.{secrets.token_hex(4)}")
         had_revision = "_session_revision" in session.metadata
@@ -1844,10 +1857,6 @@ class SessionManager:
             except OSError:
                 pass
             raise
-
-        # Mirror the new tail into the append-only display transcript so the UI
-        # keeps the full conversation even after the context jsonl is compacted.
-        self.flush_full(session)
 
         # Update cache
         self._cache[session.key] = session
