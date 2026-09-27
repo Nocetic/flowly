@@ -17,6 +17,29 @@ from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.installer import _operation
 
 
+def find_uv() -> str | None:
+    """uv on PATH, else where Flowly's installer and uv's own installer put it.
+
+    A systemd user service's PATH omits ~/.local/bin, so a normally installed
+    gateway would otherwise never see the uv that installed it. Fallbacks are
+    trusted only as regular executables owned by this user or root and not
+    writable by group or others.
+    """
+    found = shutil.which("uv")
+    if found and Path(found).is_absolute():
+        return found
+    for candidate in (Path.home() / ".local" / "bin" / "uv", Path.home() / ".cargo" / "bin" / "uv"):
+        try:
+            resolved = candidate.resolve(strict=True)
+            info = resolved.stat()
+        except (OSError, RuntimeError):
+            continue
+        if (stat.S_ISREG(info.st_mode) and info.st_uid in {os.geteuid(), 0}
+                and not info.st_mode & 0o022 and os.access(resolved, os.X_OK)):
+            return str(resolved)
+    return None
+
+
 def _recipe() -> tuple[Path, bytes, str]:
     source = Path(worker.__file__)
     requirements = source.with_name("screen-requirements.txt").read_bytes()
@@ -28,7 +51,7 @@ def _recipe() -> tuple[Path, bytes, str]:
 def python_plan() -> dict:
     """Read-only preview, stable across installation but bound to this env."""
     reason = None
-    uv = shutil.which("uv")
+    uv = find_uv()
     if sys.platform != "linux" or platform.machine() not in {"aarch64", "x86_64"}:
         reason = "INSTALL_UNSUPPORTED_HOST"
     elif getattr(sys, "frozen", False) or "__compiled__" in globals():
@@ -93,8 +116,8 @@ def install_python(plan_id: str, operation: str) -> dict:
         raise ScreenError("INSTALL_PLAN_CHANGED")
     try:
         source, _, digest = _recipe()
-        uv = shutil.which("uv")
-        if not uv or not Path(uv).is_absolute():
+        uv = find_uv()
+        if not uv:
             raise ScreenError("INSTALL_UV_REQUIRED")
         command = [sys.executable, "-I", str(source), operation, plan_id, uv, digest]
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

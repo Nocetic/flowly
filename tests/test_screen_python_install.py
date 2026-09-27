@@ -87,10 +87,42 @@ def test_unsupported_installation_never_spawns(host, monkeypatch, kind, code):
         monkeypatch.setattr(installer.sys, "platform", "win32")
     elif kind == "uv":
         monkeypatch.setattr(installer.shutil, "which", lambda name: None)
+        monkeypatch.setattr(installer.Path, "home", lambda: host.home / "empty-home")
     else:
         monkeypatch.setattr(installer.sys, "frozen", True, raising=False)
     assert installer.python_plan()["reason"] == code
     with pytest.raises(ScreenError, match=code):
+        installer.install_python(host.plan["planId"], OPERATION)
+    host.spawn.assert_not_called()
+
+
+@pytest.mark.parametrize("location", [".local/bin", ".cargo/bin"])
+def test_service_path_without_uv_uses_the_installer_location(host, monkeypatch, location):
+    # A systemd user unit's PATH omits ~/.local/bin, where install.sh puts uv.
+    monkeypatch.setattr(installer.shutil, "which", lambda name: None)
+    monkeypatch.setattr(installer.Path, "home", lambda: host.home / "user")
+    binary = host.home / "user" / location / "uv"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    plan = installer.python_plan()
+    assert plan["supported"], plan["reason"]
+    assert plan["planId"] != host.plan["planId"], "the executed uv is part of the reviewed plan"
+    host.child.communicate.return_value = (json.dumps({**host.receipt, "planId": plan["planId"]}).encode(), None)
+    installer.install_python(plan["planId"], OPERATION)
+    assert host.spawn.call_args.args[0][5] == str(binary.resolve())
+
+
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o644])
+def test_untrusted_fallback_uv_is_never_executed(host, monkeypatch, mode):
+    monkeypatch.setattr(installer.shutil, "which", lambda name: None)
+    monkeypatch.setattr(installer.Path, "home", lambda: host.home / "user")
+    binary = host.home / "user" / ".local" / "bin" / "uv"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(mode)
+    assert installer.python_plan()["reason"] == "INSTALL_UV_REQUIRED"
+    with pytest.raises(ScreenError, match="INSTALL_UV_REQUIRED"):
         installer.install_python(host.plan["planId"], OPERATION)
     host.spawn.assert_not_called()
 
