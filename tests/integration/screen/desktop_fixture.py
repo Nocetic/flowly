@@ -61,9 +61,19 @@ async def main():
     runtime = ScreenRuntime(home / "desktop")
     provider = HostBrowserProvider(runtime)
     relay_url = os.environ.get("FLOWLY_SCREEN_FIXTURE_RELAY_URL")
-    gateway = GatewayServer(host="0.0.0.0", port=8788 if relay_url else 8787, auth_token=TOKEN, require_loopback_auth=True)
+    # Optional named profiles for multi-profile screen flows (display routing,
+    # separate runtimes/accounts); the chat/agent fixture stays on default.
+    named = [name for name in os.environ.get("FLOWLY_SCREEN_FIXTURE_PROFILES", "").split(",") if name]
+    if named:
+        from flowly.profile import create_profile
+
+        for name in named:
+            create_profile(name, local_runtime=True)
+    gateway = GatewayServer(host="0.0.0.0", port=8788 if relay_url else 8787, auth_token=TOKEN, require_loopback_auth=True,
+                            enable_profile_host=bool(named))
     gateway._host_screen_browser = provider
-    gateway._host_screen_identity = {"hostId": get_or_create_profile_host_id(), "profileId": "default", "screenId": "browser"}
+    gateway._host_screen_identity = {"hostId": gateway.profile_host.host_id if gateway.profile_host else get_or_create_profile_host_id(),
+                                     "profileId": "default", "screenId": "browser"}
     actions = []
     dispatch = provider._dispatch
 
