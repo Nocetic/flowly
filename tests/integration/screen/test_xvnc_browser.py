@@ -1094,3 +1094,22 @@ def test_screen_yields_to_the_agent_under_memory_pressure_and_bounds_its_cache(t
     finally:
         runtime.stop(state["generation"])
 
+
+def test_idle_stop_of_a_real_screen_records_why_and_starts_again(tmp_path):
+    runtime = ScreenRuntime(tmp_path / "idle")
+    state = runtime.start()
+    observed = runtime.authority.snapshot()["revision"]
+    human = runtime.authority.acquire("viewer", state["generation"], runtime.authority.snapshot()["epoch"])
+    runtime.authority.release("viewer", state["generation"], human["epoch"])
+    with pytest.raises(ScreenError, match="SCREEN_BUSY"):
+        runtime.stop(state["generation"], idle_revision=observed)
+    assert runtime.status()["phase"] == "running"
+    runtime.stop(state["generation"], idle_revision=runtime.authority.snapshot()["revision"])
+    stopped = runtime.status()
+    assert (stopped["phase"], stopped["error"]) == ("stopped", "IDLE_STOPPED")
+    assert not any(is_alive(identity) for identity in [state["supervisor"], *state["children"]])
+    again = runtime.start()
+    try:
+        assert again["phase"] == "running" and again["error"] is None
+    finally:
+        runtime.stop(again["generation"])

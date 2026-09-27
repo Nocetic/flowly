@@ -293,6 +293,41 @@ def test_stop_of_a_dead_generation_ends_its_human_and_run_claims(runtime, monkey
     with pytest.raises(ScreenError, match="STALE_GENERATION"):
         runtime.stop("generation-0")
 
+
+def test_idle_stop_is_refused_after_any_change_and_never_recovers_a_dead_screen(runtime, monkeypatch):
+    manifest(runtime)
+    runtime.authority.start("generation-1")
+    observed = runtime.authority.snapshot()["revision"]
+    control = runtime.authority.acquire("viewer", "generation-1", runtime.authority.snapshot()["epoch"])
+    runtime.authority.release("viewer", "generation-1", control["epoch"])
+    monkeypatch.setattr(launcher, "is_alive", lambda value: bool(value))
+    monkeypatch.setattr(launcher, "signal_process", lambda *args: pytest.fail("used since observed"))
+    with pytest.raises(ScreenError, match="SCREEN_BUSY"):
+        runtime.stop("generation-1", idle_revision=observed)
+    assert runtime.authority.snapshot()["running"]
+    runtime.authority.acquire("viewer", "generation-1", runtime.authority.snapshot()["epoch"])
+    monkeypatch.setattr(launcher, "is_alive", lambda value: False)
+    with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED"):
+        runtime.stop("generation-1", idle_revision=runtime.authority.snapshot()["revision"])
+    assert runtime.authority.snapshot()["control"] == "human", "only an explicit stop ends human claims"
+
+
+def test_idle_stop_records_why_the_screen_stopped(runtime, monkeypatch):
+    state = manifest(runtime)
+    runtime.authority.start("generation-1")
+    alive = {"supervisor": True}
+    monkeypatch.setattr(launcher, "is_alive", lambda value: bool(value) and alive["supervisor"])
+
+    def graceful(identity, signum):
+        alive["supervisor"] = False
+        write_state(runtime.manifest, {**state, "phase": "stopped", "supervisor": None, "children": []})
+
+    monkeypatch.setattr(launcher, "signal_process", graceful)
+    runtime.stop("generation-1", idle_revision=runtime.authority.snapshot()["revision"])
+    assert not runtime.authority.snapshot()["running"]
+    assert runtime.status()["phase"] == "stopped" and runtime.status()["error"] == "IDLE_STOPPED"
+
+
 @pytest.mark.parametrize("raw", ['{', '[]', '{}', '{"schema":1}', 'x' * 17000])
 def test_corrupt_state_fails_closed(runtime, raw):
     runtime.manifest.write_text(raw)

@@ -211,12 +211,15 @@ class ScreenAuthority:
                 state.update(generation=generation, running=True, epoch=state["epoch"] + 1)
         return _public(state)
 
-    def stop(self, generation: str) -> dict:
+    def stop(self, generation: str, *, idle_revision: int | None = None) -> dict:
+        """``idle_revision``: an idle stop, refused if anything changed since then."""
         with self._transaction() as state:
             self._check(state, generation)
             if state["control"] != "agent":
                 raise ScreenError("HUMAN_HAS_CONTROL")
             if state["run"] is not None:
+                raise ScreenError("SCREEN_BUSY")
+            if idle_revision is not None and state["revision"] != idle_revision:
                 raise ScreenError("SCREEN_BUSY")
             state.update(running=False, epoch=state["epoch"] + 1)
         return _public(state)

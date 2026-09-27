@@ -15,6 +15,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -46,6 +47,14 @@ STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
 INPUT_PROTOCOL = "epoch-u64-v1"
+# An unused running screen is stopped after this long (plan: 30 minutes). Use
+# is an attached viewer stream, a viewer/control request, human control or an
+# agent run/action; a static picture without new pixels is not idleness.
+IDLE_STOP_SECONDS = 30 * 60
+IDLE_CHECK_SECONDS = 60
+ACTIVITY_METHODS = frozenset({"display.observe", "display.viewer.create", "display.control.acquire",
+                              "display.control.release", "display.control.reclaim", "display.run.resume",
+                              "display.start"})
 
 
 def _supports_input(state: dict | None) -> bool:
@@ -64,6 +73,10 @@ class DisplaySession:
         self._handoffs: RunHandoffs | None = None
         self.streams: set[web.WebSocketResponse] = set()
         self.attaching = 0
+        # Idle tracking, owned by the gateway event loop.
+        self.activity = time.monotonic()
+        self.idle_mark: tuple[str, int] | None = None
+        self.idle_stopping = False
 
     @property
     def runtime(self) -> ScreenRuntime:
@@ -370,6 +383,8 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
                 "profileId", "expectedHostId", "expectedBotId", "planId", "operationId"}.issubset(params):
             raise ScreenError("INVALID_PARAMS")
         session = await asyncio.to_thread(_resolve, gateway, params, pinned=pinned)
+        if method in ACTIVITY_METHODS:
+            session.activity = time.monotonic()
         if method == "display.install.plan":
             result = await asyncio.to_thread(installation_plan, session.identity)
             await asyncio.to_thread(_resolve, gateway, params, pinned=True)
@@ -492,9 +507,10 @@ def register_display(app: web.Application, gateway) -> None:
             return _error(exc.code, 403)
         except OSError:
             return _error("CONTROL_UNAVAILABLE", 503)
-        if session.attaching >= MAX_STREAMS:
+        if session.attaching >= MAX_STREAMS or session.idle_stopping:
             return _error("SCREEN_BUSY", 429)
         session.attaching += 1
+        session.activity = time.monotonic()
         writer = None
         observer_writer = None
         ws = web.WebSocketResponse(max_msg_size=MAX_FRAME + (8 if input_protocol else 0), heartbeat=15,
@@ -629,12 +645,111 @@ def register_display(app: web.Application, gateway) -> None:
                     observer_writer.close()
                 session.streams.discard(ws)
                 session.attaching -= 1
+                session.activity = time.monotonic()
         return ws
 
+    async def idle_monitor():
+        while True:
+            await asyncio.sleep(IDLE_CHECK_SECONDS)
+            try:
+                await idle_sweep(gateway)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Screen idle check failed")
+
+    async def start_idle_monitor(_app):
+        gateway._display_idle_task = asyncio.create_task(idle_monitor())
+
+    async def stop_idle_monitor(_app):
+        task = getattr(gateway, "_display_idle_task", None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def shutdown(_app):
+        await stop_idle_monitor(_app)
         await gateway._display_subscriptions.close()
         await asyncio.gather(*(ws.close(code=1001) for session in list(gateway._display_sessions.values())
                                for ws in tuple(session.streams)), return_exceptions=True)
 
     app.router.add_get(STREAM_PATH, stream)
+    app.on_startup.append(start_idle_monitor)
     app.on_shutdown.append(shutdown)
+
+
+def _idle_candidate(session: DisplaySession) -> tuple[str, int] | None:
+    """(generation, authority revision) of a running screen nobody uses."""
+    if not ScreenRuntime.capabilities()["supported"]:
+        return None
+    state = session.runtime.status()
+    control = session.runtime.authority.snapshot()
+    if (not state or state["phase"] != "running" or not control["running"]
+            or control["generation"] != state["generation"] or control["control"] != "agent"
+            or control["runId"] or control["actionInFlight"] or control["inputDrainRequired"]):
+        return None
+    return control["generation"], control["revision"]
+
+
+async def idle_sweep(gateway, now: float | None = None) -> list[str]:
+    """Stop running screens unused for IDLE_STOP_SECONDS; returns stopped generations.
+
+    The decision and the stream-admission fence happen on the event loop, so
+    no viewer attaches between them; the authority refuses the stop under its
+    lock if any control/run change happened since the observed revision.
+    Human control or an agent run is never idle, and a dead runtime is left
+    for explicit recovery.
+    """
+    from flowly.profile import current_profile_name, get_flowly_home
+
+    sessions = gateway._display_sessions
+    if not any(identity[0] == current_profile_name() for identity in sessions) and (
+            get_flowly_home() / "desktop" / "runtime.json").is_file():
+        # After a gateway restart nobody may have asked about the screen yet.
+        try:
+            await asyncio.to_thread(_resolve, gateway, {})
+        except (ScreenError, OSError):
+            pass
+    stopped = []
+    for session in list(sessions.values()):
+        current = time.monotonic() if now is None else now
+        if session.streams or session.attaching or session.idle_stopping:
+            session.activity = current
+            continue
+        try:
+            candidate = await asyncio.to_thread(_idle_candidate, session)
+        except (ScreenError, OSError):
+            continue
+        if candidate is None:
+            session.idle_mark = None
+            continue
+        if session.idle_mark != candidate:
+            # Any authority change (control, run, action) restarts the clock.
+            session.idle_mark = candidate
+            session.activity = max(session.activity, current)
+            continue
+        if current - session.activity < IDLE_STOP_SECONDS:
+            continue
+        if session.streams or session.attaching or session.idle_stopping:
+            continue
+        session.idle_stopping = True
+        generation, revision = candidate
+        identity = session.identity
+        pinned = {"profileId": identity["profileId"], "expectedHostId": identity["hostId"],
+                  "expectedBotId": identity["botId"]}
+
+        def guard():
+            _resolve(gateway, pinned, pinned=True)
+
+        try:
+            await asyncio.to_thread(session.runtime.stop, generation, identity_guard=guard,
+                                    idle_revision=revision)
+            stopped.append(generation)
+            logger.info("Stopped an unused screen for profile {}", identity["profileId"])
+        except ScreenError as exc:
+            logger.info("Idle screen stop refused: {}", exc.code)
+        finally:
+            session.idle_stopping = False
+            session.idle_mark = None
+            session.activity = time.monotonic() if now is None else now
+    return stopped

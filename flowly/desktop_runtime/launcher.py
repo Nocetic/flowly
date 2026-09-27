@@ -380,7 +380,8 @@ class ScreenRuntime:
         terminate_profile_account_processes(layout.account_name)
         return True
 
-    def stop(self, generation: str, *, identity_guard: Callable[[], None] | None = None) -> None:
+    def stop(self, generation: str, *, identity_guard: Callable[[], None] | None = None,
+             idle_revision: int | None = None) -> None:
         self.assert_current_directory()
         with self._lock:
             self.assert_current_directory()
@@ -391,6 +392,9 @@ class ScreenRuntime:
                 raise ScreenError("STALE_GENERATION")
             control = self.authority.snapshot()
             if not is_alive(state.get("supervisor")):
+                if idle_revision is not None:
+                    # Recovery ends human claims; only an explicit stop may.
+                    raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
                 if any(is_alive(child) for child in state["children"]):
                     # A crashed supervisor left applications behind. A
                     # dedicated-account layout identifies every one of them;
@@ -410,8 +414,8 @@ class ScreenRuntime:
                     write_state(self.manifest, {**state, "phase": "stopped", "supervisor": None,
                                                 "children": [], "error": None})
                 return
-            if control["running"]:
-                self.authority.stop(generation)
+            if control["running"] or idle_revision is not None:
+                self.authority.stop(generation, idle_revision=idle_revision)
             signal_process(state["supervisor"], signal.SIGTERM)
             deadline = time.monotonic() + self.STOP_TIMEOUT
             while time.monotonic() < deadline:
@@ -420,6 +424,9 @@ class ScreenRuntime:
                     # Terminal jobs may have daemonized out of the supervisor's
                     # process tree; none may outlive the profile's screen.
                     self._reap_account_processes()
+                    if idle_revision is not None:
+                        # Tells the user why the screen stopped by itself.
+                        write_state(self.manifest, {**current, "error": "IDLE_STOPPED"})
                     return
                 if current and current["phase"] == "failed" and not is_alive(state["supervisor"]):
                     raise ScreenError("RUNTIME_STOP_FAILED")
