@@ -18,12 +18,12 @@ installation_job = install_job_fixture
 
 def test_combined_plan_binds_identity_and_both_recipes(monkeypatch):
     identity = {"hostId": "host", "botId": "bot", "profileId": "default", "screenId": "browser"}
-    system = {"planId": "a" * 64, "runtimeAccountRequired": True}
-    python = {"planId": "b" * 64, "upToDate": False}
+    system = {"planId": "a" * 64, "runtimeAccountRequired": True, "supported": True, "sudoAvailable": False}
+    python = {"planId": "b" * 64, "upToDate": False, "supported": True}
     monkeypatch.setattr(plans, "install_plan", lambda: dict(system))
     monkeypatch.setattr(plans, "python_plan", lambda: dict(python))
     original = plans.installation_plan(identity)
-    assert not original["applySupported"]
+    assert original["applySupported"] and original["reason"] is None
     assert original["runtimeAccountRequired"]
     python["upToDate"] = True
     assert plans.installation_plan(identity)["planId"] == original["planId"]
@@ -34,6 +34,27 @@ def test_combined_plan_binds_identity_and_both_recipes(monkeypatch):
     system["planId"] = "a" * 64
     python["planId"] = "d" * 64
     assert plans.installation_plan(identity)["planId"] != original["planId"]
+
+
+@pytest.mark.parametrize("root,sudo,system_ok,python_ok,admissible", [
+    (True, False, True, True, True),     # Root: the job provisions the runtime account.
+    (False, True, True, True, True),     # Unprivileged with sudo: per-operation password.
+    (False, False, True, True, False),   # No privileged path at all.
+    (True, True, False, True, False),    # Unsupported distribution/tools.
+    (True, True, True, False, False),    # Python environment cannot take the extra.
+])
+def test_apply_admission_is_live_and_outside_the_fingerprint(monkeypatch, root, sudo, system_ok, python_ok, admissible):
+    identity = {"hostId": "host", "botId": "bot", "profileId": "default", "screenId": "browser"}
+    system = {"planId": "a" * 64, "runtimeAccountRequired": root, "supported": system_ok, "sudoAvailable": sudo}
+    python = {"planId": "b" * 64, "upToDate": False, "supported": python_ok}
+    monkeypatch.setattr(plans, "install_plan", lambda: dict(system))
+    monkeypatch.setattr(plans, "python_plan", lambda: dict(python))
+    plan = plans.installation_plan(identity)
+    assert plan["applySupported"] is admissible
+    # Older Desktop parsers accept exactly this reason for a read-only plan.
+    assert plan["reason"] == (None if admissible else "INSTALL_ADMISSION_UNAVAILABLE")
+    monkeypatch.setattr(plans, "install_plan", lambda: {**system, "sudoAvailable": not sudo})
+    assert plans.installation_plan(identity)["planId"] == plan["planId"]
 
 
 @pytest.mark.parametrize("profile", ["default", "writer"])

@@ -1922,6 +1922,9 @@ Respond to the user now:"""
 
     # Wire browser_tab tool to gateway server
     agent.set_gateway_server(gateway_server)
+    # A screen-installation restart is refused while accepted messages still
+    # wait for a turn: they live only in this process's queue.
+    gateway_server._maintenance_backlog = lambda: bus.inbound_size
 
     # Profiles collaborate through the Desktop process, which is the only
     # authority that can see and start sibling runtimes. The tool is restricted

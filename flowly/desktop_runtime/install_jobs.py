@@ -233,6 +233,48 @@ class ScreenInstallJobs:
         return {"installVerificationVersion": 1, **self.identity, "operationId": operation,
                 "planId": plan_id, "ready": reason is None, "reason": reason}
 
+    def restart_reservation(self, plan_id: str, operation: str):
+        """Admit the restart that completes an installation of this identity.
+
+        Returns ``(needed, reservation)``. When a restart is needed the
+        reservation is the exclusive environment lease: no agent turn, tracked
+        process, screen runtime or installation can start while it is held.
+        The caller keeps it until this process exits, or releases it when the
+        restart is not carried out. Nothing is recorded; the durable receipt's
+        completion boundary alone decides whether a later process is fresh.
+        """
+        _operation(operation)
+        if not isinstance(plan_id, str) or not re.fullmatch(r"[a-f0-9]{64}", plan_id):
+            raise ScreenError("INVALID_PARAMS")
+        self.guard()
+        receipt = self.status(operation)
+        if receipt["planId"] != plan_id:
+            raise ScreenError("OPERATION_CONFLICT")
+        if receipt["state"] in {"pending", "running"}:
+            raise ScreenError("INSTALL_BUSY")
+        if receipt["state"] == "recovery_required":
+            raise ScreenError("INSTALL_RECOVERY_REQUIRED")
+        if receipt["state"] != "succeeded":
+            raise ScreenError("INSTALL_VERIFICATION_FAILED")
+        reservation = environment_activity(exclusive=True)
+        reservation.__enter__()
+        needed = False
+        try:
+            try:
+                # Environment-wide: a sibling profile's pending or uncertain
+                # job blocks the restart as well; any finished job that still
+                # needs a fresh process makes this restart necessary.
+                assert_environment_installation_idle()
+            except ScreenError as exc:
+                if exc.code != "INSTALL_RESTART_REQUIRED":
+                    raise
+                self.guard()
+                needed = True
+            return needed, reservation if needed else None
+        finally:
+            if not needed:
+                reservation.__exit__(None, None, None)
+
     def submit(self, plan_id: str, operation: str, *, password: str | None = None):
         _operation(operation)
         if not isinstance(plan_id, str) or not re.fullmatch(r"[a-f0-9]{64}", plan_id):

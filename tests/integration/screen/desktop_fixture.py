@@ -105,6 +105,7 @@ async def main():
     loop = AgentLoop(bus=bus, provider=model, workspace=home / "workspace", main_config=Config(),
                      max_iterations=4, soft_warn_at_iteration=0)
     loop.tools.register(BrowserTabTool(gateway))
+    gateway._maintenance_backlog = lambda: bus.inbound_size
 
     async def on_chat(*args):
         result = await loop._run_llm_tool_loop(

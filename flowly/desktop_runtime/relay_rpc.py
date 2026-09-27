@@ -74,6 +74,11 @@ class RelayScreenRpc:
                 or not isinstance(message.get("params", {}), dict)):
             await self.error(session, rpc_id, "INVALID_PARAMS")
             return
+        if "password" in message.get("params", {}):
+            # The relay terminates TLS per hop. A host sudo password must only
+            # travel over a direct TLS/SSH connection to this gateway.
+            await self.error(session, rpc_id, "SECURE_TRANSPORT_REQUIRED")
+            return
         try:
             raw = json.dumps({"type": "rpc", "id": rpc_id, "method": message["method"],
                               "params": message.get("params", {})}, allow_nan=False)

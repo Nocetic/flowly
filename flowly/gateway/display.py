@@ -11,11 +11,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import secrets
+import sys
 import threading
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
+from loguru import logger
 
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.handoff import RunHandoffs
@@ -36,7 +39,9 @@ from flowly.gateway.mcp_management import _protected_socket
 METHODS = frozenset({"display.capabilities", "display.status", "display.observe", "display.viewer.create", "display.viewer.close",
                      "display.control.acquire", "display.control.release", "display.control.reclaim",
                      "display.subscribe", "display.unsubscribe", "display.run.resume",
-                     "display.start", "display.stop", "display.operation.status", "display.doctor", "display.install.plan", "display.install.status", "display.install.apply", "display.install.verify"})
+                     "display.start", "display.stop", "display.operation.status", "display.doctor", "display.install.plan", "display.install.status", "display.install.apply", "display.install.verify",
+                     "display.install.restart"})
+INSTALL_METHODS = frozenset({"display.install.status", "display.install.apply", "display.install.verify", "display.install.restart"})
 STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
@@ -88,7 +93,8 @@ class DisplaySession:
                 "view": capability["supported"], "input": _supports_input(state),
                 "viewerClose": bool(state and state.get("inputServiceVersion") == 3
                                     and state.get("observerServiceVersion") == 3),
-                "lifecycle": capability["supported"], "lifecycleVersion": 1, "installSupported": False, "statusEvents": True, "resumeSupported": True,
+                "lifecycle": capability["supported"], "lifecycleVersion": 1, "installSupported": True, "installRestartVersion": 1,
+                "statusEvents": True, "resumeSupported": True,
                 "browserGrantVersion": 2, "doctorVersion": 1, "installPlanVersion": 1}
 
     @property
@@ -254,6 +260,62 @@ def _resolve_locked(gateway, params: dict, *, pinned: bool = False) -> DisplaySe
     return sessions[key]
 
 
+async def _install_restart(gateway, ws, rpc_id: str, session: DisplaySession, params: dict) -> None:
+    """Restart this service to load freshly installed packages, only when idle.
+
+    The exclusive environment lease is taken before the reply and held until
+    this process exits, so no agent turn, tracked process, screen runtime or
+    installation starts between the idle check and the restart. Only a
+    systemd user unit whose main process is exactly this gateway is restarted;
+    otherwise the host owner restarts it and verification proves the result.
+    """
+    target = {key: params[key] for key in ("profileId", "expectedHostId", "expectedBotId")}
+    operation, plan = params["operationId"], params["planId"]
+
+    def admit():
+        jobs = ScreenInstallJobs(session.identity, lambda: _resolve(gateway, target, pinned=True))
+        return jobs.restart_reservation(plan, operation)
+
+    needed, reservation = await asyncio.to_thread(admit)
+    result = {"installRestartVersion": 1, **session.identity, "operationId": operation, "planId": plan}
+    if not needed:
+        await gateway._ws_rpc_reply(ws, rpc_id, {**result, "restart": "not_required"})
+        return
+    try:
+        # Accepted chat work that has not started a turn yet would be lost.
+        backlog = getattr(gateway, "_maintenance_backlog", None)
+        if not callable(backlog) or backlog() != 0:
+            raise ScreenError("INSTALL_BUSY")
+        from flowly.integrations.service_control import DEFAULT_LABEL
+        from flowly.integrations.service_ownership import owns_current_gateway
+
+        if sys.platform != "linux" or not await owns_current_gateway(DEFAULT_LABEL, os.getpid()):
+            await gateway._ws_rpc_reply(ws, rpc_id, {**result, "restart": "manual"})
+            return
+        await gateway._ws_rpc_reply(ws, rpc_id, {**result, "restart": "scheduled"})
+        gateway._install_restart = asyncio.create_task(_restart_holding(gateway, reservation))
+        reservation = None
+    finally:
+        if reservation is not None:
+            reservation.__exit__(None, None, None)
+
+
+async def _restart_holding(gateway, reservation) -> None:
+    try:
+        await asyncio.sleep(0.5)  # Let the reply flush first.
+        from flowly.integrations.service_control import restart_gateway
+
+        outcome = await restart_gateway(health_check_host=gateway.host, health_check_port=gateway.port,
+                                        expected_pid=os.getpid())
+        if not outcome.ok:
+            logger.warning("[Gateway] installation restart was not completed: {}", outcome.detail)
+    except Exception:
+        logger.exception("[Gateway] installation restart failed")
+    finally:
+        # Reached only if this process survived: work may resume here again.
+        reservation.__exit__(None, None, None)
+
+
 def _error(code: str, status: int = 400) -> web.Response:
     return web.json_response({"error": {"code": code}}, status=status, headers={"Cache-Control": "no-store"})
 
@@ -277,11 +339,11 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             return
         allowed = {"profileId", "expectedHostId", "expectedBotId"}
         pinned = method not in {"display.capabilities", "display.status"}
-        if pinned and method not in {"display.subscribe", "display.operation.status", "display.doctor", "display.install.plan", "display.install.status", "display.install.apply", "display.install.verify"}:
+        if pinned and method not in {"display.subscribe", "display.operation.status", "display.doctor", "display.install.plan"} | INSTALL_METHODS:
             allowed.add("generation")
-        if method in {"display.start", "display.stop", "display.operation.status", "display.install.status", "display.install.apply", "display.install.verify"}:
+        if method in {"display.start", "display.stop", "display.operation.status"} | INSTALL_METHODS:
             allowed.add("operationId")
-        if method in {"display.install.apply", "display.install.verify"}:
+        if method in {"display.install.apply", "display.install.verify", "display.install.restart"}:
             allowed.add("planId")
         if method == "display.install.apply":
             allowed.add("password")
@@ -293,7 +355,7 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
             allowed.update({"viewerToken", "epoch", "operationId"})
         if not isinstance(params, dict) or set(params) - allowed:
             raise ScreenError("INVALID_PARAMS")
-        if method in {"display.install.apply", "display.install.verify"} and not {
+        if method in {"display.install.apply", "display.install.verify", "display.install.restart"} and not {
                 "profileId", "expectedHostId", "expectedBotId", "planId", "operationId"}.issubset(params):
             raise ScreenError("INVALID_PARAMS")
         session = await asyncio.to_thread(_resolve, gateway, params, pinned=pinned)
@@ -311,6 +373,9 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
                 return jobs.submit(params.get("planId"), params.get("operationId"), password=params.get("password"))
             result = await asyncio.to_thread(apply_installation)
             await gateway._ws_rpc_reply(ws, rpc_id, result)
+            return
+        if method == "display.install.restart":
+            await _install_restart(gateway, ws, rpc_id, session, params)
             return
         if method in {"display.install.status", "display.install.verify"}:
             def installation_status():
