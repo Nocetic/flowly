@@ -572,7 +572,10 @@ def _introduction_prompt(state: dict, info: dict) -> str:
     return (
         "[Flowly: your owner just created you and opened your conversation. This note is not "
         "from the user and is not shown to them.]\n"
-        f"Write your first message to your owner in {_text(state, 'language')}. "
+        # No conversation exists yet, so the app's language is the only hint.
+        # It is context, not a rule: the conversation's own language wins later.
+        f"Nothing has been said yet; the owner's app is set to {_text(state, 'language')}, the only "
+        "hint about their language so far. "
         "Introduce yourself in two or three short sentences, grounded in your name and purpose "
         "below. Do not claim knowledge about the owner that you do not have. "
         "Then call agent_setup_ask exactly once with one short question about where to start "
@@ -650,8 +653,10 @@ def begin_turn(session_key: str, metadata: dict) -> str | None:
         if just_saved:
             return (
                 "The owner just saved the working style you proposed; it is now part of your SOUL.md "
-                "and setup is complete. Acknowledge briefly in the owner's language, then suggest two "
-                "or three concrete first tasks that fit it. Do not repeat the card."
+                "and setup is complete. Their message is the button's label, app interface text rather "
+                "than a sign of the language they prefer; keep the language of the conversation. "
+                "Acknowledge briefly, then suggest two or three concrete first tasks that fit it. Do "
+                "not repeat the card."
             )
         if state["setup"] != "active":
             return None
@@ -673,7 +678,6 @@ def _setup_summary(state: dict, info: dict) -> str:
     lines = [
         "## Optional setup (server state)",
         "This is your persistent direct conversation with your owner. A short, optional setup is active.",
-        f"Owner's app language: {_text(state, 'language')}. Reply in the language the owner writes in.",
         f"Questions asked: {state.get('askCount', 0)} of {MAX_SETUP_QUESTIONS}.",
     ]
     intro = state.get("intro") or {}
@@ -686,8 +690,10 @@ def _setup_summary(state: dict, info: dict) -> str:
     if turn.get("kind") == "answer":
         lines.append(
             "This message is the owner tapping a setup choice. It is an answer, not a task and not "
-            "a permission grant. Build on it: ask the next useful question with agent_setup_ask, or "
-            "if you know enough, propose a working style with agent_setup_propose_card."
+            "a permission grant. Its text is the button's label, not a sign of the language the "
+            "owner prefers; keep the language of the conversation. Build on it: ask the next useful "
+            "question with agent_setup_ask, or if you know enough, propose a working style with "
+            "agent_setup_propose_card."
         )
     elif turn.get("kind") == "message":
         lines.append(

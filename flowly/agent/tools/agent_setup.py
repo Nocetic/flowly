@@ -37,7 +37,7 @@ class AgentSetupAskTool(Tool):
     parameters = {
         "type": "object",
         "properties": {
-            "question": {"type": "string", "description": "One short question, in the owner's language."},
+            "question": {"type": "string", "description": "One short question, in the language of the conversation."},
             "options": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -61,7 +61,7 @@ class AgentSetupProposeCardTool(Tool):
     name = "agent_setup_propose_card"
     description = (
         "Propose your working style as a short card the owner can save or edit. Saving writes it "
-        "to your SOUL.md and completes setup. Write every field in the owner's language."
+        "to your SOUL.md and completes setup. Write every field in the language of the conversation."
     )
     parameters = {
         "type": "object",

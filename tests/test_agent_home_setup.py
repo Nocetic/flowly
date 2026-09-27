@@ -611,3 +611,30 @@ async def test_history_carries_the_card_for_rendering(agent):
     await server._ws_rpc_chat_history(None, "h", {"sessionKey": HOME_SESSION, "limit": 50})
     rows = [row for row in server._ws_rpc_reply.await_args.args[2]["messages"] if row.get("kind") == agent_home.CARD_ROW_KIND]
     assert len(rows) == 1 and rows[0]["setupCard"]["focus"] == "İş ve projeler"
+
+
+# ── language follows the conversation, never the app ───────────────────────
+
+
+def test_setup_never_imposes_the_app_language(agent):
+    resolve_home({"locale": "en"})
+    claim = claim_introduction({})
+    # Before anything is said, the app language is only a hint.
+    assert "the only hint about their language so far" in claim["prompt"]
+    assert "Write your first message to your owner in" not in claim["prompt"]
+    offered = settle_introduction(claim["runId"])["pendingAsk"]
+    context = begin_turn(HOME_SESSION, {
+        "run_id": "tap", "setup_answer": {"askId": offered["id"], "optionId": offered["options"][0]["id"]},
+    })
+    assert "app language" not in context
+    assert "not a sign of the language the owner prefers" in context
+    typed = begin_turn(HOME_SESSION, {"run_id": "typed"})
+    assert "English" not in typed and "language" not in typed.split("Rules:")[0]
+
+
+def test_saving_by_button_does_not_switch_language(agent):
+    view = _offer_card(agent, locale="en")
+    context = begin_turn(HOME_SESSION, {
+        "run_id": "save", "setup_answer": {"askId": view["pendingAsk"]["id"], "optionId": "save"},
+    })
+    assert "app interface text rather than a sign of the language they prefer" in context
