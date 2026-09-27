@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import resource
 import secrets
 import select
 import shutil
@@ -33,6 +34,21 @@ from flowly.desktop_runtime.launcher import (
 from flowly.desktop_runtime.observers import ObserverRegistry
 from flowly.desktop_runtime.tickets import StreamTickets
 from flowly.desktop_runtime.viewers import ViewerCredentials
+
+# Under memory pressure the kernel picks the screen before the agent (whose
+# score stays 0). Children inherit it; without CAP_SYS_RESOURCE they cannot
+# lower it below the root supervisor's floor.
+SCREEN_OOM_SCORE_ADJ = 500
+# Tasks (processes and threads) of a profile's dedicated account: a runaway
+# terminal job cannot exhaust the host's process table. Chromium with the
+# 16-tab limit stays far below it.
+ACCOUNT_TASK_LIMIT = 4096
+
+
+def limit_screen_resources(*, system: bool) -> None:
+    Path("/proc/self/oom_score_adj").write_text(str(SCREEN_OOM_SCORE_ADJ))
+    if system:
+        resource.setrlimit(resource.RLIMIT_NPROC, (ACCOUNT_TASK_LIMIT, ACCOUNT_TASK_LIMIT))
 
 
 def application_environment(directory: Path, sockets: Path) -> dict[str, str]:
@@ -175,6 +191,7 @@ def run(directory: Path, generation: str) -> None:
                 if state.get("socketLayoutVersion") != 3:
                     raise ScreenError("RUNTIME_STATE_INVALID")
                 application = root_application_layout(directory)
+            limit_screen_resources(system=application is not None)
             sockets = runtime.socket_directory
             rfb = runtime.rfb_socket_for(state)
             application_sockets = rfb.parent

@@ -761,7 +761,7 @@ was performed.
 Root fixture reproduction (fresh disposable container only):
 
 ```sh
-docker run --rm --user 0 --security-opt seccomp=unconfined --shm-size=512m \
+docker run --rm --user 0 --cap-add SYS_RESOURCE --security-opt seccomp=unconfined --shm-size=512m \
   --mount "type=bind,source=$PWD,target=/workspace,readonly" \
   -e FLOWLY_SCREEN_ACCOUNT_TEST=1 flowly-screen-gateway-test:bookworm \
   python -m pytest tests/integration/screen/test_runtime_account.py \

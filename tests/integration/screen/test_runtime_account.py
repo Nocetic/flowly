@@ -572,3 +572,32 @@ def test_stop_and_crashed_supervisor_leave_no_account_process(layout):
         assert restarted["generation"] != state["generation"]
     finally:
         runtime.stop(restarted["generation"])
+
+
+def test_account_applications_are_bounded_and_cannot_undo_their_oom_floor(layout):
+    from flowly.desktop_runtime.launcher import ScreenRuntime
+
+    directory, application = layout
+    runtime = ScreenRuntime(directory)
+    state = runtime.start()
+    try:
+        for child in state["children"]:
+            proc = Path("/proc") / str(child["pid"])
+            assert (proc / "oom_score_adj").read_text().strip() == "500"
+            limits = [line.split() for line in (proc / "limits").read_text().splitlines()
+                      if line.startswith("Max processes")]
+            assert limits and limits[0][2:4] == ["4096", "4096"]
+        # A real root host's supervisor holds CAP_SYS_RESOURCE, which pins the
+        # floor; Docker drops it by default (runner: --cap-add SYS_RESOURCE).
+        capabilities = next(line for line in (Path("/proc") / str(state["supervisor"]["pid"]) / "status")
+                            .read_text().splitlines() if line.startswith("CapEff:"))
+        assert int(capabilities.split()[1], 16) >> 24 & 1, "runner must keep CAP_SYS_RESOURCE like a root host"
+        target = next(pid for pid in _owned_live(application.account.uid)
+                      if any(pid == child["pid"] for child in state["children"]))
+        # Unbuffered: a buffered write's EACCES would be swallowed at exit.
+        lowered = _as_account(application, "import os,sys;os.write(os.open(sys.argv[1],os.O_WRONLY),b'0')",
+                              f"/proc/{target}/oom_score_adj")
+        assert lowered.returncode != 0 and "Permission denied" in lowered.stderr
+        assert (Path("/proc") / str(target) / "oom_score_adj").read_text().strip() == "500"
+    finally:
+        runtime.stop(state["generation"])

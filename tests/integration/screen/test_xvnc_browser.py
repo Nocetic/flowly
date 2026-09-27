@@ -1070,3 +1070,27 @@ def test_runtime_restored_from_another_host_never_signals_reused_pids_and_recove
         for p in strangers:
             p.kill()
             p.wait()
+
+
+def test_screen_yields_to_the_agent_under_memory_pressure_and_bounds_its_cache(tmp_path):
+    runtime = ScreenRuntime(tmp_path / "bounded")
+    state = runtime.start()
+    try:
+        for identity in [state["supervisor"], *state["children"]]:
+            assert Path(f"/proc/{identity['pid']}/oom_score_adj").read_text().strip() == "500"
+        assert Path("/proc/self/oom_score_adj").read_text().strip() == "0"
+        profile = f"--user-data-dir={tmp_path / 'bounded' / 'browser'}".encode()
+        browsers = []
+        for entry in Path("/proc").iterdir():
+            try:
+                # Chromium rewrites its argv into one space-joined string.
+                command = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+            except OSError:
+                continue
+            if b"/chromium" in command and profile in command and b"--type=" not in command:
+                browsers.append(command)
+        assert browsers, "the browser process"
+        assert all(b"--disk-cache-size=268435456" in command for command in browsers)
+    finally:
+        runtime.stop(state["generation"])
+

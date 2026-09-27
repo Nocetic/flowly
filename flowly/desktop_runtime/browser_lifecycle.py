@@ -61,6 +61,8 @@ try:
                     browser, "--user-data-dir=" + profile,
                     "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
                     "--no-first-run", "--no-default-browser-check",
+                    # Bounded HTTP cache; cookies and logins are not cache.
+                    "--disk-cache-size=268435456",
                     "--window-position=20,20", "--window-size=1360,780", "about:blank",
                 ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, close_fds=True)
