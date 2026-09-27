@@ -284,6 +284,27 @@ advanced watermark is persisted with it (`tests/test_session_display_watermark.p
 Existing duplicated display rows are not rewritten; the fix stops new ones.
 A read-time de-duplication of old archives would be separate work.
 
+## 10a. Language follows the conversation
+
+Setup must not choose the owner's language. An earlier version told the model
+"Owner's app language: English" on every setup turn and to write the first
+message in the app language; with an English app and a Turkish-speaking owner
+the agent answered half in each. Tapped buttons made it worse: their labels
+are app-interface copy ("Save and start") but arrive as the owner's message.
+
+Now:
+
+- The identity header's existing rule applies: mirror the user's language.
+- The introduction states the app language only as *the only hint so far*,
+  because nothing has been said yet. It is context, not a rule.
+- The per-turn setup summary contains no language directive.
+- Tapped choices and card saves are described to the model as button labels,
+  not a sign of the owner's preferred language.
+- Tools ask for fields "in the language of the conversation".
+
+The app-localized strings that remain (static fallback welcome, default
+choices, card question and Save/Edit) are UI copy chosen by the app's locale.
+
 ## 11. Verification
 
 Automated (2026-09-27): full Core default suite 6,935 passed, 15 skipped
