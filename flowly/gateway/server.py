@@ -8,6 +8,7 @@ import mimetypes
 import os
 import secrets
 import uuid
+import weakref
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -547,6 +548,10 @@ class GatewayServer:
         if enable_profile_host and not is_loopback_host(host) and not self._require_auth:
             raise ValueError("Remote profile hosting requires gateway authentication.")
         self._ticket_store = WsTicketStore()
+        # Screen display admission always needs the configured token, even on a
+        # loopback gateway whose other routes exempt local clients. Sockets that
+        # presented it (or run under enforced auth) are tracked here.
+        self._display_authenticated: weakref.WeakSet = weakref.WeakSet()
         # Playback tickets: short-lived, scoped to a single media id, reusable
         # across the many Range requests one clip generates.
         self._media_ticket_store = MediaTicketStore()
@@ -721,10 +726,11 @@ class GatewayServer:
         from flowly.gateway.display import register_display
 
         register_display(app, self)
-        # WS-upgrade ticket minter. Active only when auth is engaged; the
-        # static token (checked by the auth middleware) gates this route, and
-        # it hands back a single-use short-TTL ticket for the /ws upgrade.
-        if self._require_auth:
+        # WS-upgrade ticket minter. Active whenever a token exists; the static
+        # token gates this route (the auth middleware under enforced auth, the
+        # handler itself on an exempt loopback gateway) and it hands back a
+        # single-use short-TTL ticket for the /ws upgrade.
+        if self._auth_token:
             app.router.add_post("/api/auth/ws-ticket", self._handle_ws_ticket)
         if self.on_voice_message:
             app.router.add_post("/api/voice/message", self._handle_voice_message)
@@ -826,9 +832,13 @@ class GatewayServer:
         return _auth_middleware
 
     async def _handle_ws_ticket(self, request: web.Request) -> web.Response:
-        """Mint a single-use, short-TTL ticket for the /ws upgrade. The auth
-        middleware has already verified the static token, so reaching here
-        means the caller is authenticated."""
+        """Mint a single-use, short-TTL ticket for the /ws upgrade. Under
+        enforced auth the middleware has already verified the static token;
+        on an exempt loopback gateway it is checked here."""
+        if not self._require_auth and not token_matches(extract_request_token(request), self._auth_token):
+            return web.json_response(
+                {"error": "unauthorized", "detail": "Missing or invalid gateway token."}, status=401,
+            )
         ticket = self._ticket_store.mint()
         return web.json_response({"ticket": ticket, "ttl_seconds": self._ticket_store.ttl_seconds})
 
@@ -844,6 +854,11 @@ class GatewayServer:
         if token_matches(q.get("token"), self._auth_token):
             return True
         return False
+
+    def display_client_authenticated(self, client_id: str, ws) -> bool:
+        """The exact current socket presented the token (see _display_authenticated)."""
+        return (bool(self._auth_token) and not ws.closed and self._ws_clients.get(client_id) is ws
+                and ws in self._display_authenticated)
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         # Capabilities advertise what this gateway build supports so clients
@@ -1219,8 +1234,17 @@ class GatewayServer:
                 return web.Response(status=403, text="forbidden host/origin")
             if not self._ws_credential_ok(request):
                 return web.Response(status=401, text="unauthorized")
+            display_authenticated = True
         elif not loopback_ws_allowed(request):
             return web.Response(status=403, text="forbidden host/origin")
+        else:
+            # Exempt loopback: the connection is allowed either way, but only
+            # one that presented the configured token may use the screen.
+            query = request.rel_url.query
+            display_authenticated = bool(self._auth_token) and (
+                self._ticket_store.consume(query.get("ticket"))
+                or token_matches(query.get("token"), self._auth_token)
+            )
         # 40 MB frame cap: chat.send carries attachments inline as base64 (a
         # 25 MB file inflates to ~33 MB encoded + JSON overhead). This is the
         # direct-gateway equivalent of the relay's CDN upload — base64-over-WS,
@@ -1285,6 +1309,8 @@ class GatewayServer:
         else:
             client_id = str(uuid.uuid4())
         self._ws_clients[client_id] = ws
+        if display_authenticated:
+            self._display_authenticated.add(ws)
         logger.info(f"[WS] Desktop client connected: {client_id}")
 
         long_rpc_tasks: set[asyncio.Task[None]] = set()

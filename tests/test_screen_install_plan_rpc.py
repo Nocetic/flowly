@@ -1,5 +1,6 @@
 """Installation review is authenticated, pinned and incapable of executing work."""
 
+import weakref
 from unittest.mock import Mock
 
 import pytest
@@ -98,7 +99,8 @@ async def test_install_plan_rejects_unprotected_admission(display_gateway, monke
     if boundary == "transport":
         monkeypatch.setattr(display, "_protected_socket", lambda request: False)
     else:
-        monkeypatch.setattr(f.gateway, "_require_auth", False)
+        # A socket that never presented the token, e.g. an exempt loopback client.
+        monkeypatch.setattr(f.gateway, "_display_authenticated", weakref.WeakSet())
     result = await f.rpc("display.install.plan", {"profileId": "default"})
     assert result["error"]["code"] == ("SECURE_TRANSPORT_REQUIRED" if boundary == "transport" else "UNAUTHORIZED")
     inspect.assert_not_called()
@@ -150,7 +152,8 @@ async def test_install_status_rejects_unprotected_read(display_gateway, monkeypa
     if boundary == "transport":
         monkeypatch.setattr(display, "_protected_socket", lambda request: False)
     else:
-        monkeypatch.setattr(f.gateway, "_require_auth", False)
+        # A socket that never presented the token, e.g. an exempt loopback client.
+        monkeypatch.setattr(f.gateway, "_display_authenticated", weakref.WeakSet())
     result = await f.rpc("display.install.status", {"profileId": "default"})
     assert result["error"]["code"] == ("SECURE_TRANSPORT_REQUIRED" if boundary == "transport" else "UNAUTHORIZED")
     factory.assert_not_called()

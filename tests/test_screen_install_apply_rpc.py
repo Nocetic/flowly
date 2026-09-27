@@ -1,6 +1,7 @@
 """Direct installation admission uses pinned identity and durable job receipts."""
 
 import asyncio
+import weakref
 from unittest.mock import Mock
 
 import pytest
@@ -73,7 +74,8 @@ async def test_apply_rejects_untrusted_admission(display_gateway, monkeypatch, b
     if boundary == "transport":
         monkeypatch.setattr(display, "_protected_socket", lambda _: False)
     elif boundary == "authentication":
-        monkeypatch.setattr(f.gateway, "_require_auth", False)
+        # A socket that never presented the token, e.g. an exempt loopback client.
+        monkeypatch.setattr(f.gateway, "_display_authenticated", weakref.WeakSet())
     else:
         request["expectedBotId"] = "wrong"
     result = await f.rpc("display.install.apply", request)

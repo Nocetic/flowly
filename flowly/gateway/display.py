@@ -32,7 +32,7 @@ from flowly.desktop_runtime.rfb import RfbClientGate
 from flowly.desktop_runtime.status import StatusSequence
 from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
 from flowly.desktop_runtime.viewers import ViewerCredentials
-from flowly.gateway.auth import host_origin_allowed
+from flowly.gateway.auth import extract_request_token, host_origin_allowed, token_matches
 from flowly.gateway.display_watch import DisplaySubscriptions
 from flowly.gateway.mcp_management import _protected_socket
 
@@ -322,7 +322,7 @@ def _error(code: str, status: int = 400) -> web.Response:
 
 async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, params) -> None:
     request = getattr(ws, "_req", None)
-    if not gateway._require_auth or gateway._ws_clients.get(client_id) is not ws or ws.closed:
+    if not gateway.display_client_authenticated(client_id, ws):
         await gateway._ws_rpc_error(ws, rpc_id, "UNAUTHORIZED", "An authenticated display connection is required.")
         return
     if request is None or not _protected_socket(request) or not host_origin_allowed(request):
@@ -450,9 +450,11 @@ def register_display(app: web.Application, gateway) -> None:
     gateway._display_subscriptions = DisplaySubscriptions(gateway, _resolve)
 
     async def stream(request: web.Request) -> web.StreamResponse:
-        # The ordinary gateway middleware checks Authorization. Unlike /ws,
-        # this route is never exempted from that check, even with a ticket.
-        if not gateway._require_auth:
+        # The ordinary gateway middleware checks Authorization under enforced
+        # auth. An exempt loopback gateway still requires the token here: the
+        # screen is never reachable without it, even with a ticket.
+        if not gateway._auth_token or (not gateway._require_auth and not token_matches(
+                extract_request_token(request), gateway._auth_token)):
             return _error("UNAUTHORIZED", 401)
         if not _protected_socket(request) or not host_origin_allowed(request):
             return _error("SECURE_TRANSPORT_REQUIRED", 403)

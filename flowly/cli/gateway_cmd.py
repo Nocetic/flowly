@@ -630,6 +630,11 @@ def gateway(
     elif remote_exposed and not auth_token:
         auth_token = generate_gateway_token()
         _token_changed = True
+    elif not auth_token and config.channels.web.enabled and config.channels.web.relay_url:
+        # The relay screen bridge enters this gateway's display routes, which
+        # always demand the token. Loopback stays exempt for other clients.
+        auth_token = generate_gateway_token()
+        _token_changed = True
 
     if not local_runtime and (_token_changed or (host.strip() and config.gateway.host != effective_host)):
         config.gateway.token = auth_token

@@ -31,8 +31,11 @@ def relay_endpoint(url: str) -> str:
 
 
 def gateway_endpoint(gateway) -> tuple[str, str] | None:
-    """Use only the owning gateway's authenticated loopback/wildcard listener."""
-    if not getattr(gateway, "_require_auth", False) or not _text(getattr(gateway, "_auth_token", None), 4096):
+    """Use only the owning gateway's token-authenticated loopback/wildcard listener.
+
+    Display routes demand the token even where other loopback routes do not.
+    """
+    if not _text(getattr(gateway, "_auth_token", None), 4096):
         return None
     host = {"0.0.0.0": "127.0.0.1", "::": "[::1]", "::1": "[::1]"}.get(gateway.host, gateway.host)
     if host not in {"127.0.0.1", "[::1]", "localhost"} or type(gateway.port) is not int or not 0 < gateway.port < 65536:

@@ -34,8 +34,7 @@ class DisplaySubscriptions:
         self._closed = False
 
     def current(self, subscription: Subscription) -> bool:
-        return (self.gateway._require_auth and not subscription.ws.closed
-                and self.gateway._ws_clients.get(subscription.client_id) is subscription.ws)
+        return self.gateway.display_client_authenticated(subscription.client_id, subscription.ws)
 
     def sample(self, target: dict) -> dict:
         return self.resolve(self.gateway, target, pinned=True).status()

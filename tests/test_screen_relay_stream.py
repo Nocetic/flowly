@@ -101,9 +101,12 @@ def test_fixed_endpoints_and_authenticated_gateway():
     assert relay_endpoint("wss://example.com/relay") == "wss://example.com/screen/agent"
     gateway = SimpleNamespace(host="::", port=1234, _require_auth=True, _auth_token="secret")
     assert gateway_endpoint(gateway) == ("ws://[::1]:1234/api/display/stream", "secret")
+    # An exempt loopback gateway still demands the token on display routes.
     gateway._require_auth = False
+    assert gateway_endpoint(gateway) == ("ws://[::1]:1234/api/display/stream", "secret")
+    gateway._auth_token = ""
     assert gateway_endpoint(gateway) is None
-    gateway._require_auth = True
+    gateway._auth_token = "secret"
     gateway.host = "remote.example.com"
     assert gateway_endpoint(gateway) is None
 

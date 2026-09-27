@@ -155,7 +155,8 @@ async def test_shutdown_during_pending_snapshot_cannot_resurrect_subscription():
         return {"statusRevision": 1, "hostId": "host", "botId": "bot", "profileId": "default"}
 
     ws = SimpleNamespace(closed=False)
-    gateway = SimpleNamespace(_require_auth=True, _ws_clients={"client": ws})
+    gateway = SimpleNamespace(_ws_clients={"client": ws})
+    gateway.display_client_authenticated = lambda client, socket: gateway._ws_clients.get(client) is socket and not socket.closed
     subscriptions = DisplaySubscriptions(gateway, lambda *_args, **_kwargs: SimpleNamespace(status=sample))
     pending = asyncio.create_task(subscriptions.prepare(ws, "client", {}))
     try:
@@ -199,7 +200,8 @@ async def test_a_nonreading_consumer_has_a_real_send_deadline():
         await asyncio.Event().wait()
 
     ws = SimpleNamespace(closed=False, send_json=never_complete)
-    gateway = SimpleNamespace(_require_auth=True, _ws_clients={"client": ws})
+    gateway = SimpleNamespace(_ws_clients={"client": ws})
+    gateway.display_client_authenticated = lambda client, socket: gateway._ws_clients.get(client) is socket and not socket.closed
     subscriptions = DisplaySubscriptions(gateway, lambda *_args, **_kwargs: SimpleNamespace(status=lambda: {
         "statusRevision": 1, "hostId": "host", "botId": "bot", "profileId": "default"}))
     entry = await subscriptions.prepare(ws, "client", {})

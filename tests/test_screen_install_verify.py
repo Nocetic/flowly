@@ -1,5 +1,6 @@
 """Post-install verification observes identity, process age and installed components."""
 
+import weakref
 from unittest.mock import Mock
 
 import pytest
@@ -139,7 +140,8 @@ async def test_verify_rpc_rejects_unprotected_connections(display_gateway, monke
     if boundary == "transport":
         monkeypatch.setattr(display, "_protected_socket", lambda _: False)
     else:
-        monkeypatch.setattr(f.gateway, "_require_auth", False)
+        # A socket that never presented the token, e.g. an exempt loopback client.
+        monkeypatch.setattr(f.gateway, "_display_authenticated", weakref.WeakSet())
     result = await f.rpc("display.install.verify", {})
     assert result["error"]["code"] == ("SECURE_TRANSPORT_REQUIRED" if boundary == "transport" else "UNAUTHORIZED")
 
