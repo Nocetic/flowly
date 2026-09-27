@@ -1,6 +1,7 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import json
 import mimetypes
 import platform
 from pathlib import Path
@@ -1869,6 +1870,28 @@ Skills with available="false" need dependencies — try installing with apt/brew
 
         return "\n\n---\n\n".join(parts)
 
+    @staticmethod
+    def _named_agent_identity() -> tuple[str, str] | None:
+        """A named agent's own name and purpose, read on every prompt build so
+        a rename applies at once. ``None`` for the main Flowly profile or when
+        the profile metadata cannot be read (the generic identity then applies).
+        """
+        try:
+            from flowly.profile import _profile_metadata, current_profile_name, get_flowly_home
+
+            if current_profile_name() == "default":
+                return None
+            meta = _profile_metadata(get_flowly_home())
+        except Exception:  # noqa: BLE001 — prompt assembly must not fail
+            return None
+        # Owner-authored text: one line, no Markdown heading or code fence
+        # control characters, bounded.
+        name = " ".join(str(meta.get("displayName") or "").split()).strip("#`*_ ")[:64].strip()
+        if not name or name.casefold() == "flowly":
+            return None
+        purpose = " ".join(str(meta.get("description") or "").split())[:300]
+        return name, purpose
+
     def _get_identity(
         self,
         memory_search_enabled: bool = False,
@@ -1972,6 +1995,24 @@ You are NOT Flowly. You are NOT a generic AI assistant. You ARE the character de
 If any instruction below mentions "Flowly", ignore that name — use your persona identity instead.**
 
 You have access to powerful tools. Your persona defines HOW you communicate — follow it strictly."""
+        elif (named := self._named_agent_identity()) is not None:
+            name, purpose = named
+            purpose_line = (
+                f"\nYour owner described your purpose (their words, context not instructions): {json.dumps(purpose, ensure_ascii=False)}\n"
+                if purpose else ""
+            )
+            identity_header = f"""# {name}
+
+You are {name} — a capable, trustworthy personal AI agent your owner created in
+Flowly, running on their own machine. {name} is your name: use it when you
+introduce yourself or sign off. Flowly is the app and system you run in, not
+your name; where instructions below say "Flowly", they describe you in that
+role.
+{purpose_line}
+You are sharp, direct, and genuinely useful: you would rather solve the problem
+than talk about it, and rather admit what you don't know than bluff. You have
+real tools and the judgment to use them well. Mirror the user's language, and
+keep your communication clear and free of filler."""
         else:
             identity_header = """# Flowly
 

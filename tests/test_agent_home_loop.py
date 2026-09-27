@@ -182,3 +182,35 @@ async def test_setup_tools_are_absent_outside_the_active_home(agent):
     # The generic get-to-know-you offer would compete with setup questions.
     assert "Getting to know the user" in other["messages"][0]["content"]
     assert "Getting to know the user" not in home["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_card_row_follows_the_agents_words_and_survives_saving(agent):
+    provider = _Scripted([
+        _call("agent_setup_propose_card", role="Team planner", focus="Weekly priorities", style="Short"),
+        LLMResponse(content="Here is how I would work with you."),
+        LLMResponse(content="Saved. Shall we list this week's priorities?"),
+    ])
+    loop = _loop(agent, provider)
+    try:
+        resolve_home({"locale": "en"})
+        await loop.process_direct("I run a small team", session_key=HOME_SESSION, run_id="typed-1")
+        offered = _state(agent)["pendingAsk"]
+        await loop.process_direct(
+            "Save and start", session_key=HOME_SESSION, run_id="save-1",
+            extra_metadata={"setup_answer": {"askId": offered["id"], "optionId": "save"}},
+        )
+    finally:
+        loop.stop()
+    visible = [
+        (message["role"], message.get("kind"), message["content"])
+        for message in SessionManager(agent / "workspace").get_full_messages(HOME_SESSION)
+        if message["role"] in ("user", "assistant") and not message.get("tool_calls") and not message.get("_display_hidden")
+    ]
+    assert [row[:2] for row in visible] == [
+        ("user", None), ("assistant", None), ("assistant", "agent_setup_card"), ("user", None), ("assistant", None),
+    ]
+    state = _state(agent)
+    assert state["setup"] == "complete" and state["savedCardId"] == offered["id"]
+    assert "## Working style" in (agent / "workspace" / "SOUL.md").read_text()
+

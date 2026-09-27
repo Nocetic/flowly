@@ -489,10 +489,14 @@ class Session:
                 if len(self.messages) > max_messages
                 else self.messages
             )
-        # The optional introduction is app-authored display copy, not a model
-        # turn. In particular, providers requiring an initial user turn must
-        # not receive an unsolicited leading assistant message.
-        projected = [_project_for_llm(m) for m in recent if m.get("kind") != "agent_introduction"]
+        # The static introduction and the working-style card row are
+        # app-authored display rows, not model turns (the model has its own
+        # tool call for the card). In particular, providers requiring an
+        # initial user turn must not receive an unsolicited assistant message.
+        projected = [
+            _project_for_llm(m) for m in recent
+            if m.get("kind") not in ("agent_introduction", "agent_setup_card")
+        ]
         return _repair_tool_sequence(projected)
 
     def get_history_with_checkpoint(

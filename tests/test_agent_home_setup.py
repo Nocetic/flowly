@@ -290,7 +290,9 @@ def _offer_card(home, locale="tr"):
 
 def test_card_is_offered_with_localized_save_and_edit(agent):
     view = _offer_card(agent)
-    assert view["card"] == {"role": "Planlama asistanı", "focus": "İş ve projeler", "style": "Kısa ve somut"}
+    assert view["card"] == {
+        "id": view["pendingAsk"]["id"], "role": "Planlama asistanı", "focus": "İş ve projeler", "style": "Kısa ve somut",
+    }
     assert view["pendingAsk"]["kind"] == "card"
     assert [(option["id"], option["label"]) for option in view["pendingAsk"]["options"]] == [
         ("save", "Kaydet ve başla"), ("edit", "Düzenle"),
@@ -509,3 +511,103 @@ async def test_introduction_without_a_watcher_settles_to_the_welcome(agent):
     assert settled["pendingAsk"]["options"]
     again, _ = await feature_rpc.dispatch("agent.home.introduce", {})
     assert again["introduction"] == "fallback"
+
+
+# ── the agent's own name ────────────────────────────────────────────────────
+
+
+def _identity_header(workspace) -> str:
+    from flowly.agent.context import ContextBuilder
+
+    return ContextBuilder(workspace)._get_identity()
+
+
+def _rename(home, **fields) -> None:
+    info = json.loads((home / "profile.json").read_text())
+    info.update(fields)
+    (home / "profile.json").write_text(json.dumps(info))
+
+
+def test_named_agent_is_introduced_by_its_own_name(purposeful):
+    _rename(purposeful, displayName="James")
+    header = _identity_header(purposeful / "workspace")
+    assert header.startswith("# James\n")
+    assert "You are James" in header
+    assert "You are Flowly" not in header
+    assert '"Marketing for Flowly"' in header  # the owner's words, quoted as data
+    _rename(purposeful, displayName="Jim", description="")
+    renamed = _identity_header(purposeful / "workspace")
+    assert "You are Jim" in renamed and "James" not in renamed
+    assert "described your purpose" not in renamed
+
+
+def test_main_flowly_identity_is_unchanged(agent, monkeypatch):
+    monkeypatch.setenv("FLOWLY_HOME", str(profiles._DEFAULT_HOME))
+    (profiles._DEFAULT_HOME / "workspace").mkdir(parents=True, exist_ok=True)
+    assert _identity_header(profiles._DEFAULT_HOME / "workspace").startswith("# Flowly\n\nYou are Flowly")
+
+
+def test_owner_names_cannot_break_the_prompt_structure(agent):
+    _rename(agent, displayName="  ## Ja\nmes`  ", description="x" * 900)
+    header = _identity_header(agent / "workspace")
+    assert header.startswith("# Ja mes\n")
+    assert len(json.loads(header.split("instructions): ", 1)[1].split("\n", 1)[0])) == 300
+    _rename(agent, displayName="Flowly")
+    assert _identity_header(agent / "workspace").startswith("# Flowly\n\nYou are Flowly —")
+
+
+# ── the working-style card stays in the conversation ───────────────────────
+
+
+def _card_rows(home) -> list[dict]:
+    return [
+        message for message in SessionManager(home / "workspace").get_full_messages(HOME_SESSION)
+        if message.get("kind") == agent_home.CARD_ROW_KIND
+    ]
+
+
+def test_proposed_card_becomes_one_display_only_transcript_row(agent):
+    view = _offer_card(agent)
+    sm = SessionManager(agent / "workspace")
+    assert agent_home.publish_card(sm)
+    assert not agent_home.publish_card(sm)  # once
+    rows = _card_rows(agent)
+    assert len(rows) == 1
+    card_id = view["pendingAsk"]["id"]
+    assert rows[0]["id"] == f"agent-setup-card:{card_id}"
+    assert rows[0]["setupCard"] == {"id": card_id, "role": "Planlama asistanı", "focus": "İş ve projeler", "style": "Kısa ve somut"}
+    assert "Odak: İş ve projeler" in rows[0]["content"]  # readable where cards are not rendered
+    assert all(message.get("kind") != agent_home.CARD_ROW_KIND for message in sm.get_or_create(HOME_SESSION).get_history())
+    assert "unpublishedCardId" not in state(agent)
+
+
+def test_saved_and_superseded_cards_are_derivable(agent):
+    first = _offer_card(agent)["pendingAsk"]["id"]
+    agent_home.publish_card(SessionManager(agent / "workspace"))
+    begin_turn(HOME_SESSION, {"run_id": "edit-request"})
+    propose_card(HOME_SESSION, {"role": "Planner", "focus": "Launch"})
+    second = resolve_home({})["pendingAsk"]["id"]
+    agent_home.publish_card(SessionManager(agent / "workspace"))
+    assert [row["setupCard"]["id"] for row in _card_rows(agent)] == [first, second]
+    view = resolve_home({})
+    assert view["pendingAsk"]["id"] == second and "savedCardId" not in view
+    begin_turn(HOME_SESSION, {"run_id": "save", "setup_answer": {"askId": second, "optionId": "save"}})
+    assert resolve_home({})["savedCardId"] == second
+
+
+@pytest.mark.asyncio
+async def test_history_carries_the_card_for_rendering(agent):
+    from unittest.mock import AsyncMock
+
+    from flowly.gateway.server import GatewayServer
+
+    _offer_card(agent)
+    sm = SessionManager(agent / "workspace")
+    agent_home.publish_card(sm)
+    server = object.__new__(GatewayServer)
+    server.sessions = sm
+    server._ws_rpc_reply = AsyncMock()
+    server._ws_rpc_error = AsyncMock()
+    await server._ws_rpc_chat_history(None, "h", {"sessionKey": HOME_SESSION, "limit": 50})
+    rows = [row for row in server._ws_rpc_reply.await_args.args[2]["messages"] if row.get("kind") == agent_home.CARD_ROW_KIND]
+    assert len(rows) == 1 and rows[0]["setupCard"]["focus"] == "İş ve projeler"

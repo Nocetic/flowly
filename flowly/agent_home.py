@@ -234,6 +234,9 @@ def _valid_optional(state: dict) -> bool:
         return False
     if "answers" in state and not isinstance(state["answers"], list):
         return False
+    for key in ("savedCardId", "unpublishedCardId"):
+        if key in state and not (isinstance(state[key], str) and _ID.match(state[key])):
+            return False
     return True
 
 
@@ -324,6 +327,10 @@ def _public(state: dict) -> dict:
     else:
         view["pendingAsk"] = None
         view["card"] = None
+    # Card rows in the transcript are append-only; clients derive their state
+    # (offered / saved / superseded) from the pending question and this id.
+    if isinstance(state.get("savedCardId"), str):
+        view["savedCardId"] = state["savedCardId"]
     return view
 
 
@@ -505,6 +512,54 @@ def settle_introduction(run_id: str, manager: SessionManager | None = None) -> d
         return _public(state)
 
 
+CARD_ROW_KIND = "agent_setup_card"
+
+
+def card_row_text(state: dict, card: dict) -> str:
+    """Readable text for clients that do not render the card (older apps)."""
+    rows = [f"- {_text(state, key)}: {card[key]}" for key in ("role", "focus", "style", "notes") if card.get(key)]
+    return "\n".join([f"**{_text(state, 'heading')}**", *rows])
+
+
+def publish_card(manager: SessionManager) -> bool:
+    """Append the proposed working-style card to the home transcript, once.
+
+    Runs after the proposing turn's canonical save, inside its turn lock, with
+    the agent's own manager, so the row lands after the agent's words and the
+    turn's compare-and-swap revision stays current. The row is display-only
+    (excluded from the model's history; the model has its own tool call) and
+    append-only: its offered/saved/superseded state is derived by clients.
+    """
+    try:
+        home, info = _identity()
+    except AgentHomeError:
+        return False
+    with _lock(home):
+        state = _read_state(home, info)
+        if state is None:
+            return False
+        card_id = state.get("unpublishedCardId")
+        card = state.get("card") or {}
+        if not card_id or card.get("id") != card_id:
+            if card_id:
+                state.pop("unpublishedCardId", None)
+                _write_state(home, state)
+            return False
+        row_id = f"agent-setup-card:{card_id}"
+        payload = {key: card[key] for key in ("id", "role", "focus", "style", "notes") if card.get(key)}
+        text = card_row_text(state, card)
+
+        def append(session: Session) -> None:
+            if any(message.get("id") == row_id for message in session.messages):
+                return
+            session.add_message("assistant", text, id=row_id, kind=CARD_ROW_KIND, setupCard=payload)
+
+        manager.mutate(HOME_SESSION, append)
+        state.pop("unpublishedCardId", None)
+        _write_state(home, state)
+        return True
+
+
 def is_introduction_turn(session_key: str, metadata: dict) -> bool:
     return bool(metadata.get(AGENT_INTRODUCTION)) and is_agent_home(session_key)
 
@@ -580,6 +635,7 @@ def begin_turn(session_key: str, metadata: dict) -> str | None:
                             save_error = str(exc)
                         else:
                             state["setup"] = "complete"
+                            state["savedCardId"] = (state.get("card") or {}).get("id") or ask["id"]
                             just_saved = True
                     elif ask["kind"] == "ask":
                         answers = list(state.get("answers") or [])
@@ -718,10 +774,14 @@ def propose_card(session_key: str, card: dict) -> dict:
             raise AgentHomeError("INVALID_STATE", "Ask where to start first.")
         if state.get("cardCount", 0) >= MAX_CARD_PROPOSALS:
             raise AgentHomeError("SETUP_CARD_LIMIT", "Continue normally; the owner can edit SOUL.md in settings.")
-        state["card"] = {key: value for key, value in clean.items() if value}
+        card_id = f"card-{uuid.uuid4().hex[:12]}"
+        state["card"] = {"id": card_id, **{key: value for key, value in clean.items() if value}}
         state["cardCount"] = state.get("cardCount", 0) + 1
+        # Published to the transcript when this turn ends (publish_card), by
+        # the agent's own session manager inside its turn lock.
+        state["unpublishedCardId"] = card_id
         state["pendingAsk"] = {
-            "id": f"card-{uuid.uuid4().hex[:12]}",
+            "id": card_id,
             "kind": "card",
             "question": _text(state, "card_question"),
             "options": [

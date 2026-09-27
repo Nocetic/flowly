@@ -2912,6 +2912,8 @@ class GatewayServer:
                 msg["kind"] = m["kind"]
             if m.get("kind") == "voice" and isinstance(m.get("voice"), dict):
                 msg["voice"] = m["voice"]
+            if m.get("kind") == "agent_setup_card" and isinstance(m.get("setupCard"), dict):
+                msg["setupCard"] = m["setupCard"]
             if m.get("boundaryKind"):
                 msg["boundaryKind"] = m["boundaryKind"]
             if m.get("compactionId"):

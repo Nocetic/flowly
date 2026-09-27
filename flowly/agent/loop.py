@@ -7809,6 +7809,14 @@ class AgentLoop:
                                 settle_introduction(run_id, self.sessions)
                             except Exception:  # noqa: BLE001
                                 logger.exception("[agent-home] could not settle introduction {}", run_id)
+                        from flowly.agent_home import is_agent_home as _is_home, publish_card
+                        if _is_home(msg.session_key):
+                            # A working style proposed in this turn becomes a
+                            # transcript row after the agent's words.
+                            try:
+                                publish_card(self.sessions)
+                            except Exception:  # noqa: BLE001
+                                logger.exception("[agent-home] could not publish the setup card")
             finally:
                 if binding is not None:
                     binding.close()
