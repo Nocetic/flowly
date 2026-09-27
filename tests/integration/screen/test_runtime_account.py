@@ -547,3 +547,8 @@ def test_stop_and_crashed_supervisor_leave_no_account_process(layout):
     runtime.stop(state["generation"])
     assert not any(is_alive(identity) for identity in state["children"])
     assert _owned_live(application.account.uid) == []
+    restarted = runtime.start()  # The crashed generation is finished, not stuck.
+    try:
+        assert restarted["generation"] != state["generation"]
+    finally:
+        runtime.stop(restarted["generation"])

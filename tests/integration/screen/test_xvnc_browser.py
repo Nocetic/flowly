@@ -969,3 +969,28 @@ def test_detached_supervisor_holds_environment_activity_until_stop(tmp_path):
         with pytest.raises(ScreenError, match="INSTALL_BUSY"):
             screen["runtime"].start()
     assert screen["runtime"].status()["phase"] == "stopped"
+
+
+def test_crashed_supervisor_is_recovered_by_stop_and_the_screen_starts_again(tmp_path):
+    import signal
+    import time
+
+    runtime = ScreenRuntime(tmp_path / "crash")
+    state = runtime.start()
+    os.kill(state["supervisor"]["pid"], signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while is_alive(state["supervisor"]) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not is_alive(state["supervisor"])
+    assert any(is_alive(child) for child in state["children"]), "applications outlive the crash"
+    assert runtime.status()["phase"] == "failed"
+    # Without a dedicated account (unprivileged host) the exact recorded,
+    # identity-checked children are terminated; the generation is finished.
+    runtime.stop(state["generation"])
+    assert not any(is_alive(child) for child in state["children"])
+    assert runtime.status()["phase"] == "stopped"
+    restarted = runtime.start()
+    try:
+        assert restarted["phase"] == "running" and restarted["generation"] != state["generation"]
+    finally:
+        runtime.stop(restarted["generation"])

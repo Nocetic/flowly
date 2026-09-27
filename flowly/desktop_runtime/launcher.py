@@ -349,6 +349,20 @@ class ScreenRuntime:
         # reservation intact so a later request adopts it or reports recovery.
         raise ScreenError("RUNTIME_START_TIMEOUT")
 
+    @staticmethod
+    def _terminate_recorded(children: list) -> None:
+        """TERM, then KILL, only the exact recorded processes (pidfd + identity)."""
+        for signum, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
+            for child in children:
+                if is_alive(child):
+                    try:
+                        signal_process(child, signum)
+                    except ScreenError:
+                        pass  # Exited or replaced between the checks.
+            deadline = time.monotonic() + grace
+            while any(is_alive(child) for child in children) and time.monotonic() < deadline:
+                time.sleep(0.05)
+
     def _reap_account_processes(self) -> bool:
         """Kill every process of this layout's dedicated account (root hosts).
 
@@ -380,12 +394,19 @@ class ScreenRuntime:
                 self.authority.stop(generation)
             if not is_alive(state.get("supervisor")):
                 if any(is_alive(child) for child in state["children"]):
-                    # A crashed supervisor left applications behind. Only a
-                    # dedicated-account layout identifies every one of them.
+                    # A crashed supervisor left applications behind. A
+                    # dedicated-account layout identifies every one of them;
+                    # otherwise only the recorded, identity-checked children.
                     if not self._reap_account_processes():
-                        raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+                        self._terminate_recorded(state["children"])
                     if any(is_alive(child) for child in state["children"]):
                         raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+                if state["phase"] != "stopped":
+                    # The supervisor died without recording its stop. Nothing
+                    # of this generation runs now, so finish it; otherwise the
+                    # stale "running" record would refuse every later start.
+                    write_state(self.manifest, {**state, "phase": "stopped", "supervisor": None,
+                                                "children": [], "error": None})
                 return
             signal_process(state["supervisor"], signal.SIGTERM)
             deadline = time.monotonic() + self.STOP_TIMEOUT
