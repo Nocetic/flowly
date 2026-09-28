@@ -60,7 +60,7 @@ dependencies = [
     # use this runtime. Excluded on Intel macOS: onnxruntime stopped shipping
     # x86_64 wheels there, and the runtime is optional by design
     # (semantic_runtime_available() gates every use).
-    "fastembed==0.8.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "fastembed==0.8.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 
 [project.optional-dependencies]
