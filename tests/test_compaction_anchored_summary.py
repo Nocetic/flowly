@@ -13,6 +13,7 @@ from flowly.compaction.service import CompactionService
 from flowly.compaction.summarizer import (
     PREVIOUS_RECORD_FENCE,
     SUMMARIZE_SYSTEM_PROMPT,
+    SUMMARIZE_UPDATE_PROMPT,
     TRANSCRIPT_FENCE,
     extract_detail_anchors,
     generate_summary,
@@ -103,6 +104,13 @@ def test_the_record_stays_compact_without_losing_facts():
     assert "Never list each occurrence" in SUMMARIZE_SYSTEM_PROMPT
     assert "State each fact once" in SUMMARIZE_SYSTEM_PROMPT
     assert "Shorten wording, never the facts above." in SUMMARIZE_SYSTEM_PROMPT
+
+
+def test_people_keep_their_relationship_to_the_owner():
+    # Summaries kept "Elif's birthday is 14 Kasım" but never that Elif is the
+    # owner's daughter, so "what is my daughter's name?" went unanswered.
+    assert "Name every person with who they are to the owner" in SUMMARIZE_SYSTEM_PROMPT
+    assert "with who they are to the owner" in SUMMARIZE_UPDATE_PROMPT
 
 
 def test_the_system_prompt_no_longer_trades_old_facts_for_recent_context():
