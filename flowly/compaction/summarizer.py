@@ -1050,16 +1050,28 @@ def _anchor_key(kind: str, match: re.Match[str]) -> str:
     return f"{kind}:" + _fold(re.sub(r"\s+", " ", raw))
 
 
+_EXACT_IDENTIFIERS_SECTION = re.compile(r"(?ms)^## Exact Identifiers\s*\n(.*?)(?=^##\s|\Z)")
+
+
 def extract_detail_anchors(summary: str) -> dict[str, str]:
     """Specific details in a summary, keyed by a normalised form.
 
     The historical-request section is left out: it is regenerated from the
     newest user turn on every compaction, so its details are meant to change.
+
+    Identifiers (paths, env vars, commit ids) come from the summary's Exact
+    Identifiers section when it has one: that is where the model keeps the
+    ones that matter. Taken from the whole body, every file a coding session
+    merely read became a detail to restore: one run's repair pass flagged 200
+    of them, put them back, and doubled summary size and compaction time.
     """
     body = _HISTORICAL_REQUEST_SECTION.sub("", summary or "")
+    section = _EXACT_IDENTIFIERS_SECTION.search(body)
+    identifiers = section.group(1) if section else body
     anchors: dict[str, str] = {}
     for kind, pattern in _ANCHOR_PATTERNS:
-        for match in pattern.finditer(body):
+        source = identifiers if kind in _VERBATIM_KINDS else body
+        for match in pattern.finditer(source):
             key = _anchor_key(kind, match)
             if key and key not in anchors:
                 anchors[key] = match.group(0).rstrip(".,;:!?")

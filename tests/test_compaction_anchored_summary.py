@@ -268,3 +268,19 @@ async def test_an_altered_identifier_is_repaired():
     assert "feature/iade-akisi" in result.summary
     assert result.details_missing_after_repair == []
 
+
+def test_identifiers_to_keep_are_the_ones_the_summary_lists_as_exact():
+    # A coding summary names every file it read under tool results; the next
+    # one rightly drops them. Only the Exact Identifiers section is binding.
+    previous = """## Tool Results & Actions Taken
+- Read src/kargo/log_4.py, src/kargo/lint_7.py and src/kargo/ci_10.py.
+## Exact Identifiers
+- feature/iade-akisi, src/kargo/iade.py, 3f9c2a71, IADE_LIMIT_GUN"""
+    updated = """## Tool Results & Actions Taken
+- Routine reads of lint and CI helpers.
+## Exact Identifiers
+- feature/iade-akisi, src/kargo/iade.py, 3f9c2a71, IADE_LIMIT_GUN"""
+    assert missing_detail_anchors(previous, updated) == []
+    assert missing_detail_anchors(previous, updated.replace("feature/iade-akisi", "feature/iade-akışı")) == [
+        "feature/iade-akisi"]
+
