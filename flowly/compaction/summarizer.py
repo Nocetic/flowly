@@ -274,7 +274,8 @@ Stay compact as the conversation grows:
   weekly plan; still waiting for the task list"). Never list each occurrence,
   day number or date it came up.
 - State each fact once, in the section it belongs to.
-- Reduce finished work to one line.
+- Reduce finished work to one line, keeping what it changed and where: file
+  paths, commit ids, test counts, exact error messages and results stay.
 - Name every person with who they are to the owner ("the owner's daughter
   Elif", "the owner's accountant Mert"). A name without the relationship
   cannot answer "what is my daughter's name?".

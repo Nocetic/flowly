@@ -106,6 +106,15 @@ def test_the_record_stays_compact_without_losing_facts():
     assert "Shorten wording, never the facts above." in SUMMARIZE_SYSTEM_PROMPT
 
 
+def test_compacting_finished_work_keeps_its_identifiers():
+    # "Reduce finished work to one line" alone contradicts the Completed
+    # Actions rule for a coding session: the paths, commits and errors are
+    # what the next turn needs.
+    rule = "Reduce finished work to one line, keeping what it changed and where"
+    assert rule in SUMMARIZE_SYSTEM_PROMPT
+    assert "commit ids, test counts, exact error messages and results stay" in SUMMARIZE_SYSTEM_PROMPT
+
+
 def test_people_keep_their_relationship_to_the_owner():
     # Summaries kept "Elif's birthday is 14 Kasım" but never that Elif is the
     # owner's daughter, so "what is my daughter's name?" went unanswered.
