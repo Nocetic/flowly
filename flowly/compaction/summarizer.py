@@ -22,7 +22,7 @@ from flowly.compaction.types import (
     SAFETY_MARGIN,
     CompactionError,
 )
-from flowly.providers.base import LLMProvider
+from flowly.providers.base import LLMProvider, LLMResponse
 
 # Providers do not raise on API failures — they return an ordinary
 # LLMResponse carrying the error text (see e.g. OpenRouterProvider's
@@ -454,6 +454,15 @@ def reject_invented_user_attribution(
 # trim, session untouched, turn proceeds.
 SUMMARY_CALL_TIMEOUT_SECONDS = 120.0
 
+# A streamed summary is bounded by progress, not by a fixed total. Updating a
+# running record means writing it out in full every time; a long run's calls
+# crossed the fixed 120 s bound 23 times while still producing output, and
+# each failure left the history over budget until the next attempt. A stream
+# may run as long as it keeps producing (silence while a reasoning model
+# thinks is tolerated up to the idle bound), within an overall cap.
+SUMMARY_STREAM_IDLE_SECONDS = 90.0
+SUMMARY_STREAM_TOTAL_SECONDS = 300.0
+
 # How often the in-flight call re-checks the deadline and the cancel flag.
 _CALL_POLL_SECONDS = 0.5
 
@@ -464,7 +473,121 @@ _CALL_POLL_SECONDS = 0.5
 _CANCEL_GRACE_SECONDS = 2.0
 
 
+def _streams(provider: Any) -> bool:
+    """Whether ``provider`` really streams (the base class only replays chat())."""
+    method = getattr(type(provider), "chat_stream", None)
+    return method is not None and method is not LLMProvider.chat_stream
+
+
+class _StreamUnavailable(Exception):
+    """The stream failed before producing anything; try the plain call."""
+
+
+async def _chat_streamed(
+    provider: LLMProvider,
+    *,
+    messages: list[dict[str, Any]],
+    model: str,
+    max_tokens: int,
+    should_cancel: Callable[[], bool] | None = None,
+) -> LLMResponse:
+    """One summarisation call over a stream, bounded by progress.
+
+    Fails when nothing arrives for SUMMARY_STREAM_IDLE_SECONDS or the whole
+    call passes SUMMARY_STREAM_TOTAL_SECONDS. The parts are joined into one
+    response whose finish_reason is the stream's last, so the truncation and
+    error checks of ``validated_summary_text`` apply unchanged.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async for part in provider.chat_stream(
+                messages=messages, model=model, max_tokens=max_tokens,
+            ):
+                await queue.put(("part", part))
+            await queue.put(("end", None))
+        except Exception as exc:  # noqa: BLE001 — surfaced to the reader
+            await queue.put(("error", exc))
+
+    task = asyncio.ensure_future(pump())
+    loop = asyncio.get_running_loop()
+    started = last_progress = loop.time()
+    text: list[str] = []
+    finish_reason = ""
+    usage: dict[str, int] = {}
+    received = False
+    try:
+        while True:
+            if should_cancel is not None and should_cancel():
+                raise CompactionError("summarization cancelled")
+            now = loop.time()
+            if now - started >= SUMMARY_STREAM_TOTAL_SECONDS:
+                raise CompactionError(
+                    "summarization call timed out after "
+                    f"{SUMMARY_STREAM_TOTAL_SECONDS:.0f}s"
+                )
+            if now - last_progress >= SUMMARY_STREAM_IDLE_SECONDS:
+                raise CompactionError(
+                    "summarization stream made no progress for "
+                    f"{SUMMARY_STREAM_IDLE_SECONDS:.0f}s"
+                )
+            try:
+                kind, payload = await asyncio.wait_for(queue.get(), timeout=_CALL_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+            last_progress = loop.time()
+            if kind == "end":
+                break
+            if kind == "error":
+                if not received:
+                    raise _StreamUnavailable() from payload
+                raise payload
+            received = True
+            if payload.content:
+                text.append(payload.content)
+            if payload.finish_reason:
+                finish_reason = payload.finish_reason
+            if payload.usage:
+                usage = payload.usage
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+            except asyncio.CancelledError:
+                pass
+    return LLMResponse(content="".join(text), finish_reason=finish_reason or "stop", usage=usage)
+
+
 async def _chat_bounded(
+    provider: LLMProvider,
+    *,
+    messages: list[dict[str, Any]],
+    model: str,
+    max_tokens: int,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Any:
+    """One summarisation call: streamed and bounded by progress when the
+    provider streams, otherwise one request bounded by a fixed timeout."""
+    if _streams(provider):
+        try:
+            return await _chat_streamed(
+                provider, messages=messages, model=model,
+                max_tokens=max_tokens, should_cancel=should_cancel,
+            )
+        except _StreamUnavailable as exc:
+            logger.warning(
+                f"Summary stream failed before any output ({exc.__cause__}); "
+                "retrying as one request"
+            )
+    return await _chat_single(
+        provider, messages=messages, model=model,
+        max_tokens=max_tokens, should_cancel=should_cancel,
+    )
+
+
+async def _chat_single(
     provider: LLMProvider,
     *,
     messages: list[dict[str, Any]],
