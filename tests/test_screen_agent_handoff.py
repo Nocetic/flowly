@@ -119,3 +119,42 @@ async def test_another_chat_cannot_release_the_original_run_on_failed_admission(
     assert not task.done()
     loop.mark_aborted("origin-run")
     await asyncio.wait_for(task, 5)
+
+
+async def test_a_screen_run_is_told_to_hand_logins_and_codes_to_the_person(live_run):
+    from flowly.agent.loop import SCREEN_HANDOFF_GUIDANCE
+
+    _, _, _, _, model, _, _, _, _ = live_run
+    first = model.calls[0]["messages"]
+    assert any(message.get("content") == SCREEN_HANDOFF_GUIDANCE for message in first)
+    for word in ("two-factor", "take control on the Screen", "do not ask them to paste passwords"):
+        assert word in SCREEN_HANDOFF_GUIDANCE
+
+
+async def test_a_run_without_the_screen_gets_no_screen_guidance(tmp_path, monkeypatch):
+    from flowly.agent.loop import SCREEN_HANDOFF_GUIDANCE
+
+    monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "agent-home"))
+
+    class Plain(LLMProvider):
+        def __init__(self):
+            super().__init__(api_key="test")
+            self.calls = []
+
+        def get_default_model(self):
+            return "test/model"
+
+        async def chat(self, *args, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            return LLMResponse(content="done", usage={"completion_tokens": 1})
+
+    model = Plain()
+    loop = AgentLoop(bus=MessageBus(), provider=model, workspace=tmp_path / "workspace", main_config=Config(),
+                     max_iterations=2, soft_warn_at_iteration=0)
+    try:
+        await loop._run_llm_tool_loop([{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}],
+                                      action_turn=False, session_key="plain", outbound_run_id="plain-run",
+                                      tools_allowed=False)
+    finally:
+        loop.stop()
+    assert SCREEN_HANDOFF_GUIDANCE not in str(model.calls[0]["messages"])

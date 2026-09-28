@@ -872,6 +872,18 @@ def _merge_turn_usage(
     )
 
 
+# A screen run acts in the browser on the user's own server screen, which the
+# user watches and can take over. Steps that need the person go through that
+# takeover, never through chat, and the runtime resumes this same task after.
+SCREEN_HANDOFF_GUIDANCE = (
+    "[Screen task] This task runs in the browser on the user's own server screen, which they can watch and "
+    "take over. When a step needs them (signing in with a password, a two-factor or verification code, a "
+    "CAPTCHA, or approving a payment), do not guess and do not ask them to paste passwords or codes into "
+    "chat. Say what is needed and ask them to take control on the Screen, complete it there and give "
+    "control back; this same task then continues from a fresh look at the page."
+)
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -5887,6 +5899,13 @@ class AgentLoop:
             if provider_state_out is not None:
                 provider_state_out.clear()
             return True
+
+        from flowly.desktop_runtime.context import SCREEN_RUN_BINDING
+
+        bound_screen = SCREEN_RUN_BINDING.get()
+        if bound_screen is not None and bound_screen.run_id == outbound_run_id:
+            # Ephemeral guidance for this screen run; never part of the durable journal.
+            messages.append({"role": "user", "content": SCREEN_HANDOFF_GUIDANCE})
 
         while iteration < max_turn_iterations or steering.has_pending(outbound_run_id):
             try:
