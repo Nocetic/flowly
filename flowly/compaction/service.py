@@ -23,6 +23,7 @@ from flowly.compaction.pruning import (
 from flowly.compaction.summarizer import (
     ground_historical_request,
     reject_invented_user_attribution,
+    repair_dropped_details,
     summarize_in_stages,
 )
 from flowly.compaction.types import (
@@ -1147,6 +1148,23 @@ class CompactionService:
             should_cancel=should_cancel,
         )
 
+        # An updated summary can still drop a specific detail of the one it
+        # replaces (a link, a code, a date). One repair pass puts back what the
+        # new record does not show as changed; the code never re-inserts
+        # details itself. Only the committed previous summary counts here.
+        missing_before: list[str] = []
+        missing_after: list[str] = []
+        if previous_summary and previous_summary.strip():
+            summary, missing_before, missing_after = await repair_dropped_details(
+                previous_summary,
+                summary,
+                self.provider,
+                self.model,
+                self.effective_reserve_tokens,
+                window,
+                should_cancel=should_cancel,
+            )
+
         # The model supplies the rich checkpoint, but the current-task anchor
         # comes directly from the newest real user turn in the compacted
         # region. This prevents a plausible-looking summary from reviving an
@@ -1194,6 +1212,8 @@ class CompactionService:
             dropped_messages=dropped_messages,
             dropped_tokens=dropped_tokens,
             kept_messages=kept_messages,
+            details_missing_before_repair=missing_before,
+            details_missing_after_repair=missing_after,
         )
 
     async def compact_if_needed(
