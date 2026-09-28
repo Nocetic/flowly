@@ -227,7 +227,11 @@ def run(directory: Path, generation: str) -> None:
                 spawn(["Xvnc", "-displayfd", str(write_fd), "-geometry", "1440x900", "-depth", "24",
                        "-auth", str(xauthority), "-nolisten", "tcp", "-rfbport", "-1",
                        "-rfbunixpath", str(rfb), "-rfbunixmode", "0600", "-SecurityTypes", "None",
-                       "-AlwaysShared", "-FrameRate", "30"], env, pass_fds=(write_fd,))
+                       "-AlwaysShared", "-FrameRate", "30",
+                       # What the person in control or the agent copies may be a
+                       # password: never push it to viewers. Paste keeps working
+                       # (typed), and client cut text matches the gate's bound.
+                       "-SendCutText=0", "-MaxCutText", "65536"], env, pass_fds=(write_fd,))
                 os.close(write_fd)
                 write_fd = -1
                 wait_for(lambda: select.select([read_fd], [], [], 0)[0])

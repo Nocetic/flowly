@@ -1207,3 +1207,39 @@ def test_input_service_maps_other_unicode_before_typing_it(tmp_path, login_site)
         page.wait_for_function("document.querySelector('#code').value.endsWith('#')", timeout=15_000)
         assert page.locator("#code").input_value() == text + "#"
         client.request("viewer.close", **identity, operationId="close")
+
+
+def test_screen_clipboard_never_reaches_viewers(tmp_path, login_site):
+    """What the person in control (or the agent) copies on the screen may be a
+    password; Xvnc must not push it to any viewer as ServerCutText."""
+    from playwright.sync_api import sync_playwright
+
+    with running_screen(tmp_path / "clipboard") as runtime, sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(runtime["endpoint"])
+        context = browser.contexts[0]
+        page = context.pages[0]
+        page.goto(login_site)
+        with human_viewer(runtime["socket"]) as (connection, gate):
+            # Plain RFB SetEncodings (raw only): a legacy client gets ServerCutText on every change.
+            connection.sendall(gate.feed(struct.pack("!BBHi", 2, 0, 1, 0), lambda: False))
+            point = page.locator("#code").evaluate("""element => {
+                const box = element.getBoundingClientRect();
+                return {x: Math.round(screenX + box.x + 10),
+                        y: Math.round(screenY + outerHeight - innerHeight + box.y + 10)};
+            }""")
+            for buttons in (0, 1, 0):
+                connection.sendall(gate.feed(struct.pack("!BBHH", 5, buttons, point["x"], point["y"]), lambda: True))
+            page.wait_for_function("document.hasFocus()")
+            page.evaluate("""() => { const input = document.querySelector('#code');
+                input.value = 'copied-secret-4711'; input.focus(); input.select(); document.execCommand('copy'); }""")
+            connection.settimeout(3)
+            received = bytearray()
+            try:
+                while len(received) < 1 << 20:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+            except socket.timeout:
+                pass
+            assert b"copied-secret-4711" not in received
