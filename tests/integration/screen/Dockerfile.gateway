@@ -2,6 +2,8 @@
 # base screen runner first, then build this file with the repository as context.
 FROM flowly-screen-test:bookworm
 USER root
+# Root hosts guard each profile browser's DevTools port with nftables.
+RUN apt-get update && apt-get install -y --no-install-recommends nftables && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/flowly
 COPY pyproject.toml uv.lock ./
 RUN pip install --no-cache-dir uv==0.9.11 \

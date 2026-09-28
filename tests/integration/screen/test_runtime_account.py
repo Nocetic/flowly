@@ -645,3 +645,36 @@ def test_root_input_service_maps_unicode_as_the_application_account(layout):
             client.request("viewer.close", **identity, operationId="close")
     finally:
         runtime.stop(generation)
+
+
+def test_another_profile_account_cannot_reach_a_profile_browser_or_screen(layout):
+    """Per-profile accounts only isolate if no loopback door stays open: another
+    profile's applications (its Terminal, its agent) must not drive this
+    profile's browser through DevTools or its desktop through RFB/X11."""
+    from flowly.desktop_runtime.launcher import ScreenRuntime
+
+    directory, _ = layout
+    other_directory = Path("/root/screen-isolation/devtools-other")
+    other_directory.mkdir(parents=True, mode=0o700)
+    other_directory.chmod(0o700)
+    other = root_application_layout(other_directory, create=True)
+    runtime = ScreenRuntime(directory)
+    state = runtime.start()
+    try:
+        probe = ("import sys,urllib.request\n"
+                 "try:\n"
+                 "    print(urllib.request.urlopen(sys.argv[1], timeout=3).read()[:200])\n"
+                 "except Exception as error:\n"
+                 "    print('refused', type(error).__name__)\n")
+        reached = _as_account(other, probe, f"http://127.0.0.1:{state['cdpPort']}/json/version")
+        assert reached.returncode == 0, reached.stderr
+        assert reached.stdout.startswith("refused"), "another profile account reached this browser's DevTools"
+        rfb = ("import socket,sys\n"
+               "s=socket.socket(socket.AF_UNIX)\n"
+               "try:\n"
+               "    s.connect(sys.argv[1]); print('connected')\n"
+               "except OSError as error:\n"
+               "    print('refused', error.errno)\n")
+        assert "connected" not in _as_account(other, rfb, state["socket"]).stdout
+    finally:
+        runtime.stop(state["generation"])

@@ -164,6 +164,9 @@ class ScreenRuntime:
                 return dict(supported=False, reason=exc.code, missing=[])
             if shutil.which("dbus-daemon", path="/usr/bin:/bin") is None:
                 return dict(supported=False, reason="DEPENDENCIES_MISSING", missing=["dbus-daemon"])
+            # Guards each profile browser's DevTools port (devtools_guard).
+            if shutil.which("nft", path="/usr/sbin:/sbin") is None:
+                return dict(supported=False, reason="DEPENDENCIES_MISSING", missing=["nft"])
         return dict(supported=True, reason=None, missing=[])
 
     @staticmethod
@@ -343,7 +346,9 @@ class ScreenRuntime:
             if state["phase"] == "running":
                 return state
             if state["phase"] == "failed" or (process is not None and process.poll() is not None):
-                raise ScreenError("RUNTIME_START_FAILED")
+                # The one start failure the person can act on is named.
+                raise ScreenError("SCREEN_ISOLATION_UNAVAILABLE" if state.get("error") == "SCREEN_ISOLATION_UNAVAILABLE"
+                                  else "RUNTIME_START_FAILED")
             time.sleep(0.05)
         # A timeout is not permission to launch another worker. Leave the
         # reservation intact so a later request adopts it or reports recovery.

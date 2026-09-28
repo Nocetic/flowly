@@ -10,7 +10,7 @@ PACKAGES = (
     "tigervnc-standalone-server", "xauth", "dbus-x11",
     "chromium", "chromium-sandbox", "xdotool", "x11-utils", "fonts-dejavu-core",
     "xfwm4", "xfdesktop4", "xfce4-panel", "xfce4-settings", "xfce4-terminal", "xfconf",
-    "adwaita-icon-theme", "thunar", "python3", "bash",
+    "adwaita-icon-theme", "thunar", "python3", "bash", "nftables",
 )
 
 # Keep this executable standalone: the elevated interpreter must not import
@@ -32,7 +32,7 @@ from pathlib import Path
 PACKAGES = ("tigervnc-standalone-server", "xauth", "dbus-x11",
             "chromium", "chromium-sandbox", "xdotool", "x11-utils", "fonts-dejavu-core",
             "xfwm4", "xfdesktop4", "xfce4-panel", "xfce4-settings", "xfce4-terminal", "xfconf",
-            "adwaita-icon-theme", "thunar", "python3", "bash")
+            "adwaita-icon-theme", "thunar", "python3", "bash", "nftables")
 ROOT = Path("/var/lib/flowly-screen-installer")
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LANG": "C.UTF-8",
        "LC_ALL": "C.UTF-8", "DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "l"}

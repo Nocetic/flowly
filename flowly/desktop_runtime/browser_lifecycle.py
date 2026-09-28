@@ -17,9 +17,13 @@ from pathlib import Path
 
 if os.geteuid() == 0:
     raise SystemExit("browser manager requires the application account")
-browser, profile = sys.argv[1:]
+browser, profile, *fixed = sys.argv[1:]
 if not Path(browser).is_absolute() or not Path(profile).is_absolute():
     raise ValueError("application paths must be absolute")
+# A root host's supervisor picks the DevTools port and guards it before launch.
+debugging_port = int(fixed[0]) if fixed else 0
+if len(fixed) > 1 or not 0 <= debugging_port < 65536:
+    raise ValueError("invalid DevTools port")
 runtime = Path(os.environ["XDG_RUNTIME_DIR"])
 info = runtime.lstat()
 if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
@@ -59,7 +63,7 @@ try:
                 # exits; no client-provided PID is ever signalled.
                 child = subprocess.Popen([
                     browser, "--user-data-dir=" + profile,
-                    "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
+                    "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=" + str(debugging_port),
                     "--no-first-run", "--no-default-browser-check",
                     # Bounded HTTP cache; cookies and logins are not cache.
                     "--disk-cache-size=268435456",

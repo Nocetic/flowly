@@ -24,6 +24,7 @@ from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.browser_lifecycle import BROWSER_MANAGER_SOURCE
 from flowly.desktop_runtime.desktop_defaults import DESKTOP_DEFAULTS_SOURCE
 from flowly.desktop_runtime.desktop_keymap import KEYMAP_SOURCE, RemoteKeymap
+from flowly.desktop_runtime.devtools_guard import free_port, guard, listener_uid, unguard
 from flowly.desktop_runtime.input_service import InputService
 from flowly.desktop_runtime.installation_gate import environment_activity
 from flowly.desktop_runtime.launcher import (
@@ -133,6 +134,8 @@ def run(directory: Path, generation: str) -> None:
         observers = None
         stopping = False
         application = None
+        guarded = None
+        devtools_port = None
 
         def request_stop(*_):
             nonlocal stopping
@@ -272,11 +275,23 @@ def run(directory: Path, generation: str) -> None:
             port_file = browser_profile / "DevToolsActivePort"
             port_file.unlink(missing_ok=True)
             (application_sockets / "browser-open.sock").unlink(missing_ok=True)
-            spawn(["python3", "-I", "-c", BROWSER_MANAGER_SOURCE, browser_command, str(browser_profile)], env)
+            fixed_port = []
+            if application:
+                # Only root (the agent's gateway) may reach this profile's
+                # DevTools: another profile's account must not drive its browser.
+                devtools_port = free_port()
+                guard(application.directory.name, devtools_port)
+                guarded = application.directory.name
+                fixed_port = [str(devtools_port)]
+            spawn(["python3", "-I", "-c", BROWSER_MANAGER_SOURCE, browser_command, str(browser_profile),
+                   *fixed_port], env)
 
             def browser_port():
                 if application:
-                    return application.read_browser_port()
+                    # Chromium records DevToolsActivePort only for an ephemeral
+                    # port. The fixed port is ready once this profile's own
+                    # account listens on it, never a process that took it.
+                    return devtools_port if listener_uid(devtools_port) == application.account.uid else None
                 return read_browser_port(browser_profile, os.geteuid())
 
             port = wait_for(lambda: browser_port() if rfb.exists() else None)
@@ -302,10 +317,11 @@ def run(directory: Path, generation: str) -> None:
                     write_state(runtime.manifest, state)
                 time.sleep(0.2)
             state.update(phase="stopped", error=None)
-        except BaseException:
+        except BaseException as exc:
             # Never persist browser stderr, keys, URLs or arbitrary exception
             # text. Health failure does not release durable human authority.
-            state.update(phase="failed", error="RUNTIME_FAILED")
+            isolation = isinstance(exc, ScreenError) and exc.code == "SCREEN_ISOLATION_UNAVAILABLE"
+            state.update(phase="failed", error="SCREEN_ISOLATION_UNAVAILABLE" if isolation else "RUNTIME_FAILED")
         finally:
             if observers is not None:
                 try:
@@ -345,6 +361,9 @@ def run(directory: Path, generation: str) -> None:
                     except ProcessLookupError:
                         pass
                     child.wait(timeout=2)
+            if guarded is not None:
+                # The browser is gone; a later start replaces the rule anyway.
+                unguard(guarded)
             write_state(runtime.manifest, state)
 
 

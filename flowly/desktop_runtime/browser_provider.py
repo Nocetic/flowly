@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import secrets
 from typing import Any
 from urllib.parse import urlsplit
@@ -97,6 +98,8 @@ class HostBrowserProvider:
         state = await asyncio.to_thread(self.runtime.status)
         if not state or state["phase"] != "running" or state["generation"] != generation or not state.get("cdpPort"):
             raise ScreenError("BROWSER_UNAVAILABLE")
+        if not await asyncio.to_thread(self._profile_browser_listens, state["cdpPort"]):
+            raise ScreenError("BROWSER_UNAVAILABLE")
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
@@ -110,6 +113,17 @@ class HostBrowserProvider:
         except Exception:
             await self.disconnect()
             raise ScreenError("BROWSER_UNAVAILABLE") from None
+
+    def _profile_browser_listens(self, port: int) -> bool:
+        """On a root host, attach only to the profile account's own listener:
+        a process that took the port while the browser was closed must not
+        pose as the browser to the agent."""
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            return True
+        from flowly.desktop_runtime.application_layout import root_application_layout
+        from flowly.desktop_runtime.devtools_guard import listener_uid
+
+        return listener_uid(port) == root_application_layout(self.runtime.directory).account.uid
 
     def _sync_pages(self) -> dict[int, Any]:
         pages = self._browser.contexts[0].pages
