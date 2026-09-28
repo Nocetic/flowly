@@ -15,7 +15,7 @@ METHODS = frozenset({
     'voice.chats.open', 'voice.tasks.dispatch', 'voice.tasks.events', 'voice.notice', 'voice.work.list', 'voice.language',
     'voice.tasks.get', 'voice.tasks.prepare', 'voice.tasks.steer', 'voice.tasks.cancel',
     'voice.tasks.requests', 'voice.tasks.respond', 'voice.focus', 'voice.exec', 'voice.attachments',
-    'voice.tools.record',
+    'voice.tools.record', 'voice.attachments.read',
 })
 
 
@@ -57,6 +57,10 @@ class LiveVoiceService:
             from flowly.live_voice.attachments import store_attachments
 
             return store_attachments(self.sessions, params)
+        if method == 'voice.attachments.read':
+            from flowly.live_voice.attachments import read_attachment
+
+            return read_attachment(self.sessions, params)
         if method == 'voice.tools.record':
             from flowly.live_voice.tool_records import record_tool
 

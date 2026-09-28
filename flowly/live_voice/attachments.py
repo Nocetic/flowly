@@ -13,7 +13,7 @@ import binascii
 import re
 from pathlib import Path
 
-from flowly.live_voice.sessions import VoiceError, bounded_text, identity, session_key
+from flowly.live_voice.sessions import VoiceError, bounded_text, identity, integer, session_key
 
 MAX_FILES = 10
 MAX_TOTAL_BYTES = 25 * 1024 * 1024
@@ -80,3 +80,44 @@ async def store_attachments(sessions, params: dict) -> dict:
              for item, path in zip(items, paths)]
     record, created = sessions.record_attachments(conversation_id, command_id, files)
     return {"record": record, **({} if created else {"replayed": True})}
+
+
+MAX_READ_WINDOW = 1024 * 1024
+
+
+def _read_window(conversation_id: str, path: Path, offset: int, length: int):
+    from flowly.live_voice.events import EventAccess, event_access_scope
+    from flowly.media.serving import read_media_window
+    from flowly.profile import get_flowly_home
+    from flowly.session.control_access import SessionControlScope
+
+    media_dir = (get_flowly_home() / "media").resolve()
+    if path.parent.resolve() != media_dir:
+        return None
+    # The same owner scope the file was published under; private media stays private.
+    scope = SessionControlScope.capture(session_key(conversation_id))
+    with event_access_scope(EventAccess(scopes=(scope,))):
+        return read_media_window(path.name, offset, length, media_dir)
+
+
+async def read_attachment(sessions, params: dict) -> dict:
+    """Read back one window of a file sent into this voice conversation.
+
+    Only files recorded on the conversation are readable, by the conversation's
+    owner, from this agent's media directory, so clients can show what was
+    sent after a reload without any copy on Flowly servers.
+    """
+    conversation = sessions.get(params.get("conversationId"))
+    conversation_id = conversation["conversationId"]
+    command_id = identity(params.get("commandId"), "commandId")
+    index = integer(params.get("index"), "index", maximum=MAX_FILES - 1)
+    offset = integer(params.get("offset", 0), "offset", maximum=MAX_TOTAL_BYTES)
+    length = integer(params.get("length", MAX_READ_WINDOW), "length", minimum=1, maximum=MAX_READ_WINDOW)
+    record = sessions.attachment_record(conversation_id, command_id)
+    if record is None or index >= len(record["files"]):
+        raise VoiceError("NOT_FOUND", "This file is not part of the voice conversation.")
+    window = await asyncio.to_thread(_read_window, conversation_id, Path(record["files"][index]["path"]), offset, length)
+    if window is None or not window.ok:
+        raise VoiceError("NOT_FOUND", "This file is no longer available on the agent.")
+    return {"mimeType": window.mime_type, "size": window.size, "offset": offset, "eof": window.eof,
+            "data": base64.b64encode(window.data).decode("ascii")}

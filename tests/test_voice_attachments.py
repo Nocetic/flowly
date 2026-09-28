@@ -119,3 +119,50 @@ def test_deleting_the_conversation_removes_attachment_records(home):
     sessions.end({'conversationId': CONVERSATION, 'connectionId': 'connection-1'})
     assert sessions.delete({'conversationId': CONVERSATION, 'ifEmpty': True})['deleted'] is False
     assert sessions.delete({'conversationId': CONVERSATION})['deleted'] is True
+
+
+PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('owner', [None, RequestOwner('user-a')])
+async def test_the_owner_reads_back_a_sent_image_in_windows(home, owner):
+    sessions = open_voice(home, owner)
+    service = LiveVoiceService(sessions, lambda: (None, None))
+
+    async def call(method, params):
+        if owner is None:
+            return await service.call(method, params)
+        with request_owner_scope(owner):
+            return await service.call(method, params)
+
+    await call('voice.attachments', request(attachments=[{'fileName': 'a.png', 'mimeType': 'image/png', 'content': encoded(PNG)}]))
+    first = await call('voice.attachments.read', {'conversationId': CONVERSATION, 'commandId': 'command-1', 'index': 0, 'length': 10})
+    assert first['mimeType'] == 'image/png' and first['size'] == len(PNG) and first['eof'] is False
+    rest = await call('voice.attachments.read', {'conversationId': CONVERSATION, 'commandId': 'command-1', 'index': 0, 'offset': 10})
+    assert base64.b64decode(first['data']) + base64.b64decode(rest['data']) == PNG and rest['eof'] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('params', [
+    {'commandId': 'unknown', 'index': 0}, {'commandId': 'command-1', 'index': 1},
+    {'commandId': 'command-1', 'index': 0, 'length': 2 * 1024 * 1024}, {'commandId': '../etc', 'index': 0},
+])
+async def test_only_recorded_files_are_readable_within_bounds(home, params):
+    sessions = open_voice(home)
+    service = LiveVoiceService(sessions, lambda: (None, None))
+    await service.call('voice.attachments', request())
+    with pytest.raises(VoiceError):
+        await service.call('voice.attachments.read', {'conversationId': CONVERSATION, **params})
+
+
+@pytest.mark.asyncio
+async def test_another_account_cannot_read_the_files(home):
+    owner = RequestOwner('user-a')
+    sessions = open_voice(home, owner)
+    with request_owner_scope(owner):
+        await LiveVoiceService(sessions, lambda: (None, None)).call('voice.attachments', request())
+    other = VoiceSessions(SessionManager(home / 'workspace')).for_owner(RequestOwner('user-b'))
+    with pytest.raises((VoiceError, SessionAccessError)), request_owner_scope(RequestOwner('user-b')):
+        await LiveVoiceService(other, lambda: (None, None)).call('voice.attachments.read',
+                                                                 {'conversationId': CONVERSATION, 'commandId': 'command-1', 'index': 0})
