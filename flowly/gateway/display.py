@@ -678,6 +678,31 @@ def register_display(app: web.Application, gateway) -> None:
     app.on_shutdown.append(shutdown)
 
 
+def _screens_on_disk(gateway) -> list[str]:
+    """Profiles this gateway serves whose screen has a runtime manifest."""
+    from flowly.profile import (
+        _PROFILE_NAME_RE,
+        _PROFILES_ROOT,
+        current_profile_name,
+        get_flowly_home,
+        is_default_home,
+    )
+
+    found = []
+    if (get_flowly_home() / "desktop" / "runtime.json").is_file():
+        found.append(current_profile_name())
+    if gateway.profile_host is not None and is_default_home():
+        try:
+            entries = sorted(_PROFILES_ROOT.iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            if (_PROFILE_NAME_RE.match(entry.name) and entry.name not in found
+                    and (entry / "desktop" / "runtime.json").is_file()):
+                found.append(entry.name)
+    return found
+
+
 def _idle_candidate(session: DisplaySession) -> tuple[str, int] | None:
     """(generation, authority revision) of a running screen nobody uses."""
     if not ScreenRuntime.capabilities()["supported"]:
@@ -700,16 +725,16 @@ async def idle_sweep(gateway, now: float | None = None) -> list[str]:
     Human control or an agent run is never idle, and a dead runtime is left
     for explicit recovery.
     """
-    from flowly.profile import current_profile_name, get_flowly_home
-
     sessions = gateway._display_sessions
-    if not any(identity[0] == current_profile_name() for identity in sessions) and (
-            get_flowly_home() / "desktop" / "runtime.json").is_file():
-        # After a gateway restart nobody may have asked about the screen yet.
-        try:
-            await asyncio.to_thread(_resolve, gateway, {})
-        except (ScreenError, OSError):
-            pass
+    # After a gateway restart nobody may have asked about a screen yet: every
+    # profile screen this gateway serves that has a runtime on disk is covered.
+    known = {identity[0] for identity in sessions}
+    for profile in await asyncio.to_thread(_screens_on_disk, gateway):
+        if profile not in known:
+            try:
+                await asyncio.to_thread(_resolve, gateway, {"profileId": profile})
+            except (ScreenError, OSError):
+                pass
     stopped = []
     for session in list(sessions.values()):
         current = time.monotonic() if now is None else now

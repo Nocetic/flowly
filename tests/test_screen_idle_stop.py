@@ -134,3 +134,18 @@ async def test_idle_stop_checks_the_profile_identity(idle, monkeypatch):
     monkeypatch.setattr(display, "_resolve", replaced)
     assert await idle_sweep(fixture.gateway) == []
     assert session.runtime.authority.snapshot()["running"]
+
+
+async def test_screens_on_disk_are_covered_after_a_gateway_restart(idle):
+    import flowly.profile as profiles
+
+    fixture, _, _ = idle
+    sessions = fixture.gateway._display_sessions
+    writer_key = next(key for key in sessions if key[0] == "writer")
+    writer = sessions.pop(writer_key)
+    writer.streams.clear()
+    desktop = profiles.ensure_profile_bot_id("writer").path / "desktop"
+    desktop.mkdir(parents=True, exist_ok=True)
+    (desktop / "runtime.json").write_text("{}")
+    await idle_sweep(fixture.gateway)
+    assert any(key[0] == "writer" for key in sessions), "the writer screen is watched again"
