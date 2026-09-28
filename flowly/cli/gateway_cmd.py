@@ -1926,6 +1926,17 @@ Respond to the user now:"""
             index=lambda: getattr(agent, "_memory_manager", None),
         )
         _feature_rpc.set_voice_context_provider(lambda: voice_context)
+        from flowly.live_voice.memory import VoiceMemory
+
+        async def _voice_memory_append(note):
+            # The agent's own memory_append entry: content guard, duplicate
+            # protection, size cap and "voice" toolset routing as in a chat turn.
+            enabled_toolsets, disabled_toolsets = agent._resolve_toolset_route("voice")
+            return await agent.tools.execute("memory_append", note, platform="voice",
+                                             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets)
+
+        voice_memory = VoiceMemory(_voice_memory_append)
+        _feature_rpc.set_voice_memory_provider(lambda: voice_memory)
         from flowly.live_voice.outputs import WorkOutputs
 
         work_outputs = WorkOutputs(agent.workspace, agent.sessions, _feature_rpc._artifact_store)

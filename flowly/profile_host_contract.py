@@ -73,6 +73,7 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "gmail.setup.cancel": 30_000,
     "gmail.disconnect": 30_000,
     "voice.context": 10_000,
+    "voice.memory.append": 10_000,
     "provider.list": 30_000,
     "provider.active": 30_000,
     "model.list": 60_000,
@@ -369,6 +370,14 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
 
         try:
             value = validate_context(value)
+        except VoiceError as exc:
+            raise ProfileHostError(exc.code, str(exc)) from exc
+    if method == "voice.memory.append":
+        from flowly.live_voice.memory import validate_memory_append
+        from flowly.live_voice.sessions import VoiceError
+
+        try:
+            value = validate_memory_append(value)
         except VoiceError as exc:
             raise ProfileHostError(exc.code, str(exc)) from exc
     session_key_methods = {

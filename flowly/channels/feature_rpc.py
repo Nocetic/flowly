@@ -1743,7 +1743,10 @@ _board_provider = None
 _voice_provider = None
 _voice_access_verifier = None
 _voice_context_provider = None
+_voice_memory_provider = None
 _work_output_provider = None
+# Served by every runtime for its own profile, not only by the primary one.
+_PER_RUNTIME_VOICE_METHODS = frozenset({"voice.context", "voice.memory.append"})
 
 
 def set_work_output_provider(provider) -> None:
@@ -1768,6 +1771,23 @@ def work_output_call(method: str, params: dict) -> dict:
 def set_voice_context_provider(provider) -> None:
     global _voice_context_provider
     _voice_context_provider = provider
+
+
+def set_voice_memory_provider(provider) -> None:
+    global _voice_memory_provider
+    _voice_memory_provider = provider
+
+
+async def voice_memory_append(params: dict) -> dict:
+    from flowly.live_voice.sessions import VoiceError
+
+    memory = _voice_memory_provider() if _voice_memory_provider is not None else None
+    if memory is None:
+        raise FeatureRpcError("UNAVAILABLE", "Voice memory is not ready on this runtime.")
+    try:
+        return await memory.append(params)
+    except VoiceError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
 
 
 async def voice_context(params: dict) -> dict:
@@ -4912,7 +4932,7 @@ def system_capabilities() -> dict:
         and not (
             method.startswith("flowlets.") and not runtime.owns_flowlets
         )
-        and not (method.startswith("voice.") and method != "voice.context" and not runtime.owns_shared_board)
+        and not (method.startswith("voice.") and method not in _PER_RUNTIME_VOICE_METHODS and not runtime.owns_shared_board)
     ]
 
     return {
@@ -5072,6 +5092,7 @@ async def media_models_refresh(_params: dict) -> dict:
 #                   ACK then bounce the gateway
 _DISPATCH: dict[str, tuple] = {
     "voice.context": (voice_context, True, False),
+    "voice.memory.append": (voice_memory_append, True, False),
     "system.capabilities": (system_capabilities, False, False),
     "connections.list": (connections_list, False, False),
     "connections.secret.get": (connections_secret_get, True, False),
@@ -5304,7 +5325,7 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
             validate_chat_target(params)
         except ValueError as exc:
             raise FeatureRpcError('PROFILE_IDENTITY_CHANGED', str(exc)) from exc
-    if method.startswith(_PRIMARY_RUNTIME_METHOD_PREFIXES) and method != "voice.context":
+    if method.startswith(_PRIMARY_RUNTIME_METHOD_PREFIXES) and method not in _PER_RUNTIME_VOICE_METHODS:
         from flowly.runtime_capabilities import resolve_runtime_capabilities
 
         capabilities = resolve_runtime_capabilities()

@@ -240,7 +240,10 @@ async def test_named_runtime_does_not_advertise_or_accept_a_second_voice_task_ow
         pytest.fail('Named runtime fixture did not establish runtime isolation')
     with pytest.raises(feature_rpc.FeatureRpcError):
         await feature_rpc.dispatch('voice.get', {'conversationId': 'voice-1'})
-    assert not any(m.startswith('voice.') and m != 'voice.context' for m in feature_rpc.system_capabilities()['featureMethods'])
+    methods = feature_rpc.system_capabilities()['featureMethods']
+    # Recall and memory notes belong to each runtime's own profile.
+    assert not any(m.startswith('voice.') and m not in feature_rpc._PER_RUNTIME_VOICE_METHODS for m in methods)
+    assert {'voice.context', 'voice.memory.append'} <= set(methods)
 
 
 def completion_notice(runtime):
