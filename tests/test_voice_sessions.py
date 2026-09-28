@@ -295,3 +295,13 @@ def test_correction_before_any_audible_words_keeps_an_interrupted_message(voice)
     assert row['voice']['delivery'] == 'interrupted'
     with pytest.raises(VoiceError):
         append(voice, messageId='user-empty', ordinal=2, text='')
+
+
+def test_transcript_rows_keep_their_first_heard_time_in_utc(voice):
+    from datetime import datetime
+    open_call(voice)
+    first = append(voice)['message']['voice']['createdAt']
+    assert datetime.fromisoformat(first).utcoffset().total_seconds() == 0
+    corrected = append(voice, text='Raporu hemen hazırla.', revision=2)['message']['voice']
+    assert corrected['createdAt'] == first and corrected['revision'] == 2
+    assert voice.history({'conversationId': 'conversation-1'})['messages'][0]['voice']['createdAt'] == first

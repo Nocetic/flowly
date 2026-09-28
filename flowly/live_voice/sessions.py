@@ -286,7 +286,10 @@ class VoiceSessions:
                 raise VoiceError("STALE_CONNECTION", "Unknown voice connection.")
             old = next((m for m in session.messages if m.get("voice", {}).get("messageId") == row_id), None)
             current = {"connectionId": connection_id, "messageId": row_id, "providerMessageId": message_id,
-                       "generation": connection["generation"], "ordinal": ordinal, "revision": revision, "delivery": delivery}
+                       "generation": connection["generation"], "ordinal": ordinal, "revision": revision, "delivery": delivery,
+                       # When the message was first heard, in UTC. The session row's own
+                       # timestamp is the agent host's naive local time; a correction keeps this.
+                       "createdAt": (old or {}).get("voice", {}).get("createdAt") or _now()}
             if continuation is not None:
                 parent = next((m for m in session.messages
                                if m.get("voice", {}).get("connectionId") == parent_connection
