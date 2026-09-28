@@ -96,6 +96,15 @@ async def test_a_first_summary_has_no_previous_record():
     assert PREVIOUS_RECORD_FENCE not in provider.calls[0]
 
 
+def test_the_record_stays_compact_without_losing_facts():
+    # A long run's summaries listed every day a request recurred ("161., 173.,
+    # … 293. günlerde") and repeated facts across sections, growing each cycle
+    # until summary calls hit their timeout.
+    assert "Never list each occurrence" in SUMMARIZE_SYSTEM_PROMPT
+    assert "State each fact once" in SUMMARIZE_SYSTEM_PROMPT
+    assert "Shorten wording, never the facts above." in SUMMARIZE_SYSTEM_PROMPT
+
+
 def test_the_system_prompt_no_longer_trades_old_facts_for_recent_context():
     assert "Prioritize recent context over older" not in SUMMARIZE_SYSTEM_PROMPT
     assert "never drop a fact that is still\ntrue because it is old" in SUMMARIZE_SYSTEM_PROMPT
