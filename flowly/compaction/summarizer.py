@@ -258,7 +258,7 @@ mistaken for unfinished work.
 Important tool outputs, file changes, commands executed, and their results. Include key findings from web searches, file reads, and system commands.
 
 ## Exact Identifiers
-Preserve identifiers exactly as written — UUIDs, file paths, URLs, hostnames, IPs, ports, issue and commit ids. Do not shorten or reconstruct them.
+Preserve identifiers exactly as written — UUIDs, file paths, branch names, environment variables, URLs, hostnames, IPs, ports, issue and commit ids. Do not shorten or reconstruct them. Copy them character for character even when the summary is in another language: never translate an identifier or give it Turkish letters (feature/iade-akisi stays feature/iade-akisi, never feature/iade-akışı).
 NEVER reproduce a credential. API keys, tokens, passwords and private keys must be referred to, not copied: write "the GitHub token in .env" or "the API key configured for the staging host", never the value. This summary is stored and re-read for the rest of the conversation.
 
 ## Constraints
@@ -1021,7 +1021,14 @@ _ANCHOR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     # repair call, never a wrong detail.
     ("time", re.compile(r"(?<![\d.,:])(\d{1,2})[:.](\d{2})(?!\d)(?![.,:]\d)")),
     ("amount", re.compile(r"\b\d{1,3}(?:[.,]\d{3})+\b|\b\d+\s?(?:TL|₺|USD|EUR|\$|€)", re.I)),
+    # Identifiers compared character for character: a summary that rewrote
+    # feature/iade-akisi as feature/iade-akışı lost the branch.
+    ("path", re.compile(r"(?<![\w/.@:-])(?=[\w.-]*[A-Za-z])[\w.-]+(?:/[\w.-]+)+")),
+    ("env", re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")),
+    ("hash", re.compile(r"\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b")),
 )
+
+_VERBATIM_KINDS = frozenset({"path", "env", "hash"})
 
 
 def _fold(text: str) -> str:
@@ -1038,6 +1045,8 @@ def _anchor_key(kind: str, match: re.Match[str]) -> str:
         return "amount:" + re.sub(r"\D", "", raw)
     if kind == "url":
         return "url:" + _fold(raw.rstrip(".,;:!?"))
+    if kind in _VERBATIM_KINDS:
+        return f"{kind}:" + raw.rstrip(".,;:!?")
     return f"{kind}:" + _fold(re.sub(r"\s+", " ", raw))
 
 
@@ -1057,11 +1066,13 @@ def extract_detail_anchors(summary: str) -> dict[str, str]:
     return anchors
 
 
-def _stands_alone(detail: str, text: str) -> bool:
+def _stands_alone(detail: str, text: str, exact: bool = False) -> bool:
     """``detail`` appears in ``text`` on its own, not inside a longer token
-    (a code inside a link does not count as the code)."""
-    pattern = rf"(?<![\w/.@-]){re.escape(_fold(detail))}(?![\w/@-]|\.\w)"
-    return re.search(pattern, _fold(text)) is not None
+    (a code inside a link does not count as the code). ``exact`` compares
+    case and letters as written, for identifiers."""
+    norm = (lambda t: t) if exact else _fold
+    pattern = rf"(?<![\w/.@-]){re.escape(norm(detail))}(?![\w/@-]|\.\w)"
+    return re.search(pattern, norm(text)) is not None
 
 
 def missing_detail_anchors(previous: str, updated: str) -> list[str]:
@@ -1070,7 +1081,9 @@ def missing_detail_anchors(previous: str, updated: str) -> list[str]:
     after = extract_detail_anchors(updated or "")
     return [
         original for key, original in before.items()
-        if key not in after and not _stands_alone(original, updated or "")
+        if key not in after and not _stands_alone(
+            original, updated or "", exact=key.split(":", 1)[0] in _VERBATIM_KINDS,
+        )
     ]
 
 

@@ -226,3 +226,45 @@ async def test_a_first_compaction_has_nothing_to_repair():
     result = await _service(provider).compact(_conversation(12))
     assert provider.repairs == []
     assert result.details_missing_before_repair == []
+
+
+# ── Identifiers stay character for character ───────────────────────────────
+
+CODING = """## Active State
+- Branch feature/iade-akisi; changed src/kargo/iade.py and tests/test_iade.py.
+- Commit 3f9c2a71; IADE_LIMIT_GUN defaults to 14; PR https://github.com/ornek/kargo/pull/318."""
+
+
+def test_identifiers_are_details_too():
+    anchors = set(extract_detail_anchors(CODING).values())
+    assert anchors >= {"feature/iade-akisi", "src/kargo/iade.py", "tests/test_iade.py",
+                       "3f9c2a71", "IADE_LIMIT_GUN", "https://github.com/ornek/kargo/pull/318"}
+    # The path inside a link is the link, not a second identifier.
+    assert "ornek/kargo/pull/318" not in anchors
+    # Dates, versions and words are not identifiers.
+    assert set(extract_detail_anchors("on 14/11, version 1.2.3, the 2020s, a decade").values()) == set()
+
+
+def test_an_identifier_given_turkish_letters_is_reported_missing():
+    # Observed: a summary in Turkish rewrote the branch as feature/iade-akışı.
+    updated = CODING.replace("feature/iade-akisi", "feature/iade-akışı")
+    assert missing_detail_anchors(CODING, updated) == ["feature/iade-akisi"]
+
+
+def test_identifiers_keep_their_case():
+    updated = CODING.replace("IADE_LIMIT_GUN", "iade_limit_gun").replace("src/kargo/iade.py", "src/Kargo/iade.py")
+    assert missing_detail_anchors(CODING, updated) == ["src/kargo/iade.py", "IADE_LIMIT_GUN"]
+
+
+def test_the_prompt_forbids_translating_identifiers():
+    assert "never translate an identifier or give it Turkish letters" in SUMMARIZE_SYSTEM_PROMPT
+
+
+async def test_an_altered_identifier_is_repaired():
+    provider = _Scripted(update=CODING.replace("feature/iade-akisi", "feature/iade-akışı"), repair=CODING)
+    history = [{"role": "system", "content": build_summary_content(CODING)}, *_conversation(12)]
+    result = await _service(provider).compact(history)
+    assert len(provider.repairs) == 1 and "- feature/iade-akisi" in provider.repairs[0]
+    assert "feature/iade-akisi" in result.summary
+    assert result.details_missing_after_repair == []
+
