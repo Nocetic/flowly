@@ -30,8 +30,8 @@ runtime process).
    that fit that purpose.
 4. The owner taps a choice or types. The agent asks at most one more useful
    question, then proposes a **working style** card: role, focus, style,
-   notes. *Save and start* writes it into the agent's `SOUL.md`; *Edit* hands
-   them the composer to say what to change. The card stays in the
+   notes. *Save and start* writes it into the agent's `SOUL.md`; *Edit* opens the
+   card's fields in place and saving sends the owner's version (§6a). The card stays in the
    conversation as the record of what was agreed (§6a).
 6. Throughout, the agent speaks as itself: an agent named James says "I'm
    James", never "I'm Flowly" (§9).
@@ -208,7 +208,7 @@ words and survives reloads and other devices:
 ```jsonc
 { "role": "assistant", "id": "agent-setup-card:<cardId>", "kind": "agent_setup_card",
   "content": "**Working style**\n- Role: …",   // readable where cards are not rendered
-  "setupCard": { "id": "<cardId>", "role": "…", "focus": "…", "style": "…", "notes": "…" } }
+  "setupCard": { "id": "<cardId>", "runId": "<run>", "role": "…", "focus": "…", "style": "…", "notes": "…" } }
 ```
 
 - **Append-only.** A row never changes. Clients derive its state:
@@ -368,3 +368,26 @@ once, with no narration left on the tool-call message; the question appended
 when left out; anchors for an asked question, a tapped answer, a fallback and
 an introduction that did not ask. Each was mutation-checked.
 
+
+## Follow-up (2026-09-28): the card inside its message, edited in place
+
+- **A card names its message.** `propose_card` stores the proposing run's id
+  on the card (`runId`, in the row's `setupCard` and in `pendingAsk`), the
+  same anchor as a question. Clients draw the card inside that reply; a card
+  without `runId` (recorded earlier) or whose reply is not loaded stays its
+  own row.
+- **Edit is the owner's own card.** `setupAnswer` may carry
+  `card: {role, focus, style?, notes?}`, only with `optionId: "save"`.
+  `validate_setup_answer` bounds the shape (those keys, strings, at most
+  1000 characters); `begin_turn` then runs it through `_clean_card`, the same
+  rule as a proposal (lengths, no secrets, no permission or routine claims).
+  The archive is append-only, so the edited version is a **new card** with a
+  new id and the save turn's `runId`: it is written to `SOUL.md`, published
+  as a row after the save turn's reply and becomes `savedCardId`; the
+  proposal row stays as the earlier suggestion. Nothing is written if the
+  edits fail the rule.
+
+Tests (`tests/test_agent_home_setup.py`): edits saved to `SOUL.md` and to a
+new row with the save run; edits held to the proposal rule; malformed edits
+and edits with a non-save option refused; `runId` on proposal rows and
+`pendingAsk`. "Edits not screened" and "edits ignored" mutations fail them.

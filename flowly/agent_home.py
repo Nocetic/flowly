@@ -147,16 +147,31 @@ def validate_request(method: str, params: dict) -> None:
         raise AgentHomeError("INVALID_PARAMS", "Invalid conversation language.")
 
 
-def validate_setup_answer(value: object) -> dict[str, str]:
+_CARD_FIELDS = ("role", "focus", "style", "notes")
+
+
+def validate_setup_answer(value: object) -> dict:
     """Shape check for chat.send's ``setupAnswer``. Meaning is checked later,
-    inside the conversation's turn lock, against the current pending question."""
-    if (
-        not isinstance(value, dict)
-        or set(value) != {"askId", "optionId"}
-        or not all(isinstance(value[key], str) and _ID.match(value[key]) for key in value)
-    ):
+    inside the conversation's turn lock, against the current pending question.
+
+    Saving a working-style card may carry the owner's edits (``card``); they are
+    cleaned and screened like a proposed card when the save is applied."""
+    if not isinstance(value, dict) or not {"askId", "optionId"} <= set(value) <= {"askId", "optionId", "card"}:
         raise AgentHomeError("INVALID_PARAMS", "setupAnswer is invalid.")
-    return {"askId": value["askId"], "optionId": value["optionId"]}
+    if not all(isinstance(value[key], str) and _ID.match(value[key]) for key in ("askId", "optionId")):
+        raise AgentHomeError("INVALID_PARAMS", "setupAnswer is invalid.")
+    answer: dict = {"askId": value["askId"], "optionId": value["optionId"]}
+    if "card" in value:
+        edits = value["card"]
+        if (
+            value["optionId"] != "save"
+            or not isinstance(edits, dict)
+            or not set(edits) <= set(_CARD_FIELDS)
+            or not all(isinstance(text, str) and len(text) <= 1000 for text in edits.values())
+        ):
+            raise AgentHomeError("INVALID_PARAMS", "setupAnswer card is invalid.")
+        answer["card"] = dict(edits)
+    return answer
 
 
 # ── storage ─────────────────────────────────────────────────────────────────
@@ -571,7 +586,7 @@ def publish_card(manager: SessionManager) -> bool:
                 _write_state(home, state)
             return False
         row_id = f"agent-setup-card:{card_id}"
-        payload = {key: card[key] for key in ("id", "role", "focus", "style", "notes") if card.get(key)}
+        payload = {key: card[key] for key in ("id", "runId", "role", "focus", "style", "notes") if card.get(key)}
         text = card_row_text(state, card)
 
         def append(session: Session) -> None:
@@ -657,6 +672,17 @@ def begin_turn(session_key: str, metadata: dict) -> str | None:
                     kind = "answer"
                     if ask["kind"] == "card" and option["id"] == "save":
                         try:
+                            if "card" in answer:
+                                # The owner's edits are a new card, held to the
+                                # same rule. The transcript is append-only: the
+                                # proposal stays as an earlier suggestion, and
+                                # the saved card is published with this turn's
+                                # reply (publish_card at its end).
+                                edited = _clean_card(answer["card"])
+                                state["card"] = {"id": f"card-{uuid.uuid4().hex[:12]}",
+                                                 **({"runId": run_id} if run_id else {}),
+                                                 **{key: value for key, value in edited.items() if value}}
+                                state["unpublishedCardId"] = state["card"]["id"]
                             _save_card_to_soul(home, state)
                         except AgentHomeError as exc:
                             # Nothing was written; the card stays offered.
@@ -786,8 +812,10 @@ def ask(session_key: str, question: object, options: object) -> dict:
         return {"ok": True, "shown": "The app shows these choices under your message."}
 
 
-def propose_card(session_key: str, card: dict) -> dict:
-    home, info = _tool_state(session_key)
+def _clean_card(card: dict) -> dict:
+    """One rule for a working style, proposed by the agent or edited by its
+    owner: bounded fields, a role and a focus, and nothing that could act as an
+    instruction injected into the persona."""
     clean = {
         "role": _clean(card.get("role"), 160),
         "focus": _clean(card.get("focus"), 200),
@@ -800,6 +828,12 @@ def propose_card(session_key: str, card: dict) -> dict:
 
     if _find_threats(" ".join(clean.values())):
         raise AgentHomeError("INVALID_PARAMS", "This working style cannot be saved to your persona.")
+    return clean
+
+
+def propose_card(session_key: str, card: dict) -> dict:
+    home, info = _tool_state(session_key)
+    clean = _clean_card(card)
     with _lock(home):
         state = _read_state(home, info)
         if state is None or state["setup"] != "active":
@@ -809,7 +843,10 @@ def propose_card(session_key: str, card: dict) -> dict:
         if state.get("cardCount", 0) >= MAX_CARD_PROPOSALS:
             raise AgentHomeError("SETUP_CARD_LIMIT", "Continue normally; the owner can edit SOUL.md in settings.")
         card_id = f"card-{uuid.uuid4().hex[:12]}"
-        state["card"] = {"id": card_id, **{key: value for key, value in clean.items() if value}}
+        run_id = str((state.get("turn") or {}).get("runId") or "")
+        # The card belongs to the reply of the run that proposed it.
+        state["card"] = {"id": card_id, **({"runId": run_id} if run_id else {}),
+                         **{key: value for key, value in clean.items() if value}}
         state["cardCount"] = state.get("cardCount", 0) + 1
         # Published to the transcript when this turn ends (publish_card), by
         # the agent's own session manager inside its turn lock.
@@ -822,6 +859,7 @@ def propose_card(session_key: str, card: dict) -> dict:
                 {"id": "save", "label": _text(state, "save")},
                 {"id": "edit", "label": _text(state, "edit")},
             ],
+            **_anchor(run_id=run_id),
         }
         _write_state(home, state)
         return {"ok": True, "shown": "The app shows this card with Save and Edit. Wait for the owner."}
