@@ -1005,9 +1005,9 @@ async def summarize_in_stages(
 # Specific details (links, emails, codes, dates, times, amounts) are what a
 # rewritten summary drops most easily and what the owner notices first. After
 # an update, the details of the previous summary that are gone from the new
-# one are checked first: a short call asks which of them still matter. Only
-# those get ONE repair pass: the model restores them unless the new record
-# shows they changed. The code never re-inserts them itself — a restored
+# one get ONE repair pass: the model restores them unless the new record
+# shows they changed (files listed in bulk are checked first by a short call,
+# see _details_to_drop). The code never re-inserts them itself — a restored
 # "10:00" after the owner moved meetings to 09:00 would be worse than the
 # loss.
 
@@ -1123,18 +1123,17 @@ required section format. Output only the record.
 {updated_summary}
 -----END UPDATED RECORD-----"""
 
-CHECK_DROPPED_DETAILS_PROMPT = """The updated record below replaced the previous record of this conversation.
-These specific details are missing from it or were altered:
+CHECK_DROPPED_DETAILS_PROMPT = """The previous record of this conversation listed these files among others,
+and the updated record below no longer names them:
 
 {missing}
 
-For each one decide:
-KEEP: it still matters, and the updated record should hold it exactly as listed.
-DROP: the updated record shows that it was changed, cancelled or finished, or
-it is a file that was only read, listed or searched (routine activity the
-record rightly merged).
+For each file decide:
+KEEP: the work changed or created it, or it matters to what comes next.
+DROP: it was only read, listed or searched (routine activity the record
+rightly merged), or the updated record shows it no longer matters.
 
-Reply with exactly one line per detail and nothing else: <number>|KEEP or <number>|DROP
+Reply with exactly one line per file and nothing else: <number>|KEEP or <number>|DROP
 
 {record_start}
 {previous_summary}
@@ -1145,6 +1144,22 @@ Reply with exactly one line per detail and nothing else: <number>|KEEP or <numbe
 -----END UPDATED RECORD-----"""
 
 _CHECK_LINE = re.compile(r"^\s*(\d+)\s*\|\s*(KEEP|DROP)\b", re.I | re.M)
+
+# A line naming this many paths is a list of files, the shape routine reads
+# take when the model lists them anyway.
+_BULK_PATHS_PER_LINE = 3
+_PATH_PATTERN = dict(_ANCHOR_PATTERNS)["path"]
+
+
+def _bulk_listed_paths(summary: str) -> set[str]:
+    """Paths the summary names on a line together with at least two others."""
+    bulk: set[str] = set()
+    for line in _HISTORICAL_REQUEST_SECTION.sub("", summary or "").splitlines():
+        paths = {match.group(0).rstrip(".,;:!?") for match in _PATH_PATTERN.finditer(line)}
+        if len(paths) >= _BULK_PATHS_PER_LINE:
+            bulk |= paths
+    return bulk
+
 
 _FROM_PREVIOUS = "These specific details were in the previous record and are missing from the update:"
 _FROM_OWNER = ("The owner wrote these identifiers in the conversation; the update lacks them or "
@@ -1191,15 +1206,15 @@ async def _details_to_drop(
     context_window: int,
     should_cancel: Callable[[], bool] | None,
 ) -> set[str]:
-    """The missing details the model says no longer belong in the record.
+    """The bulk-listed files the model says no longer belong in the record.
 
     A repair rewrites the whole record, about a minute for a long one. In
     coding sessions it mostly fired for files the model had listed as read
     and the next update rightly merged: the rewrite then left them all out,
-    and three task runs spent up to 130 s per compaction for nothing. This
-    check answers one short line per detail instead. A detail it does not
-    clearly drop is kept for the repair, and a failed check drops nothing:
-    the fallback is the full repair, never a loss.
+    and three task runs spent up to 131 s per compaction for nothing. This
+    check answers one short line per file instead (5 s on the same case).
+    A file it does not clearly drop is kept for the repair, and a failed
+    check drops nothing: the fallback is the full repair, never a loss.
     """
     prompt = CHECK_DROPPED_DETAILS_PROMPT.format(
         missing="\n".join(f"{number}. {item}" for number, item in enumerate(missing, 1)),
@@ -1243,9 +1258,10 @@ async def repair_dropped_details(
     owner_identifiers: Sequence[str] = (),
 ) -> tuple[str, list[str], list[str]]:
     """One repair pass for details an updated summary dropped or altered:
-    those of the previous summary, and identifiers the owner wrote. A short
-    check first leaves out the ones that no longer matter; when none do, the
-    record is not rewritten.
+    those of the previous summary, and identifiers the owner wrote. Files the
+    previous record listed in bulk get a short check first; the ones it
+    drops are left out, and when nothing else is missing the record is not
+    rewritten.
 
     Returns ``(summary, missing_before, missing_after)``. When nothing is
     missing, or the repair call fails, the updated summary comes back as is:
@@ -1256,11 +1272,16 @@ async def repair_dropped_details(
     if not missing:
         return updated_summary, [], []
     previous_block = (previous_summary or "").strip() or "(no previous record)"
+    # Only files the previous record listed in bulk go to the check. Asked
+    # about 36 such files and a commit id and an env var the update had also
+    # lost, the model dropped all 38 (a real replay); the repair itself puts
+    # those two back. Identifiers the owner wrote always go to the repair.
+    bulk = _bulk_listed_paths(previous_summary)
+    candidates = [item for item in from_previous if item in bulk and item not in owner_identifiers]
     dropped = await _details_to_drop(
-        missing, previous_block, updated_summary, provider, model, reserve_tokens, context_window, should_cancel,
-    )
+        candidates, previous_block, updated_summary, provider, model, reserve_tokens, context_window, should_cancel,
+    ) if candidates else set()
     from_previous = [item for item in from_previous if item not in dropped]
-    from_owner = [item for item in from_owner if item not in dropped]
     if not from_previous and not from_owner:
         logger.info(f"Summary detail repair: {len(missing)} missing, none still matter")
         return updated_summary, missing, missing
