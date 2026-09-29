@@ -1109,8 +1109,9 @@ It lost or altered specific details:
 Return the complete updated record again, changed only in this way: put each
 listed detail back where it belongs, written exactly as listed, with its
 context — unless the updated record shows that it was changed, cancelled or
-finished, in which case leave it out. Keep the required section format. Output
-only the record.
+finished, or it is a file that was only read, listed or searched (routine
+activity the record rightly merged), in which case leave it out. Keep the
+required section format. Output only the record.
 
 {record_start}
 {previous_summary}

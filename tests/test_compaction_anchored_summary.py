@@ -338,3 +338,14 @@ def test_routine_tool_activity_is_not_listed_file_by_file():
     assert "Files that were only read, listed or searched are not listed one by one." in SUMMARIZE_SYSTEM_PROMPT
     assert "Merge routine tool activity" in SUMMARIZE_SYSTEM_PROMPT
 
+
+async def test_the_repair_may_leave_routine_reads_out():
+    # The model sometimes lists files it only read as exact identifiers; the
+    # next record rightly drops them, and the repair must not put them back.
+    previous = "## Exact Identifiers\n- src/kargo/iade.py, src/kargo/log_4.py"
+    provider = _Scripted(update="## Exact Identifiers\n- src/kargo/iade.py",
+                         repair="## Exact Identifiers\n- src/kargo/iade.py")
+    history = [{"role": "system", "content": build_summary_content(previous)}, *_conversation(12)]
+    await _service(provider).compact(history)
+    assert "only read, listed or searched" in provider.repairs[0]
+
