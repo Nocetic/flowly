@@ -18,12 +18,13 @@ from flowly.compaction.summarizer import (
     extract_detail_anchors,
     generate_summary,
     missing_detail_anchors,
+    owner_identifiers,
     summarize_in_stages,
 )
 from flowly.compaction.types import CompactionConfig, build_summary_content
 from flowly.providers.base import LLMResponse
 
-REPAIR_MARKER = "These specific details were in the previous record"
+REPAIR_MARKER = "Return the complete updated record again"
 
 PREVIOUS = """## Decisions
 - The owner's daughter Elif's birthday is 14 Kasım.
@@ -283,4 +284,57 @@ def test_identifiers_to_keep_are_the_ones_the_summary_lists_as_exact():
     assert missing_detail_anchors(previous, updated) == []
     assert missing_detail_anchors(previous, updated.replace("feature/iade-akisi", "feature/iade-akışı")) == [
         "feature/iade-akisi"]
+
+
+# ── Identifiers the owner wrote ────────────────────────────────────────────
+
+
+def _session(branch_note: str) -> list[dict]:
+    return [
+        {"role": "user", "content": "Bu iş için feature/iade-akisi dalını açtım; IADE_LIMIT_GUN=14 olsun."},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+         "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "src/kargo/log_4.py src/kargo/lint_7.py"},
+        {"role": "assistant", "content": branch_note},
+        *_conversation(12),
+    ]
+
+
+def test_owner_identifiers_come_from_the_owners_messages_only():
+    ids = owner_identifiers(_session("ok"))
+    assert ids == ["feature/iade-akisi", "IADE_LIMIT_GUN"]  # not the paths in tool output
+
+
+async def test_a_first_summary_that_alters_an_owner_identifier_is_repaired():
+    fixed = "## Exact Identifiers\n- feature/iade-akisi, IADE_LIMIT_GUN"
+    provider = _Scripted(update="## Exact Identifiers\n- feature/iade-akışı, IADE_LIMIT_GUN", repair=fixed)
+    result = await _service(provider).compact(_session("noted"))
+    assert len(provider.repairs) == 1
+    assert "The owner wrote these identifiers" in provider.repairs[0]
+    assert "- feature/iade-akisi" in provider.repairs[0]
+    assert "feature/iade-akisi" in result.summary
+    assert result.details_missing_before_repair == ["feature/iade-akisi"]
+    assert result.details_missing_after_repair == []
+
+
+async def test_an_owner_identifier_with_changed_case_is_repaired():
+    # Case-folded, src/Kargo/iade.py would pass for src/kargo/iade.py; on a
+    # case-sensitive file system it is another file.
+    history = [{"role": "user", "content": "İade hesabı src/kargo/iade.py dosyasında."}, *_conversation(12)]
+    provider = _Scripted(update="## Exact Identifiers\n- src/Kargo/iade.py",
+                         repair="## Exact Identifiers\n- src/kargo/iade.py")
+    result = await _service(provider).compact(history)
+    assert result.details_missing_before_repair == ["src/kargo/iade.py"]
+    assert "src/kargo/iade.py" in result.summary
+
+
+async def test_owner_identifiers_kept_exactly_need_no_repair():
+    provider = _Scripted(update="## Exact Identifiers\n- feature/iade-akisi, IADE_LIMIT_GUN")
+    await _service(provider).compact(_session("noted"))
+    assert provider.repairs == []
+
+
+def test_routine_tool_activity_is_not_listed_file_by_file():
+    assert "Files that were only read, listed or searched are not listed one by one." in SUMMARIZE_SYSTEM_PROMPT
+    assert "Merge routine tool activity" in SUMMARIZE_SYSTEM_PROMPT
 

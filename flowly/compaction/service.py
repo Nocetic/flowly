@@ -22,6 +22,7 @@ from flowly.compaction.pruning import (
 )
 from flowly.compaction.summarizer import (
     ground_historical_request,
+    owner_identifiers,
     reject_invented_user_attribution,
     repair_dropped_details,
     summarize_in_stages,
@@ -1154,15 +1155,17 @@ class CompactionService:
         # details itself. Only the committed previous summary counts here.
         missing_before: list[str] = []
         missing_after: list[str] = []
-        if previous_summary and previous_summary.strip():
+        owner_ids = owner_identifiers(grounding_messages)
+        if (previous_summary and previous_summary.strip()) or owner_ids:
             summary, missing_before, missing_after = await repair_dropped_details(
-                previous_summary,
+                previous_summary or "",
                 summary,
                 self.provider,
                 self.model,
                 self.effective_reserve_tokens,
                 window,
                 should_cancel=should_cancel,
+                owner_identifiers=owner_ids,
             )
 
         # The model supplies the rich checkpoint, but the current-task anchor

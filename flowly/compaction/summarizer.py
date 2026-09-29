@@ -3,7 +3,7 @@
 import asyncio
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from loguru import logger
@@ -258,7 +258,7 @@ mistaken for unfinished work.
 Important tool outputs, file changes, commands executed, and their results. Include key findings from web searches, file reads, and system commands.
 
 ## Exact Identifiers
-Preserve identifiers exactly as written — UUIDs, file paths, branch names, environment variables, URLs, hostnames, IPs, ports, issue and commit ids. Do not shorten or reconstruct them. Copy them character for character even when the summary is in another language: never translate an identifier or give it Turkish letters (feature/iade-akisi stays feature/iade-akisi, never feature/iade-akışı).
+Preserve identifiers exactly as written — UUIDs, file paths, branch names, environment variables, URLs, hostnames, IPs, ports, issue and commit ids. Do not shorten or reconstruct them. Copy them character for character even when the summary is in another language: never translate an identifier or give it Turkish letters (feature/iade-akisi stays feature/iade-akisi, never feature/iade-akışı). List the identifiers the work depends on: the branch, files changed or created, commits, configuration names, links, hosts. Files that were only read, listed or searched are not listed one by one.
 NEVER reproduce a credential. API keys, tokens, passwords and private keys must be referred to, not copied: write "the GitHub token in .env" or "the API key configured for the staging host", never the value. This summary is stored and re-read for the rest of the conversation.
 
 ## Constraints
@@ -274,6 +274,8 @@ Stay compact as the conversation grows:
   weekly plan; still waiting for the task list"). Never list each occurrence,
   day number or date it came up.
 - State each fact once, in the section it belongs to.
+- Merge routine tool activity (files read, directories listed, searches) into
+  one line; name a file only when it was changed or matters to what comes next.
 - Reduce finished work to one line, keeping what it changed and where: file
   paths, commit ids, test counts, exact error messages and results stay.
 - Name every person with who they are to the owner ("the owner's daughter
@@ -1100,13 +1102,13 @@ def missing_detail_anchors(previous: str, updated: str) -> list[str]:
 
 
 REPAIR_DROPPED_DETAILS_PROMPT = """The updated record below replaced the previous record of this conversation.
-These specific details were in the previous record and are missing from the update:
+It lost or altered specific details:
 
 {missing}
 
 Return the complete updated record again, changed only in this way: put each
-missing detail back where it belongs, with its context from the previous
-record — unless the updated record shows that it was changed, cancelled or
+listed detail back where it belongs, written exactly as listed, with its
+context — unless the updated record shows that it was changed, cancelled or
 finished, in which case leave it out. Keep the required section format. Output
 only the record.
 
@@ -1118,6 +1120,40 @@ only the record.
 {updated_summary}
 -----END UPDATED RECORD-----"""
 
+_FROM_PREVIOUS = "These specific details were in the previous record and are missing from the update:"
+_FROM_OWNER = ("The owner wrote these identifiers in the conversation; the update lacks them or "
+               "altered them (they must appear exactly like this):")
+_MAX_OWNER_IDENTIFIERS = 20
+
+
+def owner_identifiers(messages: list[dict[str, Any]]) -> list[str]:
+    """Identifiers (paths, branches, env vars, commit ids) the owner wrote.
+
+    Only the owner's own messages: tool output names hundreds of incidental
+    paths, but what the owner typed is what they will ask about. A summary in
+    Turkish rewrote such a branch (feature/iade-akisi → feature/iade-akışı)
+    on its very first pass, before any previous record existed to compare to.
+    """
+    found: dict[str, None] = {}
+    for message in messages:
+        if message.get("role") != "user" or message.get(EPHEMERAL_NUDGE_KEY) or message.get("_display_hidden"):
+            continue
+        text = _message_text(message)
+        for kind, pattern in _ANCHOR_PATTERNS:
+            if kind in _VERBATIM_KINDS:
+                for match in pattern.finditer(text):
+                    found.setdefault(match.group(0).rstrip(".,;:!?"), None)
+    return list(found)[:_MAX_OWNER_IDENTIFIERS]
+
+
+def _missing_details(previous: str, updated: str, owner: Sequence[str]) -> tuple[list[str], list[str]]:
+    from_previous = missing_detail_anchors(previous, updated) if previous and previous.strip() else []
+    from_owner = [
+        item for item in owner
+        if item not in from_previous and not _stands_alone(item, updated or "", exact=True)
+    ]
+    return from_previous, from_owner
+
 
 async def repair_dropped_details(
     previous_summary: str,
@@ -1127,21 +1163,29 @@ async def repair_dropped_details(
     reserve_tokens: int,
     context_window: int = 0,
     should_cancel: Callable[[], bool] | None = None,
+    owner_identifiers: Sequence[str] = (),
 ) -> tuple[str, list[str], list[str]]:
-    """One repair pass for details an updated summary dropped.
+    """One repair pass for details an updated summary dropped or altered:
+    those of the previous summary, and identifiers the owner wrote.
 
     Returns ``(summary, missing_before, missing_after)``. When nothing is
     missing, or the repair call fails, the updated summary comes back as is:
     a failed repair must never fail the compaction it was trying to improve.
     """
-    missing = missing_detail_anchors(previous_summary, updated_summary)
+    from_previous, from_owner = _missing_details(previous_summary, updated_summary, owner_identifiers)
+    missing = from_previous + from_owner
     if not missing:
         return updated_summary, [], []
+    sections = []
+    if from_previous:
+        sections.append(_FROM_PREVIOUS + "\n" + "\n".join(f"- {item}" for item in from_previous))
+    if from_owner:
+        sections.append(_FROM_OWNER + "\n" + "\n".join(f"- {item}" for item in from_owner))
     prompt = REPAIR_DROPPED_DETAILS_PROMPT.format(
-        missing="\n".join(f"- {item}" for item in missing),
+        missing="\n\n".join(sections),
         record_start=PREVIOUS_RECORD_FENCE,
         record_end=PREVIOUS_RECORD_FENCE_END,
-        previous_summary=previous_summary.strip(),
+        previous_summary=(previous_summary or "").strip() or "(no previous record)",
         updated_summary=updated_summary.strip(),
     )
     try:
@@ -1164,7 +1208,8 @@ async def repair_dropped_details(
     except Exception as exc:  # noqa: BLE001 — a repair is best-effort
         logger.warning(f"Summary detail repair failed, keeping the update as is: {exc}")
         return updated_summary, missing, missing
-    still_missing = missing_detail_anchors(previous_summary, repaired)
+    still_previous, still_owner = _missing_details(previous_summary, repaired, owner_identifiers)
+    still_missing = still_previous + still_owner
     logger.info(
         f"Summary detail repair: {len(missing)} missing before, "
         f"{len(still_missing)} after"
