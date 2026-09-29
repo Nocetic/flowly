@@ -1005,9 +1005,11 @@ async def summarize_in_stages(
 # Specific details (links, emails, codes, dates, times, amounts) are what a
 # rewritten summary drops most easily and what the owner notices first. After
 # an update, the details of the previous summary that are gone from the new
-# one get ONE repair pass: the model restores them unless the new record shows
-# they changed. The code never re-inserts them itself — a restored "10:00"
-# after the owner moved meetings to 09:00 would be worse than the loss.
+# one are checked first: a short call asks which of them still matter. Only
+# those get ONE repair pass: the model restores them unless the new record
+# shows they changed. The code never re-inserts them itself — a restored
+# "10:00" after the owner moved meetings to 09:00 would be worse than the
+# loss.
 
 _MONTHS = (
     "ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık|"
@@ -1121,6 +1123,29 @@ required section format. Output only the record.
 {updated_summary}
 -----END UPDATED RECORD-----"""
 
+CHECK_DROPPED_DETAILS_PROMPT = """The updated record below replaced the previous record of this conversation.
+These specific details are missing from it or were altered:
+
+{missing}
+
+For each one decide:
+KEEP: it still matters, and the updated record should hold it exactly as listed.
+DROP: the updated record shows that it was changed, cancelled or finished, or
+it is a file that was only read, listed or searched (routine activity the
+record rightly merged).
+
+Reply with exactly one line per detail and nothing else: <number>|KEEP or <number>|DROP
+
+{record_start}
+{previous_summary}
+{record_end}
+
+-----BEGIN UPDATED RECORD-----
+{updated_summary}
+-----END UPDATED RECORD-----"""
+
+_CHECK_LINE = re.compile(r"^\s*(\d+)\s*\|\s*(KEEP|DROP)\b", re.I | re.M)
+
 _FROM_PREVIOUS = "These specific details were in the previous record and are missing from the update:"
 _FROM_OWNER = ("The owner wrote these identifiers in the conversation; the update lacks them or "
                "altered them (they must appear exactly like this):")
@@ -1156,6 +1181,57 @@ def _missing_details(previous: str, updated: str, owner: Sequence[str]) -> tuple
     return from_previous, from_owner
 
 
+async def _details_to_drop(
+    missing: list[str],
+    previous_block: str,
+    updated_summary: str,
+    provider: LLMProvider,
+    model: str,
+    reserve_tokens: int,
+    context_window: int,
+    should_cancel: Callable[[], bool] | None,
+) -> set[str]:
+    """The missing details the model says no longer belong in the record.
+
+    A repair rewrites the whole record, about a minute for a long one. In
+    coding sessions it mostly fired for files the model had listed as read
+    and the next update rightly merged: the rewrite then left them all out,
+    and three task runs spent up to 130 s per compaction for nothing. This
+    check answers one short line per detail instead. A detail it does not
+    clearly drop is kept for the repair, and a failed check drops nothing:
+    the fallback is the full repair, never a loss.
+    """
+    prompt = CHECK_DROPPED_DETAILS_PROMPT.format(
+        missing="\n".join(f"{number}. {item}" for number, item in enumerate(missing, 1)),
+        record_start=PREVIOUS_RECORD_FENCE,
+        record_end=PREVIOUS_RECORD_FENCE_END,
+        previous_summary=previous_block,
+        updated_summary=updated_summary.strip(),
+    )
+    try:
+        response = await _chat_bounded(
+            provider,
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            max_tokens=resolve_summary_output_budget(reserve_tokens, context_window),
+            should_cancel=should_cancel,
+        )
+        answer = validated_summary_text(response)
+    except CompactionError as exc:
+        if "cancelled" in str(exc):
+            raise
+        logger.warning(f"Summary detail check failed, repairing every detail: {exc}")
+        return set()
+    except Exception as exc:  # noqa: BLE001 — the check only saves a rewrite
+        logger.warning(f"Summary detail check failed, repairing every detail: {exc}")
+        return set()
+    return {
+        missing[int(number) - 1]
+        for number, verdict in _CHECK_LINE.findall(answer)
+        if verdict.upper() == "DROP" and 1 <= int(number) <= len(missing)
+    }
+
+
 async def repair_dropped_details(
     previous_summary: str,
     updated_summary: str,
@@ -1167,7 +1243,9 @@ async def repair_dropped_details(
     owner_identifiers: Sequence[str] = (),
 ) -> tuple[str, list[str], list[str]]:
     """One repair pass for details an updated summary dropped or altered:
-    those of the previous summary, and identifiers the owner wrote.
+    those of the previous summary, and identifiers the owner wrote. A short
+    check first leaves out the ones that no longer matter; when none do, the
+    record is not rewritten.
 
     Returns ``(summary, missing_before, missing_after)``. When nothing is
     missing, or the repair call fails, the updated summary comes back as is:
@@ -1177,6 +1255,15 @@ async def repair_dropped_details(
     missing = from_previous + from_owner
     if not missing:
         return updated_summary, [], []
+    previous_block = (previous_summary or "").strip() or "(no previous record)"
+    dropped = await _details_to_drop(
+        missing, previous_block, updated_summary, provider, model, reserve_tokens, context_window, should_cancel,
+    )
+    from_previous = [item for item in from_previous if item not in dropped]
+    from_owner = [item for item in from_owner if item not in dropped]
+    if not from_previous and not from_owner:
+        logger.info(f"Summary detail repair: {len(missing)} missing, none still matter")
+        return updated_summary, missing, missing
     sections = []
     if from_previous:
         sections.append(_FROM_PREVIOUS + "\n" + "\n".join(f"- {item}" for item in from_previous))
@@ -1186,7 +1273,7 @@ async def repair_dropped_details(
         missing="\n\n".join(sections),
         record_start=PREVIOUS_RECORD_FENCE,
         record_end=PREVIOUS_RECORD_FENCE_END,
-        previous_summary=(previous_summary or "").strip() or "(no previous record)",
+        previous_summary=previous_block,
         updated_summary=updated_summary.strip(),
     )
     try:

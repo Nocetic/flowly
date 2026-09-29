@@ -25,6 +25,7 @@ from flowly.compaction.types import CompactionConfig, build_summary_content
 from flowly.providers.base import LLMResponse
 
 REPAIR_MARKER = "Return the complete updated record again"
+CHECK_MARKER = "Reply with exactly one line per detail"
 
 PREVIOUS = """## Decisions
 - The owner's daughter Elif's birthday is 14 Kasım.
@@ -39,19 +40,25 @@ ALL_DETAILS = ("14 Kasım ATLAS-7731 https://notion.so/deniz/atlas-7731-yol-hari
 
 
 class _Scripted:
-    """Answers summary calls with ``update`` and repair calls with ``repair``."""
+    """Answers summary calls with ``update``, the detail check with ``check``
+    (by default an answer that drops nothing) and repair calls with ``repair``."""
 
     provider_name = "stub"
 
-    def __init__(self, update: str, repair: str | LLMResponse = ""):
+    def __init__(self, update: str, repair: str | LLMResponse = "", check: str | LLMResponse = "-"):
         self.update = update
         self.repair = repair
+        self.check = check
         self.calls: list[str] = []
 
     async def chat(self, *args, **kwargs) -> LLMResponse:
         messages = kwargs.get("messages") or (args[0] if args else [])
         prompt = "\n".join(str(m.get("content") or "") for m in messages if m.get("role") == "user")
         self.calls.append(prompt)
+        if CHECK_MARKER in prompt:
+            if isinstance(self.check, LLMResponse):
+                return self.check
+            return LLMResponse(content=self.check, finish_reason="stop")
         if REPAIR_MARKER in prompt:
             if isinstance(self.repair, LLMResponse):
                 return self.repair
@@ -61,6 +68,10 @@ class _Scripted:
     @property
     def repairs(self) -> list[str]:
         return [c for c in self.calls if REPAIR_MARKER in c]
+
+    @property
+    def checks(self) -> list[str]:
+        return [c for c in self.calls if CHECK_MARKER in c]
 
 
 def _conversation(turns: int, filler: str = "word " * 60) -> list[dict]:
@@ -349,3 +360,60 @@ async def test_the_repair_may_leave_routine_reads_out():
     await _service(provider).compact(history)
     assert "only read, listed or searched" in provider.repairs[0]
 
+
+# ── A short check before the rewrite ───────────────────────────────────────
+
+READS = "## Exact Identifiers\n- src/kargo/iade.py\n- Read: src/kargo/log_4.py, src/kargo/ci_7.py"
+
+
+def _after(previous: str) -> list[dict]:
+    return [{"role": "system", "content": build_summary_content(previous)}, *_conversation(12)]
+
+
+async def test_details_that_no_longer_matter_cost_no_rewrite():
+    # Measured (task_session_tr, 600 turns, Core 2a13cdc7): the repair
+    # rewrote the whole record for files only read, then left them all out;
+    # compactions took up to 131 s instead of ~60 s.
+    provider = _Scripted(update="## Exact Identifiers\n- src/kargo/iade.py", check="1|DROP\n2|DROP")
+    result = await _service(provider).compact(_after(READS))
+    assert len(provider.checks) == 1
+    assert "1. src/kargo/log_4.py" in provider.checks[0] and "2. src/kargo/ci_7.py" in provider.checks[0]
+    assert provider.repairs == []
+    assert result.summary.count("src/kargo/") == 1
+    assert result.details_missing_before_repair == ["src/kargo/log_4.py", "src/kargo/ci_7.py"]
+    assert result.details_missing_after_repair == ["src/kargo/log_4.py", "src/kargo/ci_7.py"]
+
+
+async def test_only_the_details_that_still_matter_go_to_the_repair():
+    dropped = "## Decisions\n" + ALL_DETAILS.replace("ATLAS-7731 ", "").replace("21 Ekim ", "")
+    provider = _Scripted(update=dropped, check="1|DROP\n2|KEEP", repair="## Decisions\n" + ALL_DETAILS)
+    result = await _service(provider).compact(_history())
+    assert "1. ATLAS-7731" in provider.checks[0] and "2. 21 Ekim" in provider.checks[0]
+    assert len(provider.repairs) == 1
+    assert "- 21 Ekim" in provider.repairs[0]
+    assert "ATLAS-7731" not in provider.repairs[0].split("-----BEGIN")[0]
+    assert result.details_missing_before_repair == ["ATLAS-7731", "21 Ekim"]
+
+
+async def test_a_detail_the_check_does_not_clearly_drop_is_repaired():
+    provider = _Scripted(update="## Exact Identifiers\n- src/kargo/iade.py", check="1|DROP\n2|maybe",
+                         repair="## Exact Identifiers\n- src/kargo/iade.py")
+    await _service(provider).compact(_after(READS))
+    assert len(provider.repairs) == 1
+    assert "- src/kargo/ci_7.py" in provider.repairs[0]
+    assert "- src/kargo/log_4.py" not in provider.repairs[0]
+
+
+async def test_a_failed_check_repairs_every_detail():
+    provider = _Scripted(update="## Exact Identifiers\n- src/kargo/iade.py",
+                         check=LLMResponse(content="Error calling LLM: outage", finish_reason="error"),
+                         repair="## Exact Identifiers\n- src/kargo/iade.py")
+    await _service(provider).compact(_after(READS))
+    assert len(provider.repairs) == 1
+    assert "- src/kargo/log_4.py" in provider.repairs[0] and "- src/kargo/ci_7.py" in provider.repairs[0]
+
+
+async def test_nothing_missing_means_no_check_either():
+    provider = _Scripted(update="## Decisions\n" + ALL_DETAILS)
+    await _service(provider).compact(_history())
+    assert provider.checks == []
