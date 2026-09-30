@@ -2060,8 +2060,13 @@ class AgentLoop:
         if synthetic_goal_id:
             return {"kind": "goal", "goalId": synthetic_goal_id}
         if msg.channel == "cron" or msg.session_key.startswith("cron:"):
+            from flowly.activity.recorder import ROUTINE_METADATA_KEY, ROUTINE_NAME_MAX_CHARS
+
             job_id = msg.session_key.split(":", 1)[1] if ":" in msg.session_key else ""
-            return {"kind": "routine", "jobId": job_id}
+            routine = msg.metadata.get(ROUTINE_METADATA_KEY)
+            name = routine.get("name") if isinstance(routine, dict) else None
+            name = " ".join(name.split())[:ROUTINE_NAME_MAX_CHARS] if isinstance(name, str) else ""
+            return {"kind": "routine", "jobId": job_id, **({"name": name} if name else {})}
         if msg.sender_id in {"subagent", "process", "system", "goal"}:
             return None
         if msg.channel in self._ACTIVITY_OWNER_CHANNELS:

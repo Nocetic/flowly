@@ -440,7 +440,18 @@ def _message(channel: str, chat: str = "c", sender: str = "owner", **metadata: A
     return InboundMessage(channel=channel, sender_id=sender, chat_id=chat, content="hello", metadata=metadata)
 
 
+def test_a_routine_is_titled_by_its_name_until_summarized(home, clock):
+    rec = ActivityRecorder()
+    task = rec.begin(session_key="cron:job-7", task_id="r",
+                     trigger={"kind": "routine", "jobId": "job-7", "name": "Morning brief"},
+                     request="Read my inbox and list what needs me today.")
+    rec.end(task, outcome="completed")
+    item = _everything()["items"][0]
+    assert (item["title"], item["kind"], item["trigger"]["name"]) == ("Morning brief", "routine", "Morning brief")
+
+
 def test_who_started_a_task():
+    from flowly.activity.recorder import ROUTINE_METADATA_KEY
     from flowly.agent.loop import _AGENT_INTRODUCTION, AgentLoop
 
     loop = AgentLoop.__new__(AgentLoop)
@@ -449,6 +460,10 @@ def test_who_started_a_task():
     assert trigger(_message("desktop"), "") == {"kind": "owner"}
     assert trigger(_message("telegram"), "") == {"kind": "channel", "channel": "telegram"}
     assert trigger(_message("cron", "job-7"), "") == {"kind": "routine", "jobId": "job-7"}
+    # The cron runner names the routine; the name is kept to one short line.
+    named = _message("cron", "job-7", **{ROUTINE_METADATA_KEY: {"name": "  Morning\n brief " + "x" * 200}})
+    assert trigger(named, "")["name"] == ("Morning brief " + "x" * 200)[:80]
+    assert "name" not in trigger(_message("cron", "job-7", **{ROUTINE_METADATA_KEY: "junk"}), "")
     assert trigger(_message("web"), "goal-1") == {"kind": "goal", "goalId": "goal-1"}
     # Not the owner's tasks: helper announcements, background notices, the
     # agent's own introduction, heartbeats.

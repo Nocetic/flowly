@@ -34,6 +34,9 @@ def _title(task: dict[str, Any]) -> str:
     recap = task.get("recap") or {}
     if recap.get("title"):
         return recap["title"]
+    routine = (task.get("trigger") or {}).get("name")
+    if isinstance(routine, str) and routine.strip():
+        return routine.strip()
     request = (task.get("request") or "").strip().splitlines()
     first = request[0].strip() if request else ""
     if first:

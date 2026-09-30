@@ -82,7 +82,8 @@ These are **not** tasks:
 
 Who started a task (`trigger.kind`):
 - `owner`: the app, web, CLI, voice;
-- `routine`, with the cron job id;
+- `routine`, with the cron job id and its name. The cron runner passes the
+  name, and until a summary lands the task is titled with it;
 - `goal`, with the goal id;
 - `channel`, with Telegram, Slack and the like.
 

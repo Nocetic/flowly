@@ -503,6 +503,7 @@ def gateway(
     from flowly.cron.types import CronJob
     from flowly.cron import script_runner, skill_loader
     from flowly.cron.context import cron_context
+    from flowly.activity.recorder import ROUTINE_METADATA_KEY
     from flowly.agent import inflight
 
     # Tools hidden from the agent during cron runs.
@@ -1264,6 +1265,8 @@ def gateway(
                         stream_callback=_record_delta,
                         on_iteration=_record_iteration,
                         run_id=run_id,
+                        # The activity journal names the task after its routine.
+                        extra_metadata={ROUTINE_METADATA_KEY: {"name": job.name}},
                     )
                 except Exception as e:
                     err = f"Agent execution failed: {e}"

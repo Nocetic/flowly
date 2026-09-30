@@ -40,6 +40,11 @@ INTERNAL_SESSION_PREFIXES = (
     "subagent:",
 )
 
+# The cron runner names the routine a turn belongs to under this metadata key
+# (``{"name": …}``), so the task reads "Morning brief", not a job id.
+ROUTINE_METADATA_KEY = "_activity_routine"
+ROUTINE_NAME_MAX_CHARS = 80
+
 SUMMARY_MIN_ACTIVE_MS = 30_000
 REQUEST_MAX_CHARS = 280
 STEP_EXCERPT_CHARS = 1_500
