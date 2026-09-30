@@ -50,7 +50,7 @@ def _approval(session_key: str, approval_id: str = "a1", created_at: float | Non
     now = time.time()
     return PendingApproval(id=approval_id, request=ExecRequest(command="rm -rf build"),
                            created_at=now if created_at is None else created_at,
-                           expires_at=now + 30, session_key=session_key)
+                           expires_at=now + 30, session_key=session_key, kind="exec")
 
 
 def _question(session_key: str, question_id: str = "q1", created_at: float | None = None) -> ClarifyRequest:
@@ -118,6 +118,50 @@ async def test_a_plan_waiting_for_approval_is_reported_until_decided(registries)
 def test_a_chat_connection_request_is_reported():
     waiting = pending_inputs([{"sessionKey": "desktop:mcp", "createdAt": 12.5}])
     assert waiting == {"desktop:mcp": {"kind": "connection", "since": 12500, "count": 1}}
+
+
+def test_a_connection_names_the_service_it_is_for():
+    waiting = pending_inputs([{"sessionKey": "desktop:mcp", "createdAt": 1, "name": "higgsfield"}])
+    assert waiting["desktop:mcp"]["subject"] == "higgsfield"
+    assert most_urgent(waiting)["subject"] == "higgsfield"
+
+
+@pytest.mark.asyncio
+async def test_a_tool_action_is_named_but_a_shell_command_never_is(registries):
+    action = _approval("desktop:mail", "a1")
+    action.kind = "action"
+    action.request = ExecRequest(command="Send   email\n to team@example.com")
+    command = _approval("desktop:shell", "a2")
+    waits = [asyncio.create_task(registries.approvals.request_and_wait(item)) for item in (action, command)]
+    await _until(lambda: len(registries.approvals.list_pending()) == 2)
+
+    waiting = pending_inputs()
+    assert waiting["desktop:mail"]["subject"] == "Send email to team@example.com"
+    assert "subject" not in waiting["desktop:shell"]
+
+    registries.approvals.resolve("a1", "deny")
+    registries.approvals.resolve("a2", "deny")
+    await asyncio.gather(*waits)
+
+
+def test_a_long_subject_is_cut_to_one_short_line():
+    waiting = pending_inputs([{"sessionKey": "desktop:mcp", "createdAt": 1, "name": "x" * 200}])
+    subject = waiting["desktop:mcp"]["subject"]
+    assert len(subject) == 80 and subject.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_the_subject_comes_from_the_wait_that_is_shown(registries):
+    wait = asyncio.create_task(registries.questions.request_and_wait(_question("desktop:both", created_at=5.0)))
+    await _until(lambda: registries.questions.list_pending())
+
+    # The question outranks the connection, so the connection's name is not shown.
+    waiting = pending_inputs([{"sessionKey": "desktop:both", "createdAt": 1, "name": "higgsfield"}])
+    assert waiting["desktop:both"]["kind"] == "question"
+    assert "subject" not in waiting["desktop:both"]
+
+    registries.questions.resolve("q1", "A")
+    await wait
 
 
 @pytest.mark.asyncio
@@ -335,13 +379,27 @@ async def test_hidden_and_malformed_waits_are_dropped(profile_roots):
         "desktop:profile-inbox:reviewer:s1": {"kind": "approval", "since": 1, "count": 1},
         "telegram:123": {"kind": "approval", "since": 1, "count": 1},
         "desktop:odd": {"kind": "shout", "since": 1, "count": 1},
-        "desktop:home": {"kind": "plan", "since": -4, "count": True},
+        "desktop:home": {"kind": "plan", "since": -4, "count": True, "subject": 7},
+        "ios:mcp": {"kind": "connection", "since": 1, "count": 1, "subject": "  higgs\nfield "},
     }}
     host, runtime, _calls, _events = _host_with_runtime(answer=answer)
 
     host._schedule_attention_refresh(runtime)
     await _until(lambda: runtime.attention)
-    assert runtime.attention == {"desktop:home": {"kind": "plan", "since": 0, "count": 1}}
+    assert runtime.attention == {
+        "desktop:home": {"kind": "plan", "since": 0, "count": 1},
+        "ios:mcp": {"kind": "connection", "since": 1, "count": 1, "subject": "higgs field"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_bot_status_names_what_its_most_urgent_wait_is_for(profile_roots):
+    answer = {"sessions": {"ios:mcp": {"kind": "connection", "since": 1, "count": 1, "subject": "higgsfield"}}}
+    host, runtime, _calls, _events = _host_with_runtime(answer=answer)
+
+    host._schedule_attention_refresh(runtime)
+    await _until(lambda: runtime.attention)
+    assert host.status("writer")["needsInput"]["subject"] == "higgsfield"
 
 
 @pytest.mark.asyncio

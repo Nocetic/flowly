@@ -55,7 +55,7 @@ from flowly.profile_host_contract import (
     is_internal_profile_session,
     validate_profile_rpc,
 )
-from flowly.session.attention import KINDS as _ATTENTION_KINDS, most_urgent
+from flowly.session.attention import KINDS as _ATTENTION_KINDS, clean_subject, most_urgent
 
 ProfileEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 ProfileRoomEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -272,10 +272,12 @@ def _clean_attention(result: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(wait, dict) or wait.get("kind") not in _ATTENTION_KINDS:
             continue
         since, count = wait.get("since"), wait.get("count")
+        subject = clean_subject(wait.get("subject"))
         clean[key] = {
             "kind": wait["kind"],
             "since": since if isinstance(since, int) and not isinstance(since, bool) and since >= 0 else 0,
             "count": count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 1,
+            **({"subject": subject} if subject else {}),
         }
     return clean
 

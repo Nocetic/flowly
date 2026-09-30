@@ -42,7 +42,7 @@ decision the owner can take later.
 `pending_inputs()` reads the four registries when called and returns
 
 ```json
-{ "desktop:abc": { "kind": "approval", "since": 1727690000000, "count": 2 } }
+{ "desktop:abc": { "kind": "connection", "since": 1727690000000, "count": 1, "subject": "higgsfield" } }
 ```
 
 `kind` is the most urgent kind in that conversation, `since` (ms) when the
@@ -50,6 +50,14 @@ oldest wait began, `count` how many waits. Nothing is persisted: a wait that
 ends is gone from the next read, so there is no flag to clear and nothing to
 drift. A registry that fails is logged and skipped; it never hides the
 others.
+
+`subject` (optional) says what the shown wait is about, when that is safe in
+a list: the service a connection is for (`higgsfield`), or the sentence a
+tool action already uses for people ("Send email to …"). It comes from the
+oldest wait of the shown kind, is one line and at most 80 characters. A shell
+or Codex command is never a subject: it belongs on the approval card, not in
+a sidebar. Clients show `subject` beside the state ("Wants to connect ·
+Higgsfield") and fall back to the state alone.
 
 ## 4. Wire
 
@@ -61,7 +69,7 @@ others.
   needsInput}}`. The cheap form for callers that only need this. An
   account-scoped request sees only the keys `sessions.list` would show it.
 - **`profiles.status`** (and each entry of `profiles.statuses`): a connected
-  bot carries `needsInput: {sessionKey, kind, since, count}`, its most
+  bot carries `needsInput: {sessionKey, kind, since, count, subject?}`, its most
   urgent wait (kind first, then the longest), `count` summed across its
   conversations. A stopped bot has no turn, so nothing waits.
 - **Profile event `needsInput`** (a `profile.event` envelope, routed like
