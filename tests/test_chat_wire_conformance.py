@@ -320,6 +320,8 @@ def test_chat_inflight_is_null_when_nothing_is_running():
     assert result["inflight"] is None
     assert result["compaction"] is None
     assert result["plan"] is None
+    assert result["approvals"] == []
+    assert result["clarifies"] == []
 
 
 def test_a_compaction_cycle_is_identifiable():

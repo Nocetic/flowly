@@ -901,7 +901,49 @@ def chat_inflight(params: dict) -> dict:
         result["goal"] = goal_get({"sessionKey": session_key})["goal"]
     except Exception:
         result["goal"] = None
+    # A prompt the agent is parked on is announced once, as an event. A client
+    # that reloaded or re-entered this chat after it fired has no other way to
+    # learn it is still waiting, so the handshake carries the conversation's
+    # open approvals and questions, serialized exactly like those events.
+    result["approvals"], result["clarifies"] = _pending_prompts(session_key)
     return result
+
+
+def _pending_prompts(session_key: str) -> tuple[list[dict], list[dict]]:
+    """Open approvals and questions of one conversation, oldest first.
+
+    The managers' own listing already hides what the caller may not control,
+    so an account-scoped request never sees another owner's prompt.
+    """
+    if not session_key:
+        return [], []
+    from loguru import logger
+
+    approvals: list[dict] = []
+    clarifies: list[dict] = []
+    try:
+        from flowly.exec.approval_manager import get_approval_manager
+        from flowly.exec.wire import approval_to_wire
+
+        approvals = [
+            approval_to_wire(pending)
+            for pending in sorted(get_approval_manager().list_pending(), key=lambda item: item.created_at)
+            if pending.session_key == session_key
+        ]
+    except Exception as exc:  # noqa: BLE001 — the rest of the handshake still counts
+        logger.debug(f"[chat.inflight] approvals unavailable: {exc}")
+    try:
+        from flowly.clarify.manager import get_clarify_manager
+        from flowly.clarify.wire import clarify_to_wire
+
+        clarifies = [
+            clarify_to_wire(pending)
+            for pending in sorted(get_clarify_manager().list_pending(), key=lambda item: item.created_at)
+            if pending.session_key == session_key
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[chat.inflight] questions unavailable: {exc}")
+    return approvals, clarifies
 
 
 # Host-supplied live goal lookup. The disk fallback keeps the shared relay RPC
