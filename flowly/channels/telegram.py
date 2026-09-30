@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 
 from loguru import logger
+
+from flowly.gateway_logs.notable import notable
 from telegram import Update, InputFile, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import NetworkError, TelegramError
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -240,12 +242,12 @@ class TelegramChannel(BaseChannel):
 
         # Get bot info
         bot_info = await self._app.bot.get_me()
-        logger.info(f"Telegram bot @{bot_info.username} connected")
+        notable("channel.connected", channel="Telegram", account=f"@{bot_info.username}")
 
         # Register bot commands (shows in Telegram's command menu)
         try:
             await self._app.bot.set_my_commands(self.NATIVE_COMMANDS)
-            logger.info(f"Registered {len(self.NATIVE_COMMANDS)} native commands")
+            logger.debug(f"Registered {len(self.NATIVE_COMMANDS)} native commands")
         except Exception as e:
             logger.warning(f"Failed to set bot commands: {e}")
 

@@ -31,10 +31,18 @@ from typing import Any
 
 from loguru import logger
 
+from flowly.gateway_logs.notable import NOTABLE
+
 REJECTED_WINDOW_SECONDS = 600
 _PEER = re.compile(r"from (?P<ip>[0-9a-fA-F:.]+)")
 _LEVELS = {logging.CRITICAL: "CRITICAL", logging.ERROR: "ERROR", logging.WARNING: "WARNING",
            logging.INFO: "INFO", logging.DEBUG: "DEBUG"}
+
+
+def _notable(code: str, **params: object) -> tuple[str, str]:
+    """(level, message) for a notable line, from its one definition."""
+    level, template = NOTABLE[code]
+    return level, template.format(**params)
 
 
 def _malformed_request(record: logging.LogRecord) -> bool:
@@ -72,7 +80,7 @@ class LoguruBridge(logging.Handler):
                 return
             channel = _channel_dropped(record)
             if channel:
-                self._write(record, "WARNING", f"{channel} connection dropped; reconnecting on its own.")
+                self._write(record, *_notable("channel.reconnecting", channel=channel))
                 return
             level = _LEVELS.get(record.levelno, record.levelname)
             self._write(record, level, record.getMessage(), exc_info=record.exc_info)
@@ -88,8 +96,7 @@ class LoguruBridge(logging.Handler):
             if self._rejected_since and now - self._rejected_since < REJECTED_WINDOW_SECONDS:
                 return
             count, self._rejected, self._rejected_since = self._rejected, 0, now
-        self._write(record, "INFO", f"Rejected {count} malformed request(s) from the internet; latest from {ip}. "
-                                    "Usually a scanner probing the open port; nothing reached the agent.")
+        self._write(record, *_notable("net.rejected_request", count=count, ip=ip))
 
     @staticmethod
     def _write(record: logging.LogRecord, level: str, message: str, exc_info: Any = None) -> None:

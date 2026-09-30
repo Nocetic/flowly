@@ -3509,10 +3509,13 @@ def logs_tail(params: dict) -> dict:
     Params: ``lines`` (default 200, cap 500), ``cursor`` and ``file`` from a
     previous reply. With both, only lines written since are returned; another
     file (daily rotation) or a cursor past the end starts from the tail again.
-    Only complete lines are returned. Returns
+    Only complete lines are returned, redacted like ``logs.events``. Returns
     ``{lines, cursor, file, available}``. Clients that predate ``file`` keep
     working: without it every call is a fresh tail."""
+    from pathlib import Path
+
     from flowly.gateway_logs.events import read_tail
+    from flowly.gateway_logs.redact import redact
 
     _require_log_reader()
     limit = params.get("lines", 200)
@@ -3521,7 +3524,8 @@ def logs_tail(params: dict) -> dict:
     # A client that predates ``file`` sends a bare cursor: honour it against
     # the current file, as before.
     tail = _tail_without_file(cursor) if cursor is not None and file is None else read_tail(cursor, file)
-    return {"lines": [text for _offset, text in tail.lines][-limit:], "cursor": tail.cursor,
+    home = str(Path.home())
+    return {"lines": [redact(text, home) for _offset, text in tail.lines][-limit:], "cursor": tail.cursor,
             "file": tail.file_id, "available": tail.available}
 
 
@@ -3542,24 +3546,30 @@ def logs_events(params: dict) -> dict:
 
     Each event: ``id, ts (ms), level, source, message``, optional ``detail``
     (a traceback or continuation), ``code`` + ``params`` for situations clients
-    explain in plain words, ``signature`` (the same thing again) and ``count``
-    / ``firstTs`` when repeats in this read were collapsed. ``level``: ``all``
-    (default) or ``issues`` (warnings and errors). ``limit``: 1–500 (200),
-    newest kept. ``reset`` says the client should replace what it shows rather
-    than append (first read, rotation, truncation)."""
+    explain in plain words, ``notable`` (worth showing by default),
+    ``signature`` (the same thing again) and ``count`` / ``firstTs`` when
+    repeats in this read were collapsed. Text is redacted (credentials, home
+    directory, full identifiers). Debug lines are never served.
+
+    ``view``: ``notable`` (default: lifecycle moments and problems),
+    ``issues`` (warnings and errors) or ``technical`` (every line). ``limit``:
+    1–500 (200), newest kept. ``reset`` says the client should replace what it
+    shows rather than append (first read, rotation, truncation)."""
     from flowly.gateway_logs import events as log_events
 
     _require_log_reader()
-    level = params.get("level", "all")
-    if level not in ("all", "issues"):
-        raise FeatureRpcError("INVALID_PARAMS", "level must be 'all' or 'issues'.")
+    view = params.get("view", "notable")
+    if view not in ("notable", "issues", "technical"):
+        raise FeatureRpcError("INVALID_PARAMS", "view must be 'notable', 'issues' or 'technical'.")
     limit = params.get("limit", 200)
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
         raise FeatureRpcError("INVALID_PARAMS", "limit must be a whole number from 1 to 500.")
     cursor, file = _log_cursor(params)
     tail = log_events.read_tail(cursor, file)
-    parsed = log_events.parse(tail.lines, tail.file_id)
-    if level == "issues":
+    parsed = [event for event in log_events.parse(tail.lines, tail.file_id) if event["level"] != "debug"]
+    if view == "notable":
+        parsed = [event for event in parsed if event["notable"]]
+    elif view == "issues":
         parsed = [event for event in parsed if event["level"] in log_events.ISSUE_LEVELS]
     return {"events": log_events.collapse(parsed)[-limit:], "cursor": tail.cursor, "file": tail.file_id,
             "available": tail.available, "reset": tail.reset}

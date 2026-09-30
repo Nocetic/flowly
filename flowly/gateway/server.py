@@ -20,6 +20,8 @@ import aiohttp
 from aiohttp import web
 from loguru import logger
 
+from flowly.gateway_logs.notable import notable
+
 from flowly.agent.subagent_registry import SubagentRegistry
 from flowly.agent.subagent_observation import client_event, event_version
 from flowly.artifacts.summary import artifact_summary
@@ -1332,7 +1334,7 @@ class GatewayServer:
             client_id = str(uuid.uuid4())
         self._ws_clients[client_id] = ws
         self.event_recipients.get(ws)
-        logger.info(f"[WS] Desktop client connected: {client_id}")
+        logger.debug(f"[WS] Desktop client connected: {client_id}")
 
         long_rpc_tasks: set[asyncio.Task[None]] = set()
 
@@ -1441,7 +1443,7 @@ class GatewayServer:
                     f"(cancelled {cancelled} pending, remaining: {len(self._extension_clients)})"
                 )
             elif is_current_connection:
-                logger.info(f"[WS] Desktop client disconnected: {client_id}")
+                logger.debug(f"[WS] Desktop client disconnected: {client_id}")
 
             # Auto-stop only when this was still the current socket. A stable
             # client id may already have reattached on a replacement WS; stale
@@ -1711,7 +1713,7 @@ class GatewayServer:
             # extensions. It now feeds the same provider registry.
             elif method == "extension.register":
                 result = self._register_browser_provider(client_id, params, legacy=True)
-                logger.info(
+                logger.debug(
                     f"[WS] Legacy browser extension registered: {client_id} "
                     f"as {result['provider']['id']} (total: {len(self._extension_clients)})"
                 )
@@ -1723,7 +1725,7 @@ class GatewayServer:
                 except ValueError as exc:
                     await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", str(exc))
                     return
-                logger.info(
+                logger.debug(
                     f"[WS] Browser provider registered: {result['provider']['id']} "
                     f"({result['provider']['type']})"
                 )
@@ -3224,7 +3226,7 @@ class GatewayServer:
 
             try:
                 set_session_cwd(session_key, cwd)
-                logger.info(f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}")
+                logger.debug(f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}")
             except ValueError:
                 # Defensive: a client may ship a path that doesn't exist
                 # on this host (older client without per-kind cwd gating,
@@ -5806,7 +5808,7 @@ class GatewayServer:
                 write_api_file(self.host, self.port, self._control_token)
             except Exception as exc:  # pragma: no cover
                 logger.debug("MCP control advertise failed: {}", exc)
-        logger.info(f"Gateway API listening on http://{self.host}:{self.port}")
+        notable("gateway.started", address=f"http://{self.host}:{self.port}")
         if self.on_chat_message:
             logger.info(f"Desktop WebSocket available at ws://{self.host}:{self.port}/ws")
 
@@ -5854,4 +5856,4 @@ class GatewayServer:
             await self._site.stop()
         if self._runner:
             await self._runner.cleanup()
-        logger.info("Gateway API stopped")
+        notable("gateway.stopped")

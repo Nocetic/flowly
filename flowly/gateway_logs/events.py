@@ -15,12 +15,17 @@ Parsing
     traceback or a multi-line message — and becomes its ``detail``.
 
 Classifying
-    A few situations recur and mean something specific to an owner: a
-    rejected request from an internet scanner, a messaging channel
-    reconnecting, a connection (MCP server) dropping, an app connecting. Each
-    gets a stable ``code`` with its ``params``; clients explain codes in plain
-    words and fall back to the message. ``signature`` identifies "the same
-    thing again", so clients collapse repeats even across polls.
+    Lines written through ``notable`` (lifecycle moments and known problems)
+    are recognised from the same templates that wrote them; a few library
+    lines are recognised by pattern. Each gets a stable ``code`` with its
+    ``params``, which clients explain in plain words. ``notable`` marks what
+    an owner should see by default: those codes, and every warning or error.
+    ``signature`` identifies "the same thing again", so clients collapse
+    repeats even across polls.
+
+Serving
+    Messages, details and params pass through ``redact``: credentials, the
+    home directory and full identifiers do not leave the machine.
 """
 
 from __future__ import annotations
@@ -32,6 +37,8 @@ from pathlib import Path
 from typing import Any
 
 from flowly.gateway_logs.files import current_log_file, file_id
+from flowly.gateway_logs.notable import NOTABLE, PATTERNS
+from flowly.gateway_logs.redact import redact
 
 TAIL_BYTES = 256 * 1024
 MESSAGE_MAX = 600
@@ -114,35 +121,35 @@ def _cap(text: str, limit: int) -> str:
 
 # ── What a line means ────────────────────────────────────────────────────
 
+# Lines Flowly does not write through ``notable`` — a library's, or an older
+# Flowly's — that still mean something specific.
 _IP = r"(?P<ip>[0-9a-fA-F:.]+)"
-_RULES: tuple[tuple[str, re.Pattern[str], tuple[str, ...]], ...] = (
-    ("net.rejected_request",
-     re.compile(r"^Rejected (?P<count>\d+) malformed request\(s\) from the internet; latest from " + _IP), ("count", "ip")),
+_FOREIGN: tuple[tuple[str, re.Pattern[str], tuple[str, ...]], ...] = (
     ("net.rejected_request", re.compile(r"^Error handling request from " + _IP), ("ip",)),
-    ("channel.reconnecting",
-     re.compile(r"^(?P<channel>Slack|Discord|Telegram) connection dropped; reconnecting"), ("channel",)),
-    ("channel.reconnecting",
-     re.compile(r"^Failed to receive or enqueue a message: ConnectionClosed"), ()),
+    ("channel.reconnecting", re.compile(r"^Failed to receive or enqueue a message: ConnectionClosed"), ()),
     ("mcp.disconnected",
-     re.compile(r"^MCP server '(?P<server>[^']+)' disconnected: (?P<reason>.*?)(?:; reconnecting in [\d.]+s)?$"),
+     re.compile(r"^MCP server '(?P<server>[^']+)' disconnected: (?P<reason>.*?)"
+                r"(?:; (?:reconnecting|probing parked server) in [\d.]+s)?$"),
      ("server", "reason")),
-    ("client.connected", re.compile(r"^\[WS\] (?P<surface>Desktop|TUI|iOS|Android) client connected"), ("surface",)),
-    ("client.connected", re.compile(r"^\[WebChannel\] Browser connected"), ()),
-    ("client.disconnected",
-     re.compile(r"^\[WS\] (?P<surface>Desktop|TUI|iOS|Android) client disconnected"), ("surface",)),
-    ("client.disconnected", re.compile(r"^\[WebChannel\] Browser disconnected"), ()),
 )
 _SOURCE_DEFAULTS = {"slack_sdk": {"channel": "Slack"}}
+NOTABLE_CODES = frozenset({*NOTABLE, *(code for code, _pattern, _keys in _FOREIGN)})
 # Identifiers that differ between otherwise identical messages.
 _VOLATILE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\b\d+(?:\.\d+)*\b|\b[sS]_\d+\b|0x[0-9a-f]+",
     re.IGNORECASE,
 )
-_SIGNATURE_PARAMS = {"channel", "server", "surface"}
+# What makes two occurrences "the same thing": the channel, server or routine,
+# never a count, an address or a reason.
+_SIGNATURE_PARAMS = {"channel", "server", "name"}
 
 
 def classify(source: str, message: str) -> tuple[str | None, dict[str, str]]:
-    for code, pattern, keys in _RULES:
+    for code, pattern in PATTERNS:
+        match = pattern.match(message)
+        if match:
+            return code, {key: _cap(value, 120) for key, value in match.groupdict().items()}
+    for code, pattern, keys in _FOREIGN:
         match = pattern.search(message)
         if match:
             params = {key: _cap(match.group(key), 120) for key in keys if match.group(key)}
@@ -188,18 +195,27 @@ def parse(lines: list[tuple[int, str]], identity: str) -> list[dict[str, Any]]:
             "ts": _timestamp(groups["ts"]) if groups.get("ts") else None,
             "level": level,
             "source": source,
-            "message": _cap(message, MESSAGE_MAX),
+            "message": message,
             **({"code": code, "params": params} if code else {}),
-            "signature": _signature(level, source, code, params, message),
         })
     close()
-    # A traceback line can carry the real reason; let the rules see it too.
+    home = str(Path.home())
     for event in events:
+        # A traceback line can carry the real reason; let the rules see it too.
         if "code" not in event and event.get("detail"):
             code, params = classify(event["source"], event["detail"].splitlines()[-1].strip())
             if code:
-                event.update({"code": code, "params": params,
-                              "signature": _signature(event["level"], event["source"], code, params, event["message"])})
+                event.update({"code": code, "params": params})
+        event["notable"] = event.get("code") in NOTABLE_CODES or event["level"] in ISSUE_LEVELS
+        # Nothing secret or personal leaves in what is served — the signature
+        # included, so it is derived again from the redacted text.
+        message = redact(event["message"], home)
+        event["message"] = _cap(message, MESSAGE_MAX)
+        if event.get("detail"):
+            event["detail"] = redact(event["detail"], home)
+        if event.get("params"):
+            event["params"] = {key: redact(value, home) for key, value in event["params"].items()}
+        event["signature"] = _signature(event["level"], event["source"], event.get("code"), event.get("params") or {}, message)
     return events
 
 

@@ -6280,7 +6280,7 @@ class AgentLoop:
             if iteration > 8:
                 messages = _strip_old_tool_results(messages, keep_last=2, max_old_chars=150)
 
-            logger.info(
+            logger.debug(
                 "LLM request telemetry: "
                 f"model={selected_model}, tool_choice={tool_choice}, tool_count={len(tool_defs)}, "
                 f"reachable_tool_count={len(disclosure.all_names)}, "
@@ -7111,7 +7111,7 @@ class AgentLoop:
                         _tool_elapsed = time.monotonic() - _t0
                         if _tool_success:
                             turn_success_count += 1
-                            logger.info(
+                            logger.debug(
                                 f"Tool success: {_effective_tool_name} result={result[:180]}"
                             )
                             # Track ASYNC (background) subagent dispatch so the
@@ -7260,7 +7260,7 @@ class AgentLoop:
                         )
                         break
 
-                logger.info(f"Tool execution telemetry: executed_tools={turn_tools}")
+                logger.debug(f"Tool execution telemetry: executed_tools={turn_tools}")
                 if outbound_run_id and self.is_run_aborted(outbound_run_id):
                     # Keep the model's already-streamed preamble as the partial
                     # final. Tool protocol messages/results remain in

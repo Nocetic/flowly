@@ -609,6 +609,15 @@ def gateway(
             logger.remove(0)  # loguru's default stderr handler
         except (ValueError, OSError):
             pass
+    else:
+        # In a terminal, show what the file keeps: INFO unless --verbose.
+        # Loguru's default sink prints DEBUG, which floods the terminal with
+        # internals (store paths, per-connection chatter).
+        try:
+            logger.remove(0)
+            logger.add(sys.stderr, level="DEBUG" if verbose else "INFO")
+        except (ValueError, OSError):
+            pass
 
     from flowly import __banner__
     console.print(f"[cyan]{__banner__.format(version=__version__)}[/cyan]")
