@@ -3863,25 +3863,106 @@ def sessions_attention() -> dict:
 
     An account-scoped request sees only the conversations ``sessions.list``
     would show it; a key it may not open is left out, not just its row."""
+    waiting = _pending_inputs()
+    visible = _session_visibility()
+    return {"sessions": {key: wait for key, wait in waiting.items() if visible(key)}}
+
+
+def _session_visibility():
+    """A predicate: may the current request see this conversation?
+
+    In-process callers see everything. An account-scoped request sees what
+    ``sessions.list`` would show it; a conversation whose file cannot be read
+    is not shown. The answer is kept per key for the one request.
+    """
     from flowly.live_voice.authority import current_request_owner
 
-    waiting = _pending_inputs()
     if current_request_owner() is None:
-        return {"sessions": waiting}
+        return lambda _key: True
     from flowly.session.ownership import read_session_metadata, session_visible
     from flowly.utils.helpers import safe_filename
 
     sessions_dir = get_flowly_home() / "sessions"
-    visible = {}
-    for key, wait in waiting.items():
+    known: dict[str, bool] = {}
+
+    def visible(key: str) -> bool:
+        if key not in known:
+            try:
+                path = sessions_dir / (safe_filename(key.replace(":", "_")) + ".jsonl")
+                metadata = read_session_metadata(path, key)
+                known[key] = session_visible(key, metadata if metadata is not None else {})
+            except Exception:  # noqa: BLE001 — unreadable means not shown
+                known[key] = False
+        return known[key]
+
+    return visible
+
+
+# ── Activity: the bot's tasks (docs/engineering/activity-journal.md) ──────
+
+_activity_pruned = False
+
+
+def _activity_now() -> tuple[set[str], set[str]]:
+    """``(running task ids, conversations waiting on the owner)`` right now."""
+    from flowly.activity import get_activity_recorder
+
+    return get_activity_recorder().active_ids(), set(_pending_inputs())
+
+
+def _activity_int(params: dict, key: str, *, default: int | None, low: int, high: int) -> int | None:
+    value = params.get(key, default)
+    if value is None and default is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise FeatureRpcError("INVALID_PARAMS", f"{key} must be a whole number from {low} to {high}.")
+    return value
+
+
+def activity_list(params: dict) -> dict:
+    """Newest tasks first: ``{items, nextBefore, seenBefore}``.
+
+    ``before`` pages back from a task's ``startedAt``; ``limit`` is 1–100."""
+    global _activity_pruned
+    from flowly.activity import journal, store
+
+    limit = _activity_int(params, "limit", default=30, low=1, high=100)
+    before = _activity_int(params, "before", default=None, low=0, high=2**53)
+    if not _activity_pruned:
+        _activity_pruned = True
         try:
-            path = sessions_dir / (safe_filename(key.replace(":", "_")) + ".jsonl")
-            metadata = read_session_metadata(path, key)
-        except Exception:  # noqa: BLE001 — unreadable means not shown
-            continue
-        if session_visible(key, metadata if metadata is not None else {}):
-            visible[key] = wait
-    return {"sessions": visible}
+            from flowly.config.loader import load_config
+
+            store.prune(load_config().activity.retention_days)
+        except Exception:  # noqa: BLE001 — retention is housekeeping
+            pass
+    running, waiting = _activity_now()
+    return journal.list_tasks(limit=limit, before=before, visible=_session_visibility(),
+                              running_ids=running, waiting_keys=waiting)
+
+
+def activity_get(params: dict) -> dict:
+    """One task in full, with its steps: ``{task}``."""
+    from flowly.activity import journal
+
+    task_id = params.get("id")
+    if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128 or any(ord(c) < 32 for c in task_id):
+        raise FeatureRpcError("INVALID_PARAMS", "A task id is required.")
+    running, waiting = _activity_now()
+    task = journal.get_task(task_id, visible=_session_visibility(), running_ids=running, waiting_keys=waiting)
+    if task is None:
+        raise FeatureRpcError("NOT_FOUND", "This task is no longer in the activity log.")
+    return {"task": task}
+
+
+def activity_seen(params: dict) -> dict:
+    """The owner has seen every task up to ``before`` (ms): ``{seenBefore}``."""
+    from flowly.activity import journal
+
+    before = _activity_int(params, "before", default=None, low=0, high=2**53)
+    if before is None:
+        raise FeatureRpcError("INVALID_PARAMS", "before is required.")
+    return {"seenBefore": journal.mark_seen(before)}
 
 
 def sessions_read(params: dict) -> dict:
@@ -5370,6 +5451,9 @@ _DISPATCH: dict[str, tuple] = {
     "kg.delete_entity": (kg_delete_entity, True, False),
     "sessions.list": (sessions_list, False, False),
     "sessions.attention": (sessions_attention, False, False),
+    "activity.list": (activity_list, True, False),
+    "activity.get": (activity_get, True, False),
+    "activity.seen": (activity_seen, True, False),
     "sessions.read": (sessions_read, True, False),
     "audit.list": (audit_list, True, False),
     "audit.stats": (audit_stats, False, False),

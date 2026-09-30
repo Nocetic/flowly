@@ -1043,6 +1043,18 @@ class MediaConfig(BaseModel):
     retention: MediaRetentionConfig = Field(default_factory=MediaRetentionConfig)
 
 
+class ActivityConfig(BaseModel):
+    """The owner-facing activity journal (``docs/engineering/activity-journal.md``).
+
+    Every task is recorded either way. ``summaries`` decides whether the bot's
+    own model also writes a title, an outcome and a short summary for tasks
+    that used a tool or worked for 30 seconds or more.
+    ``retention_days=-1`` keeps the journal forever.
+    """
+    summaries: bool = True
+    retention_days: int = 90
+
+
 class AuditConfig(BaseModel):
     """Audit log retention configuration.
 
@@ -1254,6 +1266,7 @@ class Config(BaseSettings):
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
+    activity: ActivityConfig = Field(default_factory=ActivityConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(

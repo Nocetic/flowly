@@ -2049,6 +2049,98 @@ class AgentLoop:
             logger.debug("[title] schedule failed", exc_info=True)
             # titling is best-effort; never disturb the turn
 
+    # ── Activity (docs/engineering/activity-journal.md) ──────────────────
+
+    _ACTIVITY_OWNER_CHANNELS = frozenset({"web", "desktop", "ios", "android", "cli", "api", "voice"})
+
+    def _activity_trigger(self, msg: InboundMessage, synthetic_goal_id: str) -> dict[str, Any] | None:
+        """Who started this turn, or None when it is not the owner's task."""
+        if msg.channel == "system" or msg.metadata.get(_AGENT_INTRODUCTION):
+            return None
+        if synthetic_goal_id:
+            return {"kind": "goal", "goalId": synthetic_goal_id}
+        if msg.channel == "cron" or msg.session_key.startswith("cron:"):
+            job_id = msg.session_key.split(":", 1)[1] if ":" in msg.session_key else ""
+            return {"kind": "routine", "jobId": job_id}
+        if msg.sender_id in {"subagent", "process", "system", "goal"}:
+            return None
+        if msg.channel in self._ACTIVITY_OWNER_CHANNELS:
+            return {"kind": "owner"}
+        if msg.channel in _NON_USER_CHANNELS:
+            return None
+        return {"kind": "channel", "channel": msg.channel}
+
+    def _activity_begin(self, msg: InboundMessage, run_id: str, synthetic_goal_id: str) -> Any:
+        try:
+            trigger = self._activity_trigger(msg, synthetic_goal_id)
+            if trigger is None:
+                return None
+            request = msg.content or ""
+            if synthetic_goal_id and getattr(self, "goal_manager", None) is not None:
+                state = self.goal_manager.get(msg.session_key)
+                request = getattr(state, "goal", "") or request
+            from flowly.activity import get_activity_recorder
+
+            return get_activity_recorder().begin(
+                session_key=msg.session_key, task_id=run_id, trigger=trigger, request=request,
+            )
+        except Exception:  # noqa: BLE001 — activity never fails a turn
+            logger.debug("[activity] could not start a task", exc_info=True)
+            return None
+
+    def _activity_finish(self, task: Any, outcome: str, response: Any, msg: InboundMessage,
+                         *, cancelled: bool) -> None:
+        if task is None:
+            return
+        try:
+            from flowly.activity import get_activity_recorder
+
+            metadata = getattr(response, "metadata", None) or {}
+            # No reply and not cancelled: the agent chose to stay silent (a
+            # passive group message, a dropped dispatch). Not a stop.
+            if outcome == "aborted" and response is None and not cancelled:
+                outcome = "silent"
+            error = metadata.get("error") if isinstance(metadata.get("error"), dict) else {}
+            title = ""
+            if self.sessions.exists(msg.session_key):
+                title = str(self.sessions.get_or_create(msg.session_key).metadata.get("title") or "")
+            model = str(metadata.get("model") or getattr(self, "model", "") or "")
+            ended = get_activity_recorder().end(
+                task, outcome=outcome, usage=metadata.get("usage"), model=model,
+                error=str(error.get("message") or error.get("title") or ""), conversation_title=title,
+            )
+            if ended is not None and ended.summarize:
+                self._activity_schedule_recap(ended, str(getattr(response, "content", "") or ""), model)
+        except Exception:  # noqa: BLE001 — activity never fails a turn
+            logger.debug("[activity] could not finish a task", exc_info=True)
+
+    def _activity_schedule_recap(self, ended: Any, reply: str, model: str) -> None:
+        try:
+            from flowly.config.loader import load_config
+
+            if not load_config().activity.summaries:
+                return
+        except Exception:  # noqa: BLE001 — unreadable config: keep the default (on)
+            pass
+        if not hasattr(self, "_activity_recap_tasks"):
+            self._activity_recap_tasks: set[asyncio.Task] = set()
+        task = asyncio.create_task(self._activity_recap(ended, reply, model))
+        self._activity_recap_tasks.add(task)
+        task.add_done_callback(self._activity_recap_tasks.discard)
+
+    async def _activity_recap(self, ended: Any, reply: str, model: str) -> None:
+        from flowly.activity import recap, store
+
+        summary, usage = await recap.summarize(self.provider, model or None, ended.record, ended.excerpts, reply)
+        if summary is None and not usage:
+            return
+        line: dict[str, Any] = {"type": "recap", "id": ended.record["id"]}
+        if summary is not None:
+            line["recap"] = summary
+        if usage:
+            line["recapTokens"] = usage
+        store.append(line, at_ms=ended.record["startedAt"])
+
     async def _autotitle_session(self, session: Any, user_content: str, final_content: str) -> None:
         from flowly.session.title import generate_title
 
@@ -7052,6 +7144,15 @@ class AgentLoop:
                             duration_ms=_duration_ms,
                             success=_tool_success,
                         )
+                        try:
+                            from flowly.activity import get_activity_recorder
+
+                            get_activity_recorder().note_tool(
+                                _current_session_key, _effective_tool_name, call_args,
+                                ok=bool(_tool_success), duration_ms=_duration_ms, result=_tool_result,
+                            )
+                        except Exception:  # noqa: BLE001 — activity never fails a tool
+                            logger.debug("[activity] could not record a step", exc_info=True)
                         if self.tool_callback:
                             try:
                                 _r = self.tool_callback("tool.complete", {
@@ -7792,6 +7893,10 @@ class AgentLoop:
                     commands.begin_execution(msg.session_key, run_id, before_goal)
                 outcome = 'error'
                 response = None
+                # The owner-facing task record starts here, after the turn
+                # lock: time spent queued behind an earlier turn is not work.
+                activity_task = self._activity_begin(msg, run_id, synthetic_goal_id)
+                activity_cancelled = False
                 with goal_turn_scope(msg.session_key, run_id):
                     try:
                         on_started = msg.metadata.get('_on_turn_started')
@@ -7809,8 +7914,11 @@ class AgentLoop:
                         return response
                     except asyncio.CancelledError:
                         outcome = 'aborted'
+                        activity_cancelled = True
                         raise
                     finally:
+                        self._activity_finish(activity_task, outcome, response, msg,
+                                              cancelled=activity_cancelled)
                         from flowly.session.commands import _goal_binding, _goal_observation
 
                         after_goal = observe_goal()
