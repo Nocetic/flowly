@@ -73,6 +73,7 @@ _LOCAL_RUNTIME_CAPABILITIES = (
     "shared-services-v1",
     "voice-owner-hop-v1",
     "voice-owner-events-v1",
+    "session-attention-v1",
 )
 
 

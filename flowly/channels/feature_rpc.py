@@ -3715,6 +3715,9 @@ def sessions_list() -> dict:
     from flowly.session.keys import read_session_header, session_key_from_header
     from flowly.session.ownership import require_session_file, session_visible
 
+    # What each conversation is waiting on from the owner (an approval, a
+    # question, a plan, a connection), read once for the whole list.
+    waiting = _pending_inputs()
     out = []
     if sessions_dir.exists():
         from flowly.session.manager import iter_session_files
@@ -3777,6 +3780,10 @@ def sessions_list() -> dict:
                         # True while a turn for this session is in flight — drives the
                         # client's "running" shimmer. Old clients ignore the field.
                         "running": _inflight_get(key) is not None,
+                        # Set while the conversation waits for the owner:
+                        # {kind: approval|question|plan|connection, since (ms),
+                        # count}. Absent otherwise; old clients ignore it.
+                        **({"needsInput": waiting[key]} if key in waiting else {}),
                         # Conversation-scoped model selection. This is safe to
                         # expose (it is a public model id, never a credential)
                         # and lets local profile clients label each chat
@@ -3791,6 +3798,48 @@ def sessions_list() -> dict:
                 continue
     out.sort(key=lambda s: s["modifiedAt"], reverse=True)
     return {"sessions": out}
+
+
+def _pending_inputs() -> dict:
+    from flowly.session.attention import pending_inputs
+
+    requests: list = []
+    service = _mcp_connection_service
+    if service is not None:
+        try:
+            requests = service.chat.pending(None).get("requests", [])
+        except Exception:  # noqa: BLE001 — the other waits still count
+            requests = []
+    return pending_inputs(requests)
+
+
+def sessions_attention() -> dict:
+    """``{sessions: {sessionKey: {kind, since, count}}}`` — only the
+    conversations waiting for the owner. What ``sessions.list`` carries per
+    row, without reading every session file: the profile host asks a bot this
+    to show "needs you" on the bot itself.
+
+    An account-scoped request sees only the conversations ``sessions.list``
+    would show it; a key it may not open is left out, not just its row."""
+    from flowly.live_voice.authority import current_request_owner
+
+    waiting = _pending_inputs()
+    if current_request_owner() is None:
+        return {"sessions": waiting}
+    from flowly.session.ownership import read_session_metadata, session_visible
+    from flowly.utils.helpers import safe_filename
+
+    sessions_dir = get_flowly_home() / "sessions"
+    visible = {}
+    for key, wait in waiting.items():
+        try:
+            path = sessions_dir / (safe_filename(key.replace(":", "_")) + ".jsonl")
+            metadata = read_session_metadata(path, key)
+        except Exception:  # noqa: BLE001 — unreadable means not shown
+            continue
+        if session_visible(key, metadata if metadata is not None else {}):
+            visible[key] = wait
+    return {"sessions": visible}
 
 
 def sessions_read(params: dict) -> dict:
@@ -5278,6 +5327,7 @@ _DISPATCH: dict[str, tuple] = {
     "kg.graph": (kg_graph, False, False),
     "kg.delete_entity": (kg_delete_entity, True, False),
     "sessions.list": (sessions_list, False, False),
+    "sessions.attention": (sessions_attention, False, False),
     "sessions.read": (sessions_read, True, False),
     "audit.list": (audit_list, True, False),
     "audit.stats": (audit_stats, False, False),

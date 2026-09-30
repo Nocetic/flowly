@@ -60,6 +60,7 @@ def test_local_runtime_handshake_advertises_required_security_contract() -> None
         "shared-services-v1",
         "voice-owner-hop-v1",
         "voice-owner-events-v1",
+        "session-attention-v1",
     }
     assert 'voiceParentKey' not in payload
 

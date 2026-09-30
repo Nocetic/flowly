@@ -677,7 +677,7 @@ class WebChannel(BaseChannel):
 
         if event_type == "directory":
             targets.update(self._profile_directory_sessions)
-        elif event_type in {"connection", "error"}:
+        elif event_type in {"connection", "error", "needsInput"}:
             targets.update(self._profile_directory_sessions)
             for (candidate_profile, _session_key), subscribers in (
                 self._profile_conversation_sessions.items()

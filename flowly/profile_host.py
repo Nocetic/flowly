@@ -55,6 +55,7 @@ from flowly.profile_host_contract import (
     is_internal_profile_session,
     validate_profile_rpc,
 )
+from flowly.session.attention import KINDS as _ATTENTION_KINDS, most_urgent
 
 ProfileEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 ProfileRoomEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -68,6 +69,24 @@ _STOP_TIMEOUT_SECONDS = 8
 _DELETE_CONFIRM_TTL_SECONDS = 60
 _DELETE_CONFIRM_MAX = 128
 _MAX_RUNTIMES = 6
+# A runtime that answers ``sessions.attention`` advertises this.
+_ATTENTION_CAPABILITY = "session-attention-v1"
+# Events after which what a bot waits on may have changed. A chat terminal is
+# in the list because a chat connection request has no event of its own and
+# ends with its turn.
+_ATTENTION_EVENTS = frozenset({
+    "exec.approval.requested",
+    "exec.approval.closed",
+    "agent.clarify.requested",
+    "agent.clarify.closed",
+    "plan.approval.requested",
+    "plan.updated",
+})
+_ATTENTION_CHAT_STATES = frozenset({"final", "aborted", "error"})
+# Collapse a burst of events (an approval plus its turn ending) into one read.
+_ATTENTION_DEBOUNCE_SECONDS = 0.3
+_ATTENTION_RPC_TIMEOUT_SECONDS = 10
+_ATTENTION_MAX_SESSIONS = 512
 _CAPACITY_WAIT_SECONDS = 120.0
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _SAFE_DELEGATED_TOOLS = (
@@ -235,6 +254,32 @@ def _safe_rpc_error_message(value: Any) -> str:
     return plain[:500]
 
 
+def _clean_attention(result: Any) -> dict[str, dict[str, Any]]:
+    """Keep only well-formed, owner-visible waits from ``sessions.attention``."""
+    sessions = result.get("sessions") if isinstance(result, dict) else None
+    if not isinstance(sessions, dict):
+        return {}
+    clean: dict[str, dict[str, Any]] = {}
+    for key, wait in sessions.items():
+        if len(clean) >= _ATTENTION_MAX_SESSIONS:
+            break
+        # The same conversations ``sessions.list`` shows through the host: a
+        # client can open what it is told needs the owner. Host-only
+        # orchestration turns are answered by the host itself.
+        if (not isinstance(key, str) or not key.startswith(REMOTE_SESSION_PREFIXES)
+                or is_internal_profile_session(key)):
+            continue
+        if not isinstance(wait, dict) or wait.get("kind") not in _ATTENTION_KINDS:
+            continue
+        since, count = wait.get("since"), wait.get("count")
+        clean[key] = {
+            "kind": wait["kind"],
+            "since": since if isinstance(since, int) and not isinstance(since, bool) and since >= 0 else 0,
+            "count": count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 1,
+        }
+    return clean
+
+
 @dataclass(slots=True)
 class _Runtime:
     profile: str
@@ -253,6 +298,11 @@ class _Runtime:
     stderr_task: asyncio.Task[None] | None = None
     voice_parent_key: str = field(default='', repr=False)
     event_authority: Any = field(default=None, repr=False)
+    # What this bot's conversations wait on from the owner, as last read from
+    # the runtime's ``sessions.attention``; see ``_refresh_attention``.
+    attention: dict[str, Any] = field(default_factory=dict)
+    attention_task: asyncio.Task[None] | None = None
+    attention_dirty: bool = False
 
 
 class ProfileHost:
@@ -575,6 +625,7 @@ class ProfileHost:
             "owned": runtime.owned,
             "activeRuns": len(runtime.active_runs),
             "lastUsedAt": int(runtime.last_used_at * 1000),
+            **({"needsInput": urgent} if (urgent := most_urgent(runtime.attention)) else {}),
         }
 
     async def create(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1504,6 +1555,7 @@ class ProfileHost:
                                 if self._runtime_is_open(candidate_runtime):
                                     candidate_runtime.state = "connected"
                                     self._runtimes[candidate_name] = candidate_runtime
+                                    self._schedule_attention_refresh(candidate_runtime)
                             self._capacity_changed.set()
                         raise
                     except BaseException as exc:
@@ -1513,6 +1565,7 @@ class ProfileHost:
                             if self._runtime_is_open(candidate_runtime):
                                 candidate_runtime.state = "connected"
                                 self._runtimes[candidate_name] = candidate_runtime
+                                self._schedule_attention_refresh(candidate_runtime)
                             self._capacity_changed.set()
                         raise ProfileHostError(
                             "PROFILE_CAPACITY",
@@ -1674,6 +1727,8 @@ class ProfileHost:
             )
             self._runtimes[name] = runtime
             await self._emit(name, "connection", {"state": "connected"})
+            # Something may already be waiting from before this connection.
+            self._schedule_attention_refresh(runtime)
             # This bot is up for its own reasons, which makes it the free
             # moment to settle what groups left behind on it — a membership
             # it lost while stopped, a group deleted the same way, a delete
@@ -1787,6 +1842,8 @@ class ProfileHost:
             )
             self._runtimes[name] = runtime
             await self._emit(name, "connection", {"state": "connected"})
+            # Something may already be waiting from before this connection.
+            self._schedule_attention_refresh(runtime)
             # This bot is up for its own reasons, which makes it the free
             # moment to settle what groups left behind on it — a membership
             # it lost while stopped, a group deleted the same way, a delete
@@ -2102,6 +2159,10 @@ class ProfileHost:
                 runtime.active_runs.add(run_id)
         if runtime is not None:
             runtime.last_used_at = time.time()
+            if event in _ATTENTION_EVENTS or (
+                event == "chat" and payload.get("state") in _ATTENTION_CHAT_STATES
+            ):
+                self._schedule_attention_refresh(runtime)
         if await self._rooms.handle_profile_event(profile, event, payload):
             return
         if event == "exec.approval.requested" and payload.get("id"):
@@ -2197,6 +2258,47 @@ class ProfileHost:
         except Exception:
             # Notification failures must not break the runtime event reader.
             logger.warning("Profile cron push could not be dispatched for {}", params.get("name"))
+
+    def _schedule_attention_refresh(self, runtime: _Runtime) -> None:
+        """Re-read what this bot waits on, soon, if its runtime can say.
+
+        Events only say *that* something may have changed; the runtime's
+        ``sessions.attention`` says what is true, so a missed or reordered
+        event cannot leave a stale badge behind. Never starts a runtime.
+        """
+        if _ATTENTION_CAPABILITY not in runtime.capabilities:
+            return
+        runtime.attention_dirty = True
+        if runtime.attention_task is None or runtime.attention_task.done():
+            runtime.attention_task = asyncio.create_task(
+                self._refresh_attention(runtime),
+                name=f"profile-attention:{runtime.profile}",
+            )
+            self._background_tasks.add(runtime.attention_task)
+            runtime.attention_task.add_done_callback(self._background_tasks.discard)
+
+    async def _refresh_attention(self, runtime: _Runtime) -> None:
+        while runtime.attention_dirty:
+            await asyncio.sleep(_ATTENTION_DEBOUNCE_SECONDS)
+            runtime.attention_dirty = False
+            if self._runtimes.get(runtime.profile) is not runtime or not self._runtime_is_open(runtime):
+                return
+            # A status read is not use; it must not keep an idle bot alive.
+            last_used_at = runtime.last_used_at
+            try:
+                result = await self._rpc(runtime, "sessions.attention", {}, _ATTENTION_RPC_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001 — a failed read keeps the last answer
+                logger.debug("Profile attention unavailable for {}: {}", runtime.profile, exc)
+                continue
+            finally:
+                runtime.last_used_at = last_used_at
+            if self._runtimes.get(runtime.profile) is not runtime:
+                return
+            before = most_urgent(runtime.attention)
+            runtime.attention = _clean_attention(result)
+            after = most_urgent(runtime.attention)
+            if after != before:
+                await self._emit(runtime.profile, "needsInput", {"needsInput": after})
 
     def _spawn_background(self, coroutine: Awaitable[Any], *, name: str) -> None:
         task = asyncio.create_task(coroutine, name=name)
@@ -2537,6 +2639,9 @@ class ProfileHost:
                 future.set_exception(ProfileHostError("PROFILE_STOPPED", "The profile runtime was stopped."))
         runtime.pending.clear()
         current = asyncio.current_task()
+        if runtime.attention_task and runtime.attention_task is not current:
+            runtime.attention_task.cancel()
+        runtime.attention = {}
         if runtime.reader_task and runtime.reader_task is not current:
             runtime.reader_task.cancel()
         await runtime.ws.close()

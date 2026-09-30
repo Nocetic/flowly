@@ -5509,7 +5509,7 @@ class GatewayServer:
         ):
             if event_type == "directory" and subscription.directory:
                 targets.add(client_id)
-            elif event_type in {"connection", "error"} and (
+            elif event_type in {"connection", "error", "needsInput"} and (
                 subscription.directory
                 or profile in subscription.profiles
                 or any(
