@@ -177,6 +177,9 @@ async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(scr
                                instance_id="test-instance", owned=False)
             host._runtimes["writer"] = runtime
             runtime.reader_task = asyncio.create_task(host._read_runtime(runtime))
+            # The child is in-process here; a real one runs with the writer home,
+            # where it checks the forwarded agent identity against its own.
+            monkeypatch.setattr(profiles, "current_profile_name", lambda: "writer")
         async with aiohttp.ClientSession() as session:
             async with session.post(outer_server.make_url("/api/auth/ws-ticket"),
                                     headers={"Authorization": "Bearer owner-test-token"}) as response:

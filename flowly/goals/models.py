@@ -12,7 +12,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
+
+if TYPE_CHECKING:
+    from flowly.session.control_access import SessionControlScope
 
 STATE_SCHEMA_VERSION = 1
 DEFAULT_MAX_TURNS = 20
@@ -274,6 +277,9 @@ class GoalState:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     last_turn_at: float = 0.0
+    last_run_id: str | None = None
+    last_failed_run_id: str | None = None
+    created_by_run_id: str | None = None
     last_verdict: str | None = None
     last_reason: str | None = None
     paused_reason: str | None = None
@@ -288,6 +294,8 @@ class GoalState:
     waiting_since: float = 0.0
     contract: GoalContract = field(default_factory=GoalContract)
     gates: list[GoalGate] = field(default_factory=list)
+    # Store-owned authority travels with an in-process snapshot, never a DTO.
+    _session_control_scope: SessionControlScope | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.session_key = _clean_text(self.session_key, limit=1_000, field_name="session_key")
@@ -310,6 +318,9 @@ class GoalState:
         self.created_at = _bounded_float(self.created_at, default=time.time())
         self.updated_at = _bounded_float(self.updated_at, default=self.created_at)
         self.last_turn_at = _bounded_float(self.last_turn_at)
+        self.last_run_id = _clean_text(self.last_run_id, limit=512, field_name="last_run_id") or None
+        self.last_failed_run_id = _clean_text(self.last_failed_run_id, limit=512, field_name='lastFailedRunId') or None
+        self.created_by_run_id = _clean_text(self.created_by_run_id, limit=512, field_name="createdByRunId") or None
         self.last_verdict = _clean_optional(self.last_verdict, MAX_REASON_CHARS)
         self.last_reason = _clean_optional(self.last_reason, MAX_REASON_CHARS)
         self.paused_reason = _clean_optional(self.paused_reason, MAX_REASON_CHARS)
@@ -412,6 +423,9 @@ class GoalState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "last_turn_at": self.last_turn_at,
+            "last_run_id": self.last_run_id,
+            "lastFailedRunId": self.last_failed_run_id,
+            "createdByRunId": self.created_by_run_id,
             "last_verdict": self.last_verdict,
             "last_reason": self.last_reason,
             "paused_reason": self.paused_reason,
@@ -441,6 +455,9 @@ class GoalState:
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "lastTurnAt": self.last_turn_at or None,
+            "lastRunId": self.last_run_id,
+            "lastFailedRunId": self.last_failed_run_id,
+            "createdByRunId": self.created_by_run_id,
             "lastVerdict": self.last_verdict,
             "lastReason": self.last_reason,
             "pausedReason": self.paused_reason,
@@ -502,6 +519,9 @@ class GoalState:
             created_at=value.get("created_at", value.get("createdAt", 0.0)),
             updated_at=value.get("updated_at", value.get("updatedAt", 0.0)),
             last_turn_at=value.get("last_turn_at", value.get("lastTurnAt", 0.0)),
+            last_run_id=value.get("last_run_id", value.get("lastRunId")),
+            last_failed_run_id=value.get('lastFailedRunId'),
+            created_by_run_id=value.get("createdByRunId"),
             last_verdict=value.get("last_verdict", value.get("lastVerdict")),
             last_reason=value.get("last_reason", value.get("lastReason")),
             paused_reason=value.get("paused_reason", value.get("pausedReason")),

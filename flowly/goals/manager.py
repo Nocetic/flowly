@@ -75,6 +75,8 @@ class GoalManager:
         contract: GoalContract | None = None,
         conversation_epoch: int = 0,
     ) -> GoalState:
+        from flowly.goals.provenance import creating_run_id
+
         def replace(_current: GoalState | None) -> GoalState:
             return GoalState(
                 session_key=session_key,
@@ -82,11 +84,13 @@ class GoalManager:
                 max_turns=max_turns or self.default_max_turns,
                 contract=contract or GoalContract(),
                 conversation_epoch=conversation_epoch,
+                created_by_run_id=creating_run_id(session_key),
             )
 
         return self.store.update(session_key, replace)
 
-    def pause(self, session_key: str, *, reason: str = "paused by user") -> GoalState:
+    def pause(self, session_key: str, *, reason: str = "paused by user",
+              expected_goal_id: str | None = None, expected_revision: int | None = None) -> GoalState:
         def mutate(state: GoalState | None) -> GoalState:
             state = _require_goal(state)
             if state.status is GoalStatus.CLEARED:
@@ -96,9 +100,11 @@ class GoalManager:
             state.clear_wait()
             return state
 
-        return self.store.update(session_key, mutate)
+        return self.store.update(session_key, mutate,
+                                 expected_goal_id=expected_goal_id, expected_revision=expected_revision)
 
-    def resume(self, session_key: str) -> GoalState:
+    def resume(self, session_key: str, *, expected_goal_id: str | None = None,
+               expected_revision: int | None = None) -> GoalState:
         def mutate(state: GoalState | None) -> GoalState:
             state = _require_goal(state)
             if state.status is GoalStatus.CLEARED:
@@ -112,7 +118,8 @@ class GoalManager:
             state.clear_wait()
             return state
 
-        return self.store.update(session_key, mutate)
+        return self.store.update(session_key, mutate,
+                                 expected_goal_id=expected_goal_id, expected_revision=expected_revision)
 
     def resume_for_user_input(self, session_key: str) -> GoalState | None:
         """Resume a goal parked by the judge when the user replies.
@@ -144,9 +151,10 @@ class GoalManager:
         except GoalStoreConflictError:
             return self.store.get(session_key)
 
-    def clear(self, session_key: str, *, conversation_epoch: int | None = None) -> GoalState | None:
+    def clear(self, session_key: str, *, conversation_epoch: int | None = None,
+              expected_goal_id: str | None = None, expected_revision: int | None = None) -> GoalState | None:
         current = self.store.get(session_key)
-        if current is None:
+        if current is None and expected_goal_id is None and expected_revision is None:
             return None
 
         def mutate(state: GoalState | None) -> GoalState:
@@ -167,7 +175,8 @@ class GoalManager:
                 state.conversation_epoch = max(0, int(conversation_epoch))
             return state
 
-        return self.store.update(session_key, mutate)
+        return self.store.update(session_key, mutate,
+                                 expected_goal_id=expected_goal_id, expected_revision=expected_revision)
 
     def is_generation_active(self, session_key: str, goal_id: str) -> bool:
         state = self.store.get(session_key)
@@ -372,12 +381,18 @@ class GoalManager:
         aborted: bool = False,
         provider_error: bool = False,
         compaction_failed: bool = False,
+        run_id: str | None = None,
+        expected_goal_id: str | None = None,
+        expected_revision: int | None = None,
         background_processes: Iterable[Mapping[str, Any]] = (),
         cwd: Path | None = None,
     ) -> GoalDecision:
         state = self.store.get(session_key)
         if state is None or not state.is_active:
             return _decision(state, GoalVerdict.INACTIVE, reason="no active goal")
+        if ((expected_goal_id is not None and state.goal_id != expected_goal_id)
+                or (expected_revision is not None and state.revision != expected_revision)):
+            return _decision(state, GoalVerdict.SKIPPED, reason='goal changed before evaluation')
         if aborted:
             try:
                 paused = self.store.compare_and_update(
@@ -431,8 +446,15 @@ class GoalManager:
             or provider_error
             or not str(latest_response or "").strip()
         ):
+            reason = 'model response failed' if provider_error else 'turn failed' if not turn_succeeded else 'empty response'
+            try:
+                paused = self.store.compare_and_update(state, lambda current: _record_turn_failure(current, reason, run_id))
+            except GoalStoreConflictError:
+                return _decision(self.store.get(session_key), GoalVerdict.SKIPPED, reason='goal changed')
             return _decision(
-                state, GoalVerdict.SKIPPED, reason="turn did not complete successfully"
+                paused, GoalVerdict.NEEDS_INPUT, reason=reason,
+                message=('⏸ Goal paused because the turn could not finish. '
+                         'Review the error, then reply or resume the goal to continue.'),
             )
 
         waiting = self.waiting_state(session_key)
@@ -447,7 +469,7 @@ class GoalManager:
                 )
 
         try:
-            state = self.store.compare_and_update(state, _consume_turn)
+            state = self.store.compare_and_update(state, lambda current: _consume_turn(current, run_id))
         except GoalStoreConflictError:
             return _decision(
                 self.store.get(session_key), GoalVerdict.SKIPPED, reason="goal changed"
@@ -641,12 +663,27 @@ def _pause(state: GoalState, reason: str) -> GoalState:
     return state
 
 
-def _consume_turn(state: GoalState) -> GoalState:
+def _consume_turn(state: GoalState, run_id: str | None = None) -> GoalState:
     if not state.is_active:
         raise GoalStoreConflictError("goal is no longer active")
     state.turns_used += 1
     state.last_turn_at = time.time()
+    # The completion decision must resolve to this delivered response, not to
+    # the first acknowledgement or a newer unrelated conversation message.
+    state.last_run_id = run_id
     state.consecutive_compaction_failures = 0
+    return state
+
+
+def _record_turn_failure(state: GoalState, reason: str, run_id: str | None) -> GoalState:
+    if not state.is_active:
+        raise GoalStoreConflictError('goal is no longer active')
+    _pause(state, reason)
+    # A fresh user reply can continue the same goal and budget. Failed output
+    # never replaces the identity of the last successfully evaluated handoff.
+    state.last_verdict = GoalVerdict.NEEDS_INPUT.value
+    state.last_reason = reason
+    state.last_failed_run_id = run_id
     return state
 
 

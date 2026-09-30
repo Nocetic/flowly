@@ -23,6 +23,7 @@ from loguru import logger
 
 from flowly.media.adapters import AdapterError, build_payload, extract_media_urls
 from flowly.media.assets import MediaAsset, describe
+from flowly.media.authority import capture_media_access, publish_media_file
 from flowly.media.catalog import COMPAT_UNSUPPORTED, MediaModel, ModelCatalog
 
 # Generous, because a 1080p clip is genuinely large — but finite, so a runaway
@@ -77,6 +78,7 @@ async def download_output(url: str, *, kind: str, dest_dir: Path | None = None) 
     if not isinstance(url, str) or not url.startswith("https://"):
         raise GenerationError("the model returned a result that could not be downloaded safely.")
 
+    access = capture_media_access()
     directory = dest_dir or media_dir()
     directory.mkdir(parents=True, exist_ok=True)
     stem = f"{'vid' if kind == 'video' else 'img'}-{uuid.uuid4().hex[:12]}"
@@ -126,17 +128,24 @@ async def download_output(url: str, *, kind: str, dest_dir: Path | None = None) 
         raise GenerationError("the model returned an empty file.")
 
     final = directory / f"{stem}{extension}"
-    tmp.replace(final)
-    return final
+    try:
+        return publish_media_file(tmp, final, access)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _attach_poster(video_path: Path) -> str | None:
     """Best-effort poster next to the clip. None when ffmpeg isn't available."""
     from flowly.media.probe import extract_poster
 
+    access = capture_media_access()
     poster = video_path.with_suffix(".jpg")
-    if extract_poster(video_path, poster):
-        return str(poster)
+    temporary = poster.with_name(f'.{uuid.uuid4().hex}.jpg')
+    try:
+        if extract_poster(video_path, temporary):
+            return str(publish_media_file(temporary, poster, access))
+    finally:
+        temporary.unlink(missing_ok=True)
     return None
 
 

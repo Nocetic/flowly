@@ -99,6 +99,10 @@ class CompactionResult:
     dropped_tokens: int = 0
     # Recent messages preserved verbatim after compaction
     kept_messages: list = field(default_factory=list)
+    # Specific details (links, codes, dates, times, amounts) of the previous
+    # summary missing from the new one, before and after the repair pass.
+    details_missing_before_repair: list = field(default_factory=list)
+    details_missing_after_repair: list = field(default_factory=list)
 
 
 class CompactionError(RuntimeError):
@@ -235,7 +239,9 @@ def extract_summary_text(message: dict) -> str | None:
 
 MERGE_SUMMARIES_INSTRUCTIONS = (
     "Merge these partial summaries into a single cohesive summary. "
-    "Preserve decisions, TODOs, open questions, and any constraints."
+    "Preserve decisions, TODOs, open questions and constraints, and every "
+    "concrete fact: people and their details, dates, times, amounts, "
+    "identifiers, links, preferences, commitments and deadlines."
 )
 
 SILENT_REPLY_TOKEN = "NO_REPLY"

@@ -187,12 +187,36 @@ def main() -> None:
 
     # 4. Check ~/.flowly/active_profile (sticky default)
     elif profile is None:
-        from flowly.profile import get_active_profile
+        from flowly.profile import get_active_profile, profile_exists
         active = get_active_profile()
-        if active != "default":
+        # A sticky profile deleted elsewhere falls back to the default rather
+        # than being recreated as an empty directory.
+        if active != "default" and profile_exists(active):
             profile = active
 
-    # 5. Set FLOWLY_HOME before ANY other flowly import, unless an explicit
+    # 5. A named profile must exist before anything runs in it. Starting in a
+    # missing profile would create its directory (logs, databases) and bring
+    # a deleted bot back as a broken, half-empty one.
+    if profile not in (None, "default"):
+        from flowly.profile import (
+            PROFILE_DIR_IDENTITY_ENV,
+            named_profile_identity,
+            profile_exists,
+            validate_profile_name,
+        )
+        try:
+            validate_profile_name(profile)
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            raise SystemExit(2)
+        if not profile_exists(profile):
+            print(f"Error: Profile '{profile}' does not exist.", file=sys.stderr)
+            raise SystemExit(2)
+        identity = named_profile_identity(profile)
+        if identity:
+            os.environ[PROFILE_DIR_IDENTITY_ENV] = identity
+
+    # 6. Set FLOWLY_HOME before ANY other flowly import, unless an explicit
     # FLOWLY_HOME was already present and no profile override was requested.
     if not (profile is None and existing_home):
         from flowly.profile import set_profile

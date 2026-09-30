@@ -63,6 +63,7 @@ _CLONE_WORKSPACE_FILES = [
 ]
 
 _CLONE_ALL_STRIP = [
+    "agent-home.json", ".agent-home.lock",
     "session_index.sqlite", "session_index.sqlite-wal",
     "session_index.sqlite-shm", "logs", "subagents", ".machine-id",
     ".desktop-runtime.json",
@@ -74,6 +75,13 @@ _ROSTER_INDEX_FILE = "roster.json"
 _PROFILE_HOST_FILE = "profile-host.json"
 _RUNTIME_LEASE_FILE = ".desktop-runtime.json"
 _PROFILE_MUTATION_LOCK_FILE = ".profiles.lock"
+# Deleted profiles are renamed here first, then removed. Not a valid profile
+# name, so listings and the capacity count never see it.
+_PROFILE_TRASH_DIR = ".trash"
+# The profile directory a process started with, as "device:inode". A runtime
+# compares it before claiming its lease, so a directory deleted and recreated
+# underneath it (by its own start-up writes) is never taken for the profile.
+PROFILE_DIR_IDENTITY_ENV = "FLOWLY_PROFILE_DIR_ID"
 MAX_NAMED_PROFILES = 15
 _MAX_SOUL_BYTES = 64 * 1024
 _MAX_MODEL_LENGTH = 256
@@ -88,6 +96,9 @@ _PROFILE_MARK_TONES = frozenset({
     "aqua", "violet", "rose", "amber", "lime", "sky", "slate",
 })
 _PROFILE_MARK_COLOR_RE = re.compile(r"^#[0-9a-f]{6}$")
+# The avatar body a bot wears in clients. Empty means "not chosen": clients
+# derive a shape from the mark seed, so every bot has one without a migration.
+PROFILE_MARK_SHAPES = ("pinch", "ghost", "square", "robot", "bunny", "cloud", "star")
 _NAMED_PROFILE_CREDENTIAL_POLICY = "isolated"
 # The only secrets a clone may inherit. Everything else in a parent's ``.env``
 # is dropped, because ``.env`` is where identity lives and there is no way to
@@ -336,6 +347,8 @@ class ProfileInfo:
     # Creation-order seed behind the profile's generated mark. None means a
     # profile older than the seed, which clients render from its name instead.
     mark_seed: int | None = None
+    # Chosen avatar shape, or "" when clients derive it from the seed.
+    mark_shape: str = ""
     created_at: str = ""
     updated_at: str = ""
     bot_id: str = ""
@@ -355,6 +368,7 @@ class ProfileInfo:
             "markText": self.mark_text,
             "markTone": self.mark_tone,
             "markSeed": self.mark_seed,
+            "markShape": self.mark_shape,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "botId": self.bot_id,
@@ -475,6 +489,26 @@ def _validate_mark_tone(mark_tone: str) -> str:
     return value
 
 
+def _validate_mark_shape(mark_shape: object) -> str:
+    """Strict check for a shape arriving from a client; "" clears the choice."""
+    if mark_shape is None:
+        return ""
+    if not isinstance(mark_shape, str):
+        raise ValueError("Profile avatar shape must be text.")
+    value = mark_shape.strip().lower()
+    if value and value not in PROFILE_MARK_SHAPES:
+        raise ValueError(f"Unknown profile avatar shape: {value}")
+    return value
+
+
+def _read_mark_shape(value: object) -> str:
+    """Lenient read: a hand-edited or newer shape degrades to "not chosen"."""
+    try:
+        return _validate_mark_shape(value)
+    except ValueError:
+        return ""
+
+
 _MARK_SEED_MAX = 1_000_000
 
 
@@ -589,6 +623,7 @@ def _metadata_for(name: str, profile_dir: Path, *, is_default: bool) -> dict:
         "mark_text": str(meta.get("markText") or "").strip(),
         "mark_tone": str(meta.get("markTone") or "").strip(),
         "mark_seed": _read_mark_seed(meta.get("markSeed")),
+        "mark_shape": _read_mark_shape(meta.get("markShape")),
         "created_at": str(meta.get("createdAt") or "").strip(),
         "updated_at": str(meta.get("updatedAt") or "").strip(),
         "bot_id": str(meta.get("botId") or "").strip(),
@@ -764,6 +799,7 @@ def create_profile(
     mark_text: str = "",
     mark_tone: str = "",
     mark_seed: int | None = None,
+    mark_shape: str = "",
 ) -> Path:
     """Create a new profile directory.
 
@@ -776,6 +812,7 @@ def create_profile(
     if name == "default":
         raise ValueError("Cannot create a profile named 'default'.")
     requested_seed = _validate_mark_seed(mark_seed)
+    requested_shape = _validate_mark_shape(mark_shape)
 
     profile_dir = _PROFILES_ROOT / name
     with _profile_mutation_lock():
@@ -882,12 +919,14 @@ def create_profile(
             "description": description.strip(),
             "markText": _validate_mark_text(mark_text),
             "markTone": _validate_mark_tone(mark_tone),
+            "markShape": requested_shape,
             # markSeed is written under the mutation lock below, so allocation
             # and publication are one atomic step.
             "createdAt": now,
             "updatedAt": now,
             "localRuntime": bool(local_runtime),
             "credentialPolicy": _NAMED_PROFILE_CREDENTIAL_POLICY,
+            "agentHomeVersion": 1,
         })
 
         # Publishing the completed directory is the commit point. A crash
@@ -1289,6 +1328,7 @@ def update_profile_metadata(
     mark_text: str | None = None,
     mark_tone: str | None = None,
     mark_seed: int | None = None,
+    mark_shape: str | None = None,
 ) -> ProfileInfo:
     """Atomically update renderer-facing metadata for one profile."""
     profile = describe_profile(name)
@@ -1318,6 +1358,11 @@ def update_profile_metadata(
         "markSeed": (
             _validate_mark_seed(mark_seed) if mark_seed is not None
             else _read_mark_seed(current.get("markSeed"))
+        ),
+        # None keeps the current choice; "" returns to the seed-derived shape.
+        "markShape": (
+            _validate_mark_shape(mark_shape) if mark_shape is not None
+            else _read_mark_shape(current.get("markShape"))
         ),
         "createdAt": str(current.get("createdAt") or profile.created_at or now),
         "updatedAt": now,
@@ -1707,22 +1752,57 @@ def reconcile_runtime_lease(
 
 
 def claim_runtime_lease(instance_id: str) -> Path:
-    """Exclusively claim the current profile for one managed runtime."""
-    from flowly.desktop_runtime.profile_lifecycle import assert_not_retired, construction_guard
+    """Exclusively claim the current profile for one managed runtime.
 
-    home = get_flowly_home()
-    with construction_guard(home / "desktop"):
-        assert_not_retired(home / "desktop")
-        if home.parent == _PROFILES_ROOT and (not home.is_dir() or home.is_symlink()):
-            raise FileNotFoundError("The selected profile no longer exists.")
-        return _claim_runtime_lease(instance_id)
-
-
-def _claim_runtime_lease(instance_id: str) -> Path:
+    A named profile's runtime runs sandboxed: it may write only inside its
+    own directory, so it must not take the shared profile lock (that was an
+    ``[Errno 1] Operation not permitted`` at start-up). A delete is detected
+    from inside instead. The directory must still be the one this process
+    started in (``FLOWLY_PROFILE_DIR_ID``) before the lease is written and
+    again after. A delete renames the directory under its lock after reading
+    the lease, so it either sees our lease and refuses, or moved the
+    directory away and one of the two checks fails: then the lease and
+    anything our start-up recreated are removed, and the runtime stops.
+    """
     if not instance_id:
         raise ValueError("runtime instance id is required")
-    path = get_flowly_home() / _RUNTIME_LEASE_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
+    home = get_flowly_home()
+    started_with = os.environ.get(PROFILE_DIR_IDENTITY_ENV, "")
+    if home.parent != _PROFILES_ROOT or not started_with:
+        # The default home, an explicit FLOWLY_HOME outside the profiles, or
+        # a process not started through the CLI entry.
+        home.mkdir(parents=True, exist_ok=True)
+        return _write_runtime_lease(home, instance_id)
+
+    _assert_profile_unchanged(home, started_with)
+    try:
+        lease = _write_runtime_lease(home, instance_id)
+    except FileNotFoundError:
+        # The directory went away between the check and the write.
+        _assert_profile_unchanged(home, started_with)
+        raise
+    try:
+        _assert_profile_unchanged(home, started_with)
+    except FileNotFoundError:
+        lease.unlink(missing_ok=True)
+        raise
+    return lease
+
+
+def _assert_profile_unchanged(home: Path, started_with: str) -> None:
+    """Refuse a profile deleted since this process started, and clean up."""
+    current = profile_dir_identity(home)
+    if current == started_with:
+        return
+    if current is not None and not (home / _PROFILE_METADATA_FILE).exists():
+        # Only our own start-up writes can be here: the profile was retired,
+        # so this is a stray tree that would otherwise pose as the bot.
+        shutil.rmtree(home, ignore_errors=True)
+    raise FileNotFoundError(f"Profile '{current_profile_name()}' was deleted.")
+
+
+def _write_runtime_lease(home: Path, instance_id: str) -> Path:
+    path = home / _RUNTIME_LEASE_FILE
     existing = reconcile_runtime_lease(
         path.parent,
         profile_name=current_profile_name(),
@@ -1768,6 +1848,7 @@ def update_runtime_lease(
     port: int,
     auth_token: str,
     capabilities: tuple[str, ...] | list[str] = (),
+    voice_parent_key: str = '',
 ) -> None:
     """Publish the owner-only endpoint used by sibling Flowly managers.
 
@@ -1787,6 +1868,11 @@ def update_runtime_lease(
     ):
         raise ValueError("Profile runtime endpoint is invalid.")
     capability_list = list(dict.fromkeys(capabilities))
+    from flowly.live_voice.authority import valid_parent_key
+
+    if (bool(voice_parent_key) != ('voice-owner-hop-v1' in capability_list)
+            or (voice_parent_key and not valid_parent_key(voice_parent_key))):
+        raise ValueError('Profile voice authority configuration is invalid.')
     if (
         len(capability_list) > 64
         or any(
@@ -1805,6 +1891,10 @@ def update_runtime_lease(
     lease["port"] = port
     lease["authToken"] = token
     lease["capabilities"] = capability_list
+    if voice_parent_key:
+        lease['voiceParentKey'] = voice_parent_key
+    else:
+        lease.pop('voiceParentKey', None)
     lease["readyAt"] = _utc_now()
     _atomic_write_json(path, lease)
 
@@ -1820,8 +1910,74 @@ def release_runtime_lease(instance_id: str) -> None:
         path.unlink(missing_ok=True)
 
 
+def profile_dir_identity(path: Path) -> str | None:
+    """``device:inode`` of a real (non-symlink) directory, else None."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    return f"{info.st_dev}:{info.st_ino}"
+
+
+def named_profile_identity(name: str) -> str | None:
+    """Identity of a named profile's directory (see PROFILE_DIR_IDENTITY_ENV)."""
+    validate_profile_name(name)
+    return profile_dir_identity(_PROFILES_ROOT / name)
+
+
+def _remove_retired_profile(path: Path) -> bool:
+    """Remove a retired profile tree; True when it is gone.
+
+    A process that still held a file open (a runtime finishing its exit) can
+    add an entry while the tree is being removed, which fails with ENOTEMPTY.
+    Retry briefly; anything still left is swept by the next delete. The
+    profile itself is already gone either way: it was renamed away.
+    """
+    for delay in (0.0, 0.1, 0.3, 0.6):
+        if delay:
+            time.sleep(delay)
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _sweep_profile_trash() -> None:
+    """Best effort: remove leftovers of earlier deletes."""
+    trash = _PROFILES_ROOT / _PROFILE_TRASH_DIR
+    try:
+        entries = list(trash.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_symlink():
+            entry.unlink(missing_ok=True)
+        else:
+            _remove_retired_profile(entry)
+
+
 def delete_profile(name: str, *, expected_bot_id: str | None = None) -> None:
-    """Delete a named profile."""
+    """Delete a named profile.
+
+    The name is retired atomically: under the profile mutation lock (which a
+    starting runtime also takes to claim its lease), the directory is renamed
+    into a hidden trash folder. From that moment nothing can list, start or
+    write into the profile, and the name is free again, so a partially
+    removed tree can never be left behind as a half-alive bot. Removing the
+    renamed tree afterwards is best effort and retried on the next delete.
+
+    Its screen is fenced first: a live screen, human control or an agent run
+    refuses the delete. External screen storage (root hosts: the profile's
+    application directories and account) is removed before the rename, since
+    its mapping is bound to this path; a durable journal lets a delete whose
+    acknowledgement was lost finish without replay.
+    """
     validate_profile_name(name)
     if name == "default":
         raise ValueError("Cannot delete the default profile.")
@@ -1835,6 +1991,7 @@ def delete_profile(name: str, *, expected_bot_id: str | None = None) -> None:
     )
 
     profile_dir = _PROFILES_ROOT / name
+    _sweep_profile_trash()
     with removable_screen(profile_dir) as screen, _profile_mutation_lock():
         if profile_dir.is_symlink() or _PROFILES_ROOT.resolve() not in profile_dir.resolve().parents:
             raise ValueError("Profile directory failed containment validation.")
@@ -1844,21 +2001,28 @@ def delete_profile(name: str, *, expected_bot_id: str | None = None) -> None:
             # The previous deletion removed storage and the profile, then lost
             # its final acknowledgement. Finish that receipt without replay.
             finish_retirement(profile_dir)
-        else:
-            if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
-                from flowly.desktop_runtime.authority import ScreenError
+            return
+        if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
+            from flowly.desktop_runtime.authority import ScreenError
 
-                raise ScreenError("PROFILE_IDENTITY_CHANGED")
-            lease = reconcile_runtime_lease(profile_dir, profile_name=name)
-            if lease:
-                raise RuntimeError(
-                    f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before deletion."
-                )
-            begin_retirement(profile_dir)
-            if screen is not None:
-                cleanup_screen_storage(screen)
-            shutil.rmtree(profile_dir)
-            finish_retirement(profile_dir)
+            raise ScreenError("PROFILE_IDENTITY_CHANGED")
+
+        lease = reconcile_runtime_lease(profile_dir, profile_name=name)
+        if lease:
+            raise RuntimeError(
+                f"Profile '{name}' is running (pid {lease.get('pid')}). Stop it before deletion."
+            )
+
+        begin_retirement(profile_dir)
+        if screen is not None:
+            cleanup_screen_storage(screen)
+        trash = _PROFILES_ROOT / _PROFILE_TRASH_DIR
+        trash.mkdir(mode=0o700, exist_ok=True)
+        retired = trash / f"{name}.{uuid.uuid4().hex}"
+        os.rename(profile_dir, retired)
+        finish_retirement(profile_dir)
+
+    _remove_retired_profile(retired)
 
     # Clean up active_profile if it pointed to deleted profile
     if get_active_profile() == name:
@@ -2412,11 +2576,19 @@ def _import_profile_archive(
             "description": str(metadata.get("description") or "").strip(),
             "markText": _validate_mark_text(str(metadata.get("markText") or "")),
             "markTone": _validate_mark_tone(str(metadata.get("markTone") or "")),
+            # Archives from a newer build may carry a shape this one does not
+            # know; that degrades to "not chosen" instead of failing the import.
+            "markShape": _read_mark_shape(metadata.get("markShape")),
             "createdAt": str(metadata.get("createdAt") or now),
             "updatedAt": now,
             "localRuntime": bool(local_runtime or metadata.get("localRuntime")),
             "credentialPolicy": _NAMED_PROFILE_CREDENTIAL_POLICY,
         })
+        if identity != "restore":
+            # The copied transcript is retained; optional setup belongs to the
+            # original identity and must not resume on the duplicate.
+            (extracted / "agent-home.json").unlink(missing_ok=True)
+            metadata.pop("agentHomeVersion", None)
         _atomic_write_json(extracted / _PROFILE_METADATA_FILE, metadata)
         _harden_profile_tree_permissions(extracted)
         with _profile_mutation_lock():

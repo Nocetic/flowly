@@ -18,9 +18,11 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from typing import TypeVar
 
 T = TypeVar("T")
+CURRENT_RUN_ID: ContextVar[str | None] = ContextVar('flowly_current_run_id', default=None)
 
 
 class RunAbortedError(Exception):
@@ -97,10 +99,14 @@ class RunAbortController:
         if self.is_requested(run_id):
             raise RunAbortedError(run_id)
 
-        task: asyncio.Task[T] = asyncio.create_task(
-            operation(),
-            name=f"flowly-run-operation:{run_id}",
-        )
+        token = CURRENT_RUN_ID.set(run_id)
+        try:
+            task: asyncio.Task[T] = asyncio.create_task(
+                operation(),
+                name=f"flowly-run-operation:{run_id}",
+            )
+        finally:
+            CURRENT_RUN_ID.reset(token)
         active = self._active.setdefault(run_id, set())
         active.add(task)
 

@@ -29,8 +29,8 @@ _EXPORT_EXTENSIONS: dict[str, str] = {
     "code": ".txt",
     "mermaid": ".mmd",
     "latex": ".tex",
-    "form": ".json",
-    "chart": ".json",
+    "form": ".html",
+    "chart": ".html",
 }
 
 
@@ -282,16 +282,19 @@ class ArtifactTool(Tool):
             pinned=kw.get("pinned"),
             dashboard_size=kw.get("dashboard_size"),
             tags=kw.get("tags"),
+            output_session_key=kw.get("session_key"),
         )
+        if updated is None:
+            return json.dumps({'error': 'Artifact or output conversation not found'})
 
-        version_created = updated and updated["version"] > old["version"]
-        await self._notify("artifact.updated", updated or old)
+        version_created = updated["version"] > old["version"]
+        await self._notify("artifact.updated", updated)
 
         return json.dumps({
             "action": "update",
-            "artifact": _summarize(updated or old),
+            "artifact": _summarize(updated),
             "version_created": version_created,
-            "message": f"Artifact updated (v{updated['version'] if updated else old['version']})",
+            "message": f"Artifact updated (v{updated['version']})",
         })
 
     async def _get(self, **kw: Any) -> str:
@@ -302,7 +305,6 @@ class ArtifactTool(Tool):
         artifact = self._store.get(artifact_id)
         if not artifact:
             return json.dumps({"error": f"Artifact not found: {artifact_id}"})
-
         content = artifact.get("content", "")
         offset = max(0, int(kw.get("offset", 0) or 0))
         limit_raw = kw.get("limit")
@@ -342,10 +344,13 @@ class ArtifactTool(Tool):
         if not artifact_id:
             return json.dumps({"error": "artifact_id is required"})
 
-        artifact = self._store.get(artifact_id)
-        if not artifact:
-            return json.dumps({"error": f"Artifact not found: {artifact_id}"})
+        with self._store.output_guard(artifact_id, kw.get('session_key')) as artifact:
+            if not artifact:
+                return json.dumps({'error': 'Artifact or output conversation not found'})
+            return self._export_authorized(artifact, **kw)
 
+    def _export_authorized(self, artifact: dict, **kw: Any) -> str:
+        artifact_id = artifact['id']
         content = artifact.get("content", "")
         art_type = (artifact.get("type") or "markdown").lower()
         title = artifact.get("title") or artifact_id
@@ -393,6 +398,13 @@ class ArtifactTool(Tool):
         except OSError as exc:
             return json.dumps({"error": f"Write failed: {exc}"})
 
+        if kw.get("session_key"):
+            attached = self._store.attach_session_output(artifact_id, kw["session_key"])
+            if not attached and not self._store.has_session_output(artifact_id, kw["session_key"]):
+                from flowly.session.ownership import SessionAccessError
+
+                raise SessionAccessError()
+
         return json.dumps({
             "action": "export",
             "artifact_id": artifact_id,
@@ -405,17 +417,14 @@ class ArtifactTool(Tool):
     async def _list(self, **kw: Any) -> str:
         include_internal = bool(kw.get("include_internal", False))
         limit = int(kw.get("limit", 50) or 50)
-        fetch_limit = limit if include_internal else max(limit * 5, 100)
         results = self._store.list(
             type=kw.get("type"),
             pinned=kw.get("pinned"),
             search=kw.get("search"),
             tags=kw.get("tags"),
-            limit=fetch_limit,
+            limit=limit,
+            include_internal=include_internal,
         )
-        if not include_internal:
-            results = [a for a in results if not is_internal_context_artifact(a)]
-        results = results[:limit]
 
         # Return summaries (no full content) for list view
         summaries = [_summarize(a) for a in results]
@@ -461,12 +470,15 @@ class ArtifactTool(Tool):
             pinned=kw.get("pinned"),
             dashboard_size=kw.get("dashboard_size"),
             tags=tags,
+            output_session_key=kw.get("session_key"),
         )
-        await self._notify("artifact.updated", updated or old)
+        if updated is None:
+            return json.dumps({'error': 'Artifact or output conversation not found'})
+        await self._notify("artifact.updated", updated)
 
         return json.dumps({
             "action": "promote",
-            "artifact": _summarize(updated or old),
+            "artifact": _summarize(updated),
             "message": f"Artifact {artifact_id} is now user-visible",
         })
 
@@ -475,11 +487,16 @@ class ArtifactTool(Tool):
         if not artifact_id:
             return json.dumps({"error": "artifact_id is required"})
 
+        from flowly.live_voice.events import EventAccess, event_access_scope
+
+        scope = self._store.control_scope(artifact_id)
         deleted = self._store.delete(artifact_id)
         if not deleted:
             return json.dumps({"error": f"Artifact not found: {artifact_id}"})
 
-        await self._notify("artifact.deleted", {"id": artifact_id})
+        access = EventAccess(scopes=(scope,), canonical=False) if scope is not None else EventAccess(blocked=True)
+        with event_access_scope(access):
+            await self._notify("artifact.deleted", {"id": artifact_id})
 
         return json.dumps({
             "action": "delete",

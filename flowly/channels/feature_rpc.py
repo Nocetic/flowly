@@ -36,6 +36,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from flowly.live_voice.service import METHODS as _VOICE_METHODS
 from flowly.profile import get_flowly_home
 
 # Integration categories a remote client may view/edit. ``provider`` (LLM keys)
@@ -861,6 +862,12 @@ def chat_inflight(params: dict) -> dict:
     the same key the client tags its chat.send with.
     """
     from flowly.agent.inflight import get as _inflight_get
+    from flowly.session.commands import validate_chat_target
+
+    try:
+        validate_chat_target(params)
+    except ValueError as exc:
+        raise FeatureRpcError('TASK_TARGET_CHANGED', str(exc)) from exc
 
     session_key = (params.get("sessionKey") or "").strip()
     cur = _inflight_get(session_key) if session_key else None
@@ -894,18 +901,66 @@ def chat_inflight(params: dict) -> dict:
         result["goal"] = goal_get({"sessionKey": session_key})["goal"]
     except Exception:
         result["goal"] = None
+    # A prompt the agent is parked on is announced once, as an event. A client
+    # that reloaded or re-entered this chat after it fired has no other way to
+    # learn it is still waiting, so the handshake carries the conversation's
+    # open approvals and questions, serialized exactly like those events.
+    result["approvals"], result["clarifies"] = _pending_prompts(session_key)
     return result
+
+
+def _pending_prompts(session_key: str) -> tuple[list[dict], list[dict]]:
+    """Open approvals and questions of one conversation, oldest first.
+
+    The managers' own listing already hides what the caller may not control,
+    so an account-scoped request never sees another owner's prompt.
+    """
+    if not session_key:
+        return [], []
+    from loguru import logger
+
+    approvals: list[dict] = []
+    clarifies: list[dict] = []
+    try:
+        from flowly.exec.approval_manager import get_approval_manager
+        from flowly.exec.wire import approval_to_wire
+
+        approvals = [
+            approval_to_wire(pending)
+            for pending in sorted(get_approval_manager().list_pending(), key=lambda item: item.created_at)
+            if pending.session_key == session_key
+        ]
+    except Exception as exc:  # noqa: BLE001 — the rest of the handshake still counts
+        logger.debug(f"[chat.inflight] approvals unavailable: {exc}")
+    try:
+        from flowly.clarify.manager import get_clarify_manager
+        from flowly.clarify.wire import clarify_to_wire
+
+        clarifies = [
+            clarify_to_wire(pending)
+            for pending in sorted(get_clarify_manager().list_pending(), key=lambda item: item.created_at)
+            if pending.session_key == session_key
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[chat.inflight] questions unavailable: {exc}")
+    return approvals, clarifies
 
 
 # Host-supplied live goal lookup. The disk fallback keeps the shared relay RPC
 # useful in read-only processes, while the gateway binding guarantees the
 # active profile's already-initialized manager remains canonical.
 _goal_state_provider = None
+_goal_generation_provider = None
 
 
 def set_goal_state_provider(provider) -> None:
     global _goal_state_provider
     _goal_state_provider = provider
+
+
+def set_goal_generation_provider(provider) -> None:
+    global _goal_generation_provider
+    _goal_generation_provider = provider
 
 
 _goal_control_cb = None
@@ -922,7 +977,29 @@ def set_goal_control_callback(cb) -> None:
     _goal_control_cb = cb
 
 
+def _require_goal_access(session_key: str, *, goal_id: str | None = None) -> None:
+    from flowly.goals.store import GoalStore
+    from flowly.live_voice.authority import current_request_owner
+    from flowly.session.ownership import require_rpc_session
+
+    require_rpc_session('goal.get', {'sessionKey': session_key})
+    if current_request_owner() is not None:
+        # Host callbacks can have runtime effects before returning a snapshot.
+        # Check the persisted original owner before invoking any such callback.
+        store = GoalStore(get_flowly_home())
+        if goal_id is None:
+            store.get(session_key)
+        else:
+            store.get_generation(session_key, goal_id)
+
+
 async def _goal_control(params: dict, action: str) -> dict:
+    from flowly.session.commands import validate_chat_target
+
+    try:
+        validate_chat_target(params)
+    except ValueError as exc:
+        raise FeatureRpcError('TASK_TARGET_CHANGED', str(exc)) from exc
     if _goal_control_cb is None:
         raise FeatureRpcError("UNAVAILABLE", "goal control is not available")
     session_key = str(params.get("sessionKey") or "").strip()
@@ -931,9 +1008,22 @@ async def _goal_control(params: dict, action: str) -> dict:
     if len(session_key) > 2_000:
         raise FeatureRpcError("INVALID_PARAMS", "sessionKey is too long")
     from flowly.goals.manager import GoalNotFoundError
+    from flowly.goals.store import GoalStoreConflictError
 
+    guard = {}
+    if 'expectedGoalId' in params or 'expectedRevision' in params:
+        goal_id, revision = params.get('expectedGoalId'), params.get('expectedRevision')
+        if (not isinstance(goal_id, str) or not goal_id or len(goal_id) > 512
+                or any(ord(c) < 32 for c in goal_id)
+                or type(revision) is not int or revision < 0):
+            raise FeatureRpcError('INVALID_PARAMS', 'A goal identity and revision are required together.')
+        guard = {'expected_goal_id': goal_id, 'expected_revision': revision}
+
+    _require_goal_access(session_key)
     try:
-        return await _goal_control_cb(session_key, action)
+        return await _goal_control_cb(session_key, action, **guard)
+    except GoalStoreConflictError as exc:
+        raise FeatureRpcError('GOAL_STATE_CHANGED', 'The goal changed before this control could be applied.') from exc
     except GoalNotFoundError as exc:
         # A stale client can legitimately race a clear performed on another
         # surface. Keep that domain outcome on the structured RPC path so the
@@ -961,12 +1051,33 @@ async def goal_stop(params: dict) -> dict:
 
 def goal_get(params: dict) -> dict:
     """Return a conversation's durable standing-goal snapshot."""
+    from flowly.session.commands import validate_chat_target
+
+    try:
+        validate_chat_target(params)
+    except ValueError as exc:
+        raise FeatureRpcError('TASK_TARGET_CHANGED', str(exc)) from exc
     session_key = str(params.get("sessionKey") or "").strip()
     if not session_key:
         raise FeatureRpcError("INVALID_PARAMS", "sessionKey is required")
     if len(session_key) > 2_000:
         raise FeatureRpcError("INVALID_PARAMS", "sessionKey is too long")
 
+    if 'goalId' in params:
+        goal_id = params['goalId']
+        if (not isinstance(goal_id, str) or not 1 <= len(goal_id) <= 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in goal_id)):
+            raise FeatureRpcError('INVALID_PARAMS', 'A valid goal identity is required.')
+        _require_goal_access(session_key, goal_id=goal_id)
+        if _goal_generation_provider is not None:
+            proof = _goal_generation_provider(session_key, goal_id)
+        else:
+            from flowly.goals.store import GoalStore
+
+            proof = GoalStore(get_flowly_home()).get_generation(session_key, goal_id)
+        return {'sessionKey': session_key, 'goal': proof}
+
+    _require_goal_access(session_key)
     if _goal_state_provider is not None:
         state = _goal_state_provider(session_key)
     else:
@@ -980,6 +1091,70 @@ def goal_get(params: dict) -> dict:
 
 
 # ── Compaction ──────────────────────────────────────────────────────────────
+
+async def agent_home_get(params: dict) -> dict:
+    from flowly.agent_home import AgentHomeError, resolve_home
+    try:
+        return await asyncio.to_thread(resolve_home, params)
+    except AgentHomeError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+
+
+async def agent_home_setup(params: dict) -> dict:
+    from flowly.agent_home import AgentHomeError, finish_setup
+    try:
+        return await asyncio.to_thread(finish_setup, params)
+    except AgentHomeError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+
+
+# Coroutine the direct gateway registers to run a named agent's introduction as
+# a real streamed turn: ``async (run_id, prompt) -> bool``. It returns False when
+# no client is watching the conversation to receive the stream; the caller then
+# settles to the static welcome.
+_introduction_runner = None
+_introduction_tasks: set[asyncio.Task] = set()
+
+
+def set_agent_introduction_runner(runner) -> None:
+    global _introduction_runner
+    _introduction_runner = runner
+
+
+async def agent_home_introduce(params: dict) -> dict:
+    """Start the agent's first message once. Transports without a streaming
+    runner (or with nobody watching) settle to the static welcome instead."""
+    from flowly.agent_home import AgentHomeError, claim_introduction, settle_introduction
+    try:
+        claim = await asyncio.to_thread(claim_introduction, params)
+    except AgentHomeError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+    if not claim["launch"]:
+        return claim["state"]
+    run_id = claim["runId"]
+    runner = _introduction_runner
+
+    async def run() -> None:
+        from loguru import logger
+
+        try:
+            if runner is not None:
+                await runner(run_id, claim["prompt"])
+        except Exception:  # noqa: BLE001 — the fallback below still greets
+            logger.exception("[agent-home] introduction turn {} failed", run_id)
+        finally:
+            # A turn that reached the agent was already settled inside its turn
+            # lock (this is then a no-op). This covers every run that did not:
+            # no runner, nobody watching, or a failure before the agent.
+            try:
+                await asyncio.to_thread(settle_introduction, run_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("[agent-home] could not settle introduction {}", run_id)
+
+    task = asyncio.create_task(run())
+    _introduction_tasks.add(task)
+    task.add_done_callback(_introduction_tasks.discard)
+    return claim["state"]
 
 # Coroutine the host registers so ``chat.compact`` can reach the agent.
 # Signature: ``async (session_key, instructions) -> dict``.
@@ -1671,6 +1846,154 @@ def _tool_access_registry():
 # board. Wired at startup so board.snapshot/action work over relay AND gateway
 # (the gateway also has its own direct handlers; this lights up the relay).
 _board_provider = None
+_voice_provider = None
+_voice_access_verifier = None
+_voice_context_provider = None
+_work_output_provider = None
+
+
+def set_work_output_provider(provider) -> None:
+    global _work_output_provider
+    _work_output_provider = provider
+
+
+def work_output_call(method: str, params: dict) -> dict:
+    from flowly.live_voice.sessions import VoiceError
+
+    output = _work_output_provider() if _work_output_provider is not None else None
+    if output is None:
+        raise FeatureRpcError('UNAVAILABLE', 'Work outputs are not ready on this runtime.')
+    try:
+        return (output.list if method == 'chat.outputs.list' else output.read)(params)
+    except VoiceError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+    except ValueError as exc:
+        raise FeatureRpcError('TASK_TARGET_CHANGED', str(exc)) from exc
+
+
+def set_voice_context_provider(provider) -> None:
+    global _voice_context_provider
+    _voice_context_provider = provider
+
+
+async def voice_context(params: dict) -> dict:
+    from flowly.live_voice.sessions import VoiceError
+
+    context = _voice_context_provider() if _voice_context_provider is not None else None
+    if context is None:
+        raise FeatureRpcError("UNAVAILABLE", "Voice context is not ready on this runtime.")
+    try:
+        return await context.search(params)
+    except VoiceError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+
+
+def set_voice_provider(provider) -> None:
+    """Register the primary runtime's Live Voice service for both transports."""
+    global _voice_provider
+    _voice_provider = provider
+
+
+def has_voice_account() -> bool:
+    from flowly.live_voice.authority import current_request_owner
+
+    owner = current_request_owner()
+    return owner is not None and owner.uid is not None
+
+
+async def resolve_voice_owner(params: dict, *, inherit: bool = False):
+    owner, clean, _ = await resolve_voice_access(params, inherit=inherit)
+    return owner, clean
+
+
+async def resolve_voice_access(params: dict, *, inherit: bool = False):
+    from flowly.live_voice.access import VoiceAccessError, VoiceAccessVerifier
+    from flowly.live_voice.authority import HOST_OWNER, RequestOwner, current_request_owner
+
+    global _voice_access_verifier
+    if not isinstance(params, dict):
+        raise FeatureRpcError('INVALID_PARAMS', 'RPC parameters must be an object.')
+    clean = dict(params)
+    owner = (current_request_owner() or HOST_OWNER) if inherit else HOST_OWNER
+    principal = None
+    try:
+        if 'voiceAccess' in clean:
+            from flowly.profile import get_or_create_profile_host_id
+
+            if _voice_access_verifier is None:
+                _voice_access_verifier = VoiceAccessVerifier()
+            principal = await _voice_access_verifier.verify(clean.pop('voiceAccess'), get_or_create_profile_host_id())
+            owner = RequestOwner(principal.uid)
+        return owner, clean, principal
+    except VoiceAccessError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from None
+
+
+async def voice_call(method: str, params: dict) -> dict:
+    from flowly.live_voice.authority import request_owner_scope
+    from flowly.live_voice.diagnostics import records_voice_method, voice_rpc_diagnostic
+    from flowly.live_voice.sessions import VoiceError
+    from flowly.session.ownership import SessionAccessError
+    import time
+
+    started = time.monotonic()
+    outcome, reason_code = 'ok', None
+    diagnostic_binding = {}
+    authorized_at = None
+    service = _voice_provider() if _voice_provider is not None else None
+    if service is None:
+        voice_rpc_diagnostic(method, params, started, 'failed', 'UNAVAILABLE')
+        raise FeatureRpcError("UNAVAILABLE", "Live Voice is not ready on this runtime.")
+    try:
+        owner, clean = await resolve_voice_owner(params, inherit=True)
+        authorized_at = time.monotonic()
+        # Diagnostic fields never enter command fingerprint/receipt payloads.
+        clean.pop('_voiceDiagnostic', None)
+        with request_owner_scope(owner):
+            owned_service = service.for_owner(owner)
+            if records_voice_method(method, params) and method != 'voice.open':
+                try:
+                    diagnostic_binding = owned_service.sessions.diagnostic_identity(clean)
+                except Exception:
+                    pass  # Missing/deleted sessions have no trusted binding.
+            result = owned_service.call(method, clean)
+            result = await result if _inspect.isawaitable(result) else result
+            if method == 'voice.open':
+                try:
+                    diagnostic_binding = owned_service.sessions.diagnostic_identity(clean)
+                except Exception:
+                    pass
+            return result
+    except (VoiceError, SessionAccessError) as exc:
+        outcome, reason_code = 'failed', exc.code
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+    except FeatureRpcError as exc:
+        outcome, reason_code = 'failed', exc.code
+        raise
+    except Exception:
+        outcome, reason_code = 'failed', 'INTERNAL'
+        raise
+    finally:
+        finished = time.monotonic()
+        voice_rpc_diagnostic(method, params, started, outcome, reason_code, diagnostic_binding, finished=finished)
+        voice_rpc_diagnostic(method, params, started, 'ok' if authorized_at is not None else outcome,
+                             None if authorized_at is not None else reason_code, diagnostic_binding,
+                             stage='core_auth', finished=authorized_at if authorized_at is not None else finished)
+        if authorized_at is not None:
+            voice_rpc_diagnostic(method, params, authorized_at, outcome, reason_code, diagnostic_binding,
+                                 stage='core_handler', finished=finished)
+
+
+def task_request_call(method: str, params: dict) -> dict:
+    from flowly.live_voice.requests import pending_requests, respond
+    from flowly.live_voice.sessions import VoiceError
+
+    try:
+        return (pending_requests if method == 'chat.requests' else respond)(params)
+    except VoiceError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+    except ValueError as exc:
+        raise FeatureRpcError('TASK_TARGET_CHANGED', str(exc)) from exc
 
 
 def set_board_provider(provider) -> None:
@@ -2430,28 +2753,48 @@ def _artifact_store():
     return get_store()
 
 
+_artifact_change_callback = None
+
+
+def set_artifact_change_callback(callback) -> None:
+    global _artifact_change_callback
+    _artifact_change_callback = callback
+
+
+async def _artifact_changed(event: str, data: dict, scope) -> None:
+    from flowly.live_voice.events import EventAccess, event_access_scope
+
+    if _artifact_change_callback is None:
+        return
+    access = EventAccess(scopes=(scope,), canonical=event != 'artifact.deleted') if scope is not None else EventAccess(blocked=True)
+    with event_access_scope(access):
+        try:
+            result = _artifact_change_callback(event, data)
+            if _inspect.isawaitable(result):
+                await result
+        except Exception as error:
+            from loguru import logger
+
+            logger.warning('Artifact change delivery failed ({})', type(error).__name__)
+
+
 def artifacts_list(params: dict) -> dict:
-    """Artifact summaries (no content). Mirrors the gateway WS handler:
-    over-fetch then drop internal/context artifacts so the visible page
-    doesn't shrink below the caller's limit."""
-    from flowly.artifacts.context import is_internal_context_artifact
+    """Artifact summaries with ownership/internal filtering before pagination."""
     from flowly.artifacts.summary import artifact_summary
 
     store = _artifact_store()
     limit = max(1, min(int(params.get("limit", 50) or 50), 200))
     include_internal = bool(params.get("includeInternal", False))
-    fetch_limit = limit if include_internal else max(limit * 5, 100)
     results = store.list(
         type=params.get("type"),
         pinned=params.get("pinned"),
         search=params.get("search"),
         session_key=params.get("sessionKey"),
-        limit=fetch_limit,
+        limit=limit,
         offset=int(params.get("offset", 0) or 0),
+        include_internal=include_internal,
     )
-    if not include_internal:
-        results = [a for a in results if not is_internal_context_artifact(a)]
-    return {"artifacts": [artifact_summary(a) for a in results[:limit]]}
+    return {"artifacts": [artifact_summary(a) for a in results]}
 
 
 def artifacts_get(params: dict) -> dict:
@@ -2480,12 +2823,14 @@ def artifacts_get(params: dict) -> dict:
     return {"artifact": artifact}
 
 
-def artifacts_update(params: dict) -> dict:
+async def artifacts_update(params: dict) -> dict:
     """Edit title/content/tags/size — the desktop modal's save path."""
     artifact_id = str(params.get("id", "") or "")
     if not artifact_id:
         raise FeatureRpcError("INVALID", "id required")
-    artifact = _artifact_store().update(
+    store = _artifact_store()
+    scope = store.control_scope(artifact_id)
+    artifact = store.update(
         artifact_id,
         title=params.get("title"),
         content=params.get("content"),
@@ -2497,23 +2842,32 @@ def artifacts_update(params: dict) -> dict:
     )
     if not artifact:
         raise FeatureRpcError("NOT_FOUND", "Artifact not found")
+    await _artifact_changed('artifact.updated', artifact, scope)
     return {"artifact": artifact}
 
 
-def artifacts_delete(params: dict) -> dict:
+async def artifacts_delete(params: dict) -> dict:
     artifact_id = str(params.get("id", "") or "")
     if not artifact_id:
         raise FeatureRpcError("INVALID", "id required")
-    return {"ok": _artifact_store().delete(artifact_id)}
+    store = _artifact_store()
+    scope = store.control_scope(artifact_id)
+    deleted = store.delete(artifact_id)
+    if deleted:
+        await _artifact_changed('artifact.deleted', {'id': artifact_id}, scope)
+    return {'ok': deleted}
 
 
-def artifacts_pin(params: dict) -> dict:
+async def artifacts_pin(params: dict) -> dict:
     artifact_id = str(params.get("id", "") or "")
     if not artifact_id:
         raise FeatureRpcError("INVALID", "id required")
-    artifact = _artifact_store().pin(artifact_id, bool(params.get("pinned", True)))
+    store = _artifact_store()
+    scope = store.control_scope(artifact_id)
+    artifact = store.pin(artifact_id, bool(params.get("pinned", True)))
     if not artifact:
         raise FeatureRpcError("NOT_FOUND", "Artifact not found")
+    await _artifact_changed('artifact.updated', artifact, scope)
     return {"artifact": artifact}
 
 
@@ -3399,7 +3753,13 @@ def sessions_list() -> dict:
     # client — gateway and relay — surface a live "working" indicator straight
     # from the bot's runtime state, no separate flag to drift.
     from flowly.agent.inflight import get as _inflight_get
+    from flowly.live_voice.authority import current_request_owner
+    from flowly.session.keys import read_session_header, session_key_from_header
+    from flowly.session.ownership import require_session_file, session_visible
 
+    # What each conversation is waiting on from the owner (an approval, a
+    # question, a plan, a connection), read once for the whole list.
+    waiting = _pending_inputs()
     out = []
     if sessions_dir.exists():
         from flowly.session.manager import iter_session_files
@@ -3413,14 +3773,19 @@ def sessions_list() -> dict:
                     channel, chat_id = "unknown", base
                 else:
                     channel, chat_id = base[:sep], base[sep + 1 :]
-                key = base.replace("_", ":")
+                header = read_session_header(p)
+                key = session_key_from_header(p, header)
                 modified_ms = int(st.st_mtime * 1000)
                 # Auto-generated descriptive title, so every
                 # relay client can show the SAME name the gateway/CLI surfaces
                 # instead of a random session-key suffix. The client writes it
                 # to its (encrypted) Firestore conversation doc; the relay
                 # itself is untouched — this only enriches the RPC payload.
-                metadata = _session_metadata(p)
+                metadata = header.get('metadata') if current_request_owner() is None else require_session_file(p, key)
+                if metadata is None:
+                    continue
+                if not session_visible(key, metadata):
+                    continue
                 raw_title = metadata.get("title")
                 title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
                 raw_completion_id = metadata.get("last_assistant_run_id")
@@ -3445,6 +3810,8 @@ def sessions_list() -> dict:
                         "channel": channel,
                         "chatId": chat_id,
                         "title": title,
+                        **({"kind": "voice", "voiceConversationId": metadata.get("voiceConversationId")}
+                           if metadata.get("kind") == "voice" else {}),
                         # Superset fields for the TUI gateway client (which reads
                         # ``displayName`` / ``updatedAt``). Same content, one shape
                         # serves every client + transport.
@@ -3455,6 +3822,10 @@ def sessions_list() -> dict:
                         # True while a turn for this session is in flight — drives the
                         # client's "running" shimmer. Old clients ignore the field.
                         "running": _inflight_get(key) is not None,
+                        # Set while the conversation waits for the owner:
+                        # {kind: approval|question|plan|connection, since (ms),
+                        # count}. Absent otherwise; old clients ignore it.
+                        **({"needsInput": waiting[key]} if key in waiting else {}),
                         # Conversation-scoped model selection. This is safe to
                         # expose (it is a public model id, never a credential)
                         # and lets local profile clients label each chat
@@ -3471,21 +3842,71 @@ def sessions_list() -> dict:
     return {"sessions": out}
 
 
+def _pending_inputs() -> dict:
+    from flowly.session.attention import pending_inputs
+
+    requests: list = []
+    service = _mcp_connection_service
+    if service is not None:
+        try:
+            requests = service.chat.pending(None).get("requests", [])
+        except Exception:  # noqa: BLE001 — the other waits still count
+            requests = []
+    return pending_inputs(requests)
+
+
+def sessions_attention() -> dict:
+    """``{sessions: {sessionKey: {kind, since, count}}}`` — only the
+    conversations waiting for the owner. What ``sessions.list`` carries per
+    row, without reading every session file: the profile host asks a bot this
+    to show "needs you" on the bot itself.
+
+    An account-scoped request sees only the conversations ``sessions.list``
+    would show it; a key it may not open is left out, not just its row."""
+    from flowly.live_voice.authority import current_request_owner
+
+    waiting = _pending_inputs()
+    if current_request_owner() is None:
+        return {"sessions": waiting}
+    from flowly.session.ownership import read_session_metadata, session_visible
+    from flowly.utils.helpers import safe_filename
+
+    sessions_dir = get_flowly_home() / "sessions"
+    visible = {}
+    for key, wait in waiting.items():
+        try:
+            path = sessions_dir / (safe_filename(key.replace(":", "_")) + ".jsonl")
+            metadata = read_session_metadata(path, key)
+        except Exception:  # noqa: BLE001 — unreadable means not shown
+            continue
+        if session_visible(key, metadata if metadata is not None else {}):
+            visible[key] = wait
+    return {"sessions": visible}
+
+
 def sessions_read(params: dict) -> dict:
     """A session's messages (jsonl lines) — key ``:`` → ``_`` filename."""
+    from flowly.session.manager import session_file_lock
+    from flowly.session.ownership import require_session_file
+    from flowly.utils.helpers import safe_filename
+
     key = params.get("key") or params.get("sessionKey") or ""
-    file_name = key.replace(":", "_") + ".jsonl"
+    if not isinstance(key, str) or len(key) > 512 or any(char in key for char in ('/', '\\', '\x00')):
+        raise FeatureRpcError('INVALID_PARAMS', 'Invalid conversation identity.')
+    file_name = safe_filename(key.replace(':', '_')) + '.jsonl'
     path = get_flowly_home() / "sessions" / file_name
     messages = []
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                messages.append(json.loads(line))
-            except Exception:
-                continue
+    with session_file_lock(path):
+        require_session_file(path, key)
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    messages.append(json.loads(line))
+                except Exception:
+                    continue
     return {"messages": messages}
 
 
@@ -4646,6 +5067,7 @@ def system_capabilities() -> dict:
         and not (
             method.startswith("flowlets.") and not runtime.owns_flowlets
         )
+        and not (method.startswith("voice.") and method != "voice.context" and not runtime.owns_shared_board)
     ]
 
     return {
@@ -4662,6 +5084,15 @@ def system_capabilities() -> dict:
                 "shared": True,
                 "assignment": True,
                 "durableRuns": True,
+            },
+            "voice": {
+                "protocolVersion": 1,
+                "transcriptVersion": 1,
+                "commandVersion": 1,
+                "eventCursorVersion": 1,
+                "accountAccessVersion": 1,
+                "eventLeaseVersion": 1,
+                "steerMode": "next_turn",
             },
         } if runtime.owns_shared_board else {}),
     }
@@ -4795,6 +5226,7 @@ async def media_models_refresh(_params: dict) -> dict:
 #   restart_aware — a ``willRestart`` in the result means the transport should
 #                   ACK then bounce the gateway
 _DISPATCH: dict[str, tuple] = {
+    "voice.context": (voice_context, True, False),
     "system.capabilities": (system_capabilities, False, False),
     "connections.list": (connections_list, False, False),
     "connections.secret.get": (connections_secret_get, True, False),
@@ -4825,6 +5257,9 @@ _DISPATCH: dict[str, tuple] = {
     "goal.resume": (goal_resume, True, False),
     "goal.stop": (goal_stop, True, False),
     "chat.compact": (chat_compact, True, False),
+    "agent.home.get": (agent_home_get, True, False),
+    "agent.home.setup": (agent_home_setup, True, False),
+    "agent.home.introduce": (agent_home_introduce, True, False),
     "plan.get": (plan_get, True, False),
     "plan.list": (plan_list, True, False),
     "plan.resolve": (plan_resolve, True, False),
@@ -4934,6 +5369,7 @@ _DISPATCH: dict[str, tuple] = {
     "kg.graph": (kg_graph, False, False),
     "kg.delete_entity": (kg_delete_entity, True, False),
     "sessions.list": (sessions_list, False, False),
+    "sessions.attention": (sessions_attention, False, False),
     "sessions.read": (sessions_read, True, False),
     "audit.list": (audit_list, True, False),
     "audit.stats": (audit_stats, False, False),
@@ -4947,11 +5383,19 @@ _DISPATCH: dict[str, tuple] = {
     "pairing.approve": (pairing_approve, True, False),
 }
 
+_DISPATCH.update({method: (_partial(voice_call, method), True, False) for method in _VOICE_METHODS})
+_DISPATCH.update({method: (_partial(task_request_call, method), True, False)
+                  for method in ('chat.requests', 'chat.respond')})
+_DISPATCH.update({method: (_partial(work_output_call, method), True, False)
+                  for method in ('chat.outputs.list', 'chat.outputs.read')})
+
 #: Every method this module serves. Transports gate on membership.
 def _gmail_handler(method: str):
     async def handle(params: dict) -> dict:
         from flowly.integrations.gmail_rpc import gmail_rpc
-        return await gmail_rpc(method, params)
+        # dispatch already verified the transport's identity pin. It is not
+        # part of the closed Gmail feature schema or an account permission.
+        return await gmail_rpc(method, {key: value for key, value in params.items() if key != "expectedBotId"})
     return handle
 
 
@@ -4965,7 +5409,7 @@ FEATURE_METHODS = frozenset(_DISPATCH)
 # These surfaces are installation-wide and are owned exclusively by the
 # primary/default runtime. Named profile processes consume scoped task work
 # through the profile broker; they never expose a second Board or Flowlet API.
-_PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.")
+_PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.", "voice.")
 
 # These methods may legitimately wait for a human/browser or a slow server.
 # WebSocket transports dispatch them in tracked background tasks so their
@@ -4974,6 +5418,9 @@ LONG_RUNNING_METHODS = frozenset({
     "memory.editor.list",
     "memory.editor.document",
     "memory.editor.save",
+
+    'voice.tasks.requests',
+    'voice.tasks.respond',
     "mcp.test",
     "mcp.oauth_start",
     "mcp.setup.cancel",
@@ -4998,16 +5445,29 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
     unknown method or a structured handler error; any other exception
     propagates so the transport can map it to an INTERNAL error.
     """
+    if isinstance(params, dict) and 'voiceAccess' in params:
+        from flowly.live_voice.authority import request_owner_scope
+
+        owner, clean = await resolve_voice_owner(params)
+        with request_owner_scope(owner):
+            return await dispatch(method, clean)
     entry = _DISPATCH.get(method)
     if entry is None:
         raise FeatureRpcError("UNKNOWN_METHOD", f"unknown feature method: {method}")
-    if method.startswith(_PRIMARY_RUNTIME_METHOD_PREFIXES):
+    if 'expectedBotId' in params:
+        from flowly.session.commands import validate_chat_target
+
+        try:
+            validate_chat_target(params)
+        except ValueError as exc:
+            raise FeatureRpcError('PROFILE_IDENTITY_CHANGED', str(exc)) from exc
+    if method.startswith(_PRIMARY_RUNTIME_METHOD_PREFIXES) and method != "voice.context":
         from flowly.runtime_capabilities import resolve_runtime_capabilities
 
         capabilities = resolve_runtime_capabilities()
         owns_surface = (
             capabilities.owns_shared_board
-            if method.startswith("board.")
+            if method.startswith(("board.", "voice."))
             else capabilities.owns_flowlets
         )
         if not owns_surface:
@@ -5016,8 +5476,14 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
                 "This feature is owned by the primary Flowly runtime.",
             )
     fn, wants_params, restart = entry
-    result = fn(params) if wants_params else fn()
-    if _inspect.isawaitable(result):
-        result = await result
+    from flowly.session.ownership import SessionAccessError, require_rpc_session
+
+    try:
+        require_rpc_session(method, params)
+        result = fn(params) if wants_params else fn()
+        if _inspect.isawaitable(result):
+            result = await result
+    except SessionAccessError as error:
+        raise FeatureRpcError(error.code, error.message) from None
     needs_restart = bool(restart and isinstance(result, dict) and result.get("willRestart"))
     return result, needs_restart

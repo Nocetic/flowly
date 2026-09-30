@@ -404,6 +404,9 @@ async def test_push_session_message_broadcasts_chat_final(store):
     """Proactive board delivery reaches WS clients as a normal chat 'final'
     event — so the TUI/desktop render it like any assistant reply."""
     server = _server(store)
+    from flowly.profile import get_flowly_home
+
+    server.sessions.sessions_dir = get_flowly_home() / 'sessions'
 
     sent: list = []
 

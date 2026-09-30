@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import time
 
+from flowly.session.control_access import SessionControlScope
+
 # session_key → {"runId", "text", "user", "iterations": list, "updatedAt"}
 _runs: dict[str, dict] = {}
+_control_scopes: dict[str, tuple[str, SessionControlScope]] = {}
 
 # Cap the stored tool-turn events per run so a marathon turn can't grow the
 # registry without bound. Each iteration emits ~2 events (the assistant call +
@@ -30,14 +33,15 @@ _runs: dict[str, dict] = {}
 _MAX_ITERATIONS = 600
 
 
-def _fresh(run_id: str, user: str = "") -> dict:
+def _fresh(run_id: str, user: str = "", goal_run: bool | None = None) -> dict:
     return {
         "runId": run_id, "text": "", "user": user or "",
         "iterations": [], "updatedAt": time.time(),
+        **({'goalRun': goal_run} if goal_run is not None else {}),
     }
 
 
-def begin(session_key: str, run_id: str, user: str = "") -> None:
+def begin(session_key: str, run_id: str, user: str = "", *, goal_run: bool | None = None) -> None:
     """Start tracking a run for this session, clearing any stale entry.
 
     ``user`` is the message that triggered the run. We keep it so a client that
@@ -49,7 +53,9 @@ def begin(session_key: str, run_id: str, user: str = "") -> None:
     """
     if not session_key or not run_id:
         return
-    _runs[session_key] = _fresh(run_id, user)
+    scope = SessionControlScope.capture(session_key)
+    _runs[session_key] = _fresh(run_id, user, goal_run)
+    _control_scopes[session_key] = (run_id, scope)
 
 
 def append(session_key: str, run_id: str, delta: str) -> None:
@@ -59,8 +65,8 @@ def append(session_key: str, run_id: str, delta: str) -> None:
         return
     cur = _runs.get(session_key)
     if cur is None or cur.get("runId") != run_id:
-        cur = _fresh(run_id)
-        _runs[session_key] = cur
+        begin(session_key, run_id)
+        cur = _runs[session_key]
     cur["text"] += delta
     cur["updatedAt"] = time.time()
 
@@ -75,8 +81,8 @@ def append_iteration(session_key: str, run_id: str, event: dict) -> None:
         return
     cur = _runs.get(session_key)
     if cur is None or cur.get("runId") != run_id:
-        cur = _fresh(run_id)
-        _runs[session_key] = cur
+        begin(session_key, run_id)
+        cur = _runs[session_key]
     iters = cur.setdefault("iterations", [])
     iters.append(event)
     if len(iters) > _MAX_ITERATIONS:
@@ -130,6 +136,22 @@ def finish(session_key: str, run_id: str) -> None:
     cur = _runs.get(session_key)
     if cur and cur.get("runId") == run_id:
         _runs.pop(session_key, None)
+        _control_scopes.pop(session_key, None)
+
+
+def control_scope(run_id: str) -> SessionControlScope | None:
+    """Look up a live run's immutable control target without exposing text."""
+    from flowly.session.ownership import SessionAccessError
+
+    keys = [key for key, row in _runs.items() if row.get('runId') == run_id]
+    if not keys:
+        return None
+    if len(keys) != 1:
+        raise SessionAccessError()
+    binding = _control_scopes.get(keys[0])
+    if binding is None or binding[0] != run_id:
+        raise SessionAccessError()
+    return binding[1]
 
 
 def get(session_key: str) -> dict | None:
@@ -152,4 +174,6 @@ def get(session_key: str) -> dict | None:
                              for event in cur["toolProgress"].values()]}
            if cur.get("toolProgress") else {}),
         **({"steeringSequence": cur["steeringSequence"]} if cur.get("steeringSequence") else {}),
+
+        **({'goalRun': cur['goalRun']} if 'goalRun' in cur else {}),
     }

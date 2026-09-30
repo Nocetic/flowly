@@ -11,6 +11,7 @@ import pytest
 
 import flowly.profile as profiles
 from flowly.gateway.server import GatewayServer
+from flowly.live_voice.authority import RequestOwner, request_owner_scope, valid_parent_key
 from flowly.profile_host import ProfileHost
 from flowly.profile_host_contract import ProfileHostError
 
@@ -56,9 +57,68 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
     try:
         connected = await host.connect("writer")
         assert connected["status"]["state"] == "connected"
+        runtime = host._runtimes['writer']
+        lease = profiles.read_runtime_lease(root / 'writer')
+        assert 'voice-owner-hop-v1' in runtime.capabilities
+        assert 'voice-owner-events-v1' in runtime.capabilities
+        assert valid_parent_key(runtime.voice_parent_key)
+        assert runtime.voice_parent_key == lease['voiceParentKey']
+        assert runtime.voice_parent_key not in repr(connected)
 
         result = await host.rpc("writer", "sessions.list", {})
         assert result == {"sessions": []}
+        with request_owner_scope(RequestOwner('account-a')):
+            assert await host.rpc('writer', 'sessions.list', {}) == {'sessions': []}
+            task_key = 'desktop:voice-work:reservation-1'
+            with pytest.raises(ProfileHostError) as unreserved:
+                await host.rpc('writer', 'chat.history', {'sessionKey': task_key})
+            assert unreserved.value.code == 'NOT_FOUND'
+            reserved = await host._target_rpc('writer', 'runtime.voice.reserve', {
+                'sessionKey': task_key, 'expectedBotId': profiles.ensure_profile_bot_id('writer').bot_id,
+            }, 10)
+            assert reserved == {'sessionKey': task_key, 'reserved': True}
+            assert [row['key'] for row in (await host.rpc('writer', 'sessions.list', {}))['sessions']] == [task_key]
+        with request_owner_scope(RequestOwner('account-b')):
+            assert await host.rpc('writer', 'sessions.list', {}) == {'sessions': []}
+            with pytest.raises(ProfileHostError) as denied:
+                await host.rpc('writer', 'chat.history', {'sessionKey': task_key})
+            assert denied.value.code == 'NOT_FOUND'
+
+        # A real child process signs the event, the long-lived parent reader
+        # restores its original scope, and the public envelope contains no
+        # private wire proof or account identifier. No model call is needed.
+        from flowly.artifacts.store import ArtifactStore
+        from flowly.live_voice.authority import current_request_owner
+        from flowly.live_voice.events import current_event_access
+
+        artifact_store = ArtifactStore(created / 'artifacts.sqlite')
+        try:
+            with request_owner_scope(RequestOwner('account-a')):
+                artifact = artifact_store.create('markdown', 'Private output', 'original', session_key=task_key)
+        finally:
+            artifact_store.close()
+        delivered = asyncio.get_running_loop().create_future()
+
+        async def receive(envelope):
+            if envelope['type'] == 'artifact.updated' and not delivered.done():
+                delivered.set_result((envelope, current_request_owner(), current_event_access()))
+
+        subscription = host.subscribe_events(receive)
+        try:
+            with request_owner_scope(RequestOwner('account-a')):
+                # Exercise the child gateway's existing mutation without
+                # expanding the public profile host's RPC allowlist.
+                updated = await host._rpc(runtime, 'artifacts.update', {'id': artifact['id'], 'content': 'updated privately'}, 10)
+            assert updated['artifact']['content'] == 'updated privately'
+            envelope, owner, access = await asyncio.wait_for(delivered, 2)
+            assert owner == RequestOwner('account-a')
+            assert access.permits(owner)
+            assert not access.permits(RequestOwner('account-b'))
+            assert envelope['profile'] == 'writer'
+            assert 'voiceEventAuthority' not in json.dumps(envelope)
+            assert 'account-a' not in json.dumps(envelope)
+        finally:
+            host.unsubscribe_events(subscription)
 
         # Exercise the actual child process's feature handlers and allowlist,
         # rather than a permissive mock of profiles.rpc.
@@ -155,9 +215,43 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
         assert default_credentials.read_bytes() == default_credentials_before
         assert (primary_config.read_bytes() if primary_config.exists() else None) == primary_before
 
+        # Public RPC and a real child process agree on one persistent home;
+        # resolving twice and restarting must not create another greeting.
+        agent_home = await host.rpc("writer", "agent.home.get", {"locale": "tr"}, **identity)
+        assert agent_home["setup"] == "active"
+        assert agent_home["introduction"] == "pending"
+        assert await host.rpc("writer", "agent.home.get", {}, **identity) == agent_home
+        # The agent speaks first through a real turn in the child. This fixture
+        # has no model credentials, so the turn fails and the app's localized
+        # welcome is written instead — exactly once, never a provider error.
+        introducing = await host.rpc("writer", "agent.home.introduce", {"locale": "tr"}, **identity)
+        assert introducing["introduction"] in {"running", "fallback"}
+        for _ in range(200):
+            settled = await host.rpc("writer", "agent.home.get", {}, **identity)
+            if settled["introduction"] != "running":
+                break
+            await asyncio.sleep(0.05)
+        assert settled["introduction"] == "fallback"
+        assert settled["pendingAsk"]["options"]
+        repeated = await host.rpc("writer", "agent.home.introduce", {}, **identity)
+        assert repeated["introduction"] == "fallback"
+        history_params = {"sessionKey": agent_home["sessionKey"], "limit": 10}
+        page = await host.rpc("writer", "chat.history", history_params, **identity)
+        assert len(page["messages"]) == 1
+        assert "Birlikte" in json.dumps(page["messages"][0], ensure_ascii=False)
+        assert page["historyPageVersion"] == 1
+        assert not page["hasOlder"]
+        skipped = await host.rpc("writer", "agent.home.setup", {"state": "skipped"}, **identity)
+        assert skipped["setup"] == "skipped"
+        with pytest.raises(ProfileHostError) as protected:
+            await host.rpc("writer", "sessions.delete", {"sessionKey": agent_home["sessionKey"]}, **identity)
+        assert protected.value.code == "PERSISTENT_CONVERSATION"
+
         stopped = await host.stop("writer")
         assert stopped["status"]["state"] == "stopped"
         assert profiles.read_runtime_lease(root / "writer") is None
+        assert await host.rpc("writer", "agent.home.get", {}, **identity) == skipped
+        assert await host.rpc("writer", "chat.history", history_params, **identity) == page
     finally:
         await host.shutdown()
 
@@ -201,6 +295,14 @@ async def test_second_manager_cooperatively_stops_desktop_owned_profile_runtime(
         owned_lease = profiles.read_runtime_lease(root / "writer")
         assert owned_lease is not None
         assert "cooperative-stop-v1" in owned_lease["capabilities"]
+        assert 'voice-owner-hop-v1' in owned_lease['capabilities']
+        parent_key = owned_lease['voiceParentKey']
+        assert valid_parent_key(parent_key)
+        assert remote_manager._runtimes['writer'].voice_parent_key == parent_key
+        assert desktop_owner._runtimes['writer'].voice_parent_key == parent_key
+        assert parent_key not in repr(owner_status) + repr(remote_status)
+        with request_owner_scope(RequestOwner('account-a')):
+            assert await remote_manager.rpc('writer', 'sessions.list', {}) == {'sessions': []}
 
         stopped = await remote_manager.stop("writer")
         assert stopped["status"]["state"] == "stopped"

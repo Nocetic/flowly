@@ -165,6 +165,25 @@ fire-and-forget: deltas that arrived while disconnected are gone. This RPC is
 served identically over both transports; `goal.get` remains the dedicated
 canonical lookup when only standing-goal state is needed.
 
+**4.5 — A named agent's first message has no chat.send.** When a new agent's
+home conversation (`desktop:profile-home`) is introduced
+(`agent.home.introduce`), the direct gateway runs an ordinary turn whose run
+id starts with `agent-intro-`. It emits the usual `agent` deltas,
+`iteration_step`, `final`/`error`, but no `state:"user"` event: its trigger is
+hidden. A client showing the home conversation adopts such a run when it is
+not already following one of its own; any other view ignores it. On `error`,
+clients reload history instead of showing the error — the server has written
+its static welcome. Details: `docs/engineering/agent-home-setup.md`.
+
+**4.6 — `setupAnswer` on chat.send.** In the home conversation only, a tapped
+setup choice sends its visible label as `message` plus
+`setupAnswer: {askId, optionId}`. The server applies its meaning inside the
+turn lock; a stale or unknown answer is treated as typed text.
+The agent's proposed working style is appended to the home transcript as an
+assistant row with `kind: "agent_setup_card"` and a `setupCard` payload
+(forwarded by `chat.history`). The row is append-only; clients derive whether
+it is offered, saved (`savedCardId`) or superseded from `agent.home.get`.
+
 ---
 
 ## 5. Compaction lifecycle

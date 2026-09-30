@@ -161,6 +161,28 @@ async def test_web_ingress_rejects_bad_grants_before_ack_or_bus_publish(host):
             pytest.fail("old owner admitted")
 
 
+async def test_web_ingress_replays_an_accepted_screen_command_without_readmission(host):
+    bus = MessageBus()
+    channel = WebChannel(WebChannelConfig(enabled=True), bus)
+    socket = AsyncMock()
+    channel._ws = socket
+    channel.set_screen_gateway(host.gateway)
+    channel._screen_rpc = SimpleNamespace(clients={"browser": object()}, enabled=True, closed=False)
+    request = {"type": "rpc", "id": "request", "method": "chat.send", "sessionId": "browser",
+               "params": {"message": "Read page", "sessionKey": "web:original", "idempotencyKey": "run",
+                          "browserAccess": host.grant}}
+    await channel._handle_rpc(socket, request)
+    assert json.loads(socket.send.call_args.args[0])["result"]["runId"] == "run"
+    await asyncio.wait_for(bus.consume_inbound(), 2)
+    # The reply was lost and the browser reconnected: the retry reports the
+    # accepted run instead of a screen refusal, and nothing runs twice.
+    channel._screen_rpc.clients["browser"] = object()
+    channel._screen_rpc.enabled = False
+    await channel._handle_rpc(socket, request)
+    assert json.loads(socket.send.call_args.args[0])["result"]["runId"] == "run"
+    assert bus.inbound_size == 0
+
+
 async def test_relay_scope_routes_real_gateway_browser_tool_and_waits_for_explicit_resume(host):
     from flowly.gateway.server import GatewayServer
 

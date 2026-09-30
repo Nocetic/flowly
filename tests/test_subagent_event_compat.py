@@ -24,6 +24,13 @@ from flowly.gateway.server import GatewayServer
 @pytest.fixture
 def history(tmp_path, monkeypatch):
     monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "home"))
+    # Named-profile event authorization resolves the real profile directory.
+    # Keep that boundary real instead of letting nonexistent mock agents pass.
+    import flowly.profile as profiles
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", tmp_path / "home")
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", tmp_path / "home" / "profiles")
+    for name in ("writer", "other", "other-profile"):
+        profiles.create_profile(name, local_runtime=True)
     registry = SubagentRegistry(tmp_path / "runs.json")
     registry.register(SubagentRunRecord(
         run_id="12345678-1234-4321-8888-123456789abc", child_session_key="subagent:child",

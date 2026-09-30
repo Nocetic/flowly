@@ -13,11 +13,13 @@ from urllib.parse import urlsplit
 class ProfileHostError(RuntimeError):
     """Stable error returned by the profile-host RPC boundary."""
 
-    def __init__(self, code: str, message: str, *, retryable: bool = False):
+    def __init__(self, code: str, message: str, *, retryable: bool = False,
+                 terminal_state: str | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.terminal_state = terminal_state
 
 
 MAX_REQUEST_BYTES = 40 * 1024 * 1024
@@ -41,6 +43,10 @@ _NON_PUBLIC_ATTACHMENT_HOST_SUFFIXES = (
 # The small access-policy projection below is safe to
 # expose because it accepts only closed enums and a deny-only toolset list.
 PROFILE_RPC_TIMEOUTS: dict[str, int] = {
+    "agent.home.get": 30_000,
+    "agent.home.setup": 30_000,
+    "agent.home.introduce": 30_000,
+    "chat.compact": 60_000,
     "subagents.list": 15_000,
     "subagents.get": 15_000,
     "subagents.result": 15_000,
@@ -70,6 +76,7 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "gmail.setup.status": 30_000,
     "gmail.setup.cancel": 30_000,
     "gmail.disconnect": 30_000,
+    "voice.context": 10_000,
     "provider.list": 30_000,
     "provider.active": 30_000,
     "model.list": 60_000,
@@ -78,6 +85,11 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "sessions.model.get": 30_000,
     "sessions.model.set": 30_000,
     "chat.history": 30_000,
+    "chat.command": 30_000,
+    "chat.requests": 30_000,
+    "chat.respond": 30_000,
+    "chat.outputs.list": 30_000,
+    "chat.outputs.read": 30_000,
     "chat.inflight": 30_000,
     "chat.send": 60_000,
     "chat.abort": 30_000,
@@ -336,13 +348,41 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
     if size > MAX_REQUEST_BYTES:
         raise ProfileHostError("REQUEST_TOO_LARGE", "Profile request is too large.")
     value = _validate_access_policy(method, value)
+    if method.startswith("agent.home."):
+        from flowly.agent_home import AgentHomeError, validate_request
+        try:
+            validate_request(method, value)
+        except AgentHomeError as exc:
+            raise ProfileHostError(exc.code, str(exc)) from exc
     if method in {"subagents.list", "subagents.get"}:
         from flowly.agent.subagent_observation import event_version
         try:
             event_version(value)
         except ValueError as exc:
             raise ProfileHostError("INVALID_PARAMS", str(exc)) from exc
+    if method == 'goal.get' and 'goalId' in value:
+        goal_id = value['goalId']
+        if (not isinstance(goal_id, str) or not 1 <= len(goal_id) <= 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in goal_id)):
+            raise ProfileHostError('INVALID_PARAMS', 'A valid goal identity is required.')
+    if method in {"chat.outputs.list", "chat.outputs.read"}:
+        from flowly.live_voice.outputs import validate_output_request
+        from flowly.live_voice.sessions import VoiceError
+
+        try:
+            value = validate_output_request(method, value)
+        except VoiceError as exc:
+            raise ProfileHostError(exc.code, str(exc)) from exc
+    if method == "voice.context":
+        from flowly.live_voice.context import validate_context
+        from flowly.live_voice.sessions import VoiceError
+
+        try:
+            value = validate_context(value)
+        except VoiceError as exc:
+            raise ProfileHostError(exc.code, str(exc)) from exc
     session_key_methods = {
+        "chat.compact",
         "chat.history",
         "chat.inflight",
         "chat.send",
@@ -355,7 +395,9 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
     elif "sessionKey" in value:
         _validate_session_key(value.get("sessionKey"))
     if method == "sessions.delete":
-        _validate_session_key(value.get("key"), required=True)
+        if "key" in value and "sessionKey" in value and value["key"] != value["sessionKey"]:
+            raise ProfileHostError("INVALID_PARAMS", "Conversation targets do not match.")
+        _validate_session_key(value.get("sessionKey") or value.get("key"), required=True)
     if method == "media.read":
         media_id = value.get("mediaId")
         offset = value.get("offset", 0)
@@ -422,6 +464,12 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
             )
         if not message and not attachments:
             raise ProfileHostError("INVALID_PARAMS", "A bot message cannot be empty.")
+        if value.get("setupAnswer") is not None:
+            from flowly.agent_home import AgentHomeError, validate_setup_answer
+            try:
+                value["setupAnswer"] = validate_setup_answer(value["setupAnswer"])
+            except AgentHomeError as exc:
+                raise ProfileHostError(exc.code, str(exc)) from exc
         idempotency_key = value.get("idempotencyKey")
         if idempotency_key is not None and (
             not isinstance(idempotency_key, str)

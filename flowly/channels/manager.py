@@ -188,7 +188,11 @@ class ChannelManager:
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
-                        await channel.send(msg)
+                        from flowly.live_voice.bus_authority import bus_message_scope
+
+                        with bus_message_scope(msg) as allowed:
+                            if allowed:
+                                await channel.send(msg)
                     except Exception as e:
                         logger.error(f"Error sending to {msg.channel}: {e}")
                 elif msg.channel in CHANNELS_WITHOUT_ADAPTER:

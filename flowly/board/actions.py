@@ -163,6 +163,8 @@ async def apply_board_action(store: Any, orchestrator: Any, body: dict) -> tuple
             return {"ok": True, "status": "started", "card": card.to_dict()}, 200
 
         if action == "cancel":
+            if store.get_card(card_id) is None:
+                return {'ok': False, 'error': 'card not found'}, 404
             if orchestrator is not None:
                 await orchestrator.cancel_card(card_id)
             else:
@@ -191,5 +193,11 @@ async def apply_board_action(store: Any, orchestrator: Any, body: dict) -> tuple
     except BoardError as e:
         return {"ok": False, "error": str(e)}, 400
     except Exception as e:
-        logger.error(f"[board] action error {action!r}: {e}")
+        from flowly.live_voice.authority import current_request_owner
+
+        owner = current_request_owner()
+        if owner is not None and owner.uid is not None:
+            logger.error('[board] action {} failed ({})', action, type(e).__name__)
+        else:
+            logger.error(f"[board] action error {action!r}: {e}")
         return {"ok": False, "error": "Internal server error"}, 500

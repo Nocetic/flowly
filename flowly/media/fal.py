@@ -18,6 +18,8 @@ from typing import Any
 
 import httpx
 
+from flowly.media.authority import capture_media_access, publish_media_bytes
+
 _FAL_SYNC = "https://fal.run"
 # Generation can take a while; the download leg is quick.
 _TIMEOUT = httpx.Timeout(180.0, connect=10.0)
@@ -54,6 +56,7 @@ async def generate_image(
     if not (prompt or "").strip():
         raise FalError("prompt is empty.")
 
+    access = capture_media_access()
     payload: dict[str, Any] = {
         "prompt": prompt.strip(),
         "num_images": max(1, min(int(num_images or 1), 4)),
@@ -96,7 +99,7 @@ async def generate_image(
             except httpx.HTTPError:
                 continue
             dest = media_dir() / f"img-{uuid.uuid4().hex[:12]}.{ext}"
-            dest.write_bytes(resp.content)
+            dest = publish_media_bytes(resp.content, dest, access=access)
             paths.append(str(dest))
 
     if not paths:
