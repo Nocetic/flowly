@@ -269,6 +269,12 @@ async def main():
                 relay_channel._on_ready = relay_ready.set
                 relay_task = asyncio.create_task(relay_channel.start())
                 await asyncio.wait_for(relay_ready.wait(), timeout=20)
+                # Production relays sign every browser frame once the agent
+                # accepts their identity handshake, and Core then drops plain
+                # RPC. Screen tests must run on that path, not the legacy one.
+                async with asyncio.timeout(10):
+                    while not relay_channel._relay_authority_enabled:
+                        await asyncio.sleep(0.05)
             print("READY desktop screen fixture", flush=True)
             try:
                 await stopped.wait()
