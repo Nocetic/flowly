@@ -591,10 +591,12 @@ def gateway(
     from flowly.gateway.server import GatewayServer
 
     import logging
-    if verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.WARNING)
+
+    from flowly.gateway_logs import bridge as _log_bridge
+
+    # Library records join Flowly's own log (and so Settings → Logs), with the
+    # known noise — scanner probes, channel reconnects — turned down.
+    _log_bridge.install(logging.DEBUG if verbose else logging.WARNING)
 
     # Bot-side daily file sink (additive). Under a service manager we then drop
     # loguru's default stderr sink, because stderr is redirected to the
