@@ -31,6 +31,17 @@ _AGENT = {"spawn": ("label", "name"), "builtin_agent": ("agent", "name")}
 _MEDIA = {"image_generate": (), "video_generate": (), "voice_generate": (), "video_analyze": ()}
 _MEMORY_PREFIX = "memory_"
 
+# Tools that belong to talking, not to work done for the owner: recalling
+# from its own memory or past conversations, noting something down, asking
+# the owner, drafting a plan for approval, reading its own recipes. A turn
+# that used only these is a conversation. Everything else counts as work, so
+# a tool added tomorrow (a new connection, say) counts without a change here.
+CONVERSATION_TOOLS = frozenset({
+    "knowledge_graph", "session_search", "sessions_list",
+    "clarify", "agent_setup_ask", "plan",
+    "skills_list", "skill_view",
+})
+
 # A value that looks like a credential never becomes a target, whatever key it
 # came from.
 _SECRET = re.compile(
@@ -72,6 +83,16 @@ def _program(command: str) -> str:
     # The program only: arguments carry paths, hosts and, too often, secrets.
     first = command.strip().split(None, 1)[0] if command.strip() else ""
     return _line(PurePath(first).name)
+
+
+def is_work(step: dict[str, Any]) -> bool:
+    """Whether one recorded step was work done for the owner, not conversation."""
+    tool = step.get("tool") if isinstance(step, dict) else None
+    if not isinstance(tool, str) or not tool:
+        return False
+    # By the tool's name: a memory search is described as a search, but it is
+    # still the agent recalling, not looking something up for the owner.
+    return not tool.startswith(_MEMORY_PREFIX) and tool not in CONVERSATION_TOOLS
 
 
 def describe_step(tool_name: str, args: Any) -> dict[str, str]:

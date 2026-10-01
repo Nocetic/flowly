@@ -1,17 +1,37 @@
-"""Record each task the agent works on, from the turn itself.
+"""Record the work the agent does, from the turn itself.
 
-A task is one agent turn: it begins when the conversation's turn lock is taken
-(time spent queued behind an earlier turn is not the task's) and ends in the
-turn's ``finally``, whatever the outcome. Time is the process's monotonic
-clock; nothing depends on streams, clients or the network.
+Activity lists **work**, not conversation. A turn is watched from the moment
+the conversation's turn lock is taken (time queued behind an earlier turn is
+not the turn's) to the turn's ``finally``, whatever the outcome. Time is the
+process's monotonic clock; nothing depends on streams, clients or the network.
 
-*Active time* excludes time the turn spent parked on an approval or a question:
-a turn that waited ten minutes for a yes and then said one sentence did not
-work for ten minutes.
+A turn becomes work, and only then reaches the disk, when:
 
-A ``start`` line is written when the task begins. If the process dies before
-the end, that line is all there is, and the reader shows the task as
-interrupted instead of losing it.
+- a routine or a goal started it (known before it begins); or
+- it takes its first step that is work (``steps.is_work``): looking things
+  up, acting in an app, writing a file, running a program, asking another
+  agent. Recalling its own memory, asking the owner or drafting a plan is
+  part of talking and does not count.
+
+That moment writes the ``start`` line, so work cut short by a crash is still
+known and reads as interrupted. A turn that never did work writes nothing at
+all: a conversation leaves no trace in Activity.
+
+A turn without such a step that wrote a long reply (a cover letter, a plan)
+is a *candidate*: its record is written at the end, for the bot's model to
+judge when it writes the summary (``recap.py``), and it shows only if the
+model calls it work. A message from a channel follows the same rules as one
+from the app: for many owners Telegram is simply where they talk to their
+agent, and a greeting there is no more a task than in the app.
+
+*Active time* excludes time the turn spent parked on an approval or a
+question: a turn that waited ten minutes for a yes and then said one sentence
+did not work for ten minutes.
+
+A task can span several turns. A goal's turns are one task from the start
+(``task_id_for``); a follow-up the model judges to continue earlier work is
+joined to it later, by the summary. See ``journal.py`` for how turns are put
+together.
 """
 
 from __future__ import annotations
@@ -24,7 +44,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from flowly.activity import store
-from flowly.activity.steps import describe_step
+from flowly.activity.steps import describe_step, is_work
 
 # Identifies this process. A ``start`` from another boot that never ended was
 # cut short by a crash, a kill or an update.
@@ -45,7 +65,12 @@ INTERNAL_SESSION_PREFIXES = (
 ROUTINE_METADATA_KEY = "_activity_routine"
 ROUTINE_NAME_MAX_CHARS = 80
 
-SUMMARY_MIN_ACTIVE_MS = 30_000
+# A reply at least this long is a candidate even without a tool: a piece of
+# writing is work. Length, not time, because time says more about how fast
+# the model is than about what it made.
+LONG_REPLY_CHARS = 1_500
+# Started without the owner being in the conversation: always a task.
+BACKGROUND_TRIGGERS = frozenset({"routine", "goal"})
 REQUEST_MAX_CHARS = 280
 STEP_EXCERPT_CHARS = 1_500
 MAX_STEPS = 200
@@ -74,6 +99,14 @@ def _tokens(usage: Any) -> dict[str, int]:
     return tokens if any(tokens.values()) else {}
 
 
+def task_id_for(turn_id: str, trigger: dict[str, Any]) -> str:
+    """The task a turn belongs to when it starts: a goal's turns share one."""
+    goal = trigger.get("goalId") if trigger.get("kind") == "goal" else None
+    if isinstance(goal, str) and goal.strip():
+        return f"goal:{goal.strip()[:100]}"
+    return turn_id
+
+
 @dataclass
 class ActiveTask:
     id: str
@@ -82,6 +115,9 @@ class ActiveTask:
     request: str
     started_at: int
     started_mono: float
+    task_id: str = ""
+    # Did work, so its ``start`` line is on disk.
+    working: bool = False
     steps: list[dict[str, Any]] = field(default_factory=list)
     excerpts: list[str] = field(default_factory=list)
     prompts: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -95,7 +131,6 @@ class ActiveTask:
 class EndedTask:
     record: dict[str, Any]
     excerpts: list[str]
-    summarize: bool
 
 
 class ActivityRecorder:
@@ -112,29 +147,43 @@ class ActivityRecorder:
     def begin(self, *, session_key: str, task_id: str, trigger: dict[str, Any], request: str) -> ActiveTask | None:
         if not self.records(session_key):
             return None
+        turn_id = task_id or uuid.uuid4().hex
         task = ActiveTask(
-            id=task_id or uuid.uuid4().hex,
+            id=turn_id,
             session_key=session_key,
             trigger=dict(trigger),
             request=_one_line(request, REQUEST_MAX_CHARS),
             started_at=int(time.time() * 1000),
             started_mono=time.monotonic(),
+            task_id=task_id_for(turn_id, trigger),
         )
         with self._lock:
             self._active[session_key] = task
-        store.append({
-            "type": "start", "id": task.id, "sessionKey": session_key, "trigger": task.trigger,
-            "request": task.request, "startedAt": task.started_at, "boot": BOOT_ID,
-        }, at_ms=task.started_at)
+            starts = self._mark_working(task) if task.trigger.get("kind") in BACKGROUND_TRIGGERS else None
+        if starts is not None:
+            store.append(starts, at_ms=task.started_at)
         return task
+
+    @staticmethod
+    def _mark_working(task: ActiveTask) -> dict[str, Any] | None:
+        """The ``start`` line to write, the first time the turn does work. Under the lock."""
+        if task.working:
+            return None
+        task.working = True
+        return {
+            "type": "start", "id": task.id, "taskId": task.task_id, "sessionKey": task.session_key,
+            "trigger": task.trigger, "request": task.request, "startedAt": task.started_at,
+            "work": True, "boot": BOOT_ID,
+        }
 
     def active(self, session_key: str) -> ActiveTask | None:
         with self._lock:
             return self._active.get(session_key)
 
     def active_ids(self) -> set[str]:
+        """Turns running now that are work; a conversation is never "running" in Activity."""
         with self._lock:
-            return {task.id for task in self._active.values()}
+            return {task.id for task in self._active.values() if task.working}
 
     def end(
         self,
@@ -145,6 +194,7 @@ class ActivityRecorder:
         model: str = "",
         error: str = "",
         conversation_title: str = "",
+        reply_chars: int = 0,
     ) -> EndedTask | None:
         if task is None:
             return None
@@ -153,12 +203,14 @@ class ActivityRecorder:
                 del self._active[task.session_key]
             waited = task.waited + sum(time.monotonic() - prompt["opened"]
                                        for prompt in task.prompts.values() if "decision" not in prompt)
+            working = task.working
         active_ms = max(0, int((time.monotonic() - task.started_mono - waited) * 1000))
-        if outcome == "silent" and not task.steps:
+        if outcome == "silent" and not working:
             # The agent chose not to answer (a passive group message, a
-            # dropped dispatch) and did nothing: not a task. Closing the start
-            # keeps it from reading as interrupted.
-            store.append({"type": "task", "id": task.id, "discarded": True}, at_ms=task.started_at)
+            # dropped dispatch) and did no work: nothing to record.
+            return None
+        if not working and max(0, int(reply_chars or 0)) < LONG_REPLY_CHARS:
+            # A conversation. Nothing was written for it and nothing is now.
             return None
         last = task.steps[-1] if task.steps else None
         if outcome == "aborted":
@@ -171,6 +223,7 @@ class ActivityRecorder:
             status = "done"
         record = {
             "id": task.id,
+            "taskId": task.task_id,
             "sessionKey": task.session_key,
             "conversationTitle": _one_line(conversation_title, 120),
             "trigger": task.trigger,
@@ -179,6 +232,8 @@ class ActivityRecorder:
             "endedAt": int(time.time() * 1000),
             "activeMs": active_ms,
             "status": status,
+            # Work by rule; a candidate without it is the model's to judge.
+            "work": working,
             "steps": task.steps,
             "prompts": [
                 {"kind": prompt["kind"], "subject": prompt["subject"], "decision": prompt.get("decision", "open")}
@@ -189,11 +244,7 @@ class ActivityRecorder:
             **({"error": _one_line(error, 240)} if status == "failed" and error else {}),
         }
         store.append({"type": "task", **record}, at_ms=task.started_at)
-        return EndedTask(
-            record=record,
-            excerpts=task.excerpts,
-            summarize=bool(task.steps) or active_ms >= SUMMARY_MIN_ACTIVE_MS,
-        )
+        return EndedTask(record=record, excerpts=task.excerpts)
 
     # ── steps ────────────────────────────────────────────────────────────
 
@@ -211,6 +262,9 @@ class ActivityRecorder:
             task.steps.append(step)
             # Kept in memory for the summary only; never written to disk.
             task.excerpts.append(result[:STEP_EXCERPT_CHARS] if isinstance(result, str) else "")
+            starts = self._mark_working(task) if is_work(step) else None
+        if starts is not None:
+            store.append(starts, at_ms=task.started_at)
 
     # ── prompts (wired to the approval and clarify managers) ─────────────
 

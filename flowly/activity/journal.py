@@ -1,75 +1,209 @@
 """Reading the activity journal for an owner.
 
-The stored lines say what happened; a few statuses are only true *now* and are
-worked out at read time instead of written:
+The journal stores **turns**; the owner reads **tasks**. A task is one turn,
+or several that are one piece of work: a goal's turns, or a follow-up the
+model judged to carry on earlier work (``recap.py``). Turns are put together
+here, at read time, by the ``taskId`` each one names.
 
-- a task this process is still running is ``running``, or ``waiting`` while its
-  conversation waits on the owner;
-- a task that started in an earlier boot and never ended is ``interrupted``.
+Which turns are shown at all:
+
+- a routine's or a goal's: always;
+- otherwise, a turn that did work by rule (``"work": true``), unless the
+  model, writing its summary, judged it was only conversation;
+- a candidate without such work (a long reply, a channel message) only once
+  the model judged it work.
+
+Lines written before tasks and conversation were told apart carry no
+``work``; the same rule is worked out from their steps, so the old journal
+reads the new way without being rewritten.
+
+A few statuses are only true *now* and are worked out at read time instead
+of written:
+
+- a task this process is still working on is ``running``, or ``waiting``
+  while its conversation waits on the owner;
+- a turn that started doing work in an earlier boot and never ended is
+  ``interrupted``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from flowly.activity import store
+from flowly.activity.recorder import BACKGROUND_TRIGGERS
+from flowly.activity.steps import is_work
 
 # Ended in a way the owner should look at; these carry the unseen dot.
 NOTEWORTHY = frozenset({"blocked", "failed", "waiting", "interrupted"})
-TITLE_FALLBACK_MAX = 60
+# A follow-up this soon after earlier work in the same conversation may carry
+# it on; the model decides whether it does.
+CONTINUATION_WINDOW_MS = 30 * 60_000
 _KIND_ORDER = (("search", "research"), ("web", "research"), ("write", "files"), ("exec", "code"),
                ("mcp", "connection"), ("bot", "team"), ("agent", "team"), ("media", "media"))
 
 
-def _status(task: dict[str, Any], running_ids: set[str], waiting_keys: set[str]) -> str:
-    if task.get("ended"):
-        return str(task.get("status") or "done")
-    if task["id"] in running_ids:
-        return "waiting" if task.get("sessionKey") in waiting_keys else "running"
+# ── which turns are work ────────────────────────────────────────────────────
+
+
+def _trigger_kind(turn: dict[str, Any]) -> str:
+    return str((turn.get("trigger") or {}).get("kind") or "")
+
+
+def _did_work(turn: dict[str, Any]) -> bool:
+    """Work by rule. A line from before the rule existed is judged by its steps."""
+    if isinstance(turn.get("work"), bool):
+        return turn["work"]
+    return any(is_work(step) for step in turn.get("steps") or [] if isinstance(step, dict))
+
+
+def _shown(turn: dict[str, Any]) -> bool:
+    if turn.get("discarded") or not isinstance(turn.get("startedAt"), int):
+        return False
+    if _trigger_kind(turn) in BACKGROUND_TRIGGERS:
+        return True
+    verdict = turn.get("verdict")
+    if verdict is False:
+        return False
+    return _did_work(turn) or verdict is True
+
+
+# ── putting turns together ──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _Task:
+    id: str
+    turns: tuple[dict[str, Any], ...]  # oldest first
+
+    @property
+    def first(self) -> dict[str, Any]:
+        return self.turns[0]
+
+    @property
+    def last(self) -> dict[str, Any]:
+        return self.turns[-1]
+
+    @property
+    def started_at(self) -> int:
+        return self.first["startedAt"]
+
+    @property
+    def recap(self) -> dict[str, Any]:
+        # The newest summary speaks for the whole task: a turn that carried
+        # it on was summarized with the task so far in view.
+        for turn in reversed(self.turns):
+            if isinstance(turn.get("recap"), dict):
+                return turn["recap"]
+        return {}
+
+
+# Holds the merged view it was built from, compared by identity: the store
+# hands out the same object until a month file changes.
+_grouped: tuple[dict[str, dict[str, Any]], dict[str, _Task], dict[str, str]] | None = None
+
+
+def _tasks() -> tuple[dict[str, _Task], dict[str, str], int]:
+    """``({task id: task}, {turn id: task id}, seen_before)``, reused until the journal changes."""
+    global _grouped
+    turns, seen_before = store.load()
+    if _grouped is not None and _grouped[0] is turns:
+        return _grouped[1], _grouped[2], seen_before
+    members: dict[str, list[dict[str, Any]]] = {}
+    for turn in turns.values():
+        if _shown(turn):
+            members.setdefault(str(turn.get("taskId") or turn["id"]), []).append(turn)
+    tasks: dict[str, _Task] = {}
+    owner_of: dict[str, str] = {}
+    for task_id, group in members.items():
+        group.sort(key=lambda turn: turn["startedAt"])
+        tasks[task_id] = _Task(task_id, tuple(group))
+        for turn in group:
+            owner_of[turn["id"]] = task_id
+    _grouped = (turns, tasks, owner_of)
+    return tasks, owner_of, seen_before
+
+
+# ── what a task says ────────────────────────────────────────────────────────
+
+
+def _turn_status(turn: dict[str, Any], running_ids: set[str], waiting_keys: set[str]) -> str:
+    if turn.get("ended"):
+        return str(turn.get("status") or "done")
+    if turn["id"] in running_ids:
+        return "waiting" if turn.get("sessionKey") in waiting_keys else "running"
     return "interrupted"
 
 
-def _title(task: dict[str, Any]) -> str:
-    recap = task.get("recap") or {}
-    if recap.get("title"):
-        return recap["title"]
-    routine = (task.get("trigger") or {}).get("name")
-    if isinstance(routine, str) and routine.strip():
-        return routine.strip()
-    request = (task.get("request") or "").strip().splitlines()
-    first = request[0].strip() if request else ""
-    if first:
-        return first if len(first) <= TITLE_FALLBACK_MAX else first[: TITLE_FALLBACK_MAX - 1].rstrip() + "…"
-    return task.get("conversationTitle") or ""
+def _status(task: _Task, running_ids: set[str], waiting_keys: set[str]) -> str:
+    for turn in reversed(task.turns):
+        if turn["id"] in running_ids:
+            return _turn_status(turn, running_ids, waiting_keys)
+    return _turn_status(task.last, running_ids, waiting_keys)
 
 
-def _kind(task: dict[str, Any]) -> str:
-    if (task.get("trigger") or {}).get("kind") == "routine":
+def _title(task: _Task) -> str:
+    """The model's title, else the routine's name, else nothing.
+
+    Never the owner's own message: with no title the apps show the
+    conversation's title or their word for an untitled task."""
+    if task.recap.get("title"):
+        return task.recap["title"]
+    routine = (task.first.get("trigger") or {}).get("name")
+    return routine.strip() if isinstance(routine, str) else ""
+
+
+def _steps(task: _Task) -> list[dict[str, Any]]:
+    return [step for turn in task.turns for step in turn.get("steps") or [] if isinstance(step, dict)]
+
+
+def _kind(task: _Task) -> str:
+    if _trigger_kind(task.first) == "routine":
         return "routine"
-    kinds = {step.get("kind") for step in task.get("steps") or [] if isinstance(step, dict)}
+    kinds = {step.get("kind") for step in _steps(task)}
     for step_kind, icon in _KIND_ORDER:
         if step_kind in kinds:
             return icon
     return "general"
 
 
-def _summary(task: dict[str, Any], status: str, seen_before: int) -> dict[str, Any]:
-    stamp = task.get("endedAt") or task.get("startedAt") or 0
+def _ended_at(task: _Task) -> int | None:
+    return task.last.get("endedAt") if task.last.get("ended") else None
+
+
+def _summary(task: _Task, status: str, seen_before: int) -> dict[str, Any]:
+    stamp = task.last.get("endedAt") or task.last.get("startedAt") or 0
+    titled = next((turn.get("conversationTitle") for turn in reversed(task.turns)
+                   if turn.get("conversationTitle")), "")
     return {
-        "id": task["id"],
+        "id": task.id,
         "title": _title(task),
-        "outcome": (task.get("recap") or {}).get("outcome", ""),
+        "outcome": task.recap.get("outcome", ""),
         "status": status,
-        "trigger": task.get("trigger") or {},
+        "trigger": task.first.get("trigger") or {},
         "kind": _kind(task),
-        "startedAt": task.get("startedAt"),
-        "endedAt": task.get("endedAt"),
-        "sessionKey": task.get("sessionKey", ""),
-        "conversationTitle": task.get("conversationTitle", ""),
-        "summarized": bool(task.get("recap")),
+        "startedAt": task.started_at,
+        "endedAt": _ended_at(task),
+        "sessionKey": task.first.get("sessionKey", ""),
+        "conversationTitle": titled,
+        "summarized": bool(task.recap),
         "unseen": status in NOTEWORTHY and isinstance(stamp, int) and stamp > seen_before,
     }
+
+
+def _sum_tokens(values: list[Any]) -> dict[str, int]:
+    total: dict[str, int] = {}
+    for value in values:
+        if isinstance(value, dict):
+            for key in ("input", "output"):
+                if isinstance(value.get(key), int):
+                    total[key] = total.get(key, 0) + value[key]
+    return total
+
+
+# ── the reads ───────────────────────────────────────────────────────────────
 
 
 def list_tasks(
@@ -80,18 +214,13 @@ def list_tasks(
     running_ids: set[str],
     waiting_keys: set[str],
 ) -> dict[str, Any]:
-    tasks, seen_before = store.load()
-    ordered = sorted(
-        (task for task in tasks.values()
-         if isinstance(task.get("startedAt"), int) and not task.get("discarded")),
-        key=lambda task: task["startedAt"],
-        reverse=True,
-    )
+    """Newest first, by when each task started; ``before`` pages back from that."""
+    tasks, _owner_of, seen_before = _tasks()
     items: list[dict[str, Any]] = []
-    for task in ordered:
-        if before is not None and task["startedAt"] >= before:
+    for task in sorted(tasks.values(), key=lambda task: task.started_at, reverse=True):
+        if before is not None and task.started_at >= before:
             continue
-        if not visible(str(task.get("sessionKey") or "")):
+        if not visible(str(task.first.get("sessionKey") or "")):
             continue
         if len(items) == limit:
             return {"items": items, "nextBefore": items[-1]["startedAt"], "seenBefore": seen_before}
@@ -106,38 +235,88 @@ def get_task(
     running_ids: set[str],
     waiting_keys: set[str],
 ) -> dict[str, Any] | None:
-    tasks, seen_before = store.load()
-    task = tasks.get(task_id)
-    if (task is None or task.get("discarded") or not isinstance(task.get("startedAt"), int)
-            or not visible(str(task.get("sessionKey") or ""))):
+    """One task in full. A turn's id finds the task it became part of."""
+    tasks, owner_of, seen_before = _tasks()
+    task = tasks.get(task_id) or tasks.get(owner_of.get(task_id, ""))
+    if task is None or not visible(str(task.first.get("sessionKey") or "")):
         return None
     status = _status(task, running_ids, waiting_keys)
-    recap = task.get("recap") or {}
-    notes = {item["i"]: item["note"] for item in recap.get("steps") or []
-             if isinstance(item, dict) and isinstance(item.get("i"), int) and isinstance(item.get("note"), str)}
-    steps = [
-        {**{key: step.get(key) for key in ("tool", "kind", "target", "ok", "durationMs")},
-         "blocked": bool(step.get("blocked")),
-         **({"note": notes[index]} if index in notes else {})}
-        for index, step in enumerate(task.get("steps") or []) if isinstance(step, dict)
-    ]
+    steps: list[dict[str, Any]] = []
+    for turn in task.turns:
+        recap = turn.get("recap") if isinstance(turn.get("recap"), dict) else {}
+        notes = {item["i"]: item["note"] for item in recap.get("steps") or []
+                 if isinstance(item, dict) and isinstance(item.get("i"), int) and isinstance(item.get("note"), str)}
+        steps.extend(
+            {**{key: step.get(key) for key in ("tool", "kind", "target", "ok", "durationMs")},
+             "blocked": bool(step.get("blocked")),
+             **({"note": notes[index]} if index in notes else {})}
+            for index, step in enumerate(turn.get("steps") or []) if isinstance(step, dict)
+        )
+    failed = task.last if task.last.get("error") else {}
+    active = [turn.get("activeMs") for turn in task.turns if isinstance(turn.get("activeMs"), int)]
     return {
         **_summary(task, status, seen_before),
-        "summary": recap.get("summary", ""),
-        "request": task.get("request", ""),
-        "activeMs": task.get("activeMs"),
+        "summary": task.recap.get("summary", ""),
+        "request": task.first.get("request", ""),
+        "activeMs": sum(active) if active else None,
         "steps": steps,
-        "prompts": task.get("prompts") or [],
-        "model": task.get("model", ""),
-        "tokens": task.get("tokens") or {},
-        "recapTokens": task.get("recapTokens") or {},
-        **({"error": task["error"]} if task.get("error") else {}),
+        "prompts": [prompt for turn in task.turns for prompt in turn.get("prompts") or []],
+        "model": next((turn["model"] for turn in reversed(task.turns) if turn.get("model")), ""),
+        "tokens": _sum_tokens([turn.get("tokens") for turn in task.turns]),
+        "recapTokens": _sum_tokens([turn.get("recapTokens") for turn in task.turns]),
+        **({"error": failed["error"]} if failed else {}),
     }
+
+
+def earlier_work(session_key: str, *, turn_id: str, started_at: int) -> dict[str, Any] | None:
+    """The task a finished turn might carry on, for the model to judge.
+
+    The latest shown task of the same conversation that ended within
+    ``CONTINUATION_WINDOW_MS`` before the turn started. A routine's or a
+    goal's task is never carried on by a conversation: each routine run is
+    its own task, and a goal groups its own turns."""
+    tasks, owner_of, _seen = _tasks()
+    own = owner_of.get(turn_id)
+    best: _Task | None = None
+    for task in tasks.values():
+        if task.id == own or task.first.get("sessionKey") != session_key:
+            continue
+        if _trigger_kind(task.first) in BACKGROUND_TRIGGERS:
+            continue
+        ended = _ended_at(task)
+        if not isinstance(ended, int) or not 0 <= started_at - ended <= CONTINUATION_WINDOW_MS:
+            continue
+        if best is None or (ended, task.started_at) > (_ended_at(best) or 0, best.started_at):
+            best = task
+    if best is None:
+        return None
+    return {
+        "id": best.id,
+        "request": best.first.get("request", ""),
+        "title": best.recap.get("title", ""),
+        "outcome": best.recap.get("outcome", ""),
+        "summary": best.recap.get("summary", ""),
+    }
+
+
+def task_so_far(task_id: str, *, turn_id: str) -> dict[str, Any] | None:
+    """A task's own words so far, without the given turn: what a goal's next
+    turn is summarized against."""
+    tasks, _owner_of, _seen = _tasks()
+    task = tasks.get(task_id)
+    if task is None:
+        return None
+    earlier = tuple(turn for turn in task.turns if turn["id"] != turn_id)
+    if not earlier:
+        return None
+    so_far = _Task(task.id, earlier)
+    return {"id": task.id, "request": so_far.first.get("request", ""), "title": so_far.recap.get("title", ""),
+            "outcome": so_far.recap.get("outcome", ""), "summary": so_far.recap.get("summary", "")}
 
 
 def mark_seen(before: int) -> int:
     """Record that the owner has seen everything up to ``before``; returns the cursor."""
-    _tasks, seen_before = store.load()
+    _tasks_by_id, _owner_of, seen_before = _tasks()
     if before > seen_before:
         store.append({"type": "seen", "before": before}, at_ms=before)
         return before

@@ -1,17 +1,28 @@
-"""The owner-facing words for a finished task, written by the bot's own model.
+"""The owner-facing words for finished work, written by the bot's own model.
 
-One request per task, after it ended and off the reply's path. The model sees
-a compact account of the task — what was asked, each step's kind, target,
-success and the start of its result, the start of the reply — never the whole
-conversation, so the cost is a few thousand tokens and does not grow with the
-chat. Whatever comes back is validated and cleaned; anything unusable leaves
-the task with no summary rather than a wrong one.
+One request per recorded turn, after it ended and off the reply's path. The
+model sees a compact account of the turn — what was asked, each step's kind,
+target, success and the start of its result, the start of the reply — never
+the whole conversation, so the cost is a few thousand tokens and does not
+grow with the chat. When the turn may carry on earlier work, the model also
+sees that task's title, outcome and summary.
+
+The same answer carries two judgements, at no extra cost:
+
+- ``work``: was this work done for the owner, or only conversation? A turn
+  judged conversation is not shown;
+- ``continues``: does it carry on the earlier task? Then it joins that task,
+  and its title, outcome and summary speak for the whole task.
+
+Whatever comes back is validated and cleaned; anything unusable leaves the
+turn with no summary and no judgement rather than a wrong one.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
@@ -32,14 +43,25 @@ _CITATIONS = re.compile(r"【[^】]*】|\[\^\d+\]|[†‡]")
 _MARKDOWN = re.compile(r"(\*\*|__|`|^#+\s*)", re.MULTILINE)
 
 _SYSTEM = (
-    "You write the activity log of an AI agent for its owner. You get one finished task: what "
-    "was asked, the steps the agent took and the start of its reply. Return ONLY a JSON object, "
-    "no prose around it:\n"
-    '{"title": "...", "outcome": "...", "summary": "...", "steps": [{"i": 0, "note": "..."}]}\n'
-    "- title: at most 6 words, imperative, names the task (\"Research Hermes AI agent\").\n"
-    "- outcome: at most 12 words, past tense, what came of it.\n"
-    "- summary: 1-3 sentences in the first person, as the agent.\n"
-    "- steps: one short line per listed step, what it found or did; use the step's index as i.\n"
+    "You keep the activity log of a personal agent for its owner. You get one turn the agent "
+    "just finished: what was asked, the steps it took and the start of its reply. Return ONLY a "
+    "JSON object, no prose around it:\n"
+    '{"work": true, "continues": false, "title": "...", "outcome": "...", "summary": "...", '
+    '"steps": [{"i": 0, "note": "..."}]}\n'
+    "- work: true when the agent did something for the owner: looked something up, made or "
+    "changed something, acted in an app or for someone, or wrote a substantial piece (a letter, "
+    "a plan, a report). false when the turn was only conversation: a greeting, small talk, a "
+    "quick answer from what it already knew, a question back.\n"
+    "- continues: only when an earlier task is given. true when this turn carries that same work "
+    "on: a follow-up, a correction, its next step. false when it is new work, even on a related "
+    "subject.\n"
+    "- title: at most 6 words, imperative, names the work (\"Compare flights to Rome\"). When the "
+    "turn continues or is part of a task, name the whole task.\n"
+    "- outcome: at most 12 words, past tense, what came of it; for the whole task when the turn "
+    "continues or is part of one.\n"
+    "- summary: 1-3 sentences in the first person, as the agent; for the whole task likewise.\n"
+    "- steps: one short line per listed step of this turn, what it found or did; use the step's "
+    "index as i.\n"
     "Write in the same language as the request. Plain text: no markdown, no citations, no "
     "quotes around values. Never include secrets, keys or full file contents."
 )
@@ -54,8 +76,26 @@ def _clean(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def build_messages(record: dict[str, Any], excerpts: list[str], reply: str) -> list[dict[str, str]]:
-    lines = [f"Request: {record.get('request') or '(none)'}"]
+def _task_lines(task: dict[str, Any]) -> list[str]:
+    lines = [f"  {label}: {_clean(task.get(key), limit)}"
+             for key, label, limit in (("title", "Title", TITLE_MAX), ("outcome", "Outcome", OUTCOME_MAX),
+                                       ("summary", "Summary", SUMMARY_MAX)) if _clean(task.get(key), limit)]
+    if not lines:
+        lines = [f"  Request: {_clean(task.get('request'), 280) or '(none)'}"]
+    return lines
+
+
+def build_messages(record: dict[str, Any], excerpts: list[str], reply: str, *,
+                   earlier: dict[str, Any] | None = None, part_of: bool = False) -> list[dict[str, str]]:
+    """The request. ``earlier`` is a task this turn may carry on; with
+    ``part_of`` it is the task the turn already belongs to (a goal's)."""
+    lines: list[str] = []
+    if earlier and part_of:
+        lines += ["This turn is part of an ongoing task. The task so far:", *_task_lines(earlier), ""]
+    elif earlier:
+        lines += ["An earlier task in this conversation ended shortly before this turn:",
+                  *_task_lines(earlier), ""]
+    lines.append(f"Request: {record.get('request') or '(none)'}")
     trigger = record.get("trigger") or {}
     if trigger.get("kind") and trigger.get("kind") != "owner":
         lines.append(f"Started by: {trigger.get('kind')}")
@@ -112,12 +152,35 @@ def parse_recap(raw: Any, step_count: int) -> dict[str, Any] | None:
     }
 
 
-async def summarize(provider: Any, model: str | None, record: dict[str, Any],
-                    excerpts: list[str], reply: str) -> tuple[dict[str, Any] | None, dict[str, int]]:
-    """``(recap or None, token usage of this request)``. Never raises."""
+def judgements(raw: Any) -> dict[str, bool]:
+    """The model's ``work`` and ``continues``, only where it gave a real true or false."""
+    if not isinstance(raw, str):
+        return {}
+    text = _FENCE.sub("", _THINK.sub("", raw).strip()).strip()
+    start, end = text.find("{"), text.rfind("}")
+    try:
+        value = json.loads(text[start:end + 1]) if 0 <= start < end else None
+    except ValueError:
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {key: value[key] for key in ("work", "continues") if isinstance(value.get(key), bool)}
+
+
+@dataclass(frozen=True)
+class Recap:
+    """What came back: the words (or None), the judgements, the request's cost."""
+    words: dict[str, Any] | None = None
+    judged: dict[str, bool] = field(default_factory=dict)
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+async def recap_turn(provider: Any, model: str | None, record: dict[str, Any], excerpts: list[str],
+                     reply: str, *, earlier: dict[str, Any] | None = None, part_of: bool = False) -> Recap:
+    """Summarize and judge one finished turn. Never raises."""
     try:
         response = await provider.chat(
-            messages=build_messages(record, excerpts, reply),
+            messages=build_messages(record, excerpts, reply, earlier=earlier, part_of=part_of),
             model=model,
             max_tokens=2048,
             temperature=0.2,
@@ -126,14 +189,23 @@ async def summarize(provider: Any, model: str | None, record: dict[str, Any],
         )
     except Exception as exc:  # noqa: BLE001 — a summary is never worth an error
         logger.debug(f"[activity] recap request failed: {exc!r}")
-        return None, {}
+        return Recap()
     from flowly.activity.recorder import _tokens
 
     usage = _tokens(getattr(response, "usage", None))
     content = getattr(response, "content", "") or ""
     if getattr(response, "finish_reason", None) == "error" or content.startswith("Error calling LLM:"):
-        return None, usage
-    recap = parse_recap(content, len(record.get("steps") or []))
-    if recap is None:
+        return Recap(usage=usage)
+    words = parse_recap(content, len(record.get("steps") or []))
+    if words is None:
         logger.debug("[activity] recap answer was not usable")
-    return recap, usage
+        # Judgements without words are not trusted either: the answer was broken.
+        return Recap(usage=usage)
+    return Recap(words=words, judged=judgements(content), usage=usage)
+
+
+async def summarize(provider: Any, model: str | None, record: dict[str, Any],
+                    excerpts: list[str], reply: str) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    """``(recap or None, token usage of this request)``. Never raises."""
+    result = await recap_turn(provider, model, record, excerpts, reply)
+    return result.words, result.usage

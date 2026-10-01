@@ -1,13 +1,18 @@
 """The activity journal on disk: append-only, one file per month.
 
-``<FLOWLY_HOME>/activity/<YYYY-MM>.jsonl`` holds four kinds of line, all
-keyed by the task's id (its run id):
+``<FLOWLY_HOME>/activity/<YYYY-MM>.jsonl`` holds four kinds of line. The
+first three are keyed by a turn's id (its run id) and name the task the turn
+belongs to (``taskId``):
 
-- ``start``  written when a task begins, so a task cut short by a crash is
-             still known;
-- ``task``   written when it ends: the whole record;
-- ``recap``  the model's summary, written after the task ended;
+- ``start``  written when a turn starts doing work, so work cut short by a
+             crash is still known;
+- ``task``   written when the turn ends: the whole record;
+- ``recap``  the model's summary, written after the turn ended. It also
+             carries the model's verdict (``work``) and, when the turn
+             carries on earlier work, that task's id (``taskId``);
 - ``seen``   the owner has looked at everything up to ``before`` (ms).
+
+A conversation writes no line at all (``recorder.py``).
 
 Nothing is rewritten in place. Readers merge the lines, which keeps a write
 from a crashing process from ever corrupting an earlier task. Every profile
@@ -139,6 +144,12 @@ def _merge() -> tuple[dict[str, dict[str, Any]], int]:
             usage = line.get("recapTokens")
             if isinstance(usage, dict):
                 current["recapTokens"] = usage
+            verdict = line.get("work")
+            if isinstance(verdict, bool):
+                current["verdict"] = verdict
+            joined = line.get("taskId")
+            if isinstance(joined, str) and joined:
+                current["taskId"] = joined
     return tasks, seen_before
 
 

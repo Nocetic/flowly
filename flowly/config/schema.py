@@ -1046,9 +1046,10 @@ class MediaConfig(BaseModel):
 class ActivityConfig(BaseModel):
     """The owner-facing activity journal (``docs/engineering/activity-journal.md``).
 
-    Every task is recorded either way. ``summaries`` decides whether the bot's
-    own model also writes a title, an outcome and a short summary for tasks
-    that used a tool or worked for 30 seconds or more.
+    Work is recorded either way; conversation never is. ``summaries`` decides
+    whether the bot's own model also writes each task's title, outcome and
+    short summary, and judges the borderline turns and follow-ups. Without
+    it, every turn that did work is its own task.
     ``retention_days=-1`` keeps the journal forever.
     """
     summaries: bool = True

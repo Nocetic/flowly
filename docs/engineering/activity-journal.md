@@ -1,5 +1,10 @@
 # Activity: a bot's work, one task at a time
 
+> **2026-10-01: work, not conversation.** Activity used to list every turn,
+> so "hi" and "thanks" read as tasks and their words became titles. Now only
+> work is recorded, a task can span turns, and the model judges the borderline
+> cases. §2a–§2c and §4 describe it; the rest still holds.
+
 Status: Core implemented on `feat/activity-journal` (2026-09-30). The Desktop
 Activity tab follows in its own worktree. iOS and Android have not adopted it
 yet.
@@ -16,9 +21,12 @@ Tests: `tests/test_activity_journal.py`.
 
 Decisions taken with the owner:
 - the bot's own model writes the summaries;
-- only tasks that used a tool or worked for 30 s or more get one;
-- summaries are on by default and can be turned off per bot; the task record is
-  kept either way.
+- Activity lists work, never conversation (§2a); the model may veto a turn
+  the rule calls work, and decides the borderline ones;
+- a follow-up within 30 minutes that carries on earlier work joins it (§2b);
+- titles come from the model, never from the owner's message;
+- summaries are on by default and can be turned off per bot. Without them,
+  every turn that did work is its own task, and borderline turns stay out.
 
 ---
 
@@ -29,8 +37,8 @@ The model is Muse's activity view.
 
 ```
 Today
- (icon) Research Hermes AI agent                          •
-        Confirmed Hermes is an AI agent, not the brand
+ (icon) Compare flights to Rome                           •
+        Found three fares under 200 euros
         03:53
 ```
 
@@ -47,9 +55,73 @@ interrupted or waiting on them.
 
 ## 2. What a task is, and when it starts and ends
 
-A task is one agent turn. Every turn passes through
-`AgentLoop._process_message`: channel and relay turns, routines, goals and
-direct calls alike.
+Every turn passes through `AgentLoop._process_message`: channel and relay
+turns, routines, goals and direct calls alike. The recorder watches each one;
+whether it becomes (part of) a task is §2a–§2b.
+
+### 2a. Work, not conversation
+
+A turn is **work**, decided by rule, with no model involved, when:
+- a routine or a goal started it; or
+- it took a step that is work (`steps.is_work`). Everything counts except
+  talking: recalling its own memory (`memory_*`, `knowledge_graph`,
+  `session_search`, `sessions_list`), asking the owner (`clarify`,
+  `agent_setup_ask`), drafting a plan (`plan`), reading its own recipes
+  (`skills_list`, `skill_view`). The list is of what does *not* count, so a
+  tool added later counts without a change.
+
+The moment a turn becomes work, its `start` line is written. It shows as
+running from then on, and a crash after it reads as interrupted. A turn
+that never becomes work writes **nothing**: not its words, not a line.
+
+A turn without such a step that wrote a reply of 1,500 characters or more
+(a letter, a plan) is a **candidate**, written at the end and left to the
+model (§4). Length, not time: time says more about the model's speed than
+about what it made.
+
+A message from a channel follows the same rules as one from the app. For
+many owners Telegram is where they talk to their agent; a greeting there is
+no more a task than in the app, and judging every one would cost a model
+request per message.
+
+What is shown:
+
+| turn | shown |
+|---|---|
+| routine or goal | always |
+| work by rule | unless the model judged it conversation |
+| candidate | only when the model judged it work |
+| anything else | never; nothing was written |
+
+### 2b. One task, several turns
+
+Turns name the task they belong to (`taskId`):
+- a goal's turns share `goal:<goalId>` from their start;
+- each routine run is its own task;
+- an owner or channel turn starts as its own task. If an earlier task of the
+  same conversation ended within 30 minutes before it began, the model sees
+  that task's title, outcome and summary, and judges whether this turn
+  carries it on (`continues`). If so, the recap line names that task, and
+  the turn joins it.
+
+A task keeps its first turn's id and place in the list. Its title, outcome
+and summary are the newest summary's, written with the task so far in view.
+Its steps are all its turns' steps, each with its own note. Its status is
+its newest turn's (running if any turn runs). Its tokens and active time are
+summed. A turn's own id still opens the task it joined.
+
+One conversation's summaries run in order, so a follow-up is always judged
+against the summary of the work before it. Conversations do not wait on each
+other.
+
+### 2c. The old journal
+
+Lines from before this change carry no `work`. The reader works the same rule
+out from their steps: a turn without work steps is hidden, as is one cut
+short before it ended, since what it was doing is unknown. Nothing is
+rewritten.
+
+### 2d. Timing
 
 - **Start:** once the conversation's turn lock is taken. Time spent queued
   behind an earlier turn of the same conversation is not the task's.
@@ -62,13 +134,13 @@ question. The approval and clarify managers report when a prompt opens and
 closes, and the recorder subtracts the span. A turn that waited ten minutes
 for a yes and then said one sentence did not work for ten minutes.
 
-**Crash safety.** A `start` line is written when the task begins, and every
-line carries the process's boot id. If the process dies (kill, power loss, an
-update), the `finally` never runs and no `task` line follows. The reader then
-shows that start, from an earlier boot, as `interrupted`. The task is never
-lost.
+**Crash safety.** A `start` line is written when the turn becomes work
+(§2a), and every line carries the process's boot id. If the process dies
+(kill, power loss, an update), the `finally` never runs and no `task` line
+follows. The reader then shows that start, from an earlier boot, as
+`interrupted`. Work is never lost; a conversation cut short leaves nothing.
 
-These are **not** tasks:
+These are **never** recorded, whatever they do:
 - host-only orchestration sessions (`desktop:profile-inbox:`,
   `desktop:profile-room:`, `desktop:profile-task:`). The Board and groups own
   that history;
@@ -76,9 +148,8 @@ These are **not** tasks:
   turns;
 - helper announcements, background process notices, the agent's own
   introduction;
-- a turn that returned no reply **and** took no step: the agent chose to stay
-  silent, as with a passive group message. It is closed as `discarded` so it
-  never reads as interrupted.
+- a turn that returned no reply **and** did no work: the agent chose to stay
+  silent, as with a passive group message.
 
 Who started a task (`trigger.kind`):
 - `owner`: the app, web, CLI, voice;
@@ -93,18 +164,22 @@ it. Its own steps are not listed yet.
 ## 3. The record (written by Core, no model involved)
 
 Append-only JSON lines in `<FLOWLY_HOME>/activity/<YYYY-MM>.jsonl`. The file
-is chosen by the task's start time, so all of a task's lines share one file.
+is chosen by the turn's start time, so all of a turn's lines share one file.
 Every profile has its own home, so every bot has its own journal. There are
-four line types:
+four line types, keyed by the turn's id:
 
-- `start`: id, sessionKey, trigger, request, startedAt, boot;
-- `task`: the whole record, written at the end (below);
-- `recap`: the model's summary and its token usage, written later;
+- `start`: id, taskId, sessionKey, trigger, request, startedAt, work, boot.
+  Written when the turn becomes work;
+- `task`: the turn's whole record, written at the end (below);
+- `recap`: the model's summary, its token usage, its judgement (`work`) and,
+  when the turn carries on earlier work, that task's id (`taskId`);
 - `seen`: the owner has seen everything up to `before` (ms).
 
 | task field | meaning |
 |---|---|
-| `id` | the run id (a fresh id when the transport gave none) |
+| `id` | the turn's run id (a fresh id when the transport gave none) |
+| `taskId` | the task it starts in: its own id, or `goal:<goalId>` |
+| `work` | work by rule (§2a); `false` for a candidate |
 | `sessionKey`, `conversationTitle` | where it happened |
 | `trigger` | see above |
 | `request` | the first 280 characters of what started it, on one line |
@@ -141,20 +216,24 @@ Where the data comes from:
   callbacks.
 - **Tokens:** the same outcome metadata `_note_turn_usage` reads.
 
-## 4. The summary (written by the bot's model, after the task)
+## 4. The summary and the judgements (written by the bot's model)
 
-After a task ends that used a tool or worked 30 s or more, a background job
-asks the turn's own provider and model (`purpose="activity_recap"`) for one
-JSON object, in the request's language:
+After every recorded turn, a background job asks the turn's own provider and
+model (`purpose="activity_recap"`) for one JSON object, in the request's
+language:
 
 ```json
-{ "title": "≤ 6 words, imperative",
+{ "work": "true when it did something for the owner, false for conversation",
+  "continues": "true when it carries the earlier task on (only when one is given)",
+  "title": "≤ 6 words, imperative; the whole task's when it continues",
   "outcome": "≤ 12 words, past tense",
   "summary": "1–3 sentences, first person",
   "steps": [{ "i": 0, "note": "one line on what this step found or did" }] }
 ```
 
 The input is compact, never the whole conversation:
+- the earlier task, when there is one (§2b): its title, outcome and summary,
+  or its request when it has no summary. For a goal's turn, the task so far;
 - the request, the status and the trigger;
 - each step's tool, kind, target, success and the first 1,500 characters of
   its result (at most 20 steps; the rest are counted);
@@ -164,16 +243,24 @@ Step results live only in memory for this request; they are never written to
 disk.
 
 - **Timing:** it never delays the reply.
+- **Cost:** one request per recorded turn, as before. The judgements ride in
+  the same answer. A conversation is never recorded, so it costs nothing.
 - **Failure:** a timeout (30 s), a provider error or unusable JSON leaves the
-  task with its fallback title (the request's first line) and no summary.
+  turn with no summary and no judgement: a turn that did work by rule stays
+  its own task, a candidate stays out.
 - **Output check:** the answer is validated:
-  - title and outcome are required;
+  - title and outcome are required, or nothing in the answer is used,
+    judgements included;
+  - a judgement counts only as a real `true` or `false`;
   - lengths are capped;
   - step notes must point at a listed step.
 - **Cleaning:** reasoning blocks, code fences, markdown, quotes and citation
   debris (`【…†L1-L3】`, `[^1]`) are removed.
 - **Accounting:** the summary's own token usage is recorded as
   `recapTokens`.
+- **Title without a summary:** the routine's name, else none. The apps then
+  show the conversation's title (never a provisional one, which is the
+  owner's first message) or their word for an untitled task.
 
 Setting: `activity.summaries` (default `true`). It is read when each summary
 is about to run, so turning it off needs no restart.

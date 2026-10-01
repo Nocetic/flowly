@@ -2108,14 +2108,20 @@ class AgentLoop:
             error = metadata.get("error") if isinstance(metadata.get("error"), dict) else {}
             title = ""
             if self.sessions.exists(msg.session_key):
-                title = str(self.sessions.get_or_create(msg.session_key).metadata.get("title") or "")
+                session_meta = self.sessions.get_or_create(msg.session_key).metadata
+                # A provisional title is the owner's first message standing
+                # in until the real one is written; it is not a title.
+                if not session_meta.get("title_provisional"):
+                    title = str(session_meta.get("title") or "")
             model = str(metadata.get("model") or getattr(self, "model", "") or "")
+            reply = str(getattr(response, "content", "") or "")
             ended = get_activity_recorder().end(
                 task, outcome=outcome, usage=metadata.get("usage"), model=model,
                 error=str(error.get("message") or error.get("title") or ""), conversation_title=title,
+                reply_chars=len(reply),
             )
-            if ended is not None and ended.summarize:
-                self._activity_schedule_recap(ended, str(getattr(response, "content", "") or ""), model)
+            if ended is not None:
+                self._activity_schedule_recap(ended, reply, model)
         except Exception:  # noqa: BLE001 — activity never fails a turn
             logger.debug("[activity] could not finish a task", exc_info=True)
 
@@ -2129,22 +2135,55 @@ class AgentLoop:
             pass
         if not hasattr(self, "_activity_recap_tasks"):
             self._activity_recap_tasks: set[asyncio.Task] = set()
-        task = asyncio.create_task(self._activity_recap(ended, reply, model))
+            self._activity_recap_last: dict[str, asyncio.Task] = {}
+        # One conversation's summaries run in order: whether a turn carries on
+        # earlier work is judged against that work's summary, so it must be
+        # written first. Conversations do not wait on each other.
+        key = str(ended.record.get("sessionKey") or "")
+        task = asyncio.create_task(
+            self._activity_recap(ended, reply, model, after=self._activity_recap_last.get(key)))
+        self._activity_recap_last[key] = task
         self._activity_recap_tasks.add(task)
-        task.add_done_callback(self._activity_recap_tasks.discard)
 
-    async def _activity_recap(self, ended: Any, reply: str, model: str) -> None:
-        from flowly.activity import recap, store
+        def _done(done: asyncio.Task, _key: str = key) -> None:
+            self._activity_recap_tasks.discard(done)
+            if self._activity_recap_last.get(_key) is done:
+                del self._activity_recap_last[_key]
 
-        summary, usage = await recap.summarize(self.provider, model or None, ended.record, ended.excerpts, reply)
-        if summary is None and not usage:
+        task.add_done_callback(_done)
+
+    async def _activity_recap(self, ended: Any, reply: str, model: str, *,
+                              after: asyncio.Task | None = None) -> None:
+        from flowly.activity import journal, recap, store
+
+        if after is not None:
+            await asyncio.wait({after})
+        record = ended.record
+        kind = str((record.get("trigger") or {}).get("kind") or "")
+        earlier: dict[str, Any] | None = None
+        part_of = False
+        try:
+            if kind == "goal":
+                earlier, part_of = journal.task_so_far(str(record.get("taskId") or ""), turn_id=record["id"]), True
+            elif kind != "routine":
+                earlier = journal.earlier_work(str(record.get("sessionKey") or ""), turn_id=record["id"],
+                                               started_at=int(record["startedAt"]))
+        except Exception:  # noqa: BLE001 — without context it is judged on its own
+            logger.debug("[activity] could not read earlier work", exc_info=True)
+        result = await recap.recap_turn(self.provider, model or None, record, ended.excerpts, reply,
+                                        earlier=earlier, part_of=part_of)
+        if result.words is None and not result.usage:
             return
-        line: dict[str, Any] = {"type": "recap", "id": ended.record["id"]}
-        if summary is not None:
-            line["recap"] = summary
-        if usage:
-            line["recapTokens"] = usage
-        store.append(line, at_ms=ended.record["startedAt"])
+        line: dict[str, Any] = {"type": "recap", "id": record["id"]}
+        if result.words is not None:
+            line["recap"] = result.words
+        if "work" in result.judged:
+            line["work"] = result.judged["work"]
+        if earlier and not part_of and result.judged.get("continues") is True:
+            line["taskId"] = earlier["id"]
+        if result.usage:
+            line["recapTokens"] = result.usage
+        store.append(line, at_ms=record["startedAt"])
 
     async def _autotitle_session(self, session: Any, user_content: str, final_content: str) -> None:
         from flowly.session.title import generate_title
