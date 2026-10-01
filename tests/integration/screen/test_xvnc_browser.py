@@ -517,6 +517,48 @@ async def test_agent_provider_uses_human_browser_and_fences_old_references(tmp_p
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_GATEWAY_TEST") != "1", reason="requires full Core Linux runner")
+async def test_an_agent_starts_its_stopped_screen_on_its_first_browser_action(tmp_path, login_site, monkeypatch):
+    import asyncio
+
+    import flowly.profile as profiles
+    from flowly.desktop_runtime.handoff import RunHandoffs
+    from flowly.desktop_runtime.host_screen_run import host_screen_run_scope
+    from flowly.gateway.server import GatewayServer
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(profiles, "_DEFAULT_HOME", home)
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", home / "profiles")
+    monkeypatch.setenv("FLOWLY_HOME", str(home))
+    monkeypatch.delenv("FLOWLY_PROFILE", raising=False)
+    gateway = GatewayServer(host="127.0.0.1", port=0, auth_token="test-gateway-token", require_loopback_auth=True)
+    gateway._create_app()  # Registers the display sessions the Screen panel also uses.
+    _, provider = gateway._get_host_screen_browser()
+    runtime = provider.runtime
+    assert runtime.status() is None  # Never started: nobody pressed Start screen.
+    try:
+        # A routine with no Desktop attached: nothing selects or starts the screen.
+        async with host_screen_run_scope(gateway, "cron:check", "routine-run") as run:
+            assert run.uses_screen() and runtime.status() is None
+            opened = await gateway.send_browser_tool_request("open", "navigate", {"url": login_site})
+            assert opened.get("success"), opened
+            state = runtime.status()
+            assert state["phase"] == "running"
+            assert runtime.authority.snapshot()["runId"] == "routine-run"
+            page = await gateway.send_browser_tool_request("read", "get_page_text", {})
+            assert page.get("success") and "Sign in" in str(page), page
+            run.succeeded = True
+        assert runtime.authority.snapshot()["runId"] is None
+        assert RunHandoffs(runtime.directory, runtime.authority).status()["state"] == "finished"
+    finally:
+        await provider.disconnect()
+        state = runtime.status()
+        if state and state["phase"] == "running":
+            await asyncio.to_thread(runtime.stop, state["generation"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_GATEWAY_TEST") != "1", reason="requires full Core Linux runner")
 async def test_authenticated_gateway_run_uses_the_running_screen_and_keeps_it_during_handoff(tmp_path, login_site, monkeypatch):
     import asyncio
 

@@ -100,23 +100,83 @@ async def test_the_running_screen_wins_over_the_desktop_browser_and_claims_on_fi
     assert HOST_SCREEN_RUN.get() is None
 
 
-async def test_a_stopped_screen_leaves_the_run_on_the_desktop_browser_for_its_whole_run(screen_gateway):
+def installed(monkeypatch, supported: bool):
+    monkeypatch.setattr("flowly.desktop_runtime.launcher.ScreenRuntime.capabilities",
+                        staticmethod(lambda: {"supported": supported, "reason": None if supported else "DEPENDENCIES_MISSING",
+                                              "missing": []}))
+
+
+async def test_a_host_without_screen_components_keeps_the_desktop_browser_for_the_whole_run(screen_gateway, monkeypatch):
     gateway, socket, provider = screen_gateway
-    provider.runtime.status = lambda: {"phase": "stopped", "generation": None}
+    installed(monkeypatch, False)
+    provider.runtime.status = lambda: None
+    started = AsyncMock()
+    monkeypatch.setattr("flowly.desktop_runtime.host_screen_run.start_profile_screen", started)
     token = _BROWSER_RUN_BINDING.set(desktop_browser(gateway, socket))
     try:
         async with host_screen_run_scope(gateway, "session", "run") as run:
             assert not run.uses_screen()
             assert gateway.has_browser_provider("local-browser")
             assert await run.bind() is None
-            # The screen starting mid-task does not switch this run's browser.
-            provider.runtime.status = lambda: {"phase": "running", "generation": "generation"}
+            # Components installed mid-task do not switch this run's browser.
+            installed(monkeypatch, True)
             assert not run.uses_screen()
             assert gateway.has_browser_provider("local-browser")
     finally:
         _BROWSER_RUN_BINDING.reset(token)
+    started.assert_not_awaited()
     provider._dispatch.assert_not_awaited()
-    assert provider.runtime.authority.snapshot()["runId"] is None
+
+
+async def test_a_stopped_installed_screen_is_started_for_the_first_browser_action(screen_gateway, monkeypatch):
+    gateway, socket, provider = screen_gateway
+    installed(monkeypatch, True)
+    provider.runtime.status = lambda: {"phase": "stopped", "generation": "previous"}
+
+    async def start(target):
+        assert target is gateway
+        provider.runtime.status = lambda: {"phase": "running", "generation": "generation"}
+
+    started = AsyncMock(side_effect=start)
+    monkeypatch.setattr("flowly.desktop_runtime.host_screen_run.start_profile_screen", started)
+    token = _BROWSER_RUN_BINDING.set(desktop_browser(gateway, socket))
+    try:
+        async with host_screen_run_scope(gateway, "session", "run") as run:
+            # An installed screen is this bot's browser even while stopped,
+            # and entering the run starts nothing.
+            assert run.uses_screen() and gateway.has_browser_provider()
+            assert not gateway.has_browser_provider("local-browser")
+            started.assert_not_awaited()
+            assert (await gateway.send_browser_tool_request("read", "get_page_text", {}))["text"] == "remote page"
+            assert provider.runtime.authority.snapshot()["runId"] == "run"
+            run.succeeded = True
+    finally:
+        _BROWSER_RUN_BINDING.reset(token)
+    started.assert_awaited_once()
+    assert not any(message.get("type") == "tool_request" for message in socket.messages)
+
+
+async def test_a_failed_start_is_reported_and_the_next_action_tries_again(screen_gateway, monkeypatch):
+    gateway, _, provider = screen_gateway
+    installed(monkeypatch, True)
+    provider.runtime.status = lambda: None
+    attempts = []
+
+    async def start(_):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ScreenError("INSUFFICIENT_RESOURCES")
+        provider.runtime.status = lambda: {"phase": "running", "generation": "generation"}
+
+    monkeypatch.setattr("flowly.desktop_runtime.host_screen_run.start_profile_screen", start)
+    async with host_screen_run_scope(gateway, "session", "run") as run:
+        refused = await gateway.send_browser_tool_request("read", "get_page_text", {})
+        assert refused["error_code"] == "INSUFFICIENT_RESOURCES"
+        assert "enough free memory" in refused["error"]
+        assert run.uses_screen() and bound_screen_run() is None
+        assert (await gateway.send_browser_tool_request("again", "get_page_text", {}))["text"] == "remote page"
+        run.succeeded = True
+    assert len(attempts) == 2
 
 
 async def test_parallel_runs_contend_only_when_both_use_the_browser(screen_gateway):

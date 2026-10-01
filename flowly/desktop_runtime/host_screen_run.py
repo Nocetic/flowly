@@ -1,19 +1,21 @@
-"""The browser of an agent run on a host whose profile screen is running.
+"""The browser of an agent run on a host where its profile screen is installed.
 
-A bot uses the browser of the machine it runs on. When this profile's screen
-runs on this host, every agent run of the profile (Desktop, relay, channels,
-routines) uses that screen's browser; nobody selects it per message.
+A bot uses the browser of the machine it runs on. When this host can run this
+profile's screen, every agent run of the profile (Desktop, relay, channels,
+routines) uses that screen's browser; nobody selects it per message. A stopped
+screen (never started, or stopped while unused) is started for the run.
 
-Entering the scope claims nothing. The screen is claimed for the run at its
-first browser action and released when the run ends, so runs that never touch
-the browser never contend for it. The decision is made once per run: a run
-that started on another browser does not switch to the screen mid-task.
+Entering the scope claims nothing. The screen is started if needed and claimed
+for the run at its first browser action, and released when the run ends, so
+runs that never touch the browser never contend for it. The decision is made
+once per run: a run never switches browsers mid-task.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -24,6 +26,63 @@ from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.context import ScreenRunBinding
 from flowly.desktop_runtime.run_checkpoint import ScreenRunCheckpoint
 
+# A cold start (display, desktop and browser) normally takes seconds; the
+# lifecycle worker's own deadline is 120 s.
+START_TIMEOUT_SECONDS = 150
+_START_POLL_SECONDS = 0.5
+
+
+def _start_step(gateway, pinned: dict, operation: str, submitted: bool) -> tuple[dict | None, dict | None]:
+    """One observation: (running state, None) or (None, the start operation or None)."""
+    from flowly.desktop_runtime.lifecycle import ScreenLifecycle
+    from flowly.gateway.display import _resolve
+
+    session = _resolve(gateway, pinned, pinned=True)
+    state = session.runtime.status()
+    if state and state.get("phase") == "running":
+        return state, None
+    lifecycle = ScreenLifecycle(session.runtime, session.identity, lambda: _resolve(gateway, pinned, pinned=True))
+    if submitted:
+        return None, lifecycle.status(operation)
+    try:
+        return None, lifecycle.submit("start", state["generation"] if state else None, operation)
+    except ScreenError as exc:
+        # Someone else (the Screen panel, another run) is starting or stopping
+        # it, or started it since this observation: observe again.
+        if exc.code in {"LIFECYCLE_BUSY", "STALE_GENERATION"}:
+            return None, None
+        raise
+
+
+async def start_profile_screen(gateway) -> None:
+    """Start this profile's installed screen for an agent and wait until it runs.
+
+    Uses the same durable lifecycle operation as the Screen panel, so the
+    panel sees the start and the two never race to start a second runtime.
+    """
+    identity = await asyncio.to_thread(gateway._host_screen_checkpoint_identity)
+    pinned = {"profileId": identity["profileId"], "expectedHostId": identity["hostId"],
+              "expectedBotId": identity["botId"]}
+    operation = f"agent-start-{uuid.uuid4().hex}"
+    submitted = False
+    deadline = time.monotonic() + START_TIMEOUT_SECONDS
+    logger.info("[Screen] starting the screen of profile {} for an agent task", identity["profileId"])
+    while time.monotonic() < deadline:
+        state, record = await asyncio.to_thread(_start_step, gateway, pinned, operation, submitted)
+        if state is not None:
+            return
+        if record is not None and record["operationId"] == operation:
+            submitted = True
+            if record["state"] == "failed" and record["error"] != "STALE_GENERATION":
+                raise ScreenError(record["error"])
+            if record["state"] in {"failed", "succeeded"}:
+                # Started or stopped by someone else since this observation
+                # (compare-and-start refused it), or stopped again before this
+                # run could claim it: observe again.
+                operation, submitted = f"agent-start-{uuid.uuid4().hex}", False
+        await asyncio.sleep(_START_POLL_SECONDS)
+    raise ScreenError("RUNTIME_START_TIMEOUT")
+
 
 class HostScreenRun:
     def __init__(self, gateway, session_key: str, run_id: str):
@@ -33,31 +92,42 @@ class HostScreenRun:
         self.succeeded = False
         self._lock = asyncio.Lock()
 
-    def _running(self):
+    def _observe(self):
+        """(provider, state) of this profile's screen, or (None, None) when this
+        host cannot run it (not installed, unsupported, profile unavailable)."""
+        from flowly.desktop_runtime.launcher import ScreenRuntime
+
         try:
             _, provider = self.gateway._get_host_screen_browser()
             state = provider.runtime.status()
         except (ScreenError, OSError):
             return None, None
-        if not state or state.get("phase") != "running":
-            return None, None
-        return provider, state["generation"]
+        if state and state.get("phase") == "running":
+            return provider, state
+        return (provider, state) if ScreenRuntime.capabilities()["supported"] else (None, None)
 
     def uses_screen(self) -> bool:
-        """Whether this run's browser is the screen; never claims it."""
+        """Whether this run's browser is the screen; never starts or claims it."""
         if self.decided:
             return self.binding is not None
-        return self._running()[0] is not None
+        return self._observe()[0] is not None
 
     async def bind(self) -> ScreenRunBinding | None:
-        """Claim the screen for this run on its first browser action."""
+        """Start the screen if needed and claim it for this run on its first browser action."""
         async with self._lock:
             if self.decided:
                 return self.binding
-            provider, generation = await asyncio.to_thread(self._running)
+            provider, state = await asyncio.to_thread(self._observe)
             if provider is None:
                 self.decided = True
                 return None
+            if not state or state.get("phase") != "running":
+                # A failed start leaves the run undecided; a later action retries.
+                await start_profile_screen(self.gateway)
+                state = await asyncio.to_thread(provider.runtime.status)
+                if not state or state.get("phase") != "running":
+                    raise ScreenError("SCREEN_NOT_RUNNING")
+            generation = state["generation"]
             identity = await asyncio.to_thread(self.gateway._host_screen_checkpoint_identity)
             # A refused claim (human control, another run) leaves the run
             # undecided, so a later action can claim the same screen.
@@ -81,6 +151,9 @@ class HostScreenRun:
 _UNAVAILABLE = {
     "HUMAN_HAS_CONTROL": "The person has control of this screen. Ask them to give control back, then try again.",
     "SCREEN_BUSY": "Another task is using this screen's browser. Try again when it finishes.",
+    "INSUFFICIENT_RESOURCES": "The server does not have enough free memory to start the screen right now.",
+    "INSTALL_BUSY": "The screen components are being installed. Try again when the installation finishes.",
+    "RUNTIME_START_TIMEOUT": "The screen did not start in time. Try again.",
 }
 
 

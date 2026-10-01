@@ -47,10 +47,11 @@ STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
 INPUT_PROTOCOL = "epoch-u64-v1"
-# An unused running screen is stopped after this long (plan: 30 minutes). Use
-# is an attached viewer stream, a viewer/control request, human control or an
-# agent run/action; a static picture without new pixels is not idleness.
-IDLE_STOP_SECONDS = 30 * 60
+# An unused running screen is stopped after this long; an agent that needs its
+# browser again starts it (host_screen_run). Use is an attached viewer stream,
+# a viewer/control request, human control or an agent run/action; a static
+# picture without new pixels is not idleness.
+IDLE_STOP_SECONDS = 20 * 60
 IDLE_CHECK_SECONDS = 60
 ACTIVITY_METHODS = frozenset({"display.observe", "display.viewer.create", "display.control.acquire",
                               "display.control.release", "display.control.reclaim", "display.run.resume",
