@@ -3930,11 +3930,14 @@ def _session_visibility():
 _activity_pruned = False
 
 
-def _activity_now() -> tuple[set[str], set[str]]:
-    """``(running task ids, conversations waiting on the owner)`` right now."""
+def _activity_now() -> dict[str, Any]:
+    """What is only true right now: running turns, conversations waiting on
+    the owner, and what each running turn is doing."""
     from flowly.activity import get_activity_recorder
 
-    return get_activity_recorder().active_ids(), set(_pending_inputs())
+    recorder = get_activity_recorder()
+    return {"running_ids": recorder.active_ids(), "waiting_keys": set(_pending_inputs()),
+            "live_steps": recorder.live_steps()}
 
 
 def _activity_int(params: dict, key: str, *, default: int | None, low: int, high: int) -> int | None:
@@ -3963,9 +3966,7 @@ def activity_list(params: dict) -> dict:
             store.prune(load_config().activity.retention_days)
         except Exception:  # noqa: BLE001 — retention is housekeeping
             pass
-    running, waiting = _activity_now()
-    return journal.list_tasks(limit=limit, before=before, visible=_session_visibility(),
-                              running_ids=running, waiting_keys=waiting)
+    return journal.list_tasks(limit=limit, before=before, visible=_session_visibility(), **_activity_now())
 
 
 def activity_get(params: dict) -> dict:
@@ -3975,8 +3976,7 @@ def activity_get(params: dict) -> dict:
     task_id = params.get("id")
     if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128 or any(ord(c) < 32 for c in task_id):
         raise FeatureRpcError("INVALID_PARAMS", "A task id is required.")
-    running, waiting = _activity_now()
-    task = journal.get_task(task_id, visible=_session_visibility(), running_ids=running, waiting_keys=waiting)
+    task = journal.get_task(task_id, visible=_session_visibility(), **_activity_now())
     if task is None:
         raise FeatureRpcError("NOT_FOUND", "This task is no longer in the activity log.")
     return {"task": task}

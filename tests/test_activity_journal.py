@@ -834,3 +834,87 @@ def test_a_provisional_conversation_title_is_not_a_title(home, clock):
     loop._activity_finish(task, "completed", SimpleNamespace(content="ok", metadata={}), _message("desktop"),
                           cancelled=False)
     assert _everything()["items"][0]["conversationTitle"] == ""
+
+
+# ── what a task is, at a glance ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("tool,kind", [
+    ("email", "message"), ("message", "message"), ("voice_call", "message"),
+    ("google_calendar", "calendar"), ("cron", "calendar"),
+    ("image_generate", "image"), ("video_generate", "video"), ("voice_generate", "voice"),
+    ("write_file", "writing"), ("flowlet", "writing"), ("exec", "code"), ("codex_session", "code"),
+    ("mcp_linear_create", "connection"), ("github", "connection"), ("ha_call_service", "connection"),
+    ("message_profile", "team"), ("spawn", "team"), ("web_search", "research"), ("web_fetch", "browse"),
+    ("browser_tab", "browse"), ("read_file", "files"), ("memory_search", None), ("clarify", None),
+    ("image_analyze", None),
+])
+def test_each_working_step_names_what_kind_of_task_it_is(tool, kind):
+    from flowly.activity.steps import task_kind_of
+
+    assert task_kind_of(describe_step(tool, {})) == kind
+
+
+@pytest.mark.parametrize("tools,kind", [
+    (["web_search", "web_fetch", "write_file"], "writing"),  # what it made, not what it read
+    (["web_search", "web_fetch"], "research"),
+    (["read_file", "email"], "message"),
+    (["memory_search", "read_file"], "files"),
+])
+def test_a_task_takes_the_most_consequential_kind_of_its_work(home, clock, tools, kind):
+    rec = ActivityRecorder()
+    task = rec.begin(session_key="desktop:c", task_id="r", trigger={"kind": "owner"}, request="x")
+    for tool in tools:
+        rec.note_tool("desktop:c", tool, {}, ok=True, duration_ms=1)
+    rec.end(task, outcome="completed")
+    assert _everything()["items"][0]["kind"] == kind
+
+
+def test_a_goal_and_a_routine_say_so_whatever_they_did(home, clock):
+    rec = ActivityRecorder()
+    _work(rec, "desktop:g", "g", trigger={"kind": "goal", "goalId": "ship"})
+    _work(rec, "cron:j", "r", trigger={"kind": "routine", "jobId": "j"})
+    assert {item["id"]: item["kind"] for item in _everything()["items"]} == {"goal:ship": "goal", "r": "routine"}
+
+
+def test_until_its_title_is_in_a_task_shows_what_was_asked_and_what_it_is_doing(home, clock):
+    rec = ActivityRecorder()
+    task = rec.begin(session_key="desktop:c", task_id="r", trigger={"kind": "owner"},
+                     request="find me   cheap flights to Rome " + "x" * 300)
+    rec.note_tool("desktop:c", "web_search", {"query": "Rome flights"}, ok=True, duration_ms=1)
+    rec.note_tool("desktop:c", "web_fetch", {"url": "https://fares.example.com/rome"}, ok=True, duration_ms=1)
+    live = journal.list_tasks(limit=5, before=None, visible=lambda _k: True, running_ids=rec.active_ids(),
+                              waiting_keys=set(), live_steps=rec.live_steps())["items"][0]
+    assert live["status"] == "running"
+    assert live["latestStep"] == {"tool": "web_fetch", "kind": "web", "target": "fares.example.com"}
+    assert live["request"].startswith("find me cheap flights to Rome") and len(live["request"]) == 140
+    assert live["request"].endswith("…")
+
+    rec.end(task, outcome="completed")
+    ended = _everything()["items"][0]
+    assert ended["latestStep"]["kind"] == "web"
+    # The detail keeps the request whole (as stored).
+    assert len(_detail("r")["request"]) == 280
+
+
+def test_a_task_that_took_no_step_yet_has_no_latest_step(home, clock):
+    rec = ActivityRecorder()
+    rec.begin(session_key="cron:j", task_id="r", trigger={"kind": "routine", "jobId": "j"}, request="brief")
+    item = journal.list_tasks(limit=5, before=None, visible=lambda _k: True, running_ids=rec.active_ids(),
+                              waiting_keys=set(), live_steps=rec.live_steps())["items"][0]
+    assert (item["status"], item["latestStep"]) == ("running", None)
+
+
+def test_the_list_rpc_says_what_running_work_is_doing(home, clock):
+    from flowly.activity import get_activity_recorder
+    from flowly.channels.feature_rpc import activity_get, activity_list
+
+    rec = get_activity_recorder()
+    task = rec.begin(session_key="desktop:live", task_id="live", trigger={"kind": "owner"}, request="look around")
+    try:
+        rec.note_tool("desktop:live", "read_file", {"path": "/tmp/plan.md"}, ok=True, duration_ms=1)
+        [item] = activity_list({})["items"]
+        assert (item["status"], item["latestStep"]["target"]) == ("running", "plan.md")
+        assert activity_get({"id": "live"})["task"]["latestStep"]["target"] == "plan.md"
+    finally:
+        rec.end(task, outcome="completed")

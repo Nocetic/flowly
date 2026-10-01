@@ -95,6 +95,46 @@ def is_work(step: dict[str, Any]) -> bool:
     return not tool.startswith(_MEMORY_PREFIX) and tool not in CONVERSATION_TOOLS
 
 
+# What a task was, for its icon, most consequential first: what it sent or
+# put on a calendar outranks what it made, which outranks what it read on
+# the way. A task takes the first of these any of its working steps belongs
+# to. Apps show an unknown kind with their general icon, so a kind added
+# here never breaks an older app.
+TASK_KINDS: tuple[str, ...] = (
+    "message", "calendar", "image", "video", "voice", "writing", "code",
+    "connection", "team", "research", "browse", "files",
+)
+_MESSAGE_TOOLS = frozenset({"email", "message", "voice_call"})
+_CALENDAR_TOOLS = frozenset({"google_calendar", "google_tasks", "cron"})
+_WRITING_TOOLS = frozenset({"artifact", "flowlet", "obsidian_write", "obsidian_append"})
+_APP_TOOLS = frozenset({"github", "linear", "trello", "sentry", "google_drive", "google_contacts",
+                        "obsidian_read", "obsidian_search", "obsidian_list", "obsidian_ingest"})
+_BY_STEP_KIND = {"write": "writing", "exec": "code", "mcp": "connection", "bot": "team", "agent": "team",
+                 "search": "research", "web": "browse", "read": "files"}
+
+
+def task_kind_of(step: dict[str, Any]) -> str | None:
+    """Which of ``TASK_KINDS`` one working step belongs to, if any."""
+    if not is_work(step):
+        return None
+    tool = str(step.get("tool") or "")
+    if tool in _MESSAGE_TOOLS:
+        return "message"
+    if tool in _CALENDAR_TOOLS:
+        return "calendar"
+    if tool == "image_generate":
+        return "image"
+    if tool.startswith("video_"):
+        return "video"
+    if tool == "voice_generate":
+        return "voice"
+    if tool in _WRITING_TOOLS:
+        return "writing"
+    if tool in _APP_TOOLS or tool.startswith("ha_"):
+        return "connection"
+    return _BY_STEP_KIND.get(str(step.get("kind") or ""))
+
+
 def describe_step(tool_name: str, args: Any) -> dict[str, str]:
     """``{tool, kind, target}`` for one call; ``target`` may be empty."""
     tool = tool_name if isinstance(tool_name, str) else ""

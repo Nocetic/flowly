@@ -34,15 +34,16 @@ from typing import Any
 
 from flowly.activity import store
 from flowly.activity.recorder import BACKGROUND_TRIGGERS
-from flowly.activity.steps import is_work
+from flowly.activity.steps import TASK_KINDS, is_work, task_kind_of
 
 # Ended in a way the owner should look at; these carry the unseen dot.
 NOTEWORTHY = frozenset({"blocked", "failed", "waiting", "interrupted"})
 # A follow-up this soon after earlier work in the same conversation may carry
 # it on; the model decides whether it does.
 CONTINUATION_WINDOW_MS = 30 * 60_000
-_KIND_ORDER = (("search", "research"), ("web", "research"), ("write", "files"), ("exec", "code"),
-               ("mcp", "connection"), ("bot", "team"), ("agent", "team"), ("media", "media"))
+# The owner's request as a list shows it, while the model's title is not in.
+REQUEST_PREVIEW_CHARS = 140
+_STEP_FIELDS = ("tool", "kind", "target")
 
 
 # ── which turns are work ────────────────────────────────────────────────────
@@ -160,20 +161,38 @@ def _steps(task: _Task) -> list[dict[str, Any]]:
 
 
 def _kind(task: _Task) -> str:
-    if _trigger_kind(task.first) == "routine":
-        return "routine"
-    kinds = {step.get("kind") for step in _steps(task)}
-    for step_kind, icon in _KIND_ORDER:
-        if step_kind in kinds:
-            return icon
-    return "general"
+    """The task's icon: a routine or a goal says so; otherwise the most
+    consequential kind of work it did (``steps.TASK_KINDS``)."""
+    trigger = _trigger_kind(task.first)
+    if trigger in BACKGROUND_TRIGGERS:
+        return trigger
+    found = {task_kind_of(step) for step in _steps(task)}
+    return next((kind for kind in TASK_KINDS if kind in found), "general")
+
+
+def _latest_step(task: _Task, live_steps: dict[str, dict[str, Any]]) -> dict[str, str] | None:
+    """What it is doing now, if it runs; else the last thing it did."""
+    for turn in reversed(task.turns):
+        step = live_steps.get(turn["id"])
+        if step is None:
+            recorded = [step for step in turn.get("steps") or [] if isinstance(step, dict)]
+            step = recorded[-1] if recorded else None
+        if step is not None:
+            return {key: str(step.get(key) or "") for key in _STEP_FIELDS}
+    return None
+
+
+def _preview(request: Any) -> str:
+    text = " ".join(request.split()) if isinstance(request, str) else ""
+    return text if len(text) <= REQUEST_PREVIEW_CHARS else text[: REQUEST_PREVIEW_CHARS - 1].rstrip() + "…"
 
 
 def _ended_at(task: _Task) -> int | None:
     return task.last.get("endedAt") if task.last.get("ended") else None
 
 
-def _summary(task: _Task, status: str, seen_before: int) -> dict[str, Any]:
+def _summary(task: _Task, status: str, seen_before: int,
+             live_steps: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     stamp = task.last.get("endedAt") or task.last.get("startedAt") or 0
     titled = next((turn.get("conversationTitle") for turn in reversed(task.turns)
                    if turn.get("conversationTitle")), "")
@@ -190,6 +209,10 @@ def _summary(task: _Task, status: str, seen_before: int) -> dict[str, Any]:
         "conversationTitle": titled,
         "summarized": bool(task.recap),
         "unseen": status in NOTEWORTHY and isinstance(stamp, int) and stamp > seen_before,
+        # Until the model's title is in, the apps show what was asked
+        # (marked as a placeholder) and what it is doing.
+        "request": _preview(task.first.get("request")),
+        "latestStep": _latest_step(task, live_steps or {}),
     }
 
 
@@ -213,6 +236,7 @@ def list_tasks(
     visible: Callable[[str], bool],
     running_ids: set[str],
     waiting_keys: set[str],
+    live_steps: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Newest first, by when each task started; ``before`` pages back from that."""
     tasks, _owner_of, seen_before = _tasks()
@@ -224,7 +248,7 @@ def list_tasks(
             continue
         if len(items) == limit:
             return {"items": items, "nextBefore": items[-1]["startedAt"], "seenBefore": seen_before}
-        items.append(_summary(task, _status(task, running_ids, waiting_keys), seen_before))
+        items.append(_summary(task, _status(task, running_ids, waiting_keys), seen_before, live_steps))
     return {"items": items, "nextBefore": None, "seenBefore": seen_before}
 
 
@@ -234,6 +258,7 @@ def get_task(
     visible: Callable[[str], bool],
     running_ids: set[str],
     waiting_keys: set[str],
+    live_steps: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """One task in full. A turn's id finds the task it became part of."""
     tasks, owner_of, seen_before = _tasks()
@@ -255,7 +280,7 @@ def get_task(
     failed = task.last if task.last.get("error") else {}
     active = [turn.get("activeMs") for turn in task.turns if isinstance(turn.get("activeMs"), int)]
     return {
-        **_summary(task, status, seen_before),
+        **_summary(task, status, seen_before, live_steps),
         "summary": task.recap.get("summary", ""),
         "request": task.first.get("request", ""),
         "activeMs": sum(active) if active else None,

@@ -185,6 +185,12 @@ class ActivityRecorder:
         with self._lock:
             return {task.id for task in self._active.values() if task.working}
 
+    def live_steps(self) -> dict[str, dict[str, Any]]:
+        """``{turn id: its latest step}`` for work running now: what it is doing."""
+        with self._lock:
+            return {task.id: dict(task.steps[-1]) for task in self._active.values()
+                    if task.working and task.steps}
+
     def end(
         self,
         task: ActiveTask | None,
