@@ -70,6 +70,10 @@ _CLONE_ALL_STRIP = [
 ]
 
 _PROFILE_METADATA_FILE = "profile.json"
+# Set when the owner stops a named agent, cleared when it is started again.
+# Agents run until their owner stops them; this is the one thing that keeps a
+# stopped agent from being started again when the app or the host restarts.
+_STOPPED_BY_USER_KEY = "stoppedByUser"
 # Published by the primary, read by every bot: see refresh_roster_index.
 _ROSTER_INDEX_FILE = "roster.json"
 _PROFILE_HOST_FILE = "profile-host.json"
@@ -347,6 +351,9 @@ class ProfileInfo:
     updated_at: str = ""
     bot_id: str = ""
     credential_policy: str = ""
+    # The owner stopped this agent. It stays stopped, across restarts of the
+    # app and the host, until someone starts it again.
+    stopped_by_user: bool = False
 
     def to_dict(self) -> dict:
         """Return the stable, JSON-safe profile descriptor used by clients."""
@@ -367,6 +374,7 @@ class ProfileInfo:
             "updatedAt": self.updated_at,
             "botId": self.bot_id,
             "credentialPolicy": self.credential_policy,
+            "stoppedByUser": self.stopped_by_user,
         }
         if self.skill_count is not None:
             value["skillCount"] = self.skill_count
@@ -626,6 +634,8 @@ def _metadata_for(name: str, profile_dir: Path, *, is_default: bool) -> dict:
             if is_default
             else _NAMED_PROFILE_CREDENTIAL_POLICY
         ),
+        # Only a named agent can be stopped; the main agent is the host itself.
+        "stopped_by_user": not is_default and meta.get(_STOPPED_BY_USER_KEY) is True,
     }
 
 
@@ -1317,6 +1327,31 @@ def update_profile_metadata(
     _atomic_write_json(profile.path / _PROFILE_METADATA_FILE, current)
     refresh_roster_index()
     return describe_profile(name)
+
+
+def set_profile_stopped_by_user(name: str, stopped: bool) -> bool:
+    """Record whether the owner stopped this named agent.
+
+    Returns True when the stored value changed. Writing only on a change keeps
+    a start (which clears the mark every time) from rewriting ``profile.json``
+    when there is nothing to clear. Taken under the profile lock, so it cannot
+    land in a directory a concurrent delete is retiring.
+    """
+    if name == "default":
+        raise ValueError("The main agent cannot be stopped.")
+    validate_profile_name(name)
+    with _profile_mutation_lock():
+        profile = describe_profile(name)
+        current = _profile_metadata(profile.path)
+        if (current.get(_STOPPED_BY_USER_KEY) is True) == stopped:
+            return False
+        if stopped:
+            current[_STOPPED_BY_USER_KEY] = True
+        else:
+            current.pop(_STOPPED_BY_USER_KEY, None)
+        # Not an edit of the agent, so ``updatedAt`` is left alone.
+        _atomic_write_json(profile.path / _PROFILE_METADATA_FILE, current)
+    return True
 
 
 def read_profile_settings(name: str) -> dict:
@@ -2182,6 +2217,8 @@ def _sanitize_template_tree(root: Path) -> None:
     if metadata_path.exists():
         metadata = _profile_metadata(root)
         metadata.pop("botId", None)
+        # Whether the author stopped their copy says nothing about anyone else's.
+        metadata.pop(_STOPPED_BY_USER_KEY, None)
         metadata["localRuntime"] = True
         _atomic_write_json(metadata_path, metadata)
     for candidate in root.rglob("*"):
@@ -2481,6 +2518,8 @@ def _import_profile_archive(
             "localRuntime": bool(local_runtime or metadata.get("localRuntime")),
             "credentialPolicy": _NAMED_PROFILE_CREDENTIAL_POLICY,
         })
+        # An imported agent arrives ready to run, whatever its source was doing.
+        metadata.pop(_STOPPED_BY_USER_KEY, None)
         if identity != "restore":
             # The copied transcript is retained; optional setup belongs to the
             # original identity and must not resume on the duplicate.

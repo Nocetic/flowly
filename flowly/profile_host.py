@@ -28,6 +28,7 @@ import aiohttp
 from loguru import logger
 
 from flowly.exec.env_scrub import sanitize_subprocess_env
+from flowly.gateway_logs.notable import notable
 from flowly.profile import (
     MAX_NAMED_PROFILES,
     ProfileLimitError,
@@ -41,6 +42,7 @@ from flowly.profile import (
     read_profile_settings,
     reconcile_runtime_lease,
     resolve_profile_reference,
+    set_profile_stopped_by_user,
     update_profile_metadata,
     update_profile_settings,
     validate_profile_name,
@@ -68,7 +70,6 @@ _START_TIMEOUT_SECONDS = 90
 _STOP_TIMEOUT_SECONDS = 8
 _DELETE_CONFIRM_TTL_SECONDS = 60
 _DELETE_CONFIRM_MAX = 128
-_MAX_RUNTIMES = 6
 # A runtime that answers ``sessions.attention`` advertises this.
 _ATTENTION_CAPABILITY = "session-attention-v1"
 # Events after which what a bot waits on may have changed. A chat terminal is
@@ -87,7 +88,6 @@ _ATTENTION_CHAT_STATES = frozenset({"final", "aborted", "error"})
 _ATTENTION_DEBOUNCE_SECONDS = 0.3
 _ATTENTION_RPC_TIMEOUT_SECONDS = 10
 _ATTENTION_MAX_SESSIONS = 512
-_CAPACITY_WAIT_SECONDS = 120.0
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _SAFE_DELEGATED_TOOLS = (
     "read_file",
@@ -168,6 +168,12 @@ def _validate_named_profile(name: str) -> None:
             "The default profile uses the host gateway directly.",
         )
     validate_profile_name(name)
+
+
+def _autostart_reason(exc: BaseException) -> str:
+    """What went wrong starting an agent, in the words the error carries."""
+    message = exc.message if isinstance(exc, ProfileHostError) else str(exc)
+    return message.strip() or type(exc).__name__
 
 
 def _required_string(params: dict[str, Any], key: str) -> str:
@@ -318,8 +324,15 @@ class ProfileHost:
         on_room_event: ProfileRoomEventCallback | None = None,
         primary_rpc: PrimaryRpcCallback | None = None,
         primary_event_lease: PrimaryEventLeaseCallback | None = None,
+        autostart: bool = False,
     ):
         self.host_id = get_or_create_profile_host_id()
+        # Whether this host starts the owner's agents when it comes up. Only
+        # the manager that owns the gateway does it, so a machine never has
+        # two managers racing to start the same agent: Flowly Desktop owns
+        # (and sandboxes) the agents of the gateway it runs.
+        self._autostart = autostart
+        self._autostart_task: asyncio.Task[None] | None = None
         self._event_subscribers: dict[str, ProfileEventCallback] = {}
         if on_event is not None:
             self._event_subscribers["owner"] = on_event
@@ -348,8 +361,6 @@ class ProfileHost:
         self._task_audits: dict[tuple[str, str], dict[str, Any]] = {}
         self._task_audit_sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        self._capacity_lock = asyncio.Lock()
-        self._capacity_changed = asyncio.Event()
         self._closed = False
         self._manager_instance = str(uuid.uuid4())
         # Room updates fan out to every attached transport. The constructor
@@ -427,7 +438,8 @@ class ProfileHost:
             "processIsolation": "per-profile-gateway",
             "defaultProfileRpc": "direct",
             "wrappedDefaultProfileRpc": True,
-            "maxConcurrentRuntimes": _MAX_RUNTIMES,
+            # Every agent may run at once; the only bound is how many exist.
+            "maxConcurrentRuntimes": MAX_NAMED_PROFILES,
             "maxNamedProfiles": MAX_NAMED_PROFILES,
             "profileReadiness": True,
             "profileMessaging": {"authority": "gateway", "version": 1},
@@ -436,11 +448,14 @@ class ProfileHost:
                 "supported": ["isolated"],
                 "sharedCredentialBroker": False,
             },
+            # An agent runs until its owner stops it: it is never stopped for
+            # being idle or to make room, and an owner's stop survives restarts.
             "runtimePolicy": {
-                "strategy": "bounded-lru",
+                "strategy": "always-on",
                 "queuesWhileBusy": True,
-                "idleEviction": True,
-                "capacityWaitMs": int(_CAPACITY_WAIT_SECONDS * 1000),
+                "idleEviction": False,
+                "autostart": self._autostart,
+                "stickyStop": True,
             },
             "roomModes": room_capabilities["modes"],
             "roomLimits": {
@@ -544,7 +559,7 @@ class ProfileHost:
         if method == "profiles.connect":
             return await self.connect(_required_string(params, "name").strip())
         if method == "profiles.stop":
-            return await self.stop(_required_string(params, "name").strip())
+            return await self.stop(_required_string(params, "name").strip(), by_user=True)
         if method == "profiles.cron.notify":
             from flowly.push.profile_cron_push import notify_profile_cron
 
@@ -799,7 +814,13 @@ class ProfileHost:
             await self._ensure_runtime(name)
         return {"status": self.status(name)}
 
-    async def stop(self, name: str) -> dict[str, Any]:
+    async def stop(self, name: str, *, by_user: bool = False) -> dict[str, Any]:
+        """Stop an agent's runtime.
+
+        ``by_user`` is the owner's own stop: the agent then stays stopped,
+        across restarts, until it is started again. A stop Flowly makes for
+        its own reasons (before a delete or a change) is not remembered.
+        """
         _validate_profile_selector(name)
         await self._rooms.stop_for_profile(name)
         if name == "default":
@@ -836,7 +857,6 @@ class ProfileHost:
                 await self._close_runtime(runtime)
                 if not runtime.owned:
                     await self._wait_for_runtime_release(name, runtime.instance_id)
-                self._capacity_changed.set()
             else:
                 profile = describe_profile(name)
                 if reconcile_runtime_lease(profile.path, profile_name=name):
@@ -845,7 +865,9 @@ class ProfileHost:
                         "The bot runtime changed while Flowly was preparing to stop it. Try again.",
                         retryable=True,
                     )
-        await self._emit(name, "connection", {"state": "stopped"})
+        if by_user:
+            await asyncio.to_thread(set_profile_stopped_by_user, name, True)
+        await self._emit(name, "connection", {"state": "stopped", **({"byUser": True} if by_user else {})})
         return {"ok": True, "status": self.status(name)}
 
     async def _request_runtime_stop(self, runtime: _Runtime) -> None:
@@ -872,11 +894,6 @@ class ProfileHost:
                 "The bot did not confirm a safe runtime stop.",
                 retryable=True,
             )
-
-    async def _cooperative_close_runtime(self, runtime: _Runtime) -> None:
-        """Release an owner slot without interrupting another manager's turn."""
-        await self._request_runtime_stop(runtime)
-        await self._close_runtime(runtime)
 
     async def _wait_for_runtime_release(self, name: str, instance_id: str) -> None:
         """Wait for the acknowledged process to release its lease, fail closed on replacement."""
@@ -1452,6 +1469,51 @@ class ProfileHost:
             "toolTrace": [dict(item) for item in audit.get("toolTrace", [])],
         }
 
+    def start_autostart(self) -> None:
+        """Start, in the background, every agent its owner has not stopped.
+
+        Called once the gateway is serving. Does nothing on a host that does
+        not own its agents' lifecycle (see ``autostart``).
+        """
+        if not self._autostart or self._closed or self._autostart_task is not None:
+            return
+        self._autostart_task = asyncio.create_task(self._autostart_agents(), name="profile-autostart")
+        self._background_tasks.add(self._autostart_task)
+        self._autostart_task.add_done_callback(self._background_tasks.discard)
+
+    async def _autostart_agents(self) -> None:
+        try:
+            profiles = await asyncio.to_thread(list_profiles)
+        except Exception as exc:  # noqa: BLE001 — an unreadable directory must not stop the gateway
+            notable("agents.autostart_failed", reason=f"{type(exc).__name__}: {exc}")
+            return
+        wanted = [
+            profile.name for profile in profiles
+            if not profile.is_default and profile.has_config and not profile.stopped_by_user
+        ]
+        started = 0
+        # One at a time: each start spawns a process and loads a model client,
+        # and a host coming up with every agent at once would stall itself.
+        for name in wanted:
+            if self._closed:
+                return
+            try:
+                # The owner may have stopped (or deleted) it while the agents
+                # before it were starting; their word wins over this list.
+                if (await asyncio.to_thread(describe_profile, name)).stopped_by_user:
+                    continue
+                await self._ensure_runtime(name)
+            except asyncio.CancelledError:
+                raise
+            except FileNotFoundError:
+                continue  # deleted meanwhile: nothing to start, nothing wrong
+            except Exception as exc:  # noqa: BLE001 — one agent must not keep the others down
+                notable("agent.start_failed", name=name, reason=_autostart_reason(exc))
+                continue
+            started += 1
+        if started:
+            notable("agents.started", count=started)
+
     async def shutdown(self) -> None:
         if self._closed:
             return
@@ -1517,107 +1579,23 @@ class ProfileHost:
                 if pending is not None:
                     break
                 lease = reconcile_runtime_lease(profile.path, profile_name=name)
-                eviction: tuple[str, _Runtime, asyncio.Task[None]] | None = None
-                wait_for_capacity = False
-                async with self._capacity_lock:
-                    allocated = set(self._runtimes) | set(self._starting) | set(self._closing)
-                    if name in allocated or len(allocated) < _MAX_RUNTIMES:
-                        pending = asyncio.create_task(
-                            self._attach_runtime(name, lease)
-                            if lease
-                            else self._start_runtime(name),
-                            name=f"profile-{'attach' if lease else 'start'}:{name}",
-                        )
-                        self._starting[name] = pending
-                    else:
-                        candidate = self._idle_eviction_candidate(exclude=name)
-                        if candidate is not None:
-                            candidate_name, candidate_runtime = candidate
-                            self._runtimes.pop(candidate_name, None)
-                            candidate_runtime.state = "stopping"
-                            close_task = asyncio.create_task(
-                                self._cooperative_close_runtime(candidate_runtime),
-                                name=f"profile-idle-stop:{candidate_name}",
-                            )
-                            self._closing[candidate_name] = close_task
-                            eviction = (candidate_name, candidate_runtime, close_task)
-                        else:
-                            self._capacity_changed.clear()
-                            wait_for_capacity = True
-                if eviction is not None:
-                    candidate_name, candidate_runtime, close_task = eviction
-                    try:
-                        await asyncio.shield(close_task)
-                    except asyncio.CancelledError:
-                        result = await asyncio.gather(close_task, return_exceptions=True)
-                        async with self._capacity_lock:
-                            if self._closing.get(candidate_name) is close_task:
-                                self._closing.pop(candidate_name, None)
-                            if result and isinstance(result[0], BaseException):
-                                if self._runtime_is_open(candidate_runtime):
-                                    candidate_runtime.state = "connected"
-                                    self._runtimes[candidate_name] = candidate_runtime
-                                    self._schedule_attention_refresh(candidate_runtime)
-                            self._capacity_changed.set()
-                        raise
-                    except BaseException as exc:
-                        async with self._capacity_lock:
-                            if self._closing.get(candidate_name) is close_task:
-                                self._closing.pop(candidate_name, None)
-                            if self._runtime_is_open(candidate_runtime):
-                                candidate_runtime.state = "connected"
-                                self._runtimes[candidate_name] = candidate_runtime
-                                self._schedule_attention_refresh(candidate_runtime)
-                            self._capacity_changed.set()
-                        raise ProfileHostError(
-                            "PROFILE_CAPACITY",
-                            "Flowly could not release an idle bot runtime. Try again.",
-                            retryable=True,
-                        ) from exc
-                    async with self._capacity_lock:
-                        if self._closing.get(candidate_name) is close_task:
-                            self._closing.pop(candidate_name, None)
-                        self._capacity_changed.set()
-                    await self._emit(
-                        candidate_name,
-                        "connection",
-                        {"state": "stopped", "reason": "idle-capacity"},
-                    )
-                    continue
-                if wait_for_capacity:
-                    try:
-                        await asyncio.wait_for(
-                            self._capacity_changed.wait(), _CAPACITY_WAIT_SECONDS,
-                        )
-                    except asyncio.TimeoutError as exc:
-                        raise ProfileHostError(
-                            "PROFILE_CAPACITY",
-                            "All bot runtime slots are busy. Try again when an active turn finishes.",
-                            retryable=True,
-                        ) from exc
-                    continue
-                assert pending is not None
+                pending = asyncio.create_task(
+                    self._attach_runtime(name, lease)
+                    if lease
+                    else self._start_runtime(name),
+                    name=f"profile-{'attach' if lease else 'start'}:{name}",
+                )
+                self._starting[name] = pending
                 break
         try:
-            return await pending
+            runtime = await pending
         finally:
             if self._starting.get(name) is pending:
                 self._starting.pop(name, None)
-                self._capacity_changed.set()
-
-    def _idle_eviction_candidate(self, *, exclude: str) -> tuple[str, _Runtime] | None:
-        candidates = [
-            (profile, runtime)
-            for profile, runtime in self._runtimes.items()
-            if profile != exclude
-            and runtime.owned
-            and self._runtime_is_open(runtime)
-            and not runtime.active_runs
-            and not runtime.pending
-            and not any(owner == profile for owner, _session in self._broker_sessions)
-            and not self._rooms.is_profile_active(profile)
-        ]
-        return min(candidates, key=lambda item: item[1].last_used_at) if candidates else None
+        if profile.stopped_by_user:
+            # Started again, by whoever asked: the owner's stop is over.
+            await asyncio.to_thread(set_profile_stopped_by_user, name, False)
+        return runtime
 
     @staticmethod
     def _runtime_is_open(runtime: _Runtime | None) -> bool:
@@ -1964,7 +1942,6 @@ class ProfileHost:
         finally:
             runtime.pending.pop(request_id, None)
             runtime.last_used_at = time.time()
-            self._capacity_changed.set()
 
     async def _read_runtime(self, runtime: _Runtime) -> None:
         try:
@@ -2003,7 +1980,6 @@ class ProfileHost:
             owns_runtime = self._runtimes.get(runtime.profile) is runtime
             if owns_runtime:
                 self._runtimes.pop(runtime.profile, None)
-                self._capacity_changed.set()
             if owns_runtime and not self._closed:
                 await self._emit(runtime.profile, "connection", {"state": "error"})
             for future in runtime.pending.values():
@@ -2145,7 +2121,6 @@ class ProfileHost:
                 self._cancel_profile_message_requests(profile, session_key, run_id)
                 if runtime is not None:
                     runtime.active_runs.discard(run_id)
-                    self._capacity_changed.set()
                 key = (profile, run_id)
                 waiter = self._broker_waiters.get(key)
                 if (waiter is not None or (profile, session_key) in self._broker_sessions

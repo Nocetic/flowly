@@ -28,6 +28,9 @@ NOTABLE: dict[str, tuple[str, str]] = {
     "relay.connected": ("INFO", "Connected to Flowly Cloud"),
     "relay.lost": ("WARNING", "Lost the connection to Flowly Cloud; retrying in {delay}s: {reason}"),
     "routine.failed": ("ERROR", "Routine '{name}' failed: {reason}"),
+    "agents.started": ("INFO", "Started {count} agent(s); they keep running until you stop them."),
+    "agent.start_failed": ("ERROR", "Agent '{name}' did not start: {reason}"),
+    "agents.autostart_failed": ("ERROR", "Flowly could not start your agents: {reason}"),
     "net.rejected_request": (
         "INFO",
         "Rejected {count} malformed request(s) from the internet; latest from {ip}. "

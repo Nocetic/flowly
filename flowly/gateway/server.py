@@ -559,6 +559,7 @@ class GatewayServer:
         # Child profile gateways disable this so runtimes never recursively
         # start or control sibling runtimes.
         enable_profile_host: bool = False,
+        autostart_profiles: bool = False,
         # Lets the owning agent cancel background title/compaction writers
         # before the session files are removed.
         on_session_delete: SessionDeleteCallback | None = None,
@@ -702,6 +703,7 @@ class GatewayServer:
                 on_room_event=self._broadcast_profile_room_event,
                 primary_rpc=self._profile_host_primary_rpc,
                 primary_event_lease=self._set_profile_host_primary_event_lease,
+                autostart=autostart_profiles,
             )
 
     @property
@@ -5809,6 +5811,8 @@ class GatewayServer:
             except Exception as exc:  # pragma: no cover
                 logger.debug("MCP control advertise failed: {}", exc)
         notable("gateway.started", address=f"http://{self.host}:{self.port}")
+        if self._profile_host is not None:
+            self._profile_host.start_autostart()
         if self.on_chat_message:
             logger.info(f"Desktop WebSocket available at ws://{self.host}:{self.port}/ws")
 
