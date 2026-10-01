@@ -18,6 +18,18 @@ from flowly.tui.panes.composer import Composer
 from flowly.tui.panes.usage_panel import UsagePanel, build_usage_body
 
 
+@pytest.fixture(autouse=True)
+def only_this_tests_catalog(monkeypatch: pytest.MonkeyPatch):
+    """Each test prices against the catalog it builds, and nothing else.
+
+    Prices are looked up across every catalog loaded in the process, in load
+    order. A catalog an earlier test (or the machine's own cache) loaded with
+    the same model id would answer first, so the result depended on what ran
+    before and on whose machine it ran.
+    """
+    monkeypatch.setattr(mc, "_CACHE", {})
+
+
 def _totals():
     return {
         "input": 128_000, "output": 12_400, "cache_read": 96_000,
