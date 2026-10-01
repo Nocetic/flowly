@@ -572,7 +572,12 @@ class ProfileHost:
         if method == "profiles.statuses":
             return await self.statuses()
         if method == "profiles.connect":
-            return await self.connect(_required_string(params, "name").strip())
+            # ``explicit: false`` is an app opening something of the agent (its
+            # chat), not the owner pressing Start: it must not undo their stop.
+            return await self.connect(
+                _required_string(params, "name").strip(),
+                explicit=params.get("explicit") is not False,
+            )
         if method == "profiles.manager.claim":
             return self.claim_management(params.get("ttlMs") if isinstance(params, dict) else None)
         if method == "profiles.stop":
@@ -818,7 +823,10 @@ class ProfileHost:
         await self._emit(name, "directory", {"action": "deleted", "botId": current["botId"]})
         return {"ok": True, "deleted": name, "botId": current["botId"]}
 
-    async def connect(self, name: str) -> dict[str, Any]:
+    async def connect(self, name: str, *, explicit: bool = True) -> dict[str, Any]:
+        """Make the agent ready. ``explicit`` is the owner's own start, the one
+        way an agent they stopped runs again; otherwise a stopped agent stays
+        stopped and this raises PROFILE_STOPPED."""
         _validate_profile_selector(name)
         if name == "default":
             if self._primary_rpc is None:
@@ -828,8 +836,7 @@ class ProfileHost:
                     retryable=True,
                 )
         else:
-            # The owner's own start: the one way a stopped agent runs again.
-            await self._ensure_runtime(name, explicit=True)
+            await self._ensure_runtime(name, explicit=explicit)
         return {"status": self.status(name)}
 
     async def _prepare_room_member(self, name: str) -> dict[str, Any]:

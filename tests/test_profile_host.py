@@ -681,6 +681,34 @@ async def test_nothing_but_the_owners_start_wakes_a_stopped_agent(profile_roots)
     assert profiles.describe_profile("writer").stopped_by_user is False
 
 
+@pytest.mark.asyncio
+async def test_opening_a_stopped_agents_chat_does_not_start_it(profile_roots) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    profiles.set_profile_stopped_by_user("writer", True)
+    host = ProfileHost()
+    started: list[str] = []
+    host._start_runtime = _starts_into(host, started)  # type: ignore[method-assign]
+
+    with pytest.raises(ProfileHostError) as raised:
+        await host.dispatch("profiles.connect", {"name": "writer", "explicit": False})
+
+    assert raised.value.code == "PROFILE_STOPPED"
+    assert started == []
+    assert profiles.describe_profile("writer").stopped_by_user is True
+
+
+@pytest.mark.asyncio
+async def test_opening_a_running_or_unstopped_agent_still_readies_it(profile_roots) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    host = ProfileHost()
+    started: list[str] = []
+    host._start_runtime = _starts_into(host, started)  # type: ignore[method-assign]
+
+    await host.dispatch("profiles.connect", {"name": "writer", "explicit": False})
+
+    assert started == ["writer"]
+
+
 def test_the_gateway_keeps_its_agents_only_when_told(profile_roots) -> None:
     keeps = GatewayServer(enable_profile_host=True, autostart_profiles=True)
     leaves = GatewayServer(enable_profile_host=True)
