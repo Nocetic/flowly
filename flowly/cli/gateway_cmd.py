@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 
 from flowly import __version__, __logo__
-from flowly.gateway.identity import GATEWAY_SERVICE_ID, runtime_owner
+from flowly.gateway.identity import GATEWAY_SERVICE_ID
 from flowly.push.cron_push import should_push_cron_completion as _should_push_persisted_cron_completion
 
 console = Console()
@@ -340,17 +340,6 @@ def _installed_service_unit():
         if unit is not None and unit.exists():
             return unit
     return None
-
-
-def _starts_own_agents() -> bool:
-    """Whether this gateway starts the owner's named agents when it comes up.
-
-    Exactly one manager on a machine starts them, so two never race to start
-    the same agent. Flowly Desktop runs (and sandboxes) the agents of the
-    gateway it starts. Any other gateway (a server, a CLI install) is the only
-    manager its agents have, so it starts them itself.
-    """
-    return runtime_owner() != "desktop"
 
 
 def _gateway_identity(port: int) -> dict:
@@ -2001,7 +1990,9 @@ Respond to the user now:"""
         require_loopback_auth=local_runtime,
         advertise_control=not local_runtime,
         enable_profile_host=not local_runtime and current_profile_name() == "default",
-        autostart_profiles=_starts_own_agents(),
+        # The primary keeps its agents running unless Flowly Desktop claims
+        # them (it runs them in its sandbox); see ProfileHost.claim_management.
+        autostart_profiles=True,
         on_voice_message=on_voice_message if legacy_voice_bridge_enabled else None,
         on_cron_run=on_cron_run,
         on_cron_reload=cron.reload,

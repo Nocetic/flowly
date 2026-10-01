@@ -168,7 +168,7 @@ async def test_relay_profile_error_preserves_code_and_retryability(profile_roots
 
     host = ProfileHost()
     host.dispatch = AsyncMock(side_effect=ProfileHostError(
-        "PROFILE_CAPACITY", "Stop another agent and try again.", retryable=True
+        "PROFILE_STOPPED", "This agent is stopped. Start it to use it.", retryable=True
     ))  # type: ignore[method-assign]
     channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
     channel.set_profile_host(host)
@@ -183,10 +183,29 @@ async def test_relay_profile_error_preserves_code_and_retryability(profile_roots
     })
 
     assert socket.messages[0]["error"] == {
-        "code": "PROFILE_CAPACITY",
-        "message": "Stop another agent and try again.",
+        "code": "PROFILE_STOPPED",
+        "message": "This agent is stopped. Start it to use it.",
         "retryable": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_a_phone_cannot_claim_the_hosts_agents(profile_roots) -> None:
+    host = ProfileHost(autostart=True)
+    channel = WebChannel(config=WebChannelConfig(enabled=True), bus=MessageBus())
+    channel.set_profile_host(host)
+    socket = _Socket()
+
+    await channel._handle_rpc(socket, {
+        "type": "rpc",
+        "id": "rpc-claim",
+        "method": "profiles.manager.claim",
+        "sessionId": "relay-a",
+        "params": {"ttlMs": 60_000},
+    })
+
+    assert socket.messages[0]["error"]["code"] == "PROFILE_MANAGER_LOCAL_ONLY"
+    assert host._desktop_manages_agents() is False
 
 
 @pytest.mark.asyncio

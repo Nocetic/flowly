@@ -82,6 +82,7 @@ async def test_profile_directory_and_statuses_are_public_and_stable(profile_root
         "queuesWhileBusy": True,
         "idleEviction": False,
         "autostart": False,
+        "managerClaim": True,
         "stickyStop": True,
     }
     assert host.capabilities()["roomModes"] == ["panel", "council"]
@@ -498,15 +499,61 @@ async def test_the_host_starts_every_agent_its_owner_has_not_stopped(profile_roo
     started: list[str] = []
     host._start_runtime = _starts_into(host, started)  # type: ignore[method-assign]
 
-    host.start_autostart()
-    task = host._autostart_task
-    assert task is not None
-    await task
-    host.start_autostart()
+    await host._start_wanted_agents()
+    # A second pass finds them running and starts nothing more.
+    await host._start_wanted_agents()
 
     assert started == ["alpha", "gamma"]
-    assert host._autostart_task is task
     assert host.capabilities()["runtimePolicy"]["autostart"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_keeper_starts_agents_after_the_grace_and_brings_back_a_crashed_one(
+    profile_roots, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profiles.create_profile("alpha", local_runtime=True)
+    monkeypatch.setattr(profile_host_module, "_KEEPER_STARTUP_GRACE_SECONDS", 0)
+    monkeypatch.setattr(profile_host_module, "_KEEPER_INTERVAL_SECONDS", 0.01)
+    host = ProfileHost(autostart=True)
+    started: list[str] = []
+    host._start_runtime = _starts_into(host, started)  # type: ignore[method-assign]
+
+    host.start_keeping_agents()
+    host.start_keeping_agents()
+    await asyncio.wait_for(_until(lambda: started == ["alpha"]), 1)
+    # The agent's process goes away on its own.
+    host._runtimes.pop("alpha")
+    await asyncio.wait_for(_until(lambda: started == ["alpha", "alpha"]), 1)
+    await host.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_while_desktop_claims_the_agents_the_host_leaves_them_to_it(profile_roots) -> None:
+    profiles.create_profile("alpha", local_runtime=True)
+    host = ProfileHost(autostart=True)
+    started: list[str] = []
+    host._start_runtime = _starts_into(host, started)  # type: ignore[method-assign]
+
+    assert await host.dispatch("profiles.manager.claim", {"ttlMs": 60_000}) == {"ok": True, "ttlMs": 60_000}
+    await host._start_wanted_agents()
+    assert started == []
+
+    # The claim lapses (Desktop quit): the host keeps them itself.
+    host._manager_claim_until = 0.0
+    await host._start_wanted_agents()
+    assert started == ["alpha"]
+
+
+@pytest.mark.asyncio
+async def test_a_claim_is_bounded_and_must_be_a_duration(profile_roots) -> None:
+    host = ProfileHost(autostart=True)
+
+    assert host.claim_management(1)["ttlMs"] == 10_000
+    assert host.claim_management(10**9)["ttlMs"] == 300_000
+    with pytest.raises(ProfileHostError) as raised:
+        host.claim_management("soon")
+    assert raised.value.code == "INVALID_PARAMS"
+    assert "profiles.manager.claim" in host.capabilities()["methods"]
 
 
 @pytest.mark.asyncio
@@ -525,9 +572,7 @@ async def test_an_agent_stopped_while_others_start_stays_stopped(profile_roots) 
 
     host._start_runtime = start  # type: ignore[method-assign]
 
-    host.start_autostart()
-    assert host._autostart_task is not None
-    await host._autostart_task
+    await host._start_wanted_agents()
 
     assert started == ["alpha"]
     assert profiles.describe_profile("beta").stopped_by_user is True
@@ -551,16 +596,14 @@ async def test_an_agent_deleted_while_others_start_is_skipped_quietly(
 
     host._start_runtime = start  # type: ignore[method-assign]
 
-    host.start_autostart()
-    assert host._autostart_task is not None
-    await host._autostart_task
+    await host._start_wanted_agents()
 
     assert set(host._runtimes) == {"alpha"}
     assert logged == ["agents.started"]
 
 
 @pytest.mark.asyncio
-async def test_one_agent_failing_to_start_does_not_keep_the_others_down(
+async def test_an_agent_that_cannot_start_is_reported_once_and_retried_less_often(
     profile_roots, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for name in ("alpha", "beta"):
@@ -570,58 +613,106 @@ async def test_one_agent_failing_to_start_does_not_keep_the_others_down(
     monkeypatch.setattr(
         profile_host_module, "notable", lambda code, **params: logged.append((code, params)),
     )
+    attempts: list[str] = []
     started = _starts_into(host)
 
     async def start(name: str):
         if name == "alpha":
+            attempts.append(name)
             raise ProfileHostError("PROFILE_START_FAILED", "The model provider rejected the key.")
         return await started(name)
 
     host._start_runtime = start  # type: ignore[method-assign]
 
-    host.start_autostart()
-    assert host._autostart_task is not None
-    await host._autostart_task
-
+    await host._start_wanted_agents()
     assert set(host._runtimes) == {"beta"}
     assert logged == [
         ("agent.start_failed", {"name": "alpha", "reason": "The model provider rejected the key."}),
         ("agents.started", {"count": 1}),
     ]
 
+    # Within its back-off it is not tried again.
+    await host._start_wanted_agents()
+    assert attempts == ["alpha"]
+    # Once due, it is retried; the same problem is not written again.
+    reason, _due, delay = host._keeper_failures["alpha"]
+    host._keeper_failures["alpha"] = (reason, 0.0, delay)
+    await host._start_wanted_agents()
+    assert attempts == ["alpha", "alpha"]
+    assert host._keeper_failures["alpha"][2] == delay * 2
+    assert [code for code, _ in logged].count("agent.start_failed") == 1
+
 
 @pytest.mark.asyncio
-async def test_a_host_that_does_not_own_its_agents_starts_none(profile_roots) -> None:
+async def test_a_host_that_does_not_keep_agents_starts_none(profile_roots) -> None:
     profiles.create_profile("writer", local_runtime=True)
     host = ProfileHost()
     host._start_runtime = AsyncMock()  # type: ignore[method-assign]
 
-    host.start_autostart()
+    host.start_keeping_agents()
 
-    assert host._autostart_task is None
+    assert host._keeper_task is None
     host._start_runtime.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("owner", "expected"), [("desktop", False), ("cli", True), ("manual", True)],
-)
-def test_the_gateway_starts_agents_unless_desktop_owns_it(
-    monkeypatch: pytest.MonkeyPatch, owner: str, expected: bool,
-) -> None:
-    from flowly.cli.gateway_cmd import _starts_own_agents
+@pytest.mark.asyncio
+async def test_nothing_but_the_owners_start_wakes_a_stopped_agent(profile_roots) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    profiles.set_profile_stopped_by_user("writer", True)
+    host = ProfileHost()
+    started: list[str] = []
+    host._start_runtime = _starts_into(host, started)  # type: ignore[method-assign]
 
-    monkeypatch.setenv("FLOWLY_SERVICE_OWNER", owner)
+    # A read, a delegated task and a group message all find it stopped.
+    for attempt in (
+        host.dispatch("profiles.rpc", {"name": "writer", "method": "sessions.list", "params": {}}),
+        host._ensure_runtime("writer"),
+        host._prepare_room_member("writer"),
+    ):
+        with pytest.raises(ProfileHostError) as raised:
+            await attempt
+        assert raised.value.code == "PROFILE_STOPPED"
+    assert started == []
+    assert profiles.describe_profile("writer").stopped_by_user is True
 
-    assert _starts_own_agents() is expected
+    # The owner's own start runs it and ends the stop.
+    await host.dispatch("profiles.connect", {"name": "writer"})
+    assert started == ["writer"]
+    assert profiles.describe_profile("writer").stopped_by_user is False
 
 
-def test_the_gateway_passes_the_decision_to_its_agent_host(profile_roots) -> None:
-    starts = GatewayServer(enable_profile_host=True, autostart_profiles=True)
+def test_the_gateway_keeps_its_agents_only_when_told(profile_roots) -> None:
+    keeps = GatewayServer(enable_profile_host=True, autostart_profiles=True)
     leaves = GatewayServer(enable_profile_host=True)
 
-    assert starts.profile_host is not None and leaves.profile_host is not None
-    assert starts.profile_host.capabilities()["runtimePolicy"]["autostart"] is True
+    assert keeps.profile_host is not None and leaves.profile_host is not None
+    assert keeps.profile_host.capabilities()["runtimePolicy"]["autostart"] is True
     assert leaves.profile_host.capabilities()["runtimePolicy"]["autostart"] is False
+
+
+@pytest.mark.parametrize(
+    ("peer", "local"),
+    [
+        (("127.0.0.1", 5000), True),
+        (("::1", 5000, 0, 0), True),
+        (("::ffff:127.0.0.1", 5000, 0, 0), True),
+        (("192.168.1.22", 5000), False),
+        (("10.0.0.5", 5000), False),
+        (None, False),
+    ],
+)
+def test_only_this_machine_can_claim_its_agents(peer, local: bool) -> None:
+    from flowly.gateway.server import _loopback_peer
+
+    request = SimpleNamespace(transport=SimpleNamespace(get_extra_info=lambda key: peer))
+
+    assert _loopback_peer(request) is local
+    assert _loopback_peer(None) is False
+
+
+async def _until(condition) -> None:
+    while not condition():
+        await asyncio.sleep(0.005)
 
 
 @pytest.mark.asyncio

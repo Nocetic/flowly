@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import inspect
+import ipaddress
 import json
 import mimetypes
 import secrets
@@ -259,6 +260,19 @@ _PROFILE_CLIENT_SUBSCRIPTION_LIMIT = 128
 _PROFILE_PROFILES_PER_CLIENT_LIMIT = 64
 _PROFILE_CONVERSATIONS_PER_CLIENT_LIMIT = 256
 _PROFILE_RUN_SUBSCRIPTION_LIMIT = 2048
+
+
+def _loopback_peer(request: Any) -> bool:
+    """Whether the request comes from this machine (not merely over TLS)."""
+    transport = getattr(request, "transport", None)
+    peer = transport.get_extra_info("peername") if transport else None
+    try:
+        address = ipaddress.ip_address(peer[0])
+    except (TypeError, ValueError, IndexError):
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.is_loopback
 
 
 def _valid_profile_id(value: str) -> bool:
@@ -1854,6 +1868,16 @@ class GatewayServer:
                 rpc_id,
                 "PROFILE_HOST_UNAVAILABLE",
                 "This gateway does not manage isolated bot profiles.",
+            )
+            return
+        if method == "profiles.manager.claim" and not _loopback_peer(getattr(ws, "_req", None)):
+            # Only the Desktop on the agents' own machine runs them. A remote
+            # app claiming them would leave nobody running them.
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "PROFILE_MANAGER_LOCAL_ONLY",
+                "Only Flowly Desktop on this machine can manage its agents.",
             )
             return
         self._bind_profile_client_request(client_id, method, params)
@@ -5812,7 +5836,7 @@ class GatewayServer:
                 logger.debug("MCP control advertise failed: {}", exc)
         notable("gateway.started", address=f"http://{self.host}:{self.port}")
         if self._profile_host is not None:
-            self._profile_host.start_autostart()
+            self._profile_host.start_keeping_agents()
         if self.on_chat_message:
             logger.info(f"Desktop WebSocket available at ws://{self.host}:{self.port}/ws")
 

@@ -70,6 +70,15 @@ _START_TIMEOUT_SECONDS = 90
 _STOP_TIMEOUT_SECONDS = 8
 _DELETE_CONFIRM_TTL_SECONDS = 60
 _DELETE_CONFIRM_MAX = 128
+# Keeping the agents running. Flowly Desktop manages its machine's agents (it
+# runs them in its sandbox) and says so by renewing a short claim; without a
+# current claim this host keeps them itself. The grace gives a Desktop that is
+# open time to claim before the host starts anything.
+_KEEPER_STARTUP_GRACE_SECONDS = 10.0
+_KEEPER_INTERVAL_SECONDS = 30.0
+_KEEPER_RETRY_MAX_SECONDS = 600.0
+_MANAGER_CLAIM_MIN_MS = 10_000
+_MANAGER_CLAIM_MAX_MS = 300_000
 # A runtime that answers ``sessions.attention`` advertises this.
 _ATTENTION_CAPABILITY = "session-attention-v1"
 # Events after which what a bot waits on may have changed. A chat terminal is
@@ -327,12 +336,14 @@ class ProfileHost:
         autostart: bool = False,
     ):
         self.host_id = get_or_create_profile_host_id()
-        # Whether this host starts the owner's agents when it comes up. Only
-        # the manager that owns the gateway does it, so a machine never has
-        # two managers racing to start the same agent: Flowly Desktop owns
-        # (and sandboxes) the agents of the gateway it runs.
+        # Whether this host keeps the owner's agents running: it starts them
+        # when it comes up and brings back any that stop on their own, unless
+        # Flowly Desktop currently claims them (``profiles.manager.claim``).
         self._autostart = autostart
-        self._autostart_task: asyncio.Task[None] | None = None
+        self._keeper_task: asyncio.Task[None] | None = None
+        self._manager_claim_until = 0.0
+        # name -> (reason last reported, monotonic time of the next try, delay)
+        self._keeper_failures: dict[str, tuple[str, float, float]] = {}
         self._event_subscribers: dict[str, ProfileEventCallback] = {}
         if on_event is not None:
             self._event_subscribers["owner"] = on_event
@@ -373,7 +384,7 @@ class ProfileHost:
 
         self._rooms = ProfileRoomService(
             target_rpc=self._target_rpc,
-            target_prepare=self.connect,
+            target_prepare=self._prepare_room_member,
             profile_directory=lambda: [profile.name for profile in list_profiles()],
             # The names their owner reads, so a group's members address each
             # other the way the person watching them does.
@@ -427,6 +438,7 @@ class ProfileHost:
                 "profiles.statuses",
                 "profiles.connect",
                 "profiles.stop",
+                "profiles.manager.claim",
                 "profiles.rpc",
                 "profiles.cron.notify",
                 *self._rooms.methods,
@@ -449,12 +461,15 @@ class ProfileHost:
                 "sharedCredentialBroker": False,
             },
             # An agent runs until its owner stops it: it is never stopped for
-            # being idle or to make room, and an owner's stop survives restarts.
+            # being idle or to make room, and an owner's stop survives restarts
+            # (only profiles.connect starts a stopped agent again). Agents run
+            # alongside this host and stop with it.
             "runtimePolicy": {
                 "strategy": "always-on",
                 "queuesWhileBusy": True,
                 "idleEviction": False,
                 "autostart": self._autostart,
+                "managerClaim": True,
                 "stickyStop": True,
             },
             "roomModes": room_capabilities["modes"],
@@ -558,6 +573,8 @@ class ProfileHost:
             return await self.statuses()
         if method == "profiles.connect":
             return await self.connect(_required_string(params, "name").strip())
+        if method == "profiles.manager.claim":
+            return self.claim_management(params.get("ttlMs") if isinstance(params, dict) else None)
         if method == "profiles.stop":
             return await self.stop(_required_string(params, "name").strip(), by_user=True)
         if method == "profiles.cron.notify":
@@ -811,8 +828,35 @@ class ProfileHost:
                     retryable=True,
                 )
         else:
+            # The owner's own start: the one way a stopped agent runs again.
+            await self._ensure_runtime(name, explicit=True)
+        return {"status": self.status(name)}
+
+    async def _prepare_room_member(self, name: str) -> dict[str, Any]:
+        """Ready a group member without overriding its owner's stop."""
+        _validate_profile_selector(name)
+        if name != "default":
             await self._ensure_runtime(name)
         return {"status": self.status(name)}
+
+    def claim_management(self, ttl_ms: Any) -> dict[str, Any]:
+        """Flowly Desktop manages this machine's agents for the next ``ttl_ms``.
+
+        Desktop runs its agents in its own sandbox, so while its claim is
+        current this host leaves starting them to it. Desktop renews the claim
+        while it is connected; once it lapses (Desktop quit, or lost the
+        gateway) this host keeps the agents running itself.
+        """
+        try:
+            ttl = int(ttl_ms)
+        except (TypeError, ValueError):
+            raise ProfileHostError("INVALID_PARAMS", "ttlMs must be a number of milliseconds.") from None
+        ttl = max(_MANAGER_CLAIM_MIN_MS, min(ttl, _MANAGER_CLAIM_MAX_MS))
+        self._manager_claim_until = time.monotonic() + ttl / 1000
+        return {"ok": True, "ttlMs": ttl}
+
+    def _desktop_manages_agents(self) -> bool:
+        return time.monotonic() < self._manager_claim_until
 
     async def stop(self, name: str, *, by_user: bool = False) -> dict[str, Any]:
         """Stop an agent's runtime.
@@ -1469,34 +1513,55 @@ class ProfileHost:
             "toolTrace": [dict(item) for item in audit.get("toolTrace", [])],
         }
 
-    def start_autostart(self) -> None:
-        """Start, in the background, every agent its owner has not stopped.
+    def start_keeping_agents(self) -> None:
+        """Keep the owner's agents running while this host runs.
 
-        Called once the gateway is serving. Does nothing on a host that does
-        not own its agents' lifecycle (see ``autostart``).
+        Called once the gateway is serving. After a short grace (time for an
+        open Desktop to claim them), and then every so often, it starts every
+        agent its owner has not stopped that is not running: on boot, after
+        a crash, or once Desktop has quit. Does nothing on a host that does
+        not keep agents (see ``autostart``).
         """
-        if not self._autostart or self._closed or self._autostart_task is not None:
+        if not self._autostart or self._closed or self._keeper_task is not None:
             return
-        self._autostart_task = asyncio.create_task(self._autostart_agents(), name="profile-autostart")
-        self._background_tasks.add(self._autostart_task)
-        self._autostart_task.add_done_callback(self._background_tasks.discard)
+        self._keeper_task = asyncio.create_task(self._keep_agents(), name="profile-keeper")
+        self._background_tasks.add(self._keeper_task)
+        self._keeper_task.add_done_callback(self._background_tasks.discard)
 
-    async def _autostart_agents(self) -> None:
+    async def _keep_agents(self) -> None:
+        await asyncio.sleep(_KEEPER_STARTUP_GRACE_SECONDS)
+        while not self._closed:
+            if not self._desktop_manages_agents():
+                await self._start_wanted_agents()
+            await asyncio.sleep(_KEEPER_INTERVAL_SECONDS)
+
+    async def _start_wanted_agents(self) -> None:
+        """One pass: start every agent that should run and does not."""
         try:
             profiles = await asyncio.to_thread(list_profiles)
         except Exception as exc:  # noqa: BLE001 — an unreadable directory must not stop the gateway
-            notable("agents.autostart_failed", reason=f"{type(exc).__name__}: {exc}")
+            self._report_keeper_failure("", f"{type(exc).__name__}: {exc}")
             return
+        self._keeper_failures.pop("", None)
         wanted = [
             profile.name for profile in profiles
             if not profile.is_default and profile.has_config and not profile.stopped_by_user
         ]
+        # Forget agents that were deleted or stopped by their owner.
+        for name in list(self._keeper_failures):
+            if name and name not in wanted:
+                self._keeper_failures.pop(name, None)
         started = 0
         # One at a time: each start spawns a process and loads a model client,
         # and a host coming up with every agent at once would stall itself.
         for name in wanted:
-            if self._closed:
+            if self._closed or self._desktop_manages_agents():
                 return
+            if self._runtime_is_open(self._runtimes.get(name)) or name in self._starting:
+                continue
+            failure = self._keeper_failures.get(name)
+            if failure is not None and time.monotonic() < failure[1]:
+                continue
             try:
                 # The owner may have stopped (or deleted) it while the agents
                 # before it were starting; their word wins over this list.
@@ -1508,11 +1573,29 @@ class ProfileHost:
             except FileNotFoundError:
                 continue  # deleted meanwhile: nothing to start, nothing wrong
             except Exception as exc:  # noqa: BLE001 — one agent must not keep the others down
-                notable("agent.start_failed", name=name, reason=_autostart_reason(exc))
+                self._report_keeper_failure(name, _autostart_reason(exc))
                 continue
+            self._keeper_failures.pop(name, None)
             started += 1
         if started:
             notable("agents.started", count=started)
+
+    def _report_keeper_failure(self, name: str, reason: str) -> None:
+        """Record a failed start and back off; log it only when it changes.
+
+        An agent that cannot start (a missing key, say) would otherwise write
+        the same problem into the log every pass. It is retried less and less
+        often, and reported again only if the reason changes.
+        """
+        previous = self._keeper_failures.get(name)
+        delay = _KEEPER_INTERVAL_SECONDS if previous is None else min(previous[2] * 2, _KEEPER_RETRY_MAX_SECONDS)
+        self._keeper_failures[name] = (reason, time.monotonic() + delay, delay)
+        if previous is not None and previous[0] == reason:
+            return
+        if name:
+            notable("agent.start_failed", name=name, reason=reason)
+        else:
+            notable("agents.autostart_failed", reason=reason)
 
     async def shutdown(self) -> None:
         if self._closed:
@@ -1553,7 +1636,13 @@ class ProfileHost:
             self._locks[name] = lock
         return lock
 
-    async def _ensure_runtime(self, name: str) -> _Runtime:
+    async def _ensure_runtime(self, name: str, *, explicit: bool = False) -> _Runtime:
+        """The agent's runtime: the open one, an attach to a live one, or a start.
+
+        Only an ``explicit`` start (the owner's own) runs an agent its owner
+        stopped. Anything else (a read, a delegated task, a group message, the
+        keeper) gets PROFILE_STOPPED instead, so a stop stays a stop.
+        """
         if self._closed:
             raise ProfileHostError("HOST_STOPPED", "The profile host is shutting down.")
         _validate_named_profile(name)
@@ -1579,6 +1668,11 @@ class ProfileHost:
                 if pending is not None:
                     break
                 lease = reconcile_runtime_lease(profile.path, profile_name=name)
+                if lease is None and profile.stopped_by_user and not explicit:
+                    raise ProfileHostError(
+                        "PROFILE_STOPPED",
+                        "This agent is stopped. Start it to use it.",
+                    )
                 pending = asyncio.create_task(
                     self._attach_runtime(name, lease)
                     if lease
@@ -1592,8 +1686,8 @@ class ProfileHost:
         finally:
             if self._starting.get(name) is pending:
                 self._starting.pop(name, None)
-        if profile.stopped_by_user:
-            # Started again, by whoever asked: the owner's stop is over.
+        if explicit and profile.stopped_by_user:
+            # The owner started it again: their stop is over.
             await asyncio.to_thread(set_profile_stopped_by_user, name, False)
         return runtime
 

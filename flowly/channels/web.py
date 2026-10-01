@@ -744,6 +744,20 @@ class WebChannel(BaseChannel):
                 },
             }))
             return
+        if method == "profiles.manager.claim":
+            # Only the Desktop on the agent's own machine runs its agents; a
+            # phone or a remote app must not tell the host to stop keeping them.
+            await ws.send(json.dumps({
+                "type": "rpc",
+                "id": rpc_id,
+                "sessionId": session_id,
+                "error": {
+                    "code": "PROFILE_MANAGER_LOCAL_ONLY",
+                    "message": "Only Flowly Desktop on this machine can manage its agents.",
+                    "retryable": False,
+                },
+            }))
+            return
 
         self._bind_profile_directory(session_id)
         if method in PROFILE_ROOM_METHODS:
