@@ -31,6 +31,11 @@ Flowly is a full agent, not just a chat box. These features work together across
 
 - **[Plan mode](plan-mode.md)** — a standing mode where the agent proposes a plan and waits for your approval before it changes anything. `Shift+Tab` to it, or `/plan`.
 
+## Oversight
+
+- **[Activity](activity.md)** — the work your agent did, one task per piece of work, titled and summarized by its own model; open any step to see exactly what the tool was given and returned. Conversation never lands here.
+- **[Audit log](audit-log.md)** — the forensic record of every model and tool call, as daily JSON lines on your machine.
+
 ## Interfaces
 
 - **[Voice](voice.md)** — phone calls over Twilio with speech-to-text and text-to-speech.

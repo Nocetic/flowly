@@ -2,6 +2,7 @@
 title: Audit Log
 eyebrow: Features
 description: A local, append-only record of what the agent did — every run and tool call — on disk as daily JSON lines you fully own.
+group: Oversight
 ---
 
 Flowly keeps a plain, append-only **audit log** of what the agent actually did:
