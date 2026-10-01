@@ -156,29 +156,33 @@ def _title(task: _Task) -> str:
     return routine.strip() if isinstance(routine, str) else ""
 
 
-def _steps(task: _Task) -> list[dict[str, Any]]:
-    return [step for turn in task.turns for step in turn.get("steps") or [] if isinstance(step, dict)]
+def _steps(task: _Task, live_steps: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [step for turn in task.turns for step in _turn_steps(turn, live_steps)]
 
 
-def _kind(task: _Task) -> str:
+def _kind(task: _Task, live_steps: dict[str, list[dict[str, Any]]]) -> str:
     """The task's icon: a routine or a goal says so; otherwise the most
     consequential kind of work it did (``steps.TASK_KINDS``)."""
     trigger = _trigger_kind(task.first)
     if trigger in BACKGROUND_TRIGGERS:
         return trigger
-    found = {task_kind_of(step) for step in _steps(task)}
+    found = {task_kind_of(step) for step in _steps(task, live_steps)}
     return next((kind for kind in TASK_KINDS if kind in found), "general")
 
 
-def _latest_step(task: _Task, live_steps: dict[str, dict[str, Any]]) -> dict[str, str] | None:
+def _turn_steps(turn: dict[str, Any], live_steps: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """A turn's steps: from the journal once it ended, live from the recorder while it runs."""
+    if not turn.get("ended") and turn["id"] in live_steps:
+        return live_steps[turn["id"]]
+    return [step for step in turn.get("steps") or [] if isinstance(step, dict)]
+
+
+def _latest_step(task: _Task, live_steps: dict[str, list[dict[str, Any]]]) -> dict[str, str] | None:
     """What it is doing now, if it runs; else the last thing it did."""
     for turn in reversed(task.turns):
-        step = live_steps.get(turn["id"])
-        if step is None:
-            recorded = [step for step in turn.get("steps") or [] if isinstance(step, dict)]
-            step = recorded[-1] if recorded else None
-        if step is not None:
-            return {key: str(step.get(key) or "") for key in _STEP_FIELDS}
+        steps = _turn_steps(turn, live_steps)
+        if steps:
+            return {key: str(steps[-1].get(key) or "") for key in _STEP_FIELDS}
     return None
 
 
@@ -192,7 +196,7 @@ def _ended_at(task: _Task) -> int | None:
 
 
 def _summary(task: _Task, status: str, seen_before: int,
-             live_steps: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+             live_steps: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
     stamp = task.last.get("endedAt") or task.last.get("startedAt") or 0
     titled = next((turn.get("conversationTitle") for turn in reversed(task.turns)
                    if turn.get("conversationTitle")), "")
@@ -202,7 +206,7 @@ def _summary(task: _Task, status: str, seen_before: int,
         "outcome": task.recap.get("outcome", ""),
         "status": status,
         "trigger": task.first.get("trigger") or {},
-        "kind": _kind(task),
+        "kind": _kind(task, live_steps or {}),
         "startedAt": task.started_at,
         "endedAt": _ended_at(task),
         "sessionKey": task.first.get("sessionKey", ""),
@@ -236,7 +240,7 @@ def list_tasks(
     visible: Callable[[str], bool],
     running_ids: set[str],
     waiting_keys: set[str],
-    live_steps: dict[str, dict[str, Any]] | None = None,
+    live_steps: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Newest first, by when each task started; ``before`` pages back from that."""
     tasks, _owner_of, seen_before = _tasks()
@@ -258,7 +262,7 @@ def get_task(
     visible: Callable[[str], bool],
     running_ids: set[str],
     waiting_keys: set[str],
-    live_steps: dict[str, dict[str, Any]] | None = None,
+    live_steps: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any] | None:
     """One task in full. A turn's id finds the task it became part of."""
     tasks, owner_of, seen_before = _tasks()
@@ -266,6 +270,7 @@ def get_task(
     if task is None or not visible(str(task.first.get("sessionKey") or "")):
         return None
     status = _status(task, running_ids, waiting_keys)
+    live = live_steps or {}
     steps: list[dict[str, Any]] = []
     for turn in task.turns:
         recap = turn.get("recap") if isinstance(turn.get("recap"), dict) else {}
@@ -275,7 +280,7 @@ def get_task(
             {**{key: step.get(key) for key in ("tool", "kind", "target", "ok", "durationMs")},
              "blocked": bool(step.get("blocked")),
              **({"note": notes[index]} if index in notes else {})}
-            for index, step in enumerate(turn.get("steps") or []) if isinstance(step, dict)
+            for index, step in enumerate(_turn_steps(turn, live))
         )
     failed = task.last if task.last.get("error") else {}
     active = [turn.get("activeMs") for turn in task.turns if isinstance(turn.get("activeMs"), int)]

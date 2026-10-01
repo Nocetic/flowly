@@ -185,10 +185,13 @@ class ActivityRecorder:
         with self._lock:
             return {task.id for task in self._active.values() if task.working}
 
-    def live_steps(self) -> dict[str, dict[str, Any]]:
-        """``{turn id: its latest step}`` for work running now: what it is doing."""
+    def live_steps(self) -> dict[str, list[dict[str, Any]]]:
+        """``{turn id: its steps so far}`` for work running now.
+
+        A turn's steps reach the disk only when it ends; until then this is how
+        a reader sees what a running task has done and is doing."""
         with self._lock:
-            return {task.id: dict(task.steps[-1]) for task in self._active.values()
+            return {task.id: [dict(step) for step in task.steps] for task in self._active.values()
                     if task.working and task.steps}
 
     def end(

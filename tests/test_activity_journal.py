@@ -918,3 +918,20 @@ def test_the_list_rpc_says_what_running_work_is_doing(home, clock):
         assert activity_get({"id": "live"})["task"]["latestStep"]["target"] == "plan.md"
     finally:
         rec.end(task, outcome="completed")
+
+
+def test_a_running_tasks_detail_shows_its_steps_so_far_and_its_kind(home, clock):
+    rec = ActivityRecorder()
+    rec.begin(session_key="desktop:c", task_id="r", trigger={"kind": "owner"}, request="find flights")
+    rec.note_tool("desktop:c", "web_search", {"query": "Rome flights"}, ok=True, duration_ms=900)
+    rec.note_tool("desktop:c", "web_fetch", {"url": "https://fares.example.com"}, ok=False, duration_ms=40)
+    now = dict(running_ids=rec.active_ids(), waiting_keys=set(), live_steps=rec.live_steps())
+
+    detail = journal.get_task("r", visible=lambda _k: True, **now)
+    # Steps reach the disk only when the turn ends; the detail reads them live.
+    assert [(step["tool"], step["ok"]) for step in detail["steps"]] == [("web_search", True), ("web_fetch", False)]
+    assert (detail["status"], detail["kind"]) == ("running", "research")
+    assert journal.list_tasks(limit=5, before=None, visible=lambda _k: True, **now)["items"][0]["kind"] == "research"
+    # The recorder hands out copies: a reader cannot change a running task.
+    rec.live_steps()["r"][0]["tool"] = "tampered"
+    assert rec.live_steps()["r"][0]["tool"] == "web_search"
