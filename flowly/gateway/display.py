@@ -108,7 +108,7 @@ class DisplaySession:
                                     and state.get("observerServiceVersion") == 3),
                 "lifecycle": capability["supported"], "lifecycleVersion": 1, "installSupported": True, "installRestartVersion": 1,
                 "statusEvents": True, "resumeSupported": True,
-                "browserGrantVersion": 2, "doctorVersion": 1, "installPlanVersion": 1}
+                "doctorVersion": 1, "installPlanVersion": 1}
 
     @property
     def viewers(self) -> ViewerCredentials:

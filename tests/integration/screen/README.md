@@ -829,3 +829,33 @@ reopen from the launcher, reconnect the provider, preserve a persistent cookie,
 then stop normally. Root-account runtime regressions also pass. This does not
 certify browser crashes during an in-flight agent action, arbitrary terminal
 child-process cleanup, resource limits, or packaged-client behavior.
+
+
+## Running screen is the agent's browser (2026-10-01)
+
+Supersedes the per-message browser grants described above (`browserAccess`
+`host-desktop-browser`, `browserGrantVersion`, the Desktop composer selector).
+A bot uses the browser of the machine it runs on. When a profile's screen is
+running on this host, every agent run of that profile uses its browser: direct
+gateway, relay, channels and routines alike. Nothing selects it per message, and
+a client that names a browser for a remote bot is refused as before the screen
+work (`REMOTE_HOST_ACCESS_DENIED` through the profile broker; an unknown provider
+on the direct gateway). When the screen is stopped, the run keeps the previous
+behaviour (the Desktop's own browser over its connection, where one is offered).
+
+`AgentLoop._process_message` scopes every run (`host_screen_run_scope`). The
+scope claims nothing: the screen is claimed for the run at its first browser
+action and released when the run ends, so a conversation that never browses does
+not contend with one that does. The decision is made once per run; a run that
+started without the screen does not switch to it mid-task. Nested runs get their
+own scope. A person holding control refuses the first claim with
+`HUMAN_HAS_CONTROL` and a message the model can relay; the explicit-resume
+guarantee applies from the run's first browser action.
+
+Verified: unit tests for the scope (relay turn, routine without a run id, nested
+run, cancellation keeping human control, typed screen errors, non-Linux hosts),
+the gateway routing tests, the real Xvnc/Chromium gateway handoff test, and a
+headless relay E2E in which a relay chat with no browser field claims the
+running screen, pauses for the person and releases on Stop. The same E2E fails
+with the scope disabled. The Desktop GUI smoke was updated (no selector; first
+read, takeover, explicit resume) but has not been re-run in this change.

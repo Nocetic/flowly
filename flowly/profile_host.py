@@ -929,8 +929,7 @@ class ProfileHost:
             # Old runtimes ignore the additive parameter and keep legacy events.
             safe["eventVersion"] = 2
         guarded = expected_host_id is not None or expected_bot_id is not None
-        screen_grant = safe.get("browserAccess")
-        if (method.startswith(("mcp.", "gmail.", "memory.editor.")) or screen_grant is not None) and not guarded:
+        if method.startswith(("mcp.", "gmail.", "memory.editor.")) and not guarded:
             raise ProfileHostError("INVALID_PARAMS", "This operation requires the selected profile identities.")
         if guarded:
             if not isinstance(expected_host_id, str) or not expected_host_id or not isinstance(expected_bot_id, str) or not expected_bot_id:
@@ -939,13 +938,6 @@ class ProfileHost:
                 raise ProfileHostError("PROFILE_IDENTITY_CHANGED", "The selected host identity changed.")
             self._check_rpc_profile_identity(name, expected_bot_id)
             safe['expectedBotId'] = expected_bot_id
-        if screen_grant is not None and (
-            screen_grant["hostId"] != self.host_id or screen_grant["profileId"] != name
-            or screen_grant["botId"] != expected_bot_id
-        ):
-            raise ProfileHostError(
-                "PROFILE_IDENTITY_CHANGED", "The screen does not belong to the selected profile.",
-            )
         if method == "chat.send":
             directory = [profile.name for profile in list_profiles()]
             mentions = safe.get("profileMentions")

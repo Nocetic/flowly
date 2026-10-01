@@ -27,8 +27,6 @@ from flowly.agent.subagent_observation import client_event, event_version
 from flowly.artifacts.summary import artifact_summary
 from flowly.browser_annotations import append_browser_annotation_context
 from flowly.channels import feature_rpc
-from flowly.desktop_runtime.authority import ScreenError as ScreenRunError
-from flowly.desktop_runtime.context import SCREEN_RUN_BINDING, ScreenRunBinding
 from flowly.gateway.auth import (
     MediaTicketStore,
     WsTicketStore,
@@ -214,8 +212,6 @@ class _BrowserRunBinding:
     client_id: str
     provider_id: str | None = None
     registration_id: str | None = None
-    screen_generation: str | None = None
-    screen_bot_id: str | None = None
 
 
 _BROWSER_RUN_BINDING: ContextVar[_BrowserRunBinding | None] = ContextVar(
@@ -3582,26 +3578,9 @@ class GatewayServer:
             )
 
         binding_token = _BROWSER_RUN_BINDING.set(browser_binding)
-        screen_binding = None
-        if browser_binding is not None and browser_binding.screen_generation is not None:
-            _, provider = self._get_host_screen_browser()
-            screen_binding = ScreenRunBinding(provider, browser_binding.screen_generation, run_id)
-        screen_token = SCREEN_RUN_BINDING.set(screen_binding)
-        screen_checkpoint = None
-        screen_finished = False
         profile_binding = None
         profile_binding_token = _PROFILE_RUN_BINDING.set(None)
         try:
-            if screen_binding is not None:
-                from flowly.desktop_runtime.run_checkpoint import ScreenRunCheckpoint
-
-                identity = self._host_screen_checkpoint_identity()
-                if identity["botId"] != browser_binding.screen_bot_id:
-                    raise ScreenRunError("PROFILE_IDENTITY_CHANGED")
-                screen_checkpoint = await ScreenRunCheckpoint.start(screen_binding.provider, identity,
-                    session_key, run_id, screen_binding.generation)
-                screen_binding = ScreenRunBinding(screen_binding.provider, screen_binding.generation, run_id, screen_checkpoint)
-                SCREEN_RUN_BINDING.set(screen_binding)
             host = getattr(self, "_profile_host", None)
             if host is not None:
                 profile_binding = host.collaboration_binding(
@@ -3802,7 +3781,6 @@ class GatewayServer:
                     goal_snapshot,
                     fallback_ws=ws,
                 )
-            screen_finished = not final_data.get("aborted") and not provider_error
             await self._notify_chat_delivered(session_key, response, metadata or {})
             if not final_data.get("aborted"):
                 self._schedule_offline_chat_push(
@@ -3822,14 +3800,6 @@ class GatewayServer:
                     "data": {"state": "aborted", "runId": run_id, "sessionKey": session_key},
                 },
             )
-        except ScreenRunError as exc:
-            code = exc.code if exc.code in {"SCREEN_BUSY", "HUMAN_HAS_CONTROL", "STALE_GENERATION",
-                "PROFILE_IDENTITY_CHANGED", "HANDOFF_RECOVERY_REQUIRED", "HANDOFF_STATE_INVALID", "RUN_CHANGED"} else "CONTROL_UNAVAILABLE"
-            await self._session_send(session_key, ws, {"type": "event", "event": "chat", "data": {
-                "state": "error", "runId": run_id, "sessionKey": session_key, "errorCode": code,
-                "errorTitle": "The screen task needs attention",
-                "errorMessage": "Check this profile's screen before continuing the task.", "retryable": False,
-            }})
         except Exception as e:
             # Unexpected exceptions are logged with their native detail for
             # operators, but the gateway wire contract never exposes reprs,
@@ -3854,15 +3824,6 @@ class GatewayServer:
                 },
             )
         finally:
-            try:
-                if screen_checkpoint is not None:
-                    await screen_checkpoint.finish(cancelled=not screen_finished)
-            except (Exception, asyncio.CancelledError):
-                # A failed/unknown browser outcome deliberately retains its
-                # durable fence; do not log browser payloads during cleanup.
-                logger.warning("[Screen] run cleanup requires runtime recovery")
-            finally:
-                SCREEN_RUN_BINDING.reset(screen_token)
             if profile_binding is not None:
                 profile_binding.close()
             _PROFILE_RUN_BINDING.reset(profile_binding_token)
@@ -4393,7 +4354,9 @@ class GatewayServer:
         return {"hostId": identity["hostId"], "profileId": identity["profileId"], "botId": bot_id}
 
     def validate_browser_tool_result(self, result: dict) -> bool:
-        binding = SCREEN_RUN_BINDING.get()
+        from flowly.desktop_runtime.host_screen_run import bound_screen_run
+
+        binding = bound_screen_run()
         if binding is None:
             return "_screenObservation" not in result
         return binding.provider.observation_valid(result)
@@ -4421,18 +4384,6 @@ class GatewayServer:
             }
 
         provider_id = raw_access.get("providerId")
-        if provider_id == "host-desktop-browser":
-            from flowly.desktop_runtime.authority import ScreenError
-            from flowly.desktop_runtime.grants import resolve_host_browser_grant
-
-            if self._ws_clients.get(client_id) is not ws or ws.closed:
-                return denied, {"code": "BROWSER_ACCESS_NOT_GRANTED", "message": "The calling connection is no longer active"}
-            try:
-                grant, identity, _ = resolve_host_browser_grant(self, raw_access)
-            except ScreenError as exc:
-                return denied, {"code": exc.code, "message": "The selected screen browser is unavailable."}
-            return _BrowserRunBinding(client_id=client_id, provider_id=provider_id,
-                                      screen_generation=grant["generation"], screen_bot_id=identity["botId"]), None
         registration_id = raw_access.get("registrationId")
         if not isinstance(provider_id, str) or not provider_id:
             return denied, {
@@ -4701,11 +4652,13 @@ class GatewayServer:
 
     def has_browser_provider(self, provider_id: str | None = None) -> bool:
         """Return whether the selected (or requested) browser provider is live."""
+        from flowly.desktop_runtime.host_screen_run import current_screen_run
+
+        screen_run = current_screen_run()
+        if screen_run is not None and screen_run.uses_screen():
+            # The bot's own running screen is its browser, whatever the client offered.
+            return provider_id in (None, "host-desktop-browser")
         binding = _BROWSER_RUN_BINDING.get()
-        screen = SCREEN_RUN_BINDING.get()
-        if binding is not None and binding.screen_generation is not None:
-            return (screen is not None and screen.generation == binding.screen_generation
-                    and provider_id in (None, "host-desktop-browser"))
         if binding is not None:
             if not binding.provider_id:
                 return False
@@ -4741,13 +4694,21 @@ class GatewayServer:
         provider_id: str | None = None,
     ) -> dict:
         """Send a tool request to one provider and await only its result."""
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.host_screen_run import current_screen_run, unavailable
+
+        screen_run = current_screen_run()
+        if screen_run is not None:
+            try:
+                screen = await screen_run.bind()
+            except ScreenError as exc:
+                return unavailable(exc)
+            if screen is not None:
+                if provider_id not in (None, "host-desktop-browser"):
+                    return {"error": "The requested browser is outside this screen run",
+                            "error_code": "BROWSER_PROVIDER_NOT_OWNED"}
+                return await screen.provider.request(screen.run_id, request_id, screen.generation, action, params)
         binding = _BROWSER_RUN_BINDING.get()
-        screen = SCREEN_RUN_BINDING.get()
-        if binding is not None and binding.screen_generation is not None:
-            if (screen is None or screen.generation != binding.screen_generation
-                    or provider_id not in (None, "host-desktop-browser")):
-                return {"error": "Browser access is outside this screen run", "error_code": "BROWSER_ACCESS_NOT_GRANTED"}
-            return await screen.provider.request(screen.run_id, request_id, screen.generation, action, params)
         if binding is not None:
             if not binding.provider_id:
                 return {

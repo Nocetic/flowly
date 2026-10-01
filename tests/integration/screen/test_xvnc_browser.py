@@ -517,7 +517,7 @@ async def test_agent_provider_uses_human_browser_and_fences_old_references(tmp_p
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.environ.get("FLOWLY_SCREEN_GATEWAY_TEST") != "1", reason="requires full Core Linux runner")
-async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp_path, login_site, monkeypatch):
+async def test_authenticated_gateway_run_uses_the_running_screen_and_keeps_it_during_handoff(tmp_path, login_site, monkeypatch):
     import asyncio
 
     import aiohttp
@@ -530,6 +530,7 @@ async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp
     from flowly.bus.queue import MessageBus
     from flowly.config.schema import Config
     from flowly.desktop_runtime.browser_provider import HostBrowserProvider
+    from flowly.desktop_runtime.host_screen_run import host_screen_run_scope
     from flowly.gateway.server import GatewayServer
     from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
@@ -557,8 +558,6 @@ async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp
     gateway = GatewayServer(host="127.0.0.1", port=0, auth_token="test-gateway-token", require_loopback_auth=True)
     gateway._host_screen_browser = provider
     gateway._host_screen_identity = {"hostId": profiles.get_or_create_profile_host_id(), "profileId": "default", "screenId": "browser"}
-    access = {"botId": profiles.ensure_profile_bot_id("default").bot_id, **gateway._host_screen_identity, "providerId": "host-desktop-browser", "generation": generation}
-
     class LocalModel(LLMProvider):
         calls = 0
 
@@ -589,9 +588,15 @@ async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp
     loop.tools.register(BrowserTabTool(gateway))
 
     async def on_chat(*args):
-        result = await loop._run_llm_tool_loop(
-            [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Read the login result."}],
-            action_turn=False, session_key=args[0], outbound_run_id=args[2])
+        # Production enters this scope in AgentLoop._process_message; the
+        # running screen is the run's browser without any selection.
+        async with host_screen_run_scope(gateway, args[0], args[2]) as run:
+            # The task's first browser action claims the screen for this run.
+            assert (await gateway.send_browser_tool_request("open", "read_page", {}))["success"]
+            result = await loop._run_llm_tool_loop(
+                [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Read the login result."}],
+                action_turn=False, session_key=args[0], outbound_run_id=args[2])
+            run.succeeded = not loop.is_run_aborted(args[2])
         return result[0], {"aborted": loop.is_run_aborted(args[2])}
 
     gateway.on_chat_message = on_chat
@@ -629,7 +634,7 @@ async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp
                           "expectedBotId": status["botId"], "generation": generation}
                 viewer = await rpc("display.viewer.create", pinned)
                 started = await rpc("chat.send", {"sessionKey": "screen:test", "message": "work",
-                    "idempotencyKey": "origin-run", "browserAccess": access})
+                    "idempotencyKey": "origin-run"})
                 assert started["runId"] == "origin-run"
                 await asyncio.wait_for(model_started.wait(), 15)
                 controlled = {**pinned, "viewerToken": viewer["viewerToken"]}
@@ -649,7 +654,7 @@ async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp
                 assert status["handoff"]["originRunId"] == "origin-run"
                 await asyncio.sleep(0.3)
                 assert model.calls == 1
-                assert actions == []
+                assert actions == ["read_page"]
                 resumed = await rpc("display.run.resume", {**controlled, "epoch": released["control"]["epoch"],
                     "operationId": "continue-original", "handoffId": status["handoff"]["handoffId"]})
                 assert resumed["requested"] is True
@@ -660,7 +665,7 @@ async def test_authenticated_gateway_browser_run_keeps_target_during_handoff(tmp
                 assert final["data"]["runId"] == "origin-run"
                 assert "Signed in" in final["data"]["message"]["content"][0]["text"]
                 assert model.calls == 3
-                assert actions == ["read_page", "get_page_text"]
+                assert actions == ["read_page", "read_page", "get_page_text"]
     finally:
         return_model.set()
         await server.close()

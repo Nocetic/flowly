@@ -1,6 +1,5 @@
-"""Profile proxy grants stay pinned through validation and runtime startup."""
+"""A named bot's running screen is reached only through its own gateway, never selected."""
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,30 +14,20 @@ def grant(host_id="host", profile="writer", bot_id="bot"):
             "profileId": profile, "botId": bot_id, "screenId": "browser", "generation": "generation"}
 
 
-def message(access):
-    return {"sessionKey": "desktop:screen-task", "message": "Continue this browser task", "browserAccess": access}
+def message(access=None):
+    value = {"sessionKey": "desktop:screen-task", "message": "Continue this browser task"}
+    return value if access is None else {**value, "browserAccess": access}
 
 
+@pytest.mark.parametrize("method", ["chat.send", "chat.steer"])
 @pytest.mark.parametrize("access", [
-    "host-desktop-browser", {}, {"providerId": "local-browser", "registrationId": "lease"},
-    {**grant(), "cdpUrl": "http://localhost:9222"},
-    {**grant(), "registrationId": "lease"}, {**grant(), "screenId": "physical"},
-    {**grant(), "generation": None}, {**grant(), "generation": "x" * 257},
-    {**grant(), "hostId": "host\x7f"}, {**grant(), "profileId": " writer"},
+    grant(), "host-desktop-browser", {}, {"providerId": "local-browser", "registrationId": "lease"},
+    {**grant(), "cdpUrl": "http://localhost:9222"}, {**grant(), "registrationId": "lease"},
 ])
-def test_profile_contract_rejects_arbitrary_browser_access(access):
+def test_remote_messages_cannot_select_a_browser_on_the_bot_host(method, access):
+    # A bot's running screen is its browser; no message may name one.
     with pytest.raises(ProfileHostError) as error:
-        validate_profile_rpc("chat.send", message(access))
-    assert error.value.code == "REMOTE_HOST_ACCESS_DENIED"
-
-
-def test_profile_contract_copies_screen_grant_and_rejects_steering_rebind():
-    original = message(grant())
-    _, sanitized = validate_profile_rpc("chat.send", original)
-    sanitized["browserAccess"]["generation"] = "changed"
-    assert original["browserAccess"]["generation"] == "generation"
-    with pytest.raises(ProfileHostError) as error:
-        validate_profile_rpc("chat.steer", original)
+        validate_profile_rpc(method, message(access))
     assert error.value.code == "REMOTE_HOST_ACCESS_DENIED"
 
 
@@ -55,68 +44,8 @@ def screen_host(tmp_path, monkeypatch):
     return host, profiles.ensure_profile_bot_id("writer").bot_id
 
 
-async def test_screen_profile_requires_pinned_identities_before_starting_runtime(screen_host):
-    host, _ = screen_host
-    with pytest.raises(ProfileHostError) as error:
-        await host.rpc("writer", "chat.send", message(grant(host.host_id)))
-    assert error.value.code == "INVALID_PARAMS"
-    host._target_rpc.assert_not_awaited()
-
-
-@pytest.mark.parametrize("mismatch", ["host", "profile", "bot", "grant-bot", "expected-host"])
-async def test_screen_profile_rejects_target_drift_before_starting_runtime(screen_host, mismatch):
-    host, bot_id = screen_host
-    access = grant(host.host_id, bot_id=bot_id)
-    expected_host = host.host_id
-    if mismatch == "host":
-        access["hostId"] = "other"
-    elif mismatch == "profile":
-        access["profileId"] = "default"
-    elif mismatch == "grant-bot":
-        access["botId"] = "replacement"
-    elif mismatch == "bot":
-        bot_id = "deleted-and-recreated"
-    else:
-        expected_host = "other"
-    with pytest.raises(ProfileHostError) as error:
-        await host.rpc("writer", "chat.send", message(access),
-                       expected_host_id=expected_host, expected_bot_id=bot_id)
-    assert error.value.code == "PROFILE_IDENTITY_CHANGED"
-    host._target_rpc.assert_not_awaited()
-
-
-async def test_screen_profile_forwards_exact_grant_with_startup_identity_guard(screen_host):
-    host, bot_id = screen_host
-    access = grant(host.host_id, bot_id=bot_id)
-    assert await host.rpc("writer", "chat.send", message(access),
-                          expected_host_id=host.host_id, expected_bot_id=bot_id) == {"runId": "run"}
-    forwarded = host._target_rpc.await_args
-    assert forwarded.args[:2] == ("writer", "chat.send")
-    assert forwarded.args[2]["browserAccess"] == access
-    assert forwarded.kwargs == {"expected_bot_id": bot_id}
-
-
-async def test_screen_profile_rechecks_recreated_identity_after_runtime_start(screen_host, monkeypatch):
-    host, bot_id = screen_host
-    # Exercise the real second identity check across the runtime-start await.
-    del host._target_rpc
-    runtime = SimpleNamespace(active_runs=set())
-
-    async def start(_):
-        monkeypatch.setattr("flowly.profile_host._public_profile", lambda name: {"botId": "replacement"})
-        return runtime
-
-    host._ensure_runtime = start
-    host._rpc = AsyncMock()
-    with pytest.raises(ProfileHostError) as error:
-        await host.rpc("writer", "chat.send", message(grant(host.host_id, bot_id=bot_id)),
-                       expected_host_id=host.host_id, expected_bot_id=bot_id)
-    assert error.value.code == "PROFILE_IDENTITY_CHANGED"
-    host._rpc.assert_not_awaited()
-
-
 @pytest.mark.parametrize("target", ["default", "writer"])
-async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(screen_host, tmp_path, target, monkeypatch):
+async def test_authenticated_profile_proxy_reaches_only_its_own_running_screen(screen_host, tmp_path, target, monkeypatch):
     """Real authenticated sockets and RPC dispatch; only browser I/O is faked.
 
     Linux integration separately proves this provider operates real Chromium.
@@ -133,7 +62,7 @@ async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(scr
     from flowly.agent.tools.browser_tab import BrowserTabTool
     from flowly.desktop_runtime.authority import ScreenAuthority
     from flowly.desktop_runtime.browser_provider import HostBrowserProvider
-    from flowly.desktop_runtime.context import SCREEN_RUN_BINDING
+    from flowly.desktop_runtime.host_screen_run import bound_screen_run, host_screen_run_scope
     from flowly.gateway.server import GatewayServer
     from flowly.profile_host import _Runtime
 
@@ -158,9 +87,12 @@ async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(scr
     seen = []
     finished = asyncio.Event()
 
-    async def chat(*_):
-        seen.append(SCREEN_RUN_BINDING.get().run_id)
-        seen.append(json.loads(await BrowserTabTool(bound_gateway).execute("get_page_text")))
+    async def chat(*args):
+        # Production enters this scope in the bound runtime's AgentLoop._process_message.
+        async with host_screen_run_scope(bound_gateway, args[0], args[2]) as run:
+            page = json.loads(await BrowserTabTool(bound_gateway).execute("get_page_text"))
+            seen.extend([bound_screen_run().run_id, page])
+            run.succeeded = True
         finished.set()
         return "done", {}
 
@@ -197,11 +129,10 @@ async def test_authenticated_profile_proxy_reaches_only_bound_gateway_screen(scr
                             if frame.get("type") == "rpc" and frame.get("id") == request_id:
                                 return frame
 
-                access = grant(host.host_id, target, bot_id)
-                stale = await send({**access, "generation": "old-generation"}, "stale")
-                assert stale["error"]["code"] == "STALE_GENERATION"
+                selected = await send(grant(host.host_id, target, bot_id), "selected")
+                assert selected["error"]["code"] == "REMOTE_HOST_ACCESS_DENIED"
                 provider._dispatch.assert_not_awaited()
-                accepted = await send(access, "original-run")
+                accepted = await send(None, "original-run")
                 assert accepted["result"]["runId"] == "original-run"
                 await asyncio.wait_for(finished.wait(), 10)
                 assert seen[0] == "original-run"

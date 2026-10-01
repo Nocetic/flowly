@@ -10,6 +10,7 @@ from flowly.agent.loop import AgentLoop
 from flowly.bus.queue import MessageBus
 from flowly.config.schema import Config
 from flowly.desktop_runtime.handoff import RunHandoffs
+from flowly.desktop_runtime.host_screen_run import host_screen_run_scope
 from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from tests.test_screen_gateway_binding import screen_gateway as gateway_fixture
 
@@ -42,7 +43,7 @@ async def wait_state(store, state):
 
 @pytest.fixture
 async def live_run(screen_gateway, tmp_path, monkeypatch):
-    gateway, socket, browser, access = screen_gateway
+    gateway, socket, browser = screen_gateway
     monkeypatch.setenv("FLOWLY_HOME", str(tmp_path / "agent-home"))
     monkeypatch.setattr("flowly.desktop_runtime.run_checkpoint.ScreenRunCheckpoint.INTERVAL", 0.005)
     browser._dispatch.return_value = {"success": True, "elements": "ref_fresh button Continue"}
@@ -54,20 +55,22 @@ async def live_run(screen_gateway, tmp_path, monkeypatch):
     result = {}
 
     async def chat(*args):
-        result["loop"] = await loop._run_llm_tool_loop(
-            [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Continue."}],
-            action_turn=False, session_key=args[0], outbound_run_id=args[2], tools_allowed=False)
+        # Production enters this scope in AgentLoop._process_message.
+        async with host_screen_run_scope(gateway, args[0], args[2]) as run:
+            # The task's first browser action claims the running screen.
+            assert (await gateway.send_browser_tool_request("open", "get_page_text", {}))["success"]
+            result["loop"] = await loop._run_llm_tool_loop(
+                [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Continue."}],
+                action_turn=False, session_key=args[0], outbound_run_id=args[2], tools_allowed=False)
+            run.succeeded = not loop.is_run_aborted(args[2])
         return result["loop"][0], {"aborted": loop.is_run_aborted(args[2])}
 
     gateway.on_chat_message = chat
-    binding, error = gateway._browser_binding_for_chat("viewer", socket, access)
-    assert error is None
-    task = asyncio.create_task(gateway._run_chat(socket, "viewer", "original-chat", "work", "origin-run",
-                                               AsyncMock(), browser_binding=binding))
+    task = asyncio.create_task(gateway._run_chat(socket, "viewer", "original-chat", "work", "origin-run", AsyncMock()))
     store = RunHandoffs(browser.runtime.directory, authority)
     try:
         await wait_state(store, "waiting_human")
-        yield gateway, socket, browser, loop, model, store, task, result, binding
+        yield gateway, socket, browser, loop, model, store, task, result
     finally:
         if not task.done():
             task.cancel()
@@ -76,7 +79,7 @@ async def live_run(screen_gateway, tmp_path, monkeypatch):
 
 
 async def test_same_agent_loop_waits_for_explicit_resume_and_discards_old_model_actions(live_run):
-    _, _, browser, loop, model, store, task, result, _ = live_run
+    _, _, browser, loop, model, store, task, result = live_run
     authority = browser.runtime.authority
     assert len(model.calls) == 1
     held = authority.snapshot()
@@ -94,25 +97,27 @@ async def test_same_agent_loop_waits_for_explicit_resume_and_discards_old_model_
     assert "untrusted page content" in str(model.calls[1]["messages"])
     assert result["loop"][3]["completion_tokens"] == 30
     loop.tools.execute.assert_not_awaited()
-    browser._dispatch.assert_awaited_once_with("read_page", {})
+    assert [call.args for call in browser._dispatch.await_args_list] == [("get_page_text", {}), ("read_page", {})]
     assert store.status()["state"] == "finished"
     assert authority.snapshot()["runId"] is None
 
 
 async def test_stop_interrupts_the_wait_without_releasing_human_control(live_run):
-    _, _, browser, loop, model, store, task, _, _ = live_run
+    _, _, browser, loop, model, store, task, _ = live_run
     loop.mark_aborted("origin-run")
     await asyncio.wait_for(task, 5)
     assert len(model.calls) == 1
-    browser._dispatch.assert_not_awaited()
+    browser._dispatch.assert_awaited_once_with("get_page_text", {})
     assert store.status()["state"] == "cancelled"
     assert browser.runtime.authority.snapshot()["control"] == "human"
     assert browser.runtime.authority.snapshot()["runId"] is None
 
 
-async def test_another_chat_cannot_release_the_original_run_on_failed_admission(live_run):
-    gateway, socket, browser, loop, model, store, task, _, binding = live_run
-    await gateway._run_chat(socket, "viewer", "another-chat", "work", "another-run", AsyncMock(), browser_binding=binding)
+async def test_another_chat_cannot_release_the_original_run_on_a_refused_claim(live_run):
+    gateway, _, browser, loop, model, store, task, _ = live_run
+    async with host_screen_run_scope(gateway, "another-chat", "another-run"):
+        refused = await gateway.send_browser_tool_request("other", "get_page_text", {})
+    assert refused["error_code"] == "HUMAN_HAS_CONTROL"
     assert len(model.calls) == 1
     assert browser.runtime.authority.snapshot()["runId"] == "origin-run"
     assert store.status()["originSessionKey"] == "original-chat"
@@ -124,7 +129,7 @@ async def test_another_chat_cannot_release_the_original_run_on_failed_admission(
 async def test_a_screen_run_is_told_to_hand_logins_and_codes_to_the_person(live_run):
     from flowly.agent.loop import SCREEN_HANDOFF_GUIDANCE
 
-    _, _, _, _, model, _, _, _, _ = live_run
+    _, _, _, _, model, _, _, _ = live_run
     first = model.calls[0]["messages"]
     assert any(message.get("content") == SCREEN_HANDOFF_GUIDANCE for message in first)
     for word in ("two-factor", "take control on the Screen", "do not ask them to paste passwords"):

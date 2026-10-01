@@ -115,11 +115,19 @@ class ScreenshotTool(Tool):
         Returns:
             Success message with file path, or error message.
         """
-        from flowly.desktop_runtime.context import SCREEN_RUN_BINDING
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.host_screen_run import current_screen_run, unavailable
 
-        binding = SCREEN_RUN_BINDING.get()
-        if binding is not None:
+        screen_run = current_screen_run()
+        if screen_run is not None and screen_run.uses_screen():
             import uuid
+
+            try:
+                binding = await screen_run.bind()
+            except ScreenError as exc:
+                return json.dumps(unavailable(exc))
+            if binding is None:
+                return json.dumps(unavailable(ScreenError("SCREEN_NOT_RUNNING")))
 
             from flowly.agent.tools.browser_tab import BrowserTabTool
 

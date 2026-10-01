@@ -2082,30 +2082,6 @@ class WebChannel(BaseChannel):
                     "should send a stable sessionKey (chat document id)."
                 )
             idempotency_key = params.get("idempotencyKey") or str(uuid.uuid4())
-            screen_admission = None
-            # A refused screen grant must not claim the command identity (a
-            # corrected retry would conflict with it); a retry of a command
-            # already accepted replays its receipt below without re-admission.
-            if "browserAccess" in params and not (
-                    isinstance(session_key, str) and isinstance(idempotency_key, str)
-                    and self.chat_commands.lookup(session_key, idempotency_key) is not None):
-                from flowly.desktop_runtime.authority import ScreenError
-                from flowly.desktop_runtime.relay_chat import admit_relay_screen_run
-
-                manager = self._screen_rpc
-                client = manager.clients.get(session_id) if manager is not None else None
-                def screen_owner_current():
-                    return (ws is self._ws and manager is self._screen_rpc and manager is not None
-                            and manager.enabled and not manager.closed and client is not None
-                            and manager.clients.get(session_id) is client)
-                try:
-                    screen_admission = admit_relay_screen_run(self._screen_gateway, params["browserAccess"],
-                                                             session_key, idempotency_key, screen_owner_current)
-                except ScreenError as exc:
-                    await ws.send(json.dumps({"type": "rpc", "id": rpc_id, "sessionId": session_id,
-                        "error": {"code": exc.code, "message": "The selected screen browser is unavailable."}}))
-                    return
-
             from flowly.session.commands import ChatCommandConflictError
 
             try:
@@ -2222,10 +2198,6 @@ class WebChannel(BaseChannel):
                     media,
                     voice_mode,
                     render_capabilities,
-                    # Only a screen run adds metadata; an ordinary turn keeps
-                    # the exact call every other caller makes.
-                    **({"extra_metadata": {"_relay_screen_run": screen_admission}}
-                       if screen_admission is not None else {}),
                 )
             )
             self._track_chat_publish(task, session_key, run_id)

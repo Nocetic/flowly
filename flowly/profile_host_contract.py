@@ -424,28 +424,14 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
             )
         value = {"mediaId": media_id, "offset": offset, "length": length}
     if method in {"chat.send", "chat.steer"}:
-        # Remote clients cannot select arbitrary host paths or client browser
-        # registrations. An explicit host-screen grant is checked again by the
-        # broker against the pinned profile, then by the target gateway against
-        # the live generation. Steering cannot replace an existing run's grant.
-        if value.get("cwd") is not None:
+        # Remote clients may upload bytes, but they may never select paths or
+        # browser registrations on the machine that owns the bot host. A bot's
+        # running profile screen is its browser without any selection.
+        if value.get("cwd") is not None or value.get("browserAccess") is not None:
             raise ProfileHostError(
                 "REMOTE_HOST_ACCESS_DENIED",
                 "Remote bot messages cannot select host folders or browser sessions.",
             )
-        if value.get("browserAccess") is not None:
-            from flowly.desktop_runtime.authority import ScreenError
-            from flowly.desktop_runtime.grants import validate_browser_grant
-
-            try:
-                if method != "chat.send":
-                    raise ScreenError("INVALID_PARAMS")
-                value["browserAccess"] = validate_browser_grant(value["browserAccess"])
-            except ScreenError as exc:
-                raise ProfileHostError(
-                    "REMOTE_HOST_ACCESS_DENIED",
-                    "Only an explicit profile screen may be selected for a new run.",
-                ) from exc
         attachments = value.get("attachments")
         if attachments is None:
             attachments = []

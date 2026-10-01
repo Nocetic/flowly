@@ -923,6 +923,9 @@ def _merge_turn_usage(
 # A screen run acts in the browser on the user's own server screen, which the
 # user watches and can take over. Steps that need the person go through that
 # takeover, never through chat, and the runtime resumes this same task after.
+# Screen outcomes a run may report as-is; anything else is CONTROL_UNAVAILABLE.
+_SCREEN_RUN_ERRORS = frozenset({"SCREEN_BUSY", "HUMAN_HAS_CONTROL", "STALE_GENERATION", "PROFILE_IDENTITY_CHANGED",
+                                "HANDOFF_RECOVERY_REQUIRED", "HANDOFF_STATE_INVALID"})
 SCREEN_HANDOFF_GUIDANCE = (
     "[Screen task] This task runs in the browser on the user's own server screen, which they can watch and "
     "take over. When a step needs them (signing in with a password, a two-factor or verification code, a "
@@ -6008,14 +6011,11 @@ class AgentLoop:
 
         async def await_screen_checkpoint() -> bool:
             # Plain control release is not permission to continue this run.
-            from flowly.desktop_runtime.context import SCREEN_RUN_BINDING
+            from flowly.desktop_runtime.host_screen_run import bound_screen_run
 
-            screen_run = SCREEN_RUN_BINDING.get()
+            screen_run = bound_screen_run()
             if screen_run is None or screen_run.checkpoint is None:
                 return False
-            if screen_run.run_id != outbound_run_id:
-                from flowly.desktop_runtime.authority import ScreenError
-                raise ScreenError("RUN_CHANGED")
             fresh_screen = await self._run_aborts.run_cancellable(outbound_run_id, screen_run.checkpoint.wait)
             if fresh_screen is None:
                 return False
@@ -6030,10 +6030,10 @@ class AgentLoop:
                 provider_state_out.clear()
             return True
 
-        from flowly.desktop_runtime.context import SCREEN_RUN_BINDING
+        from flowly.desktop_runtime.host_screen_run import current_screen_run
 
-        bound_screen = SCREEN_RUN_BINDING.get()
-        if bound_screen is not None and bound_screen.run_id == outbound_run_id:
+        screen_run = current_screen_run()
+        if screen_run is not None and screen_run.uses_screen():
             # Ephemeral guidance for this screen run; never part of the durable journal.
             messages.append({"role": "user", "content": SCREEN_HANDOFF_GUIDANCE})
 
@@ -7742,22 +7742,27 @@ class AgentLoop:
                 )
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=message,
                                        metadata={"error": {"code": exc.code, "message": message}})
-            from flowly.desktop_runtime.relay_chat import METADATA_KEY, relay_screen_scope
+            from flowly.desktop_runtime.host_screen_run import host_screen_run_scope
 
-            admission = msg.metadata.pop(METADATA_KEY, None)
-            if admission is None:
-                return await self._process_message_in_environment(msg)
+            # Every run of this profile uses its running screen's browser, if any.
             try:
-                async with relay_screen_scope(admission, msg) as scope:
+                async with host_screen_run_scope(getattr(self, "_gateway_server", None), msg.session_key,
+                                                 msg.metadata.get("run_id")) as screen_run:
                     response = await self._process_message_in_environment(msg)
-                    outcome = (response.metadata or {}) if response is not None else {}
-                    scope.succeeded = response is not None and not outcome.get("aborted") and not outcome.get("error")
+                    if screen_run is not None:
+                        outcome = (response.metadata or {}) if response is not None else {}
+                        screen_run.succeeded = (response is not None and not outcome.get("aborted")
+                                                and not outcome.get("error"))
                     return response
             except ScreenError as exc:
-                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                    content="The screen task needs attention. Check the selected screen before continuing.",
+                # A screen handoff that cannot continue ends this run; every
+                # transport reports it as the same typed error.
+                code = exc.code if exc.code in _SCREEN_RUN_ERRORS else "CONTROL_UNAVAILABLE"
+                message = "Check this profile's screen before continuing the task."
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=message,
                     metadata={"run_id": msg.metadata.get("run_id"), "session_key": msg.session_key,
-                              "error": {"code": exc.code, "message": "The selected screen browser is unavailable."}})
+                              "error": {"code": code, "title": "The screen task needs attention",
+                                        "message": message}})
 
     async def _process_message_in_environment(self, msg: InboundMessage) -> OutboundMessage | None:
         """Serialize a conversation's turns and reject stale continuations."""

@@ -1,6 +1,5 @@
-"""Explicit host-screen grant for one authenticated chat run."""
+"""The profile screen claimed by one agent run (see host_screen_run)."""
 
-from contextvars import ContextVar
 from dataclasses import dataclass
 
 from flowly.desktop_runtime.browser_provider import HostBrowserProvider
@@ -14,5 +13,3 @@ class ScreenRunBinding:
     run_id: str
     checkpoint: ScreenRunCheckpoint | None = None
 
-
-SCREEN_RUN_BINDING: ContextVar[ScreenRunBinding | None] = ContextVar("flowly_screen_run", default=None)

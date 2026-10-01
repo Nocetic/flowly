@@ -24,6 +24,7 @@ from flowly.bus.queue import MessageBus
 from flowly.config.schema import Config
 from flowly.desktop_runtime import rfb as rfb_module
 from flowly.desktop_runtime.browser_provider import HostBrowserProvider
+from flowly.desktop_runtime.host_screen_run import host_screen_run_scope
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.desktop_runtime.supervisor import application_environment
 from flowly.gateway.server import GatewayServer
@@ -96,6 +97,10 @@ async def main():
                 return LLMResponse(content="Screen fixture")
             self.calls += 1
             if self.calls == 1:
+                # The task's first browser action claims the running screen.
+                return LLMResponse(content=None, tool_calls=[ToolCallRequest(id="open-login", name="browser_tab",
+                    arguments={"action": "get_page_text"})])
+            if self.calls == 2:
                 # Hold only the deterministic model response. The production
                 # checkpoint must handle the subsequent wait and continuation.
                 async with asyncio.timeout(90):
@@ -103,7 +108,7 @@ async def main():
                         await asyncio.sleep(0.02)
                 return LLMResponse(content=None, tool_calls=[ToolCallRequest(id="stale-click", name="browser_tab",
                     arguments={"action": "click", "selector": "#login"})])
-            if self.calls == 2:
+            if self.calls == 3:
                 assert "fresh browser observation" in str(kwargs["messages"])
                 return LLMResponse(content=None, tool_calls=[ToolCallRequest(id="observe-login", name="browser_tab",
                     arguments={"action": "get_page_text"})])
@@ -130,14 +135,19 @@ async def main():
     # chat.send through WebChannel ingress, admission and the agent loop.
     bus = MessageBus()
     loop = AgentLoop(bus=bus, provider=model, workspace=home / "workspace", main_config=Config(),
-                     max_iterations=4, soft_warn_at_iteration=0)
+                     max_iterations=5, soft_warn_at_iteration=0)
     loop.tools.register(BrowserTabTool(gateway))
+    # As in production: every run of this profile uses its running screen.
+    loop.set_gateway_server(gateway)
     gateway._maintenance_backlog = lambda: bus.inbound_size
 
     async def on_chat(*args):
-        result = await loop._run_llm_tool_loop(
-            [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Read the login result."}],
-            action_turn=False, session_key=args[0], outbound_run_id=args[2])
+        # Production enters this scope in AgentLoop._process_message.
+        async with host_screen_run_scope(gateway, args[0], args[2]) as run:
+            result = await loop._run_llm_tool_loop(
+                [{"role": "system", "content": "Complete the browser task."}, {"role": "user", "content": "Read the login result."}],
+                action_turn=False, session_key=args[0], outbound_run_id=args[2])
+            run.succeeded = not loop.is_run_aborted(args[2])
         return result[0], {"aborted": loop.is_run_aborted(args[2])}
 
     gateway.on_chat_message = on_chat
@@ -255,6 +265,8 @@ async def main():
                     server_id="screen-fixture", auth_token=TOKEN,
                     jwt_secret=os.environ["MOLTBOT_PROXY_JWT_SECRET"]), bus)
                 relay_channel.set_screen_gateway(gateway)
+                # As in production (gateway_cmd): a relay Stop reaches the agent loop.
+                relay_channel.set_abort_callback(loop.mark_aborted)
 
                 async def deliver_outbound():
                     # The production ChannelManager dispatcher, reduced to the
