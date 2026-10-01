@@ -935,3 +935,115 @@ def test_a_running_tasks_detail_shows_its_steps_so_far_and_its_kind(home, clock)
     # The recorder hands out copies: a reader cannot change a running task.
     rec.live_steps()["r"][0]["tool"] = "tampered"
     assert rec.live_steps()["r"][0]["tool"] == "web_search"
+
+
+# ── a step in full ──────────────────────────────────────────────────────────
+
+
+def _transcript(home, key: str, calls: list[tuple[str, str, dict, str]]) -> None:
+    """A conversation file holding tool calls: (call id, tool, arguments, result)."""
+    sessions = home / "sessions"
+    sessions.mkdir(exist_ok=True)
+    lines = [{"_type": "metadata", "metadata": {}}]
+    for call_id, tool, args, result in calls:
+        lines.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": tool, "arguments": json.dumps(args)}}]})
+        lines.append({"role": "tool", "tool_call_id": call_id, "name": tool, "content": result})
+    (sessions / (key.replace(":", "_") + ".jsonl")).write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+def _step(task_id: str, index: int, rec: ActivityRecorder | None = None):
+    rec = rec or ActivityRecorder()
+    return journal.get_step(task_id, index, visible=lambda _k: True, running_ids=rec.active_ids(),
+                            waiting_keys=set(), live_steps=rec.live_steps(), from_memory=rec.step_detail)
+
+
+def test_a_step_shows_its_call_while_the_turn_runs_and_just_after(home, clock):
+    rec = ActivityRecorder()
+    task = rec.begin(session_key="desktop:c", task_id="r", trigger={"kind": "owner"}, request="find flights")
+    rec.note_tool("desktop:c", "web_search", {"query": "Rome flights"}, ok=True, duration_ms=900,
+                  result="1. Fares to Rome …", call_id="call_1")
+    live = _step("r", 0, rec)
+    assert (live["tool"], live["detail"]) == ("web_search", "live")
+    assert json.loads(live["args"]) == {"query": "Rome flights"} and live["result"] == "1. Fares to Rome …"
+    # The call id goes to the journal; the arguments and result never do.
+    rec.end(task, outcome="completed")
+    on_disk = (home / "activity").joinpath(next((home / "activity").iterdir()).name).read_text()
+    assert '"callId":"call_1"' in on_disk and "Fares to Rome" not in on_disk
+    assert _step("r", 0, rec)["detail"] == "live"  # this process still has it
+
+
+def test_a_step_reads_its_call_from_the_transcript_later(home, clock):
+    rec = ActivityRecorder()
+    task = rec.begin(session_key="desktop:c", task_id="r", trigger={"kind": "owner"}, request="x")
+    rec.note_tool("desktop:c", "exec", {"command": "ls"}, ok=True, duration_ms=5, result="a.txt", call_id="call_7")
+    rec.end(task, outcome="completed")
+    store.append({"type": "recap", "id": "r", "recap": {"title": "List files", "outcome": "Found one", "summary": "",
+                                                        "steps": [{"i": 0, "note": "Listed the folder; one file."}]}})
+    _transcript(home, "desktop:c", [("call_7", "exec", {"command": "ls -la"}, "total 1\na.txt")])
+
+    step = _step("r", 0)  # a new process: nothing in memory
+    assert step["detail"] == "transcript"
+    assert json.loads(step["args"]) == {"command": "ls -la"} and step["result"] == "total 1\na.txt"
+    assert step["note"] == "Listed the folder; one file."
+    assert (step["tool"], step["kind"], step["ok"], step["blocked"]) == ("exec", "exec", True, False)
+
+
+def test_a_step_without_its_call_says_so(home, clock):
+    rec = ActivityRecorder()
+    _work(rec, "desktop:c", "r")  # no call id, as the old journal
+    step = _step("r", 0)
+    assert step["detail"] == "none" and "args" not in step and "result" not in step
+    assert _step("r", 1) is None and _step("r", -1) is None and _step("nope", 0) is None
+
+
+def test_a_step_index_counts_across_a_tasks_turns(home, clock):
+    rec = ActivityRecorder()
+    for turn, call in (("a", "call_a"), ("b", "call_b")):
+        task = rec.begin(session_key="desktop:c", task_id=turn, trigger={"kind": "owner"}, request=turn)
+        rec.note_tool("desktop:c", "web_search", {"query": turn}, ok=True, duration_ms=1, result=f"hits for {turn}",
+                      call_id=call)
+        rec.end(task, outcome="completed")
+    store.append({"type": "recap", "id": "b", "taskId": "a", "work": True,
+                  "recap": {"title": "T", "outcome": "O", "summary": "", "steps": []}})
+    assert _step("a", 1, rec)["result"] == "hits for b"
+    assert _step("b", 0, rec)["result"] == "hits for a"  # a turn's id opens its task
+
+
+def test_only_recent_turns_keep_their_calls_in_memory(home, clock):
+    from flowly.activity.recorder import RECENT_DETAIL_TURNS
+
+    rec = ActivityRecorder()
+    for n in range(RECENT_DETAIL_TURNS + 1):
+        _work(rec, "desktop:c", f"t{n}")
+    assert rec.step_detail("t0", 0) is None
+    assert rec.step_detail(f"t{RECENT_DETAIL_TURNS}", 0) is not None
+
+
+def test_a_conversation_the_caller_may_not_open_keeps_its_steps(home, clock):
+    rec = ActivityRecorder()
+    _work(rec, "desktop:secret", "r")
+    assert journal.get_step("r", 0, visible=lambda key: key != "desktop:secret", running_ids=set(),
+                            waiting_keys=set()) is None
+
+
+def test_the_step_rpc_validates_and_reads(home, clock):
+    from flowly.activity import get_activity_recorder
+    from flowly.channels.feature_rpc import FeatureRpcError, activity_step
+    from flowly.profile_host_contract import validate_profile_rpc
+
+    for bad in ({}, {"id": "r"}, {"id": "", "index": 0}, {"id": "r", "index": -1}, {"id": "r", "index": "0"}):
+        with pytest.raises(FeatureRpcError):
+            activity_step(bad)
+    with pytest.raises(FeatureRpcError) as missing:
+        activity_step({"id": "nope", "index": 0})
+    assert missing.value.code == "NOT_FOUND"
+    rec = get_activity_recorder()
+    task = rec.begin(session_key="desktop:rpc", task_id="rpc", trigger={"kind": "owner"}, request="x")
+    try:
+        rec.note_tool("desktop:rpc", "read_file", {"path": "/tmp/a.md"}, ok=True, duration_ms=1, result="hello",
+                      call_id="c1")
+        assert activity_step({"id": "rpc", "index": 0})["step"]["result"] == "hello"
+    finally:
+        rec.end(task, outcome="completed")
+    assert validate_profile_rpc("activity.step", {"id": "rpc", "index": 0})[0] == "activity.step"

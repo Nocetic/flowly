@@ -298,6 +298,56 @@ def get_task(
     }
 
 
+def get_step(
+    task_id: str,
+    index: int,
+    *,
+    visible: Callable[[str], bool],
+    running_ids: set[str],
+    waiting_keys: set[str],
+    live_steps: dict[str, list[dict[str, Any]]] | None = None,
+    from_memory: Callable[[str, int], dict[str, str] | None] = lambda _turn, _index: None,
+) -> dict[str, Any] | None:
+    """One step in full: what it was, its note, and the call's arguments and
+    result, the same the chat's tool panel shows.
+
+    ``index`` counts the task's steps across its turns, as ``get_task`` lists
+    them. The call is read from memory while its turn runs (or just ended),
+    otherwise from the conversation's transcript. ``detail`` says which:
+    ``live``, ``transcript`` or ``none`` when neither has it any more."""
+    from flowly.activity import transcript
+
+    tasks, owner_of, _seen = _tasks()
+    task = tasks.get(task_id) or tasks.get(owner_of.get(task_id, ""))
+    if task is None or not visible(str(task.first.get("sessionKey") or "")) or index < 0:
+        return None
+    live = live_steps or {}
+    offset = 0
+    for turn in task.turns:
+        steps = _turn_steps(turn, live)
+        if index >= offset + len(steps):
+            offset += len(steps)
+            continue
+        local = index - offset
+        step = steps[local]
+        recap = turn.get("recap") if isinstance(turn.get("recap"), dict) else {}
+        note = next((item["note"] for item in recap.get("steps") or []
+                     if isinstance(item, dict) and item.get("i") == local and isinstance(item.get("note"), str)), "")
+        call: dict[str, str] | None = from_memory(turn["id"], local)
+        source = "live" if call is not None else "none"
+        if call is None and isinstance(step.get("callId"), str):
+            call = transcript.find_call(str(turn.get("sessionKey") or ""), step["callId"])
+            source = "transcript" if call is not None else "none"
+        return {
+            **{key: step.get(key) for key in ("tool", "kind", "target", "ok", "durationMs")},
+            "blocked": bool(step.get("blocked")),
+            "note": note,
+            "detail": source,
+            **(call or {}),
+        }
+    return None
+
+
 def earlier_work(session_key: str, *, turn_id: str, started_at: int) -> dict[str, Any] | None:
     """The task a finished turn might carry on, for the model to judge.
 

@@ -34,7 +34,7 @@ TIMEOUT_SECONDS = 30.0
 TITLE_MAX = 80
 OUTCOME_MAX = 140
 SUMMARY_MAX = 600
-NOTE_MAX = 200
+NOTE_MAX = 320
 
 _THINK = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
@@ -60,8 +60,9 @@ _SYSTEM = (
     "- outcome: at most 12 words, past tense, what came of it; for the whole task when the turn "
     "continues or is part of one.\n"
     "- summary: 1-3 sentences in the first person, as the agent; for the whole task likewise.\n"
-    "- steps: one short line per listed step of this turn, what it found or did; use the step's "
-    "index as i.\n"
+    "- steps: for each listed step of this turn, one or two sentences on what it did and what came "
+    "of it, with the specifics that matter (the query, the file, how many results, what was made); "
+    "use the step's index as i.\n"
     "Write in the same language as the request. Plain text: no markdown, no citations, no "
     "quotes around values. Never include secrets, keys or full file contents."
 )

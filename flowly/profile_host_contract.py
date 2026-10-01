@@ -83,6 +83,7 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "sessions.list": 30_000,
     "activity.list": 30_000,
     "activity.get": 30_000,
+    "activity.step": 30_000,
     "activity.seen": 30_000,
     "sessions.delete": 30_000,
     "sessions.model.get": 30_000,

@@ -3982,6 +3982,23 @@ def activity_get(params: dict) -> dict:
     return {"task": task}
 
 
+def activity_step(params: dict) -> dict:
+    """One step of a task in full, with its call's arguments and result: ``{step}``."""
+    from flowly.activity import get_activity_recorder, journal
+
+    task_id = params.get("id")
+    if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128 or any(ord(c) < 32 for c in task_id):
+        raise FeatureRpcError("INVALID_PARAMS", "A task id is required.")
+    index = _activity_int(params, "index", default=None, low=0, high=10_000)
+    if index is None:
+        raise FeatureRpcError("INVALID_PARAMS", "index is required.")
+    step = journal.get_step(task_id, index, visible=_session_visibility(),
+                            from_memory=get_activity_recorder().step_detail, **_activity_now())
+    if step is None:
+        raise FeatureRpcError("NOT_FOUND", "This step is no longer in the activity log.")
+    return {"step": step}
+
+
 def activity_seen(params: dict) -> dict:
     """The owner has seen every task up to ``before`` (ms): ``{seenBefore}``."""
     from flowly.activity import journal
@@ -5503,6 +5520,7 @@ _DISPATCH: dict[str, tuple] = {
     "sessions.attention": (sessions_attention, False, False),
     "activity.list": (activity_list, True, False),
     "activity.get": (activity_get, True, False),
+    "activity.step": (activity_step, True, False),
     "activity.seen": (activity_seen, True, False),
     "sessions.read": (sessions_read, True, False),
     "audit.list": (audit_list, True, False),

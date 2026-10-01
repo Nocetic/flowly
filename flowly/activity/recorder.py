@@ -36,10 +36,12 @@ together.
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,6 +75,14 @@ LONG_REPLY_CHARS = 1_500
 BACKGROUND_TRIGGERS = frozenset({"routine", "goal"})
 REQUEST_MAX_CHARS = 280
 STEP_EXCERPT_CHARS = 1_500
+# A step's arguments and result, as the owner's step detail shows them: kept
+# in memory only (the transcript holds them on disk), capped for the wire.
+DETAIL_ARGS_MAX_CHARS = 16_000
+DETAIL_RESULT_MAX_CHARS = 64_000
+# Recently ended turns keep their details a while, so a step opened right
+# after the turn (before its transcript is saved, or once it is compacted)
+# still shows them.
+RECENT_DETAIL_TURNS = 32
 MAX_STEPS = 200
 SUBJECT_MAX_CHARS = 80
 
@@ -84,6 +94,16 @@ _CLARIFY_DECISIONS = {"answered": "answered", "timeout": "timeout", "cancelled":
 def _one_line(value: Any, limit: int) -> str:
     text = re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _args_text(args: Any) -> str:
+    """A tool call's arguments as the transcript keeps them: a JSON object."""
+    if isinstance(args, str):
+        return args
+    try:
+        return json.dumps(args if args is not None else {}, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return "{}"
 
 
 def _tokens(usage: Any) -> dict[str, int]:
@@ -121,6 +141,8 @@ class ActiveTask:
     steps: list[dict[str, Any]] = field(default_factory=list)
     excerpts: list[str] = field(default_factory=list)
     prompts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Per step, in memory only: ``{"args": str, "result": str}``.
+    details: list[dict[str, str]] = field(default_factory=list)
     waited: float = 0.0
     # A prompt closed with no (deny/timeout) since the last step: the next
     # failed step was blocked, not broken.
@@ -137,6 +159,8 @@ class ActivityRecorder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._active: dict[str, ActiveTask] = {}
+        # Turn id → its steps' details, for turns that ended lately.
+        self._recent: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -210,6 +234,10 @@ class ActivityRecorder:
         with self._lock:
             if self._active.get(task.session_key) is task:
                 del self._active[task.session_key]
+            if task.working and task.details:
+                self._recent[task.id] = task.details
+                while len(self._recent) > RECENT_DETAIL_TURNS:
+                    self._recent.popitem(last=False)
             waited = task.waited + sum(time.monotonic() - prompt["opened"]
                                        for prompt in task.prompts.values() if "decision" not in prompt)
             working = task.working
@@ -257,20 +285,36 @@ class ActivityRecorder:
 
     # ── steps ────────────────────────────────────────────────────────────
 
+    def step_detail(self, turn_id: str, index: int) -> dict[str, str] | None:
+        """A step's arguments and result from memory: a running turn's, or a
+        recently ended one's. None when this process no longer has them."""
+        with self._lock:
+            details = next((task.details for task in self._active.values() if task.id == turn_id), None)
+            if details is None:
+                details = self._recent.get(turn_id)
+            if details is None or not 0 <= index < len(details):
+                return None
+            return dict(details[index])
+
     def note_tool(self, session_key: str, tool_name: str, args: Any, *, ok: bool,
-                  duration_ms: int, result: Any = None) -> None:
+                  duration_ms: int, result: Any = None, call_id: str = "") -> None:
         with self._lock:
             task = self._active.get(session_key)
             if task is None or len(task.steps) >= MAX_STEPS:
                 return
             step = describe_step(tool_name, args)
             step.update({"ok": bool(ok), "durationMs": max(0, int(duration_ms or 0))})
+            if isinstance(call_id, str) and call_id:
+                # Where the transcript keeps this call, for the step's detail.
+                step["callId"] = call_id[:128]
             if not ok and task.refused_since_step:
                 step["blocked"] = True
             task.refused_since_step = False
             task.steps.append(step)
             # Kept in memory for the summary only; never written to disk.
             task.excerpts.append(result[:STEP_EXCERPT_CHARS] if isinstance(result, str) else "")
+            task.details.append({"args": _args_text(args)[:DETAIL_ARGS_MAX_CHARS],
+                                 "result": (result if isinstance(result, str) else "")[:DETAIL_RESULT_MAX_CHARS]})
             starts = self._mark_working(task) if is_work(step) else None
         if starts is not None:
             store.append(starts, at_ms=task.started_at)

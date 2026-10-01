@@ -7194,6 +7194,7 @@ class AgentLoop:
                             get_activity_recorder().note_tool(
                                 _current_session_key, _effective_tool_name, call_args,
                                 ok=bool(_tool_success), duration_ms=_duration_ms, result=_tool_result,
+                                call_id=getattr(tool_call, "id", "") or "",
                             )
                         except Exception:  # noqa: BLE001 — activity never fails a tool
                             logger.debug("[activity] could not record a step", exc_info=True)
