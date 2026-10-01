@@ -5150,6 +5150,24 @@ from functools import partial as _partial
 import inspect as _inspect
 
 
+async def gateway_restart() -> dict:
+    """Restart the main agent from wherever its owner is (a phone, say).
+
+    The reply is sent before the restart, which the transport schedules once
+    ``willRestart`` is acked, so the app hears "restarting" rather than a cut
+    connection. A gateway that is not its machine's installed service (one
+    started in a terminal) cannot restart itself, and says so instead.
+    """
+    from flowly.integrations.service_control import service_runs_this_process
+
+    if not await service_runs_this_process():
+        raise FeatureRpcError(
+            "RESTART_UNAVAILABLE",
+            "This Flowly was started by hand, so it can only be restarted where it runs.",
+        )
+    return {"ok": True, "willRestart": True}
+
+
 def system_capabilities() -> dict:
     """Advertise this bot's version + its full feature-method surface.
 
@@ -5176,6 +5194,7 @@ def system_capabilities() -> dict:
             method.startswith("flowlets.") and not runtime.owns_flowlets
         )
         and not (method.startswith("voice.") and method != "voice.context" and not runtime.owns_shared_board)
+        and not (method.startswith("gateway.") and not runtime.owns_shared_board)
     ]
 
     return {
@@ -5336,6 +5355,9 @@ async def media_models_refresh(_params: dict) -> dict:
 _DISPATCH: dict[str, tuple] = {
     "voice.context": (voice_context, True, False),
     "system.capabilities": (system_capabilities, False, False),
+    # Only the main agent's gateway restarts itself; a named agent's runtime
+    # never exposes it.
+    "gateway.restart": (gateway_restart, False, True),
     "connections.list": (connections_list, False, False),
     "connections.secret.get": (connections_secret_get, True, False),
     "connections.set": (connections_set, True, True),
@@ -5521,7 +5543,7 @@ FEATURE_METHODS = frozenset(_DISPATCH)
 # These surfaces are installation-wide and are owned exclusively by the
 # primary/default runtime. Named profile processes consume scoped task work
 # through the profile broker; they never expose a second Board or Flowlet API.
-_PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.", "voice.")
+_PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.", "voice.", "gateway.")
 
 # These methods may legitimately wait for a human/browser or a slow server.
 # WebSocket transports dispatch them in tracked background tasks so their
@@ -5579,7 +5601,7 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
         capabilities = resolve_runtime_capabilities()
         owns_surface = (
             capabilities.owns_shared_board
-            if method.startswith(("board.", "voice."))
+            if method.startswith(("board.", "voice.", "gateway."))
             else capabilities.owns_flowlets
         )
         if not owns_surface:

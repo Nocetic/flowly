@@ -5407,9 +5407,11 @@ class GatewayServer:
         and stops them at once on a stop. Best effort: a crash says nothing,
         and an app that misses this falls back to a short grace.
         """
+        from flowly.integrations.service_control import restart_requested
+
         try:
             await asyncio.wait_for(
-                self.broadcast_event("gateway.stopping", {"restarting": self._restarting}),
+                self.broadcast_event("gateway.stopping", {"restarting": self._restarting or restart_requested()}),
                 timeout=1.0,
             )
         except Exception as exc:  # noqa: BLE001 — stopping must never fail on a goodbye

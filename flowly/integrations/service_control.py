@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import re
 import shlex
 import shutil
 import socket
@@ -29,6 +30,23 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_LABEL = "ai.flowly.gateway"
+
+# Set once this process has asked to be restarted, so the gateway's goodbye
+# can tell its apps it is coming back rather than stopping.
+_restart_requested = False
+
+
+def restart_requested() -> bool:
+    """Whether this process asked its service manager to restart it."""
+    return _restart_requested
+
+
+def _set_restart_requested(value: bool) -> None:
+    # Set just before the restart command (whose SIGTERM can land before it
+    # returns) and cleared if the command fails: a later real stop must not
+    # read as a restart.
+    global _restart_requested
+    _restart_requested = value
 
 
 def _unit_exec_path(label: str) -> Path | None:
@@ -138,8 +156,10 @@ async def restart_gateway(
         # avoids the "stop, then load, then start" race in our older code.
         uid = os.getuid()
         cmd = ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"]
+        _set_restart_requested(True)
         rc, out, err = await _run(cmd)
         if rc != 0:
+            _set_restart_requested(False)
             return RestartResult(
                 ok=False, method="error",
                 detail=f"launchctl kickstart failed: {(err or out).strip()}",
@@ -174,8 +194,10 @@ async def restart_gateway(
                 detail="systemctl not found — restart gateway manually",
             )
         cmd = ["systemctl", "--user", "restart", label]
+        _set_restart_requested(True)
         rc, out, err = await _run(cmd)
         if rc != 0:
+            _set_restart_requested(False)
             err_text = (err or out).strip()
             if "could not find unit" in err_text.lower() or rc == 5:
                 return RestartResult(
@@ -214,10 +236,12 @@ async def restart_gateway(
         # Windows Service — so the old `sc.exe stop/start` path failed with
         # "service does not exist" even though `flowly service stop`/`start`
         # (which use schtasks) work. Bounce the task: /end then /run.
+        _set_restart_requested(True)
         await _run(["schtasks", "/end", "/tn", label])
         await asyncio.sleep(0.5)
         rc, out, err = await _run(["schtasks", "/run", "/tn", label])
         if rc != 0:
+            _set_restart_requested(False)
             return RestartResult(
                 ok=False, method="error",
                 detail=f"schtasks /run failed: {(err or out).strip()}",
@@ -236,6 +260,39 @@ async def restart_gateway(
         ok=False, method="no_service",
         detail=f"unsupported platform: {system}",
     )
+
+
+async def service_runs_this_process(label: str = DEFAULT_LABEL) -> bool:
+    """Whether this very process is the installed gateway service.
+
+    Only then can the gateway restart itself. A gateway started in a
+    terminal is not the service: restarting the service from there would
+    start a second gateway, or nothing at all. Never raises; anything it
+    cannot tell reads as "no".
+    """
+    pid = os.getpid()
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            rc, out, _ = await _run(["launchctl", "list", label])
+            match = re.search(r'"PID"\s*=\s*(\d+);', out) if rc == 0 else None
+            return bool(match) and int(match.group(1)) == pid
+        if system == "linux":
+            if shutil.which("systemctl") is None:
+                return False
+            rc, out, _ = await _run(["systemctl", "--user", "show", "-p", "MainPID", "--value", label])
+            value = out.strip()
+            return rc == 0 and value.isdigit() and int(value) == pid
+        if system == "windows":
+            # Task Scheduler does not report the task's process; an installed
+            # task is the best evidence there is.
+            if shutil.which("schtasks") is None:
+                return False
+            rc, _, _ = await _run(["schtasks", "/query", "/tn", label])
+            return rc == 0
+    except Exception:  # noqa: BLE001 — unknown means "cannot restart from here"
+        return False
+    return False
 
 
 # ── helpers ────────────────────────────────────────────────────────
