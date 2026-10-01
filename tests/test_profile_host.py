@@ -1413,3 +1413,24 @@ def test_empty_terminal_is_not_a_successful_board_audit(profile_roots, content):
         'state': 'final', 'message': {'content': content},
     })
     assert audit['outcome'] == 'error'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restarting", [False, True])
+async def test_the_gateway_says_whether_it_is_stopping_or_restarting(
+    profile_roots, monkeypatch: pytest.MonkeyPatch, restarting: bool,
+) -> None:
+    server = GatewayServer(enable_profile_host=True)
+    sent: list[dict] = []
+
+    async def broadcast(event: dict) -> None:
+        sent.append(event)
+
+    monkeypatch.setattr(server, "_broadcast_clients", broadcast)
+    if restarting:
+        monkeypatch.setattr(asyncio, "create_task", lambda coro: coro.close())
+        server._schedule_feature_restart()
+
+    await server.stop()
+
+    assert sent[0] == {"type": "event", "event": "gateway.stopping", "data": {"restarting": restarting}}

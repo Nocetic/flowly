@@ -707,6 +707,9 @@ class GatewayServer:
         self._profile_run_subscriptions: OrderedDict[
             tuple[str, str], str
         ] = OrderedDict()
+        # Set when this gateway bounces itself (a settings change), so its
+        # goodbye says it is coming back.
+        self._restarting = False
         self._profile_host = None
         if enable_profile_host:
             from flowly.profile_host import ProfileHost
@@ -4284,6 +4287,8 @@ class GatewayServer:
 
     def _schedule_feature_restart(self) -> None:
         """Bounce the gateway after the ACK frame has flushed."""
+        # Clients are told this is a restart, not a stop, when it goes down.
+        self._restarting = True
 
         async def _run() -> None:
             await asyncio.sleep(0.5)
@@ -5393,6 +5398,23 @@ class GatewayServer:
         event = {"type": "event", "event": event_name, "data": data}
         await self._broadcast_clients(event)
 
+    async def _announce_stopping(self) -> None:
+        """Tell connected apps the gateway is going down, and whether it returns.
+
+        A dropped connection alone cannot say which it is: a settings change
+        restarts the gateway in a second, a stop does not come back. Desktop
+        keeps the agents (they run alongside this gateway) through a restart
+        and stops them at once on a stop. Best effort: a crash says nothing,
+        and an app that misses this falls back to a short grace.
+        """
+        try:
+            await asyncio.wait_for(
+                self.broadcast_event("gateway.stopping", {"restarting": self._restarting}),
+                timeout=1.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — stopping must never fail on a goodbye
+            logger.debug("Could not announce the gateway stopping: {}", exc)
+
     async def broadcast_event(self, event_name: str, data: dict) -> None:
         """Push a generic event to all connected WS clients.
 
@@ -5842,6 +5864,7 @@ class GatewayServer:
 
     async def stop(self) -> None:
         """Stop the server and clean up."""
+        await self._announce_stopping()
         if self._profile_host is not None:
             await self._profile_host.shutdown()
         self._profile_client_subscriptions.clear()
