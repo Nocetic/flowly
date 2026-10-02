@@ -1,10 +1,12 @@
 """Push notifications for everything the agent waits on the user for.
 
 Approvals, questions (clarify, MCP prompts) and plan reviews all pause the
-agent until the user answers. Each is pushed to the phone only if it is still
-waiting :data:`~flowly.push.notifications.APPROVAL_PUSH_DELAY_SECONDS` after
-it was asked: at the computer, in a voice call or on the strip it is answered
-first and the phone stays silent.
+agent until the user answers. One is pushed at once, unless the owner can
+answer it on a computer right now (its conversation is on a Flowly Desktop's
+screen, or a voice call is on there; see :mod:`flowly.push.presence`). Then it
+is pushed only if it is still waiting
+:data:`~flowly.push.notifications.APPROVAL_PUSH_DELAY_SECONDS` after it was
+asked, and an answer on any surface cancels it.
 
 The notification reads as a message from the agent: its name as the title,
 and what it is waiting for as the body, the question, the command, the
@@ -96,9 +98,21 @@ async def notify_approval_requested(pending: Any) -> None:
     await notifications.deliver(approval_notice(pending))
 
 
+def waiting_push_delay(session_key: object) -> float:
+    """How long a waiting request holds back its push: a minute while the
+    owner can answer it on a computer, no time at all otherwise."""
+    from flowly.push import presence
+
+    try:
+        watching = presence.owner_watching(session_key)
+    except Exception:
+        watching = False
+    return notifications.APPROVAL_PUSH_DELAY_SECONDS if watching else 0.0
+
+
 def schedule_approval_push(pending: Any) -> None:
     """Push the approval later unless it is settled first. Never blocks."""
-    notifications.schedule(approval_notice(pending), notifications.APPROVAL_PUSH_DELAY_SECONDS)
+    notifications.schedule(approval_notice(pending), waiting_push_delay(getattr(pending, "session_key", "")))
 
 
 def cancel_approval_push(approval_id: str) -> None:
@@ -165,13 +179,17 @@ def wire_waiting_pushes(questions: Any, plans: Any) -> None:
     prompt never takes the phone notification down with it.
     """
     async def push_question(pending: Any) -> None:
-        notifications.schedule(question_notice(pending), notifications.APPROVAL_PUSH_DELAY_SECONDS)
+        notifications.schedule(question_notice(pending), waiting_push_delay(getattr(pending, "session_key", "")))
 
     async def retire_question(question_id: str, reason: str, session_key: str) -> None:
         notifications.cancel(notifications.event_key("clarify", question_id))
 
     async def push_plan(approval: Any, plan_id: str) -> None:
-        notifications.schedule(plan_notice(approval, plan_id), notifications.APPROVAL_PUSH_DELAY_SECONDS)
+        try:
+            session_key = getattr(_stored_plan(str(plan_id or "")), "sessionKey", "")
+        except Exception:
+            session_key = ""
+        notifications.schedule(plan_notice(approval, plan_id), waiting_push_delay(session_key))
 
     def retire_plan(approval_id: str, reason: str) -> None:
         notifications.cancel(notifications.event_key("plan", approval_id))

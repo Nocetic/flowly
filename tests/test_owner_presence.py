@@ -127,3 +127,32 @@ async def test_shared_voice_access_cannot_silence_the_owner(clock):
                 'sourceId': 'desktop-x', 'present': True, 'kinds': ['cron'], 'ttlSeconds': 90,
             })
     assert not presence.shown_at_computer('cron')
+
+
+def test_a_request_waits_only_where_the_owner_can_answer_it(clock):
+    from flowly.push import approval_push, notifications
+
+    assert approval_push.waiting_push_delay('web:conv-a') == 0
+    presence.report('desktop-a', True, ['chat'], 90, watching=['web:conv-a', '', 7])
+    assert approval_push.waiting_push_delay('web:conv-a') == notifications.APPROVAL_PUSH_DELAY_SECONDS
+    assert approval_push.waiting_push_delay('web:conv-b') == 0
+    assert approval_push.waiting_push_delay('') == 0
+    presence.report('desktop-b', True, [], 90, in_call=True)
+    assert approval_push.waiting_push_delay('web:conv-b') == notifications.APPROVAL_PUSH_DELAY_SECONDS
+    clock[0] += 91
+    assert approval_push.waiting_push_delay('web:conv-a') == 0
+
+
+@pytest.mark.asyncio
+async def test_the_owner_reports_screen_and_call_over_the_feature_rpc(clock):
+    await feature_rpc.dispatch('presence.report', {
+        'sourceId': 'desktop-a', 'present': True, 'kinds': [], 'ttlSeconds': 90,
+        'watching': ['web:conv-a'], 'inCall': 'yes',
+    })
+    assert presence.owner_watching('web:conv-a')
+    assert not presence.owner_watching('web:conv-b')
+    await feature_rpc.dispatch('presence.report', {
+        'sourceId': 'desktop-a', 'present': True, 'kinds': [], 'ttlSeconds': 90, 'inCall': True,
+    })
+    assert presence.owner_watching('web:conv-b')
+    assert not presence.shown_at_computer('chat')

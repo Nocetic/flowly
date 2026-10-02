@@ -550,8 +550,10 @@ def config_set(params: dict) -> dict:
 
 
 def presence_report(params: dict) -> dict:
-    """A Flowly Desktop says its user is at the computer and which kinds of
-    notification it shows there, so the phone is not rung for them too.
+    """A Flowly Desktop says its user is at the computer: which kinds of
+    notification it shows there (so the phone is not rung for them too), which
+    conversations are on its screen and whether a voice call is on (so a
+    request waiting there gives the owner a minute to answer it there).
 
     Accepted only from the owner's own connection: someone reaching this agent
     through shared voice access must not be able to silence the owner's
@@ -568,6 +570,8 @@ def presence_report(params: dict) -> dict:
             params.get("present") is True,
             params.get("kinds"),
             params.get("ttlSeconds"),
+            watching=params.get("watching"),
+            in_call=params.get("inCall"),
         )
     except ValueError as exc:
         raise FeatureRpcError("INVALID", str(exc)) from None

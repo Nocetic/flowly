@@ -90,12 +90,16 @@ task notices still do not push.
   and anything an older agent sends), so the guarantee does not depend on
   the agent's version.
 
-**P3 — Requests that can be answered elsewhere wait.**
+**P3 — A request waits only where it can be answered (revised 2026-10-03).**
 - Anything that pauses the agent for the user (an approval, a question, a
-  plan review) is pushed only if it is still waiting 60 s after it was asked;
-  an answer on any surface cancels it. Keys: `approval:<id>`, `clarify:<id>`,
-  `plan:<approval id>`. At the computer or in a call the
-  phone stays silent; away, the phone takes over.
+  plan review) is pushed at once, unless the owner can answer it on a
+  computer right now: its conversation is on a Flowly Desktop's screen, or a
+  voice call is on there (`presence.report` `watching`, `inCall`). Then it is
+  pushed only if still waiting 60 s after it was asked; an answer on any
+  surface cancels it. Keys: `approval:<id>`, `clarify:<id>`, `plan:<id>`.
+- The first version waited 60 s everywhere, so a question in a chat the
+  owner had started on the phone and then closed reached the phone a minute
+  late. Where the owner is decides, not a fixed delay.
 
 **P4 — Notify where the user is (Phase 2, 2026-10-03).**
 - Flowly Desktop reports to every agent it is connected to (the local agent,
@@ -109,7 +113,10 @@ task notices still do not push.
   Desktop, bounded 15 to 300 s). While a fresh report covers a kind,
   `notifications.deliver` does not ring the phone for it; the event still
   counts as delivered, so it is not pushed later.
-- Only informational kinds are held. Approvals, questions and plans keep P3.
+- Only informational kinds are held. Approvals, questions and plans keep P3,
+  which reads the same report's `watching` (agent session keys of the chats
+  on screen in a visible Flowly window) and `inCall`. During a call the
+  computer counts as present even without input; lock and sleep still end it.
 - Everything fails toward ringing the phone: a stale report expires, a
   Desktop that has not reported its settings holds nothing, an older agent
   rejects the unknown method and pushes as before, and relay-only agents
