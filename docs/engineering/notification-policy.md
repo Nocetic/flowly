@@ -116,9 +116,17 @@ task notices still do not push.
   (whose scheduled results Desktop does not show) are not reported to.
 
 **P5 — The notification leads to the thing (Phase 3, mobile).**
-- Tapping an approval opens the conversation that asked (including Live Voice
-  conversations); a settled request removes its notification; text is
-  localized on the device.
+- Approvals, questions and plans carry the conversation that asked as
+  `conversationId` (2026-10-03), in the form the phone opens it by: a relay
+  chat by its bare id (as the relay's chat pushes), a chat the phone apps
+  keep in the agent (bare, `ios:`, `android:`) by its key (as the gateway's
+  chat pushes). A computer's session or a messaging channel carries none.
+  The apps route it like a chat push, restore the waiting request from
+  `chat.inflight`, and remove the notification when the request closes
+  (`exec.approval.closed`, `agent.clarify.closed`) or when the app opens
+  and the request is no longer waiting.
+- Still to do: removing it while the app is closed (a silent push from the
+  agent), answering from the notification, text in the device's language.
 
 ## Architecture
 

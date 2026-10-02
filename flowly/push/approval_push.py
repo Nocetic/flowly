@@ -11,7 +11,8 @@ and what it is waiting for as the body, the question, the command, the
 action or the plan, with credentials redacted (:mod:`flowly.push.display`).
 A command holding characters a reader cannot see is never shown. The owner
 can switch the content off (``notifications.preview: minimal``). Tapping it
-opens the app, where the live event drives the answer. See
+opens the conversation that asked, when the phone has it (see
+:func:`phone_conversation`), where the waiting request is restored. See
 ``docs/engineering/notification-policy.md``.
 """
 
@@ -34,6 +35,32 @@ PLAN_FALLBACK = "Has a plan ready for your OK. Open Flowly to review it."
 #: Choices are listed after a question only while they stay short.
 MAX_LISTED_CHOICES = 4
 MAX_CHOICE_LENGTH = 24
+
+
+#: Phone apps open a relay chat by its bare id and an agent-stored chat by its
+#: own key; these prefixes are the agent-stored chats the phone apps start.
+_PHONE_SESSION_PREFIXES = ("ios", "android")
+
+
+def phone_conversation(session_key: object) -> str:
+    """The conversation a phone opens for this session, or "" if it has none.
+
+    Relay chats ("web:<id>") open by the bare id, as the relay's own chat
+    pushes carry it; chats the phone apps keep in the agent's own store (a
+    bare id, "ios:<id>", "android:<id>") open by their key, as the gateway's
+    chat pushes carry it. A computer's session or a messaging channel
+    (Telegram, a schedule) is not a conversation on the phone: the tap then
+    just opens the app.
+    """
+    key = str(session_key or "").strip()
+    if not key:
+        return ""
+    if key.startswith("web:"):
+        return key[len("web:"):]
+    prefix, separator, _rest = key.partition(":")
+    if not separator:
+        return key
+    return key if prefix in _PHONE_SESSION_PREFIXES else ""
 
 
 def approval_body(pending: Any) -> str:
@@ -60,6 +87,7 @@ def approval_notice(pending: Any) -> notifications.Notice:
         title=notifications.agent_name(),
         body=approval_body(pending),
         data={"id": approval_id},
+        conversation_id=phone_conversation(getattr(pending, "session_key", "")),
     )
 
 
@@ -96,6 +124,7 @@ def question_notice(pending: Any) -> notifications.Notice:
         title=notifications.agent_name(),
         body=question_body(pending),
         data={"id": question_id},
+        conversation_id=phone_conversation(getattr(pending, "session_key", "")),
     )
 
 
@@ -125,6 +154,7 @@ def plan_notice(approval: Any, plan_id: str, lookup: Callable[[str], Any] = _sto
         title=notifications.agent_name(),
         body=plan_body(plan),
         data={"id": approval_id, "planId": str(plan_id or "")},
+        conversation_id=phone_conversation(getattr(plan, "sessionKey", "")),
     )
 
 
