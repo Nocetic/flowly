@@ -48,7 +48,7 @@ def plan(approval_id: str) -> PlanApproval:
 
 
 @pytest.mark.asyncio
-async def test_an_unanswered_question_is_pushed_once_without_its_text(phones, managers):
+async def test_an_unanswered_question_is_pushed_once_as_the_question(phones, managers):
     questions, _ = managers
     waiting = asyncio.create_task(questions.request_and_wait(question('q1')))
     while 'q1' not in questions._pending:
@@ -57,9 +57,9 @@ async def test_an_unanswered_question_is_pushed_once_without_its_text(phones, ma
     assert questions.resolve('q1', 'Yes')
     assert await waiting == 'Yes'
     assert len(phones) == 1
-    assert phones[0]['title'] == 'Question from Flowly'
+    assert phones[0]['title'] == 'Flowly'
+    assert phones[0]['body'] == 'Send the contract to ayse@example.com? (Yes / No)'
     assert phones[0]['data'] == {'type': 'clarify', 'id': 'q1', 'eventKey': 'clarify:q1'}
-    assert 'contract' not in repr(phones) and 'ayse' not in repr(phones)
 
 
 @pytest.mark.asyncio
@@ -85,7 +85,8 @@ async def test_an_unreviewed_plan_is_pushed_once(phones, managers):
     assert plans.resolve_future('pa1', 'approve')
     assert (await waiting).approved
     assert len(phones) == 1
-    assert phones[0]['title'] == 'Plan ready for review'
+    assert phones[0]['title'] == 'Flowly'
+    assert phones[0]['body'] == 'Has a plan ready for your OK. Open Flowly to review it.'
     assert phones[0]['data'] == {'type': 'plan', 'id': 'pa1', 'planId': 'plan-7', 'eventKey': 'plan:pa1'}
 
 
