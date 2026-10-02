@@ -47,11 +47,14 @@ async def notify_profile_cron(host_id: str, name: str, job_id: str, run_id: str)
     except FileExistsError:
         return {"ok": True, "sent": False, "duplicate": True}
 
-    await relay_push.notify_devices(
-        f"{profile.display_name or name} · {record.get('jobName') or 'Scheduled task'}"[:80],
-        str(notification.get("body") or record.get("jobName") or "Scheduled task")[:140],
+    from flowly.push import notifications
+
+    await notifications.deliver(notifications.Notice(
+        kind="cron",
+        key=notifications.event_key("cron", name, job_id, run_id),
+        title=f"{profile.display_name or name} · {record.get('jobName') or 'Scheduled task'}",
+        body=str(notification.get("body") or record.get("jobName") or "Scheduled task"),
         data={
-            "type": "cron",
             "jobId": job_id,
             "jobName": str(record.get("jobName") or "Scheduled task"),
             "runId": run_id,
@@ -59,5 +62,5 @@ async def notify_profile_cron(host_id: str, name: str, job_id: str, run_id: str)
             "profileBotId": profile.bot_id,
             "profileName": name,
         },
-    )
+    ))
     return {"ok": True, "sent": True}

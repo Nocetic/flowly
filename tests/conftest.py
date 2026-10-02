@@ -22,3 +22,16 @@ _SESSION_HOME = tempfile.mkdtemp(prefix="flowly-tests-home-")
 os.environ["HOME"] = _SESSION_HOME
 os.environ["FLOWLY_HOME"] = os.path.join(_SESSION_HOME, ".flowly")
 atexit.register(shutil.rmtree, _SESSION_HOME, True)
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_push_notifications():
+    """Each test starts with no pushed or scheduled notification events."""
+    from flowly.push import notifications
+
+    notifications._reset_for_tests()
+    yield
+    notifications._reset_for_tests()

@@ -4209,22 +4209,22 @@ class GatewayServer:
             preview = "New message"
 
         async def _run() -> None:
-            try:
-                from flowly.push.relay_push import notify_devices
+            from flowly.push import notifications
 
-                push_data = {"type": "chat"}
-                if run_id:
-                    push_data["runId"] = run_id
-                if completed_at:
-                    push_data["completedAt"] = completed_at
-                await notify_devices(
-                    "Flowly",
-                    preview[:140],
-                    conversation_id=session_key,
-                    data=push_data,
-                )
-            except Exception as exc:  # pragma: no cover - best-effort background notify
-                logger.debug(f"[push] offline chat notify skipped: {exc}")
+            push_data: dict[str, str] = {}
+            if run_id:
+                push_data["runId"] = run_id
+            if completed_at:
+                push_data["completedAt"] = completed_at
+            await notifications.deliver(notifications.Notice(
+                kind="chat",
+                key=(notifications.event_key("chat", session_key, run_id) if run_id
+                     else notifications.unique_key("chat", session_key)),
+                title="Flowly",
+                body=preview,
+                data=push_data,
+                conversation_id=session_key,
+            ))
 
         asyncio.create_task(_run())
 

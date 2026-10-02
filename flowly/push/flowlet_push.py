@@ -31,13 +31,16 @@ async def notify_flowlet(
 
     # Mobile (backgrounded iOS/Android) — APNs/FCM via the relay registry.
     try:
-        from flowly.push import relay_push
+        from flowly.push import notifications
 
-        await relay_push.notify_devices(
-            title,
-            body,
-            data={"type": "flowlet", "flowletId": str(flowlet_id or "")},
-        )
+        # A reminder may legitimately repeat, so every one is its own event.
+        await notifications.deliver(notifications.Notice(
+            kind="flowlet",
+            key=notifications.unique_key("flowlet", flowlet_id),
+            title=title,
+            body=body,
+            data={"flowletId": str(flowlet_id or "")},
+        ))
     except Exception as exc:  # pragma: no cover — push is best-effort
         logger.debug("[flowlet] push notify skipped: {}", exc)
 

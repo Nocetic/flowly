@@ -193,19 +193,15 @@ def _schedule_cron_push_notification(
     data = {k: v for k, v in data.items() if v}
 
     async def _run() -> None:
-        try:
-            from flowly.push.relay_push import notify_devices
+        from flowly.push import notifications
 
-            await notify_devices(
-                title,
-                preview,
-                conversation_id=conversation_id,
-                data=data,
-            )
-        except Exception as exc:  # pragma: no cover - best-effort background notify
-            logger.debug(
-                f"Cron '{getattr(job, 'name', '')}' push-notify skipped: {exc}"
-            )
+        job_id = str(getattr(job, "id", "") or "")
+        key = (notifications.event_key("cron", job_id, run_id) if job_id and run_id
+               else notifications.unique_key("cron", job_id))
+        await notifications.deliver(notifications.Notice(
+            kind="cron", key=key, title=title, body=preview,
+            data=data, conversation_id=conversation_id,
+        ))
 
     asyncio.create_task(_run())
 
@@ -2672,8 +2668,9 @@ Respond to the user now:"""
                 # Closed-app push: wake the phone with an APNs/FCM notification
                 # so the request reaches the user even when the app is shut.
                 # Same relay path the board uses; tapping opens the app where
-                # the live event above drives approve/deny. In the background:
-                # phones must never delay a decision made on another surface.
+                # the live event above drives approve/deny. Scheduled: it goes
+                # out only if nobody has answered on a screen within a minute,
+                # and phones never delay a decision made on another surface.
                 from flowly.push.approval_push import schedule_approval_push
                 schedule_approval_push(pending)
 
@@ -2689,6 +2686,10 @@ Respond to the user now:"""
                 card's countdown eventually fires a decision against an id the
                 manager has already dropped.
                 """
+                # Settled before the phone was needed: it never hears of it.
+                from flowly.push.approval_push import cancel_approval_push
+                cancel_approval_push(approval_id)
+
                 web = channels.get_channel("web")
                 if web and hasattr(web, "send_approval_closed"):
                     if session_key.startswith("web:"):
