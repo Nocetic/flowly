@@ -546,6 +546,34 @@ def config_set(params: dict) -> dict:
     return {"ok": True, "willRestart": bool(params.get("restart"))}
 
 
+# ── Owner presence (phone notifications) ───────────────────────────────────
+
+
+def presence_report(params: dict) -> dict:
+    """A Flowly Desktop says its user is at the computer and which kinds of
+    notification it shows there, so the phone is not rung for them too.
+
+    Accepted only from the owner's own connection: someone reaching this agent
+    through shared voice access must not be able to silence the owner's
+    phone. See :mod:`flowly.push.presence`.
+    """
+    from flowly.live_voice.authority import current_request_owner
+    from flowly.push import presence
+
+    if current_request_owner() is not None:
+        raise FeatureRpcError("UNAVAILABLE", "Presence is reported by the owner's own connection.")
+    try:
+        presence.report(
+            params.get("sourceId"),
+            params.get("present") is True,
+            params.get("kinds"),
+            params.get("ttlSeconds"),
+        )
+    except ValueError as exc:
+        raise FeatureRpcError("INVALID", str(exc)) from None
+    return {"ok": True}
+
+
 # ── Model tool access (safe settings projection) ───────────────────────────
 
 
@@ -5397,6 +5425,7 @@ _DISPATCH: dict[str, tuple] = {
     # never exposes it.
     "gateway.restart": (gateway_restart, False, True),
     "connections.list": (connections_list, False, False),
+    "presence.report": (presence_report, True, False),
     "connections.secret.get": (connections_secret_get, True, False),
     "connections.set": (connections_set, True, True),
     "gmail.set_credentials": (gmail_set_credentials, True, True),

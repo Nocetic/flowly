@@ -118,9 +118,19 @@ def _claim(key: str) -> bool:
 
 
 async def deliver(notice: Notice) -> bool:
-    """Push ``notice`` now unless its event was already pushed. Never raises."""
+    """Push ``notice`` now unless its event was already pushed, or the owner
+    is at a computer that shows it (:mod:`flowly.push.presence`). Never raises."""
     if not notice.key or not _claim(notice.key):
         return False
+    try:
+        from flowly.push import presence
+
+        if presence.shown_at_computer(notice.kind):
+            # Claimed all the same: this event was delivered, on the computer.
+            logger.info(f"[push] {notice.kind} shown on the computer; phone not rung")
+            return False
+    except Exception as exc:  # pragma: no cover - never lose a notification to this check
+        logger.debug(f"[push] presence check skipped: {exc}")
     try:
         from flowly.push import relay_push
 
