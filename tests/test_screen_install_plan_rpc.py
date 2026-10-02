@@ -1,7 +1,8 @@
 """Installation review is authenticated, pinned and incapable of executing work."""
 
+import os
 import weakref
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -73,7 +74,7 @@ async def test_install_plan_requires_exact_pin_without_runtime_creation(display_
                    {**target, "packages": ["arbitrary"]}):
         assert "error" in await f.rpc("display.install.plan", params)
     inspect.assert_not_called()
-    assert (await f.rpc("display.install.plan", target))["result"] == inspect.return_value
+    assert (await f.rpc("display.install.plan", target))["result"] == {**inspect.return_value, "selfRestart": False}
     inspect.assert_called_once_with(identity)
     assert session._runtime is None
 
@@ -185,3 +186,17 @@ async def test_install_status_reads_durable_job_without_replaying_worker(display
         "expectedBotId": other.identity["botId"], "operationId": operation,
     })
     assert result["error"]["code"] == "PROFILE_IDENTITY_CHANGED"
+
+
+@pytest.mark.parametrize("owned", [True, False])
+async def test_install_plan_says_whether_the_gateway_restarts_itself(display_gateway, monkeypatch, owned):
+    # The same proof display.install.restart requires before scheduling one.
+    f = display_gateway
+    monkeypatch.setattr("flowly.gateway.display.installation_plan", Mock(return_value={"planId": "a" * 64}))
+    monkeypatch.setattr("flowly.gateway.display.sys.platform", "linux")
+    ownership = AsyncMock(return_value=owned)
+    monkeypatch.setattr("flowly.integrations.service_ownership.owns_current_gateway", ownership)
+    status = (await f.rpc("display.status", {"profileId": "default"}))["result"]
+    target = {"profileId": "default", "expectedHostId": status["hostId"], "expectedBotId": status["botId"]}
+    assert (await f.rpc("display.install.plan", target))["result"]["selfRestart"] is owned
+    assert ownership.await_args.args[1] == os.getpid()

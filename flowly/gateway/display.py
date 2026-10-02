@@ -285,6 +285,23 @@ def _resolve_locked(gateway, params: dict, *, pinned: bool = False) -> DisplaySe
     return sessions[key]
 
 
+async def _restarts_itself() -> bool:
+    """Whether this gateway can restart itself after an installation.
+
+    The same proof display.install.restart requires, so a plan that says yes
+    is one whose restart will be scheduled rather than left to the owner.
+    """
+    if sys.platform != "linux":
+        return False
+    from flowly.integrations.service_control import DEFAULT_LABEL
+    from flowly.integrations.service_ownership import owns_current_gateway
+
+    try:
+        return await owns_current_gateway(DEFAULT_LABEL, os.getpid())
+    except Exception:
+        return False
+
+
 async def _install_restart(gateway, ws, rpc_id: str, session: DisplaySession, params: dict) -> None:
     """Restart this service to load freshly installed packages, only when idle.
 
@@ -389,7 +406,7 @@ async def handle_rpc(gateway, ws, client_id: str, rpc_id: str, method: str, para
         if method == "display.install.plan":
             result = await asyncio.to_thread(installation_plan, session.identity)
             await asyncio.to_thread(_resolve, gateway, params, pinned=True)
-            await gateway._ws_rpc_reply(ws, rpc_id, result)
+            await gateway._ws_rpc_reply(ws, rpc_id, {**result, "selfRestart": await _restarts_itself()})
             return
         if method == "display.install.apply":
             # Retain only target identity in the worker's guard. Never capture
