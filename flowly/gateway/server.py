@@ -4220,7 +4220,7 @@ class GatewayServer:
                 kind="chat",
                 key=(notifications.event_key("chat", session_key, run_id) if run_id
                      else notifications.unique_key("chat", session_key)),
-                title="Flowly",
+                title=notifications.agent_name(),
                 body=preview,
                 data=push_data,
                 conversation_id=session_key,

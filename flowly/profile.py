@@ -258,6 +258,22 @@ def set_profile(name: str | None) -> Path:
     return home
 
 
+def current_profile_display_name() -> str:
+    """The name the owner reads for this process' bot ("Flowly" by default)."""
+    name = current_profile_name()
+    if name == "default":
+        # The default bot, or a home outside the profiles root: its own
+        # metadata may still name it.
+        try:
+            return _metadata_for(name, get_flowly_home(), is_default=True)["display_name"] or "Flowly"
+        except Exception:
+            return "Flowly"
+    try:
+        return _metadata_for(name, get_flowly_home(), is_default=False)["display_name"] or name
+    except Exception:
+        return name
+
+
 def get_active_profile() -> str:
     """Read the sticky active profile from ``~/.flowly/active_profile``."""
     path = _DEFAULT_HOME / "active_profile"

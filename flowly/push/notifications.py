@@ -6,6 +6,11 @@ can collapse repeats on the device (``eventKey``), and lets a request that can
 be answered elsewhere wait and be cancelled (:func:`schedule`, :func:`cancel`).
 See ``docs/engineering/notification-policy.md``.
 
+Every title and body is cleaned and redacted here (:mod:`flowly.push.display`)
+whatever the sender did, and the owner's ``notifications.preview`` setting is
+applied here: ``minimal`` replaces the content with the agent's name and what
+kind of thing happened.
+
 Nothing here may sit on a decision path: callers either await :func:`deliver`
 from a background task or use :func:`schedule`.
 """
@@ -25,6 +30,24 @@ DEDUPE_SECONDS = 600
 APPROVAL_PUSH_DELAY_SECONDS = 60
 
 _MAX_KEY = 200
+TITLE_LIMIT = 80
+#: APNs and FCM bodies are cut at 200 by the relay; a lock screen shows ~4 lines.
+BODY_LIMIT = 180
+
+#: What a ``minimal`` preview says for each kind, under the agent's name.
+MINIMAL_BODY = {
+    "approval": "Needs your OK to continue. Open Flowly to review it.",
+    "clarify": "Has a question for you. Open Flowly to reply.",
+    "plan": "Has a plan ready for your OK. Open Flowly to review it.",
+    "cron": "A scheduled task finished. Open Flowly to see it.",
+    "board": "A Board task finished. Open Flowly to see it.",
+    "flowlet": "You have a reminder. Open Flowly to see it.",
+    "chat": "Sent you a message.",
+}
+_MINIMAL_FALLBACK = "Open Flowly to see it."
+#: Payload fields that repeat content rather than route the tap. The payload
+#: travels with the notification, so a ``minimal`` preview leaves them out.
+_CONTENT_DATA_KEYS = ("jobName",)
 _sent: dict[str, float] = {}
 _scheduled: dict[str, asyncio.Task[None]] = {}
 
@@ -49,6 +72,41 @@ def unique_key(kind: str, *parts: object) -> str:
     return event_key(kind, *parts, uuid.uuid4().hex)
 
 
+def agent_name() -> str:
+    """The name the owner reads for this bot: the title of a notification
+    that reads as a message from it."""
+    try:
+        from flowly.profile import current_profile_display_name
+
+        return current_profile_display_name() or "Flowly"
+    except Exception:
+        return "Flowly"
+
+
+def preview_mode() -> str:
+    """``full`` or ``minimal``, from the owner's config; ``full`` when unsure."""
+    try:
+        from flowly.config.loader import load_config
+
+        return "minimal" if load_config().notifications.preview == "minimal" else "full"
+    except Exception:
+        return "full"
+
+
+def rendered(notice: Notice) -> tuple[str, str]:
+    """The title and body that actually leave the machine."""
+    from flowly.push.display import safe_text
+
+    if preview_mode() == "minimal":
+        title, body = agent_name(), MINIMAL_BODY.get(notice.kind, _MINIMAL_FALLBACK)
+    else:
+        title, body = notice.title, notice.body
+    return (
+        safe_text(title, TITLE_LIMIT) or "Flowly",
+        safe_text(body, BODY_LIMIT) or MINIMAL_BODY.get(notice.kind, _MINIMAL_FALLBACK),
+    )
+
+
 def _claim(key: str) -> bool:
     now = time.monotonic()
     for old in [k for k, at in _sent.items() if now - at > DEDUPE_SECONDS]:
@@ -66,11 +124,16 @@ async def deliver(notice: Notice) -> bool:
     try:
         from flowly.push import relay_push
 
+        title, body = rendered(notice)
+        data = dict(notice.data)
+        if preview_mode() == "minimal":
+            for key in _CONTENT_DATA_KEYS:
+                data.pop(key, None)
         await relay_push.notify_devices(
-            notice.title.strip()[:80],
-            notice.body.strip()[:140],
+            title,
+            body,
             conversation_id=notice.conversation_id,
-            data={"type": notice.kind, **notice.data, "eventKey": notice.key},
+            data={"type": notice.kind, **data, "eventKey": notice.key},
         )
     except Exception as exc:  # pragma: no cover - best-effort
         logger.debug(f"[push] {notice.kind} notify skipped: {exc}")

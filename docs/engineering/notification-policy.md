@@ -56,17 +56,39 @@ task notices still do not push.
   Core sends an event at most once; APNs collapses repeats by
   `apns-collapse-id`, FCM by `collapseKey`.
 
-**P2 — Say what happened, never what it contains, for requests to act.**
-- Requests to act or answer never carry their payload:
-  - approvals: "Approval needed · Flowly wants to run a command. Open Flowly
-    to review it." (an action: "…to take an action…");
-  - questions: "Question from Flowly · Flowly needs your answer to continue.
-    Open Flowly to reply.";
-  - plan reviews: "Plan ready for review · Flowly has a plan waiting for your
-    approval. Open Flowly to review it."
-- Results the user's own agent produced (chat replies, scheduled results,
-  Board outcomes, Flowlets) keep their short preview, as chat already does;
-  encrypted chats stay generic.
+**P2 — A notification reads as a message from the agent; nothing secret leaves.**
+(Revised 2026-10-02: the first version hid all content and read as noise.)
+- The title is the agent's name ("Flowly", or a named bot's display name).
+  The body is what it is waiting for or what happened:
+  - command approval: "Needs your OK to run: git push origin main";
+  - action approval: "Needs your OK: Send email to ali@example.com" (the
+    first line only; an email's preview stays in the app);
+  - question: the question itself, plus its choices while they are few and
+    short: "Move the meeting to 10? (Yes / No)";
+  - plan review: "Plan ready for your OK: Move the blog to Next.js (5 steps)";
+  - results (chat replies, scheduled results, Board outcomes, Flowlets):
+    their short preview, as before.
+- Every title and body goes through one pipeline (`flowly/push/display.py`),
+  applied centrally in `notifications.deliver` whoever built the text:
+  1. invisible and spoofing characters (zero-width, bidi overrides, control
+     characters) are removed first, so a secret split by one is still
+     recognised; a command holding any of them, or an unusual space, is not
+     shown at all ("…a command with hidden characters…");
+  2. credentials are redacted on the full text: the conversation redactor
+     (keys with known prefixes, `Authorization`/`Bearer`, URL userinfo, JWTs,
+     PEM blocks, `password=`-style settings) plus command shapes
+     (`API_KEY=…`, `--token …`, `curl -u user:…`, `mysql -p…`,
+     `sshpass -p`, webhook URLs, unterminated private keys, 32+ character
+     mixed-case tokens);
+  3. only then is the text put on one line (a command's line breaks become
+     `↵`) and cut, so a cut never exposes the start of a secret.
+- The owner can switch content off: `notifications.preview: "minimal"` in the
+  agent's config sends only the agent's name and a fixed line per kind
+  ("Has a question for you. Open Flowly to reply."). Unknown values read as
+  `full`. The phone's own preview setting still applies on the lock screen.
+- Relay applies the same redaction to what it sends (chat replies it builds,
+  and anything an older agent sends), so the guarantee does not depend on
+  the agent's version.
 
 **P3 — Requests that can be answered elsewhere wait.**
 - Anything that pauses the agent for the user (an approval, a question, a
