@@ -147,21 +147,32 @@ def _send_one(base: str, sub: dict[str, Any], title: str, body: str,
         return 0
 
 
+#: Devices pushed at once. Each push is one relay call that can take a second
+#: or more; sent one after another, a few dozen registrations took ~20 s.
+PUSH_CONCURRENCY = 8
+#: The relay's answers for a registration that will never deliver again:
+#: unauthorized (secret rotated), not found, gone (the phone's token is dead).
+DEAD_REGISTRATION = (401, 404, 410)
+
+
 async def notify_devices(title: str, body: str, *, conversation_id: str = "",
                          data: dict[str, str] | None = None) -> None:
     """Push ``title``/``body`` to every registered device via the relay.
 
-    Best-effort and fire-and-forget friendly: a dead registration (401/404) is
-    dropped; network errors are logged and ignored. ``conversation_id`` +
-    ``gatewayId`` ride along as data for deep-linking the tap.
+    Best-effort and fire-and-forget friendly: a dead registration (401, 404,
+    or 410 when the relay reports the phone's token is gone) is dropped;
+    network errors are logged and ignored. ``conversation_id`` +
+    ``gatewayId`` ride along as data for deep-linking the tap. Devices are
+    pushed in parallel, at most :data:`PUSH_CONCURRENCY` at a time.
     """
     reg = get_push_registry()
     subs = reg.list()
     if not subs:
         return
     base = _relay_base()
-    dead: list[str] = []
-    for sub in subs:
+    gate = asyncio.Semaphore(PUSH_CONCURRENCY)
+
+    async def push(sub: dict) -> str | None:
         d: dict[str, str] = dict(data or {})
         ident = str(sub.get("gatewayId") or "")
         if ident:
@@ -172,14 +183,18 @@ async def notify_devices(title: str, body: str, *, conversation_id: str = "",
         if conversation_id:
             d.setdefault("conversationId", conversation_id)
         try:
-            status = await asyncio.to_thread(_send_one, base, sub, title, body, d)
+            async with gate:
+                status = await asyncio.to_thread(_send_one, base, sub, title, body, d)
         except Exception as e:  # pragma: no cover
             logger.debug(f"[push] notify {str(sub.get('pushId',''))[:8]} error: {e}")
-            continue
-        if status in (401, 404):
-            dead.append(sub["pushId"])
-        elif status and status >= 400:
+            return None
+        if status in DEAD_REGISTRATION:
+            return sub["pushId"]
+        if status and status >= 400:
             logger.debug(f"[push] notify {sub['pushId'][:8]} → HTTP {status}")
+        return None
+
+    dead = [pid for pid in await asyncio.gather(*(push(sub) for sub in subs)) if pid]
     for pid in dead:
         reg.unregister(pid)
         logger.info(f"[push] dropped dead registration {pid[:8]}")

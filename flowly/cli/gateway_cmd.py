@@ -2651,9 +2651,10 @@ Respond to the user now:"""
                 # Closed-app push: wake the phone with an APNs/FCM notification
                 # so the request reaches the user even when the app is shut.
                 # Same relay path the board uses; tapping opens the app where
-                # the live event above drives approve/deny.
-                from flowly.push.approval_push import notify_approval_requested
-                await notify_approval_requested(pending)
+                # the live event above drives approve/deny. In the background:
+                # phones must never delay a decision made on another surface.
+                from flowly.push.approval_push import schedule_approval_push
+                schedule_approval_push(pending)
 
             _approval_mgr.add_notify_callback(_notify_approval)
 
