@@ -63,7 +63,7 @@ async def test_approval_push_shows_the_command_without_its_secret(monkeypatch) -
     pending.kind = "exec"  # type: ignore[attr-defined]
     await notify_approval_requested(pending)
 
-    assert calls[0]["body"] == "Needs your OK to run: curl -H 'Authorization: Bearer [redacted] x"
+    assert calls[0]["body"] == "Needs your OK to run: curl -H 'Authorization: Bearer \u2022\u2022\u2022\u2022 x"
     assert calls[0]["data"]["id"] == "a_2"
     assert "s3cret" not in str(calls)
 

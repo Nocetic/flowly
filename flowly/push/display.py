@@ -10,7 +10,7 @@ title and body goes through :func:`safe_text` first:
    by one is still recognised; unusual spaces become spaces in prose and are
    removed from commands. :func:`has_hidden_characters` tells a caller to
    show a command holding any of them generically instead.
-2. Credentials are redacted on the full text, before it is shortened, so a
+2. Credentials are redacted (shown as ``••••``) on the full text, before it is shortened, so a
    cut never exposes the start of a secret that the full pattern would have
    matched.
 3. Whitespace is collapsed to one line (a command's line breaks become ``↵``)
@@ -25,6 +25,10 @@ import re
 import unicodedata
 
 from flowly.compaction.redaction import REDACTED, redact_secrets
+
+#: What a redacted credential looks like on the phone: it reads as hidden,
+#: the way a password field does, instead of as a label.
+MASK = "\u2022" * 4
 
 #: Text past this point can never be displayed (bodies are a few hundred
 #: characters), so it is not scanned: a bound on the work done per push.
@@ -101,11 +105,11 @@ def has_hidden_characters(text: str) -> bool:
 
 
 def redact(text: str) -> str:
-    """Credentials in ``text`` replaced; everything else as it was."""
+    """Credentials in ``text`` replaced by :data:`MASK`; everything else as it was."""
     redacted = redact_secrets(text)
     for pattern, replacement in _COMMAND_SECRETS:
         redacted = pattern.sub(replacement, redacted)
-    return redacted
+    return redacted.replace(f"{REDACTED} (private key)", MASK).replace(REDACTED, MASK)
 
 
 def safe_text(text: object, limit: int, *, command: bool = False) -> str:

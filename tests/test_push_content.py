@@ -49,6 +49,7 @@ ORDINARY = [
 @pytest.mark.parametrize('command,hidden_parts,kept_parts', SECRETS)
 def test_a_credential_in_a_command_never_leaves_the_machine(command, hidden_parts, kept_parts):
     shown = safe_text(command, 500, command=True)
+    assert '\u2022\u2022\u2022\u2022' in shown and '[redacted]' not in shown, shown
     for part in hidden_parts:
         assert part not in shown, shown
     for part in kept_parts:
@@ -182,7 +183,8 @@ async def test_every_notification_is_redacted_whoever_built_it(phones):
         body='done: new key is sk-live-AbCdEfGhIjKlMnOpQrSt and the old one ghp_1234567890abcdefghij',
     ))
     assert 'AbCdEf' not in repr(phones) and 'ghp_123' not in repr(phones)
-    assert phones[0]['body'].startswith('done: new key is [redacted]')
+    assert phones[0]['body'].startswith('done: new key is \u2022\u2022\u2022\u2022 and the old one \u2022\u2022\u2022\u2022')
+    assert 'redacted' not in phones[0]['body']
 
 
 @pytest.mark.asyncio
