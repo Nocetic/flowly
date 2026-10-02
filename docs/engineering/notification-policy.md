@@ -21,7 +21,10 @@ something the user is already looking at.
 | Board card finished | Core `board_push` | anonymous | always (filtered by `should_notify`) | `Board · title` + first line or error | opens the Board |
 | Flowlet | Core `flowlet_push` (agent tool) | anonymous | always | agent-written title + body | opens the app |
 
-Clarify questions and Live Voice task notices do not push.
+Clarify questions (including MCP prompts), plan reviews and Live Voice task
+notices did not push. Questions and plan reviews pause the agent like
+approvals do, so they follow P3 since 2026-10-02 (see below); Live Voice
+task notices still do not push.
 
 ## Problems found (with evidence)
 
@@ -54,16 +57,22 @@ Clarify questions and Live Voice task notices do not push.
   `apns-collapse-id`, FCM by `collapseKey`.
 
 **P2 — Say what happened, never what it contains, for requests to act.**
-- Requests to act (approvals) never carry their payload: "Approval needed ·
-  Flowly wants to run a command. Open Flowly to review it." (an action: "…to
-  take an action…").
+- Requests to act or answer never carry their payload:
+  - approvals: "Approval needed · Flowly wants to run a command. Open Flowly
+    to review it." (an action: "…to take an action…");
+  - questions: "Question from Flowly · Flowly needs your answer to continue.
+    Open Flowly to reply.";
+  - plan reviews: "Plan ready for review · Flowly has a plan waiting for your
+    approval. Open Flowly to review it."
 - Results the user's own agent produced (chat replies, scheduled results,
   Board outcomes, Flowlets) keep their short preview, as chat already does;
   encrypted chats stay generic.
 
 **P3 — Requests that can be answered elsewhere wait.**
-- An approval is pushed only if it is still waiting 60 s after it was asked;
-  a decision on any surface cancels it. At the computer or in a call the
+- Anything that pauses the agent for the user (an approval, a question, a
+  plan review) is pushed only if it is still waiting 60 s after it was asked;
+  an answer on any surface cancels it. Keys: `approval:<id>`, `clarify:<id>`,
+  `plan:<approval id>`. At the computer or in a call the
   phone stays silent; away, the phone takes over.
 
 **P4 — Notify where the user is (Phase 2).**
@@ -84,7 +93,8 @@ Clarify questions and Live Voice task notices do not push.
   never on a decision path; it de-duplicates event keys for ten minutes and
   adds the key to the payload as `eventKey`.
 - **Senders** (approval, cron, profile cron, Board, Flowlet) build a `Notice`
-  and call it; the approval path schedules on request and cancels on close.
+  and call it; approvals, questions and plan reviews schedule on request and
+  cancel on close (`approval_push.wire_waiting_pushes` for the latter two).
 - **Relay** keeps the per-token registration invariant and maps `eventKey`
   to the collapse identifiers. No database schema change: registrations keep
   their fields; superseding deletes documents.

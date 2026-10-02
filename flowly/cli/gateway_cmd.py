@@ -2742,6 +2742,12 @@ Respond to the user now:"""
 
             _clarify_mgr.add_close_callback(_close_clarify)
 
+            # Questions and plan reviews pause the agent like approvals do:
+            # pushed to the phone only if still unanswered after a minute.
+            from flowly.plans.approval import get_plan_approval_manager
+            from flowly.push.approval_push import wire_waiting_pushes
+            wire_waiting_pushes(_clarify_mgr, get_plan_approval_manager())
+
             # Run until shutdown signal
             async def run_until_shutdown():
                 # Standing goals are durable, their work queue is not: a

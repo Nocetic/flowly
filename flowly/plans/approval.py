@@ -34,6 +34,9 @@ from flowly.plans.models import PlanApproval
 Decision = Literal["approve", "reject", "revise", "timeout"]
 
 NotifyCallback = Callable[[PlanApproval, str], Awaitable[None]]
+# Fired once a proposal stops waiting, however it ended. Args: (approval_id,
+# reason). Synchronous: it runs in the waiting turn's ``finally``.
+CloseCallback = Callable[[str, str], None]
 
 
 @dataclass
@@ -68,9 +71,13 @@ class PlanApprovalManager:
         self._pending: dict[str, PlanApproval] = {}
         self._plan_of: dict[str, str] = {}  # approval_id → plan_id
         self._notify_callbacks: list[NotifyCallback] = []
+        self._close_callbacks: list[CloseCallback] = []
 
     def add_notify_callback(self, cb: NotifyCallback) -> None:
         self._notify_callbacks.append(cb)
+
+    def add_close_callback(self, cb: CloseCallback) -> None:
+        self._close_callbacks.append(cb)
 
     # ── the proposing turn awaits here ──────────────────────────────────
 
@@ -102,17 +109,25 @@ class PlanApprovalManager:
                 logger.error(f"[plan.approval] notify failed: {e}")
 
         timeout = max(0.0, approval.expiresAt - time.time())
+        reason = "cancelled"
         try:
             decision = await asyncio.wait_for(future, timeout=timeout)
+            reason = decision.decision
             logger.info(f"[plan.approval] {approval.id} → {decision.decision}")
             return decision
         except asyncio.TimeoutError:
+            reason = "timeout"
             logger.info(f"[plan.approval] {approval.id} timed out (not approved)")
             return PlanDecision("timeout", via="timeout")
         finally:
             self._futures.pop(approval.id, None)
             self._pending.pop(approval.id, None)
             self._plan_of.pop(approval.id, None)
+            for cb in self._close_callbacks:
+                try:
+                    cb(approval.id, reason)
+                except Exception as e:
+                    logger.error(f"[plan.approval] close callback failed: {e}")
 
     # ── surfaces resolve here ───────────────────────────────────────────
 
