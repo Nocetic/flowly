@@ -33,6 +33,8 @@ async def test_schedule_cron_push_without_chat_target(monkeypatch) -> None:
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
+    # Without a run id the event cannot be recognized again: a unique key.
+    assert calls[0]["data"].pop("eventKey").startswith("cron:job-1:")
     assert calls == [{
         "title": "Daily report",
         "body": "first line",
@@ -73,6 +75,7 @@ async def test_chat_origin_cron_push_keeps_conversation_target(monkeypatch) -> N
             "jobId": "job-1",
             "jobName": "Daily report",
             "runId": "run-42",
+            "eventKey": "cron:job-1:run-42",
         },
     }]
 

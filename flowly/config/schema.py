@@ -1257,6 +1257,22 @@ class DisplayConfig(BaseModel):
     pet: PetDisplayConfig = Field(default_factory=PetDisplayConfig)
 
 
+class NotificationsConfig(BaseModel):
+    """Phone notifications sent by this agent.
+
+    ``preview`` is ``full`` (the question, the command, the result, with
+    credentials redacted) or ``minimal`` (the agent's name and what kind of
+    thing happened, nothing of its content). Anything else reads as ``full``,
+    so a typo never silences notifications.
+    """
+    preview: str = "full"
+
+    @field_validator("preview", mode="before")
+    @classmethod
+    def _known_preview(cls, v: object) -> str:
+        return "minimal" if str(v or "").strip().lower() == "minimal" else "full"
+
+
 class Config(BaseSettings):
     """Root configuration for flowly."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -1270,6 +1286,7 @@ class Config(BaseSettings):
     activity: ActivityConfig = Field(default_factory=ActivityConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)
+    notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(
         default_factory=dict, alias="mcpServers",
     )

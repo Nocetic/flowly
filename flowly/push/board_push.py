@@ -30,7 +30,7 @@ async def notify_board_finished(card: Any, outcome: str) -> None:
     if not should_notify_board_finished(card, outcome):
         return
     try:
-        from flowly.push import relay_push
+        from flowly.push import notifications
 
         name = (getattr(card, "title", "") or "task").strip()
         if outcome == "failed":
@@ -44,10 +44,14 @@ async def notify_board_finished(card: Any, outcome: str) -> None:
             "outcome": outcome,
         }
         data = {k: v for k, v in data.items() if v}
-        await relay_push.notify_devices(
-            f"Board · {name}"[:80],
-            body[:140],
+        card_id = data.get("cardId", "")
+        await notifications.deliver(notifications.Notice(
+            kind="board",
+            key=(notifications.event_key("board", card_id, outcome) if card_id
+                 else notifications.unique_key("board", outcome)),
+            title=f"Board · {name}",
+            body=body,
             data=data,
-        )
+        ))
     except Exception as exc:  # pragma: no cover
         logger.debug(f"[board] push notify skipped: {exc}")

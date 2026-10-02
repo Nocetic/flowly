@@ -241,6 +241,7 @@ async def test_offline_chat_final_schedules_push(monkeypatch) -> None:
             "type": "chat",
             "runId": "run-1",
             "completedAt": "2026-07-30T10:00:00Z",
+            "eventKey": "chat:ios:chat-1:run-1",
         },
     }]
 

@@ -36,18 +36,21 @@ async def test_approval_push_payload(monkeypatch) -> None:
     monkeypatch.setattr(relay_push, "notify_devices", fake_notify)
     await notify_approval_requested(_Pending())
 
+    # Reads as a message from the agent: its name, and the action it waits on.
     assert calls == [{
-        "title": "Approval required",
-        "body": "rm -rf ./build",
+        "title": "Flowly",
+        "body": "Needs your OK: rm -rf ./build",
+        "conversation_id": "",
         "data": {
             "type": "approval",
             "id": "a_1",
+            "eventKey": "approval:a_1",
         },
     }]
 
 
 @pytest.mark.asyncio
-async def test_approval_push_empty_command_falls_back(monkeypatch) -> None:
+async def test_approval_push_shows_the_command_without_its_secret(monkeypatch) -> None:
     calls: list[dict] = []
 
     async def fake_notify(title: str, body: str, **kwargs) -> None:
@@ -56,10 +59,13 @@ async def test_approval_push_empty_command_falls_back(monkeypatch) -> None:
     from flowly.push import relay_push
 
     monkeypatch.setattr(relay_push, "notify_devices", fake_notify)
-    await notify_approval_requested(_Pending(request=_Request(command="")))
+    pending = _Pending(id="a_2", request=_Request(command="curl -H 'Authorization: Bearer s3cret' x"))
+    pending.kind = "exec"  # type: ignore[attr-defined]
+    await notify_approval_requested(pending)
 
-    assert calls[0]["body"] == "A command needs your approval"
-    assert calls[0]["data"]["id"] == "a_1"
+    assert calls[0]["body"] == "Needs your OK to run: curl -H 'Authorization: Bearer \u2022\u2022\u2022\u2022 x"
+    assert calls[0]["data"]["id"] == "a_2"
+    assert "s3cret" not in str(calls)
 
 
 @pytest.mark.asyncio
