@@ -223,8 +223,8 @@ def _inline_setup_field(field: Field, value: object) -> InlineSetupField:
 # (codex_approval, codex_sandbox)).
 # codex approval values are the FLOWLY policy names (on-request / never /
 # auto-review / granular) — codex.policy.set maps them to codex's own
-# ask_for_approval vocabulary. auto-review → codex "untrusted" (prompt for
-# everything but safe reads); never → run unattended.
+# approval vocabulary. auto-review → codex on-request answered by its
+# auto_review reviewer; never → run unattended.
 _PERMISSION_LEVELS: tuple[tuple[str, str, tuple[str, str] | None, tuple[str, str] | None], ...] = (
     ("ask",  "🔒 Ask",  ("full", "always"),       ("auto-review", "workspace-write")),
     ("auto", "⚖️ Auto", ("allowlist", "on-miss"), ("on-request",  "workspace-write")),

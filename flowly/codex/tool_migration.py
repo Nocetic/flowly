@@ -228,6 +228,7 @@ def render_managed_block(
     plugins: list[dict] | None = None,
     default_permissions: str | None = None,
     approval_policy: str | None = None,
+    approvals_reviewer: str | None = None,
     include_callback: bool = True,
 ) -> str:
     """Render the managed codex config block.
@@ -239,6 +240,8 @@ def render_managed_block(
       * ``approval_policy`` — codex approval policy (the config.toml key; the
         ``--ask-for-approval`` CLI flag is a separate spelling codex does NOT
         accept in config)
+      * ``approvals_reviewer`` — who answers approval prompts (``auto_review``
+        for Flowly's auto-review policy; omitted means the user)
 
     With ``include_callback`` (the default), also writes the
     ``[mcp_servers.flowly-tools]`` callback entry plus, when provided, the
@@ -261,6 +264,9 @@ def render_managed_block(
         lines.append("")
     if approval_policy:
         lines.append(f"approval_policy = {_toml_str(approval_policy)}")
+        lines.append("")
+    if approvals_reviewer:
+        lines.append(f"approvals_reviewer = {_toml_str(approvals_reviewer)}")
         lines.append("")
 
     if include_callback:
@@ -441,20 +447,28 @@ def _sandbox_to_permission(sandbox: str | None) -> str:
 
 def _approval_to_codex(policy: str | None) -> str:
     """Map a Flowly ``codex_session`` approval policy to codex's
-    ``ask_for_approval`` config value.
+    ``approval_policy`` config value.
 
-    Codex CLI accepts ``untrusted``, ``on-request`` and ``never``
-    (``on-failure`` is deprecated). Flowly exposes ``on-request`` / ``never`` /
-    ``auto-review`` / ``granular``; ``granular`` has no 1:1 codex equivalent, so
-    it maps to the safest prompt-first policy. Unknown values fall back to
-    ``on-request``.
+    Codex accepts ``on-request`` and ``never``; it dropped ``untrusted`` and
+    refuses the whole config.toml (CLI and desktop app) when it sees it.
+    Flowly exposes ``on-request`` / ``never`` / ``auto-review`` / ``granular``.
+    ``auto-review`` is ``on-request`` with the ``auto_review`` reviewer (see
+    :func:`_approvals_reviewer_for`); ``granular`` has no 1:1 codex
+    equivalent, so it maps to the safest prompt-first policy. Unknown values
+    fall back to ``on-request``.
     """
     return {
         "on-request": "on-request",
         "never": "never",
-        "auto-review": "untrusted",
+        "auto-review": "on-request",
         "granular": "on-request",
     }.get((policy or "").strip(), "on-request")
+
+
+def _approvals_reviewer_for(policy: str | None) -> str | None:
+    """Codex ``approvals_reviewer`` for a Flowly approval policy, or None to
+    leave codex's default (the user answers prompts)."""
+    return "auto_review" if (policy or "").strip() == "auto-review" else None
 
 
 def migrate_flowly_tools_to_codex(
@@ -464,6 +478,7 @@ def migrate_flowly_tools_to_codex(
     config=None,
     default_permissions: str | None = ":workspace",
     approval_policy: str | None = None,
+    approvals_reviewer: str | None = None,
     discover_plugins: bool = False,
     include_callback: bool = True,
 ) -> Path:
@@ -472,8 +487,9 @@ def migrate_flowly_tools_to_codex(
     With ``include_callback`` (the default), registers the ``flowly-tools``
     callback and migrates the user's Flowly MCP servers (and, when
     ``discover_plugins``, installed codex plugins). Always writes the policy
-    keys — ``default_permissions`` (sandbox) and ``ask_for_approval`` — when
-    they are provided. With ``include_callback=False`` the write is policy-only:
+    keys — ``default_permissions`` (sandbox), ``approval_policy`` and
+    ``approvals_reviewer`` — when they are provided. With
+    ``include_callback=False`` the write is policy-only:
     sandbox/approval land even when the runtime is kept fully isolated
     (``expose_flowly_tools=False``), while nothing is exposed to codex.
 
@@ -485,6 +501,8 @@ def migrate_flowly_tools_to_codex(
             to skip. Map from a Flowly sandbox with ``_sandbox_to_permission``.
         approval_policy: codex ``approval_policy`` value (``on-request`` etc.);
             None to skip. Map from a Flowly policy with ``_approval_to_codex``.
+        approvals_reviewer: codex ``approvals_reviewer`` value; None to skip.
+            Map from a Flowly policy with ``_approvals_reviewer_for``.
         discover_plugins: query ``plugin/list`` and migrate installed plugins.
             Off by default (boot path); the CLI enables it. Auto-skips inside
             a running event loop. Ignored when ``include_callback=False``.
@@ -541,6 +559,7 @@ def migrate_flowly_tools_to_codex(
         plugins=plugins,
         default_permissions=default_permissions,
         approval_policy=approval_policy,
+        approvals_reviewer=approvals_reviewer,
         include_callback=include_callback,
     )
 

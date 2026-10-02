@@ -100,20 +100,15 @@ class ApprovalManager:
         # awaiting task being torn down mid-wait (gateway shutdown), which is
         # neither a decision nor a timeout.
         reason = "cancelled"
+        # Surfaces are told in the background. A decision must never wait for
+        # them: the gateway used to deliver the request to every registered
+        # phone, one HTTP call after another, before reading the decision, so
+        # an approval given in seconds took effect ~20 s later. The request
+        # stays bounded by the same deadline through the cancellation below.
+        logger.info(f"[ApprovalManager] Notifying {len(self._notify_callbacks)} channel(s) for {pending.id}")
+        notifier = asyncio.create_task(self._notify(pending, scope), name=f"approval-notify-{pending.id}")
         try:
-            # Notification delivery is part of the bounded wait too. If a
-            # surface hangs or the caller cancels here, finally still retires
-            # the pending request and every UI card already delivered.
             async with asyncio.timeout(max(0, pending.expires_at - time.time())):
-                logger.info(f"[ApprovalManager] Notifying {len(self._notify_callbacks)} channel(s) for {pending.id}")
-                for cb in self._notify_callbacks:
-                    try:
-                        from flowly.live_voice.events import event_access_scope
-
-                        with event_access_scope(scope):
-                            await cb(pending)
-                    except Exception as e:
-                        logger.error('[ApprovalManager] Notify callback failed ({})', type(e).__name__)
                 decision = await future
             logger.info(f"[ApprovalManager] {pending.id} resolved: {decision}")
             reason = str(decision)
@@ -128,10 +123,29 @@ class ApprovalManager:
             self._futures.pop(pending.id, None)
             self._pending.pop(pending.id, None)
             self._control_scopes.pop(pending.id, None)
+            # Never retire a card before the request that drew it has gone
+            # out: stop telling surfaces that have not been told yet, and let
+            # a delivery already in flight finish, then close.
+            if not notifier.done():
+                notifier.cancel()
+            await asyncio.gather(notifier, return_exceptions=True)
             from flowly.live_voice.events import EventAccess, event_access_scope
 
             with event_access_scope(EventAccess(scopes=(scope,), canonical=False)):
                 await self._fire_close(pending, reason)
+
+    async def _notify(self, pending: PendingApproval, scope: SessionControlScope) -> None:
+        """Tell every surface about the request, one failure never stopping the rest."""
+        from flowly.live_voice.events import event_access_scope
+
+        for cb in self._notify_callbacks:
+            try:
+                with event_access_scope(scope):
+                    await cb(pending)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error('[ApprovalManager] Notify callback failed ({})', type(e).__name__)
 
     async def _fire_close(self, pending: PendingApproval, reason: str) -> None:
         """Tell every channel the approval is settled so it can drop its card.

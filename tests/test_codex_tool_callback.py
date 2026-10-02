@@ -306,11 +306,39 @@ class TestPolicyMigration:
     def test_approval_mapping(self):
         assert tm._approval_to_codex("on-request") == "on-request"
         assert tm._approval_to_codex("never") == "never"
-        assert tm._approval_to_codex("auto-review") == "untrusted"
+        # codex dropped approval_policy = "untrusted" and refuses the whole
+        # config on it; auto-review is on-request + the auto_review reviewer.
+        assert tm._approval_to_codex("auto-review") == "on-request"
         # No 1:1 codex equivalent → safest prompt-first policy.
         assert tm._approval_to_codex("granular") == "on-request"
         assert tm._approval_to_codex("bogus") == "on-request"
         assert tm._approval_to_codex(None) == "on-request"
+
+    def test_approvals_reviewer_mapping(self):
+        assert tm._approvals_reviewer_for("auto-review") == "auto_review"
+        for policy in ("on-request", "never", "granular", "bogus", None):
+            assert tm._approvals_reviewer_for(policy) is None
+
+    def test_auto_review_writes_config_codex_accepts(self, tmp_path):
+        import tomllib
+        target = tm.migrate_flowly_tools_to_codex(
+            codex_home=str(tmp_path), python_bin="/p",
+            approval_policy=tm._approval_to_codex("auto-review"),
+            approvals_reviewer=tm._approvals_reviewer_for("auto-review"),
+        )
+        text = target.read_text()
+        assert "untrusted" not in text
+        parsed = tomllib.loads(text)
+        assert parsed["approval_policy"] == "on-request"
+        assert parsed["approvals_reviewer"] == "auto_review"
+        # Root keys must precede the first table.
+        assert text.index("approvals_reviewer") < text.index("[mcp_servers.flowly-tools]")
+
+    def test_render_omits_reviewer_when_unset(self):
+        block = tm.render_managed_block(
+            python_bin="/py", env={}, approval_policy="never",
+        )
+        assert "approvals_reviewer" not in block
 
     def test_sandbox_mapping_only_emits_valid_profiles(self):
         # codex refuses the whole config on an unknown profile, so we only ever
@@ -322,10 +350,10 @@ class TestPolicyMigration:
 
     def test_render_writes_approval_policy_root_level(self):
         block = tm.render_managed_block(
-            python_bin="/py", env={}, approval_policy="untrusted",
+            python_bin="/py", env={}, approval_policy="on-request",
             default_permissions=":read-only",
         )
-        assert 'approval_policy = "untrusted"' in block
+        assert 'approval_policy = "on-request"' in block
         # Root keys must precede the first table (the callback block).
         assert block.index("approval_policy") < block.index("[mcp_servers.flowly-tools]")
 
@@ -375,11 +403,12 @@ class TestPolicyMigration:
         import tomllib
         target = tm.migrate_flowly_tools_to_codex(
             codex_home=str(tmp_path), python_bin="/p",
-            default_permissions=":workspace", approval_policy="untrusted",
-            include_callback=False,
+            default_permissions=":workspace", approval_policy="on-request",
+            approvals_reviewer="auto_review", include_callback=False,
         )
         parsed = tomllib.loads(target.read_text())
-        assert parsed["approval_policy"] == "untrusted"
+        assert parsed["approval_policy"] == "on-request"
+        assert parsed["approvals_reviewer"] == "auto_review"
         assert parsed["default_permissions"] == ":workspace"
 
 
