@@ -3222,6 +3222,7 @@ class AgentLoop:
         try:
             from flowly.codex.tool_migration import (
                 _approval_to_codex,
+                _approvals_reviewer_for,
                 _sandbox_to_permission,
                 migrate_flowly_tools_to_codex,
             )
@@ -3239,6 +3240,7 @@ class AgentLoop:
                 config=self._main_config,
                 default_permissions=_sandbox_to_permission(codex_cfg.sandbox),
                 approval_policy=_approval_to_codex(codex_cfg.approval_policy),
+                approvals_reviewer=_approvals_reviewer_for(codex_cfg.approval_policy),
                 discover_plugins=False,
                 include_callback=expose,
             )
