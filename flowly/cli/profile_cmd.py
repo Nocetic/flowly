@@ -22,6 +22,7 @@ from flowly.profile import (
     is_encrypted_profile_backup,
     list_profiles,
     read_profile_settings,
+    set_profile_stopped_by_user,
     update_profile_metadata,
     update_profile_settings,
 )
@@ -237,6 +238,29 @@ def profile_settings(
     except (ValueError, FileNotFoundError, OSError) as exc:
         _fail(exc)
     _emit({"settings": settings}, json_output)
+
+
+@profile_app.command("run-state")
+def profile_run_state(
+    name: str = typer.Argument(..., help="Named profile."),
+    state: str = typer.Argument(..., help="'stopped' or 'running'."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Record whether the owner wants this agent running.
+
+    Agents run until their owner stops them. 'stopped' keeps this one from
+    being started again when Flowly or the host restarts; 'running' lets it
+    start again. This records the choice; the app or the gateway that runs
+    the agent does the stopping and starting.
+    """
+    if state not in ("stopped", "running"):
+        _fail(ValueError("state must be 'stopped' or 'running'."))
+    try:
+        changed = set_profile_stopped_by_user(name, state == "stopped")
+        profile = describe_profile(name)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        _fail(exc)
+    _emit({"ok": True, "changed": changed, "profile": profile.to_dict()}, json_output)
 
 
 @profile_app.command("delete")

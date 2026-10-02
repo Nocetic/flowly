@@ -1,4 +1,3 @@
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -103,7 +102,6 @@ async def test_relay_rejects_even_a_valid_local_parent_proof(server, monkeypatch
 @pytest.mark.parametrize('owner', [None, HOST_OWNER, RequestOwner('account-a')])
 async def test_profile_rpc_preserves_authority_end_to_end_without_a_login_bearer(server, monkeypatch, owner):
     host = ProfileHost.__new__(ProfileHost)
-    host._capacity_changed = asyncio.Event()
     frames = []
 
     class Reply:
@@ -139,7 +137,6 @@ async def test_profile_rpc_preserves_authority_end_to_end_without_a_login_bearer
 @pytest.mark.asyncio
 async def test_account_call_cannot_downgrade_to_an_old_profile_runtime():
     host = ProfileHost.__new__(ProfileHost)
-    host._capacity_changed = asyncio.Event()
     ws = SimpleNamespace(closed=False, send_json=AsyncMock())
     runtime = _Runtime('writer', None, SimpleNamespace(), ws, 'runtime-old')
     with request_owner_scope(RequestOwner('account-a')):

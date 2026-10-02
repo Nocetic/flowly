@@ -503,6 +503,7 @@ def gateway(
     from flowly.cron.types import CronJob
     from flowly.cron import script_runner, skill_loader
     from flowly.cron.context import cron_context
+    from flowly.activity.recorder import ROUTINE_METADATA_KEY
     from flowly.agent import inflight
 
     # Tools hidden from the agent during cron runs.
@@ -590,10 +591,12 @@ def gateway(
     from flowly.gateway.server import GatewayServer
 
     import logging
-    if verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.WARNING)
+
+    from flowly.gateway_logs import bridge as _log_bridge
+
+    # Library records join Flowly's own log (and so Settings → Logs), with the
+    # known noise — scanner probes, channel reconnects — turned down.
+    _log_bridge.install(logging.DEBUG if verbose else logging.WARNING)
 
     # Bot-side daily file sink (additive). Under a service manager we then drop
     # loguru's default stderr sink, because stderr is redirected to the
@@ -604,6 +607,15 @@ def gateway(
     if _GATEWAY_FILE_SINK_ID is not None and _should_drop_stderr_sink(sys.stderr):
         try:
             logger.remove(0)  # loguru's default stderr handler
+        except (ValueError, OSError):
+            pass
+    else:
+        # In a terminal, show what the file keeps: INFO unless --verbose.
+        # Loguru's default sink prints DEBUG, which floods the terminal with
+        # internals (store paths, per-connection chatter).
+        try:
+            logger.remove(0)
+            logger.add(sys.stderr, level="DEBUG" if verbose else "INFO")
         except (ValueError, OSError):
             pass
 
@@ -1269,6 +1281,8 @@ def gateway(
                         stream_callback=_record_delta,
                         on_iteration=_record_iteration,
                         run_id=run_id,
+                        # The activity journal names the task after its routine.
+                        extra_metadata={ROUTINE_METADATA_KEY: {"name": job.name}},
                     )
                 except Exception as e:
                     err = f"Agent execution failed: {e}"
@@ -1981,6 +1995,9 @@ Respond to the user now:"""
         require_loopback_auth=local_runtime,
         advertise_control=not local_runtime,
         enable_profile_host=not local_runtime and current_profile_name() == "default",
+        # The primary keeps its agents running unless Flowly Desktop claims
+        # them (it runs them in its sandbox); see ProfileHost.claim_management.
+        autostart_profiles=True,
         on_voice_message=on_voice_message if legacy_voice_bridge_enabled else None,
         on_cron_run=on_cron_run,
         on_cron_reload=cron.reload,

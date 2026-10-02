@@ -7,6 +7,8 @@ from collections import OrderedDict
 from typing import Any
 
 from loguru import logger
+
+from flowly.gateway_logs.notable import notable
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.socket_mode.websockets import SocketModeClient
@@ -65,7 +67,7 @@ class SlackChannel(BaseChannel):
         try:
             auth = await self._web_client.auth_test()
             self._bot_user_id = auth.get("user_id")
-            logger.info(f"Slack bot connected as {self._bot_user_id}")
+            notable("channel.connected", channel="Slack", account=self._bot_user_id)
         except Exception as e:
             logger.warning(f"Slack auth_test failed: {e}")
 

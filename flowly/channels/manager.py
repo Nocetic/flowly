@@ -5,6 +5,8 @@ from typing import Any
 
 from loguru import logger
 
+from flowly.gateway_logs.notable import notable
+
 from flowly.bus.events import OutboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.channels.base import BaseChannel
@@ -16,6 +18,12 @@ from flowly.config.schema import Config
 # them silently, and anything validating a target counts them as real, so
 # the two cannot disagree about what exists.
 CHANNELS_WITHOUT_ADAPTER = frozenset({"cli", "tui", "desktop"})
+
+# How a channel is named to its owner (Settings → Logs).
+CHANNEL_LABELS = {
+    "telegram": "Telegram", "whatsapp": "WhatsApp", "imessage": "iMessage", "discord": "Discord",
+    "slack": "Slack", "web": "Flowly Cloud", "teams": "Microsoft Teams",
+}
 
 
 class ChannelManager:
@@ -140,11 +148,23 @@ class ChannelManager:
         tasks = []
         for name, channel in self.channels.items():
             logger.info(f"Starting {name} channel...")
-            tasks.append(asyncio.create_task(channel.start()))
+            tasks.append(asyncio.create_task(self._run_channel(name, channel)))
         
         # Wait for all to complete (they should run forever)
         await asyncio.gather(*tasks, return_exceptions=True)
     
+    @staticmethod
+    async def _run_channel(name: str, channel: Any) -> None:
+        """Run one channel; a channel that cannot start says so instead of
+        vanishing inside ``gather(return_exceptions=True)``."""
+        try:
+            await channel.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            notable("channel.failed", channel=CHANNEL_LABELS.get(name, name.title()), reason=exc)
+            raise
+
     async def stop_all(self) -> None:
         """Stop all channels and the dispatcher."""
         logger.info("Stopping all channels...")

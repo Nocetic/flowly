@@ -16,6 +16,8 @@ from typing import Any, Awaitable, Callable
 import websockets
 from loguru import logger
 
+from flowly.gateway_logs.notable import notable
+
 from flowly.browser_annotations import append_browser_annotation_context
 from flowly.bus.events import InboundMessage as _Base
 from flowly.bus.events import OutboundMessage
@@ -749,6 +751,20 @@ class WebChannel(BaseChannel):
                 },
             }))
             return
+        if method == "profiles.manager.claim":
+            # Only the Desktop on the agent's own machine runs its agents; a
+            # phone or a remote app must not tell the host to stop keeping them.
+            await ws.send(json.dumps({
+                "type": "rpc",
+                "id": rpc_id,
+                "sessionId": session_id,
+                "error": {
+                    "code": "PROFILE_MANAGER_LOCAL_ONLY",
+                    "message": "Only Flowly Desktop on this machine can manage its agents.",
+                    "retryable": False,
+                },
+            }))
+            return
 
         self._bind_profile_directory(session_id)
         if method in PROFILE_ROOM_METHODS:
@@ -875,7 +891,7 @@ class WebChannel(BaseChannel):
             except Exception as e:
                 if not self._running:
                     break
-                logger.warning(f"[WebChannel] Disconnected ({e}), reconnecting in {delay}s...")
+                notable("relay.lost", delay=delay, reason=e)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self._max_reconnect_delay)
 
@@ -1701,7 +1717,7 @@ class WebChannel(BaseChannel):
             self._relay_authority_enabled = False
             self._relay_principals.clear()
             self._relay_recipients.clear()
-            logger.info("[WebChannel] Connected to relay proxy")
+            notable("relay.connected")
 
             # Replay anything that piled up while disconnected. Done before
             # entering the recv loop so a fresh inbound message can't race
@@ -1895,11 +1911,11 @@ class WebChannel(BaseChannel):
             cron_session_id = msg.get("cronSessionId")
             if cron_session_id:
                 self._cron_session_id = cron_session_id
-                logger.info(
+                logger.debug(
                     f"[WebChannel] Relay confirmed agent ready — cronSessionId={cron_session_id[:8]}"
                 )
             else:
-                logger.info("[WebChannel] Relay confirmed agent ready (no cronSessionId)")
+                logger.debug("[WebChannel] Relay confirmed agent ready (no cronSessionId)")
             if self._on_ready:
                 try:
                     result = self._on_ready()
@@ -1918,13 +1934,13 @@ class WebChannel(BaseChannel):
 
         elif msg_type == "browser-connected":
             session_id = msg.get("sessionId", "")
-            logger.info(f"[WebChannel] Browser connected: {session_id}")
+            logger.debug(f"[WebChannel] Browser connected: {session_id}")
             if ws is self._ws and self._screen_rpc is not None:
                 self._screen_rpc.connected(session_id)
 
         elif msg_type == "browser-disconnected":
             session_id = msg.get("sessionId", "")
-            logger.info(f"[WebChannel] Browser disconnected: {session_id}")
+            logger.debug(f"[WebChannel] Browser disconnected: {session_id}")
             if ws is self._ws and self._screen_rpc is not None:
                 await self._screen_rpc.disconnected(session_id)
             self._pending.pop(session_id, None)
@@ -2114,7 +2130,7 @@ class WebChannel(BaseChannel):
 
                 try:
                     set_session_cwd(session_key, cwd)
-                    logger.info(
+                    logger.debug(
                         f"[WebChannel] chat.send pinned cwd={cwd} for session={session_key}"
                     )
                 except ValueError:

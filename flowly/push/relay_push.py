@@ -61,6 +61,13 @@ class PushRegistry:
                  platform: str = "ios", kind: str = "gateway") -> None:
         if not push_id or not push_secret:
             return
+        # The app registers on every connect, often several times in a row.
+        # The same registration again changes nothing: no rewrite, no log line.
+        wanted = (push_secret, gateway_id or "", kind or "gateway", platform or "ios")
+        if any(s.get("pushId") == push_id
+               and (s.get("pushSecret"), s.get("gatewayId"), s.get("kind"), s.get("platform")) == wanted
+               for s in self._subs):
+            return
         # Dedup by pushId — a device re-registering replaces its old entry.
         self._subs = [s for s in self._subs if s.get("pushId") != push_id]
         self._subs.append({
@@ -76,7 +83,7 @@ class PushRegistry:
             "createdAt": int(time.time() * 1000),
         })
         self._save()
-        logger.info(f"[push] registered device {push_id[:8]} ({platform})")
+        logger.debug(f"[push] registered device {push_id[:8]} ({platform})")
 
     def unregister(self, push_id: str) -> None:
         before = len(self._subs)

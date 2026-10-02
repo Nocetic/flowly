@@ -15,6 +15,8 @@ from typing import Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
+from flowly.gateway_logs.notable import notable
+
 from flowly.cron.timezone import schedule_timezone
 from flowly.cron.types import (
     CronJob,
@@ -1623,12 +1625,12 @@ class CronService:
             job.state.last_status = "error"
             error_text = f"Inactivity timeout after {_JOB_TIMEOUT_S}s"
             job.state.last_error = error_text
-            logger.error(f"Cron: job '{job.name}' {error_text}")
+            notable("routine.failed", name=job.name, reason=error_text)
         except Exception as e:
             job.state.last_status = "error"
             error_text = str(e)[:500]
             job.state.last_error = error_text
-            logger.error(f"Cron: job '{job.name}' failed: {e}")
+            notable("routine.failed", name=job.name, reason=e)
 
         job.state.last_run_at_ms = start_ms
         job.state.last_run_id = str(run["runId"])

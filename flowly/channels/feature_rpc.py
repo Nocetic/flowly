@@ -3486,66 +3486,93 @@ async def flowlets_create_from_template(params: dict) -> dict:
 # ── Logs ─────────────────────────────────────────────────────────────────────
 
 
-def _gateway_log_file():
-    """The gateway service's stderr log (loguru writes to stderr) — the same
-    file launchd/systemd capture to. Falls back to the stdout log. Returns a
-    Path or None when neither exists (e.g. a foreground `flowly gateway` run
-    whose output went to the terminal)."""
-    import platform
-    from pathlib import Path
+def _require_log_reader() -> None:
+    """The gateway log is the machine's: its owner and in-process callers read
+    it, an account that was only given voice or chat access does not."""
+    from flowly.live_voice.authority import current_request_owner
 
-    if platform.system().lower() == "windows":
-        log_dir = Path.home() / "AppData" / "Local" / "flowly" / "logs"
-    else:
-        from flowly.profile import get_flowly_home
+    owner = current_request_owner()
+    if owner is not None and owner.uid is not None:
+        raise FeatureRpcError("FORBIDDEN", "Only this machine's owner can read its logs.")
 
-        log_dir = get_flowly_home() / "logs"
-    for name in ("flowly-gateway.err.log", "flowly-gateway.out.log"):
-        p = log_dir / name
-        if p.exists():
-            return p
-    return None
+
+def _log_cursor(params: dict) -> tuple[int | None, str | None]:
+    cursor = params.get("cursor")
+    cursor = int(cursor) if isinstance(cursor, (int, float)) and not isinstance(cursor, bool) and cursor >= 0 else None
+    file = params.get("file")
+    return cursor, file if isinstance(file, str) and len(file) <= 256 else None
 
 
 def logs_tail(params: dict) -> dict:
-    """Tail the bot's own log file for the desktop Activity feed (pull
-    model: the client POLLS this; nothing is streamed/broadcast).
+    """Raw lines of the gateway's log, newest last (pull model: clients poll).
 
-    Params: ``lines`` (default 200, cap 500) and an optional ``cursor`` (byte
-    offset from a previous call). With a cursor only the NEW bytes' lines are
-    returned, so the poller gets exact increments with no duplicates; a cursor
-    beyond the file size (rotation/truncation) resets to a fresh tail. Returns
-    ``{lines, cursor, available}``."""
+    Params: ``lines`` (default 200, cap 500), ``cursor`` and ``file`` from a
+    previous reply. With both, only lines written since are returned; another
+    file (daily rotation) or a cursor past the end starts from the tail again.
+    Only complete lines are returned, redacted like ``logs.events``. Returns
+    ``{lines, cursor, file, available}``. Clients that predate ``file`` keep
+    working: without it every call is a fresh tail."""
+    from pathlib import Path
+
+    from flowly.gateway_logs.events import read_tail
+    from flowly.gateway_logs.redact import redact
+
+    _require_log_reader()
     limit = params.get("lines", 200)
     limit = max(1, min(int(limit) if isinstance(limit, (int, float)) else 200, 500))
-    cursor = params.get("cursor")
-    cursor = int(cursor) if isinstance(cursor, (int, float)) and cursor >= 0 else None
+    cursor, file = _log_cursor(params)
+    # A client that predates ``file`` sends a bare cursor: honour it against
+    # the current file, as before.
+    tail = _tail_without_file(cursor) if cursor is not None and file is None else read_tail(cursor, file)
+    home = str(Path.home())
+    return {"lines": [redact(text, home) for _offset, text in tail.lines][-limit:], "cursor": tail.cursor,
+            "file": tail.file_id, "available": tail.available}
 
-    path = _gateway_log_file()
-    if path is None:
-        return {"lines": [], "cursor": 0, "available": False}
+
+def _tail_without_file(cursor: int):
+    from flowly.gateway_logs.events import read_tail
+    from flowly.gateway_logs.files import current_log_file, file_id
+
+    path = current_log_file()
     try:
-        size = path.stat().st_size
-        if cursor is not None and cursor > size:
-            cursor = None  # rotated/truncated → fresh tail
-        if cursor is not None:
-            if cursor == size:
-                return {"lines": [], "cursor": size, "available": True}
-            with path.open("rb") as f:
-                f.seek(cursor)
-                chunk = f.read(size - cursor)
-        else:
-            # Fresh tail: read at most ~256 KB from the end — plenty for 500
-            # lines without slurping a huge file.
-            start = max(0, size - 256 * 1024)
-            with path.open("rb") as f:
-                f.seek(start)
-                chunk = f.read(size - start)
-        text = chunk.decode("utf-8", errors="replace")
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        return {"lines": lines[-limit:], "cursor": size, "available": True}
-    except Exception:
-        return {"lines": [], "cursor": 0, "available": False}
+        identity = file_id(path) if path is not None else None
+    except OSError:
+        identity = None
+    return read_tail(cursor, identity, path=path)
+
+
+def logs_events(params: dict) -> dict:
+    """The gateway's log as events: ``{events, cursor, file, available, reset}``.
+
+    Each event: ``id, ts (ms), level, source, message``, optional ``detail``
+    (a traceback or continuation), ``code`` + ``params`` for situations clients
+    explain in plain words, ``notable`` (worth showing by default),
+    ``signature`` (the same thing again) and ``count`` / ``firstTs`` when
+    repeats in this read were collapsed. Text is redacted (credentials, home
+    directory, full identifiers). Debug lines are never served.
+
+    ``view``: ``notable`` (default: lifecycle moments and problems),
+    ``issues`` (warnings and errors) or ``technical`` (every line). ``limit``:
+    1–500 (200), newest kept. ``reset`` says the client should replace what it
+    shows rather than append (first read, rotation, truncation)."""
+    from flowly.gateway_logs import events as log_events
+
+    _require_log_reader()
+    view = params.get("view", "notable")
+    if view not in ("notable", "issues", "technical"):
+        raise FeatureRpcError("INVALID_PARAMS", "view must be 'notable', 'issues' or 'technical'.")
+    limit = params.get("limit", 200)
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
+        raise FeatureRpcError("INVALID_PARAMS", "limit must be a whole number from 1 to 500.")
+    cursor, file = _log_cursor(params)
+    tail = log_events.read_tail(cursor, file)
+    parsed = [event for event in log_events.parse(tail.lines, tail.file_id) if event["level"] != "debug"]
+    if view == "notable":
+        parsed = [event for event in parsed if event["notable"]]
+    elif view == "issues":
+        parsed = [event for event in parsed if event["level"] in log_events.ISSUE_LEVELS]
+    return {"events": log_events.collapse(parsed)[-limit:], "cursor": tail.cursor, "file": tail.file_id,
+            "available": tail.available, "reset": tail.reset}
 
 
 # ── Skills ──────────────────────────────────────────────────────────────────
@@ -3863,25 +3890,123 @@ def sessions_attention() -> dict:
 
     An account-scoped request sees only the conversations ``sessions.list``
     would show it; a key it may not open is left out, not just its row."""
+    waiting = _pending_inputs()
+    visible = _session_visibility()
+    return {"sessions": {key: wait for key, wait in waiting.items() if visible(key)}}
+
+
+def _session_visibility():
+    """A predicate: may the current request see this conversation?
+
+    In-process callers see everything. An account-scoped request sees what
+    ``sessions.list`` would show it; a conversation whose file cannot be read
+    is not shown. The answer is kept per key for the one request.
+    """
     from flowly.live_voice.authority import current_request_owner
 
-    waiting = _pending_inputs()
     if current_request_owner() is None:
-        return {"sessions": waiting}
+        return lambda _key: True
     from flowly.session.ownership import read_session_metadata, session_visible
     from flowly.utils.helpers import safe_filename
 
     sessions_dir = get_flowly_home() / "sessions"
-    visible = {}
-    for key, wait in waiting.items():
+    known: dict[str, bool] = {}
+
+    def visible(key: str) -> bool:
+        if key not in known:
+            try:
+                path = sessions_dir / (safe_filename(key.replace(":", "_")) + ".jsonl")
+                metadata = read_session_metadata(path, key)
+                known[key] = session_visible(key, metadata if metadata is not None else {})
+            except Exception:  # noqa: BLE001 — unreadable means not shown
+                known[key] = False
+        return known[key]
+
+    return visible
+
+
+# ── Activity: the bot's tasks (docs/engineering/activity-journal.md) ──────
+
+_activity_pruned = False
+
+
+def _activity_now() -> dict[str, Any]:
+    """What is only true right now: running turns, conversations waiting on
+    the owner, and what each running turn is doing."""
+    from flowly.activity import get_activity_recorder
+
+    recorder = get_activity_recorder()
+    return {"running_ids": recorder.active_ids(), "waiting_keys": set(_pending_inputs()),
+            "live_steps": recorder.live_steps()}
+
+
+def _activity_int(params: dict, key: str, *, default: int | None, low: int, high: int) -> int | None:
+    value = params.get(key, default)
+    if value is None and default is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise FeatureRpcError("INVALID_PARAMS", f"{key} must be a whole number from {low} to {high}.")
+    return value
+
+
+def activity_list(params: dict) -> dict:
+    """Newest tasks first: ``{items, nextBefore, seenBefore}``.
+
+    ``before`` pages back from a task's ``startedAt``; ``limit`` is 1–100."""
+    global _activity_pruned
+    from flowly.activity import journal, store
+
+    limit = _activity_int(params, "limit", default=30, low=1, high=100)
+    before = _activity_int(params, "before", default=None, low=0, high=2**53)
+    if not _activity_pruned:
+        _activity_pruned = True
         try:
-            path = sessions_dir / (safe_filename(key.replace(":", "_")) + ".jsonl")
-            metadata = read_session_metadata(path, key)
-        except Exception:  # noqa: BLE001 — unreadable means not shown
-            continue
-        if session_visible(key, metadata if metadata is not None else {}):
-            visible[key] = wait
-    return {"sessions": visible}
+            from flowly.config.loader import load_config
+
+            store.prune(load_config().activity.retention_days)
+        except Exception:  # noqa: BLE001 — retention is housekeeping
+            pass
+    return journal.list_tasks(limit=limit, before=before, visible=_session_visibility(), **_activity_now())
+
+
+def activity_get(params: dict) -> dict:
+    """One task in full, with its steps: ``{task}``."""
+    from flowly.activity import journal
+
+    task_id = params.get("id")
+    if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128 or any(ord(c) < 32 for c in task_id):
+        raise FeatureRpcError("INVALID_PARAMS", "A task id is required.")
+    task = journal.get_task(task_id, visible=_session_visibility(), **_activity_now())
+    if task is None:
+        raise FeatureRpcError("NOT_FOUND", "This task is no longer in the activity log.")
+    return {"task": task}
+
+
+def activity_step(params: dict) -> dict:
+    """One step of a task in full, with its call's arguments and result: ``{step}``."""
+    from flowly.activity import get_activity_recorder, journal
+
+    task_id = params.get("id")
+    if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128 or any(ord(c) < 32 for c in task_id):
+        raise FeatureRpcError("INVALID_PARAMS", "A task id is required.")
+    index = _activity_int(params, "index", default=None, low=0, high=10_000)
+    if index is None:
+        raise FeatureRpcError("INVALID_PARAMS", "index is required.")
+    step = journal.get_step(task_id, index, visible=_session_visibility(),
+                            from_memory=get_activity_recorder().step_detail, **_activity_now())
+    if step is None:
+        raise FeatureRpcError("NOT_FOUND", "This step is no longer in the activity log.")
+    return {"step": step}
+
+
+def activity_seen(params: dict) -> dict:
+    """The owner has seen every task up to ``before`` (ms): ``{seenBefore}``."""
+    from flowly.activity import journal
+
+    before = _activity_int(params, "before", default=None, low=0, high=2**53)
+    if before is None:
+        raise FeatureRpcError("INVALID_PARAMS", "before is required.")
+    return {"seenBefore": journal.mark_seen(before)}
 
 
 def sessions_read(params: dict) -> dict:
@@ -5042,6 +5167,24 @@ from functools import partial as _partial
 import inspect as _inspect
 
 
+async def gateway_restart() -> dict:
+    """Restart the main agent from wherever its owner is (a phone, say).
+
+    The reply is sent before the restart, which the transport schedules once
+    ``willRestart`` is acked, so the app hears "restarting" rather than a cut
+    connection. A gateway that is not its machine's installed service (one
+    started in a terminal) cannot restart itself, and says so instead.
+    """
+    from flowly.integrations.service_control import service_runs_this_process
+
+    if not await service_runs_this_process():
+        raise FeatureRpcError(
+            "RESTART_UNAVAILABLE",
+            "This Flowly was started by hand, so it can only be restarted where it runs.",
+        )
+    return {"ok": True, "willRestart": True}
+
+
 def system_capabilities() -> dict:
     """Advertise this bot's version + its full feature-method surface.
 
@@ -5068,6 +5211,7 @@ def system_capabilities() -> dict:
             method.startswith("flowlets.") and not runtime.owns_flowlets
         )
         and not (method.startswith("voice.") and method != "voice.context" and not runtime.owns_shared_board)
+        and not (method.startswith("gateway.") and not runtime.owns_shared_board)
     ]
 
     return {
@@ -5228,6 +5372,9 @@ async def media_models_refresh(_params: dict) -> dict:
 _DISPATCH: dict[str, tuple] = {
     "voice.context": (voice_context, True, False),
     "system.capabilities": (system_capabilities, False, False),
+    # Only the main agent's gateway restarts itself; a named agent's runtime
+    # never exposes it.
+    "gateway.restart": (gateway_restart, False, True),
     "connections.list": (connections_list, False, False),
     "connections.secret.get": (connections_secret_get, True, False),
     "connections.set": (connections_set, True, True),
@@ -5335,6 +5482,7 @@ _DISPATCH: dict[str, tuple] = {
     "provider.set_flowly_account": (provider_set_flowly_account, True, True),
     "provider.bind_flowly_account": (provider_bind_flowly_account, True, True),
     "logs.tail": (logs_tail, True, False),
+    "logs.events": (logs_events, True, False),
     "media.library.list": (media_library_list, True, False),
     "media.library.get": (media_library_get, True, False),
     "media.library.star": (media_library_star, True, False),
@@ -5370,6 +5518,10 @@ _DISPATCH: dict[str, tuple] = {
     "kg.delete_entity": (kg_delete_entity, True, False),
     "sessions.list": (sessions_list, False, False),
     "sessions.attention": (sessions_attention, False, False),
+    "activity.list": (activity_list, True, False),
+    "activity.get": (activity_get, True, False),
+    "activity.step": (activity_step, True, False),
+    "activity.seen": (activity_seen, True, False),
     "sessions.read": (sessions_read, True, False),
     "audit.list": (audit_list, True, False),
     "audit.stats": (audit_stats, False, False),
@@ -5409,7 +5561,7 @@ FEATURE_METHODS = frozenset(_DISPATCH)
 # These surfaces are installation-wide and are owned exclusively by the
 # primary/default runtime. Named profile processes consume scoped task work
 # through the profile broker; they never expose a second Board or Flowlet API.
-_PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.", "voice.")
+_PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.", "voice.", "gateway.")
 
 # These methods may legitimately wait for a human/browser or a slow server.
 # WebSocket transports dispatch them in tracked background tasks so their
@@ -5467,7 +5619,7 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
         capabilities = resolve_runtime_capabilities()
         owns_surface = (
             capabilities.owns_shared_board
-            if method.startswith(("board.", "voice."))
+            if method.startswith(("board.", "voice.", "gateway."))
             else capabilities.owns_flowlets
         )
         if not owns_surface:

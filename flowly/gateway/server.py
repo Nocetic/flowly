@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import inspect
+import ipaddress
 import json
 import mimetypes
 import os
@@ -21,6 +22,8 @@ from weakref import WeakKeyDictionary
 import aiohttp
 from aiohttp import web
 from loguru import logger
+
+from flowly.gateway_logs.notable import notable
 
 from flowly.agent.subagent_registry import SubagentRegistry
 from flowly.agent.subagent_observation import client_event, event_version
@@ -259,6 +262,19 @@ _PROFILE_CLIENT_SUBSCRIPTION_LIMIT = 128
 _PROFILE_PROFILES_PER_CLIENT_LIMIT = 64
 _PROFILE_CONVERSATIONS_PER_CLIENT_LIMIT = 256
 _PROFILE_RUN_SUBSCRIPTION_LIMIT = 2048
+
+
+def _loopback_peer(request: Any) -> bool:
+    """Whether the request comes from this machine (not merely over TLS)."""
+    transport = getattr(request, "transport", None)
+    peer = transport.get_extra_info("peername") if transport else None
+    try:
+        address = ipaddress.ip_address(peer[0])
+    except (TypeError, ValueError, IndexError):
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.is_loopback
 
 
 def _valid_profile_id(value: str) -> bool:
@@ -559,6 +575,7 @@ class GatewayServer:
         # Child profile gateways disable this so runtimes never recursively
         # start or control sibling runtimes.
         enable_profile_host: bool = False,
+        autostart_profiles: bool = False,
         # Lets the owning agent cancel background title/compaction writers
         # before the session files are removed.
         on_session_delete: SessionDeleteCallback | None = None,
@@ -698,6 +715,9 @@ class GatewayServer:
         self._profile_run_subscriptions: OrderedDict[
             tuple[str, str], str
         ] = OrderedDict()
+        # Set when this gateway bounces itself (a settings change), so its
+        # goodbye says it is coming back.
+        self._restarting = False
         self._profile_host = None
         if enable_profile_host:
             from flowly.profile_host import ProfileHost
@@ -708,6 +728,7 @@ class GatewayServer:
                 on_room_event=self._broadcast_profile_room_event,
                 primary_rpc=self._profile_host_primary_rpc,
                 primary_event_lease=self._set_profile_host_primary_event_lease,
+                autostart=autostart_profiles,
             )
 
     @property
@@ -1364,7 +1385,7 @@ class GatewayServer:
         if display_authenticated:
             self._display_authenticated.add(ws)
         self.event_recipients.get(ws)
-        logger.info(f"[WS] Desktop client connected: {client_id}")
+        logger.debug(f"[WS] Desktop client connected: {client_id}")
 
         long_rpc_tasks: set[asyncio.Task[None]] = set()
 
@@ -1473,7 +1494,7 @@ class GatewayServer:
                     f"(cancelled {cancelled} pending, remaining: {len(self._extension_clients)})"
                 )
             elif is_current_connection:
-                logger.info(f"[WS] Desktop client disconnected: {client_id}")
+                logger.debug(f"[WS] Desktop client disconnected: {client_id}")
 
             # Auto-stop only when this was still the current socket. A stable
             # client id may already have reattached on a replacement WS; stale
@@ -1751,7 +1772,7 @@ class GatewayServer:
             # extensions. It now feeds the same provider registry.
             elif method == "extension.register":
                 result = self._register_browser_provider(client_id, params, legacy=True)
-                logger.info(
+                logger.debug(
                     f"[WS] Legacy browser extension registered: {client_id} "
                     f"as {result['provider']['id']} (total: {len(self._extension_clients)})"
                 )
@@ -1763,7 +1784,7 @@ class GatewayServer:
                 except ValueError as exc:
                     await self._ws_rpc_error(ws, rpc_id, "INVALID_REQUEST", str(exc))
                     return
-                logger.info(
+                logger.debug(
                     f"[WS] Browser provider registered: {result['provider']['id']} "
                     f"({result['provider']['type']})"
                 )
@@ -1890,6 +1911,16 @@ class GatewayServer:
                 rpc_id,
                 "PROFILE_HOST_UNAVAILABLE",
                 "This gateway does not manage isolated bot profiles.",
+            )
+            return
+        if method == "profiles.manager.claim" and not _loopback_peer(getattr(ws, "_req", None)):
+            # Only the Desktop on the agents' own machine runs them. A remote
+            # app claiming them would leave nobody running them.
+            await self._ws_rpc_error(
+                ws,
+                rpc_id,
+                "PROFILE_MANAGER_LOCAL_ONLY",
+                "Only Flowly Desktop on this machine can manage its agents.",
             )
             return
         self._bind_profile_client_request(client_id, method, params)
@@ -3264,7 +3295,7 @@ class GatewayServer:
 
             try:
                 set_session_cwd(session_key, cwd)
-                logger.info(f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}")
+                logger.debug(f"[GatewayWS] chat.send pinned cwd={cwd} for session={session_key}")
             except ValueError:
                 # Defensive: a client may ship a path that doesn't exist
                 # on this host (older client without per-kind cwd gating,
@@ -4296,6 +4327,8 @@ class GatewayServer:
 
     def _schedule_feature_restart(self) -> None:
         """Bounce the gateway after the ACK frame has flushed."""
+        # Clients are told this is a restart, not a stop, when it goes down.
+        self._restarting = True
 
         async def _run() -> None:
             await asyncio.sleep(0.5)
@@ -5470,6 +5503,25 @@ class GatewayServer:
         event = {"type": "event", "event": event_name, "data": data}
         await self._broadcast_clients(event)
 
+    async def _announce_stopping(self) -> None:
+        """Tell connected apps the gateway is going down, and whether it returns.
+
+        A dropped connection alone cannot say which it is: a settings change
+        restarts the gateway in a second, a stop does not come back. Desktop
+        keeps the agents (they run alongside this gateway) through a restart
+        and stops them at once on a stop. Best effort: a crash says nothing,
+        and an app that misses this falls back to a short grace.
+        """
+        from flowly.integrations.service_control import restart_requested
+
+        try:
+            await asyncio.wait_for(
+                self.broadcast_event("gateway.stopping", {"restarting": self._restarting or restart_requested()}),
+                timeout=1.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — stopping must never fail on a goodbye
+            logger.debug("Could not announce the gateway stopping: {}", exc)
+
     async def broadcast_event(self, event_name: str, data: dict) -> None:
         """Push a generic event to all connected WS clients.
 
@@ -5911,12 +5963,15 @@ class GatewayServer:
                 write_api_file(self.host, self.port, self._control_token)
             except Exception as exc:  # pragma: no cover
                 logger.debug("MCP control advertise failed: {}", exc)
-        logger.info(f"Gateway API listening on http://{self.host}:{self.port}")
+        notable("gateway.started", address=f"http://{self.host}:{self.port}")
+        if self._profile_host is not None:
+            self._profile_host.start_keeping_agents()
         if self.on_chat_message:
             logger.info(f"Desktop WebSocket available at ws://{self.host}:{self.port}/ws")
 
     async def stop(self) -> None:
         """Stop the server and clean up."""
+        await self._announce_stopping()
         if self._profile_host is not None:
             await self._profile_host.shutdown()
         self._profile_client_subscriptions.clear()
@@ -5959,4 +6014,4 @@ class GatewayServer:
             await self._site.stop()
         if self._runner:
             await self._runner.cleanup()
-        logger.info("Gateway API stopped")
+        notable("gateway.stopped")

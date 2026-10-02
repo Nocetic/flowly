@@ -28,6 +28,7 @@ import aiohttp
 from loguru import logger
 
 from flowly.exec.env_scrub import sanitize_subprocess_env
+from flowly.gateway_logs.notable import notable
 from flowly.profile import (
     MAX_NAMED_PROFILES,
     ProfileLimitError,
@@ -41,6 +42,7 @@ from flowly.profile import (
     read_profile_settings,
     reconcile_runtime_lease,
     resolve_profile_reference,
+    set_profile_stopped_by_user,
     update_profile_metadata,
     update_profile_settings,
     validate_profile_name,
@@ -68,7 +70,15 @@ _START_TIMEOUT_SECONDS = 90
 _STOP_TIMEOUT_SECONDS = 8
 _DELETE_CONFIRM_TTL_SECONDS = 60
 _DELETE_CONFIRM_MAX = 128
-_MAX_RUNTIMES = 6
+# Keeping the agents running. Flowly Desktop manages its machine's agents (it
+# runs them in its sandbox) and says so by renewing a short claim; without a
+# current claim this host keeps them itself. The grace gives a Desktop that is
+# open time to claim before the host starts anything.
+_KEEPER_STARTUP_GRACE_SECONDS = 10.0
+_KEEPER_INTERVAL_SECONDS = 30.0
+_KEEPER_RETRY_MAX_SECONDS = 600.0
+_MANAGER_CLAIM_MIN_MS = 10_000
+_MANAGER_CLAIM_MAX_MS = 300_000
 # A runtime that answers ``sessions.attention`` advertises this.
 _ATTENTION_CAPABILITY = "session-attention-v1"
 # Events after which what a bot waits on may have changed. A chat terminal is
@@ -87,7 +97,6 @@ _ATTENTION_CHAT_STATES = frozenset({"final", "aborted", "error"})
 _ATTENTION_DEBOUNCE_SECONDS = 0.3
 _ATTENTION_RPC_TIMEOUT_SECONDS = 10
 _ATTENTION_MAX_SESSIONS = 512
-_CAPACITY_WAIT_SECONDS = 120.0
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _SAFE_DELEGATED_TOOLS = (
     "read_file",
@@ -168,6 +177,12 @@ def _validate_named_profile(name: str) -> None:
             "The default profile uses the host gateway directly.",
         )
     validate_profile_name(name)
+
+
+def _autostart_reason(exc: BaseException) -> str:
+    """What went wrong starting an agent, in the words the error carries."""
+    message = exc.message if isinstance(exc, ProfileHostError) else str(exc)
+    return message.strip() or type(exc).__name__
 
 
 def _required_string(params: dict[str, Any], key: str) -> str:
@@ -318,8 +333,17 @@ class ProfileHost:
         on_room_event: ProfileRoomEventCallback | None = None,
         primary_rpc: PrimaryRpcCallback | None = None,
         primary_event_lease: PrimaryEventLeaseCallback | None = None,
+        autostart: bool = False,
     ):
         self.host_id = get_or_create_profile_host_id()
+        # Whether this host keeps the owner's agents running: it starts them
+        # when it comes up and brings back any that stop on their own, unless
+        # Flowly Desktop currently claims them (``profiles.manager.claim``).
+        self._autostart = autostart
+        self._keeper_task: asyncio.Task[None] | None = None
+        self._manager_claim_until = 0.0
+        # name -> (reason last reported, monotonic time of the next try, delay)
+        self._keeper_failures: dict[str, tuple[str, float, float]] = {}
         self._event_subscribers: dict[str, ProfileEventCallback] = {}
         if on_event is not None:
             self._event_subscribers["owner"] = on_event
@@ -348,8 +372,6 @@ class ProfileHost:
         self._task_audits: dict[tuple[str, str], dict[str, Any]] = {}
         self._task_audit_sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        self._capacity_lock = asyncio.Lock()
-        self._capacity_changed = asyncio.Event()
         self._closed = False
         self._manager_instance = str(uuid.uuid4())
         # Room updates fan out to every attached transport. The constructor
@@ -362,7 +384,7 @@ class ProfileHost:
 
         self._rooms = ProfileRoomService(
             target_rpc=self._target_rpc,
-            target_prepare=self.connect,
+            target_prepare=self._prepare_room_member,
             profile_directory=lambda: [profile.name for profile in list_profiles()],
             # The names their owner reads, so a group's members address each
             # other the way the person watching them does.
@@ -416,6 +438,7 @@ class ProfileHost:
                 "profiles.statuses",
                 "profiles.connect",
                 "profiles.stop",
+                "profiles.manager.claim",
                 "profiles.rpc",
                 "profiles.cron.notify",
                 *self._rooms.methods,
@@ -427,7 +450,8 @@ class ProfileHost:
             "processIsolation": "per-profile-gateway",
             "defaultProfileRpc": "direct",
             "wrappedDefaultProfileRpc": True,
-            "maxConcurrentRuntimes": _MAX_RUNTIMES,
+            # Every agent may run at once; the only bound is how many exist.
+            "maxConcurrentRuntimes": MAX_NAMED_PROFILES,
             "maxNamedProfiles": MAX_NAMED_PROFILES,
             "profileReadiness": True,
             "profileMessaging": {"authority": "gateway", "version": 1},
@@ -436,11 +460,17 @@ class ProfileHost:
                 "supported": ["isolated"],
                 "sharedCredentialBroker": False,
             },
+            # An agent runs until its owner stops it: it is never stopped for
+            # being idle or to make room, and an owner's stop survives restarts
+            # (only profiles.connect starts a stopped agent again). Agents run
+            # alongside this host and stop with it.
             "runtimePolicy": {
-                "strategy": "bounded-lru",
+                "strategy": "always-on",
                 "queuesWhileBusy": True,
-                "idleEviction": True,
-                "capacityWaitMs": int(_CAPACITY_WAIT_SECONDS * 1000),
+                "idleEviction": False,
+                "autostart": self._autostart,
+                "managerClaim": True,
+                "stickyStop": True,
             },
             "roomModes": room_capabilities["modes"],
             "roomLimits": {
@@ -542,9 +572,16 @@ class ProfileHost:
         if method == "profiles.statuses":
             return await self.statuses()
         if method == "profiles.connect":
-            return await self.connect(_required_string(params, "name").strip())
+            # ``explicit: false`` is an app opening something of the agent (its
+            # chat), not the owner pressing Start: it must not undo their stop.
+            return await self.connect(
+                _required_string(params, "name").strip(),
+                explicit=params.get("explicit") is not False,
+            )
+        if method == "profiles.manager.claim":
+            return self.claim_management(params.get("ttlMs") if isinstance(params, dict) else None)
         if method == "profiles.stop":
-            return await self.stop(_required_string(params, "name").strip())
+            return await self.stop(_required_string(params, "name").strip(), by_user=True)
         if method == "profiles.cron.notify":
             from flowly.push.profile_cron_push import notify_profile_cron
 
@@ -797,7 +834,10 @@ class ProfileHost:
         await self._emit(name, "directory", {"action": "deleted", "botId": current["botId"]})
         return {"ok": True, "deleted": name, "botId": current["botId"]}
 
-    async def connect(self, name: str) -> dict[str, Any]:
+    async def connect(self, name: str, *, explicit: bool = True) -> dict[str, Any]:
+        """Make the agent ready. ``explicit`` is the owner's own start, the one
+        way an agent they stopped runs again; otherwise a stopped agent stays
+        stopped and this raises PROFILE_STOPPED."""
         _validate_profile_selector(name)
         if name == "default":
             if self._primary_rpc is None:
@@ -807,10 +847,42 @@ class ProfileHost:
                     retryable=True,
                 )
         else:
+            await self._ensure_runtime(name, explicit=explicit)
+        return {"status": self.status(name)}
+
+    async def _prepare_room_member(self, name: str) -> dict[str, Any]:
+        """Ready a group member without overriding its owner's stop."""
+        _validate_profile_selector(name)
+        if name != "default":
             await self._ensure_runtime(name)
         return {"status": self.status(name)}
 
-    async def stop(self, name: str) -> dict[str, Any]:
+    def claim_management(self, ttl_ms: Any) -> dict[str, Any]:
+        """Flowly Desktop manages this machine's agents for the next ``ttl_ms``.
+
+        Desktop runs its agents in its own sandbox, so while its claim is
+        current this host leaves starting them to it. Desktop renews the claim
+        while it is connected; once it lapses (Desktop quit, or lost the
+        gateway) this host keeps the agents running itself.
+        """
+        try:
+            ttl = int(ttl_ms)
+        except (TypeError, ValueError):
+            raise ProfileHostError("INVALID_PARAMS", "ttlMs must be a number of milliseconds.") from None
+        ttl = max(_MANAGER_CLAIM_MIN_MS, min(ttl, _MANAGER_CLAIM_MAX_MS))
+        self._manager_claim_until = time.monotonic() + ttl / 1000
+        return {"ok": True, "ttlMs": ttl}
+
+    def _desktop_manages_agents(self) -> bool:
+        return time.monotonic() < self._manager_claim_until
+
+    async def stop(self, name: str, *, by_user: bool = False) -> dict[str, Any]:
+        """Stop an agent's runtime.
+
+        ``by_user`` is the owner's own stop: the agent then stays stopped,
+        across restarts, until it is started again. A stop Flowly makes for
+        its own reasons (before a delete or a change) is not remembered.
+        """
         _validate_profile_selector(name)
         await self._rooms.stop_for_profile(name)
         if name == "default":
@@ -847,7 +919,6 @@ class ProfileHost:
                 await self._close_runtime(runtime)
                 if not runtime.owned:
                     await self._wait_for_runtime_release(name, runtime.instance_id)
-                self._capacity_changed.set()
             else:
                 profile = describe_profile(name)
                 if reconcile_runtime_lease(profile.path, profile_name=name):
@@ -856,7 +927,9 @@ class ProfileHost:
                         "The bot runtime changed while Flowly was preparing to stop it. Try again.",
                         retryable=True,
                     )
-        await self._emit(name, "connection", {"state": "stopped"})
+        if by_user:
+            await asyncio.to_thread(set_profile_stopped_by_user, name, True)
+        await self._emit(name, "connection", {"state": "stopped", **({"byUser": True} if by_user else {})})
         return {"ok": True, "status": self.status(name)}
 
     async def _request_runtime_stop(self, runtime: _Runtime) -> None:
@@ -883,11 +956,6 @@ class ProfileHost:
                 "The bot did not confirm a safe runtime stop.",
                 retryable=True,
             )
-
-    async def _cooperative_close_runtime(self, runtime: _Runtime) -> None:
-        """Release an owner slot without interrupting another manager's turn."""
-        await self._request_runtime_stop(runtime)
-        await self._close_runtime(runtime)
 
     async def _wait_for_runtime_release(self, name: str, instance_id: str) -> None:
         """Wait for the acknowledged process to release its lease, fail closed on replacement."""
@@ -1463,6 +1531,90 @@ class ProfileHost:
             "toolTrace": [dict(item) for item in audit.get("toolTrace", [])],
         }
 
+    def start_keeping_agents(self) -> None:
+        """Keep the owner's agents running while this host runs.
+
+        Called once the gateway is serving. After a short grace (time for an
+        open Desktop to claim them), and then every so often, it starts every
+        agent its owner has not stopped that is not running: on boot, after
+        a crash, or once Desktop has quit. Does nothing on a host that does
+        not keep agents (see ``autostart``).
+        """
+        if not self._autostart or self._closed or self._keeper_task is not None:
+            return
+        self._keeper_task = asyncio.create_task(self._keep_agents(), name="profile-keeper")
+        self._background_tasks.add(self._keeper_task)
+        self._keeper_task.add_done_callback(self._background_tasks.discard)
+
+    async def _keep_agents(self) -> None:
+        await asyncio.sleep(_KEEPER_STARTUP_GRACE_SECONDS)
+        while not self._closed:
+            if not self._desktop_manages_agents():
+                await self._start_wanted_agents()
+            await asyncio.sleep(_KEEPER_INTERVAL_SECONDS)
+
+    async def _start_wanted_agents(self) -> None:
+        """One pass: start every agent that should run and does not."""
+        try:
+            profiles = await asyncio.to_thread(list_profiles)
+        except Exception as exc:  # noqa: BLE001 — an unreadable directory must not stop the gateway
+            self._report_keeper_failure("", f"{type(exc).__name__}: {exc}")
+            return
+        self._keeper_failures.pop("", None)
+        wanted = [
+            profile.name for profile in profiles
+            if not profile.is_default and profile.has_config and not profile.stopped_by_user
+        ]
+        # Forget agents that were deleted or stopped by their owner.
+        for name in list(self._keeper_failures):
+            if name and name not in wanted:
+                self._keeper_failures.pop(name, None)
+        started = 0
+        # One at a time: each start spawns a process and loads a model client,
+        # and a host coming up with every agent at once would stall itself.
+        for name in wanted:
+            if self._closed or self._desktop_manages_agents():
+                return
+            if self._runtime_is_open(self._runtimes.get(name)) or name in self._starting:
+                continue
+            failure = self._keeper_failures.get(name)
+            if failure is not None and time.monotonic() < failure[1]:
+                continue
+            try:
+                # The owner may have stopped (or deleted) it while the agents
+                # before it were starting; their word wins over this list.
+                if (await asyncio.to_thread(describe_profile, name)).stopped_by_user:
+                    continue
+                await self._ensure_runtime(name)
+            except asyncio.CancelledError:
+                raise
+            except FileNotFoundError:
+                continue  # deleted meanwhile: nothing to start, nothing wrong
+            except Exception as exc:  # noqa: BLE001 — one agent must not keep the others down
+                self._report_keeper_failure(name, _autostart_reason(exc))
+                continue
+            self._keeper_failures.pop(name, None)
+            started += 1
+        if started:
+            notable("agents.started", count=started)
+
+    def _report_keeper_failure(self, name: str, reason: str) -> None:
+        """Record a failed start and back off; log it only when it changes.
+
+        An agent that cannot start (a missing key, say) would otherwise write
+        the same problem into the log every pass. It is retried less and less
+        often, and reported again only if the reason changes.
+        """
+        previous = self._keeper_failures.get(name)
+        delay = _KEEPER_INTERVAL_SECONDS if previous is None else min(previous[2] * 2, _KEEPER_RETRY_MAX_SECONDS)
+        self._keeper_failures[name] = (reason, time.monotonic() + delay, delay)
+        if previous is not None and previous[0] == reason:
+            return
+        if name:
+            notable("agent.start_failed", name=name, reason=reason)
+        else:
+            notable("agents.autostart_failed", reason=reason)
+
     async def shutdown(self) -> None:
         if self._closed:
             return
@@ -1502,7 +1654,13 @@ class ProfileHost:
             self._locks[name] = lock
         return lock
 
-    async def _ensure_runtime(self, name: str) -> _Runtime:
+    async def _ensure_runtime(self, name: str, *, explicit: bool = False) -> _Runtime:
+        """The agent's runtime: the open one, an attach to a live one, or a start.
+
+        Only an ``explicit`` start (the owner's own) runs an agent its owner
+        stopped. Anything else (a read, a delegated task, a group message, the
+        keeper) gets PROFILE_STOPPED instead, so a stop stays a stop.
+        """
         if self._closed:
             raise ProfileHostError("HOST_STOPPED", "The profile host is shutting down.")
         _validate_named_profile(name)
@@ -1528,107 +1686,28 @@ class ProfileHost:
                 if pending is not None:
                     break
                 lease = reconcile_runtime_lease(profile.path, profile_name=name)
-                eviction: tuple[str, _Runtime, asyncio.Task[None]] | None = None
-                wait_for_capacity = False
-                async with self._capacity_lock:
-                    allocated = set(self._runtimes) | set(self._starting) | set(self._closing)
-                    if name in allocated or len(allocated) < _MAX_RUNTIMES:
-                        pending = asyncio.create_task(
-                            self._attach_runtime(name, lease)
-                            if lease
-                            else self._start_runtime(name),
-                            name=f"profile-{'attach' if lease else 'start'}:{name}",
-                        )
-                        self._starting[name] = pending
-                    else:
-                        candidate = self._idle_eviction_candidate(exclude=name)
-                        if candidate is not None:
-                            candidate_name, candidate_runtime = candidate
-                            self._runtimes.pop(candidate_name, None)
-                            candidate_runtime.state = "stopping"
-                            close_task = asyncio.create_task(
-                                self._cooperative_close_runtime(candidate_runtime),
-                                name=f"profile-idle-stop:{candidate_name}",
-                            )
-                            self._closing[candidate_name] = close_task
-                            eviction = (candidate_name, candidate_runtime, close_task)
-                        else:
-                            self._capacity_changed.clear()
-                            wait_for_capacity = True
-                if eviction is not None:
-                    candidate_name, candidate_runtime, close_task = eviction
-                    try:
-                        await asyncio.shield(close_task)
-                    except asyncio.CancelledError:
-                        result = await asyncio.gather(close_task, return_exceptions=True)
-                        async with self._capacity_lock:
-                            if self._closing.get(candidate_name) is close_task:
-                                self._closing.pop(candidate_name, None)
-                            if result and isinstance(result[0], BaseException):
-                                if self._runtime_is_open(candidate_runtime):
-                                    candidate_runtime.state = "connected"
-                                    self._runtimes[candidate_name] = candidate_runtime
-                                    self._schedule_attention_refresh(candidate_runtime)
-                            self._capacity_changed.set()
-                        raise
-                    except BaseException as exc:
-                        async with self._capacity_lock:
-                            if self._closing.get(candidate_name) is close_task:
-                                self._closing.pop(candidate_name, None)
-                            if self._runtime_is_open(candidate_runtime):
-                                candidate_runtime.state = "connected"
-                                self._runtimes[candidate_name] = candidate_runtime
-                                self._schedule_attention_refresh(candidate_runtime)
-                            self._capacity_changed.set()
-                        raise ProfileHostError(
-                            "PROFILE_CAPACITY",
-                            "Flowly could not release an idle bot runtime. Try again.",
-                            retryable=True,
-                        ) from exc
-                    async with self._capacity_lock:
-                        if self._closing.get(candidate_name) is close_task:
-                            self._closing.pop(candidate_name, None)
-                        self._capacity_changed.set()
-                    await self._emit(
-                        candidate_name,
-                        "connection",
-                        {"state": "stopped", "reason": "idle-capacity"},
+                if lease is None and profile.stopped_by_user and not explicit:
+                    raise ProfileHostError(
+                        "PROFILE_STOPPED",
+                        "This agent is stopped. Start it to use it.",
                     )
-                    continue
-                if wait_for_capacity:
-                    try:
-                        await asyncio.wait_for(
-                            self._capacity_changed.wait(), _CAPACITY_WAIT_SECONDS,
-                        )
-                    except asyncio.TimeoutError as exc:
-                        raise ProfileHostError(
-                            "PROFILE_CAPACITY",
-                            "All bot runtime slots are busy. Try again when an active turn finishes.",
-                            retryable=True,
-                        ) from exc
-                    continue
-                assert pending is not None
+                pending = asyncio.create_task(
+                    self._attach_runtime(name, lease)
+                    if lease
+                    else self._start_runtime(name),
+                    name=f"profile-{'attach' if lease else 'start'}:{name}",
+                )
+                self._starting[name] = pending
                 break
         try:
-            return await pending
+            runtime = await pending
         finally:
             if self._starting.get(name) is pending:
                 self._starting.pop(name, None)
-                self._capacity_changed.set()
-
-    def _idle_eviction_candidate(self, *, exclude: str) -> tuple[str, _Runtime] | None:
-        candidates = [
-            (profile, runtime)
-            for profile, runtime in self._runtimes.items()
-            if profile != exclude
-            and runtime.owned
-            and self._runtime_is_open(runtime)
-            and not runtime.active_runs
-            and not runtime.pending
-            and not any(owner == profile for owner, _session in self._broker_sessions)
-            and not self._rooms.is_profile_active(profile)
-        ]
-        return min(candidates, key=lambda item: item[1].last_used_at) if candidates else None
+        if explicit and profile.stopped_by_user:
+            # The owner started it again: their stop is over.
+            await asyncio.to_thread(set_profile_stopped_by_user, name, False)
+        return runtime
 
     @staticmethod
     def _runtime_is_open(runtime: _Runtime | None) -> bool:
@@ -1975,7 +2054,6 @@ class ProfileHost:
         finally:
             runtime.pending.pop(request_id, None)
             runtime.last_used_at = time.time()
-            self._capacity_changed.set()
 
     async def _read_runtime(self, runtime: _Runtime) -> None:
         try:
@@ -2014,7 +2092,6 @@ class ProfileHost:
             owns_runtime = self._runtimes.get(runtime.profile) is runtime
             if owns_runtime:
                 self._runtimes.pop(runtime.profile, None)
-                self._capacity_changed.set()
             if owns_runtime and not self._closed:
                 await self._emit(runtime.profile, "connection", {"state": "error"})
             for future in runtime.pending.values():
@@ -2156,7 +2233,6 @@ class ProfileHost:
                 self._cancel_profile_message_requests(profile, session_key, run_id)
                 if runtime is not None:
                     runtime.active_runs.discard(run_id)
-                    self._capacity_changed.set()
                 key = (profile, run_id)
                 waiter = self._broker_waiters.get(key)
                 if (waiter is not None or (profile, session_key) in self._broker_sessions

@@ -11,6 +11,15 @@ LABEL = "ai.flowly.gateway"
 GROUP = "/user.slice/user-1000.slice/user@1000.service/app.slice/ai.flowly.gateway.service"
 
 
+@pytest.fixture(autouse=True)
+def restart_mark(monkeypatch):
+    # A real restart_gateway call marks the process as restarting; keep that
+    # module-wide mark from leaking into later tests of the gateway's goodbye.
+    from flowly.integrations import service_control
+
+    monkeypatch.setattr(service_control, "_restart_requested", False)
+
+
 @pytest.fixture
 def observed(monkeypatch):
     pid = os.getpid()

@@ -239,7 +239,7 @@ class SecureExecTool(Tool):
 
         # Analyze command first (for logging)
         analysis = analyze_command(command)
-        logger.info(f"Exec request: {command[:50]}... (safe_bin={analysis.is_safe_bin}, resolved={analysis.resolved_path})")
+        logger.debug(f"Exec request: {command[:50]}... (safe_bin={analysis.is_safe_bin}, resolved={analysis.resolved_path})")
 
         # Execute with security checks
         result = await execute_command(request, self.config, self._store)

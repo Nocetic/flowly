@@ -220,6 +220,10 @@ class _RefusingKeyring:
 
 @pytest.fixture
 def refusing_keychain(monkeypatch: pytest.MonkeyPatch):
+    # A keychain that exists and refuses. Said outright rather than left to
+    # the macOS pre-flight, which reads the machine's real ~/Library and so
+    # made these tests pass or fail with whoever ran them.
+    monkeypatch.setattr(token_store, "_MACOS_KEYCHAIN_MISSING", False)
     monkeypatch.setitem(sys.modules, "keyring", _RefusingKeyring)
 
 

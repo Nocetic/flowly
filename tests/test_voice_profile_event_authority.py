@@ -111,7 +111,6 @@ async def test_retired_runtime_reader_cannot_publish_or_evict_its_replacement(mo
     replacement = object()
     host._runtimes = {'worker': replacement}
     host._closed = False
-    host._capacity_changed = asyncio.Event()
     handle = AsyncMock()
     monkeypatch.setattr(host, '_handle_runtime_event', handle)
     await asyncio.wait_for(host._read_runtime(runtime), 1)
@@ -221,7 +220,6 @@ async def test_private_close_survives_deletion_through_the_managed_transport(set
                                          (HOST_OWNER, 'runtime.voice.reserve'), (None, 'runtime.voice.reserve')])
 async def test_voice_work_requires_runtime_event_authority_capability(owner, method):
     host = ProfileHost.__new__(ProfileHost)
-    host._capacity_changed = asyncio.Event()
     socket = SimpleNamespace(closed=False, send_json=AsyncMock())
     runtime = _Runtime('worker', None, SimpleNamespace(), socket, INSTANCE,
                        capabilities=frozenset({'voice-owner-hop-v1'}), voice_parent_key=PARENT_KEY)
