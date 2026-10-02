@@ -160,22 +160,30 @@ PUSH_CONCURRENCY = 8
 #: The relay's answers for a registration that will never deliver again:
 #: unauthorized (secret rotated), not found, gone (the phone's token is dead).
 DEAD_REGISTRATION = (401, 404, 410)
+#: Answers that say the push never reached the relay, or the relay could not
+#: finish it: a network error (0) and the proxy's 502/503/504 (e.g. the relay
+#: restarting). Tried again after each delay. A retry that the relay had in
+#: fact delivered collapses on the device by the event key.
+TRANSIENT = (0, 502, 503, 504)
+RETRY_DELAYS: tuple[float, ...] = (1.0, 3.0)
 
 
 async def notify_devices(title: str, body: str, *, conversation_id: str = "",
-                         data: dict[str, str] | None = None) -> None:
+                         data: dict[str, str] | None = None) -> dict[str, int]:
     """Push ``title``/``body`` to every registered device via the relay.
 
     Best-effort and fire-and-forget friendly: a dead registration (401, 404,
     or 410 when the relay reports the phone's token is gone) is dropped;
     network errors are logged and ignored. ``conversation_id`` +
     ``gatewayId`` ride along as data for deep-linking the tap. Devices are
-    pushed in parallel, at most :data:`PUSH_CONCURRENCY` at a time.
+    pushed in parallel, at most :data:`PUSH_CONCURRENCY` at a time; a
+    :data:`TRANSIENT` failure is retried after each of :data:`RETRY_DELAYS`.
+    Returns and logs the counts sent / dropped / failed.
     """
     reg = get_push_registry()
     subs = reg.list()
     if not subs:
-        return
+        return {}
     base = _relay_base()
     gate = asyncio.Semaphore(PUSH_CONCURRENCY)
 
@@ -189,19 +197,34 @@ async def notify_devices(title: str, body: str, *, conversation_id: str = "",
             d.setdefault(key, ident)
         if conversation_id:
             d.setdefault("conversationId", conversation_id)
-        try:
-            async with gate:
-                status = await asyncio.to_thread(_send_one, base, sub, title, body, d)
-        except Exception as e:  # pragma: no cover
-            logger.debug(f"[push] notify {str(sub.get('pushId',''))[:8]} error: {e}")
-            return None
-        if status in DEAD_REGISTRATION:
-            return sub["pushId"]
-        if status and status >= 400:
-            logger.debug(f"[push] notify {sub['pushId'][:8]} → HTTP {status}")
-        return None
+        status = 0
+        for delay in (None, *RETRY_DELAYS):
+            if delay is not None:
+                await asyncio.sleep(delay)  # outside the gate: others keep going
+            try:
+                async with gate:
+                    status = await asyncio.to_thread(_send_one, base, sub, title, body, d)
+            except Exception as e:  # pragma: no cover
+                logger.debug(f"[push] notify {str(sub.get('pushId',''))[:8]} error: {e}")
+                status = 0
+            if status not in TRANSIENT:
+                break
+        return status
 
-    dead = [pid for pid in await asyncio.gather(*(push(sub) for sub in subs)) if pid]
-    for pid in dead:
-        reg.unregister(pid)
-        logger.info(f"[push] dropped dead registration {pid[:8]}")
+    statuses = await asyncio.gather(*(push(sub) for sub in subs))
+    for sub, status in zip(subs, statuses):
+        if status in DEAD_REGISTRATION:
+            reg.unregister(sub["pushId"])
+            logger.info(f"[push] dropped dead registration {sub['pushId'][:8]}")
+    # Counts only: no ids, tokens or text, so the line is safe to share.
+    summary = {
+        "sent": sum(1 for s in statuses if 200 <= s < 300),
+        "dropped": sum(1 for s in statuses if s in DEAD_REGISTRATION),
+        "failed": sum(1 for s in statuses if not 200 <= s < 300 and s not in DEAD_REGISTRATION),
+    }
+    failures = sorted({s for s in statuses if not 200 <= s < 300 and s not in DEAD_REGISTRATION})
+    logger.info(
+        f"[push] {summary['sent']}/{len(subs)} sent, {summary['dropped']} dropped, {summary['failed']} failed"
+        + (f" (HTTP {', '.join(str(s) for s in failures)})" if failures else "")
+    )
+    return summary
