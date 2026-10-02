@@ -13,7 +13,8 @@ _OPERATION = re.compile(r"^(?:[a-f0-9]{64}|[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-
 _METHODS = frozenset({
     'voice.open', 'voice.end', 'voice.delete', 'voice.tasks.dispatch',
     'voice.tasks.prepare', 'voice.tasks.steer', 'voice.tasks.cancel',
-    'voice.tasks.respond', 'voice.chats.open', 'voice.notice',
+    'voice.tasks.respond', 'voice.chats.open', 'voice.notice', 'voice.exec', 'voice.attachments',
+    'voice.tools.record',
 })
 _TOOL_READS = frozenset({'voice.tasks.events', 'voice.tasks.get', 'voice.tasks.requests', 'voice.focus'})
 

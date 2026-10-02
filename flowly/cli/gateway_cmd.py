@@ -1908,12 +1908,25 @@ Respond to the user now:"""
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None))
         )
         from flowly.live_voice.service import LiveVoiceService
+        from flowly.live_voice.exec import VoiceExec
         from flowly.live_voice.sessions import VoiceSessions
+        from flowly.profile import current_profile_name as _voice_exec_profile
 
+        async def _voice_exec(params, session_key):
+            # The same registry entry, policy, approvals and hooks as a chat
+            # turn. "voice" honors global and wildcard toolset routing.
+            enabled_toolsets, disabled_toolsets = agent._resolve_toolset_route("voice")
+            return await agent.tools.execute(
+                "exec", {**params, "session_key": session_key}, session_key=session_key,
+                platform="voice", enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            )
+
+        voice_exec = VoiceExec(_voice_exec, _voice_exec_profile)
         live_voice = LiveVoiceService(
             VoiceSessions(agent.sessions),
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None)),
             worker=lambda: getattr(getattr(agent, '_gateway_server', None), 'profile_host', None),
+            executor=lambda: voice_exec,
         )
         _feature_rpc.set_voice_provider(lambda: live_voice)
         from flowly.live_voice.context import VoiceContext
@@ -1928,6 +1941,17 @@ Respond to the user now:"""
             index=lambda: getattr(agent, "_memory_manager", None),
         )
         _feature_rpc.set_voice_context_provider(lambda: voice_context)
+        from flowly.live_voice.memory import VoiceMemory
+
+        async def _voice_memory_append(note):
+            # The agent's own memory_append entry: content guard, duplicate
+            # protection, size cap and "voice" toolset routing as in a chat turn.
+            enabled_toolsets, disabled_toolsets = agent._resolve_toolset_route("voice")
+            return await agent.tools.execute("memory_append", note, platform="voice",
+                                             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets)
+
+        voice_memory = VoiceMemory(_voice_memory_append)
+        _feature_rpc.set_voice_memory_provider(lambda: voice_memory)
         from flowly.live_voice.outputs import WorkOutputs
 
         work_outputs = WorkOutputs(agent.workspace, agent.sessions, _feature_rpc._artifact_store)
@@ -2648,9 +2672,10 @@ Respond to the user now:"""
                 # Closed-app push: wake the phone with an APNs/FCM notification
                 # so the request reaches the user even when the app is shut.
                 # Same relay path the board uses; tapping opens the app where
-                # the live event above drives approve/deny.
-                from flowly.push.approval_push import notify_approval_requested
-                await notify_approval_requested(pending)
+                # the live event above drives approve/deny. In the background:
+                # phones must never delay a decision made on another surface.
+                from flowly.push.approval_push import schedule_approval_push
+                schedule_approval_push(pending)
 
             _approval_mgr.add_notify_callback(_notify_approval)
 
