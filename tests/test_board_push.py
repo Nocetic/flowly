@@ -33,10 +33,12 @@ async def test_board_finished_push_payload(monkeypatch) -> None:
     assert calls == [{
         "title": "Board · Ship task",
         "body": "first line",
+        "conversation_id": "",
         "data": {
             "type": "board",
             "cardId": "c_1",
             "outcome": "done",
+            "eventKey": "board:c_1:done",
         },
     }]
 

@@ -8,7 +8,7 @@ import pytest
 
 from flowly.exec.approval_manager import ApprovalManager
 from flowly.exec.types import ExecRequest, PendingApproval
-from flowly.push import approval_push, relay_push
+from flowly.push import approval_push, notifications, relay_push
 
 
 def pending(identifier: str = 'approval-1') -> PendingApproval:
@@ -67,20 +67,20 @@ async def test_a_decision_before_delivery_closes_without_a_late_request():
 
 
 @pytest.mark.asyncio
-async def test_the_approval_push_runs_in_the_background(monkeypatch):
-    started, release = asyncio.Event(), asyncio.Event()
+async def test_the_approval_push_waits_for_screens_and_never_blocks(monkeypatch):
+    sent = []
 
     async def phones(title, body, **kwargs):
-        started.set()
-        await release.wait()
+        sent.append(kwargs['data']['eventKey'])
 
     monkeypatch.setattr(relay_push, 'notify_devices', phones)
-    approval_push.schedule_approval_push(pending())
-    await asyncio.wait_for(started.wait(), 1)
-    assert len(approval_push._inflight) == 1
-    release.set()
-    await asyncio.sleep(0.01)
-    assert not approval_push._inflight
+    monkeypatch.setattr(notifications, 'APPROVAL_PUSH_DELAY_SECONDS', 0.05)
+    approval_push.schedule_approval_push(pending('approval-unanswered'))
+    approval_push.schedule_approval_push(pending('approval-answered'))
+    approval_push.cancel_approval_push('approval-answered')
+    assert sent == []
+    await asyncio.sleep(0.15)
+    assert sent == ['approval:approval-unanswered']
 
 
 @pytest.mark.asyncio

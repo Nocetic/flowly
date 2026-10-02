@@ -1,55 +1,48 @@
-"""Exec-approval push notifications."""
+"""Approval push notifications.
+
+An approval is pushed to the phone only if it is still waiting
+:data:`~flowly.push.notifications.APPROVAL_PUSH_DELAY_SECONDS` after it was
+asked: at the computer, in a voice call or on the strip it is answered first
+and the phone stays silent. The notification says that something needs a
+decision, never what: a command can hold a secret, a path or a recipient, and
+the text passes through Apple's and Google's push services and the lock
+screen. Tapping it opens the app, where the live ``exec.approval.requested``
+event drives the decision. See ``docs/engineering/notification-policy.md``.
+"""
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
-from loguru import logger
+from flowly.push import notifications
 
-# Strong references: a fire-and-forget task with none can be collected mid-send.
-_inflight: set[asyncio.Task[None]] = set()
+TITLE = "Approval needed"
+COMMAND_BODY = "Flowly wants to run a command. Open Flowly to review it."
+ACTION_BODY = "Flowly wants to take an action. Open Flowly to review it."
+
+
+def approval_notice(pending: Any) -> notifications.Notice:
+    approval_id = str(getattr(pending, "id", "") or "")
+    kind = str(getattr(pending, "kind", "") or "action")
+    return notifications.Notice(
+        kind="approval",
+        key=notifications.event_key("approval", approval_id),
+        title=TITLE,
+        body=COMMAND_BODY if kind in ("exec", "codex") else ACTION_BODY,
+        data={"id": approval_id},
+    )
 
 
 async def notify_approval_requested(pending: Any) -> None:
-    """Send a best-effort push when an approval is requested.
-
-    Mirrors ``notify_board_finished`` — same relay ``/api/push/send`` endpoint
-    and the same device registry — so an approval request reaches the user's
-    phone even when the app is closed. The push is informational: tapping it
-    opens the app, where the live ``exec.approval.requested`` event drives the
-    in-app approve/deny UI. Callers on the approval path use
-    :func:`schedule_approval_push`, which never blocks the approval wait.
-    """
-    try:
-        from flowly.push import relay_push
-
-        command = (
-            getattr(getattr(pending, "request", None), "command", "") or ""
-        ).strip()
-        await relay_push.notify_devices(
-            "Approval required",
-            (command or "A command needs your approval")[:140],
-            data={
-                "type": "approval",
-                "id": str(getattr(pending, "id", "") or ""),
-            },
-        )
-    except Exception as exc:  # pragma: no cover - best-effort
-        logger.debug(f"[approval] push notify skipped: {exc}")
+    """Push the approval now (for a caller that has already waited)."""
+    await notifications.deliver(approval_notice(pending))
 
 
 def schedule_approval_push(pending: Any) -> None:
-    """Send the approval push in the background.
+    """Push the approval later unless it is settled first. Never blocks."""
+    notifications.schedule(approval_notice(pending), notifications.APPROVAL_PUSH_DELAY_SECONDS)
 
-    The push reaches phones through one relay call per registered device, which
-    can take seconds; awaited on the notify path it delayed every approval
-    decision by that long. Best-effort: no running loop means no push.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    task = loop.create_task(notify_approval_requested(pending), name="approval-push")
-    _inflight.add(task)
-    task.add_done_callback(_inflight.discard)
+
+def cancel_approval_push(approval_id: str) -> None:
+    """The approval was settled: a push that has not gone out never will."""
+    notifications.cancel(notifications.event_key("approval", approval_id))
