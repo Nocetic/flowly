@@ -96,6 +96,7 @@ async def test_phones_are_pushed_in_parallel_and_dead_registrations_dropped(tmp_
         return statuses.get(sub['pushId'], 200)
 
     monkeypatch.setattr(relay_push, '_send_one', send)
+    monkeypatch.setattr(relay_push, 'RETRY_DELAYS', (0.01, 0.01))
     started = time.monotonic()
     await relay_push.notify_devices('Approval required', 'ls ~/Desktop')
     # 16 one after another would take 4 s.
