@@ -18,7 +18,7 @@ import json
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
-
+from typing import Iterable
 
 # Predicates where the object is a value (not an entity)
 VALUE_PREDICATES = frozenset({
@@ -454,48 +454,57 @@ class KnowledgeGraph:
             "relationship_types": predicates,
         }
 
-    def summary(self, max_entities: int = 20) -> str:
+    def summary(self, max_entities: int = 20, exclude_triple_ids: Iterable[str] = ()) -> str:
         """Compact text summary for system prompt injection.
 
         Format:
         - Alice (person): email=alice@example.com, works_at → Acme Corp
+
+        ``exclude_triple_ids`` leaves those triples out as if they did not
+        exist (an entity left with none is not listed). A voice call passes
+        the triples governance withholds, so its summary is the agent's own
+        minus what may not leave the agent.
         """
         conn = self._conn()
+        excluded = sorted({str(value) for value in exclude_triple_ids})
+        live = "t.valid_to IS NULL"
+        if excluded:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS summary_excluded (id TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM summary_excluded")
+            conn.executemany("INSERT OR IGNORE INTO summary_excluded (id) VALUES (?)", [(v,) for v in excluded])
+            live += " AND t.id NOT IN (SELECT id FROM summary_excluded)"
 
-        rows = conn.execute("""
-            SELECT e.id, e.name, e.type, COUNT(t.id) as cnt
-            FROM entities e
-            LEFT JOIN triples t ON t.subject = e.id AND t.valid_to IS NULL
-            GROUP BY e.id
-            HAVING cnt > 0
-            ORDER BY cnt DESC
-            LIMIT ?
-        """, (max_entities,)).fetchall()
+        try:
+            rows = conn.execute(f"""
+                SELECT e.id, e.name, e.type, COUNT(t.id) as cnt
+                FROM entities e
+                LEFT JOIN triples t ON t.subject = e.id AND {live}
+                GROUP BY e.id
+                HAVING cnt > 0
+                ORDER BY cnt DESC
+                LIMIT ?
+            """, (max_entities,)).fetchall()
 
-        if not rows:
+            lines = []
+            for eid, name, etype, _ in rows:
+                triples = conn.execute(
+                    f"""SELECT t.predicate, COALESCE(e.name, t.object) as obj_display
+                       FROM triples t
+                       LEFT JOIN entities e ON t.object = e.id
+                       WHERE t.subject = ? AND {live}
+                       ORDER BY t.predicate""",
+                    (eid,),
+                ).fetchall()
+                if not triples:
+                    continue
+
+                parts = []
+                for pred, obj in triples:
+                    if pred in VALUE_PREDICATES:
+                        parts.append(f"{pred}={obj}")
+                    else:
+                        parts.append(f"{pred} → {obj}")
+                lines.append(f"- {name} ({etype}): {', '.join(parts)}")
+        finally:
             conn.close()
-            return ""
-
-        lines = []
-        for eid, name, etype, _ in rows:
-            triples = conn.execute(
-                """SELECT t.predicate, COALESCE(e.name, t.object) as obj_display
-                   FROM triples t
-                   LEFT JOIN entities e ON t.object = e.id
-                   WHERE t.subject = ? AND t.valid_to IS NULL
-                   ORDER BY t.predicate""",
-                (eid,),
-            ).fetchall()
-            if not triples:
-                continue
-
-            parts = []
-            for pred, obj in triples:
-                if pred in VALUE_PREDICATES:
-                    parts.append(f"{pred}={obj}")
-                else:
-                    parts.append(f"{pred} → {obj}")
-            lines.append(f"- {name} ({etype}): {', '.join(parts)}")
-
-        conn.close()
         return "\n".join(lines)
