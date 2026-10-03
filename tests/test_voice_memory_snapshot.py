@@ -205,3 +205,29 @@ def test_profile_without_line_breaks_still_fits(env):
     (workspace / 'IDENTITY.md').write_text('ğ' * 5_000)
     profile = reader.snapshot({})['profile']
     assert 0 < len(profile.encode()) <= PROFILE_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_a_profile_rpc_pinned_to_this_agent_reaches_the_snapshot_and_recall(env, monkeypatch):
+    """The phone pins the agent (expectedBotId). The runtime checks it and the
+    strict voice validators never see it; another agent's id is refused."""
+    from flowly.profile import current_profile_name, ensure_profile_bot_id
+
+    reader, workspace, _, _, _ = env
+    (workspace / 'USER.md').write_text('Hakan builds Flowly.')
+    monkeypatch.setattr(feature_rpc, '_voice_snapshot_provider', lambda: reader)
+
+    class Context:
+        async def search(self, params):
+            assert set(params) <= {'query', 'limit'}
+            return {'scope': {'profile': 'default', 'botId': 'bot-1'}, 'facts': [{'text': 'Hakan builds Flowly.'}]}
+
+    monkeypatch.setattr(feature_rpc, '_voice_context_provider', lambda: Context())
+    bot_id = ensure_profile_bot_id(current_profile_name()).bot_id
+    result, _ = await feature_rpc.dispatch('voice.memory.snapshot', {'expectedBotId': bot_id})
+    assert 'Hakan builds Flowly.' in text_of(result, 'user')
+    recall, _ = await feature_rpc.dispatch('voice.context', {'query': 'Hakan', 'limit': 8, 'expectedBotId': bot_id})
+    assert recall['facts']
+    with pytest.raises(feature_rpc.FeatureRpcError) as refused:
+        await feature_rpc.dispatch('voice.memory.snapshot', {'expectedBotId': 'another-agent'})
+    assert refused.value.code == 'PROFILE_IDENTITY_CHANGED'

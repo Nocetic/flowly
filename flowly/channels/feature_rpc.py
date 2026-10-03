@@ -5717,6 +5717,10 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
             validate_chat_target(params)
         except ValueError as exc:
             raise FeatureRpcError('PROFILE_IDENTITY_CHANGED', str(exc)) from exc
+        if method in _PER_RUNTIME_VOICE_METHODS:
+            # The pin is checked; the strict voice validators accept only
+            # their own fields (profiles.rpc adds the pin for a phone).
+            params = {key: value for key, value in params.items() if key != 'expectedBotId'}
     if method.startswith(_PRIMARY_RUNTIME_METHOD_PREFIXES) and method not in _PER_RUNTIME_VOICE_METHODS:
         from flowly.runtime_capabilities import resolve_runtime_capabilities
 
