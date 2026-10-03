@@ -233,7 +233,9 @@ Web: `5cdf02e` backend prompt; `5b34009` config export.
 - iOS: additions in `FlowlyTests/LiveVoiceTaskContextTests.swift` and
   `LiveVoiceCoreClientTests.swift` (run in Xcode).
 - Relay: `live-voice-eval.test.ts`, additions in `live-voice-openai.test.ts`.
-  (`live-voice-audio.test.ts` hangs on `main` too; unrelated.)
+  `live-voice-audio.test.ts` used to hang `npm test` (and the deploy script):
+  its teardown removed the journal before the relay stored final usage; fixed on
+  Relay `main` in `c2b5683`. Relay and Web are merged (`4f83f5f`, `ed425e5`; Web pushed).
 - Web: addition in `lib/live-voice/openai-config.test.ts`.
 
 Each new behavior was checked to fail without its fix (removing the
