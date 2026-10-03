@@ -1937,6 +1937,15 @@ Respond to the user now:"""
             index=lambda: getattr(agent, "_memory_manager", None),
         )
         _feature_rpc.set_voice_context_provider(lambda: voice_context)
+        from flowly.live_voice.memory_snapshot import VoiceMemorySnapshot
+
+        # The same sources and rules as this agent's own chat prompt.
+        voice_snapshot = VoiceMemorySnapshot(
+            agent.workspace, state_db=_feature_rpc.state_db, profile=_voice_scope,
+            persona=lambda: getattr(agent.context, "persona", "default"),
+            search_enabled=lambda: getattr(agent, "_memory_manager", None) is not None,
+        )
+        _feature_rpc.set_voice_snapshot_provider(lambda: voice_snapshot)
         from flowly.live_voice.memory import VoiceMemory
 
         async def _voice_memory_append(note):

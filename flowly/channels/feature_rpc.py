@@ -1882,9 +1882,10 @@ _voice_provider = None
 _voice_access_verifier = None
 _voice_context_provider = None
 _voice_memory_provider = None
+_voice_snapshot_provider = None
 _work_output_provider = None
 # Served by every runtime for its own profile, not only by the primary one.
-_PER_RUNTIME_VOICE_METHODS = frozenset({"voice.context", "voice.memory.append"})
+_PER_RUNTIME_VOICE_METHODS = frozenset({"voice.context", "voice.memory.append", "voice.memory.snapshot"})
 
 
 def set_work_output_provider(provider) -> None:
@@ -1924,6 +1925,27 @@ async def voice_memory_append(params: dict) -> dict:
         raise FeatureRpcError("UNAVAILABLE", "Voice memory is not ready on this runtime.")
     try:
         return await memory.append(params)
+    except VoiceError as exc:
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+
+
+def set_voice_snapshot_provider(provider) -> None:
+    global _voice_snapshot_provider
+    _voice_snapshot_provider = provider
+
+
+async def voice_memory_snapshot(params: dict) -> dict:
+    """The agent's memory and identity for a voice call (see memory_snapshot)."""
+    import asyncio
+
+    from flowly.live_voice.sessions import VoiceError
+
+    snapshot = _voice_snapshot_provider() if _voice_snapshot_provider is not None else None
+    if snapshot is None:
+        raise FeatureRpcError("UNAVAILABLE", "Voice memory is not ready on this runtime.")
+    try:
+        # File and SQLite reads; keep them off the event loop.
+        return await asyncio.to_thread(snapshot.snapshot, params)
     except VoiceError as exc:
         raise FeatureRpcError(exc.code, str(exc)) from exc
 
@@ -5424,6 +5446,7 @@ async def media_models_refresh(_params: dict) -> dict:
 _DISPATCH: dict[str, tuple] = {
     "voice.context": (voice_context, True, False),
     "voice.memory.append": (voice_memory_append, True, False),
+    "voice.memory.snapshot": (voice_memory_snapshot, True, False),
     "system.capabilities": (system_capabilities, False, False),
     # Only the main agent's gateway restarts itself; a named agent's runtime
     # never exposes it.
