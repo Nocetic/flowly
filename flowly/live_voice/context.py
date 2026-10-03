@@ -67,10 +67,17 @@ class VoiceContext:
             folded = text.casefold()
             return sum(word in folded for word in words) if words else 1
 
-        def add(text: str, ref: str, revision: str, updated_at: Any = None, **provenance) -> None:
+        searched: set[int] = set()
+
+        def add(text: str, ref: str, revision: str, updated_at: Any = None, *, matched: bool = False,
+                **provenance) -> None:
             text = redact_secrets(text).strip()
-            if not text or (words and not rank(text)):
+            # A memory-search match is relevant by the agent's own search (as
+            # in its chat), even without the query's literal words.
+            if not text or (words and not matched and not rank(text)):
                 return
+            if matched:
+                searched.add(len(facts))
             facts.append({'text': text[:900], 'sourceRef': ref, 'revision': revision,
                           'updatedAt': updated_at, **provenance})
 
@@ -134,7 +141,7 @@ class VoiceContext:
                     snippet = str(match.snippet).strip()
                     if snippet and snippet in text:
                         add(snippet, f'memory://file/{quote(relative, safe="/")}#L{match.start_line}', revision,
-                            updated_at, startLine=match.start_line, endLine=match.end_line)
+                            updated_at, matched=True, startLine=match.start_line, endLine=match.end_line)
                 sources['search'] = {'status': 'ok' if index else 'unavailable'}
             except (OSError, ValueError, RuntimeError, asyncio.TimeoutError):
                 sources['search'] = {'status': 'unavailable'}
@@ -166,7 +173,10 @@ class VoiceContext:
             sources.update({name: {'status': 'unavailable'} for name in ('user', 'memory', 'search', 'knowledge')})
 
         unique: dict[str, dict] = {}
-        for fact in sorted(facts, key=lambda f: -rank(f['text'])):
+        # Keyword overlap ranks; a memory-search match counts one more, so a
+        # semantic hit is not pushed out by facts that merely share a word.
+        order = sorted(range(len(facts)), key=lambda i: -(rank(facts[i]['text']) + (i in searched)))
+        for fact in (facts[i] for i in order):
             unique.setdefault(fact['text'].casefold(), fact)
         selected = list(unique.values())[:limit]
         return {'scope': {'profile': scope_profile, 'botId': bot_id}, 'facts': selected, 'sources': sources,
