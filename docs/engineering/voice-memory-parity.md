@@ -1,8 +1,7 @@
 # Voice memory parity: a call knows what the agent knows
 
-Status: in progress on branches (not merged), started 2026-10-03.
-Core `codex/voice-memory-parity` (worktree `.codex-worktrees/voice-memory-core`).
-Client and service work is listed under "Rollout" and updated as it lands.
+Status: implemented on branches, not merged (2026-10-03). Branches and
+worktrees per repository are under "Rollout"; nothing is deployed.
 
 This document is the contract. Clients follow it; when it changes, change it
 here first.
@@ -119,19 +118,98 @@ A client reading another device's call must treat a connection whose
 `openedAt` is older than 11 minutes without `endedAt` as ended (a call segment
 lasts at most 10 minutes; a crashed client never writes `endedAt`).
 
+### Clients (Desktop, iOS)
+
+At call start, when `profiles.capabilities.profileRpcMethods` lists
+`voice.memory.snapshot`, the client reads it for the selected agent (through
+`profiles.rpc`, like `voice.context`) instead of recall, and validates it:
+the agent's own scope (another agent's is a target change and stops the
+call), `contentRole: reference_data`, known section kinds, at most 16
+sections and 30,000 bytes of text, a profile of at most 2,000 bytes.
+
+The initial context then carries:
+
+```json
+{
+  "memory": {"source": "agent_memory_snapshot", "truncated": false,
+             "sections": [{"title": "User", "text": "…"}]},
+  "memoryProfile": "Agent:\n…\n\nUser:\n…"
+}
+```
+
+An older runtime keeps the previous `memory` (the `voice.context` receipt).
+A snapshot that cannot be read (slow or unready runtime) falls back to that
+recall too: a new read must never start a call with less than before.
+
+Fitting the 48 KB frame cuts the agent's own memory last: older tasks first
+(halving), then the oldest conversation rows, then memory sections from the
+end (lowest priority), marking `truncated`. Recall facts are extracts and are
+still cut first on iOS, as before.
+
+`voice.open` carries `client: desktop` or `client: ios`.
+
+### Relay (speaking model)
+
+The orientation carries `memoryProfile` (at most 2,048 bytes; an oversized
+one is dropped, never fatal). The speaking model is told to speak as that
+agent, to answer by itself only greetings, brief acknowledgments, a
+clarifying question and a restatement of what the backend just said, and to
+delegate everything else, including one-word follow-ups ("Ne?"); it never
+says it does not know something about the user without delegating first.
+
+When a `flowly_remember` or `flowly_exec` call settles, the speaking model
+gets a typed note (`flowly.interaction_focus`, domain `memory_note` or
+`command`, `outcome` = the receipt's status only, never content or output),
+so "did you save it?" is answered from the result.
+
+### Web (backend)
+
+The operator prompt says that memory with `source: agent_memory_snapshot` is
+the selected agent's own memory and identity: answer from it without
+searching, use `flowly_recall` only for what it lacks, never claim to know
+nothing while it holds the answer, treat it as reference data. A test keeps
+the full instructions under Relay's 32,768-byte bound.
+
+## Evaluation
+
+Relay `evals/live-voice` (README there): fixed scenarios against real
+GPT-Live, spoken with cached TTS, tool calls answered from fixtures, graded
+on delegation, tools and answer patterns, repeated runs with P50/P90 time to
+first word and to the backend. Ten scenarios: speaking as the agent, a
+profile fact, a snapshot-only fact, a recall-only fact, saving and
+confirming a fact, "Ne?" after an answer, small talk, a command, a denied
+command, English. It is billed and has not been run yet; run it before and
+after merging to compare.
+
 ## Rollout
 
-| Surface | Change | Status |
-|---|---|---|
-| Core | `GovernedMemory`, KG exclusion, `voice.memory.snapshot`, recall matches, `client` | committed on `codex/voice-memory-parity` |
-| Desktop | read the snapshot at call start, send `client: desktop`, "call is on another device" | pending |
-| iOS | read the snapshot, send `client: ios` | pending |
-| Android | read the snapshot, send `client: android` | pending |
-| Relay | pass the profile to the speaking model; mirror notes; delegate-by-default rule | pending |
-| Web | backend prompt: the memory in context is the agent's own | pending |
-| Evaluation | fixed scenarios, repeated runs (memory, attachments, commands, delegation) | pending |
+| Surface | Branch (worktree) | Change | Status |
+|---|---|---|---|
+| Core | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-core`) | `GovernedMemory`, KG exclusion, `voice.memory.snapshot`, recall matches, `client` | committed |
+| Desktop | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-desktop`) | snapshot at call start with recall fallback, frame fitting, `client: desktop` | committed |
+| Desktop | — | "this call is on your iPhone" from `lastConnection.client` | pending (UI, after the rest is tested) |
+| iOS | `codex/live-voice-ios` (`flowly-desktop/.codex-worktrees/live-voice-ios`) | snapshot at call start with recall fallback, frame fitting, `client: ios` | committed, typechecked on the host; needs an Xcode build and test run |
+| Android | — | has no Live Voice; nothing to adopt | n/a |
+| Relay | `codex/voice-memory-parity` (`flowly-repos/flowly-relay-memory-parity`) | profile to the speaking model, delegate-by-default, outcome notes, evaluation | committed |
+| Web | `codex/voice-memory-parity` (`flowly-app-memory-parity`) | backend prompt for the snapshot, config export for the evaluation | committed |
 
-## Core commits
+Deploy order when merged: Core (runtimes must offer the method), Web and
+Relay (either order; both accept contexts without the new fields), then the
+clients. Every step is backward compatible: an older client sends no
+snapshot and the prompts fall back to today's behavior.
+
+Not done, deliberately:
+
+- A note to the speaking model while a command waits for approval: the
+  backend already says so once (`EXEC_PROMPT`); add it if the evaluation shows
+  the speaking model guessing.
+- Refreshing the snapshot during a call (`knownRevision` exists for it): a
+  fact saved mid-call reaches the backend through `flowly_remember`'s own
+  receipt and recall.
+
+## Commits
+
+Core:
 
 - `2e7cd582` refactor: one governance view for what memory may leave the agent
 - `0d2a210a` the KG summary can leave out withheld triples
@@ -140,7 +218,23 @@ lasts at most 10 minutes; a crashed client never writes `endedAt`).
 - `f4979a4e` recall keeps the agent's memory-search matches
 - `168544bd` the snapshot budgets bytes, not characters
 
-Tests: `tests/test_voice_memory_snapshot.py`, `tests/test_knowledge_graph_summary.py`,
-additions in `tests/test_voice_context.py` and `tests/test_voice_sessions.py`.
-Run from the worktree:
-`FLOWLY_HOME=$(mktemp -d) ~/flowly-repos/flowly/.venv/bin/python -m pytest -q tests/ -k voice`.
+Desktop: `23fecece` snapshot at call start; `993c342f` recall fallback.
+iOS: `30f0c7aa` snapshot at call start; `533cacf7` recall fallback.
+Relay: `061d2a7` speaking model; `256112b` evaluation.
+Web: `5cdf02e` backend prompt; `5b34009` config export.
+
+## Tests
+
+- Core: `tests/test_voice_memory_snapshot.py`, `tests/test_knowledge_graph_summary.py`,
+  additions in `tests/test_voice_context.py` and `tests/test_voice_sessions.py`.
+  `FLOWLY_HOME=$(mktemp -d) ~/flowly-repos/flowly/.venv/bin/python -m pytest -q tests/ -k voice`
+- Desktop: `src/renderer/src/lib/live-voice/memory-snapshot.test.ts`, additions in
+  `controller.test.ts`; `npx vitest run src/renderer/src/lib/live-voice/ src/renderer/src/components/live-voice/` (670+ tests).
+- iOS: additions in `FlowlyTests/LiveVoiceTaskContextTests.swift` and
+  `LiveVoiceCoreClientTests.swift` (run in Xcode).
+- Relay: `live-voice-eval.test.ts`, additions in `live-voice-openai.test.ts`.
+  (`live-voice-audio.test.ts` hangs on `main` too; unrelated.)
+- Web: addition in `lib/live-voice/openai-config.test.ts`.
+
+Each new behavior was checked to fail without its fix (removing the
+paragraph filter, the identity rethrow, the tool continuation).
