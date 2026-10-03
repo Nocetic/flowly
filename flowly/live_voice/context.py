@@ -6,7 +6,6 @@ prompt is accepted. The authenticated profile host chooses the runtime.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import sqlite3
@@ -16,11 +15,9 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from flowly.compaction.redaction import redact_secrets
+from flowly.live_voice.memory_view import GovernedMemory, read_db, read_memory_file, revision_of
 from flowly.live_voice.sessions import VoiceError, bounded_text, integer
 from flowly.memory.summary import SENTINEL_END, SENTINEL_START
-
-MAX_SOURCE_BYTES = 128_000
-MAX_GOVERNED = 10_000
 
 
 def validate_context(params: dict) -> dict:
@@ -30,17 +27,17 @@ def validate_context(params: dict) -> dict:
             'limit': integer(params.get('limit', 8), 'limit', minimum=1, maximum=12)}
 
 
-def _revision(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:24]
+_revision = revision_of
+_read_db = read_db
 
 
-def _read_db(path: Path, sql: str, values: tuple = ()) -> list[dict]:
-    connection = sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True, timeout=0.25)
-    connection.row_factory = sqlite3.Row
-    try:
-        return [dict(row) for row in connection.execute(sql, values)]
-    finally:
-        connection.close()
+def manual_memory(text: str) -> str:
+    """MEMORY.md without its generated block(s): the human-written notes.
+
+    The generated block renders governed items; callers take those from the
+    governance view instead, so a withdrawn item is never read back from it.
+    """
+    return _manual(text)
 
 
 def _manual(text: str) -> str:
@@ -64,10 +61,6 @@ class VoiceContext:
         words = set(re.findall(r'\w+', query.casefold()))
         facts: list[dict] = []
         sources: dict[str, dict] = {}
-        protected: list[str] = []
-        governed: list[dict] = []
-        excluded_triples: set[str] = set()
-        governance_ok = True
         now = datetime.now(timezone.utc).isoformat()
 
         def rank(text: str) -> int:
@@ -81,49 +74,32 @@ class VoiceContext:
             facts.append({'text': text[:900], 'sourceRef': ref, 'revision': revision,
                           'updatedAt': updated_at, **provenance})
 
-        gov_path = self.state_db('memory_governance.sqlite3')
-        try:
-            if gov_path.exists():
-                governed = _read_db(gov_path, 'SELECT * FROM memory_items LIMIT ?', (MAX_GOVERNED + 1,))
-                if len(governed) > MAX_GOVERNED:
-                    raise ValueError('Governance projection limit')
-                for item in governed:
-                    allowed = (item['status'] == 'active' and item['privacy_level'] == 'normal'
-                               and (not item['valid_to'] or item['valid_to'] > now)
-                               and (not item['valid_from'] or item['valid_from'] <= now))
-                    if not allowed:
-                        if item['text'].strip():
-                            protected.append(item['text'].casefold().strip())
-                        if item['ref_kind'] == 'kg_triple' and item['ref_id']:
-                            excluded_triples.add(str(item['ref_id']))
-                    else:
-                        add(item['text'], f"memory://item/{quote(item['id'], safe='')}", _revision(item),
-                            item.get('updated_at'), sourceSession=item['source_session'],
-                            sourceMessageIds=json.loads(item['source_message_ids']))
-            sources['governance'] = {'status': 'ok' if governed else 'empty', 'revision': _revision(governed)}
-        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
-            governance_ok = False
-            sources['governance'] = {'status': 'unavailable'}
-            facts = []
+        governed = GovernedMemory.load(self.state_db, now)
+        governance_ok = governed.available
+        protected, excluded_triples = governed.protected, governed.excluded_triples
+        if governance_ok:
+            try:
+                for item in governed.allowed:
+                    add(item['text'], f"memory://item/{quote(item['id'], safe='')}", _revision(item),
+                        item.get('updated_at'), sourceSession=item['source_session'],
+                        sourceMessageIds=json.loads(item['source_message_ids']))
+            except (ValueError, KeyError, TypeError):
+                # A malformed governed row is an unreadable index: export nothing.
+                governance_ok = False
+                facts = []
+        sources['governance'] = ({'status': governed.status, 'revision': governed.revision}
+                                 if governance_ok else {'status': 'unavailable'})
 
         def read_file(relative: str) -> tuple[str, str, str] | None:
-            path = (self.workspace / relative).resolve()
-            if not path.is_relative_to(self.workspace):
+            source = read_memory_file(self.workspace, relative)
+            if source is None:
                 return None
-            if not path.is_file():
-                return None
-            if path.stat().st_size > MAX_SOURCE_BYTES:
-                raise ValueError('Memory source limit')
-            with path.open('rb') as handle:
-                raw = handle.read(MAX_SOURCE_BYTES + 1)
-            if len(raw) > MAX_SOURCE_BYTES:
-                raise ValueError('Memory source limit')
-            text = raw.decode('utf-8')
+            text, revision, updated_at = source
             # A manually copied governed item does not bypass its privacy or
             # lifecycle. Conservatively withhold that file if it contains one.
-            if any(item in text.casefold() for item in protected):
+            if governed.withholds(text):
                 return None
-            return _manual(text), _revision(raw.hex()), datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+            return _manual(text), revision, updated_at
 
         if governance_ok:
             for name, relative in [('user', 'USER.md'), ('memory', 'memory/MEMORY.md')]:
