@@ -16,6 +16,8 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$")
 _DIAGNOSTIC_ID = re.compile(r"^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$", re.I)
 MAX_MESSAGES = 4000
 MAX_CONNECTIONS = 100
+# The apps a call can run in (voice.open ``client``).
+VOICE_CLIENTS = frozenset({"ios", "android", "desktop", "web"})
 MAX_TOOL_RECORDS = 100
 MAX_ATTACHMENT_RECORDS = 200
 TOOL_STATUSES = frozenset({"running", "completed", "failed", "denied", "timed_out", "interrupted"})
@@ -99,6 +101,11 @@ class VoiceSessions:
         language = params.get("language", "en")
         if not isinstance(language, str) or language not in {"en", "tr", "es"}:
             raise VoiceError("INVALID_PARAMS", "Unsupported conversation language.")
+        # Which app holds the call, so another of the user's devices can say
+        # where it is running. Optional: older clients do not send it.
+        client = params.get("client")
+        if client is not None and client not in VOICE_CLIENTS:
+            raise VoiceError("INVALID_PARAMS", "Unsupported voice client.")
 
         def update(session: Session) -> dict:
             if session.metadata and session.metadata.get("kind") != "voice":
@@ -117,7 +124,7 @@ class VoiceSessions:
                 raise VoiceError("TARGET_CONFLICT", "Resume this conversation with its original agent.")
             existing = next((c for c in voice["connections"] if c["id"] == connection_id), None)
             if existing:
-                if existing["language"] != language:
+                if existing["language"] != language or existing.get("client") != client:
                     raise VoiceError("CONFLICT", "Connection identity already has different settings.")
                 if existing is not voice["connections"][-1] or existing["endedAt"]:
                     raise VoiceError("STALE_CONNECTION", "Create a new connection to resume this conversation.")
@@ -127,6 +134,7 @@ class VoiceSessions:
             voice["connections"].append({
                 "id": connection_id, "generation": len(voice["connections"]) + 1,
                 "language": language, "openedAt": _now(), "endedAt": None,
+                **({'client': client} if client else {}),
                 **({'diagnosticRunId': diagnostic_run_id} if diagnostic_run_id else {}),
             })
             voice["revision"] += 1
