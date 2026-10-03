@@ -181,17 +181,79 @@ confirming a fact, "Ne?" after an answer, small talk, a command, a denied
 command, English. It is billed and has not been run yet; run it before and
 after merging to compare.
 
+## Incident 2026-10-04: the phone's memory requests were refused
+
+The first device tests found every iOS call starting without memory. iOS
+pins the agent on profile RPCs (expectedHostId, expectedBotId);
+`ProfileHost.rpc` forwards the pin as `expectedBotId`; the runtime's
+`feature_rpc.dispatch` checked it but left it in the params; the strict voice
+validators (`validate_snapshot`, `validate_context`) refused the unknown field
+(INVALID_PARAMS). Both landed in `5faedbf8` (2026-09-23), so iOS recall had
+always been refused; Desktop sends no pin. The snapshot inherited the path.
+No test sent the request a client actually sends.
+
+Fix (`31dd01bd`): dispatch drops the pin for the per-runtime voice methods
+after checking it. Prevention:
+
+- **Contract** `tests/fixtures/live_voice_client_requests.json`: the exact
+  envelopes Desktop and iOS send (snapshot and recall, default and named
+  agent, pinned and unpinned). Desktop
+  (`src/renderer/src/lib/live-voice/contracts/`) and iOS
+  (`FlowlyTests/Contracts/`) keep byte-identical copies and test that their
+  request builders produce them; `scripts/check_voice_client_contract.py`
+  fails on a drifted copy.
+- **Core contract test** `tests/test_voice_client_contract.py` sends every
+  envelope through the real routing (ProfileHost.rpc, runtime dispatch,
+  strict validators); without the fix exactly the iOS envelopes fail.
+- **Probe** `scripts/voice_memory_probe.py`: asks the running local gateway
+  the clients' way for every running agent and prints shapes (read-only).
+  Run it before asking anyone to test a call. On 2026-10-04 all four agents
+  answered both clients' envelopes.
+- **Report** `scripts/voice_memory_report.py`: from gateway.log, how calls
+  started (snapshot or recall, served or refused).
+- **Logs**: Core logs what each snapshot and recall served (shape only);
+  iOS logs how a call's memory started (`live-voice-memory`).
+
+## Spoken language (2026-10-04)
+
+A new conversation opened in the client's interface language, so a Turkish
+speaker with an English interface was greeted in English. iOS ignored the
+host's `spokenLanguage` and never reported one; Desktop reported it only via
+`flowly_recall`, which the snapshot makes rare.
+
+The host now owns it (`flowly/live_voice/language.py`):
+
+- learned from the owner's own transcribed speech (`voice.append`, every
+  client) and the model's reports (`voice.language`); kept per owner and
+  agent in `voice_language.json` (atomic, bounded);
+- conservative detection (Turkish, English, Spanish); speech moves the
+  preference only when the same new language is heard twice in a row, a
+  model report at once;
+- `voice.open` opens a new conversation in it (the client's language only
+  when none is known) and returns it as `spokenLanguage`; an existing
+  conversation keeps its own.
+
+Clients start the call in the returned language (Desktop already did; iOS
+`75b0d0cf`). Relay's speaking model starts and stays in it and never
+drifts into English on its own; the greeting names it (`eadc621`). Web
+tells the backend to write in it (`d03b83f`).
+
+Known limit: the first call to an agent, with nothing learned yet, opens
+in the interface language; the owner's first sentence in another language
+switches the call, and the next one opens in it.
+
 ## Rollout
 
-| Surface | Branch (worktree) | Change | Status |
-|---|---|---|---|
-| Core | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-core`) | `GovernedMemory`, KG exclusion, `voice.memory.snapshot`, recall matches, `client` | committed |
-| Desktop | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-desktop`) | snapshot at call start with recall fallback, frame fitting, `client: desktop` | committed |
-| Desktop | — | "this call is on your iPhone" from `lastConnection.client` | pending (UI, after the rest is tested) |
-| iOS | `codex/live-voice-ios` (`flowly-desktop/.codex-worktrees/live-voice-ios`) | snapshot at call start with recall fallback, frame fitting, `client: ios` | committed, typechecked on the host; needs an Xcode build and test run |
-| Android | — | has no Live Voice; nothing to adopt | n/a |
-| Relay | `codex/voice-memory-parity` (`flowly-repos/flowly-relay-memory-parity`) | profile to the speaking model, delegate-by-default, outcome notes, evaluation | committed |
-| Web | `codex/voice-memory-parity` (`flowly-app-memory-parity`) | backend prompt for the snapshot, config export for the evaluation | committed |
+Nothing merged except as noted; branches and worktrees:
+
+| Surface | Branch (worktree) | State |
+|---|---|---|
+| Core | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-core`) | snapshot, pin fix, contract, probe, report, language |
+| Desktop | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-desktop`) | snapshot, greeting (merged in), contract test |
+| iOS | `codex/live-voice-ios` (`flowly-desktop/.codex-worktrees/live-voice-ios`) | snapshot, greeting, ringing, call screen, language, contract test |
+| Relay | `main` has memory and greeting (merged, deployed by the owner); `codex/voice-language` (`flowly-repos/flowly-relay-language`) | language rules |
+| Web | `main` has the memory prompt (merged, pushed); `codex/voice-language` (`flowly-app-language`) | language rule |
+| Android | — | no Live Voice |
 
 Deploy order when merged: Core (runtimes must offer the method), Web and
 Relay (either order; both accept contexts without the new fields), then the
