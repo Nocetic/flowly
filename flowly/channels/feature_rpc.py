@@ -1940,26 +1940,49 @@ async def voice_memory_snapshot(params: dict) -> dict:
 
     from flowly.live_voice.sessions import VoiceError
 
+    from loguru import logger
+
     snapshot = _voice_snapshot_provider() if _voice_snapshot_provider is not None else None
     if snapshot is None:
+        logger.warning("Live Voice memory snapshot requested before the runtime was ready")
         raise FeatureRpcError("UNAVAILABLE", "Voice memory is not ready on this runtime.")
     try:
         # File and SQLite reads; keep them off the event loop.
-        return await asyncio.to_thread(snapshot.snapshot, params)
+        result = await asyncio.to_thread(snapshot.snapshot, params)
     except VoiceError as exc:
+        logger.warning("Live Voice memory snapshot refused: {}", exc.code)
         raise FeatureRpcError(exc.code, str(exc)) from exc
+    # Shape only, never content: what a call started with.
+    sections = result.get("sections") or []
+    logger.info(
+        "Live Voice memory snapshot served: sections={} bytes={} profileBytes={} truncated={} partial={} unchanged={}",
+        ",".join(section.get("kind", "?") for section in sections),
+        sum(len(str(section.get("text", "")).encode()) for section in sections),
+        len(str(result.get("profile", "")).encode()), bool(result.get("truncated")),
+        bool(result.get("partial")), bool(result.get("unchanged")),
+    )
+    return result
 
 
 async def voice_context(params: dict) -> dict:
     from flowly.live_voice.sessions import VoiceError
 
+    from loguru import logger
+
     context = _voice_context_provider() if _voice_context_provider is not None else None
     if context is None:
+        logger.warning("Live Voice recall requested before the runtime was ready")
         raise FeatureRpcError("UNAVAILABLE", "Voice context is not ready on this runtime.")
     try:
-        return await context.search(params)
+        result = await context.search(params)
     except VoiceError as exc:
+        logger.warning("Live Voice recall refused: {}", exc.code)
         raise FeatureRpcError(exc.code, str(exc)) from exc
+    # Shape only, never the query or the facts.
+    logger.info("Live Voice recall served: query={} facts={}",
+                "empty" if not str(params.get("query") or "").strip() else "given",
+                len(result.get("facts") or []))
+    return result
 
 
 def set_voice_provider(provider) -> None:
