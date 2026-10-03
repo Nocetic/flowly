@@ -10,6 +10,7 @@ from typing import Any
 
 from flowly.live_voice.access import VoicePrincipal
 from flowly.live_voice.authority import RequestOwner
+from flowly.live_voice.language import VoiceLanguagePreferences, detect_language
 from flowly.session.manager import Session, SessionManager
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$")
@@ -75,16 +76,19 @@ def _public(session: Session) -> dict:
 
 
 class VoiceSessions:
-    def __init__(self, sessions: SessionManager, *, principal: VoicePrincipal | None = None):
+    def __init__(self, sessions: SessionManager, *, principal: VoicePrincipal | None = None,
+                 languages: VoiceLanguagePreferences | None = None):
         self.sessions = sessions
         self._owner = {'kind': 'account', 'uid': principal.uid} if principal else {'kind': 'host'}
+        # The language the owner speaks to each agent (see language.py).
+        self._languages = languages
 
     def for_principal(self, principal: VoicePrincipal | None) -> VoiceSessions:
         """A request-local view; identity must come from verified access, not RPC data."""
-        return VoiceSessions(self.sessions, principal=principal)
+        return VoiceSessions(self.sessions, principal=principal, languages=self._languages)
 
     def for_owner(self, owner: RequestOwner) -> VoiceSessions:
-        view = VoiceSessions(self.sessions)
+        view = VoiceSessions(self.sessions, languages=self._languages)
         view._owner = {'kind': 'account', 'uid': owner.uid} if owner.uid is not None else {'kind': 'host'}
         return view
 
@@ -106,6 +110,9 @@ class VoiceSessions:
         client = params.get("client")
         if client is not None and client not in VOICE_CLIENTS:
             raise VoiceError("INVALID_PARAMS", "Unsupported voice client.")
+        # A new conversation starts in the language the owner speaks to this
+        # agent; the client's (interface) language only when none is known.
+        spoken = (self._languages.get(self._owner, bot_id) if self._languages else None) or language
 
         def update(session: Session) -> dict:
             if session.metadata and session.metadata.get("kind") != "voice":
@@ -117,7 +124,7 @@ class VoiceSessions:
                     "kind": "voice", "voiceConversationId": params["conversationId"],
                     "voiceOwner": dict(self._owner),
                     "title": {"tr": "Sesli sohbet", "es": "Conversación de voz", "en": "Voice chat"}[language],
-                    "voice": {"profile": profile, "botId": bot_id, "revision": 0, "connections": [], "spokenLanguage": language},
+                    "voice": {"profile": profile, "botId": bot_id, "revision": 0, "connections": [], "spokenLanguage": spoken},
                 })
             voice = self._metadata(session)
             if (voice["profile"], voice["botId"]) != (profile, bot_id):
@@ -335,9 +342,22 @@ class VoiceSessions:
             voice["revision"] += 1
             session.updated_at = datetime.now()
             voice["updatedAt"] = session.updated_at.isoformat()
+            if role == "user":
+                heard_bot.append(voice["botId"])
             return {"message": copy.deepcopy(row), "replayed": False}
 
-        return self.sessions.mutate(key, update)
+        heard_bot: list[str] = []
+        result = self.sessions.mutate(key, update)
+        # The owner's own words say which language they speak (outside the
+        # session lock; a detection failure never fails the transcript).
+        if self._languages and heard_bot:
+            spoken = detect_language(text)
+            if spoken:
+                try:
+                    self._languages.heard(self._owner, heard_bot[0], spoken)
+                except OSError:
+                    pass
+        return result
 
     def history(self, params: dict) -> dict:
         session = self._read(params.get("conversationId"))
@@ -536,9 +556,17 @@ class VoiceSessions:
             voice["revision"] += 1
             session.updated_at = datetime.now()
             voice["updatedAt"] = session.updated_at.isoformat()
+            reported_bot.append(voice["botId"])
             return _public(session)
 
-        return self.sessions.mutate(key, update)
+        reported_bot: list[str] = []
+        result = self.sessions.mutate(key, update)
+        if self._languages and reported_bot:
+            try:
+                self._languages.reported(self._owner, reported_bot[0], language)
+            except OSError:
+                pass
+        return result
 
     def end(self, params: dict) -> dict:
         key = session_key(params.get("conversationId"))

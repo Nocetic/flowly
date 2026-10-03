@@ -1918,8 +1918,12 @@ Respond to the user now:"""
             )
 
         voice_exec = VoiceExec(_voice_exec, _voice_exec_profile)
+        from flowly.live_voice.language import VoiceLanguagePreferences
+
         live_voice = LiveVoiceService(
-            VoiceSessions(agent.sessions),
+            # The language the owner speaks to each agent, kept on this host.
+            VoiceSessions(agent.sessions, languages=VoiceLanguagePreferences(
+                _feature_rpc.state_db("voice_language.json"))),
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None)),
             worker=lambda: getattr(getattr(agent, '_gateway_server', None), 'profile_host', None),
             executor=lambda: voice_exec,
