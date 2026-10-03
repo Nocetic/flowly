@@ -31,10 +31,11 @@ from flowly.live_voice.context import manual_memory
 from flowly.live_voice.memory_view import GovernedMemory, read_memory_file, revision_of
 from flowly.live_voice.sessions import VoiceError
 
-# Characters of section text a call's backend receives: generous next to a
-# chat turn's memory, inside the client's 48 KB initial-context frame.
+# UTF-8 bytes of section text a call's backend receives: generous next to a
+# chat turn's memory, leaving room for tasks and recent conversation in the
+# client's 48 KB initial-context frame (Turkish letters take two bytes).
 SNAPSHOT_BUDGET = 30_000
-# The speaking model's profile: a short orientation, not the memory.
+# UTF-8 bytes of the speaking model's profile: an orientation, not the memory.
 PROFILE_BUDGET = 2_000
 RECENT_DAYS = 3
 KG_ENTITIES = 20
@@ -59,6 +60,10 @@ def validate_snapshot(params: dict) -> dict:
     if known is not None and (not isinstance(known, str) or not re.fullmatch(r'[0-9a-f]{24}', known)):
         raise VoiceError('INVALID_PARAMS', 'knownRevision must be a snapshot revision.')
     return {'knownRevision': known}
+
+
+def _bytes(text: str) -> int:
+    return len(text.encode())
 
 
 def _paragraphs(text: str) -> list[str]:
@@ -180,31 +185,32 @@ class VoiceMemorySnapshot:
 
     @staticmethod
     def _budget(sections: list[Section]) -> tuple[list[Section], bool]:
-        """Keep sections in priority order within ``SNAPSHOT_BUDGET``, cutting
-        only at a paragraph and saying so."""
+        """Keep sections in priority order within ``SNAPSHOT_BUDGET`` bytes,
+        cutting only at a paragraph and saying so."""
         kept: list[Section] = []
         left = SNAPSHOT_BUDGET
+        note = _bytes(TRUNCATION_NOTE) + 2
         truncated = False
         for section in sections:
-            if left <= len(TRUNCATION_NOTE) + 2:
+            if left <= note:
                 truncated = True
                 break
-            if len(section.text) <= left:
+            if _bytes(section.text) <= left:
                 kept.append(section)
-                left -= len(section.text)
+                left -= _bytes(section.text)
                 continue
             truncated = True
-            room = left - len(TRUNCATION_NOTE) - 2
+            room = left - note
             taken: list[str] = []
             for chunk in _paragraphs(section.text):
-                if len(chunk) + 2 > room:
+                if _bytes(chunk) + 2 > room:
                     break
                 taken.append(chunk)
-                room -= len(chunk) + 2
+                room -= _bytes(chunk) + 2
             if taken:
                 text = '\n\n'.join(taken + [TRUNCATION_NOTE])
                 kept.append(Section(section.kind, section.title, text, section.source))
-                left -= len(text)
+                left -= _bytes(text)
             break
         return kept, truncated
 
@@ -221,4 +227,8 @@ class VoiceMemorySnapshot:
             excerpt = text if len(text) <= share else text[:share].rsplit('\n', 1)[0].rstrip() + ' …'
             parts.append(f'{label}:\n{excerpt}')
         profile = '\n\n'.join(parts)
-        return profile if len(profile) <= PROFILE_BUDGET else profile[:PROFILE_BUDGET].rsplit('\n', 1)[0]
+        while _bytes(profile) > PROFILE_BUDGET:
+            if '\n' not in profile:
+                return profile.encode()[:PROFILE_BUDGET].decode('utf-8', 'ignore')
+            profile = profile.rsplit('\n', 1)[0]
+        return profile

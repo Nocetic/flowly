@@ -146,18 +146,18 @@ def test_the_budget_keeps_priority_order_and_cuts_only_at_a_paragraph(env, monke
     assert user.endswith(TRUNCATION_NOTE) and 'User paragraph 0 ' in user
     assert all(paragraph.startswith('User paragraph') or paragraph == TRUNCATION_NOTE
                for paragraph in user.split('\n\n'))
-    assert sum(len(section['text']) for section in result['sections']) <= 400
+    assert sum(len(section['text'].encode()) for section in result['sections']) <= 400
     assert SNAPSHOT_BUDGET >= 20_000
 
 
 def test_profile_is_short_and_comes_from_the_same_sources(env):
     reader, workspace, store, _, _ = env
     (workspace / 'IDENTITY.md').write_text('Name: Flowly')
-    (workspace / 'USER.md').write_text('Hakan. ' + 'Likes coffee. ' * 200)
+    (workspace / 'USER.md').write_text('Hakan. ' + 'Kahveyi çok sever. ' * 200)
     store.add_item(kind='profile', text='Name is Hakan', status='active')
     profile = reader.snapshot({})['profile']
     assert 'Agent:\nName: Flowly' in profile and 'User:\nHakan.' in profile and 'Name is Hakan' in profile
-    assert len(profile) <= PROFILE_BUDGET
+    assert len(profile.encode()) <= PROFILE_BUDGET
 
 
 def test_an_unchanged_snapshot_answers_with_its_revision_only(env):
@@ -198,3 +198,10 @@ async def test_dispatch_serves_the_snapshot_and_reports_an_unready_runtime(env, 
     assert 'Hakan builds Flowly.' in text_of(result, 'user')
     with pytest.raises(feature_rpc.FeatureRpcError):
         await feature_rpc.voice_memory_snapshot({'path': '/etc'})
+
+
+def test_profile_without_line_breaks_still_fits(env):
+    reader, workspace, _, _, _ = env
+    (workspace / 'IDENTITY.md').write_text('ğ' * 5_000)
+    profile = reader.snapshot({})['profile']
+    assert 0 < len(profile.encode()) <= PROFILE_BUDGET
