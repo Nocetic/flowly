@@ -3876,102 +3876,152 @@ def _session_title(path) -> str | None:
     return title if isinstance(title, str) and title.strip() else None
 
 
-def sessions_list() -> dict:
-    """Conversation sessions — mirrors the desktop's activity:sessions-list
-    exactly (key/fileName/sizeBytes/modifiedAt/channel/chatId)."""
-    sessions_dir = get_flowly_home() / "sessions"
-    # A session is "running" right now iff the in-flight registry still holds its
-    # turn (begin() on chat.send, finish() at true run completion). Lets every
-    # client — gateway and relay — surface a live "working" indicator straight
-    # from the bot's runtime state, no separate flag to drift.
+_SESSIONS_CURSOR = re.compile(r"v1:(\d{1,20}):([^/\\\x00-\x1f]{1,255})")
+
+
+def _sessions_cursor(params: dict, key: str) -> tuple[int, str] | None:
+    raw = params.get(key)
+    if raw is None:
+        return None
+    match = _SESSIONS_CURSOR.fullmatch(raw) if isinstance(raw, str) else None
+    if match is None:
+        raise FeatureRpcError("INVALID_PARAMS", f"{key} must be a cursor from a previous sessions.list page.")
+    return int(match.group(1)), match.group(2)
+
+
+def _session_row(p, st, waiting: dict) -> dict | None:
+    """One conversation's list row, or None when this caller may not see it."""
     from flowly.agent.inflight import get as _inflight_get
     from flowly.live_voice.authority import current_request_owner
     from flowly.session.keys import read_session_header, session_key_from_header
     from flowly.session.ownership import require_session_file, session_visible
 
+    base = p.stem
+    sep = base.find("_")
+    if sep == -1:
+        channel, chat_id = "unknown", base
+    else:
+        channel, chat_id = base[:sep], base[sep + 1 :]
+    header = read_session_header(p)
+    key = session_key_from_header(p, header)
+    modified_ms = int(st.st_mtime * 1000)
+    # A session is "running" right now iff the in-flight registry still holds
+    # its turn (begin() on chat.send, finish() at true run completion), so
+    # every client surfaces a live "working" indicator from runtime state.
+    # Auto-generated descriptive title, so every
+    # relay client can show the SAME name the gateway/CLI surfaces
+    # instead of a random session-key suffix. The client writes it
+    # to its (encrypted) Firestore conversation doc; the relay
+    # itself is untouched — this only enriches the RPC payload.
+    metadata = header.get('metadata') if current_request_owner() is None else require_session_file(p, key)
+    if metadata is None or not session_visible(key, metadata):
+        return None
+    raw_title = metadata.get("title")
+    title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
+    raw_completion_id = metadata.get("last_assistant_run_id")
+    last_assistant_run_id = (
+        raw_completion_id.strip()
+        if isinstance(raw_completion_id, str) and raw_completion_id.strip()
+        else None
+    )
+    raw_completed_at = metadata.get("last_assistant_at")
+    last_assistant_at = (
+        raw_completed_at
+        if isinstance(raw_completed_at, (str, int, float))
+        and not isinstance(raw_completed_at, bool)
+        else None
+    )
+    return {
+        "key": key,
+        "fileName": p.name,
+        "sizeBytes": st.st_size,
+        "modifiedAt": modified_ms,
+        "channel": channel,
+        "chatId": chat_id,
+        "title": title,
+        **({"kind": "voice", "voiceConversationId": metadata.get("voiceConversationId")}
+           if metadata.get("kind") == "voice" else {}),
+        # Superset fields for the TUI gateway client (which reads
+        # ``displayName`` / ``updatedAt``). Same content, one shape
+        # serves every client + transport.
+        "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
+        "updatedAt": modified_ms,
+        "lastAssistantRunId": last_assistant_run_id,
+        "lastAssistantAt": last_assistant_at,
+        # True while a turn for this session is in flight — drives the
+        # client's "running" shimmer. Old clients ignore the field.
+        "running": _inflight_get(key) is not None,
+        # Set while the conversation waits for the owner:
+        # {kind: approval|question|plan|connection, since (ms),
+        # count}. Absent otherwise; old clients ignore it.
+        **({"needsInput": waiting[key]} if key in waiting else {}),
+        # Conversation-scoped model selection. This is safe to
+        # expose (it is a public model id, never a credential)
+        # and lets local profile clients label each chat
+        # without opening every JSONL file a second time.
+        "modelOverride": (
+            str(metadata.get("model_override") or "").strip()
+            or None
+        ),
+    }
+
+
+def sessions_list(params: dict | None = None) -> dict:
+    """Conversation sessions, newest first — mirrors the desktop's
+    activity:sessions-list (key/fileName/sizeBytes/modifiedAt/channel/chatId).
+
+    Without ``limit`` the whole list (what every client before paging asks
+    for). With ``limit`` (1–200) one page: ``{sessions, next}``, where
+    ``next`` is the cursor to pass as ``before`` for the page after it, or
+    None at the end. ``through`` stops at the row a cursor names, including
+    it, so a client that has scrolled can refresh everything down to the end
+    of the first page it loaded, however many conversations arrived since;
+    with ``before`` too it reads on between two cursors.
+
+    A cursor is a position (modification time, file name), not an offset: a
+    conversation that gets a message moves to the top, and the pages after a
+    cursor neither skip nor repeat a row. Only the page's own session
+    headers are read; the rest of the list costs a directory listing.
+    """
+    params = params or {}
+    limit = _activity_int(params, "limit", default=None, low=1, high=200)
+    before = _sessions_cursor(params, "before") if limit is not None else None
+    through = _sessions_cursor(params, "through") if limit is not None else None
+    sessions_dir = get_flowly_home() / "sessions"
     # What each conversation is waiting on from the owner (an approval, a
     # question, a plan, a connection), read once for the whole list.
     waiting = _pending_inputs()
-    out = []
+    entries = []
     if sessions_dir.exists():
         from flowly.session.manager import iter_session_files
 
         for p in iter_session_files(sessions_dir):
             try:
                 st = p.stat()
-                base = p.stem
-                sep = base.find("_")
-                if sep == -1:
-                    channel, chat_id = "unknown", base
-                else:
-                    channel, chat_id = base[:sep], base[sep + 1 :]
-                header = read_session_header(p)
-                key = session_key_from_header(p, header)
-                modified_ms = int(st.st_mtime * 1000)
-                # Auto-generated descriptive title, so every
-                # relay client can show the SAME name the gateway/CLI surfaces
-                # instead of a random session-key suffix. The client writes it
-                # to its (encrypted) Firestore conversation doc; the relay
-                # itself is untouched — this only enriches the RPC payload.
-                metadata = header.get('metadata') if current_request_owner() is None else require_session_file(p, key)
-                if metadata is None:
-                    continue
-                if not session_visible(key, metadata):
-                    continue
-                raw_title = metadata.get("title")
-                title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
-                raw_completion_id = metadata.get("last_assistant_run_id")
-                last_assistant_run_id = (
-                    raw_completion_id.strip()
-                    if isinstance(raw_completion_id, str) and raw_completion_id.strip()
-                    else None
-                )
-                raw_completed_at = metadata.get("last_assistant_at")
-                last_assistant_at = (
-                    raw_completed_at
-                    if isinstance(raw_completed_at, (str, int, float))
-                    and not isinstance(raw_completed_at, bool)
-                    else None
-                )
-                out.append(
-                    {
-                        "key": key,
-                        "fileName": p.name,
-                        "sizeBytes": st.st_size,
-                        "modifiedAt": modified_ms,
-                        "channel": channel,
-                        "chatId": chat_id,
-                        "title": title,
-                        **({"kind": "voice", "voiceConversationId": metadata.get("voiceConversationId")}
-                           if metadata.get("kind") == "voice" else {}),
-                        # Superset fields for the TUI gateway client (which reads
-                        # ``displayName`` / ``updatedAt``). Same content, one shape
-                        # serves every client + transport.
-                        "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
-                        "updatedAt": modified_ms,
-                        "lastAssistantRunId": last_assistant_run_id,
-                        "lastAssistantAt": last_assistant_at,
-                        # True while a turn for this session is in flight — drives the
-                        # client's "running" shimmer. Old clients ignore the field.
-                        "running": _inflight_get(key) is not None,
-                        # Set while the conversation waits for the owner:
-                        # {kind: approval|question|plan|connection, since (ms),
-                        # count}. Absent otherwise; old clients ignore it.
-                        **({"needsInput": waiting[key]} if key in waiting else {}),
-                        # Conversation-scoped model selection. This is safe to
-                        # expose (it is a public model id, never a credential)
-                        # and lets local profile clients label each chat
-                        # without opening every JSONL file a second time.
-                        "modelOverride": (
-                            str(metadata.get("model_override") or "").strip()
-                            or None
-                        ),
-                    }
-                )
-            except Exception:
+            except OSError:
                 continue
-    out.sort(key=lambda s: s["modifiedAt"], reverse=True)
-    return {"sessions": out}
+            entries.append((st.st_mtime_ns, p.name, p, st))
+    entries.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+    if before is not None:
+        entries = [entry for entry in entries if (entry[0], entry[1]) < before]
+    if through is not None:
+        entries = [entry for entry in entries if (entry[0], entry[1]) >= through]
+    out = []
+    next_cursor = None
+    for index, (mtime_ns, name, p, st) in enumerate(entries):
+        if limit is not None and len(out) == limit:
+            previous = entries[index - 1]
+            next_cursor = f"v1:{previous[0]}:{previous[1]}"
+            break
+        try:
+            row = _session_row(p, st, waiting)
+        except Exception:
+            continue
+        if row is not None:
+            out.append(row)
+    if limit is None:
+        return {"sessions": out}
+    return {"sessions": out, "next": next_cursor}
 
 
 def _pending_inputs() -> dict:
@@ -5323,6 +5373,10 @@ def system_capabilities() -> dict:
         "version": __version__,
         "featureMethods": sorted(methods),
         "chatSteeringVersion": 2 if _chat_steering_callback is not None else 0,
+        # 2: ``sessions.list`` pages by cursor (``limit``/``before`` → ``next``).
+        # Clients send ``limit`` only to a bot that says so: an old gateway
+        # cut its list at ``limit`` and returned no way to the rest.
+        "sessionsListVersion": 2,
         "runtime": {
             "role": runtime.role.value,
             "profile": runtime.profile_name,
@@ -5624,7 +5678,7 @@ _DISPATCH: dict[str, tuple] = {
     "skills.remove": (skills_remove, True, True),
     "kg.graph": (kg_graph, False, False),
     "kg.delete_entity": (kg_delete_entity, True, False),
-    "sessions.list": (sessions_list, False, False),
+    "sessions.list": (sessions_list, True, False),
     "sessions.attention": (sessions_attention, False, False),
     "activity.list": (activity_list, True, False),
     "activity.get": (activity_get, True, False),
