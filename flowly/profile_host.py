@@ -322,6 +322,22 @@ class _Runtime:
     attention_dirty: bool = False
 
 
+#: Further pages read to fill one remote `sessions.list` page past internal rows.
+_SESSIONS_FILL_ROUNDS = 8
+
+
+def _remote_sessions(sessions: list) -> list:
+    """The conversations a remote client may open: no internal collaboration."""
+    return [
+        session
+        for session in sessions
+        if isinstance(session, dict)
+        and isinstance(session.get("key"), str)
+        and session["key"].startswith(REMOTE_SESSION_PREFIXES)
+        and not is_internal_profile_session(session["key"])
+    ]
+
+
 class ProfileHost:
     """Own and proxy named profile gateways for authenticated clients."""
 
@@ -1020,17 +1036,26 @@ class ProfileHost:
         if method == "sessions.list" and isinstance(result, dict):
             sessions = result.get("sessions")
             if isinstance(sessions, list):
-                result = {
-                    **result,
-                    "sessions": [
-                        session
-                        for session in sessions
-                        if isinstance(session, dict)
-                        and isinstance(session.get("key"), str)
-                        and session["key"].startswith(REMOTE_SESSION_PREFIXES)
-                        and not is_internal_profile_session(session["key"])
-                    ],
-                }
+                rows = _remote_sessions(sessions)
+                # A page is cut before this filter, so a page of internal
+                # sessions would come back short or empty while older
+                # conversations remain. Read on until it is full; the
+                # cursor stays the agent's, so no row is skipped or repeated.
+                limit, cursor = safe.get("limit"), result.get("next")
+                for _ in range(_SESSIONS_FILL_ROUNDS):
+                    if not isinstance(limit, int) or len(rows) >= limit or not isinstance(cursor, str):
+                        break
+                    more = await self._target_rpc(
+                        name, method, {**safe, "before": cursor}, bounded_timeout(method, timeout_ms),
+                        **identity_options,
+                    )
+                    if not isinstance(more, dict) or not isinstance(more.get("sessions"), list):
+                        break
+                    rows += _remote_sessions(more["sessions"])
+                    cursor = more.get("next")
+                if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
+                    raise ProfileHostError('PROFILE_IDENTITY_CHANGED', 'The selected agent has changed.')
+                result = {**result, "sessions": rows, **({"next": cursor} if "next" in result else {})}
         return result
 
     async def run_task(

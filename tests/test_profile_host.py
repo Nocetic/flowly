@@ -160,6 +160,36 @@ async def test_remote_session_directory_hides_internal_collaboration(profile_roo
 
 
 @pytest.mark.asyncio
+async def test_a_remote_session_page_is_filled_past_internal_rows(profile_roots) -> None:
+    profiles.create_profile("writer", local_runtime=True)
+    host = ProfileHost()
+    runtime = SimpleNamespace(last_used_at=0.0, active_runs=set())
+    host._ensure_runtime = AsyncMock(return_value=runtime)  # type: ignore[method-assign]
+    pages = {
+        None: {"sessions": [{"key": "ios:a"}, {"key": "cron:internal"}], "next": "v1:3:c"},
+        "v1:3:c": {"sessions": [{"key": "desktop:profile-task:private"}, {"key": "cron:other"}], "next": "v1:2:b"},
+        "v1:2:b": {"sessions": [{"key": "android:b"}, {"key": "ios:c"}], "next": "v1:1:a"},
+    }
+    asked = []
+
+    async def page(_name, _method, params, *_args, **_kwargs):
+        asked.append(params.get("before"))
+        return pages[params.get("before")]
+
+    host._rpc = page  # type: ignore[method-assign]
+
+    result = await host.rpc("writer", "sessions.list", {"limit": 3})
+
+    # Full page, the agent's own cursor after the last row read.
+    assert result == {"sessions": [{"key": "ios:a"}, {"key": "android:b"}, {"key": "ios:c"}], "next": "v1:1:a"}
+    assert asked == [None, "v1:3:c", "v1:2:b"]
+    # The whole list, as every client asked before paging, reads once.
+    asked.clear()
+    host._rpc = AsyncMock(return_value=pages[None])  # type: ignore[method-assign]
+    assert await host.rpc("writer", "sessions.list", {}) == {"sessions": [{"key": "ios:a"}], "next": "v1:3:c"}
+
+
+@pytest.mark.asyncio
 async def test_internal_board_task_is_scoped_and_hidden_from_public_contract(
     profile_roots,
 ) -> None:
