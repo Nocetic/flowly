@@ -786,12 +786,19 @@ class WebChannel(BaseChannel):
                     profile, inner_session_key, session_id
                 )
 
+        # A call's memory reads arrive here from the phone. Name and outcome
+        # only, so a missing read can be told from a refused one.
+        voice_read = inner_method.startswith("voice.")
+        if voice_read:
+            logger.info("[WebChannel] voice profile RPC {} for {} arrived", inner_method, profile or "?")
         read_token = object()
         if inner_method in {"subagents.list", "subagents.get"} and session_id and len(self._profile_subagent_reads) < 128:
             self._profile_subagent_reads[read_token] = session_id
         try:
             result = await host.dispatch(method, params)
         except ProfileHostError as exc:
+            if voice_read:
+                logger.warning("[WebChannel] voice profile RPC {} refused: {}", inner_method, exc.code)
             await ws.send(json.dumps({
                 "type": "rpc",
                 "id": rpc_id,
