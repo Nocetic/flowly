@@ -403,6 +403,15 @@ Found on the owner's call ("I'm not allergic to penicillin") and memory:
   speaking model's profile starts with "Last talked about: …". Clients
   need no change: `recent` is already an accepted kind.
 
+- **An earlier call counts as where we left off** (`71b2d1e4`): "Latest
+  call: …"; a call still open (this one, or one running elsewhere) never.
+- **Recall searches past conversations** (`12df66a1`): for a query,
+  `voice.context` also returns up to 3 dated matching moments of past
+  chats and calls from the session index (every word first, then rarity-
+  weighted words; five-letter stems), visible as `sessions.list` shows
+  them, governance and redaction applied, hashed source references. Web
+  `492214a` (branch `codex/voice-conversation-recall`) tells the call so.
+
 Not done, by decision: refreshing memory during a call (rare; a correction
 made in the call reaches it through the task result).
 
