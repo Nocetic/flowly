@@ -3,8 +3,9 @@
 Status: implementation and startup hardening are on branches (2026-10-04).
 The phone's reported missing-snapshot incident still needs a device retest;
 passing the routing probe is not evidence of a phone call loading its memory.
-See "Rollout" for previously merged/deployed pieces. The new startup
-hardening below has not been merged, pushed or deployed.
+See "Rollout" for merged/deployed pieces. At the owner's subsequent request,
+Web and Relay were merged and pushed to main; deployment is owner-operated
+and has not been verified. Core, Desktop and iOS remain on their worktree branches.
 
 This document is the contract. Clients follow it; when it changes, change it
 here first.
@@ -284,6 +285,10 @@ Verification on 2026-10-04:
   failed on the old implementation for literal context corruption and a
   mismatched scoped snapshot, then passed with the fixes.
 - Core/Desktop/iOS client request fixtures remain byte-identical.
+- Merge verification: Web's 192 Voice library/API tests passed after fixing
+  the existing access-endpoint test fixture's missing database/rate-limiter
+  dependency (test-only change). Relay's 231 tests, typecheck, bundle build
+  and bundle syntax check passed on the merged main.
 
 No iOS simulator was run. Before claiming the incident resolved, the owner
 must build the iOS worktree on a device and make a fresh call: verify
@@ -326,15 +331,16 @@ switches the call, and the next one opens in it.
 
 ## Rollout
 
-Nothing merged except as noted; branches and worktrees:
+The owner authorized Web and Relay merges after the startup hardening.
+Core, Desktop and iOS remain unmerged; branches and worktrees:
 
 | Surface | Branch (worktree) | State |
 |---|---|---|
 | Core | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-core`) | snapshot, pin fix, contract, probe, report, language |
 | Desktop | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-desktop`) | snapshot, greeting (merged in), contract test, scoped startup and diagnostics |
 | iOS | `codex/live-voice-ios` (`flowly-desktop/.codex-worktrees/live-voice-ios`) | snapshot, greeting, ringing, call screen, language, contract test, scoped startup and diagnostics |
-| Relay | `main` has memory and greeting (merged, deployed by the owner); `codex/voice-language` (`flowly-repos/flowly-relay-language`) | language rules, literal memory handoff and scope check |
-| Web | `main` has the memory prompt (merged, pushed); `codex/voice-language` (`flowly-app-language`) | language rule |
+| Relay | `main` at `094821d`; `codex/voice-language` (`flowly-repos/flowly-relay-language`) retained | language and memory hardening merged/pushed; latest deploy not verified |
+| Web | `main` at `b0e293b`; `codex/voice-language` (`flowly-app-language`) retained | memory/language rules and access test fixture merged/pushed; latest deploy not verified |
 | Android | — | no Live Voice |
 
 Deploy order when merged: Core (runtimes must offer the method), Web and
@@ -367,10 +373,13 @@ iOS: `30f0c7aa` snapshot at call start; `533cacf7` recall fallback.
 Relay: `061d2a7` speaking model; `256112b` evaluation.
 Web: `5cdf02e` backend prompt; `5b34009` config export.
 
-Startup hardening (2026-10-04, worktree branches only): Desktop `7bda3187`,
-iOS `5a0022c3`, Relay `6eb0ebd`. Web and Core runtime code did not change in
-this follow-up. iOS's owner's existing `project.pbxproj` and `Info.plist`
-edits were left outside these commits.
+Startup hardening (2026-10-04): Desktop `7bda3187`, iOS `5a0022c3`, Relay
+`6eb0ebd`. Core runtime code did not change in this follow-up. Web test fixture
+repair: `3c74986`. Web main `b0e293b` and Relay main `094821d` were subsequently
+pushed with the owner's authorization; deployment remains unverified. The
+Relay push also included 31 already-committed changes on local main that were
+previously ahead of origin/main. iOS's owner's existing `project.pbxproj` and
+`Info.plist` edits were left outside these commits.
 
 ## Tests
 
