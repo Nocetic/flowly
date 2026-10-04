@@ -3879,13 +3879,13 @@ def _session_title(path) -> str | None:
 _SESSIONS_CURSOR = re.compile(r"v1:(\d{1,20}):([^/\\\x00-\x1f]{1,255})")
 
 
-def _sessions_cursor(params: dict) -> tuple[int, str] | None:
-    raw = params.get("before")
+def _sessions_cursor(params: dict, key: str) -> tuple[int, str] | None:
+    raw = params.get(key)
     if raw is None:
         return None
     match = _SESSIONS_CURSOR.fullmatch(raw) if isinstance(raw, str) else None
     if match is None:
-        raise FeatureRpcError("INVALID_PARAMS", "before must be a cursor from a previous sessions.list page.")
+        raise FeatureRpcError("INVALID_PARAMS", f"{key} must be a cursor from a previous sessions.list page.")
     return int(match.group(1)), match.group(2)
 
 
@@ -3973,15 +3973,20 @@ def sessions_list(params: dict | None = None) -> dict:
     Without ``limit`` the whole list (what every client before paging asks
     for). With ``limit`` (1–200) one page: ``{sessions, next}``, where
     ``next`` is the cursor to pass as ``before`` for the page after it, or
-    None at the end. The cursor is a position (modification time, file
-    name), not an offset: a conversation that gets a message moves to the
-    top and is in the next first page, and the pages after the cursor
-    neither skip nor repeat a row. Only the page's own session headers are
-    read; the rest of the list costs a directory listing.
+    None at the end. ``through`` stops at the row a cursor names, including
+    it, so a client that has scrolled can refresh everything down to the end
+    of the first page it loaded, however many conversations arrived since;
+    with ``before`` too it reads on between two cursors.
+
+    A cursor is a position (modification time, file name), not an offset: a
+    conversation that gets a message moves to the top, and the pages after a
+    cursor neither skip nor repeat a row. Only the page's own session
+    headers are read; the rest of the list costs a directory listing.
     """
     params = params or {}
     limit = _activity_int(params, "limit", default=None, low=1, high=200)
-    cursor = _sessions_cursor(params) if limit is not None else None
+    before = _sessions_cursor(params, "before") if limit is not None else None
+    through = _sessions_cursor(params, "through") if limit is not None else None
     sessions_dir = get_flowly_home() / "sessions"
     # What each conversation is waiting on from the owner (an approval, a
     # question, a plan, a connection), read once for the whole list.
@@ -3997,8 +4002,10 @@ def sessions_list(params: dict | None = None) -> dict:
                 continue
             entries.append((st.st_mtime_ns, p.name, p, st))
     entries.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
-    if cursor is not None:
-        entries = [entry for entry in entries if (entry[0], entry[1]) < cursor]
+    if before is not None:
+        entries = [entry for entry in entries if (entry[0], entry[1]) < before]
+    if through is not None:
+        entries = [entry for entry in entries if (entry[0], entry[1]) >= through]
     out = []
     next_cursor = None
     for index, (mtime_ns, name, p, st) in enumerate(entries):
