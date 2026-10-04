@@ -125,7 +125,9 @@ class VoiceContext:
 
             try:
                 index = self.index()
-                matches = await asyncio.wait_for(index.search(query, max_results=12), 1.5) if query and index else []
+                matches = await asyncio.wait_for(
+                    index.search(query, max_results=12, embedding_timeout=0.8), 1.5
+                ) if query and index else []
                 for match in matches:
                     relative = str(match.path)
                     # Search results are data. Do not follow an index entry
@@ -138,7 +140,10 @@ class VoiceContext:
                     text, revision, updated_at = source
                     # Verify the snippet against current manual source content;
                     # stale/generated index entries cannot restore removed facts.
-                    snippet = str(match.snippet).strip()
+                    # Display snippets may end with a synthetic ellipsis. Use
+                    # full evidence for verification, then bound the exported
+                    # fact in add(); never loosen the stale/privacy check.
+                    snippet = str(getattr(match, 'source_text', '') or match.snippet).strip()
                     if snippet and snippet in text:
                         add(snippet, f'memory://file/{quote(relative, safe="/")}#L{match.start_line}', revision,
                             updated_at, matched=True, startLine=match.start_line, endLine=match.end_line)

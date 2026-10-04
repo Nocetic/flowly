@@ -50,9 +50,9 @@ def _resolve_provider_and_model(
         candidates = []
         if api_key:
             # api_key was explicitly passed — detect provider from it
-            if api_key.startswith("sk-"):
+            if api_key.startswith("sk-") and not api_key.startswith(("sk-or-", "sk-ant-")):
                 candidates = [("openai", _DEFAULT_MODELS["openai"])]
-            else:
+            elif api_key.startswith("AIza"):
                 candidates = [("gemini", _DEFAULT_MODELS["gemini"])]
         else:
             openai_key = getattr(getattr(config, "providers", None), "openai", None)
@@ -62,10 +62,32 @@ def _resolve_provider_and_model(
             if gemini_key and getattr(gemini_key, "api_key", None):
                 candidates.append(("gemini", _DEFAULT_MODELS["gemini"]))
 
-        return candidates[0] if candidates else (None, None)
+        if candidates:
+            name, default_model = candidates[0]
+            return name, model or default_model
+        return None, None
 
     resolved_model = model or _DEFAULT_MODELS.get(provider, "")
     return provider, resolved_model
+
+
+def resolve_embedding_settings(provider: str, model: str, api_key: str,
+                               api_base: str, config: Any) -> tuple[str | None, str, str, str]:
+    """Resolve credentials from the embedding provider, never the chat provider.
+
+    An OpenAI-compatible service can be selected explicitly with provider,
+    key and endpoint overrides. Automatic selection must not send another
+    service's chat key to OpenAI just because its prefix also starts `sk-`.
+    """
+    name, resolved_model = _resolve_provider_and_model(provider, model, api_key, config)
+    if not name:
+        return None, "", "", ""
+    configured = getattr(getattr(config, "providers", None), name, None)
+    key = api_key or getattr(configured, "api_key", "") or ""
+    base = api_base or getattr(configured, "api_base", "") or ""
+    if not key and not base:
+        return None, "", "", ""
+    return name, resolved_model or "", key, base
 
 
 def get_embedding_dims(model: str) -> int:
@@ -110,19 +132,21 @@ async def embed_texts(
         client_kwargs: dict[str, Any] = {"api_key": api_key or "placeholder"}
         if api_base:
             client_kwargs["base_url"] = api_base
-        client = AsyncOpenAI(**client_kwargs)
-
-        response = await asyncio.wait_for(
-            client.embeddings.create(model=model, input=texts),
-            timeout=60.0,
-        )
+        # Close the transport even when a bounded caller cancels the request.
+        async with AsyncOpenAI(**client_kwargs) as client:
+            response = await asyncio.wait_for(
+                client.embeddings.create(model=model, input=texts),
+                timeout=60.0,
+            )
         return [item.embedding for item in response.data]
 
     except asyncio.TimeoutError:
         logger.warning(f"[Memory] Embedding timeout for provider={provider}")
         return None
     except Exception as e:
-        logger.warning(f"[Memory] Embedding failed ({provider}/{model}): {e}")
+        # Provider error bodies can echo credentials or user input.
+        logger.warning("[Memory] Embedding failed ({}/{}): {} status={}",
+                       provider, model, type(e).__name__, getattr(e, "status_code", None))
         return None
 
 

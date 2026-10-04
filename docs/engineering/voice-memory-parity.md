@@ -111,6 +111,20 @@ hybrid search `memory_search` uses in chat). A memory-search match is kept even
 without the query's literal words and ranks one above keyword overlap.
 Previously such matches were dropped.
 
+Follow-up (2026-10-04): lexical indexing now completes before bounded embedding
+work (5 seconds for normal search, 0.8 seconds inside Voice's 1.5-second read).
+Provider failures/timeouts retain keyword hits and back off for 30 seconds.
+Missing vectors can be enriched later without reindexing unchanged files;
+hash-conditional writes cannot attach an old vector to changed text. Full
+indexed text, not the display snippet's synthetic ellipsis, is checked against
+current, governance-filtered source before a Voice fact is exported.
+
+Embedding credentials and endpoint resolve from the embedding provider's
+configuration or explicit memory-search overrides. A configured OpenRouter
+chat key alone selects keyword-only search; it is not sent to OpenAI. These
+changes affect normal `memory_search` as well as Voice recall. Initial memory
+snapshots remain independent of embeddings.
+
 ### Which app holds the call
 
 `voice.open` takes an optional `client` (`ios`, `android`, `desktop`, `web`),
@@ -130,6 +144,15 @@ At call start, when `profiles.capabilities.profileRpcMethods` lists
 the agent's own scope (another agent's is a target change and stops the
 call), `contentRole: reference_data`, known section kinds, at most 16
 sections and 30,000 bytes of text, a profile of at most 2,000 bytes.
+
+iOS now also probes the pinned snapshot RPC once when its advertisement is
+missing (at most 2 seconds, within the caller's budget). The runtime's receipt
+or error is authoritative; no other agent is tried. Desktop's discovery gate
+is unchanged. On iOS's recall fallback, up to 12 verified facts also produce a
+UTF-8-safe, at-most-2,000-byte `memoryProfile`, explicitly marked partial, so
+the speaking model gets a bounded excerpt of the backend's available knowledge.
+Empty recall does not invent a profile. Previously a successful fallback read
+left the speaking model with no memory.
 
 The initial context then carries:
 

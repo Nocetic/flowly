@@ -3542,21 +3542,6 @@ class AgentLoop:
             from flowly.memory.manager import get_manager
             ms = self._memory_search_config
 
-            # Resolve api_key from main config if not overridden.
-            api_key = ms.api_key
-            if not api_key and self._main_config:
-                # Only seed the embedding key from the active provider when it is
-                # actually an OpenAI key — embeddings work with OpenAI only. A
-                # non-OpenAI active key (xAI/Grok, a Flowly proxy `flw_…` key,
-                # etc.) would otherwise be mis-detected as a Gemini key by the
-                # "auto" resolver and fail silently (401 → keyword-only) while
-                # claiming vector search. Leaving it empty lets the resolver fall
-                # back to an explicitly-configured openai/gemini key, or honestly
-                # report keyword-only search.
-                active = self._main_config.get_api_key() or ""
-                if active.startswith("sk-"):
-                    api_key = active
-
             state_dir = self._state_dir if self._state_dir else (self.workspace / ".flowly_state")
 
             return get_manager(
@@ -3565,7 +3550,9 @@ class AgentLoop:
                 config=self._main_config,
                 provider=ms.provider,
                 model=ms.model,
-                api_key=api_key,
+                # Embeddings resolve their own provider's key and endpoint
+                # together. The chat provider may use an incompatible API.
+                api_key=ms.api_key,
                 api_base=ms.api_base,
                 chunk_tokens=ms.chunk_tokens,
                 overlap_tokens=ms.overlap_tokens,

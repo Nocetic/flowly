@@ -9,17 +9,13 @@ from typing import Any
 
 from loguru import logger
 
-from flowly.memory.chunker import chunk_text
 from flowly.memory.embeddings import (
-    EmbeddingProvider,
-    _resolve_provider_and_model,
-    embed_texts,
     embed_single,
-    get_embedding_dims,
+    embed_texts,
+    resolve_embedding_settings,
 )
 from flowly.memory.indexer import MemoryIndexer
 from flowly.memory.search import SearchResult, hybrid_search, vector_search
-
 
 # ── Singleton cache ────────────────────────────────────────────────────────────
 _CACHE: dict[str, "MemoryIndexManager"] = {}
@@ -97,13 +93,13 @@ class MemoryIndexManager:
         self._text_weight = text_weight
 
         # Resolve embedding provider
-        resolved_provider, resolved_model = _resolve_provider_and_model(
-            provider, model, api_key, config
+        resolved_provider, resolved_model, key, base = resolve_embedding_settings(
+            provider, model, api_key, api_base, config
         )
         self._emb_provider = resolved_provider   # None = FTS5 only
         self._emb_model = resolved_model or ""
-        self._api_key = api_key
-        self._api_base = api_base
+        self._api_key = key
+        self._api_base = base
 
         if resolved_provider:
             logger.info(
@@ -118,6 +114,8 @@ class MemoryIndexManager:
 
         self._last_sync: float = 0.0
         self._sync_lock = asyncio.Lock()
+        self._embedding_lock = asyncio.Lock()
+        self._embedding_retry_at = 0.0
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -126,6 +124,8 @@ class MemoryIndexManager:
         query: str,
         max_results: int | None = None,
         min_score: float | None = None,
+        *,
+        embedding_timeout: float = 5.0,
     ) -> list[SearchResult]:
         """
         Search memory files for relevant chunks.
@@ -145,24 +145,17 @@ class MemoryIndexManager:
             logger.warning(f"[Memory] FTS5 search failed (database locked?): {e}")
             keyword_results = []
 
-        # Vector search (if embedding available)
+        # Local indexing and FTS complete before optional network work. A slow
+        # provider must never take the already-available keyword hits with it.
         vector_results: list[dict] = []
-        if self._emb_provider:
+        if self._emb_provider and embedding_timeout > 0 and time.monotonic() >= self._embedding_retry_at:
             try:
-                query_emb = await embed_single(
-                    query,
-                    provider=self._emb_provider,
-                    model=self._emb_model,
-                    api_key=self._api_key,
-                    api_base=self._api_base,
+                vector_results = await asyncio.wait_for(
+                    self._search_vectors(query, candidate_limit), timeout=embedding_timeout,
                 )
-                if query_emb:
-                    all_chunks = self._indexer.get_all_chunks()
-                    vector_results = vector_search(
-                        query_emb, all_chunks, limit=candidate_limit, min_score=0.0
-                    )
             except Exception as e:
-                logger.warning(f"[Memory] Vector search failed: {e}")
+                self._embedding_retry_at = time.monotonic() + 30
+                logger.warning("[Memory] Vector search unavailable: {}; keeping keyword results", type(e).__name__)
 
         return hybrid_search(
             keyword_results=keyword_results,
@@ -172,6 +165,34 @@ class MemoryIndexManager:
             max_results=max_r,
             min_score=min_s,
         )
+
+    async def _search_vectors(self, query: str, limit: int) -> list[dict]:
+        async with self._embedding_lock:
+            if time.monotonic() < self._embedding_retry_at:
+                return []
+            missing = [c for c in self._indexer.get_all_chunks()
+                       if not c["embedding"] or c["model"] != self._emb_model]
+            # Bounded batches preserve completed enrichment across searches.
+            # No detached task outlives a caller's timeout/cancellation.
+            for start in range(0, len(missing), 32):
+                batch = missing[start:start + 32]
+                embeddings = await embed_texts(
+                    [c["text"] for c in batch], provider=self._emb_provider,
+                    model=self._emb_model, api_key=self._api_key, api_base=self._api_base,
+                )
+                if not embeddings or len(embeddings) != len(batch):
+                    self._embedding_retry_at = time.monotonic() + 30
+                    return []
+                self._indexer.store_embeddings(batch, embeddings, self._emb_model)
+            query_emb = await embed_single(
+                query, provider=self._emb_provider, model=self._emb_model,
+                api_key=self._api_key, api_base=self._api_base,
+            )
+            if not query_emb:
+                self._embedding_retry_at = time.monotonic() + 30
+                return []
+            chunks = [c for c in self._indexer.get_all_chunks() if c["model"] == self._emb_model]
+            return vector_search(query_emb, chunks, limit=limit, min_score=0.0)
 
     def get_snippet(self, rel_path: str, from_line: int, lines: int = 20) -> str | None:
         """Read a snippet from an indexed file by line range."""
@@ -232,7 +253,7 @@ class MemoryIndexManager:
         # Index new/changed files
         changed = [
             (rel, path) for rel, path in rel_disk.items()
-            if self._indexer.needs_reindex(path)
+            if self._indexer.needs_reindex(path, self._workspace)
         ]
 
         if not changed:
@@ -244,36 +265,10 @@ class MemoryIndexManager:
             await self._index_file(path)
 
     async def _index_file(self, path: Path) -> None:
-        """Index a single file, optionally with embeddings."""
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as e:
-            logger.warning(f"[Memory] Cannot read {path}: {e}")
-            return
-
-        chunks = chunk_text(
-            text,
-            chunk_tokens=self._chunk_tokens,
-            overlap_tokens=self._overlap_tokens,
-        )
-        if not chunks:
-            return
-
-        embeddings: list[list[float]] | None = None
-        if self._emb_provider and chunks:
-            embeddings = await embed_texts(
-                [c.text for c in chunks],
-                provider=self._emb_provider,
-                model=self._emb_model,
-                api_key=self._api_key,
-                api_base=self._api_base,
-            )
-
+        """Make current text searchable locally before attempting embeddings."""
         count = self._indexer.index_file(
             path=path,
             workspace=self._workspace,
-            embeddings=embeddings,
-            model=self._emb_model,
             chunk_tokens=self._chunk_tokens,
             overlap_tokens=self._overlap_tokens,
         )
