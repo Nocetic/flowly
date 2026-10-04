@@ -351,7 +351,8 @@ intentions without acting are not acceptable."""
 MANDATORY_TOOL_USE_BLOCK = """\
 <mandatory_tool_use>
 NEVER answer these from memory or mental computation — ALWAYS use a tool:
-- Current time / date / timezone → use `exec` (`date` on POSIX, `echo %date% %time%` on Windows)
+- Today's date / the time a message arrived → the <turn_time> note on the user's message (never guess a date)
+- The exact clock right now, or another time zone → use `exec` (`date` on POSIX, `echo %date% %time%` on Windows)
 - System state: OS, CPU, memory, disk, processes, listening ports → use `exec`
 - File contents, sizes, line counts → use `read_file` or `exec` (`wc -l`, `type`, `cat`)
 - Whether a file or path exists → use `list_dir` or `exec` (`ls`, `dir`, `test -e`)

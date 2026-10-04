@@ -786,12 +786,19 @@ class WebChannel(BaseChannel):
                     profile, inner_session_key, session_id
                 )
 
+        # A call's memory reads arrive here from the phone. Name and outcome
+        # only, so a missing read can be told from a refused one.
+        voice_read = inner_method.startswith("voice.")
+        if voice_read:
+            logger.info("[WebChannel] voice profile RPC {} for {} arrived", inner_method, profile or "?")
         read_token = object()
         if inner_method in {"subagents.list", "subagents.get"} and session_id and len(self._profile_subagent_reads) < 128:
             self._profile_subagent_reads[read_token] = session_id
         try:
             result = await host.dispatch(method, params)
         except ProfileHostError as exc:
+            if voice_read:
+                logger.warning("[WebChannel] voice profile RPC {} refused: {}", inner_method, exc.code)
             await ws.send(json.dumps({
                 "type": "rpc",
                 "id": rpc_id,
@@ -1959,9 +1966,18 @@ class WebChannel(BaseChannel):
                     raise feature_rpc.FeatureRpcError('VOICE_AUTH_REQUIRED', 'The account connection changed or expired.')
             if lease_method and (binding is None or params or (msg['method'] == 'voice.events.bind' and certificate is None)):
                 raise feature_rpc.FeatureRpcError('VOICE_AUTH_REQUIRED', 'A verified account is required for this event lease.')
-            if binding is not None and not await self._relay_recipients.bind(
-                    binding, None if msg.get('method') == 'voice.events.clear' else certificate):
-                raise feature_rpc.FeatureRpcError('VOICE_AUTH_REQUIRED', 'The account connection changed or expired.')
+            if binding is not None:
+                bound = await self._relay_recipients.bind(
+                    binding, None if msg.get('method') == 'voice.events.clear' else certificate)
+                # The receive-order guard decides who receives this browser's
+                # events, so only the lease methods depend on it. Any other
+                # request is authorized by its own verified certificate (and
+                # the account checks above): a newer request that bound first,
+                # as when a call starts with memory, tasks and focus at once,
+                # leaves the recipient to that request but must not refuse this
+                # one. Refusing it started phone calls without the agent's memory.
+                if not bound and lease_method:
+                    raise feature_rpc.FeatureRpcError('VOICE_AUTH_REQUIRED', 'The account connection changed or expired.')
             if owner.uid is not None and msg.get('method') != 'voice.events.clear':
                 ws = _AccountReplySocket(self, ws, source, certificate.expires_at)
         except feature_rpc.FeatureRpcError as error:

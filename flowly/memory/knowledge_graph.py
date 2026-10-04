@@ -18,7 +18,7 @@ import json
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
-
+from typing import Iterable
 
 # Predicates where the object is a value (not an entity)
 VALUE_PREDICATES = frozenset({
@@ -241,6 +241,11 @@ class KnowledgeGraph:
         return triple_id
 
     def invalidate(self, subject: str, predicate: str, obj: str, ended: str | None = None) -> int:
+        return len(self.invalidate_triples(subject, predicate, obj, ended))
+
+    def invalidate_triples(self, subject: str, predicate: str, obj: str, ended: str | None = None) -> list[str]:
+        """Close the current triples for this fact; returns their ids, so the
+        governed memory copies of exactly these triples can follow."""
         conn = self._conn()
         sub_resolved = self.resolve_entity(subject, conn)
         sub_id = sub_resolved[0] if sub_resolved else self._normalize_id(subject)
@@ -255,14 +260,17 @@ class KnowledgeGraph:
 
         ended = ended or date.today().isoformat()
 
-        cursor = conn.execute(
-            "UPDATE triples SET valid_to=? WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-            (ended, sub_id, pred, obj_id),
-        )
-        conn.commit()
-        affected = cursor.rowcount
-        conn.close()
-        return affected
+        try:
+            with conn:
+                ids = [row[0] for row in conn.execute(
+                    "SELECT id FROM triples WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (sub_id, pred, obj_id),
+                )]
+                conn.executemany("UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
+                                 [(ended, triple_id) for triple_id in ids])
+        finally:
+            conn.close()
+        return ids
 
     def merge_entities(self, source_name: str, target_name: str) -> bool:
         """Merge source entity into target. Source becomes an alias of target."""
@@ -454,48 +462,57 @@ class KnowledgeGraph:
             "relationship_types": predicates,
         }
 
-    def summary(self, max_entities: int = 20) -> str:
+    def summary(self, max_entities: int = 20, exclude_triple_ids: Iterable[str] = ()) -> str:
         """Compact text summary for system prompt injection.
 
         Format:
         - Alice (person): email=alice@example.com, works_at → Acme Corp
+
+        ``exclude_triple_ids`` leaves those triples out as if they did not
+        exist (an entity left with none is not listed). A voice call passes
+        the triples governance withholds, so its summary is the agent's own
+        minus what may not leave the agent.
         """
         conn = self._conn()
+        excluded = sorted({str(value) for value in exclude_triple_ids})
+        live = "t.valid_to IS NULL"
+        if excluded:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS summary_excluded (id TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM summary_excluded")
+            conn.executemany("INSERT OR IGNORE INTO summary_excluded (id) VALUES (?)", [(v,) for v in excluded])
+            live += " AND t.id NOT IN (SELECT id FROM summary_excluded)"
 
-        rows = conn.execute("""
-            SELECT e.id, e.name, e.type, COUNT(t.id) as cnt
-            FROM entities e
-            LEFT JOIN triples t ON t.subject = e.id AND t.valid_to IS NULL
-            GROUP BY e.id
-            HAVING cnt > 0
-            ORDER BY cnt DESC
-            LIMIT ?
-        """, (max_entities,)).fetchall()
+        try:
+            rows = conn.execute(f"""
+                SELECT e.id, e.name, e.type, COUNT(t.id) as cnt
+                FROM entities e
+                LEFT JOIN triples t ON t.subject = e.id AND {live}
+                GROUP BY e.id
+                HAVING cnt > 0
+                ORDER BY cnt DESC
+                LIMIT ?
+            """, (max_entities,)).fetchall()
 
-        if not rows:
+            lines = []
+            for eid, name, etype, _ in rows:
+                triples = conn.execute(
+                    f"""SELECT t.predicate, COALESCE(e.name, t.object) as obj_display
+                       FROM triples t
+                       LEFT JOIN entities e ON t.object = e.id
+                       WHERE t.subject = ? AND {live}
+                       ORDER BY t.predicate""",
+                    (eid,),
+                ).fetchall()
+                if not triples:
+                    continue
+
+                parts = []
+                for pred, obj in triples:
+                    if pred in VALUE_PREDICATES:
+                        parts.append(f"{pred}={obj}")
+                    else:
+                        parts.append(f"{pred} → {obj}")
+                lines.append(f"- {name} ({etype}): {', '.join(parts)}")
+        finally:
             conn.close()
-            return ""
-
-        lines = []
-        for eid, name, etype, _ in rows:
-            triples = conn.execute(
-                """SELECT t.predicate, COALESCE(e.name, t.object) as obj_display
-                   FROM triples t
-                   LEFT JOIN entities e ON t.object = e.id
-                   WHERE t.subject = ? AND t.valid_to IS NULL
-                   ORDER BY t.predicate""",
-                (eid,),
-            ).fetchall()
-            if not triples:
-                continue
-
-            parts = []
-            for pred, obj in triples:
-                if pred in VALUE_PREDICATES:
-                    parts.append(f"{pred}={obj}")
-                else:
-                    parts.append(f"{pred} → {obj}")
-            lines.append(f"- {name} ({etype}): {', '.join(parts)}")
-
-        conn.close()
         return "\n".join(lines)

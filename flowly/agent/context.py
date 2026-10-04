@@ -1128,7 +1128,7 @@ class ContextBuilder:
         notes) as one string. Same content/order as before; returned as a single
         block so freezing it (below) is byte-identical to the inline version."""
         sub: list[str] = []
-        long_term = self.memory.read_long_term()
+        long_term = self._prompt_memory_md(self.memory.read_long_term())
         if long_term:
             from flowly.cron.guard import scan_context_file
             blocked = scan_context_file(long_term, "MEMORY.md")
@@ -1149,7 +1149,13 @@ class ContextBuilder:
                 kg_path = self.workspace / ".flowly_state" / "knowledge_graph.sqlite3"
             if not kg_path.exists():
                 kg_path = self.workspace.parent / "knowledge_graph.sqlite3"
-            if kg_path.exists():
+            # Governed MEMORY.md already carries the graph summary in its
+            # generated block (kept current by the governance refresh); a
+            # second copy only doubled it in every prompt.
+            from flowly.memory.summary import SENTINEL_START
+            if SENTINEL_START in long_term and "\n## Knowledge Graph\n" in long_term:
+                kg_path = None
+            if kg_path is not None and kg_path.exists():
                 from flowly.memory.knowledge_graph import KnowledgeGraph
                 kg = KnowledgeGraph(str(kg_path))
                 kg_summary = kg.summary(max_entities=20)
@@ -1162,6 +1168,23 @@ class ContextBuilder:
             if recent:
                 sub.append(f"# Recent Notes\n\n{recent}")
         return "\n\n".join(sub)
+
+    @staticmethod
+    def _prompt_memory_md(long_term: str) -> str:
+        """MEMORY.md as the prompt states it: a note carrying memory that is no
+        longer active (rejected, superseded, stale, unreviewed) is left out,
+        as a call's memory leaves it out. An unreadable index changes nothing:
+        the agent keeps its memory."""
+        if not long_term:
+            return long_term
+        try:
+            from flowly.config.loader import get_data_dir
+            from flowly.memory.summary import governance_states, withhold_retired_notes
+
+            states = governance_states(get_data_dir() / "memory_governance.sqlite3")
+            return withhold_retired_notes(long_term, states) if states else long_term
+        except Exception:  # noqa: BLE001 — prompt assembly must not fail
+            return long_term
 
     def _memory_block_for(self, session_key: str | None, memory_search_enabled: bool) -> str:
         """Freeze-aware memory block: when freezing is on and we have a session

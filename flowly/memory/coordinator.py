@@ -10,6 +10,8 @@ Privacy: ``secret`` items are never returned by recall or written to MEMORY.md.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from flowly.memory.governance import (
@@ -128,13 +130,22 @@ class MemoryGovernance:
         return active
 
     def reject(self, item_id: str) -> MemoryItem:
-        """User rejects an item (any non-terminal state) → rejected."""
+        """User rejects an item (any non-terminal state) → rejected.
+
+        A rejected fact also stops being current in the knowledge graph, which
+        MEMORY.md and a call's memory render too; otherwise the graph kept
+        stating what the owner had rejected.
+        """
         item = self.gov.get_item(item_id)
         if item is None:
             raise GovernanceError(f"item not found: {item_id}")
-        return self.gov.transition(
+        rejected = self.gov.transition(
             item_id, STATUS_REJECTED, actor=ACTOR_USER, reason="user_reject"
         )
+        if self.kg_mirror is not None and item.ref_kind == "kg_triple" and item.ref_id:
+            self.kg_mirror.supersede(item.ref_id)
+            self._summary_dirty = True
+        return rejected
 
     def correct(
         self, item_id: str, new_text: str, *, confidence: Optional[float] = None
@@ -417,6 +428,55 @@ class MemoryGovernance:
         )
         return item
 
+    def retire_kg_facts(self, triple_ids: list[str]) -> list[MemoryItem]:
+        """A knowledge_graph invalidate closed these triples: their governed
+        copies stop being active memory (stale), so MEMORY.md, recall and a
+        call's memory stop stating them. ``undo`` restores the item and
+        reopens its triple."""
+        retired: list[MemoryItem] = []
+        for triple_id in dict.fromkeys(t for t in triple_ids if t):
+            for item in self.gov.find_by_ref("kg_triple", triple_id):
+                if item.status not in (STATUS_ACTIVE, STATUS_NEEDS_REVIEW):
+                    continue
+                retired.append(self.gov.transition(
+                    item.id, STATUS_STALE, actor="system", reason="knowledge_graph_invalidate"))
+        if retired:
+            self._summary_dirty = True
+            self.mark_dirty()
+        return retired
+
+    def reconcile_kg_triples(self) -> dict[str, int]:
+        """Repair governed facts and their triples that disagree.
+
+        A governed fact is active exactly while its triple is current. Before
+        invalidate, reject and consolidation were mirrored both ways, they
+        could disagree: an invalidated fact stayed active memory, a rejected
+        one stayed current in the graph. Repairs only what it can read: a
+        triple the graph lacks, or an unreadable graph, changes nothing.
+        """
+        if self.kg_mirror is None:
+            return {"staled": 0, "closed": 0}
+        items = [i for i in self.gov.list_items() if i.ref_kind == "kg_triple" and i.ref_id]
+        states = self.kg_mirror.triple_states([i.ref_id for i in items])
+        if not states:
+            return {"staled": 0, "closed": 0}
+        # A triple another live item still stands on stays as it is.
+        live = {i.ref_id for i in items if i.status in (STATUS_ACTIVE, STATUS_NEEDS_REVIEW, STATUS_CANDIDATE)}
+        staled = closed = 0
+        for item in items:
+            current = states.get(item.ref_id)
+            if current is False and item.status == STATUS_ACTIVE:
+                self.gov.transition(item.id, STATUS_STALE, actor="system", reason="kg_triple_closed")
+                staled += 1
+            elif (current is True and item.ref_id not in live
+                  and item.status in (STATUS_REJECTED, STATUS_STALE, STATUS_SUPERSEDED)):
+                closed += self.kg_mirror.supersede(item.ref_id)
+                states[item.ref_id] = False
+        if staled or closed:
+            self._summary_dirty = True
+            self.mark_dirty()
+        return {"staled": staled, "closed": closed}
+
     # -- maintenance --------------------------------------------------------
 
     def refresh(self) -> Optional[str]:
@@ -438,3 +498,63 @@ class MemoryGovernance:
         if not self._summary_dirty:
             return None
         return self.refresh()
+
+
+_TRIPLE_ID = re.compile(r"\bt_[^\s,()]+")
+
+
+def mirror_tool_write(facade: MemoryGovernance, tool_name: str, params: dict, result: str,
+                      *, source_session: str = "", auto_activate: bool = True) -> None:
+    """Mirror one successful memory tool call into governance (the agent's
+    post_tool_call hook). memory_append records a note; knowledge_graph add
+    records the fact; invalidate retires the facts it closed."""
+    if tool_name == "memory_append":
+        facade.ingest_append(params.get("content", ""), source_session=source_session,
+                             auto_activate=auto_activate)
+    elif tool_name == "knowledge_graph" and params.get("action") == "add":
+        match = re.search(r"id:\s*(t_[^)\s]+)", result or "")
+        if match:  # no id: the add failed, nothing to record
+            facade.ingest_kg_fact(params.get("subject", ""), params.get("predicate", ""),
+                                  params.get("object", ""), match.group(1),
+                                  source_session=source_session, auto_activate=auto_activate)
+    elif tool_name == "knowledge_graph" and params.get("action") == "invalidate":
+        _, _, listed = (result or "").partition("ids:")
+        if (result or "").startswith("Invalidated:") and listed:
+            facade.retire_kg_facts(_TRIPLE_ID.findall(listed))
+
+
+def open_memory_governance(state_dir: Path, workspace: Path, *,
+                           governance_db: Path | None = None,
+                           kg_path: Path | None = None) -> MemoryGovernance:
+    """The governance facade every surface uses (the agent, the memory panel's
+    RPCs, the CLI), wired to the knowledge graph so supersede, reject, stale
+    and undo keep governed facts and their triples in agreement."""
+    from flowly.agent.memory import MemoryStore
+    from flowly.memory.governance import GovernanceStore
+    from flowly.memory.kg_mirror import SqliteKGMirror
+
+    graph = kg_path or state_dir / "knowledge_graph.sqlite3"
+    store = GovernanceStore(governance_db or state_dir / "memory_governance.sqlite3")
+
+    def kg_summary() -> str:
+        """The graph as memory states it: a triple whose governed fact is not
+        active (rejected, superseded, stale, waiting for review) is left out,
+        as a call's memory leaves it out."""
+        try:
+            if graph.exists():
+                from flowly.memory.knowledge_graph import KnowledgeGraph
+                facts = [i for i in store.list_items(ref_kind="kg_triple") if i.ref_id]
+                live = {i.ref_id for i in facts if i.status == STATUS_ACTIVE}
+                withheld = {i.ref_id for i in facts if i.status != STATUS_ACTIVE}
+                return KnowledgeGraph(str(graph)).summary(max_entities=20, exclude_triple_ids=withheld - live)
+        except Exception:  # noqa: BLE001 — a summary never blocks memory
+            pass
+        return ""
+
+    return MemoryGovernance(
+        store,
+        memory_store=MemoryStore(workspace),
+        kg_mirror=SqliteKGMirror(str(graph)),
+        kg_summary_fn=kg_summary,
+        kg_path=str(graph),
+    )

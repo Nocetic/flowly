@@ -1537,29 +1537,20 @@ class AgentLoop:
         if not enabled:
             return
         try:
-            from flowly.agent.memory import MemoryStore
-            from flowly.memory.governance import GovernanceStore
-            from flowly.memory.coordinator import MemoryGovernance
-            from flowly.memory.kg_mirror import SqliteKGMirror
+            from flowly.memory.coordinator import open_memory_governance
 
-            kg_path = self._state_dir / "knowledge_graph.sqlite3"
-
-            def _kg_summary() -> str:
-                try:
-                    if kg_path.exists():
-                        from flowly.memory.knowledge_graph import KnowledgeGraph
-                        return KnowledgeGraph(str(kg_path)).summary(max_entities=20)
-                except Exception:
-                    pass
-                return ""
-
-            self._memory_gov = MemoryGovernance(
-                GovernanceStore(self._state_dir / "memory_governance.sqlite3"),
-                memory_store=MemoryStore(self.workspace),
-                kg_mirror=SqliteKGMirror(str(kg_path)),
-                kg_summary_fn=_kg_summary,
-                kg_path=str(kg_path),
-            )
+            self._memory_gov = open_memory_governance(self._state_dir, self.workspace)
+            _kg_summary = self._memory_gov.kg_summary_fn
+            # Facts and their graph triples written before invalidate, reject
+            # and consolidation were mirrored both ways may disagree: repair
+            # them once, so neither MEMORY.md nor a call states a retired fact.
+            try:
+                repaired = self._memory_gov.reconcile_kg_triples()
+                if any(repaired.values()):
+                    self._memory_gov.refresh()
+                    logger.info(f"[memory-gov] repaired facts out of step with the knowledge graph: {repaired}")
+            except Exception as exc:  # noqa: BLE001 — memory stays usable unrepaired
+                logger.warning(f"[memory-gov] knowledge graph reconcile failed: {type(exc).__name__}")
             self.hooks.register("post_tool_call", self._governance_post_tool)
             # Also route subagent (background self-review) memory/KG writes into
             # governance — they use a separate tool registry that bypasses the
@@ -1618,24 +1609,12 @@ class AgentLoop:
         # agent's own inference, not a user statement — those writes go to review
         # instead of silently becoming active memory. Real user-channel writes
         # stay trusted (auto-active), as before.
+        from flowly.memory.coordinator import mirror_tool_write
         from flowly.memory.dreamer import is_automation_session
-        auto_activate = not is_automation_session(session)
         try:
-            if name == "memory_append":
-                self._memory_gov.ingest_append(
-                    params.get("content", ""), source_session=session,
-                    auto_activate=auto_activate,
-                )
-            elif name == "knowledge_graph" and params.get("action") == "add":
-                import re
-                m = re.search(r"id:\s*(t_[^)\s]+)", getattr(ctx, "result", "") or "")
-                if not m:
-                    return  # add failed or no triple id → nothing to record
-                self._memory_gov.ingest_kg_fact(
-                    params.get("subject", ""), params.get("predicate", ""),
-                    params.get("object", ""), m.group(1), source_session=session,
-                    auto_activate=auto_activate,
-                )
+            mirror_tool_write(self._memory_gov, name, params, getattr(ctx, "result", "") or "",
+                              source_session=session,
+                              auto_activate=not is_automation_session(session))
         except Exception as exc:
             logger.warning(f"[memory-gov] post_tool sync failed: {exc}")
 
@@ -3536,21 +3515,6 @@ class AgentLoop:
             from flowly.memory.manager import get_manager
             ms = self._memory_search_config
 
-            # Resolve api_key from main config if not overridden.
-            api_key = ms.api_key
-            if not api_key and self._main_config:
-                # Only seed the embedding key from the active provider when it is
-                # actually an OpenAI key — embeddings work with OpenAI only. A
-                # non-OpenAI active key (xAI/Grok, a Flowly proxy `flw_…` key,
-                # etc.) would otherwise be mis-detected as a Gemini key by the
-                # "auto" resolver and fail silently (401 → keyword-only) while
-                # claiming vector search. Leaving it empty lets the resolver fall
-                # back to an explicitly-configured openai/gemini key, or honestly
-                # report keyword-only search.
-                active = self._main_config.get_api_key() or ""
-                if active.startswith("sk-"):
-                    api_key = active
-
             state_dir = self._state_dir if self._state_dir else (self.workspace / ".flowly_state")
 
             return get_manager(
@@ -3559,7 +3523,9 @@ class AgentLoop:
                 config=self._main_config,
                 provider=ms.provider,
                 model=ms.model,
-                api_key=api_key,
+                # Embeddings resolve their own provider's key and endpoint
+                # together. The chat provider may use an incompatible API.
+                api_key=ms.api_key,
                 api_base=ms.api_base,
                 chunk_tokens=ms.chunk_tokens,
                 overlap_tokens=ms.overlap_tokens,
@@ -8847,9 +8813,11 @@ class AgentLoop:
         skip_memory_flag = bool(msg.metadata.get("skip_memory", False))
         skip_context_files_flag = bool(msg.metadata.get("skip_context_files", False))
         voice_mode_flag = bool(msg.metadata.get("voice_mode", False))
+        from flowly.agent.turn_clock import turn_clock
         request_sidecars = [
             block
             for block in (
+                turn_clock(),
                 coverage_sidecar,
                 tool_policy_sidecar,
                 profile_collaboration_sidecar,
@@ -9571,12 +9539,11 @@ class AgentLoop:
             if str(item.get("function", {}).get("name", ""))
         }
         announce_coverage = self._context_coverage_sidecar(session)
+        from flowly.agent.turn_clock import turn_clock
         messages = self.context.build_messages(
             history=self._history_with_summary_anchor(session),
-            current_message=(
-                f"{announce_coverage}\n\n{msg.content}"
-                if announce_coverage
-                else msg.content
+            current_message="\n\n".join(
+                block for block in (turn_clock(), announce_coverage, msg.content) if block
             ),
             memory_search_enabled=self._memory_manager is not None,
             model=self.model,

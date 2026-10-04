@@ -1918,8 +1918,12 @@ Respond to the user now:"""
             )
 
         voice_exec = VoiceExec(_voice_exec, _voice_exec_profile)
+        from flowly.live_voice.language import VoiceLanguagePreferences
+
         live_voice = LiveVoiceService(
-            VoiceSessions(agent.sessions),
+            # The language the owner speaks to each agent, kept on this host.
+            VoiceSessions(agent.sessions, languages=VoiceLanguagePreferences(
+                _feature_rpc.state_db("voice_language.json"))),
             lambda: (getattr(agent, "_board_store", None), getattr(agent, "_board_orchestrator", None)),
             worker=lambda: getattr(getattr(agent, '_gateway_server', None), 'profile_host', None),
             executor=lambda: voice_exec,
@@ -1935,8 +1939,20 @@ Respond to the user now:"""
         voice_context = VoiceContext(
             agent.workspace, state_db=_feature_rpc.state_db, profile=_voice_scope,
             index=lambda: getattr(agent, "_memory_manager", None),
+            conversations=lambda: (_feature_rpc.get_flowly_home() / "session_index.sqlite",
+                                   _feature_rpc.get_flowly_home() / "sessions"),
         )
         _feature_rpc.set_voice_context_provider(lambda: voice_context)
+        from flowly.live_voice.memory_snapshot import VoiceMemorySnapshot
+
+        # The same sources and rules as this agent's own chat prompt.
+        voice_snapshot = VoiceMemorySnapshot(
+            agent.workspace, state_db=_feature_rpc.state_db, profile=_voice_scope,
+            persona=lambda: getattr(agent.context, "persona", "default"),
+            search_enabled=lambda: getattr(agent, "_memory_manager", None) is not None,
+            sessions_dir=lambda: _feature_rpc.get_flowly_home() / "sessions",
+        )
+        _feature_rpc.set_voice_snapshot_provider(lambda: voice_snapshot)
         from flowly.live_voice.memory import VoiceMemory
 
         async def _voice_memory_append(note):

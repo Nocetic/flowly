@@ -124,3 +124,15 @@ async def test_context_rpc_returns_the_same_projection_for_named_profile(context
 def test_profile_host_cannot_expand_context_scope(params):
     with pytest.raises(ProfileHostError):
         validate_profile_rpc('voice.context', params)
+
+
+@pytest.mark.asyncio
+async def test_memory_search_matches_count_even_without_the_query_words(context):
+    """Recall uses the agent's own memory search; a semantic match that does
+    not repeat the query's words is still a match, as in the agent's chat."""
+    reader, workspace, _, index = context
+    (workspace / 'memory/2026-10-01.md').write_text('Hakan drinks an Americano every morning.')
+    index.search.return_value = [SimpleNamespace(path='memory/2026-10-01.md', snippet='Hakan drinks an Americano every morning.',
+                                                 start_line=1, end_line=1)]
+    result = await reader.search({'query': 'kahve alışkanlığı'})
+    assert any('Americano' in fact['text'] for fact in result['facts'])

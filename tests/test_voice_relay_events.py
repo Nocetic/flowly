@@ -276,3 +276,44 @@ async def test_mirror_cannot_recapture_a_different_owner_between_direct_and_rela
     await mirror_event(gateway, channel, 'artifact.updated', artifact)
     assert events(socket) == []
     assert channel._outbound_queue == []
+
+
+@pytest.mark.asyncio
+async def test_a_call_starting_with_several_reads_at_once_gets_all_of_them(admission, monkeypatch):
+    """A phone starts a call with the agent's memory, tasks and focus at once.
+    The receive-order guard decides who receives events (the lease methods);
+    an ordinary read whose certificate verified after a later request's is
+    authorized by its own certificate and must still be served. It used to
+    be refused (VOICE_AUTH_REQUIRED), so the call started without memory."""
+    channel, socket, token = admission
+
+    class Snapshot:
+        def snapshot(self, params):
+            return {'scope': {'profile': 'default', 'botId': 'bot'}, 'sections': [{'kind': 'user', 'text': 'Hakan'}]}
+
+    monkeypatch.setattr(feature_rpc, '_voice_snapshot_provider', lambda: Snapshot())
+    original = feature_rpc.resolve_voice_access
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def first_is_slow(params):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        return await original(params)
+
+    monkeypatch.setattr(feature_rpc, 'resolve_voice_access', first_is_slow)
+    first = asyncio.create_task(relay_rpc(channel, socket, {
+        'id': 'memory', 'method': 'voice.memory.snapshot', 'sessionId': 'browser-a',
+        'params': {'voiceAccess': token({'sub': A.uid})}}, uid=A.uid))
+    await asyncio.wait_for(entered.wait(), 1)
+    await relay_rpc(channel, socket, {'id': 'tasks', 'method': 'voice.memory.snapshot', 'sessionId': 'browser-a',
+                                     'params': {'voiceAccess': token({'sub': A.uid})}}, uid=A.uid)
+    release.set()
+    await first
+    replies = {frame['id']: frame for frame in socket.sent if frame.get('id') in {'memory', 'tasks'}}
+    assert 'result' in replies['tasks'], replies['tasks']
+    assert 'result' in replies['memory'], replies['memory']
+    assert replies['memory']['result']['sections'][0]['text'] == 'Hakan'
