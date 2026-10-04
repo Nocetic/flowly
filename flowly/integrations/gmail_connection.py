@@ -13,6 +13,7 @@ import re
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,12 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 from filelock import FileLock
 
-from flowly.integrations.google_permissions import granted_services, normalize_services
+from flowly.integrations.google_permissions import (
+    CONNECTION_SERVICES,
+    granted_services,
+    normalize_services,
+    service_permissions,
+)
 from flowly.profile import get_active_profile_name, get_flowly_home
 
 BROKER_ORIGIN = "https://useflowlyapp.com"
@@ -32,6 +38,7 @@ MAX_BODY = 64 * 1024
 _ID = re.compile(r"^[a-f0-9]{32}$")
 _SECRET = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _TERMINAL = {"expired", "cancelled", "revoked", "failed", "reauthorize"}
+_LOCK_CREATION = threading.Lock()
 
 
 class GmailConnectionError(Exception):
@@ -104,16 +111,63 @@ def is_managed_credentials(value: dict[str, Any]) -> bool:
 
 
 class GmailConnection:
-    def __init__(self, home: Path | None = None, *, client: httpx.Client | None = None):
+    def __init__(self, home: Path | None = None, *, client: httpx.Client | None = None, service: str | None = None):
+        if service is not None and service not in CONNECTION_SERVICES:
+            raise GmailConnectionError("INVALID_SERVICE")
+        self.service = service
         self.home = home if home is not None else get_flowly_home()
         self.credentials = self.home / "credentials" / "gmail.json"
         self.pending = self.home / "credentials" / "gmail-setup.json"
+        if service is not None:
+            self.credentials = self.home / "credentials" / f"google-{service}.json"
+            self.pending = self.home / "credentials" / f"google-{service}-setup.json"
+        # Construct the reentrant singleton atomically across parallel RPC workers.
+        with _LOCK_CREATION:
+            self._file_lock = FileLock(str(self.credentials.parent / ".gmail.lock"), timeout=40, is_singleton=True)
         self._client = client
 
     def _lock(self) -> FileLock:
         self.credentials.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _private(self.credentials.parent, directory=True)
-        return FileLock(str(self.credentials.parent / ".gmail.lock"), timeout=40)
+        return self._file_lock
+
+    def _read_credentials(self) -> dict | None:
+        own = _read(self.credentials)
+        if own is not None or self.service is None:
+            return own
+        shared = _read(self.home / "credentials" / "gmail.json")
+        if not shared or self.service in shared.get("disabled_services", []):
+            return None
+        actual = granted_services(shared)
+        # Historical native credentials omitted scopes; keep their compatibility
+        # path until the user explicitly reconnects or disconnects each service.
+        if self.service not in actual and not (not shared.get("scopes", shared.get("scope")) and (self.service == "gmail" or shared.get("mode") != MANAGED_MODE)):
+            return None
+        return {**shared, "_shared": True, "_shared_service": self.service}
+
+    def _save_credentials(self, value: dict) -> None:
+        target = self.home / "credentials" / "gmail.json" if value.get("_shared") else self.credentials
+        atomic_private_json(target, {key: item for key, item in value.items() if not key.startswith("_shared")})
+
+    def _detach_shared(self, credentials: dict) -> bool:
+        """Remove this service from an old bundle, preserving every other service."""
+        path = self.home / "credentials" / "gmail.json"
+        shared = _read(path)
+        if not shared or self.connection_id(shared) != self.connection_id(credentials):
+            return True
+        shared["disabled_services"] = sorted(set(shared.get("disabled_services", [])) | {self.service})
+        atomic_private_json(path, shared)
+        unknown_native = shared.get("mode") != MANAGED_MODE and not shared.get("scopes", shared.get("scope"))
+        if granted_services(shared) or (unknown_native and set(CONNECTION_SERVICES) - set(shared["disabled_services"])):
+            return True
+        if is_managed_credentials(shared):
+            try:
+                self._grant_request(shared, "disconnect")
+            except GmailConnectionError as error:
+                if error.code not in {"NOT_FOUND", "REAUTHORIZE", "EXPIRED"}:
+                    return False
+        path.unlink(missing_ok=True)
+        return True
 
     def _request(self, method: str, url: str, *, secret: str | None = None, body: dict | None = None) -> dict:
         # URLs are constructed locally, never taken from an RPC payload or remote response.
@@ -161,6 +215,7 @@ class GmailConnection:
             "verificationCode": grant["verification_code"], "expiresAt": grant["expires_at"],
             "label": grant["label"], "profile": grant["profile"], "interval": 5,
             "services": grant.get("services", ["gmail"]),
+            **({"service": grant["connection_service"]} if grant.get("connection_service") else {}),
             "replacingConnectionId": grant.get("replacing_connection_id"),
         }
 
@@ -168,12 +223,14 @@ class GmailConnection:
         if locale not in {"en", "tr", "es"}:
             raise GmailConnectionError("INVALID_PARAMS")
         try:
-            selected = normalize_services(services)
+            selected = normalize_services(services if services is not None else (service_permissions(self.service) if self.service else None), require_gmail=self.service is None)
+            if self.service and (self.service not in selected or set(selected) - set(service_permissions(self.service))):
+                raise ValueError("INVALID_SERVICES")
         except ValueError:
             raise GmailConnectionError("INVALID_SERVICES") from None
         with self._lock():
             existing = _read(self.pending)
-            credentials = _read(self.credentials)
+            credentials = self._read_credentials()
             saved_same_grant = bool(existing and credentials and credentials.get("grant_id") == existing.get("grant_id"))
             if existing and (existing.get("expires_at", 0) > time.time() * 1000 or saved_same_grant):
                 if not is_managed_credentials(existing):
@@ -198,7 +255,7 @@ class GmailConnection:
                     raise GmailConnectionError("CONNECTION_CHANGED")
                 if not credentials.get("email"):
                     raise GmailConnectionError("REAUTHORIZE")
-                selected = normalize_services(list(set(selected) | set(granted_services(credentials))))
+                selected = normalize_services(list(set(selected) | (set(granted_services(credentials)) & set(service_permissions(self.service)) if self.service else set(granted_services(credentials)))), require_gmail=self.service is None)
             elif connection_id:
                 raise GmailConnectionError("CONNECTION_CHANGED")
             target_label = (label or socket.gethostname())[:100]
@@ -212,7 +269,9 @@ class GmailConnection:
                 "services": selected,
                 "replacing_connection_id": connection_id,
                 "expected_email": credentials.get("email") if credentials else None,
-                "superseded": credentials if credentials and is_managed_credentials(credentials) else None,
+                "expected_subject": credentials.get("subject") if credentials else None,
+                "connection_service": self.service,
+                "superseded": credentials if credentials and (is_managed_credentials(credentials) or credentials.get("_shared")) else None,
             }
             if not is_managed_credentials(grant):
                 raise GmailConnectionError("INVALID_RESPONSE")
@@ -240,7 +299,7 @@ class GmailConnection:
     def setup_status(self, request_id: str) -> dict:
         with self._lock():
             # Reply loss after a successful local save is safe to retry.
-            credentials = _read(self.credentials)
+            credentials = self._read_credentials()
             if credentials and credentials.get("grant_id") == request_id and not self.pending.exists():
                 return {"requestId": request_id, **self._status_locked(credentials, verify=True)}
             grant = self._require_pending(request_id)
@@ -261,10 +320,14 @@ class GmailConnection:
                         raise GmailConnectionError("ALREADY_CONFIGURED")
                 tokens = self._token(grant)
                 self._verify_gmail(tokens)
+                if self.service and self.service not in granted_services({**grant, **tokens}):
+                    raise GmailConnectionError("PERMISSION_REQUIRED")
+                if grant.get("expected_subject") and tokens.get("subject") != grant["expected_subject"]:
+                    raise GmailConnectionError("GMAIL_ACCOUNT_MISMATCH")
                 if grant.get("expected_email") and tokens["email"].casefold() != grant["expected_email"].casefold():
                     raise GmailConnectionError("GMAIL_ACCOUNT_MISMATCH")
                 saved = {key: value for key, value in {**grant, **tokens}.items() if key != "superseded"}
-                atomic_private_json(self.credentials, saved)
+                self._save_credentials(saved)
                 self._enable_email()
                 cleanup_pending = not self._retire_superseded(grant)
                 if not cleanup_pending:
@@ -282,6 +345,8 @@ class GmailConnection:
         old = grant.get("superseded")
         if not old:
             return True
+        if old.get("_shared"):
+            return self._detach_shared(old)
         try:
             self._grant_request(old, "disconnect")
             return True
@@ -289,6 +354,8 @@ class GmailConnection:
             return error.code in {"NOT_FOUND", "REAUTHORIZE"}
 
     def _enable_email(self) -> None:
+        if self.service and self.service != "gmail":
+            return
         # Read/modify only the email card; never rewrite provider/model or enable an inbound channel.
         from flowly.config.loader import get_config_path
         from flowly.integrations.config_io import apply_card_values, read_card_values
@@ -311,9 +378,16 @@ class GmailConnection:
                 or not isinstance(expiry, (int, float)) or not time.time() * 1000 < expiry <= (time.time() + 86400) * 1000
                 or not isinstance(email, str) or len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+", email)):
             raise GmailConnectionError("INVALID_RESPONSE")
-        return {"access_token": access, "expiry": datetime.fromtimestamp(expiry / 1000, timezone.utc).isoformat(), "email": email, "scopes": data.get("scope", "")}
+        return {"access_token": access, "expiry": datetime.fromtimestamp(expiry / 1000, timezone.utc).isoformat(), "email": email, "scopes": data.get("scope", ""), **({"subject": data["subject"]} if isinstance(data.get("subject"), str) else {})}
 
     def _verify_gmail(self, tokens: dict) -> None:
+        if self.service and self.service != "gmail" and not tokens.get("_shared"):
+            data = self._request("GET", "https://openidconnect.googleapis.com/v1/userinfo", secret=tokens["access_token"])
+            if (data.get("email_verified") is not True or data.get("email") != tokens["email"]
+                    or not isinstance(data.get("sub"), str) or not data["sub"]
+                    or data["sub"] != tokens.get("subject")):
+                raise GmailConnectionError("GMAIL_ACCOUNT_MISMATCH")
+            return
         data = self._request("GET", "https://gmail.googleapis.com/gmail/v1/users/me/profile", secret=tokens["access_token"])
         if data.get("emailAddress") != tokens["email"]:
             raise GmailConnectionError("GMAIL_ACCOUNT_MISMATCH")
@@ -321,7 +395,7 @@ class GmailConnection:
     def cancel(self, request_id: str) -> dict:
         with self._lock():
             grant = self._require_pending(request_id)
-            credentials = _read(self.credentials)
+            credentials = self._read_credentials()
             saved_same_grant = bool(credentials and credentials.get("grant_id") == request_id)
             if saved_same_grant and grant.get("replacing_connection_id"):
                 # Authorization already committed. A late cancel must not erase it.
@@ -331,7 +405,7 @@ class GmailConnection:
                 # Cancellation must also stop that partial local connection.
                 credentials["disconnect_pending"] = True
                 credentials.pop("access_token", None)
-                atomic_private_json(self.credentials, credentials)
+                self._save_credentials(credentials)
             self._grant_request(grant, "disconnect")
             if saved_same_grant:
                 self.credentials.unlink(missing_ok=True)
@@ -345,7 +419,7 @@ class GmailConnection:
                 return None
             if not is_managed_credentials(grant):
                 raise GmailConnectionError("INVALID_LOCAL_STATE")
-            credentials = _read(self.credentials)
+            credentials = self._read_credentials()
             saved_same_grant = bool(credentials and credentials.get("grant_id") == grant["grant_id"])
             return self._public_setup(grant, "expired" if grant["expires_at"] <= time.time() * 1000 and not saved_same_grant else "pending")
 
@@ -367,29 +441,31 @@ class GmailConnection:
         try:
             if is_managed_credentials(credentials):
                 tokens = self._token(credentials)
-                self._verify_gmail(tokens)
+                self._verify_gmail({**tokens, "_shared": credentials.get("_shared")})
+                if credentials.get("subject") and tokens.get("subject") != credentials["subject"]:
+                    raise GmailConnectionError("GMAIL_ACCOUNT_MISMATCH")
                 if credentials.get("email") and tokens["email"].casefold() != credentials["email"].casefold():
                     raise GmailConnectionError("GMAIL_ACCOUNT_MISMATCH")
                 credentials.pop("reauthorize_required", None)
                 credentials.update(tokens)
-                atomic_private_json(self.credentials, credentials)
+                self._save_credentials(credentials)
             else:
                 from flowly.channels.gmail_auth import get_valid_access_token
-                token, email = get_valid_access_token()
+                token, email = get_valid_access_token(self.service) if self.service else get_valid_access_token()
                 if not token:
                     raise GmailConnectionError("REAUTHORIZE")
-                self._verify_gmail({"access_token": token, "email": email})
-            return {**result, "status": "connected", "connected": True, "services": granted_services(credentials)}
+                self._verify_gmail({"access_token": token, "email": email, "_shared": credentials.get("_shared")})
+            return {**result, "status": "connected", "connected": True, "services": [item for item in granted_services(credentials) if not self.service or item in service_permissions(self.service)]}
         except GmailConnectionError as error:
             if is_managed_credentials(credentials) and error.code in {"UNAUTHORIZED", "REAUTHORIZE", "NOT_FOUND"}:
                 credentials["reauthorize_required"] = True
                 credentials.pop("access_token", None)
-                atomic_private_json(self.credentials, credentials)
+                self._save_credentials(credentials)
             return {**result, "status": "reauthorize" if error.code in {"UNAUTHORIZED", "REAUTHORIZE", "NOT_FOUND"} else "unavailable", "connected": False, "error": {"code": error.code}}
 
     def status(self, *, verify: bool = True) -> dict:
         with self._lock():
-            credentials = _read(self.credentials)
+            credentials = self._read_credentials()
             result = self._status_locked(credentials, verify=verify)
             pending = _read(self.pending)
             if verify and result.get("connected") and pending and credentials and pending.get("grant_id") == credentials.get("grant_id"):
@@ -399,17 +475,39 @@ class GmailConnection:
                     self.pending.unlink(missing_ok=True)
                 else:
                     result["cleanupPending"] = True
+            if self.service:
+                result["service"] = self.service
+                result["services"] = [item for item in result.get("services", []) if item in service_permissions(self.service)]
+                if result.get("connected") and self.service not in result["services"]:
+                    result.update(connected=False, status="reauthorize", error={"code": "PERMISSION_REQUIRED"})
             return result
 
     def disconnect(self, connection_id: str) -> dict:
         with self._lock():
-            credentials = _read(self.credentials)
+            credentials = self._read_credentials()
             if not credentials or self.connection_id(credentials) != connection_id:
                 raise GmailConnectionError("CONNECTION_CHANGED")
+            if credentials.get("_shared"):
+                # A tombstone shadows fallback immediately, including on revocation failure.
+                stopped = {**credentials, "disconnect_pending": True}
+                stopped.pop("access_token", None)
+                atomic_private_json(self.credentials, stopped)
+                pending = _read(self.pending)
+                if pending:
+                    try:
+                        self._grant_request(pending, "disconnect")
+                    except GmailConnectionError as error:
+                        if error.code not in {"NOT_FOUND", "EXPIRED", "REAUTHORIZE"}:
+                            return {"connected": False, "status": "disconnect_pending", "connectionId": connection_id}
+                if not self._detach_shared(credentials):
+                    return {"connected": False, "status": "disconnect_pending", "connectionId": connection_id}
+                self.credentials.unlink(missing_ok=True)
+                self.pending.unlink(missing_ok=True)
+                return {"connected": False, "status": "not_configured"}
             # Stop local use before ANY network call, including pending upgrades.
             credentials["disconnect_pending"] = True
             credentials.pop("access_token", None)
-            atomic_private_json(self.credentials, credentials)
+            self._save_credentials(credentials)
             pending = _read(self.pending)
             try:
                 if pending and pending.get("grant_id") != credentials.get("grant_id"):
@@ -431,7 +529,7 @@ class GmailConnection:
 
     def access_token(self) -> tuple[str | None, str | None]:
         with self._lock():
-            credentials = _read(self.credentials)
+            credentials = self._read_credentials()
             if not credentials or not is_managed_credentials(credentials) or credentials.get("disconnect_pending") or credentials.get("reauthorize_required"):
                 return None, None
             from flowly.channels.gmail_auth import _is_expired
@@ -439,6 +537,8 @@ class GmailConnection:
                 tokens = self._token(credentials)
                 if tokens["email"] != credentials.get("email"):
                     raise GmailConnectionError("GMAIL_ACCOUNT_MISMATCH")
+                if credentials.get("subject") and tokens.get("subject") != credentials["subject"]:
+                    raise GmailConnectionError("GMAIL_ACCOUNT_MISMATCH")
                 credentials.update(tokens)
-                atomic_private_json(self.credentials, credentials)
+                self._save_credentials(credentials)
             return credentials.get("access_token"), credentials.get("email")

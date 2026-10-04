@@ -22,7 +22,7 @@ def main():
     home_b.mkdir()
     with httpx.Client(timeout=5, follow_redirects=False, trust_env=False) as fixture:
         def request(req: httpx.Request):
-            assert req.url.host in {"useflowlyapp.com", "gmail.googleapis.com"}
+            assert req.url.host in {"useflowlyapp.com", "gmail.googleapis.com", "openidconnect.googleapis.com"}
             # These fixture credentials can only reach the explicit localhost test server.
             return fixture.request(req.method, origin + req.url.raw_path.decode(), headers=dict(req.headers), content=req.content)
 
@@ -66,7 +66,24 @@ def main():
             assert get_valid_access_token() == (None, None)
             os.environ["FLOWLY_HOME"] = str(home_b)
             assert second.status()["connected"]
-    print("PASS: create, resume, authorize, claim, permission upgrade, partial consent, token use, disconnect and profile isolation")
+            os.environ["FLOWLY_HOME"] = str(home_a)
+            config_before = (home_a / "config.json").read_bytes()
+            independent = {}
+            for service in ("drive", "tasks"):
+                connection = GmailConnection(client=client, service=service)
+                setup = connection.begin()
+                assert setup["services"] == [service]
+                fixture.post(origin + "/fixture/approve", json=setup).raise_for_status()
+                assert connection.setup_status(setup["requestId"])["services"] == [service]
+                assert get_valid_access_token(service) == ("fixture-google-access", "fixture@example.test")
+                independent[service] = connection, setup
+            assert (home_a / "config.json").read_bytes() == config_before
+            drive, drive_setup = independent["drive"]
+            drive.disconnect(drive_setup["requestId"])
+            assert get_valid_access_token("drive") == (None, None)
+            assert independent["tasks"][0].status()["connected"]
+            assert get_valid_access_token() == (None, None)
+    print("PASS: create, resume, authorize, claim, upgrade, partial consent, standalone Drive/Tasks, disconnect and profile isolation")
 
 
 if __name__ == "__main__":

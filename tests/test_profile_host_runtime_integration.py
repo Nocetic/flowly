@@ -143,7 +143,14 @@ async def test_profile_host_starts_proxies_and_stops_real_isolated_gateway(
         assert set(gmail_capability["methods"]) == {
             "gmail.capabilities", "gmail.status", "gmail.setup.begin", "gmail.setup.pending",
             "gmail.setup.status", "gmail.setup.cancel", "gmail.disconnect",
+            "gmail.chat.pending", "gmail.chat.cancel",
         }
+        assert gmail_capability["independentServices"] is True
+        for service in ("gmail", "calendar", "drive", "contacts", "tasks"):
+            assert await host.rpc("writer", "gmail.status", {"service": service}, **identity) == {
+                "status": "not_configured", "connected": False, "service": service, "services": [],
+            }
+        assert await host.rpc("writer", "gmail.chat.pending", {"sessionKey": "web:research"}, **identity) == {"requests": []}
         gmail = await host.rpc("writer", "gmail.status", {}, **identity)
         assert gmail == {"status": "not_configured", "connected": False}
         assert default_credentials.read_bytes() == default_credentials_before

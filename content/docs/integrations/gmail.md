@@ -8,9 +8,16 @@ description: Connect Gmail, search and read messages, and manage mail with expli
 
 The native `email` tool calls Gmail from the selected agent. Connect it from
 Connections or ask in chat: the `google_connection` tool presents a review card
-in Desktop. Choose Gmail management and optional Google Workspace services, then
-approve the selected permissions on Google’s own page. Existing read/send grants
-continue working; use “Extend Google access” for management permission.
+in Desktop. Gmail, Calendar, Drive, Contacts and Tasks each have their own
+connection row. Open Gmail, then continue to Google's permission screen. Existing
+read/send grants continue working; the Gmail panel offers additional authorization
+when management permission is missing.
+
+Calendar, Drive, Contacts and Tasks can connect without Gmail. Disconnecting one
+service leaves the others connected. Each row shows its own Google account;
+services may use different accounts. New credentials and pending setup are stored
+per service and per agent profile. An existing shared Google grant stays usable
+for its remaining services when one is disconnected or replaced.
 
 Send/reply and management approval remain mandatory. Only GET requests are
 retried; submissions and management writes are never automatically repeated.

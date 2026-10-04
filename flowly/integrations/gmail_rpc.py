@@ -6,12 +6,12 @@ from flowly.integrations.gmail_connection import GmailConnection, GmailConnectio
 
 PARAMETERS = {
     "gmail.capabilities": set(),
-    "gmail.status": set(),
-    "gmail.setup.begin": {"locale", "label", "services", "connectionId", "chatRequestId", "sessionKey"},
-    "gmail.setup.pending": set(),
-    "gmail.setup.status": {"requestId"},
-    "gmail.setup.cancel": {"requestId"},
-    "gmail.disconnect": {"connectionId"},
+    "gmail.status": {"service"},
+    "gmail.setup.begin": {"service", "locale", "label", "services", "connectionId", "chatRequestId", "sessionKey"},
+    "gmail.setup.pending": {"service"},
+    "gmail.setup.status": {"service", "requestId"},
+    "gmail.setup.cancel": {"service", "requestId"},
+    "gmail.disconnect": {"service", "connectionId"},
     "gmail.chat.pending": {"sessionKey"},
     "gmail.chat.cancel": {"requestId", "sessionKey"},
 }
@@ -26,7 +26,7 @@ async def gmail_rpc(method: str, params: dict) -> dict:
         raise FeatureRpcError("INVALID_PARAMS", "Invalid Gmail request.")
     if method == "gmail.capabilities":
         return {"version": 1, "methods": sorted(METHODS), "authorization": "browser", "scopes": ["gmail.readonly", "gmail.send", "gmail.modify"],
-                "permissionsVersion": 2, "services": ["gmail", "gmail_manage", "calendar", "drive", "contacts", "tasks"], "upgrade": True, "chatSetup": True}
+                "permissionsVersion": 2, "independentServices": True, "services": ["gmail", "gmail_manage", "calendar", "drive", "contacts", "tasks"], "upgrade": True, "chatSetup": True}
 
     from flowly.session.ownership import require_rpc_session
     require_rpc_session("chat.google_connection", params)
@@ -40,14 +40,14 @@ async def gmail_rpc(method: str, params: dict) -> dict:
             return await google_chat_requests().cancel(params.get("requestId"), params.get("sessionKey"))
         if method == "gmail.setup.begin" and params.get("chatRequestId"):
             return await google_chat_requests().begin(params["chatRequestId"], params.get("sessionKey"),
-                locale=params.get("locale", "en"), label=params.get("label"), services=params.get("services"), connection_id=params.get("connectionId"))
+                locale=params.get("locale", "en"), label=params.get("label"), services=params.get("services"), connection_id=params.get("connectionId"), service=params.get("service"))
     except GmailConnectionError as error:
         raise FeatureRpcError(error.code, "Google connection request could not complete.") from None
     except Exception:
         raise FeatureRpcError("UNAVAILABLE", "Google connection request is temporarily unavailable.") from None
 
     def run():
-        service = GmailConnection()
+        service = GmailConnection(service=params.get("service"))
         if method == "gmail.status":
             return service.status()
         if method == "gmail.setup.begin":

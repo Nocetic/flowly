@@ -91,6 +91,7 @@ def test_profile_gmail_surface_is_explicit():
     expected = {
         "gmail.capabilities", "gmail.status", "gmail.setup.begin", "gmail.setup.pending",
         "gmail.setup.status", "gmail.setup.cancel", "gmail.disconnect",
+        "gmail.chat.pending", "gmail.chat.cancel",
     }
     profile_methods = {method for method in PROFILE_RPC_TIMEOUTS if method.startswith("gmail.")}
     assert profile_methods == expected
@@ -99,6 +100,10 @@ def test_profile_gmail_surface_is_explicit():
         assert validate_profile_rpc(method, {}) == (method, {})
     with pytest.raises(ProfileHostError, match="not available"):
         validate_profile_rpc("gmail.arbitrary", {})
+    for method in ["gmail.chat.pending", "gmail.chat.cancel", "gmail.setup.begin"]:
+        with pytest.raises(ProfileHostError) as error:
+            validate_profile_rpc(method, {"sessionKey": "desktop:profile-room:private"})
+        assert error.value.code == "REMOTE_SESSION_DENIED"
 
 
 @pytest.mark.asyncio

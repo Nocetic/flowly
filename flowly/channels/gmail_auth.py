@@ -25,31 +25,30 @@ def _creds_path() -> Path:
     return get_flowly_home() / "credentials" / "gmail.json"
 
 
-def load_credentials() -> dict[str, Any] | None:
-    """Load Gmail OAuth credentials from disk.  Returns None if missing."""
-    path = _creds_path()
-    if not path.exists():
-        return None
+def load_credentials(service: str = "gmail") -> dict[str, Any] | None:
+    """Resolve one service, using a scoped record before compatible shared grants."""
+    from flowly.integrations.gmail_connection import (
+        GmailConnection,
+        GmailConnectionError,
+        is_managed_credentials,
+    )
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+        connection = GmailConnection(service=service)
+        data = connection._read_credentials()
+        if not data:
             return None
         if data.get("mode") == "flowly_broker":
-            from flowly.integrations.gmail_connection import is_managed_credentials
             return data if is_managed_credentials(data) else None
-        if not data.get("refresh_token"):
-            logger.warning("[Gmail] Credentials missing refresh_token")
-            return None
-        return data
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"[Gmail] Failed to load credentials: {e}")
+        return data if data.get("refresh_token") else None
+    except (ValueError, OSError, GmailConnectionError):
+        logger.warning("[Google] Credentials unavailable")
         return None
 
 
 def save_credentials(creds: dict[str, Any]) -> None:
     """Save Gmail OAuth credentials to disk (mode 0600)."""
     from flowly.integrations.gmail_connection import atomic_private_json
-    atomic_private_json(_creds_path(), creds)
+    atomic_private_json(_creds_path(), {key: value for key, value in creds.items() if not key.startswith("_shared")})
 
 
 def _is_expired(creds: dict[str, Any]) -> bool:
@@ -110,19 +109,27 @@ def _refresh(creds: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
-def get_valid_access_token() -> tuple[str | None, str | None]:
+def get_valid_access_token(service: str = "gmail") -> tuple[str | None, str | None]:
     """Return (access_token, email) with a valid (non-expired) token.
 
     Automatically refreshes if needed.  Returns (None, None) on failure.
     """
-    creds = load_credentials()
+    from flowly.integrations.gmail_connection import GmailConnection
+    # Shared legacy tokens and service detach operations use the same reentrant
+    # lock, so a refresh cannot restore permissions removed by another service.
+    with GmailConnection(service=service)._lock():
+        return _get_valid_access_token_locked(service)
+
+
+def _get_valid_access_token_locked(service: str) -> tuple[str | None, str | None]:
+    creds = load_credentials() if service == "gmail" else load_credentials(service)
     if not creds or creds.get("disconnect_pending") or creds.get("reauthorize_required"):
         return None, None
 
     if creds.get("mode") == "flowly_broker":
         from flowly.integrations.gmail_connection import GmailConnection
         try:
-            return GmailConnection().access_token()
+            return GmailConnection(service=creds.get("connection_service") or creds.get("_shared_service")).access_token()
         except Exception:
             logger.warning("[Gmail] Managed authorization unavailable; reconnect if access was revoked")
             return None, None
@@ -140,6 +147,9 @@ def email_tool_ready(*, legacy_enabled: bool = False) -> bool:
     credentials = load_credentials()
     if not credentials or credentials.get("disconnect_pending") or credentials.get("reauthorize_required"):
         return False
+    if credentials.get("connection_service") == "gmail":
+        from flowly.integrations.google_permissions import granted_services
+        return "gmail" in granted_services(credentials)
     if credentials.get("mode") != "flowly_broker":
         return legacy_enabled
     try:
@@ -152,8 +162,8 @@ def email_tool_ready(*, legacy_enabled: bool = False) -> bool:
 def google_tool_ready(service: str, *, legacy_enabled: bool = False) -> bool:
     """A new grant can enable Workspace tools without restarting the agent."""
     from flowly.integrations.google_permissions import granted_services
-    credentials = load_credentials()
-    if not credentials or not email_tool_ready(legacy_enabled=legacy_enabled):
+    credentials = load_credentials(service)
+    if not credentials or credentials.get("disconnect_pending") or credentials.get("reauthorize_required"):
         return False
     if credentials.get("mode") != "flowly_broker" and not credentials.get("scopes", credentials.get("scope")):
         # Historical credentials did not record scopes; Google still enforces them.

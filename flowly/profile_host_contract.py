@@ -76,6 +76,8 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "gmail.setup.status": 30_000,
     "gmail.setup.cancel": 30_000,
     "gmail.disconnect": 30_000,
+    "gmail.chat.pending": 30_000,
+    "gmail.chat.cancel": 60_000,
     "voice.context": 10_000,
     "voice.memory.append": 10_000,
     "voice.memory.snapshot": 10_000,

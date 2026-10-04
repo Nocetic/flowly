@@ -769,7 +769,7 @@ requires-dist = [
     { name = "ddgs", marker = "extra == 'search'", specifier = ">=9.0.0" },
     { name = "exa-py", marker = "extra == 'search'", specifier = ">=1.0.0" },
     { name = "fastembed", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'", specifier = "==0.8.0" },
-    { name = "filelock", specifier = ">=3.0.0" },
+    { name = "filelock", specifier = ">=3.20.3" },
     { name = "firecrawl-py", marker = "extra == 'search'", specifier = ">=1.0.0" },
     { name = "httpx", specifier = ">=0.25.0" },
     { name = "inquirerpy", specifier = ">=0.3.4" },

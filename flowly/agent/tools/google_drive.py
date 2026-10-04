@@ -75,11 +75,11 @@ class GoogleDriveTool(Tool):
         }
 
     async def _require_approval(self, description: str, session_key: str = "") -> bool:
-        from flowly.exec.approval_manager import get_approval_manager
-        from flowly.exec.types import PendingApproval, ExecRequest
         import secrets
 
         from flowly.agent.tool_context import current_tool_origin
+        from flowly.exec.approval_manager import get_approval_manager
+        from flowly.exec.types import ExecRequest, PendingApproval
         origin = current_tool_origin()
         if origin is not None:
             session_key = origin.session_key
@@ -104,8 +104,8 @@ class GoogleDriveTool(Tool):
             return False
 
     async def execute(self, action: str, **kwargs: Any) -> str:
-        token, _ = await asyncio.to_thread(gmail_auth.get_valid_access_token)
-        credentials = gmail_auth.load_credentials()
+        token, _ = await asyncio.to_thread(gmail_auth.get_valid_access_token, "drive")
+        credentials = gmail_auth.load_credentials("drive")
         if credentials and credentials.get("mode") == "flowly_broker":
             from flowly.integrations.google_permissions import granted_services
             if "drive" not in granted_services(credentials):

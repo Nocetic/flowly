@@ -6,7 +6,11 @@ import time
 from dataclasses import dataclass, field
 
 from flowly.integrations.gmail_connection import GmailConnection, GmailConnectionError
-from flowly.integrations.google_permissions import normalize_services
+from flowly.integrations.google_permissions import (
+    CONNECTION_SERVICES,
+    normalize_services,
+    service_permissions,
+)
 from flowly.profile import get_flowly_home
 
 TTL = 900
@@ -19,6 +23,7 @@ class Request:
     reason: str
     services: list[str]
     future: asyncio.Future
+    service: str | None = None
     created_at: float = field(default_factory=time.time)
     phase: str = "proposed"
     setup_id: str | None = None
@@ -27,7 +32,7 @@ class Request:
 
     def public(self):
         return {"id": self.id, "sessionKey": self.session_key, "reason": self.reason,
-                "services": self.services, "phase": self.phase, "setupId": self.setup_id,
+                "services": self.services, "service": self.service, "phase": self.phase, "setupId": self.setup_id,
                 "createdAt": self.created_at * 1000, "expiresAt": (self.created_at + TTL) * 1000}
 
 
@@ -53,19 +58,21 @@ class GoogleChatRequests:
             req.future.set_result({**result, "requestId": req.id,
                                    "note": "Use only granted access. Do not bypass declined setup with commands or credentials."})
 
-    async def request(self, session_key, reason, services):
+    async def request(self, session_key, reason, services, service=None):
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 512:
             raise GmailConnectionError("INVALID_PARAMS")
         if not isinstance(session_key, str) or not 1 <= len(session_key) <= 512 or ":" not in session_key:
             raise GmailConnectionError("INVALID_PARAMS")
         try:
-            selected = normalize_services(services)
+            selected = normalize_services(services, require_gmail=service is None)
+            if service is not None and (service not in CONNECTION_SERVICES or service not in selected or set(selected) - set(service_permissions(service))):
+                raise ValueError("INVALID_SERVICE")
         except ValueError:
             raise GmailConnectionError("INVALID_SERVICES") from None
         self.requests = {key: req for key, req in self.requests.items() if not req.future.done()}
         if len(self.requests) >= 32 or self.pending(session_key)["requests"]:
             raise GmailConnectionError("SETUP_IN_PROGRESS")
-        req = Request(secrets.token_hex(16), session_key, reason.strip(), selected, asyncio.get_running_loop().create_future())
+        req = Request(secrets.token_hex(16), session_key, reason.strip(), selected, asyncio.get_running_loop().create_future(), service=service)
         self.requests[req.id] = req
         try:
             async with asyncio.timeout(TTL):
@@ -85,7 +92,10 @@ class GoogleChatRequests:
         req = self._get(request_id, session_key)
         async with req.lock:
             self._get(request_id, session_key)
-            service = GmailConnection()
+            chosen = kwargs.pop("service", None)
+            if chosen != req.service:
+                raise GmailConnectionError("INVALID_SERVICE")
+            service = GmailConnection(service=req.service)
             setup = await asyncio.to_thread(service.begin, **kwargs)
             req.setup_id = setup["requestId"]
             req.phase = "started"
@@ -118,7 +128,7 @@ class GoogleChatRequests:
             if req.future.done():
                 return req.future.result()
             if req.setup_id:
-                service = GmailConnection()
+                service = GmailConnection(service=req.service)
                 try:
                     await asyncio.to_thread(service.cancel, req.setup_id)
                 except GmailConnectionError as error:
