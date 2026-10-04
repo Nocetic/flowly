@@ -1537,29 +1537,20 @@ class AgentLoop:
         if not enabled:
             return
         try:
-            from flowly.agent.memory import MemoryStore
-            from flowly.memory.governance import GovernanceStore
-            from flowly.memory.coordinator import MemoryGovernance
-            from flowly.memory.kg_mirror import SqliteKGMirror
+            from flowly.memory.coordinator import open_memory_governance
 
-            kg_path = self._state_dir / "knowledge_graph.sqlite3"
-
-            def _kg_summary() -> str:
-                try:
-                    if kg_path.exists():
-                        from flowly.memory.knowledge_graph import KnowledgeGraph
-                        return KnowledgeGraph(str(kg_path)).summary(max_entities=20)
-                except Exception:
-                    pass
-                return ""
-
-            self._memory_gov = MemoryGovernance(
-                GovernanceStore(self._state_dir / "memory_governance.sqlite3"),
-                memory_store=MemoryStore(self.workspace),
-                kg_mirror=SqliteKGMirror(str(kg_path)),
-                kg_summary_fn=_kg_summary,
-                kg_path=str(kg_path),
-            )
+            self._memory_gov = open_memory_governance(self._state_dir, self.workspace)
+            _kg_summary = self._memory_gov.kg_summary_fn
+            # Facts and their graph triples written before invalidate, reject
+            # and consolidation were mirrored both ways may disagree: repair
+            # them once, so neither MEMORY.md nor a call states a retired fact.
+            try:
+                repaired = self._memory_gov.reconcile_kg_triples()
+                if any(repaired.values()):
+                    self._memory_gov.refresh()
+                    logger.info(f"[memory-gov] repaired facts out of step with the knowledge graph: {repaired}")
+            except Exception as exc:  # noqa: BLE001 — memory stays usable unrepaired
+                logger.warning(f"[memory-gov] knowledge graph reconcile failed: {type(exc).__name__}")
             self.hooks.register("post_tool_call", self._governance_post_tool)
             # Also route subagent (background self-review) memory/KG writes into
             # governance — they use a separate tool registry that bypasses the
@@ -1618,24 +1609,12 @@ class AgentLoop:
         # agent's own inference, not a user statement — those writes go to review
         # instead of silently becoming active memory. Real user-channel writes
         # stay trusted (auto-active), as before.
+        from flowly.memory.coordinator import mirror_tool_write
         from flowly.memory.dreamer import is_automation_session
-        auto_activate = not is_automation_session(session)
         try:
-            if name == "memory_append":
-                self._memory_gov.ingest_append(
-                    params.get("content", ""), source_session=session,
-                    auto_activate=auto_activate,
-                )
-            elif name == "knowledge_graph" and params.get("action") == "add":
-                import re
-                m = re.search(r"id:\s*(t_[^)\s]+)", getattr(ctx, "result", "") or "")
-                if not m:
-                    return  # add failed or no triple id → nothing to record
-                self._memory_gov.ingest_kg_fact(
-                    params.get("subject", ""), params.get("predicate", ""),
-                    params.get("object", ""), m.group(1), source_session=session,
-                    auto_activate=auto_activate,
-                )
+            mirror_tool_write(self._memory_gov, name, params, getattr(ctx, "result", "") or "",
+                              source_session=session,
+                              auto_activate=not is_automation_session(session))
         except Exception as exc:
             logger.warning(f"[memory-gov] post_tool sync failed: {exc}")
 

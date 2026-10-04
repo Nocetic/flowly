@@ -170,9 +170,11 @@ class KnowledgeGraphTool(Tool):
         if not subject or not predicate or not obj:
             return "Error: 'subject', 'predicate', and 'object' are required."
 
-        affected = kg.invalidate(subject=subject, predicate=predicate, obj=obj, ended=kwargs.get("ended"))
-        if affected:
-            return f"Invalidated: {subject} → {predicate} → {obj} ({affected} fact(s) expired)"
+        closed = kg.invalidate_triples(subject=subject, predicate=predicate, obj=obj, ended=kwargs.get("ended"))
+        if closed:
+            # The ids let the memory governance retire exactly these facts.
+            return (f"Invalidated: {subject} → {predicate} → {obj} "
+                    f"({len(closed)} fact(s) expired; ids: {', '.join(closed)})")
         return f"No active fact found: {subject} → {predicate} → {obj}"
 
     def _search(self, kg, kwargs: dict) -> str:

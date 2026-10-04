@@ -241,6 +241,11 @@ class KnowledgeGraph:
         return triple_id
 
     def invalidate(self, subject: str, predicate: str, obj: str, ended: str | None = None) -> int:
+        return len(self.invalidate_triples(subject, predicate, obj, ended))
+
+    def invalidate_triples(self, subject: str, predicate: str, obj: str, ended: str | None = None) -> list[str]:
+        """Close the current triples for this fact; returns their ids, so the
+        governed memory copies of exactly these triples can follow."""
         conn = self._conn()
         sub_resolved = self.resolve_entity(subject, conn)
         sub_id = sub_resolved[0] if sub_resolved else self._normalize_id(subject)
@@ -255,14 +260,17 @@ class KnowledgeGraph:
 
         ended = ended or date.today().isoformat()
 
-        cursor = conn.execute(
-            "UPDATE triples SET valid_to=? WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-            (ended, sub_id, pred, obj_id),
-        )
-        conn.commit()
-        affected = cursor.rowcount
-        conn.close()
-        return affected
+        try:
+            with conn:
+                ids = [row[0] for row in conn.execute(
+                    "SELECT id FROM triples WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (sub_id, pred, obj_id),
+                )]
+                conn.executemany("UPDATE triples SET valid_to=? WHERE id=? AND valid_to IS NULL",
+                                 [(ended, triple_id) for triple_id in ids])
+        finally:
+            conn.close()
+        return ids
 
     def merge_entities(self, source_name: str, target_name: str) -> bool:
         """Merge source entity into target. Source becomes an alias of target."""

@@ -150,6 +150,9 @@ def apply_operations(
             if op.op == OP_STALE:
                 gov.transition(op.item_id, STATUS_STALE, actor=ACTOR_SYSTEM,
                                reason=f"consolidate: {op.reason}"[:200])
+                # A fact no longer believed current is closed in the graph too.
+                if kg_mirror is not None and item.ref_kind == "kg_triple" and item.ref_id:
+                    kg_mirror.supersede(item.ref_id)
                 res.staled += 1
             else:  # supersede / merge
                 survivor = None

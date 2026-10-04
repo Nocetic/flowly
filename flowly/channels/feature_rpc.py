@@ -1387,12 +1387,13 @@ def memory_update_user(params: dict) -> dict:
 
 
 def _open_memory_gov():
-    from flowly.memory.governance import GovernanceStore
-    from flowly.memory.coordinator import MemoryGovernance
-    from flowly.agent.memory import MemoryStore
+    # The panel's accept/reject/correct keep the graph in agreement, as the
+    # agent's own facade does (open_memory_governance wires the mirror).
+    from flowly.memory.coordinator import open_memory_governance
 
-    gov = GovernanceStore(state_db("memory_governance.sqlite3"))
-    return MemoryGovernance(gov, memory_store=MemoryStore(workspace_dir()))
+    return open_memory_governance(get_flowly_home(), workspace_dir(),
+                                  governance_db=state_db("memory_governance.sqlite3"),
+                                  kg_path=state_db("knowledge_graph.sqlite3"))
 
 
 def _obsidian_cfg():
@@ -1481,6 +1482,7 @@ def memory_gov(action: str, params: dict) -> dict:
         if not item_id:
             raise FeatureRpcError("INVALID", "id required")
         item = getattr(mg, action)(item_id)
+        _refresh_memory_md(mg)
         return {"item": item.to_dict() if item else None}
     if action == "correct":
         item_id = params.get("id", "")
@@ -1488,6 +1490,7 @@ def memory_gov(action: str, params: dict) -> dict:
         if not item_id or not text:
             raise FeatureRpcError("INVALID", "id and text required")
         item = mg.correct(item_id, text, confidence=params.get("confidence"))
+        _refresh_memory_md(mg)
         return {"item": item.to_dict() if item else None}
     if action == "feedback":
         item_id = params.get("id", "")
@@ -1498,8 +1501,19 @@ def memory_gov(action: str, params: dict) -> dict:
             bool(params.get("helpful", False)),
             params.get("note", ""),
         )
+        _refresh_memory_md(mg)
         return {"item": item.to_dict() if item else None}
     raise FeatureRpcError("INVALID", f"unknown memory action: {action}")
+
+
+def _refresh_memory_md(mg) -> None:
+    """An owner's decision reaches the agent's next prompt: MEMORY.md (which
+    the prompt reads) is rebuilt at once instead of at some later write."""
+    try:
+        mg.refresh()
+    except Exception as exc:  # noqa: BLE001 — the decision itself is saved
+        from loguru import logger
+        logger.warning(f"[memory-gov] MEMORY.md refresh after a panel action failed: {type(exc).__name__}")
 
 
 def _consolidate_run(dry_run: bool) -> dict:
@@ -1603,17 +1617,14 @@ def _dream_run(max_messages: int) -> dict:
     no-ops. ``loop=None`` tells the extractor to drive its own ``asyncio.run``
     here (there is no live event loop on this thread), mirroring how
     ``memory_consolidate`` streams its proposal."""
-    from flowly.agent.memory import MemoryStore
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
-    from flowly.memory.coordinator import MemoryGovernance
     from flowly.memory.dreamer import (
         MemoryDreamerService,
         SessionIndexDeltaSource,
         read_user_profile,
     )
     from flowly.memory.extractor import SubagentExtractor
-    from flowly.memory.governance import GovernanceStore
     from flowly.memory.kg_mirror import SqliteKGMirror
     from flowly.providers.factory import build_provider
 
@@ -1631,8 +1642,8 @@ def _dream_run(max_messages: int) -> dict:
     si_path = str(state_db("session_index.sqlite"))
     kg_path = state_db("knowledge_graph.sqlite3")
     ws = workspace_dir()
-    gov = GovernanceStore(state_db("memory_governance.sqlite3"))
-    coordinator = MemoryGovernance(gov, memory_store=MemoryStore(ws))
+    coordinator = _open_memory_gov()
+    gov = coordinator.gov
     extractor = SubagentExtractor(provider=provider, model=model, loop=None)
     dreamer = MemoryDreamerService(
         gov,
@@ -1708,12 +1719,9 @@ def memory_import_prompt(params: dict) -> dict:
 def _import_run(params: dict) -> dict:
     """Blocking external memory import. Mirrors ``flowly memory import`` and
     runs in a worker thread because it makes an LLM round-trip."""
-    from flowly.agent.memory import MemoryStore
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
-    from flowly.memory.coordinator import MemoryGovernance
     from flowly.memory.dreamer import read_user_profile
-    from flowly.memory.governance import GovernanceStore
     from flowly.memory.importer import normalize_source, run_import
     from flowly.providers.factory import build_provider
 
@@ -1734,8 +1742,8 @@ def _import_run(params: dict) -> dict:
     provider = build_provider(ap, default_model=model, config=config)
 
     ws = workspace_dir()
-    gov = GovernanceStore(state_db("memory_governance.sqlite3"))
-    coordinator = MemoryGovernance(gov, memory_store=MemoryStore(ws))
+    coordinator = _open_memory_gov()
+    gov = coordinator.gov
     res = run_import(
         gov,
         provider=provider,

@@ -19,6 +19,9 @@ between the sentinels and never touches manual content.
 
 from __future__ import annotations
 
+import re
+import sqlite3
+from pathlib import Path
 from typing import Iterable
 
 from flowly.memory.governance import STATUS_ACTIVE, MemoryItem
@@ -142,6 +145,7 @@ def regenerate_memory_md(gov, memory_store, kg_summary: str | None = "") -> str:
             i for i in gov.list_items(status=STATUS_ACTIVE)
             if i.privacy_level != "secret"
         ]
+        items = without_noted(items, extract_manual_content(existing))
         block = render_generated_block(items, kg_summary=kg_summary)
         new_content = splice_generated_block(existing, block)
         atomic_write(memory_store.memory_file, new_content)
@@ -159,3 +163,95 @@ def extract_manual_content(text: str) -> str:
     if before and after:
         return before + "\n\n" + after
     return before or after
+
+
+# ── One statement per note ────────────────────────────────────────────────
+#
+# memory_append writes the note into MEMORY.md (outside the generated block,
+# stamped ``<!-- YYYY-MM-DD HH:MM -->``) and governance records it as an item
+# the block renders, so every note reached the prompt twice. Governance stays
+# the record; the prompt states each note once, and a note the owner or the
+# agent retired is not stated at all.
+
+_NOTE_STAMP = re.compile(r"^\s*<!--\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}\s*-->\s*$", re.M)
+
+
+def fold(text: str) -> str:
+    """Whitespace- and case-insensitive form used to compare memory text."""
+    return " ".join(text.split()).casefold()
+
+
+def paragraphs(text: str) -> list[str]:
+    return [chunk.strip() for chunk in re.split(r"\n\s*\n", text) if chunk.strip()]
+
+
+def note_body(paragraph: str) -> str:
+    """A note's words, without memory_append's timestamp comment."""
+    return _NOTE_STAMP.sub("", paragraph).strip()
+
+
+def noted_texts(manual: str) -> set[str]:
+    """Each note written outside the generated block, folded: every stamped
+    note whole, and every paragraph."""
+    units: set[str] = set()
+    for note in _NOTE_STAMP.split(manual):
+        if note.strip():
+            units.add(fold(note))
+        units.update(fold(note_body(chunk)) for chunk in paragraphs(note))
+    units.discard("")
+    return units
+
+
+def without_noted(items: Iterable[MemoryItem], manual: str) -> list[MemoryItem]:
+    """Leave out of the generated block the governed copy of a note MEMORY.md
+    already states (the prompt reads the whole file). The copy returns if the
+    note is removed from the file."""
+    noted = noted_texts(manual)
+    return [i for i in items if not (i.ref_kind == "memory_md" and fold(i.text) in noted)]
+
+
+def governance_states(path: Path) -> list[tuple[str, str]] | None:
+    """(status, text) of every governed item, read-only; None when the index
+    cannot be read."""
+    if not path.exists():
+        return []
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.25)
+        try:
+            return [(str(row[0]), str(row[1] or "")) for row in
+                    connection.execute("SELECT status, text FROM memory_items LIMIT 10001")]
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+
+
+def withhold_retired_notes(memory_md: str, states: list[tuple[str, str]]) -> str:
+    """MEMORY.md as the agent's prompt may state it: a note outside the
+    generated block that carries an item which is no longer active memory
+    (rejected, superseded, stale, or waiting for review) is left out, as a
+    call's memory already leaves it out. Text an active item also has stays.
+    The generated block is kept as it is (it renders active items only)."""
+    active = {fold(text) for status, text in states if status == STATUS_ACTIVE}
+    retired = {fold(text) for status, text in states if status != STATUS_ACTIVE} - active
+    retired.discard("")
+    if not retired:
+        return memory_md
+    # A sentence-length item is withheld wherever its words appear; a short
+    # one only as a whole note, so a retired "Codex" cannot hide every note
+    # that mentions Codex.
+    long_texts = [text for text in retired if len(text) >= 24]
+
+    def retired_note(chunk: str) -> bool:
+        body = fold(note_body(chunk))
+        return body in retired or any(text in body for text in long_texts)
+
+    def keep(part: str) -> str:
+        return "\n\n".join(chunk for chunk in paragraphs(part) if not retired_note(chunk))
+
+    region = _find_region(memory_md)
+    if region is None:
+        return keep(memory_md)
+    start, end = region
+    before, after = keep(memory_md[:start]), keep(memory_md[end:])
+    return "\n\n".join(part for part in (before, memory_md[start:end], after) if part)

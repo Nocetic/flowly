@@ -106,10 +106,17 @@ class VoiceMemorySnapshot:
                 sources[key] = {'status': 'empty'}
                 return
             raw, revision, _ = source
-            text = self._safe(raw if kind != 'notes' else manual_memory(raw), relative, governed)
+            text = (self._safe(raw, relative, governed) if kind != 'notes'
+                    else self._safe(manual_memory(raw), relative, governed, stated=governed_notes))
             sources[key] = {'status': 'ok' if text else 'empty', 'revision': revision}
             if text:
                 sections.append(Section(kind, title, text, f'memory://file/{relative}'))
+
+        # A note memory_append wrote is also a governed item the Memory section
+        # renders; the call states it there, once.
+        from flowly.memory.summary import fold
+        governed_notes = {fold(str(item.get('text') or '')) for item in governed.allowed
+                          if item.get('ref_kind') == 'memory_md'}
 
         # The agent's identity, in the order its own prompt loads it.
         file_section('soul', 'Soul', 'SOUL.md')
@@ -142,11 +149,14 @@ class VoiceMemorySnapshot:
                 'partial': any(source.get('status') == 'unavailable' for source in sources.values()),
                 'sources': sources}
 
-    def _safe(self, text: str, name: str, governed: GovernedMemory) -> str:
-        """The paragraphs a call may see, through the agent's injection scan."""
+    def _safe(self, text: str, name: str, governed: GovernedMemory, *, stated: set[str] = frozenset()) -> str:
+        """The paragraphs a call may see, through the agent's injection scan,
+        less the notes another section already states (``stated``, folded)."""
         from flowly.cron.guard import scan_context_file
+        from flowly.memory.summary import fold, note_body
 
-        kept = [chunk for chunk in _paragraphs(text) if not governed.withholds(chunk)]
+        kept = [chunk for chunk in _paragraphs(text)
+                if not governed.withholds(chunk) and fold(note_body(chunk)) not in stated]
         joined = redact_secrets('\n\n'.join(kept)).strip()
         if not joined:
             return ''
