@@ -376,6 +376,36 @@ Known limit: the first call to an agent, with nothing learned yet, opens
 in the interface language; the owner's first sentence in another language
 switches the call, and the next one opens in it.
 
+## Corrections, dates and where we left off (2026-10-04)
+
+Found on the owner's call ("I'm not allergic to penicillin") and memory:
+
+- **A correction did not hold.** `knowledge_graph invalidate` closed the
+  triple, but its governed copy stayed active, so MEMORY.md and the next
+  call stated both facts. The panel's facade had no graph mirror, so a
+  rejected fact stayed current in the graph. Fixed `83276e41`: a governed
+  fact is active exactly while its triple is current (invalidate retires,
+  reject and consolidation's stale close, one facade for agent, panel and
+  CLI, a one-time startup repair `reconcile_kg_triples`), the graph
+  summary leaves out non-active facts, a panel decision rebuilds
+  MEMORY.md. Each note is stated once (the generated block skips a note's
+  copy while the file states it; the prompt reads the graph once; a
+  retired note is left out of the prompt as of a call).
+- **Dates were guessed.** The prompt has no clock (cache stability). Fixed
+  `fee23686`: each turn carries `<turn_time>` on its own message, never
+  cached or stored.
+- **A call did not know what was just said.** The snapshot now carries
+  the end of the owner's latest conversation (kind `recent`, title
+  "Latest conversation: <title> (<date>)", at most 12 messages / 6 KB,
+  newest kept; never another call, a call's work, an agent room or a
+  scheduled run; visible exactly as `sessions.list` shows it; governance
+  withholding, secret redaction and the injection scan apply). The
+  speaking model's profile starts with "Last talked about: …". Clients
+  need no change: `recent` is already an accepted kind.
+
+Not done, by decision: refreshing memory during a call (rare; a correction
+made in the call reaches it through the task result).
+
 ## Rollout
 
 The owner authorized Web and Relay merges after the startup hardening.

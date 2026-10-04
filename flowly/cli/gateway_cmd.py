@@ -1948,6 +1948,7 @@ Respond to the user now:"""
             agent.workspace, state_db=_feature_rpc.state_db, profile=_voice_scope,
             persona=lambda: getattr(agent.context, "persona", "default"),
             search_enabled=lambda: getattr(agent, "_memory_manager", None) is not None,
+            sessions_dir=lambda: _feature_rpc.get_flowly_home() / "sessions",
         )
         _feature_rpc.set_voice_snapshot_provider(lambda: voice_snapshot)
         from flowly.live_voice.memory import VoiceMemory

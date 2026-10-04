@@ -74,13 +74,15 @@ class VoiceMemorySnapshot:
     def __init__(self, workspace: Path, *, state_db: Callable[[str], Path],
                  profile: Callable[[], tuple[str, str]], persona: Callable[[], str] = lambda: 'default',
                  search_enabled: Callable[[], bool] = lambda: False,
-                 today: Callable[[], datetime] = lambda: datetime.now()):
+                 today: Callable[[], datetime] = lambda: datetime.now(),
+                 sessions_dir: Callable[[], Path | None] = lambda: None):
         self.workspace = workspace.resolve()
         self.state_db = state_db
         self.profile = profile
         self.persona = persona
         self.search_enabled = search_enabled
         self.today = today
+        self.sessions_dir = sessions_dir
 
     def snapshot(self, params: dict) -> dict:
         request = validate_snapshot(params)
@@ -131,6 +133,10 @@ class VoiceMemorySnapshot:
         memory = self._governed_block(governed, sources)
         if memory:
             sections.append(Section('memory', 'Memory', memory, 'memory://governance'))
+        # Where the owner and the agent left off: a call continues it.
+        latest = self._latest_conversation(governed, sources)
+        if latest:
+            sections.append(latest)
         file_section('notes', 'Notes', 'memory/MEMORY.md')
 
         # Without memory search the agent's prompt carries its recent notes.
@@ -148,6 +154,27 @@ class VoiceMemorySnapshot:
                 'profile': self._profile(budgeted), 'truncated': truncated,
                 'partial': any(source.get('status') == 'unavailable' for source in sources.values()),
                 'sources': sources}
+
+    def _latest_conversation(self, governed: GovernedMemory, sources: dict) -> Section | None:
+        from flowly.live_voice.recent_chat import latest_chat
+
+        directory = self.sessions_dir()
+        if directory is None:
+            return None
+        try:
+            chat = latest_chat(directory)
+        except Exception:  # noqa: BLE001 — memory never fails on a conversation read
+            sources['conversation'] = {'status': 'unavailable'}
+            return None
+        if chat is None:
+            sources['conversation'] = {'status': 'empty'}
+            return None
+        text = self._safe(chat.text, 'latest conversation', governed)
+        sources['conversation'] = {'status': 'ok' if text else 'empty', 'revision': revision_of(text)}
+        if not text:
+            return None
+        title = f"Latest conversation{': ' + chat.title if chat.title else ''} ({chat.updated_at:%Y-%m-%d %H:%M})"
+        return Section('recent', title[:200], text, 'memory://conversation/latest')
 
     def _safe(self, text: str, name: str, governed: GovernedMemory, *, stated: set[str] = frozenset()) -> str:
         """The paragraphs a call may see, through the agent's injection scan,
@@ -236,6 +263,11 @@ class VoiceMemorySnapshot:
                 continue
             excerpt = text if len(text) <= share else text[:share].rsplit('\n', 1)[0].rstrip() + ' …'
             parts.append(f'{label}:\n{excerpt}')
+        latest = next((section.title for section in sections if section.kind == 'recent'
+                       and section.title.startswith('Latest conversation')), '')
+        if latest:
+            # The speaking model greets first: it should know where they left off.
+            parts.insert(0, latest.replace('Latest conversation', 'Last talked about', 1))
         profile = '\n\n'.join(parts)
         while _bytes(profile) > PROFILE_BUDGET:
             if '\n' not in profile:
