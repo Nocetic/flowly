@@ -5675,6 +5675,8 @@ _PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.", "voice.", "gateway.")
 # WebSocket transports dispatch them in tracked background tasks so their
 # receive loops keep processing control frames, pings, and unrelated RPCs.
 LONG_RUNNING_METHODS = frozenset({
+    # Status checks call Google; all service reads must overlap on one socket.
+    "gmail.status",
     "memory.editor.list",
     "memory.editor.document",
     "memory.editor.save",

@@ -206,3 +206,90 @@ async def test_chat_request_cannot_be_switched_to_another_service():
         await manager.begin(req["id"], req["sessionKey"], service="gmail")
     await manager.cancel(req["id"], req["sessionKey"])
     assert (await waiting)["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("shared_grant", [False, True])
+def test_status_network_checks_overlap(google, monkeypatch, shared_grant):
+    create, state = google
+    if shared_grant:
+        shared(create, state)
+    else:
+        for service in ("drive", "tasks"):
+            connection = create(service)
+            connection.setup_status(connection.begin()["requestId"])
+    barrier = threading.Barrier(2, timeout=3)
+    original = GmailConnection._token
+
+    def token(self, credentials):
+        barrier.wait()
+        return original(self, credentials)
+
+    monkeypatch.setattr(GmailConnection, "_token", token)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = [workers.submit(create(service).status) for service in ("drive", "tasks")]
+        assert all(result.result(timeout=5)["connected"] for result in results)
+
+
+@pytest.mark.parametrize("action", ["disconnect", "replace", "detach_other", "revoke_error"])
+def test_late_status_cannot_restore_changed_grants(google, monkeypatch, action):
+    create, state = google
+    connection = create("drive")
+    if action == "detach_other":
+        data, path = shared(create, state)
+        grant_id = GmailConnection.connection_id(data)
+    else:
+        grant_id = connection.begin()["requestId"]
+        connection.setup_status(grant_id)
+    entered, release = threading.Event(), threading.Event()
+    original = connection._token
+
+    def token(credentials):
+        tokens = original(credentials)
+        entered.set()
+        assert release.wait(3)
+        if action == "revoke_error":
+            raise GmailConnectionError("REAUTHORIZE")
+        return tokens
+
+    monkeypatch.setattr(connection, "_token", token)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(connection.status)
+        assert entered.wait(3)
+        try:
+            if action == "detach_other":
+                create("tasks").disconnect(grant_id)
+            elif action in ("replace", "revoke_error"):
+                replacement = create("drive")
+                setup = replacement.begin(connection_id=grant_id)
+                replacement.setup_status(setup["requestId"])
+            else:
+                create("drive").disconnect(grant_id)
+        finally:
+            release.set()
+        result = pending.result(timeout=5)
+    assert result["connected"] is False
+    if action == "disconnect":
+        assert connection._read_credentials() is None
+    elif action == "detach_other":
+        assert "tasks" in json.loads(path.read_text())["disabled_services"]
+        assert create("tasks")._read_credentials() is None
+    else:
+        current = connection._read_credentials()
+        assert current["grant_id"] == setup["requestId"]
+        assert not current.get("reauthorize_required")
+
+
+def test_native_status_verification_overlaps_after_safe_token_refresh(google, monkeypatch):
+    create, state = google
+    data, path = shared(create, state, native=True)
+    data.update(access_token="native-access", expiry="2999-01-01T00:00:00+00:00")
+    atomic_private_json(path, data)
+    barrier = threading.Barrier(2, timeout=3)
+    original = GmailConnection._verify_gmail
+    def verify(self, tokens):
+        barrier.wait()
+        return original(self, tokens)
+    monkeypatch.setattr(GmailConnection, "_verify_gmail", verify)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = [workers.submit(create(service).status) for service in ("drive", "tasks")]
+        assert all(result.result(timeout=5)["connected"] for result in results)

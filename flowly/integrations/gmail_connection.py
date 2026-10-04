@@ -429,7 +429,7 @@ class GmailConnection:
             return credentials["grant_id"]
         return hashlib.sha256(str(credentials.get("refresh_token", "")).encode()).hexdigest()[:32]
 
-    def _status_locked(self, credentials: dict | None, *, verify: bool) -> dict:
+    def _status_locked(self, credentials: dict | None, *, verify: bool, persist: bool = True) -> dict:
         if not credentials:
             return {"status": "not_configured", "connected": False}
         result = {"connectionId": self.connection_id(credentials), "email": credentials.get("email"), "mode": "managed" if is_managed_credentials(credentials) else "legacy",
@@ -448,7 +448,8 @@ class GmailConnection:
                     raise GmailConnectionError("GMAIL_ACCOUNT_MISMATCH")
                 credentials.pop("reauthorize_required", None)
                 credentials.update(tokens)
-                self._save_credentials(credentials)
+                if persist:
+                    self._save_credentials(credentials)
             else:
                 from flowly.channels.gmail_auth import get_valid_access_token
                 token, email = get_valid_access_token(self.service) if self.service else get_valid_access_token()
@@ -460,13 +461,27 @@ class GmailConnection:
             if is_managed_credentials(credentials) and error.code in {"UNAUTHORIZED", "REAUTHORIZE", "NOT_FOUND"}:
                 credentials["reauthorize_required"] = True
                 credentials.pop("access_token", None)
-                self._save_credentials(credentials)
+                if persist:
+                    self._save_credentials(credentials)
             return {**result, "status": "reauthorize" if error.code in {"UNAUTHORIZED", "REAUTHORIZE", "NOT_FOUND"} else "unavailable", "connected": False, "error": {"code": error.code}}
 
     def status(self, *, verify: bool = True) -> dict:
         with self._lock():
+            snapshot = self._read_credentials()
+        # The network checks must not hold the profile-wide migration lock: five
+        # service status requests arrive together. Commit only if the grant and
+        # permissions still match, so disconnect/replacement always wins.
+        checked = dict(snapshot) if snapshot else None
+        result = self._status_locked(checked, verify=verify, persist=False)
+        with self._lock():
             credentials = self._read_credentials()
-            result = self._status_locked(credentials, verify=verify)
+            def grant_state(value: dict | None) -> dict | None:
+                return {key: item for key, item in value.items() if key not in {"access_token", "expiry"}} if value else None
+            if grant_state(credentials) not in (grant_state(snapshot), grant_state(checked)):
+                result = self._status_locked(credentials, verify=False)
+            elif checked and checked != snapshot and is_managed_credentials(checked):
+                self._save_credentials(checked)
+                credentials = checked
             pending = _read(self.pending)
             if verify and result.get("connected") and pending and credentials and pending.get("grant_id") == credentials.get("grant_id"):
                 # Retry a committed upgrade's revocation journal on normal status checks.
