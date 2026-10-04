@@ -15,6 +15,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from flowly.compaction.redaction import redact_secrets
+from flowly.live_voice.conversation_recall import search_conversations
 from flowly.live_voice.memory_view import GovernedMemory, read_db, read_memory_file, revision_of
 from flowly.live_voice.sessions import VoiceError, bounded_text, integer
 from flowly.memory.summary import SENTINEL_END, SENTINEL_START
@@ -48,11 +49,15 @@ def _manual(text: str) -> str:
 
 class VoiceContext:
     def __init__(self, workspace: Path, *, state_db: Callable[[str], Path],
-                 profile: Callable[[], tuple[str, str]], index: Callable[[], Any] = lambda: None):
+                 profile: Callable[[], tuple[str, str]], index: Callable[[], Any] = lambda: None,
+                 conversations: Callable[[], tuple[Path, Path] | None] = lambda: None):
         self.workspace = workspace.resolve()
         self.state_db = state_db
         self.profile = profile
         self.index = index
+        # (conversation index, sessions folder): past conversations recall
+        # searches as the agent's session_search does.
+        self.conversations = conversations
 
     async def search(self, params: dict) -> dict:
         request = validate_context(params)
@@ -172,6 +177,24 @@ class VoiceContext:
                 sources['knowledge'] = {'status': 'ok' if triples else 'empty', 'revision': _revision(triples)}
             except (OSError, sqlite3.Error, ValueError):
                 sources['knowledge'] = {'status': 'unavailable'}
+
+            # What was said: the best matching moments of past conversations
+            # (chats and calls), as the agent's own session_search finds them.
+            located = self.conversations() if query else None
+            if located:
+                try:
+                    hits = await asyncio.wait_for(asyncio.to_thread(search_conversations, *located, query), 1.5)
+                    for hit in hits:
+                        if governed.withholds(hit.text):
+                            continue
+                        heading = f"{'Call' if hit.is_call else 'Conversation'}{': ' + hit.title if hit.title else ''}"
+                        when = datetime.fromtimestamp(hit.at, timezone.utc).isoformat() if hit.at else None
+                        add(f"{heading} ({when[:10] if when else 'earlier'})\n{hit.text}",
+                            f"memory://conversation/{_revision(hit.key)}", _revision(hit.text), when,
+                            matched=True, kind='conversation')
+                    sources['conversations'] = {'status': 'ok' if hits else 'empty'}
+                except (OSError, sqlite3.Error, ValueError, asyncio.TimeoutError):
+                    sources['conversations'] = {'status': 'unavailable'}
         else:
             # A corrupt/unreadable privacy index is not equivalent to no
             # private items. Do not export unfiltered mirrors as a fallback.

@@ -1939,6 +1939,8 @@ Respond to the user now:"""
         voice_context = VoiceContext(
             agent.workspace, state_db=_feature_rpc.state_db, profile=_voice_scope,
             index=lambda: getattr(agent, "_memory_manager", None),
+            conversations=lambda: (_feature_rpc.get_flowly_home() / "session_index.sqlite",
+                                   _feature_rpc.get_flowly_home() / "sessions"),
         )
         _feature_rpc.set_voice_context_provider(lambda: voice_context)
         from flowly.live_voice.memory_snapshot import VoiceMemorySnapshot
