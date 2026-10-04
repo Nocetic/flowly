@@ -6,6 +6,7 @@ Creating/updating/deleting tasks requires user approval.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -77,6 +78,11 @@ class GoogleTasksTool(Tool):
         from flowly.exec.types import PendingApproval, ExecRequest
         import secrets
 
+        from flowly.agent.tool_context import current_tool_origin
+        origin = current_tool_origin()
+        if origin is not None:
+            session_key = origin.session_key
+
         pending = PendingApproval(
             id=secrets.token_hex(8),
             request=ExecRequest(command=description),
@@ -89,7 +95,7 @@ class GoogleTasksTool(Tool):
         )
         try:
             decision = await get_approval_manager().request_and_wait(pending)
-            if decision is None or decision == "deny":
+            if decision not in {"allow-once", "allow-always"}:
                 return False
             return True
         except Exception as e:
@@ -97,7 +103,12 @@ class GoogleTasksTool(Tool):
             return False
 
     async def execute(self, action: str, **kwargs: Any) -> str:
-        token, _ = gmail_auth.get_valid_access_token()
+        token, _ = await asyncio.to_thread(gmail_auth.get_valid_access_token)
+        credentials = gmail_auth.load_credentials()
+        if credentials and credentials.get("mode") == "flowly_broker":
+            from flowly.integrations.google_permissions import granted_services
+            if "tasks" not in granted_services(credentials):
+                return "Error: PERMISSION_REQUIRED: Request tasks access with google_connection."
         if not token:
             return "Error: Google account not connected."
 
@@ -200,6 +211,9 @@ class GoogleTasksTool(Tool):
         task_id = kwargs.get("task_id", "")
         if not task_id:
             return "Error: task_id required."
+        if not await self._require_approval(f"Complete Google task {task_id}", kwargs.get("session_key", "")):
+            return "Task completion cancelled — user denied."
+
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.patch(

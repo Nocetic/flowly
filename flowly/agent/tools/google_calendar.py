@@ -6,6 +6,7 @@ Creating/updating/deleting events requires user approval.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -95,6 +96,11 @@ class GoogleCalendarTool(Tool):
         from flowly.exec.types import PendingApproval, ExecRequest
         import secrets
 
+        from flowly.agent.tool_context import current_tool_origin
+        origin = current_tool_origin()
+        if origin is not None:
+            session_key = origin.session_key
+
         pending = PendingApproval(
             id=secrets.token_hex(8),
             request=ExecRequest(command=description),
@@ -107,7 +113,7 @@ class GoogleCalendarTool(Tool):
         )
         try:
             decision = await get_approval_manager().request_and_wait(pending)
-            if decision is None or decision == "deny":
+            if decision not in {"allow-once", "allow-always"}:
                 return False
             return True
         except Exception as e:
@@ -115,7 +121,12 @@ class GoogleCalendarTool(Tool):
             return False
 
     async def execute(self, action: str, **kwargs: Any) -> str:
-        token, _ = gmail_auth.get_valid_access_token()
+        token, _ = await asyncio.to_thread(gmail_auth.get_valid_access_token)
+        credentials = gmail_auth.load_credentials()
+        if credentials and credentials.get("mode") == "flowly_broker":
+            from flowly.integrations.google_permissions import granted_services
+            if "calendar" not in granted_services(credentials):
+                return "Error: PERMISSION_REQUIRED: Request calendar access with google_connection."
         if not token:
             return "Error: Google account not connected. Connect via Desktop app settings."
 

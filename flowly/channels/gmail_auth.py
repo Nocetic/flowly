@@ -96,6 +96,8 @@ def _refresh(creds: dict[str, Any]) -> dict[str, Any] | None:
 
         creds["access_token"] = data["access_token"]
         creds["expiry"] = expiry.isoformat()
+        if isinstance(data.get("scope"), str):
+            creds["scopes"] = data["scope"]
         # Google may issue a new refresh token
         if data.get("refresh_token"):
             creds["refresh_token"] = data["refresh_token"]
@@ -114,7 +116,7 @@ def get_valid_access_token() -> tuple[str | None, str | None]:
     Automatically refreshes if needed.  Returns (None, None) on failure.
     """
     creds = load_credentials()
-    if not creds:
+    if not creds or creds.get("disconnect_pending") or creds.get("reauthorize_required"):
         return None, None
 
     if creds.get("mode") == "flowly_broker":
@@ -145,3 +147,15 @@ def email_tool_ready(*, legacy_enabled: bool = False) -> bool:
         return config.get("channels", {}).get("email", {}).get("enabled") is True
     except (ValueError, OSError, AttributeError):
         return False
+
+
+def google_tool_ready(service: str, *, legacy_enabled: bool = False) -> bool:
+    """A new grant can enable Workspace tools without restarting the agent."""
+    from flowly.integrations.google_permissions import granted_services
+    credentials = load_credentials()
+    if not credentials or not email_tool_ready(legacy_enabled=legacy_enabled):
+        return False
+    if credentials.get("mode") != "flowly_broker" and not credentials.get("scopes", credentials.get("scope")):
+        # Historical credentials did not record scopes; Google still enforces them.
+        return legacy_enabled
+    return service in granted_services(credentials)

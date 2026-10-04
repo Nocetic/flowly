@@ -24,12 +24,18 @@ def _error(error: Exception) -> None:
 def connect(
     no_browser: bool = typer.Option(False, "--no-browser", help="Print the link without opening a browser."),
     no_wait: bool = typer.Option(False, "--no-wait", help="Print the request and return; run connect again to resume."),
+    services: str = typer.Option("", "--services", help="Comma-separated access: gmail,gmail_manage,calendar,drive,contacts,tasks. Always include gmail."),
+    extend: bool = typer.Option(False, "--extend", help="Extend this account without removing the existing connection."),
     locale: str = typer.Option("en", help="Authorization page language: en, tr, es."),
 ):
     """Authorize Gmail in any browser; no callback port or pasted token is needed."""
     service = GmailConnection()
     try:
-        setup = service.begin(locale=locale)
+        selected = [item.strip() for item in services.split(",")] if services else None
+        current = service.status(verify=False) if extend else {}
+        if extend and not current.get("connectionId"):
+            raise GmailConnectionError("CONNECTION_CHANGED")
+        setup = service.begin(locale=locale, services=selected, connection_id=current.get("connectionId"))
         console.print(f"Gmail → {setup['label']} / {setup['profile']}", markup=False)
         console.print(f"Confirmation code: {setup['verificationCode']}", markup=False)
         console.print(setup["authorizationUrl"], markup=False)

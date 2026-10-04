@@ -1,15 +1,36 @@
 ---
 title: Gmail
 eyebrow: Integrations
-description: Search, paginate and read Gmail messages with explicit results and safe failure handling.
+description: Connect Gmail, search and read messages, and manage mail with explicit approval.
 ---
 
-# Gmail query contract
+# Gmail
 
-The native `email` tool calls Gmail from the selected agent. This read-path
-change does not change OAuth scopes, enroll a gateway, or route mail through
-a new service. Existing send/reply approval remains mandatory. Only GET
-requests are retried; a mail submission is never automatically repeated.
+The native `email` tool calls Gmail from the selected agent. Connect it from
+Connections or ask in chat: the `google_connection` tool presents a review card
+in Desktop. Choose Gmail management and optional Google Workspace services, then
+approve the selected permissions on Google’s own page. Existing read/send grants
+continue working; use “Extend Google access” for management permission.
+
+Send/reply and management approval remain mandatory. Only GET requests are
+retried; submissions and management writes are never automatically repeated.
+
+## Managing messages
+
+`trash` moves messages to Trash, and `untrash` restores them. Immediate permanent
+deletion is not exposed. Other actions are `archive`, `move_to_inbox`, `mark_read`,
+`mark_unread`, `star`, `unstar`, `label` and `unlabel`. Use `labels_list` to find
+existing user labels, then pass their `label_ids` to label/unlabel.
+
+Management requires `gmail.modify`. Pass one `message_id` or up to 100 explicit
+`message_ids` from prior results; search queries and thread IDs are not accepted
+as mutation targets. The approval lists the account, action, subjects, senders
+and exact IDs. If any target cannot be read for the preview, no write starts.
+After approval, the account and connection are checked again.
+
+Results separate `succeeded`, `failed` and `not_attempted` IDs. A timeout or server
+failure can mean `OUTCOME_UNKNOWN`: read that message’s state before retrying.
+Do not replay successful IDs or assume a result page represents every match.
 
 ## Listing and searching
 

@@ -46,6 +46,15 @@ def main():
             assert json.loads((home_a / "config.json").read_text())["channels"]["email"]["enabled"]
             assert first.setup_status(setup["requestId"])["connected"]
 
+            assert connected["services"] == ["gmail"]
+            upgraded = first.begin(services=["gmail", "gmail_manage", "tasks"], connection_id=setup["requestId"])
+            assert load_credentials()["grant_id"] == setup["requestId"]
+            fixture.post(origin + "/fixture/approve", json={**upgraded, "dropTasks": True}).raise_for_status()
+            updated = first.setup_status(upgraded["requestId"])
+            assert updated["services"] == ["gmail", "gmail_manage"]
+            assert updated["requestedServices"] == ["gmail", "gmail_manage", "tasks"]
+            assert load_credentials()["grant_id"] == upgraded["requestId"]
+
             os.environ["FLOWLY_HOME"] = str(home_b)
             second = GmailConnection(client=client)
             assert second.status()["status"] == "not_configured"
@@ -53,11 +62,11 @@ def main():
             fixture.post(origin + "/fixture/approve", json=other).raise_for_status()
             assert second.setup_status(other["requestId"])["connected"]
             os.environ["FLOWLY_HOME"] = str(home_a)
-            assert first.disconnect(setup["requestId"])["status"] == "not_configured"
+            assert first.disconnect(upgraded["requestId"])["status"] == "not_configured"
             assert get_valid_access_token() == (None, None)
             os.environ["FLOWLY_HOME"] = str(home_b)
             assert second.status()["connected"]
-    print("PASS: create, resume, authorize, claim, Gmail validation, token use, disconnect and profile isolation")
+    print("PASS: create, resume, authorize, claim, permission upgrade, partial consent, token use, disconnect and profile isolation")
 
 
 if __name__ == "__main__":
