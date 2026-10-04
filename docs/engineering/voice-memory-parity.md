@@ -324,6 +324,30 @@ actual `profiles.capabilities` response on that phone connection;
 diagnosed from the model's answer alone. A healthy loaded snapshot still
 requires model-behavior evaluation; the hosted eval suite has not been run.
 
+## Incident 2026-10-04 (2): the phone's memory read lost a race on the relay
+
+After the pin fix the phone still started calls without memory, and
+gateway.log showed no snapshot request at all. Cause: every relay request
+carrying voiceAccess takes a receive-order slot (RelayRecipients.begin) and
+binds it after its certificate verifies asynchronously;
+EventRecipients.bind accepted only the newest slot. The phone sends the
+snapshot, tasks and focus at once, so the snapshot (and tasks) lost to a
+later request and was refused with VOICE_AUTH_REQUIRED before any handler,
+without a log line. The probe and local clients never take this path.
+
+Fix `6f4dd732` (`flowly/channels/web.py` `_handle_rpc`): only the lease
+methods (voice.events.bind/clear) are refused on a stale slot; other
+requests are authorized by their own certificate and the live principal
+check. Test: `tests/test_voice_relay_events.py`
+`test_a_call_starting_with_several_reads_at_once_gets_all_of_them`.
+The cloud channel now logs each voice profile RPC arriving and any refusal
+(`90d445a0`). Verified on the owner's phone at 15:13: snapshot arrived and
+was served (15 KB), and the agent knew the owner.
+
+Lesson: the local probe proves the routing inside the gateway, not the
+relay path; a phone's call must be checked in gateway.log
+("voice profile RPC … arrived").
+
 ## Spoken language (2026-10-04)
 
 A new conversation opened in the client's interface language, so a Turkish
