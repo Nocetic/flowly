@@ -1,7 +1,10 @@
 # Voice memory parity: a call knows what the agent knows
 
-Status: implemented on branches, not merged (2026-10-03). Branches and
-worktrees per repository are under "Rollout"; nothing is deployed.
+Status: implementation and startup hardening are on branches (2026-10-04).
+The phone's reported missing-snapshot incident still needs a device retest;
+passing the routing probe is not evidence of a phone call loading its memory.
+See "Rollout" for previously merged/deployed pieces. The new startup
+hardening below has not been merged, pushed or deployed.
 
 This document is the contract. Clients follow it; when it changes, change it
 here first.
@@ -131,7 +134,9 @@ The initial context then carries:
 
 ```json
 {
-  "memory": {"source": "agent_memory_snapshot", "truncated": false,
+  "memory": {"source": "agent_memory_snapshot",
+             "scope": {"profile": "default", "botId": "…"},
+             "revision": "<24 hex>", "partial": false, "truncated": false,
              "sections": [{"title": "User", "text": "…"}]},
   "memoryProfile": "Agent:\n…\n\nUser:\n…"
 }
@@ -139,7 +144,15 @@ The initial context then carries:
 
 An older runtime keeps the previous `memory` (the `voice.context` receipt).
 A snapshot that cannot be read (slow or unready runtime) falls back to that
-recall too: a new read must never start a call with less than before.
+recall too. Cancellation and account/agent identity changes are terminal;
+they never trigger a recall for another target. Each new call reads the
+selected agent afresh, even if two hosts both call their profile `default`.
+There is no cross-agent memory cache or transfer between agents' stores.
+
+Clients retain the verified snapshot's scope, revision and partial flag in
+the initial context. Final context serialization rejects a memory bot ID
+that differs from the selected agent. Revision identifies Core's snapshot,
+not a digest of the client's possibly budget-trimmed sections.
 
 Fitting the 48 KB frame cuts the agent's own memory last: older tasks first
 (halving), then the oldest conversation rows, then memory sections from the
@@ -156,6 +169,15 @@ agent, to answer by itself only greetings, brief acknowledgments, a
 clarifying question and a restatement of what the backend just said, and to
 delegate everything else, including one-word follow-ups ("Ne?"); it never
 says it does not know something about the user without delegating first.
+
+Relay checks a scoped snapshot's bot ID against `selectedAgent.id` before
+starting the provider session. Legacy contexts without snapshot scope remain
+accepted. This is a consistency check, not authorization: ownership and
+identity remain enforced by the session and Core's pinned RPC. Relay inserts
+the complete initial context into the backend prompt literally (a replacement
+callback); `$&`, `$$`, ``$` `` and `$'` inside memory must not be interpreted as
+JavaScript replacement-string syntax. Full sections go only to the backend;
+the speaker receives the short profile.
 
 When a `flowly_remember` or `flowly_exec` call settles, the speaking model
 gets a typed note (`flowly.interaction_focus`, domain `memory_note` or
@@ -214,6 +236,66 @@ after checking it. Prevention:
 - **Logs**: Core logs what each snapshot and recall served (shape only);
   iOS logs how a call's memory started (`live-voice-memory`).
 
+### Follow-up: prove selection, fallback and delivery separately
+
+The 02:16 phone call still used empty-query recall without a snapshot request
+after the pin fix. That evidence does **not** establish why the phone skipped
+the snapshot. Previously, successful recall when the capability was absent
+emitted no memory log, and snapshot failures logged raw error text. The latter
+could include private server content.
+
+Desktop and iOS now emit a single content-free startup result from the same
+reader used by their call startup:
+
+- `snapshotAdvertised`, `source` (`snapshot`, `recall`, `none`);
+- `snapshot` and `recall` outcomes: `not_attempted`, `not_advertised`, `ok`,
+  `cancelled`, `target_changed`, `account_changed`, `invalid_receipt`,
+  `invalid_params`, `unsupported`, `timeout`, `unavailable`;
+- section count, section text bytes, profile bytes, partial and truncated.
+
+iOS uses the `live-voice-memory` category; Desktop uses
+`[live-voice-memory]` / `live_voice_startup_memory` with the connection ID.
+No text, profile, credential, arbitrary upstream code or error message is
+logged. These are local client diagnostics; this change does not add a Web
+ingestion endpoint, central delivery or dashboard. Desktop diagnostic sink
+failures cannot affect the memory read's result.
+
+The host's `PROFILE_IDENTITY_CHANGED` and `TASK_TARGET_CHANGED` refusals now
+remain terminal through optional startup reads. They cannot silently become
+a call without the selected agent's memory. Ordinary unavailable-memory
+behavior is unchanged: recall is attempted; if it also fails, iOS may start
+without enrichment, while Desktop startup reports the read failure.
+
+Verification on 2026-10-04:
+
+- Running Core: 16/16 read-only checks (four running agents, Desktop/iOS
+  envelopes, snapshot/recall). Snapshot advertised; no call created.
+- Core: 1,104 selected Voice/profile/feature-RPC tests passed. The sandbox
+  denied loopback binding on the first run; the allowed local retry passed.
+- Desktop: 688 Voice tests passed, plus six newly added diagnostic/fallback
+  cases in a subsequent 26-test tools run; renderer TypeScript check passed.
+- iOS: `scripts/verify-live-voice-startup.sh` builds actual Foundation routing,
+  validation and context code in a temporary macOS Swift package: 57 tests
+  passed, including default/named profiles, two hosts named `default`,
+  cancellation, wrong-agent receipts and missing/failed snapshot fallback.
+  `scripts/verify-live-voice-context.sh` passed. Coordinator source parsed.
+  This does not compile the full UIKit/Firebase app or run a phone call.
+- Relay: 231 tests and TypeScript check passed. New regression tests first
+  failed on the old implementation for literal context corruption and a
+  mismatched scoped snapshot, then passed with the fixes.
+- Core/Desktop/iOS client request fixtures remain byte-identical.
+
+No iOS simulator was run. Before claiming the incident resolved, the owner
+must build the iOS worktree on a device and make a fresh call: verify
+`source=snapshot snapshotAdvertised=true snapshot=ok`, then ask about a known
+non-private fact without an explicit search. Repeat on another updated host
+with a different known fact and verify the first host's fact is absent. Pair
+these with Core's served/refused logs. `not_advertised` means inspect the
+actual `profiles.capabilities` response on that phone connection;
+`invalid_params` means inspect its request envelope. Neither should be
+diagnosed from the model's answer alone. A healthy loaded snapshot still
+requires model-behavior evaluation; the hosted eval suite has not been run.
+
 ## Spoken language (2026-10-04)
 
 A new conversation opened in the client's interface language, so a Turkish
@@ -249,9 +331,9 @@ Nothing merged except as noted; branches and worktrees:
 | Surface | Branch (worktree) | State |
 |---|---|---|
 | Core | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-core`) | snapshot, pin fix, contract, probe, report, language |
-| Desktop | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-desktop`) | snapshot, greeting (merged in), contract test |
-| iOS | `codex/live-voice-ios` (`flowly-desktop/.codex-worktrees/live-voice-ios`) | snapshot, greeting, ringing, call screen, language, contract test |
-| Relay | `main` has memory and greeting (merged, deployed by the owner); `codex/voice-language` (`flowly-repos/flowly-relay-language`) | language rules |
+| Desktop | `codex/voice-memory-parity` (`flowly-desktop/.codex-worktrees/voice-memory-desktop`) | snapshot, greeting (merged in), contract test, scoped startup and diagnostics |
+| iOS | `codex/live-voice-ios` (`flowly-desktop/.codex-worktrees/live-voice-ios`) | snapshot, greeting, ringing, call screen, language, contract test, scoped startup and diagnostics |
+| Relay | `main` has memory and greeting (merged, deployed by the owner); `codex/voice-language` (`flowly-repos/flowly-relay-language`) | language rules, literal memory handoff and scope check |
 | Web | `main` has the memory prompt (merged, pushed); `codex/voice-language` (`flowly-app-language`) | language rule |
 | Android | — | no Live Voice |
 
@@ -284,6 +366,11 @@ Desktop: `23fecece` snapshot at call start; `993c342f` recall fallback.
 iOS: `30f0c7aa` snapshot at call start; `533cacf7` recall fallback.
 Relay: `061d2a7` speaking model; `256112b` evaluation.
 Web: `5cdf02e` backend prompt; `5b34009` config export.
+
+Startup hardening (2026-10-04, worktree branches only): Desktop `7bda3187`,
+iOS `5a0022c3`, Relay `6eb0ebd`. Web and Core runtime code did not change in
+this follow-up. iOS's owner's existing `project.pbxproj` and `Info.plist`
+edits were left outside these commits.
 
 ## Tests
 
