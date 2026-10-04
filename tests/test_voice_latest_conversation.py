@@ -32,6 +32,12 @@ def say(role, content, **extra):
     return {"role": role, "content": content, **extra}
 
 
+def open_call(ended=False):
+    return {"kind": "voice", "title": "Voice chat", "voice": {"connections": [
+        {"id": "c-1", "endedAt": "2026-10-04T15:00:00"},
+        {"id": "c-2", "endedAt": "2026-10-04T15:20:00" if ended else None}]}}
+
+
 @pytest.fixture
 def sessions(tmp_path):
     directory = tmp_path / "sessions"
@@ -50,8 +56,11 @@ def test_the_latest_owner_conversation_is_carried_in_its_own_words(sessions):
         say("user", "Delete it then"),
         say("assistant", "Done, it is in the trash."),
     ], mtime=2_000, metadata={"title": "Google security alert"})
-    # Newer, but none of these is a conversation with the owner.
-    for key in ("desktop:voice:call-1", "desktop:voice-work:c_1", "desktop:profile-inbox:x",
+    # Newer, but none of these is a conversation to continue: the call that
+    # is open (this one), a call's work, an agent room, scheduled runs.
+    write_session(sessions, "desktop:voice:call-1", [say("user", "this call")], mtime=3_000,
+                  metadata=open_call())
+    for key in ("desktop:voice-work:c_1", "desktop:profile-inbox:x",
                 "desktop:group:room", "cron:nightly", "heartbeat:main"):
         write_session(sessions, key, [say("user", "not this")], mtime=3_000)
 
@@ -130,3 +139,31 @@ def test_without_a_sessions_folder_the_snapshot_is_unchanged(tmp_path):
     reader = VoiceMemorySnapshot(workspace, state_db=lambda name: tmp_path / name,
                                  profile=lambda: ("default", "bot-1"), search_enabled=lambda: True)
     assert [section["kind"] for section in reader.snapshot({})["sections"]] == ["notes"]
+
+
+def test_an_earlier_call_is_where_they_left_off_when_it_came_last(tmp_path, sessions):
+    write_session(sessions, "telegram:1", [say("user", "Earlier chat")], mtime=1_000)
+    write_session(sessions, "desktop:voice:call-1", [
+        say("user", "Let's plan the trip to İzmir."),
+        say("assistant", "Friday morning works; I will hold the 9:40 train."),
+    ], mtime=datetime(2026, 10, 4, 15, 20).timestamp(), metadata=open_call(ended=True) | {"title": "İzmir trip"})
+    chat = latest_chat(sessions)
+    assert chat.is_call and chat.title == "İzmir trip" and "9:40 train" in chat.text
+
+    workspace = tmp_path / "workspace"
+    (workspace / "memory").mkdir(parents=True)
+    reader = VoiceMemorySnapshot(workspace, state_db=lambda name: tmp_path / name,
+                                 profile=lambda: ("default", "bot-1"), search_enabled=lambda: True,
+                                 sessions_dir=lambda: sessions)
+    result = reader.snapshot({})
+    [recent] = [section for section in result["sections"] if section["kind"] == "recent"]
+    assert recent["title"] == "Latest call: İzmir trip (2026-10-04 15:20)"
+    assert result["profile"].startswith("Last talked about in a call: İzmir trip (2026-10-04 15:20)")
+
+
+def test_another_accounts_call_is_never_carried(sessions):
+    write_session(sessions, "web:mine", [say("user", "my chat")], mtime=1_000)
+    theirs = open_call(ended=True) | {"voiceOwner": {"kind": "account", "uid": "account-b"}}
+    write_session(sessions, "desktop:voice:theirs", [say("user", "their call")], mtime=2_000, metadata=theirs)
+    with request_owner_scope(RequestOwner("account-a")):
+        assert latest_chat(sessions).key == "web:mine"

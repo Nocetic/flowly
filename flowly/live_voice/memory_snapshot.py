@@ -173,7 +173,8 @@ class VoiceMemorySnapshot:
         sources['conversation'] = {'status': 'ok' if text else 'empty', 'revision': revision_of(text)}
         if not text:
             return None
-        title = f"Latest conversation{': ' + chat.title if chat.title else ''} ({chat.updated_at:%Y-%m-%d %H:%M})"
+        kind = 'call' if chat.is_call else 'conversation'
+        title = f"Latest {kind}{': ' + chat.title if chat.title else ''} ({chat.updated_at:%Y-%m-%d %H:%M})"
         return Section('recent', title[:200], text, 'memory://conversation/latest')
 
     def _safe(self, text: str, name: str, governed: GovernedMemory, *, stated: set[str] = frozenset()) -> str:
@@ -264,10 +265,11 @@ class VoiceMemorySnapshot:
             excerpt = text if len(text) <= share else text[:share].rsplit('\n', 1)[0].rstrip() + ' …'
             parts.append(f'{label}:\n{excerpt}')
         latest = next((section.title for section in sections if section.kind == 'recent'
-                       and section.title.startswith('Latest conversation')), '')
+                       and section.title.startswith(('Latest conversation', 'Latest call'))), '')
         if latest:
             # The speaking model greets first: it should know where they left off.
-            parts.insert(0, latest.replace('Latest conversation', 'Last talked about', 1))
+            parts.insert(0, latest.replace('Latest conversation', 'Last talked about', 1)
+                         .replace('Latest call', 'Last talked about in a call', 1))
         profile = '\n\n'.join(parts)
         while _bytes(profile) > PROFILE_BUDGET:
             if '\n' not in profile:

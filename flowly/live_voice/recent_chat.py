@@ -4,9 +4,10 @@ A chat turn carries its own history, so the agent always knows what was just
 said. A call is a separate conversation: without this it knew the owner's
 memory but not what the two had been talking about a minute earlier. The
 call's memory snapshot therefore carries the end of the conversation the
-owner was most recently in (any chat channel; never another call, a call's
-work, an agent room or a scheduled run), visible to the requester exactly as
-``sessions.list`` would show it.
+owner was most recently in: any chat channel or an earlier call (never a
+call still open, which is this call or one still running elsewhere; never a
+call's work, an agent room or a scheduled run), visible to the requester
+exactly as ``sessions.list`` would show it (another account's calls never).
 
 Read-only. Bounded: the newest user and assistant messages, at most
 ``RECENT_CHAT_MESSAGES`` and ``RECENT_CHAT_BYTES`` UTF-8 bytes, each cut at
@@ -29,7 +30,8 @@ CANDIDATES = 24
 # Conversations the owner has with the agent, by session key.
 CHAT_PREFIXES = ('desktop:', 'web:', 'ios:', 'android:', 'telegram:', 'whatsapp:', 'discord:', 'slack:', 'imessage:')
 # Inside those, what is not a conversation with the owner.
-NOT_CONVERSATIONS = ('desktop:voice:', 'desktop:voice-work:', 'desktop:profile-', 'desktop:group:')
+NOT_CONVERSATIONS = ('desktop:voice-work:', 'desktop:profile-', 'desktop:group:')
+CALL_PREFIX = 'desktop:voice:'
 
 
 @dataclass(frozen=True)
@@ -38,10 +40,22 @@ class RecentChat:
     title: str
     updated_at: datetime
     text: str
+    is_call: bool = False
 
 
 def is_owner_chat(key: str) -> bool:
+    """A chat or a call with the owner (`desktop:voice:` is a call)."""
     return key.startswith(CHAT_PREFIXES) and not key.startswith(NOT_CONVERSATIONS)
+
+
+def is_open_call(key: str, metadata: dict) -> bool:
+    """A call whose last connection has not ended: this call (just opened or
+    resumed) or one still running on another device."""
+    if not key.startswith(CALL_PREFIX):
+        return False
+    voice = metadata.get('voice') if isinstance(metadata.get('voice'), dict) else {}
+    connections = voice.get('connections') if isinstance(voice.get('connections'), list) else []
+    return bool(connections) and isinstance(connections[-1], dict) and not connections[-1].get('endedAt')
 
 
 def latest_chat(sessions_dir: Path) -> RecentChat | None:
@@ -61,14 +75,14 @@ def latest_chat(sessions_dir: Path) -> RecentChat | None:
             metadata = header.get('metadata') if isinstance(header.get('metadata'), dict) else {}
         except (OSError, ValueError):
             continue
-        if not is_owner_chat(key) or not session_visible(key, metadata):
+        if not is_owner_chat(key) or is_open_call(key, metadata) or not session_visible(key, metadata):
             continue
         lines = _tail_messages(path)
         if not lines:
             continue
         title = str(metadata.get('title') or '').strip()
         return RecentChat(key=key, title=' '.join(title.split())[:120], text='\n\n'.join(lines),
-                          updated_at=datetime.fromtimestamp(_mtime(path)))
+                          updated_at=datetime.fromtimestamp(_mtime(path)), is_call=key.startswith(CALL_PREFIX))
     return None
 
 
