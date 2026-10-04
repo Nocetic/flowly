@@ -8819,9 +8819,11 @@ class AgentLoop:
         skip_memory_flag = bool(msg.metadata.get("skip_memory", False))
         skip_context_files_flag = bool(msg.metadata.get("skip_context_files", False))
         voice_mode_flag = bool(msg.metadata.get("voice_mode", False))
+        from flowly.agent.turn_clock import turn_clock
         request_sidecars = [
             block
             for block in (
+                turn_clock(),
                 coverage_sidecar,
                 tool_policy_sidecar,
                 profile_collaboration_sidecar,
@@ -9543,12 +9545,11 @@ class AgentLoop:
             if str(item.get("function", {}).get("name", ""))
         }
         announce_coverage = self._context_coverage_sidecar(session)
+        from flowly.agent.turn_clock import turn_clock
         messages = self.context.build_messages(
             history=self._history_with_summary_anchor(session),
-            current_message=(
-                f"{announce_coverage}\n\n{msg.content}"
-                if announce_coverage
-                else msg.content
+            current_message="\n\n".join(
+                block for block in (turn_clock(), announce_coverage, msg.content) if block
             ),
             memory_search_enabled=self._memory_manager is not None,
             model=self.model,
