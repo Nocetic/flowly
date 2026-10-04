@@ -2543,24 +2543,16 @@ class AgentLoop:
         )
         self.tools.register(EmailTool(), check_fn=lambda _context: email_tool_ready(legacy_enabled=legacy_email_enabled))
 
-        # Existing broader Google Workspace grants remain opt-in and unchanged.
-        if self._main_config and hasattr(self._main_config, 'channels'):
-            email_cfg = getattr(self._main_config.channels, 'email', None)
-            if email_cfg and email_cfg.enabled:
-                from flowly.agent.tools.google_calendar import GoogleCalendarTool
-                from flowly.agent.tools.google_drive import GoogleDriveTool
-                from flowly.agent.tools.google_contacts import GoogleContactsTool
-                from flowly.agent.tools.google_tasks import GoogleTasksTool
-                def _google_ready(_context: Any) -> bool:
-                    from flowly.channels.gmail_auth import load_credentials
-                    credentials = load_credentials()
-                    return credentials is not None and credentials.get("mode") != "flowly_broker"
+        from flowly.channels.gmail_auth import google_tool_ready
+        from flowly.agent.tools.google_calendar import GoogleCalendarTool
+        from flowly.agent.tools.google_drive import GoogleDriveTool
+        from flowly.agent.tools.google_contacts import GoogleContactsTool
+        from flowly.agent.tools.google_tasks import GoogleTasksTool
+        for service, tool in (("calendar", GoogleCalendarTool()), ("drive", GoogleDriveTool()),
+                              ("contacts", GoogleContactsTool()), ("tasks", GoogleTasksTool())):
+            self.tools.register(tool, check_fn=lambda _context, service=service:
+                                google_tool_ready(service, legacy_enabled=legacy_email_enabled))
 
-                self.tools.register(GoogleCalendarTool(), check_fn=_google_ready)
-                self.tools.register(GoogleDriveTool(), check_fn=_google_ready)
-                self.tools.register(GoogleContactsTool(), check_fn=_google_ready)
-                self.tools.register(GoogleTasksTool(), check_fn=_google_ready)
-        
         # Web tools — direct Brave key OR centralized proxy via web app
         web_proxy_url = None
         web_server_id = None
@@ -2604,6 +2596,8 @@ class AgentLoop:
         # back an answer; see flowly.clarify.
         from flowly.agent.tools.clarify import ClarifyTool
         self.tools.register(ClarifyTool())
+        from flowly.agent.tools.google_connection import GoogleConnectionTool
+        self.tools.register(GoogleConnectionTool())
         from flowly.agent.tools.mcp_connection import MCPConnectionRequestTool
         self.tools.register(MCPConnectionRequestTool())
 

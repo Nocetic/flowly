@@ -57,6 +57,10 @@ class EmailTool(Tool):
             "read (email body by ID, with body_offset continuation for long messages), "
             "send (send a new email — supports file attachments), "
             "reply (reply to an email — supports file attachments). "
+            "Management: trash, untrash, archive, move_to_inbox, mark_read, mark_unread, star, unstar, "
+            "labels_list, label, unlabel. Management requires Google Gmail management permission and user approval. "
+            "Use explicit message_id or up to 100 message_ids from prior results; never treat a page as all matches. "
+            "Delete means trash, never permanent deletion. Use google_connection for missing access. "
             "Only use when the user explicitly asks about emails. "
             "List results are one page, NOT a total count; continue using next_page_token as page_token "
             "with the same query and filters. Partial results contain failed IDs, not missing matches. "
@@ -74,12 +78,20 @@ class EmailTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["inbox", "read", "send", "reply", "search"],
+                    "enum": ["inbox", "read", "send", "reply", "search", "trash", "untrash", "archive", "move_to_inbox", "mark_read", "mark_unread", "star", "unstar", "labels_list", "label", "unlabel"],
                     "description": "Action to perform.",
                 },
                 "message_id": {
                     "type": "string",
-                    "description": "Gmail message ID (for read/reply).",
+                    "description": "Gmail message ID (for read/reply or one management target).",
+                },
+                "message_ids": {
+                    "type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100,
+                    "description": "Exact message IDs to manage, from previous results. Do not combine with message_id.",
+                },
+                "label_ids": {
+                    "type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20,
+                    "description": "Existing user label IDs from labels_list, for label/unlabel.",
                 },
                 "to": {
                     "type": "string",
@@ -136,6 +148,9 @@ class EmailTool(Tool):
         }
 
     async def execute(self, action: str, **kwargs: Any) -> str:
+        from flowly.integrations.gmail_writer import WRITE_ACTIONS, manage_mail
+        if action in WRITE_ACTIONS:
+            return await manage_mail(action, kwargs, self._require_approval)
         error = self._validate_read_arguments(action, kwargs)
         if error:
             return f"Error: INVALID_ARGUMENT: {error}"
@@ -144,11 +159,14 @@ class EmailTool(Tool):
         if not token:
             return "Error: Gmail not connected. Connect in the app or run `flowly gmail connect` on this agent."
 
-        if action in {"inbox", "search", "read"}:
+        if action in {"inbox", "search", "read", "labels_list"}:
             try:
                 async with asyncio.timeout(90), httpx.AsyncClient() as client:
                     reader = GmailReader(client, token)
-                    if action == "read":
+                    if action == "labels_list":
+                        data = await reader.get("labels")
+                        result = {"labels": data.get("labels", [])}
+                    elif action == "read":
                         result = await reader.read_message(
                             kwargs["message_id"],
                             body_offset=kwargs.get("body_offset", 0),
@@ -217,6 +235,11 @@ class EmailTool(Tool):
 
         approval_mgr = get_approval_manager()
 
+        from flowly.agent.tool_context import current_tool_origin
+        origin = current_tool_origin()
+        if origin is not None:
+            session_key = origin.session_key
+
         pending = PendingApproval(
             id=secrets.token_hex(8),
             request=ExecRequest(command=description),
@@ -233,7 +256,7 @@ class EmailTool(Tool):
             if decision is None:
                 logger.info("[Email] Approval timed out — denying")
                 return False
-            if decision == "deny":
+            if decision not in {"allow-once", "allow-always"}:
                 logger.info("[Email] User denied email send")
                 return False
             logger.info(f"[Email] User approved: {decision}")

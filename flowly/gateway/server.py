@@ -1567,7 +1567,7 @@ class GatewayServer:
         # Gmail management uses the same TLS/SSH boundary as its HTTP endpoint.
         # No change to ordinary chat RPCs or other features on this connection.
         requested = params.get("method", "") if method == "profiles.rpc" and isinstance(params, dict) else method
-        if isinstance(requested, str) and requested.startswith("gmail.") and requested != "gmail.capabilities":
+        if isinstance(requested, str) and requested.startswith("gmail.") and requested not in {"gmail.capabilities", "gmail.chat.pending"}:
             from flowly.gateway.mcp_management import _protected_socket
             request = getattr(ws, "_req", None)
             if request is None or not _protected_socket(request):
