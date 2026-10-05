@@ -172,12 +172,17 @@ def running_worker(tmp_path, monkeypatch):
     monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, "a" * 64, "/usr/local/bin/uv", digest])
     install = Mock(return_value=0)
     monkeypatch.setattr(worker, "install", install)
-    monkeypatch.setattr(worker, "ready", Mock(side_effect=[False, True]))
+    monkeypatch.setattr(worker, "ready", Mock(return_value=True))  # checked after installing
+    # A fresh environment: the screen's own packages are missing, the shared
+    # ones are already the agent's.
+    monkeypatch.setattr(worker, "needed", lambda repair=False: list(worker.OWN))
+    monkeypatch.setattr(worker, "conflicts", lambda: [])
     monkeypatch.setattr(worker, "verify", lambda: True)
     return SimpleNamespace(install=install, root=worker.state_root())
 
 
 def test_worker_persists_results_and_retries_without_installing(running_worker, capsys):
+    # Only the selected packages, from the hash-pinned file, reach uv.
     assert worker.main() == 0
     result = json.loads(capsys.readouterr().out)
     assert result["restartRequired"] and result["state"] == "succeeded"
@@ -189,6 +194,7 @@ def test_worker_persists_results_and_retries_without_installing(running_worker, 
 
 def test_matching_versions_do_not_touch_environment_or_require_restart(running_worker, monkeypatch, capsys):
     monkeypatch.setattr(worker, "ready", lambda: True)
+    monkeypatch.setattr(worker, "needed", lambda repair=False: list(worker.OWN) if repair else [])
     assert worker.main() == 0
     assert not json.loads(capsys.readouterr().out)["restartRequired"]
     running_worker.install.assert_not_called()
@@ -283,6 +289,7 @@ def test_a_later_success_leaves_nothing_to_reinstall(running_worker, monkeypatch
     uncertain(running_worker.root, "3" * 32, updated=1)
     uncertain(running_worker.root, "4" * 32, "succeeded", updated=2)
     monkeypatch.setattr(worker, "ready", lambda: True)
+    monkeypatch.setattr(worker, "needed", lambda repair=False: list(worker.OWN) if repair else [])
     assert worker.main() == 0
     assert json.loads(capsys.readouterr().out)["restartRequired"] is False
     running_worker.install.assert_not_called()
@@ -297,3 +304,57 @@ def test_reinstall_is_the_same_hash_pinned_command(monkeypatch, tmp_path):
     plain = spawn.call_args.args[0]
     worker.install("/usr/local/bin/uv", tmp_path / "requirements.txt", reinstall=True)
     assert spawn.call_args.args[0] == [*plain, "--reinstall"]
+
+
+def installed_versions(monkeypatch, versions):
+    def version(name):
+        if name not in versions:
+            raise worker.importlib.metadata.PackageNotFoundError(name)
+        return versions[name]
+    monkeypatch.setattr(worker.importlib.metadata, "version", version)
+
+
+PINNED = dict(worker.VERSIONS)
+
+
+def test_a_package_the_agent_already_uses_is_never_replaced(monkeypatch):
+    """Seen live: a pinned typing-extensions 4.15.0 replaced the agent's newer
+    one and anyio could no longer import; the gateway never started again."""
+    installed_versions(monkeypatch, {"typing-extensions": "4.16.0", "greenlet": "3.4.0", "anyio": "4.15.1"})
+    assert worker.needed() == ["playwright", "pyee"]
+    assert worker.needed(repair=True) == ["playwright", "pyee"]
+    installed_versions(monkeypatch, {**PINNED, "typing-extensions": "4.16.0", "greenlet": "3.4.0"})
+    assert worker.needed() == [] and worker.ready()
+
+
+def test_a_shared_package_that_is_absent_is_installed_at_its_pin(monkeypatch):
+    installed_versions(monkeypatch, {"typing-extensions": "4.16.0"})
+    assert worker.needed() == ["playwright", "pyee", "greenlet"]
+    assert not worker.ready()
+
+
+@pytest.mark.parametrize("greenlet", ["2.0.2", "4.0.0"])
+def test_an_incompatible_shared_package_is_a_conflict_not_a_replacement(monkeypatch, greenlet):
+    installed_versions(monkeypatch, {"typing-extensions": "4.16.0", "greenlet": greenlet})
+    assert worker.conflicts() == ["greenlet"]
+
+
+def test_only_the_selected_packages_reach_uv_each_with_its_hashes(tmp_path):
+    source = (worker.Path(worker.__file__).with_name("screen-requirements.txt")).read_text()
+    subset = worker.requirements_for(["playwright", "pyee"], source)
+    names = [line.split("==")[0] for line in subset.splitlines() if "==" in line and not line.startswith(" ")]
+    assert names == ["playwright", "pyee"]
+    assert subset.count("--hash=sha256:") >= 2 and "typing-extensions" not in subset and "greenlet" not in subset
+
+
+def test_a_conflict_stops_the_worker_before_any_change(running_worker, monkeypatch, capsys):
+    monkeypatch.setattr(worker, "conflicts", lambda: ["greenlet"])
+    assert worker.main() == 1
+    assert json.loads(capsys.readouterr().out) == {"error": "INSTALL_DEPENDENCY_CONFLICT"}
+    running_worker.install.assert_not_called()
+
+
+def test_the_plan_names_a_dependency_conflict_before_anything_is_installed(host, monkeypatch):
+    monkeypatch.setattr(worker, "conflicts", lambda: ["greenlet"])
+    plan = installer.python_plan()
+    assert plan["supported"] is False and plan["reason"] == "INSTALL_DEPENDENCY_CONFLICT"

@@ -167,6 +167,10 @@ _ADVICE = {
     "INSTALL_ACCOUNT_CONFLICT": "An account named flowly-screen exists on this server that Flowly did not create. "
                                 "Remove or rename it, then run `flowly screen install` again.",
     "INSTALL_HISTORY_FULL": "This server has too many installation records. Contact Flowly support.",
+    "INSTALL_DOWNLOAD_FAILED": "The browser could not be downloaded and checked. Check the server's internet "
+                               "connection, then run `flowly screen install` again.",
+    "INSTALL_DEPENDENCY_CONFLICT": "This agent uses a package version screens cannot use. Run `flowly update`, "
+                                   "then `flowly screen install` again.",
 }
 _REPAIR = "The installation did not finish. Run `flowly screen install` again to repair it."
 _WAIT_SECONDS = 30 * 60

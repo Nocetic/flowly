@@ -18,19 +18,72 @@ import time
 from pathlib import Path
 
 VERSIONS = {"greenlet": "3.5.6", "playwright": "1.58.0", "pyee": "13.0.1", "typing-extensions": "4.15.0"}
+# Only the screen uses these: installed (or upgraded) to their pins.
+OWN = ("playwright", "pyee")
+# The agent may already use these. Never replaced (seen live: a pinned
+# typing-extensions replaced a newer one and anyio could not import, so the
+# gateway never started again). Installed at the pin only when absent; the
+# range is what playwright and pyee declare. Lower bound inclusive, upper
+# bound exclusive (None: open).
+SHARED = {"greenlet": ((3, 1, 1), (4,)), "typing-extensions": ((0,), None)}
 ERRORS = {"INSTALL_BUSY", "INSTALL_STATE_INVALID", "INSTALL_PLAN_CHANGED", "INSTALL_RECOVERY_REQUIRED",
           "INSTALL_HISTORY_FULL", "OPERATION_CONFLICT", "INSTALL_PYTHON_FAILED", "INSTALL_TIMEOUT",
-          "INSTALL_VERIFICATION_FAILED", "INSTALL_VIRTUALENV_REQUIRED", "INVALID_PARAMS"}
+          "INSTALL_VERIFICATION_FAILED", "INSTALL_VIRTUALENV_REQUIRED", "INVALID_PARAMS",
+          "INSTALL_DEPENDENCY_CONFLICT"}
+
+
+def installed(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _release(version):
+    parts = []
+    for piece in re.split(r"[.+-]", version):
+        if not piece.isdigit():
+            break
+        parts.append(int(piece))
+    return tuple(parts)
+
+
+def compatible(name, version):
+    lower, upper = SHARED[name]
+    release = _release(version)
+    return release >= lower and (upper is None or release < upper)
+
+
+def conflicts():
+    """Shared packages the agent has at a version the screen cannot use."""
+    return [name for name in SHARED if installed(name) is not None and not compatible(name, installed(name))]
+
+
+def needed(repair=False):
+    """What to install: the screen's own packages unless already at their pins
+    (always, to repair), and a shared package only where the agent has none."""
+    return ([name for name in OWN if repair or installed(name) != VERSIONS[name]]
+            + [name for name in SHARED if installed(name) is None])
 
 
 def ready():
-    for name, version in VERSIONS.items():
-        try:
-            if importlib.metadata.version(name) != version:
-                return False
-        except importlib.metadata.PackageNotFoundError:
-            return False
-    return True
+    return (all(installed(name) == VERSIONS[name] for name in OWN)
+            and all(installed(name) is not None and compatible(name, installed(name)) for name in SHARED))
+
+
+def requirements_for(names, source):
+    """The hash-pinned blocks of screen-requirements.txt for these packages only."""
+    blocks, current = {}, None
+    for line in source.splitlines():
+        match = re.match(r"([A-Za-z0-9_.-]+)==", line)
+        if match:
+            current = match.group(1).lower()
+            blocks[current] = []
+        if current is not None and (match or line.startswith(" ")):
+            blocks[current].append(line)
+        elif not match:
+            current = None
+    return "".join("\n".join(blocks[name]) + "\n" for name in names)
 
 
 def state_root():
@@ -155,6 +208,8 @@ def main():
     raw = requirements.read_bytes()
     if len(raw) > 65536 or hashlib.sha256(raw).hexdigest() != digest:
         return fail("INSTALL_PLAN_CHANGED")
+    if conflicts():
+        return fail("INSTALL_DEPENDENCY_CONFLICT")
     root = state_root()
     private_directory(root, create=True)
     import fcntl
@@ -194,13 +249,20 @@ def main():
                  "phase": "installing", "error": None, "updatedAt": int(time.time()), "restartRequired": False}
         save(path, value)
         try:
-            if not repair and ready():
+            names = needed(repair)
+            if not names:
                 code = 0
             else:
                 # Packages change under the running agent: it must restart.
                 value["restartRequired"] = True
                 save(path, value)
-                code = install(uv, requirements, reinstall=True) if repair else install(uv, requirements)
+                subset = root / ("requirements-" + operation + ".txt")
+                subset.write_text(requirements_for(names, raw.decode()))
+                subset.chmod(0o600)
+                try:
+                    code = install(uv, subset, reinstall=True) if repair else install(uv, subset)
+                finally:
+                    subset.unlink(missing_ok=True)
             if code:
                 value.update(state="recovery_required", error="INSTALL_PYTHON_FAILED")
             else:

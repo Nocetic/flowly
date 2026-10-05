@@ -60,6 +60,9 @@ def python_plan() -> dict:
         reason = "INSTALL_VIRTUALENV_REQUIRED"
     elif not uv:
         reason = "INSTALL_UV_REQUIRED"
+    elif worker.conflicts():
+        # The agent uses a version the screen cannot: never replaced.
+        reason = "INSTALL_DEPENDENCY_CONFLICT"
     try:
         source, requirements, digest = _recipe()
         implementation = hashlib.sha256(source.read_bytes()).hexdigest()
