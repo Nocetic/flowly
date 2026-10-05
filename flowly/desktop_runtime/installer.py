@@ -17,13 +17,18 @@ import sys
 from pathlib import Path
 
 from flowly.desktop_runtime.authority import ScreenError
-from flowly.desktop_runtime.install_payload import PACKAGES, WORKER
+from flowly.desktop_runtime.install_payload import WORKER
+from flowly.desktop_runtime.install_recipe import os_release, recipe_id, screen_recipe
 
 ROOT = Path("/var/lib/flowly-screen-installer")
 _ERRORS = {"INSTALL_BUSY", "INSTALL_STATE_INVALID", "INSTALL_PRIVILEGE_REQUIRED", "INSTALL_PLAN_CHANGED",
            "INSTALL_RECOVERY_REQUIRED", "INSTALL_HISTORY_FULL", "OPERATION_CONFLICT", "INVALID_PARAMS",
            "INSTALL_INDEX_FAILED", "INSTALL_PACKAGES_FAILED", "INSTALL_TIMEOUT", "INSTALL_HOST_PACKAGES_BROKEN",
-           "INSTALL_ACCOUNT_CONFLICT"}
+           "INSTALL_ACCOUNT_CONFLICT", "INSTALL_DOWNLOAD_FAILED", "INSTALL_BROWSER_FAILED"}
+# Package index, packages, the pinned browser's download and a repair, bounded
+# by each command's own timeout; jobs and clients wait longer than this.
+WORKER_SECONDS = 1800
+_exists = os.path.exists  # the recipe's fixed path probes
 
 
 def _sudo_available() -> bool:
@@ -32,24 +37,19 @@ def _sudo_available() -> bool:
 
 def install_plan() -> dict:
     """No subprocess, sudo probe, directory creation or package-manager write."""
-    release = {}
-    if sys.platform == "linux":
-        try:
-            release = platform.freedesktop_os_release()
-        except OSError:
-            pass
     architecture = platform.machine()
-    supported = (sys.platform == "linux" and release.get("ID") == "debian"
-                 and release.get("VERSION_ID") == "12" and architecture in {"x86_64", "aarch64"})
-    tools = all(Path(path).is_file() and os.access(path, os.X_OK)
-                for path in ("/usr/bin/python3", "/usr/bin/apt-get", "/usr/bin/dpkg")) if supported else False
+    recipe = screen_recipe(os_release(), architecture, _exists) if sys.platform == "linux" else None
+    supported = recipe is not None
+    tools = supported and Path("/usr/bin/python3").is_file() and os.access("/usr/bin/python3", os.X_OK)
     reason = "INSTALL_UNSUPPORTED_HOST" if not supported else "INSTALL_TOOLS_MISSING" if not tools else None
-    body = {"installVersion": 1, "distribution": "debian-12" if supported else None,
+    body = {"installVersion": 1, "distribution": recipe["distribution"] if supported else None,
             "architecture": architecture if architecture in {"x86_64", "aarch64"} else None,
-            "packages": list(PACKAGES) if supported else [], "supported": reason is None,
-            "reason": reason, "scope": "system-packages", "requiresRoot": True,
+            "packages": list(recipe["packages"]) if supported else [],
+            "browser": dict(recipe["browser"]) if supported else None,
+            "recipeId": recipe_id(recipe) if supported else None,
+            "supported": reason is None, "reason": reason, "scope": "system-packages", "requiresRoot": True,
             "pythonExtra": "screen", "runtimeAccountRequired": bool(hasattr(os, "geteuid") and os.geteuid() == 0),
-            "sudoAvailable": bool(supported and _sudo_available()), "maximumSeconds": 850}
+            "sudoAvailable": bool(supported and _sudo_available()), "maximumSeconds": WORKER_SECONDS}
     # Changes to any executable part require a freshly reviewed plan. No paths
     # or credentials are in this stable public fingerprint.
     digest = hashlib.sha256((json.dumps(body, sort_keys=True) + WORKER).encode()).hexdigest()
@@ -141,7 +141,7 @@ def install_system(plan_id: str, operation: str, *, password: str | None = None)
                 raise ScreenError("INVALID_PARAMS")
         except UnicodeError:
             raise ScreenError("INVALID_PARAMS") from None
-    command = ["/usr/bin/python3", "-I", "-c", WORKER, operation, plan_id, plan["architecture"]]
+    command = ["/usr/bin/python3", "-I", "-c", WORKER, operation, plan_id, plan["recipeId"]]
     if os.geteuid() != 0:
         if not _sudo_available():
             raise ScreenError("INSTALL_PRIVILEGE_REQUIRED")
@@ -152,7 +152,7 @@ def install_system(plan_id: str, operation: str, *, password: str | None = None)
     try:
         child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                  env=env, cwd="/", start_new_session=True, close_fds=True)
-        output, _ = child.communicate(input=(password + "\n").encode() if password is not None else b"", timeout=850)
+        output, _ = child.communicate(input=(password + "\n").encode() if password is not None else b"", timeout=WORKER_SECONDS)
     except subprocess.TimeoutExpired:
         # Do not launch again or assume apt was cancelled: the privileged worker
         # has its own package timeouts and may still publish a terminal receipt.

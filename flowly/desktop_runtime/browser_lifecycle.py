@@ -63,6 +63,12 @@ try:
                 # exits; no client-provided PID is ever signalled.
                 child = subprocess.Popen([
                     browser, "--user-data-dir=" + profile,
+                    # One window class for every build: the dock finds the
+                    # running browser by it.
+                    "--class=chromium",
+                    # The pinned Chrome for Testing build would otherwise show
+                    # a "for automated testing" bar to the person in control.
+                    *(["--test-type"] if browser.startswith("/opt/flowly-screen/chromium/") else []),
                     "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=" + str(debugging_port),
                     "--no-first-run", "--no-default-browser-check",
                     # Bounded HTTP cache; cookies and logins are not cache.

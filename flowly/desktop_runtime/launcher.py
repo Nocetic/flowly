@@ -28,7 +28,8 @@ from filelock import FileLock
 from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError
 from flowly.desktop_runtime.resources import resource_report
 
-REQUIRED_PROGRAMS = ("Xvnc", "dbus-run-session", "chromium", "python3", "bash",
+# The browser is resolved separately (install_recipe.screen_browser).
+REQUIRED_PROGRAMS = ("Xvnc", "dbus-run-session", "python3", "bash",
                      "xfwm4", "xfsettingsd", "xfdesktop", "xfce4-panel", "xfce4-terminal",
                      "xfce4-settings-manager", "xfconf-query", "xdotool", "xprop")
 _UNPINNED = object()
@@ -158,6 +159,10 @@ class ScreenRuntime:
         except ScreenError as exc:
             return dict(supported=False, reason=exc.code, missing=[])
         missing = [program for program in REQUIRED_PROGRAMS if shutil.which(program) is None]
+        from flowly.desktop_runtime.install_recipe import screen_browser
+
+        if screen_browser() is None:
+            missing.append("chromium")
         if importlib.util.find_spec("playwright") is None:
             missing.append("playwright")
         if missing:

@@ -9,10 +9,14 @@ from unittest.mock import Mock
 import pytest
 
 from flowly.desktop_runtime.install_payload import WORKER
+from flowly.desktop_runtime.install_recipe import recipe_id, screen_recipe
 
 fcntl = pytest.importorskip("fcntl")
 
 OPERATION, PLAN = "1" * 32, "a" * 64
+APT = {"/usr/bin/apt-get", "/usr/bin/dpkg"}
+RECIPE = screen_recipe({"ID": "debian", "VERSION_ID": "12"}, "aarch64", APT.__contains__)
+REVIEWED = recipe_id(RECIPE)
 
 
 @pytest.fixture
@@ -23,9 +27,10 @@ def worker(tmp_path, monkeypatch):
     worker.ROOT = tmp_path / "receipts"
     monkeypatch.setattr(worker.os, "geteuid", lambda: 0)
     monkeypatch.setenv("SUDO_UID", "1000")
-    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, PLAN, "aarch64"])
+    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, PLAN, REVIEWED])
     monkeypatch.setattr(worker.platform, "machine", lambda: "aarch64")
-    monkeypatch.setattr(worker.platform, "freedesktop_os_release", lambda: {"ID": "debian", "VERSION_ID": "12"})
+    worker.os_release = lambda: {"ID": "debian", "VERSION_ID": "12"}
+    worker.PROBE = APT.__contains__
     # Test files are owned by the developer; emulate only their kernel UID.
     fstat, lstat = os.fstat, worker.Path.lstat
     def root_info(info):
@@ -47,7 +52,7 @@ def test_success_is_durable_idempotent_and_has_fixed_argv(worker, capsys):
     audit, update, install = worker.command.call_args_list
     assert audit.args == (["/usr/bin/dpkg", "--audit"], 30)
     assert update.args[0][-1] == "update" and update.args[1] == 180
-    assert install.args[0][-len(worker.PACKAGES):] == list(worker.PACKAGES)
+    assert install.args[0][-len(RECIPE["packages"]):] == RECIPE["packages"]
     assert "--no-remove" in install.args[0] and install.args[1] == 600
     assert worker.main() == 0
     assert json.loads(capsys.readouterr().out) == result
@@ -104,14 +109,14 @@ def test_an_interrupted_operation_is_reported_never_replayed_and_repaired_by_a_n
     worker.command.assert_not_called()
     # A new operation, from any account, repairs before running the same recipe.
     monkeypatch.setenv("SUDO_UID", "1001")
-    monkeypatch.setattr(worker.sys, "argv", ["worker", "2" * 32, PLAN, "aarch64"])
+    monkeypatch.setattr(worker.sys, "argv", ["worker", "2" * 32, PLAN, REVIEWED])
     assert worker.main() == 0
     assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
     calls = [call.args for call in worker.command.call_args_list]
     assert calls[0] == CONFIGURE and calls[1][0] == QUERY and calls[2] == CONFIGURE
     assert calls[3][0][-5:] == ["install", "-f", "-y", "--no-install-recommends", "--no-remove"] and calls[3][1] == 600
     assert calls[4] == (["/usr/bin/dpkg", "--audit"], 30)
-    assert calls[-1][0][-len(worker.PACKAGES):] == list(worker.PACKAGES)
+    assert calls[-1][0][-len(RECIPE["packages"]):] == RECIPE["packages"]
     # History stays as it happened.
     assert worker.read(worker.ROOT / ("1000-" + OPERATION + ".json"))["state"] == "recovery_required"
 
@@ -183,7 +188,7 @@ def test_symlink_lock_and_corrupted_receipt_fail_closed(worker):
 def test_changed_plan_cannot_reuse_operation(worker, capsys, monkeypatch):
     assert worker.main() == 0
     capsys.readouterr()
-    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, "b" * 64, "aarch64"])
+    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, "b" * 64, REVIEWED])
     assert worker.main() == 1
     assert json.loads(capsys.readouterr().out) == {"error": "OPERATION_CONFLICT"}
     assert worker.command.call_count == 3
@@ -263,3 +268,49 @@ def test_an_interrupted_account_creation_still_needs_repair(worker, capsys, monk
     worker.provision_runtime_account = Mock(side_effect=ValueError("INSTALL_RECOVERY_REQUIRED"))
     assert worker.main() == 1
     assert json.loads(capsys.readouterr().out)["state"] == "recovery_required"
+
+
+UBUNTU_PROBES = APT | {"/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "/usr/sbin/apparmor_parser"}
+UBUNTU = screen_recipe({"ID": "ubuntu", "VERSION_ID": "24.04"}, "x86_64", UBUNTU_PROBES.__contains__)
+
+
+@pytest.fixture
+def ubuntu(worker, monkeypatch):
+    worker.os_release = lambda: {"ID": "ubuntu", "VERSION_ID": "24.04"}
+    worker.PROBE = UBUNTU_PROBES.__contains__
+    monkeypatch.setattr(worker.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, PLAN, recipe_id(UBUNTU)])
+    order = []
+    worker.command.side_effect = lambda args, *rest, **kw: (order.append(args[-1]), (0, b""))[1]
+    worker.install_pinned_browser = Mock(side_effect=lambda machine: order.append("browser:" + machine))
+    worker.install_apparmor_profile = Mock(side_effect=lambda: order.append("apparmor"))
+    worker.provision_runtime_account = Mock(side_effect=lambda: order.append("account"))
+    worker.order = order
+    return worker
+
+
+def test_ubuntu_installs_its_packages_then_the_pinned_browser_and_its_profile(ubuntu, capsys, monkeypatch):
+    monkeypatch.setenv("SUDO_UID", "0")
+    assert ubuntu.main() == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
+    install = ubuntu.command.call_args_list[2].args[0]
+    assert install[-len(UBUNTU["packages"]):] == UBUNTU["packages"] and "chromium" not in install
+    assert ubuntu.order[-3:] == ["browser:x86_64", "apparmor", "account"]
+
+
+@pytest.mark.parametrize("code", ["INSTALL_DOWNLOAD_FAILED", "INSTALL_BROWSER_FAILED"])
+def test_a_browser_that_cannot_be_verified_is_a_plain_failure(ubuntu, capsys, code):
+    ubuntu.install_pinned_browser.side_effect = ubuntu.BrowserInstallError(code)
+    assert ubuntu.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    # Verified or nothing: no half-published browser, nothing to repair.
+    assert result["state"] == "failed" and result["error"] == code
+    ubuntu.install_apparmor_profile.assert_not_called()
+
+
+def test_a_host_that_changed_since_review_is_refused_before_anything_runs(ubuntu, capsys):
+    ubuntu.PROBE = APT.__contains__  # e.g. the kernel's namespace restriction is gone
+    assert ubuntu.main() == 1
+    assert json.loads(capsys.readouterr().out) == {"error": "INSTALL_PLAN_CHANGED"}
+    ubuntu.command.assert_not_called()
+    assert not list(ubuntu.ROOT.glob("*.json"))

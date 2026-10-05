@@ -197,7 +197,7 @@ def test_unsupported_doctor_never_reads_linux_resources(tmp_path, monkeypatch):
 def test_capabilities_require_optional_browser_dependency(monkeypatch):
     monkeypatch.setattr(launcher.sys, "platform", "linux")
     monkeypatch.setattr(launcher.os, "pidfd_open", lambda pid: 1, raising=False)
-    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(launcher.shutil, "which", lambda name, **kw: "/usr/bin/" + name)
     monkeypatch.setattr(launcher.importlib.util, "find_spec", lambda name: None)
     assert ScreenRuntime.capabilities() == {"supported": False, "reason": "DEPENDENCIES_MISSING", "missing": ["playwright"]}
 

@@ -10,7 +10,16 @@ import pytest
 
 from flowly.desktop_runtime import installer
 from flowly.desktop_runtime.authority import ScreenError
-from flowly.desktop_runtime.install_payload import PACKAGES, WORKER
+from flowly.desktop_runtime.install_payload import WORKER
+from flowly.desktop_runtime.install_recipe import (
+    BROWSER_SOURCE,
+    RECIPE_SOURCE,
+    recipe_id,
+    screen_recipe,
+)
+
+APT = {"/usr/bin/apt-get", "/usr/bin/dpkg"}
+DEBIAN = screen_recipe({"ID": "debian", "VERSION_ID": "12"}, "aarch64", APT.__contains__)
 
 OPERATION = "1" * 32
 
@@ -18,8 +27,9 @@ OPERATION = "1" * 32
 @pytest.fixture
 def host(monkeypatch):
     monkeypatch.setattr(installer.sys, "platform", "linux")
-    monkeypatch.setattr(installer.platform, "freedesktop_os_release", lambda: {"ID": "debian", "VERSION_ID": "12"})
+    monkeypatch.setattr(installer, "os_release", lambda: {"ID": "debian", "VERSION_ID": "12"})
     monkeypatch.setattr(installer.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(installer, "_exists", APT.__contains__)
     monkeypatch.setattr(installer.Path, "is_file", lambda path: True)
     monkeypatch.setattr(installer.os, "access", lambda *args: True)
     monkeypatch.setattr(installer.os, "geteuid", lambda: 1000, raising=False)
@@ -35,20 +45,31 @@ def host(monkeypatch):
 
 def test_plan_is_readonly_and_fingerprints_privileged_source(host, monkeypatch):
     assert host.plan["scope"] == "system-packages"
-    assert host.plan["packages"] == list(PACKAGES)
+    assert host.plan["packages"] == DEBIAN["packages"]
+    assert host.plan["distribution"] == "debian-12" and host.plan["recipeId"] == recipe_id(DEBIAN)
     assert installer.install_plan() == host.plan
     host.spawn.assert_not_called()
     monkeypatch.setattr(installer, "WORKER", WORKER + "\n# changed")
     assert installer.install_plan()["planId"] != host.plan["planId"]
 
 
-@pytest.mark.parametrize("distro,version,arch", [("ubuntu", "24.04", "x86_64"), ("debian", "13", "aarch64"), ("debian", "12", "riscv64")])
-def test_unverified_distributions_do_not_inherit_debian_recipe(host, monkeypatch, distro, version, arch):
-    monkeypatch.setattr(installer.platform, "freedesktop_os_release", lambda: {"ID": distro, "VERSION_ID": version})
+@pytest.mark.parametrize("distro,version,arch", [("fedora", "42", "x86_64"), ("debian", "11", "aarch64"),
+                                                  ("debian", "12", "riscv64"), ("ubuntu", "20.04", "x86_64")])
+def test_hosts_without_a_reviewed_recipe_are_not_offered_one(host, monkeypatch, distro, version, arch):
+    monkeypatch.setattr(installer, "os_release", lambda: {"ID": distro, "VERSION_ID": version})
     monkeypatch.setattr(installer.platform, "machine", lambda: arch)
     plan = installer.install_plan()
     assert not plan["supported"] and plan["reason"] == "INSTALL_UNSUPPORTED_HOST"
-    assert plan["packages"] == []
+    assert plan["packages"] == [] and plan["browser"] is None and plan["recipeId"] is None
+
+
+def test_ubuntu_is_offered_its_own_recipe_with_the_pinned_browser(host, monkeypatch):
+    monkeypatch.setattr(installer, "os_release", lambda: {"ID": "ubuntu", "VERSION_ID": "24.04"})
+    monkeypatch.setattr(installer.platform, "machine", lambda: "x86_64")
+    plan = installer.install_plan()
+    assert plan["supported"] and plan["distribution"] == "ubuntu-24.04"
+    assert plan["browser"]["source"] == "pinned" and "chromium" not in plan["packages"]
+    assert plan["planId"] != host.plan["planId"]
 
 
 def test_plan_change_never_starts_privileged_process(host):
@@ -67,14 +88,14 @@ def test_password_only_uses_stdin_and_does_not_enter_command_or_environment(host
     assert "generated-test-password" not in repr(host.spawn.call_args)
     assert "must-not-inherit" not in repr(kwargs)
     assert kwargs["stderr"] == subprocess.DEVNULL and kwargs["start_new_session"]
-    host.child.communicate.assert_called_once_with(input=b"generated-test-password\n", timeout=850)
+    host.child.communicate.assert_called_once_with(input=b"generated-test-password\n", timeout=installer.WORKER_SECONDS)
     assert host.child.stdin.closed and host.child.stdout.closed
 
 
 def test_passwordless_execution_never_prompts(host):
     installer.install_system(host.plan["planId"], OPERATION)
     assert host.spawn.call_args.args[0][:3] == ["/usr/bin/sudo", "-n", "--"]
-    host.child.communicate.assert_called_once_with(input=b"", timeout=850)
+    host.child.communicate.assert_called_once_with(input=b"", timeout=installer.WORKER_SECONDS)
 
 
 def test_root_does_not_call_sudo_but_still_requires_runtime_account(host, monkeypatch):
@@ -120,13 +141,14 @@ def test_private_diagnostics_never_escape(host, output, code):
         installer.install_system(host.plan["planId"], OPERATION)
 
 
-def test_worker_payload_has_same_fixed_packages_as_plan():
-    # Compile the standalone worker without executing its privileged entrypoint.
-    import ast
-    parsed = ast.parse(WORKER)
-    packages = next(node.value for node in parsed.body if isinstance(node, ast.Assign)
-                    and any(isinstance(t, ast.Name) and t.id == "PACKAGES" for t in node.targets))
-    assert ast.literal_eval(packages) == PACKAGES
+def test_the_worker_recomputes_exactly_the_reviewed_recipe(host):
+    # The privileged worker carries the same recipe source verbatim and is
+    # given only the reviewed recipe's id; it installs nothing else.
+    assert RECIPE_SOURCE in WORKER and BROWSER_SOURCE in WORKER
+    command = None
+    installer.install_system(host.plan["planId"], OPERATION)
+    command = host.spawn.call_args.args[0]
+    assert command[-3:] == [OPERATION, host.plan["planId"], recipe_id(DEBIAN)]
     compile(WORKER, "<screen-install-worker>", "exec")
 
 

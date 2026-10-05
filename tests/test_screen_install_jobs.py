@@ -261,7 +261,7 @@ def test_observation_deadline_is_not_permission_to_replay(fixture, monkeypatch):
     try:
         service.submit(PLAN, OP)
         now = time.time()
-        monkeypatch.setattr(jobs.time, "time", lambda: now + 1261)
+        monkeypatch.setattr(jobs.time, "time", lambda: now + jobs.JOB_SECONDS + 1)
         assert service.status(OP)["state"] == "recovery_required"
         assert service.submit(PLAN, OP)["state"] == "recovery_required"
         executor.submit.assert_called_once()
@@ -485,7 +485,7 @@ def test_an_overdue_job_still_holding_the_environment_excludes_a_repair(fixture,
     assert entered.wait(3)
     now = time.time()
     try:
-        monkeypatch.setattr(jobs.time, "time", lambda: now + 1261)
+        monkeypatch.setattr(jobs.time, "time", lambda: now + jobs.JOB_SECONDS + 1)
         assert service.status(OP)["state"] == "recovery_required"
         with pytest.raises(ScreenError, match="INSTALL_BUSY"):
             service.submit(PLAN, "2" * 32)

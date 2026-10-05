@@ -4,18 +4,13 @@ No package names, command fragments, paths or environment come from the caller.
 Stdlib only: the agent's Python environment is never imported with sudo.
 """
 
+from flowly.desktop_runtime.install_recipe import BROWSER_SOURCE, RECIPE_SOURCE
 from flowly.desktop_runtime.runtime_account_payload import PROVISION_SOURCE
 
-PACKAGES = (
-    "tigervnc-standalone-server", "xauth", "dbus-x11",
-    "chromium", "chromium-sandbox", "xdotool", "x11-utils", "fonts-dejavu-core",
-    "xfwm4", "xfdesktop4", "xfce4-panel", "xfce4-settings", "xfce4-terminal", "xfconf",
-    "adwaita-icon-theme", "thunar", "python3", "bash", "nftables",
-)
-
 # Keep this executable standalone: the elevated interpreter must not import
-# user-writable Core modules. The source itself is part of the reviewed plan.
-WORKER = PROVISION_SOURCE + r'''
+# user-writable Core modules. The source itself is part of the reviewed plan;
+# the recipe it installs is recomputed here and must match the reviewed one.
+WORKER = PROVISION_SOURCE + RECIPE_SOURCE + BROWSER_SOURCE + r'''
 import fcntl
 import json
 import os
@@ -29,11 +24,8 @@ import tempfile
 import time
 from pathlib import Path
 
-PACKAGES = ("tigervnc-standalone-server", "xauth", "dbus-x11",
-            "chromium", "chromium-sandbox", "xdotool", "x11-utils", "fonts-dejavu-core",
-            "xfwm4", "xfdesktop4", "xfce4-panel", "xfce4-settings", "xfce4-terminal", "xfconf",
-            "adwaita-icon-theme", "thunar", "python3", "bash", "nftables")
 ROOT = Path("/var/lib/flowly-screen-installer")
+PROBE = os.path.exists
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LANG": "C.UTF-8",
        "LC_ALL": "C.UTF-8", "DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "l"}
 APT = ["/usr/bin/apt-get", "-o", "DPkg::Lock::Timeout=20", "-o", "Acquire::Retries=1",
@@ -91,7 +83,8 @@ def read(path):
                 or value["state"] not in ("running", "succeeded", "failed", "recovery_required")
                 or value["phase"] not in ("checking", "updating", "installing", "complete")
                 or value["error"] not in (None, "INSTALL_RECOVERY_REQUIRED", "INSTALL_INDEX_FAILED", "INSTALL_PACKAGES_FAILED",
-                                          "INSTALL_TIMEOUT", "INSTALL_HOST_PACKAGES_BROKEN", "INSTALL_ACCOUNT_CONFLICT")
+                                          "INSTALL_TIMEOUT", "INSTALL_HOST_PACKAGES_BROKEN", "INSTALL_ACCOUNT_CONFLICT",
+                                          "INSTALL_DOWNLOAD_FAILED", "INSTALL_BROWSER_FAILED")
                 or (value["state"] in ("failed", "recovery_required")) != (value["error"] is not None)
                 or (value["state"] == "succeeded") != (value["phase"] == "complete")
                 or type(value["updatedAt"]) is not int or not 0 <= value["updatedAt"] < 2**53):
@@ -189,11 +182,13 @@ def main():
     # Gateway/service parents may ignore SIGCHLD. Package exit codes and the
     # unreaped-leader timeout fence require ordinary wait/reap semantics.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-    operation, plan, architecture = sys.argv[1:]
-    if not re.fullmatch(r"[a-f0-9]{32}", operation) or not re.fullmatch(r"[a-f0-9]{64}", plan):
+    operation, plan, reviewed = sys.argv[1:]
+    if (not re.fullmatch(r"[a-f0-9]{32}", operation) or not re.fullmatch(r"[a-f0-9]{64}", plan)
+            or not re.fullmatch(r"[a-f0-9]{64}", reviewed)):
         return fail("INVALID_PARAMS")
-    release = platform.freedesktop_os_release()
-    if release.get("ID") != "debian" or release.get("VERSION_ID") != "12" or platform.machine() != architecture:
+    # This host's recipe, from this host alone, must be the one reviewed.
+    recipe = screen_recipe(os_release(), platform.machine(), PROBE)
+    if recipe is None or recipe_id(recipe) != reviewed:
         return fail("INSTALL_PLAN_CHANGED")
     uid = os.environ.get("SUDO_UID", "0")
     if not re.fullmatch(r"[0-9]{1,10}", uid):
@@ -252,7 +247,8 @@ def main():
                 else:
                     value.update(phase="installing", updatedAt=int(time.time()))
                     save(path, value)
-                    code, _ = command([*APT, "install", "-y", "--no-install-recommends", "--no-remove", "--no-upgrade", *PACKAGES], 600)
+                    code, _ = command([*APT, "install", "-y", "--no-install-recommends", "--no-remove", "--no-upgrade",
+                                       *recipe["packages"]], 600)
                     if code:
                         value.update(state="recovery_required", error="INSTALL_PACKAGES_FAILED")
                     else:
@@ -260,8 +256,15 @@ def main():
                         # account. This fixed step is part of the reviewed worker
                         # fingerprint and runs before its success receipt.
                         try:
+                            if recipe["browser"]["source"] == "pinned":
+                                install_pinned_browser(recipe["architecture"])
+                            if recipe["apparmor"]:
+                                install_apparmor_profile()
                             if uid == "0":
                                 provision_runtime_account()
+                        except BrowserInstallError as exc:
+                            # Verified or nothing: no half-published browser.
+                            value.update(state="failed", error=exc.code)
                         except ValueError as exc:
                             # Someone else's account under our name: nothing of
                             # ours is half-done, and it is not ours to change.

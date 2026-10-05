@@ -247,7 +247,11 @@ def run(directory: Path, generation: str) -> None:
                 if write_fd >= 0:
                     os.close(write_fd)
             browser_profile = application.browser if application else private_directory(directory / "browser")
-            browser_command = application_command(["chromium"], system=application is not None)[0]
+            from flowly.desktop_runtime.install_recipe import screen_browser
+
+            browser_command = screen_browser()
+            if browser_command is None:
+                raise ScreenError("DEPENDENCIES_MISSING")
             if not application_check(["python3", "-I", "-c", DESKTOP_DEFAULTS_SOURCE,
                                       browser_command, str(browser_profile)], env):
                 raise ScreenError("RUNTIME_START_FAILED")

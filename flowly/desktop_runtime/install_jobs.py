@@ -30,9 +30,12 @@ from flowly.desktop_runtime.python_install_worker import private_directory, stat
 from flowly.desktop_runtime.python_installer import install_python
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="screen-install")
+# Covers the system worker (installer.WORKER_SECONDS) plus the Python step.
+JOB_SECONDS = 2400
 _SLOTS = threading.BoundedSemaphore(1)
 _ERRORS = {"INSTALL_BUSY", "INSTALL_STATE_INVALID", "INSTALL_PRIVILEGE_REQUIRED", "INSTALL_PLAN_CHANGED", "INSTALL_RESTART_REQUIRED",
            "INSTALL_RECOVERY_REQUIRED", "INSTALL_HISTORY_FULL", "INSTALL_INDEX_FAILED", "INSTALL_PACKAGES_FAILED", "INSTALL_HOST_PACKAGES_BROKEN", "INSTALL_ACCOUNT_CONFLICT",
+           "INSTALL_DOWNLOAD_FAILED", "INSTALL_BROWSER_FAILED",
            "INSTALL_PYTHON_FAILED", "INSTALL_VERIFICATION_FAILED", "INSTALL_TIMEOUT", "INSTALL_UV_REQUIRED",
            "INSTALL_VIRTUALENV_REQUIRED", "INSTALL_UNSUPPORTED_HOST", "INSTALL_TOOLS_MISSING",
            "INSTALL_MANAGED_BUILD_REQUIRED", "INSTALL_RUNTIME_ACCOUNT_REQUIRED",
@@ -347,7 +350,7 @@ class ScreenInstallJobs:
                     raise ScreenError("INSTALL_BUSY")
                 record = {"installJobVersion": 1, **self.identity, "operationId": operation, "planId": plan_id,
                           "state": "pending", "phase": "pending", "completedSteps": [], "error": None,
-                          "restartRequired": False, "restartBoundary": None, "owner": owner, "deadline": int(time.time()) + 1260}
+                          "restartRequired": False, "restartBoundary": None, "owner": owner, "deadline": int(time.time()) + JOB_SECONDS}
                 db.execute("INSERT INTO operations (id, value) VALUES (?, ?)", (operation, json.dumps(_validate(record))))
             try:
                 _EXECUTOR.submit(self._run, record, plan, password, reservation, repairing_agent_environment)
