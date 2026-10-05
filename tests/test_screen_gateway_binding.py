@@ -19,6 +19,12 @@ from flowly.desktop_runtime.host_screen_run import (
 from flowly.gateway.server import _BROWSER_RUN_BINDING, GatewayServer
 
 
+@pytest.fixture(autouse=True)
+def _profile_screens_run_on_linux(monkeypatch):
+    """Routing is Linux-only; the screen here is a fake, so pin the platform."""
+    monkeypatch.setattr("flowly.desktop_runtime.host_screen_run.sys.platform", "linux")
+
+
 class Socket:
     closed = False
 

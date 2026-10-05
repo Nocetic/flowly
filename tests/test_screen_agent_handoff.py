@@ -14,6 +14,12 @@ from flowly.desktop_runtime.host_screen_run import host_screen_run_scope
 from flowly.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from tests.test_screen_gateway_binding import screen_gateway as gateway_fixture
 
+
+@pytest.fixture(autouse=True)
+def _profile_screens_run_on_linux(monkeypatch):
+    """Routing is Linux-only; the screen here is a fake, so pin the platform."""
+    monkeypatch.setattr("flowly.desktop_runtime.host_screen_run.sys.platform", "linux")
+
 screen_gateway = gateway_fixture
 
 

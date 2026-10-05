@@ -1,6 +1,7 @@
 """An agent starts its installed screen through the same durable lifecycle as the panel."""
 
 import asyncio
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -12,6 +13,10 @@ from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.host_screen_run import start_profile_screen
 from flowly.desktop_runtime.lifecycle import ScreenLifecycle
 from flowly.gateway.display import IDLE_STOP_SECONDS
+
+
+# The real durable lifecycle identifies its worker process through /proc.
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity (/proc)")
 
 IDENTITY = {"hostId": "host", "profileId": "default", "botId": "bot"}
 

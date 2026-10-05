@@ -9,6 +9,12 @@ from flowly.profile_host import ProfileHost
 from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
 
 
+@pytest.fixture(autouse=True)
+def _profile_screens_run_on_linux(monkeypatch):
+    """Routing is Linux-only; the screen here is a fake, so pin the platform."""
+    monkeypatch.setattr("flowly.desktop_runtime.host_screen_run.sys.platform", "linux")
+
+
 def grant(host_id="host", profile="writer", bot_id="bot"):
     return {"providerId": "host-desktop-browser", "hostId": host_id,
             "profileId": profile, "botId": bot_id, "screenId": "browser", "generation": "generation"}
