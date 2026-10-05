@@ -115,7 +115,7 @@ def test_invalid_password_never_creates_receipt(fixture, password):
     assert not service.root.exists()
 
 
-def test_partial_python_failure_blocks_new_installations_and_hides_details(fixture):
+def test_partial_python_failure_is_never_replayed_and_hides_details(fixture):
     service, _ = fixture
     jobs.install_python.side_effect = RuntimeError("private token and path")
     service.submit(PLAN, OP)
@@ -123,10 +123,50 @@ def test_partial_python_failure_blocks_new_installations_and_hides_details(fixtu
     assert result["state"] == "recovery_required"
     assert result["phase"] == "python" and result["completedSteps"] == ["system"]
     assert result["restartRequired"] and "private" not in str(result)
+    # The same operation reports what happened; it never runs again.
     assert service.submit(PLAN, OP) == result
-    with pytest.raises(ScreenError, match="INSTALL_BUSY"):
-        service.submit(PLAN, "2" * 32)
     jobs.install_python.assert_called_once()
+    with pytest.raises(ScreenError, match="INSTALL_RECOVERY_REQUIRED"):
+        jobs.assert_environment_installation_idle()
+
+
+def test_a_new_operation_repairs_an_uncertain_python_step_and_requires_a_restart(fixture, monkeypatch):
+    service, _ = fixture
+    jobs.install_python.side_effect = RuntimeError("interrupted")
+    service.submit(PLAN, OP)
+    assert finished(service)["state"] == "recovery_required"
+    # The repair finds nothing left to install, yet modules may have changed
+    # under the running process: it must still be restarted.
+    jobs.install_python.side_effect = None
+    jobs.install_python.return_value = {"state": "succeeded", "error": None, "restartRequired": False}
+    service.submit(PLAN, "2" * 32)
+    repaired = finished(service, "2" * 32)
+    assert repaired["state"] == "succeeded" and repaired["restartRequired"] is True
+    with pytest.raises(ScreenError, match="INSTALL_RESTART_REQUIRED"):
+        jobs.assert_environment_installation_idle()
+    monkeypatch.setattr(jobs, "process_identity", lambda _: {"pid": 43, "start": "101", "boot": "boot"})
+    jobs.assert_environment_installation_idle()
+    # History is kept as it happened.
+    assert service.status(OP)["state"] == "recovery_required"
+
+
+@pytest.mark.parametrize("receipt", [
+    {"state": "recovery_required", "error": "INSTALL_PACKAGES_FAILED"},
+    {"state": "failed", "error": "INSTALL_INDEX_FAILED"},
+])
+def test_system_package_trouble_never_stops_agent_turns(fixture, receipt):
+    service, _ = fixture
+    jobs.install_system.return_value = receipt
+    service.submit(PLAN, OP)
+    result = finished(service)
+    # A worker that changed nothing reports a plain failure; anything uncertain needs repair.
+    assert result["state"] == ("failed" if receipt["state"] == "failed" else "recovery_required")
+    assert result["error"] == receipt["error"] and result["phase"] == "system"
+    jobs.install_python.assert_not_called()
+    jobs.assert_environment_installation_idle()  # the agent's own environment was not touched
+    jobs.install_system.return_value = {"state": "succeeded", "error": None}
+    service.submit(PLAN, "2" * 32)
+    assert finished(service, "2" * 32)["state"] == "succeeded"
 
 
 def test_identity_changes_between_steps_stop_before_python(fixture):
@@ -147,9 +187,9 @@ def test_lost_or_expired_owner_never_replays(fixture, monkeypatch):
         monkeypatch.setattr(jobs, "is_alive", lambda _: False)
         assert service.status(OP)["state"] == "recovery_required"
         assert service.submit(PLAN, OP)["state"] == "recovery_required"
-        with pytest.raises(ScreenError, match="INSTALL_BUSY"):
-            service.submit(PLAN, "2" * 32)
         jobs.install_system.assert_not_called()
+        # A lost job that never reached the agent's environment does not stop its turns.
+        jobs.assert_environment_installation_idle()
     finally:
         # Execute the intercepted worker only to release its accepted slot.
         function, *args = executor.submit.call_args.args
@@ -193,13 +233,10 @@ def test_privilege_errors_are_retryable_only_before_worker_acceptance(fixture, m
     result = finished(service)
     assert result["state"] == ("recovery_required" if accepted_receipt else "failed")
     jobs.install_python.assert_not_called()
-    if accepted_receipt:
-        with pytest.raises(ScreenError, match="INSTALL_BUSY"):
-            service.submit(PLAN, "2" * 32)
-    else:
-        jobs.install_system.side_effect = None
-        service.submit(PLAN, "2" * 32, password="correct-synthetic-password")
-        assert finished(service, "2" * 32)["state"] == "succeeded"
+    # Either way a new, explicit operation may follow; an uncertain one repairs.
+    jobs.install_system.side_effect = None
+    service.submit(PLAN, "2" * 32, password="correct-synthetic-password")
+    assert finished(service, "2" * 32)["state"] == "succeeded"
 
 
 def test_executor_rejection_is_durable_without_executing_packages(fixture, monkeypatch):
@@ -409,3 +446,47 @@ def test_failure_to_record_completion_boundary_needs_recovery(fixture, monkeypat
     assert finished(service)["state"] == "recovery_required"
     with pytest.raises(ScreenError, match="INSTALL_RECOVERY_REQUIRED"):
         jobs.assert_environment_installation_idle()
+
+
+def test_a_live_job_still_excludes_any_other(fixture):
+    service, _ = fixture
+    entered, release = threading.Event(), threading.Event()
+    def install(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return {"state": "succeeded", "error": None}
+    jobs.install_system.side_effect = install
+    service.submit(PLAN, OP)
+    assert entered.wait(3)
+    try:
+        with pytest.raises(ScreenError, match="INSTALL_BUSY"):
+            service.submit(PLAN, "2" * 32)
+        with pytest.raises(ScreenError, match="INSTALL_BUSY"):
+            jobs.assert_environment_installation_idle()
+    finally:
+        release.set()
+    assert finished(service)["state"] == "succeeded"
+
+
+def test_an_overdue_job_still_holding_the_environment_excludes_a_repair(fixture, monkeypatch):
+    """Past its deadline a job reads as uncertain, but while its worker lives
+    it holds the environment lease: a repair cannot run beside it."""
+    service, _ = fixture
+    entered, release = threading.Event(), threading.Event()
+    def install(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return {"state": "succeeded", "error": None}
+    jobs.install_system.side_effect = install
+    service.submit(PLAN, OP)
+    assert entered.wait(3)
+    now = time.time()
+    try:
+        monkeypatch.setattr(jobs.time, "time", lambda: now + 1261)
+        assert service.status(OP)["state"] == "recovery_required"
+        with pytest.raises(ScreenError, match="INSTALL_BUSY"):
+            service.submit(PLAN, "2" * 32)
+    finally:
+        monkeypatch.setattr(jobs.time, "time", lambda: now)
+        release.set()
+    finished(service)

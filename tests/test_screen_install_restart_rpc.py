@@ -66,12 +66,16 @@ def test_reservation_refuses_a_live_turn_and_unfinished_or_foreign_receipts(inst
     assert_released()
 
 
-def test_failed_or_uncertain_jobs_never_admit_a_restart(installation_job):
+@pytest.mark.parametrize("worker,job,refusal", [
+    ({"state": "failed", "error": "INSTALL_INDEX_FAILED"}, "failed", "INSTALL_VERIFICATION_FAILED"),
+    ({"state": "recovery_required", "error": "INSTALL_PACKAGES_FAILED"}, "recovery_required", "INSTALL_RECOVERY_REQUIRED"),
+])
+def test_failed_or_uncertain_jobs_never_admit_a_restart(installation_job, worker, job, refusal):
     service, _ = installation_job
-    install_jobs.install_system.return_value = {"state": "failed", "error": "INSTALL_PACKAGES_FAILED"}
+    install_jobs.install_system.return_value = worker
     service.submit(PLAN, OP)
-    assert finished(service)["state"] == "recovery_required"
-    with pytest.raises(ScreenError, match="INSTALL_RECOVERY_REQUIRED"):
+    assert finished(service)["state"] == job
+    with pytest.raises(ScreenError, match=refusal):
         service.restart_reservation(PLAN, OP)
     assert_released()
 

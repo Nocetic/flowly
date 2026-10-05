@@ -2,7 +2,9 @@
 
 Only an authenticated admission layer may call submit. Recipes and interpreter
 paths are always host-resolved. Secrets live only in the worker call, never in
-receipts. Gateway loss requires recovery; accepted mutations are never replayed.
+receipts. Accepted mutations are never replayed: the same operation reports
+its result. A later, explicit operation converges an uncertain environment
+(the workers repair first) and a later success supersedes earlier uncertainty.
 """
 
 from __future__ import annotations
@@ -29,7 +31,6 @@ from flowly.desktop_runtime.python_installer import install_python
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="screen-install")
 _SLOTS = threading.BoundedSemaphore(1)
-_TERMINAL = {"succeeded", "failed"}
 _ERRORS = {"INSTALL_BUSY", "INSTALL_STATE_INVALID", "INSTALL_PRIVILEGE_REQUIRED", "INSTALL_PLAN_CHANGED", "INSTALL_RESTART_REQUIRED",
            "INSTALL_RECOVERY_REQUIRED", "INSTALL_HISTORY_FULL", "INSTALL_INDEX_FAILED", "INSTALL_PACKAGES_FAILED",
            "INSTALL_PYTHON_FAILED", "INSTALL_VERIFICATION_FAILED", "INSTALL_TIMEOUT", "INSTALL_UV_REQUIRED",
@@ -116,6 +117,22 @@ def _installation_components_ready() -> bool:
     return True
 
 
+class _WorkerFailedError(ScreenError):
+    """A worker's terminal failure that left nothing half-changed."""
+
+
+def _agent_environment_uncertain(rows: list[dict]) -> bool:
+    """An attempt to change the agent's own Python environment ended uncertainly
+    and no later installation succeeded. System packages, the runtime account
+    and the browser are outside the agent's environment."""
+    for row in reversed(rows):
+        if row["state"] == "succeeded":
+            return False
+        if row["phase"] == "python" and ScreenInstallJobs._public(row)["state"] == "recovery_required":
+            return True
+    return False
+
+
 class ScreenInstallJobs:
     def __init__(self, identity: dict, guard: Callable[[], None]):
         if os.name != "posix":
@@ -160,7 +177,8 @@ class ScreenInstallJobs:
 
     @staticmethod
     def _rows(db):
-        rows = db.execute("SELECT id, value FROM operations LIMIT 129").fetchall()
+        # Insertion order: a later success supersedes earlier uncertainty.
+        rows = db.execute("SELECT id, value FROM operations ORDER BY rowid LIMIT 129").fetchall()
         if len(rows) > 128:
             raise ScreenError("INSTALL_STATE_INVALID")
         result = []
@@ -313,8 +331,12 @@ class ScreenInstallJobs:
                         if row["planId"] != plan_id or any(row[key] != value for key, value in self.identity.items()):
                             raise ScreenError("OPERATION_CONFLICT")
                         return self._public(row)
-                if any(row["state"] not in _TERMINAL for row in rows):
+                # Only live work excludes a new operation; uncertain history is
+                # repaired by it. A worker still running past its deadline holds
+                # the exclusive environment lease taken above, so cannot overlap.
+                if any(self._public(row)["state"] in {"pending", "running"} for row in rows):
                     raise ScreenError("INSTALL_BUSY")
+                repairing_agent_environment = _agent_environment_uncertain(rows)
                 if len(rows) >= 128:
                     raise ScreenError("INSTALL_HISTORY_FULL")
                 owner = process_identity(os.getpid())
@@ -328,7 +350,7 @@ class ScreenInstallJobs:
                           "restartRequired": False, "restartBoundary": None, "owner": owner, "deadline": int(time.time()) + 1260}
                 db.execute("INSERT INTO operations (id, value) VALUES (?, ?)", (operation, json.dumps(_validate(record))))
             try:
-                _EXECUTOR.submit(self._run, record, plan, password, reservation)
+                _EXECUTOR.submit(self._run, record, plan, password, reservation, repairing_agent_environment)
             except RuntimeError:
                 record.update(state="failed", error="CONTROL_UNAVAILABLE")
                 self._save(record)
@@ -343,7 +365,7 @@ class ScreenInstallJobs:
             if acquired:
                 _SLOTS.release()
 
-    def _run(self, accepted, plan, password, reservation):
+    def _run(self, accepted, plan, password, reservation, repairing_agent_environment=False):
         record = {**accepted, "completedSteps": []}
         attempted = False
         try:
@@ -357,6 +379,9 @@ class ScreenInstallJobs:
                 result = install_system(plan["system"]["planId"], record["operationId"], password=password)
             finally:
                 password = None
+            if result["state"] == "failed":
+                # The worker changed nothing it could not finish: a plain failure.
+                raise _WorkerFailedError(result["error"] or "INSTALL_PACKAGES_FAILED")
             if result["state"] != "succeeded":
                 raise ScreenError(result["error"] or "INSTALL_RECOVERY_REQUIRED")
             record["completedSteps"] = ["system"]
@@ -369,7 +394,9 @@ class ScreenInstallJobs:
             record["restartRequired"] = True
             self._save(record)
             result = install_python(plan["python"]["planId"], record["operationId"])
-            record["restartRequired"] = result["restartRequired"]
+            # Repairing an interrupted change: modules may have changed under the
+            # running process even when nothing is left to install now.
+            record["restartRequired"] = result["restartRequired"] or repairing_agent_environment
             if result["state"] != "succeeded":
                 raise ScreenError(result["error"] or "INSTALL_RECOVERY_REQUIRED")
             if record["restartRequired"]:
@@ -379,7 +406,8 @@ class ScreenInstallJobs:
             code = exc.code if isinstance(exc, ScreenError) and exc.code in _ERRORS else "INSTALL_RECOVERY_REQUIRED"
             # Privilege rejection before any package step is safe to retry with
             # a new operation. All uncertain/partial mutations require recovery.
-            safe = not attempted or (record["phase"] == "system" and code in {"INSTALL_BUSY", "INSTALL_PLAN_CHANGED"})
+            safe = (not attempted or isinstance(exc, _WorkerFailedError)
+                    or (record["phase"] == "system" and code in {"INSTALL_BUSY", "INSTALL_PLAN_CHANGED"}))
             if record["phase"] == "system" and code == "INSTALL_PRIVILEGE_REQUIRED":
                 # The wrapper also uses this code for malformed worker output.
                 # Only a definitely absent accepted receipt permits a new try.
@@ -415,11 +443,13 @@ def assert_environment_installation_idle() -> None:
             return
         raise
     for row in rows:
-        public = store._public(row)
-        if public["state"] in {"pending", "running"}:
+        if store._public(row)["state"] in {"pending", "running"}:
             raise ScreenError("INSTALL_BUSY")
-        if public["state"] == "recovery_required":
-            raise ScreenError("INSTALL_RECOVERY_REQUIRED")
+    # Fail closed only where agent turns could run on a half-changed Python
+    # environment; a new installation repairs it. Interrupted system package,
+    # account or browser work leaves the screen off, not the agent.
+    if _agent_environment_uncertain(rows):
+        raise ScreenError("INSTALL_RECOVERY_REQUIRED")
     for row in rows:
         if row["state"] == "succeeded" and row["restartRequired"]:
             _assert_restarted(row)
