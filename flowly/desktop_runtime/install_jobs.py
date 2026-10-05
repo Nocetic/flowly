@@ -32,7 +32,7 @@ from flowly.desktop_runtime.python_installer import install_python
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="screen-install")
 _SLOTS = threading.BoundedSemaphore(1)
 _ERRORS = {"INSTALL_BUSY", "INSTALL_STATE_INVALID", "INSTALL_PRIVILEGE_REQUIRED", "INSTALL_PLAN_CHANGED", "INSTALL_RESTART_REQUIRED",
-           "INSTALL_RECOVERY_REQUIRED", "INSTALL_HISTORY_FULL", "INSTALL_INDEX_FAILED", "INSTALL_PACKAGES_FAILED",
+           "INSTALL_RECOVERY_REQUIRED", "INSTALL_HISTORY_FULL", "INSTALL_INDEX_FAILED", "INSTALL_PACKAGES_FAILED", "INSTALL_HOST_PACKAGES_BROKEN", "INSTALL_ACCOUNT_CONFLICT",
            "INSTALL_PYTHON_FAILED", "INSTALL_VERIFICATION_FAILED", "INSTALL_TIMEOUT", "INSTALL_UV_REQUIRED",
            "INSTALL_VIRTUALENV_REQUIRED", "INSTALL_UNSUPPORTED_HOST", "INSTALL_TOOLS_MISSING",
            "INSTALL_MANAGED_BUILD_REQUIRED", "INSTALL_RUNTIME_ACCOUNT_REQUIRED",
@@ -425,6 +425,25 @@ class ScreenInstallJobs:
                     reservation.__exit__(None, None, None)
                 finally:
                     _SLOTS.release()
+
+
+def environment_installation_uncertain() -> bool:
+    """An installation in this environment ended uncertain (any step) and no
+    later one succeeded: what is on disk may be half-installed."""
+    store = ScreenInstallJobs({"hostId": "environment", "botId": "environment", "profileId": "default"}, lambda: None)
+    try:
+        with store._transaction() as db:
+            rows = store._rows(db)
+    except ScreenError as exc:
+        if exc.code == "OPERATION_NOT_FOUND":
+            return False
+        raise
+    for row in reversed(rows):
+        if row["state"] == "succeeded":
+            return False
+        if store._public(row)["state"] == "recovery_required":
+            return True
+    return False
 
 
 def assert_environment_installation_idle() -> None:

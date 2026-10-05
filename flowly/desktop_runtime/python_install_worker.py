@@ -125,11 +125,12 @@ def run_command(command, timeout):
         raise TimeoutError() from None
 
 
-def install(uv, requirements):
+def install(uv, requirements, reinstall=False):
     return run_command([
         uv, "--no-config", "--no-cache", "--no-progress", "--no-python-downloads", "pip", "install",
         "--python", sys.executable, "--index-url", "https://pypi.org/simple", "--require-hashes",
         "--only-binary", ":all:", "--no-deps", "--requirements", str(requirements),
+        *(["--reinstall"] if reinstall else []),
     ], 300)
 
 
@@ -182,18 +183,24 @@ def main():
         receipts = list(root.glob("*.json"))
         if len(receipts) >= 128:
             return fail("INSTALL_HISTORY_FULL")
-        if any(read(receipt)["state"] in {"running", "recovery_required"} for receipt in receipts):
-            return fail("INSTALL_RECOVERY_REQUIRED")
+        # Under the venv lock a "running" receipt was interrupted. Work left
+        # uncertain since the last success is repaired by reinstalling the same
+        # hash-pinned set; the interrupted operation itself is never replayed.
+        history = [read(receipt) for receipt in receipts]
+        succeeded = max((item["updatedAt"] for item in history if item["state"] == "succeeded"), default=-1)
+        repair = any(item["state"] in ("running", "recovery_required") and item["updatedAt"] >= succeeded
+                     for item in history)
         value = {"installVersion": 1, "operationId": operation, "planId": plan, "state": "running",
                  "phase": "installing", "error": None, "updatedAt": int(time.time()), "restartRequired": False}
         save(path, value)
         try:
-            if ready():
+            if not repair and ready():
                 code = 0
             else:
+                # Packages change under the running agent: it must restart.
                 value["restartRequired"] = True
                 save(path, value)
-                code = install(uv, requirements)
+                code = install(uv, requirements, reinstall=True) if repair else install(uv, requirements)
             if code:
                 value.update(state="recovery_required", error="INSTALL_PYTHON_FAILED")
             else:

@@ -7842,11 +7842,13 @@ class AgentLoop:
                 activity.enter_context(agent_environment_activity())
             except ScreenError as exc:
                 message = (
-                    "The agent needs to restart after screen component installation."
+                    "The agent needs to restart to finish setting up Screen. "
+                    "If it does not restart by itself, run `flowly restart` on the server."
                     if exc.code == "INSTALL_RESTART_REQUIRED" else
-                    "Screen component installation is running. Try again when it finishes."
+                    "Screen is being set up on this server. Try again when it finishes."
                     if exc.code == "INSTALL_BUSY" else
-                    "Screen component installation needs recovery on this host before agent tasks can continue."
+                    "Screen setup on this server was interrupted, so the agent paused to stay safe. "
+                    "Repair it from Screen in Flowly Desktop, or run `flowly screen install` on the server."
                 )
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=message,
                                        metadata={"error": {"code": exc.code, "message": message}})

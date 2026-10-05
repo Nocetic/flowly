@@ -90,7 +90,8 @@ def read(path):
                 or not isinstance(value["planId"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["planId"])
                 or value["state"] not in ("running", "succeeded", "failed", "recovery_required")
                 or value["phase"] not in ("checking", "updating", "installing", "complete")
-                or value["error"] not in (None, "INSTALL_RECOVERY_REQUIRED", "INSTALL_INDEX_FAILED", "INSTALL_PACKAGES_FAILED", "INSTALL_TIMEOUT")
+                or value["error"] not in (None, "INSTALL_RECOVERY_REQUIRED", "INSTALL_INDEX_FAILED", "INSTALL_PACKAGES_FAILED",
+                                          "INSTALL_TIMEOUT", "INSTALL_HOST_PACKAGES_BROKEN", "INSTALL_ACCOUNT_CONFLICT")
                 or (value["state"] in ("failed", "recovery_required")) != (value["error"] is not None)
                 or (value["state"] == "succeeded") != (value["phase"] == "complete")
                 or type(value["updatedAt"]) is not int or not 0 <= value["updatedAt"] < 2**53):
@@ -126,6 +127,26 @@ def command(args, timeout, capture=False):
             raise TimeoutError() from None
         output.seek(0)
         return result, output.read(1) if capture else b""
+
+def prepare_packages(repair):
+    """None when the package system is ready for this installation, else the
+    terminal (state, error) to record."""
+    if repair:
+        # Finish what an interrupted run of this installer left unfinished;
+        # never remove a package to get there.
+        code, _ = command(["/usr/bin/dpkg", "--configure", "-a"], 300)
+        if not code:
+            code, _ = command([*APT, "install", "-f", "-y", "--no-install-recommends", "--no-remove"], 600)
+        if code:
+            return "recovery_required", "INSTALL_PACKAGES_FAILED"
+    code, dirty = command(["/usr/bin/dpkg", "--audit"], 30, capture=True)
+    if code or dirty:
+        if repair:
+            return "recovery_required", "INSTALL_PACKAGES_FAILED"
+        # Unfinished package work this installer did not leave belongs to the
+        # host's owner: change nothing and say what to run.
+        return "failed", "INSTALL_HOST_PACKAGES_BROKEN"
+    return None
 
 def main():
     if os.geteuid() != 0 or len(sys.argv) != 4:
@@ -172,17 +193,21 @@ def main():
         receipts = list(ROOT.glob("*.json"))
         if len(receipts) >= 128:
             return fail("INSTALL_HISTORY_FULL")
-        for receipt in receipts:
-            if read(receipt).get("state") in {"running", "recovery_required"}:
-                return fail("INSTALL_RECOVERY_REQUIRED")
+        # Under the host lock a "running" receipt was interrupted. Work this
+        # installer left uncertain since its last success is repaired by this
+        # new operation; the interrupted operation itself is never replayed.
+        history = [read(receipt) for receipt in receipts]
+        succeeded = max((item["updatedAt"] for item in history if item["state"] == "succeeded"), default=-1)
+        repair = any(item["state"] in ("running", "recovery_required") and item["updatedAt"] >= succeeded
+                     for item in history)
         value = {"installVersion": 1, "operationId": operation, "planId": plan,
                  "state": "running", "phase": "checking", "error": None,
                  "updatedAt": int(time.time())}
         save(path, value)
         try:
-            code, dirty = command(["/usr/bin/dpkg", "--audit"], 30, capture=True)
-            if code or dirty:
-                value.update(state="recovery_required", error="INSTALL_RECOVERY_REQUIRED")
+            problem = prepare_packages(repair)
+            if problem:
+                value.update(state=problem[0], error=problem[1])
             else:
                 value.update(phase="updating", updatedAt=int(time.time()))
                 save(path, value)
@@ -199,9 +224,17 @@ def main():
                         # Root-hosted agents need a separate locked application
                         # account. This fixed step is part of the reviewed worker
                         # fingerprint and runs before its success receipt.
-                        if uid == "0":
-                            provision_runtime_account()
-                        value.update(state="succeeded", phase="complete")
+                        try:
+                            if uid == "0":
+                                provision_runtime_account()
+                        except ValueError as exc:
+                            # Someone else's account under our name: nothing of
+                            # ours is half-done, and it is not ours to change.
+                            if str(exc) != "INSTALL_ACCOUNT_CONFLICT":
+                                raise
+                            value.update(state="failed", error="INSTALL_ACCOUNT_CONFLICT")
+                        else:
+                            value.update(state="succeeded", phase="complete")
         except TimeoutError:
             value.update(state="recovery_required", error="INSTALL_TIMEOUT")
         except BaseException:

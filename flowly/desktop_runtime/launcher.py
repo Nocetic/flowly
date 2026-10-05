@@ -148,6 +148,15 @@ class ScreenRuntime:
     def capabilities() -> dict:
         if sys.platform != "linux" or not hasattr(os, "pidfd_open"):
             return dict(supported=False, reason="UNSUPPORTED_HOST", missing=[])
+        # Programs an interrupted installation left may be half-configured:
+        # no screen until a later installation repairs them.
+        from flowly.desktop_runtime.install_jobs import environment_installation_uncertain
+
+        try:
+            if environment_installation_uncertain():
+                return dict(supported=False, reason="INSTALL_RECOVERY_REQUIRED", missing=[])
+        except ScreenError as exc:
+            return dict(supported=False, reason=exc.code, missing=[])
         missing = [program for program in REQUIRED_PROGRAMS if shutil.which(program) is None]
         if importlib.util.find_spec("playwright") is None:
             missing.append("playwright")

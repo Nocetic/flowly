@@ -1,7 +1,9 @@
 """Fixed account-provisioning source for the isolated privileged installer.
 
 No name, UID, group, shell, home or filesystem path is accepted from a client.
-An interrupted creation is retained for explicit recovery, never guessed/adopted.
+A creation interrupted after this installer reserved it is completed by the
+next run: created if absent, adopted only if it is exactly what `useradd` was
+asked for. An account this installer never reserved is never adopted.
 """
 
 PROVISION_SOURCE = r'''
@@ -78,6 +80,63 @@ def account_identity(value=None):
         raise ValueError("INSTALL_STATE_INVALID")
     return actual
 
+def account_absent(name):
+    for lookup in (pwd.getpwnam, grp.getgrnam):
+        try:
+            lookup(name)
+        except KeyError:
+            continue
+        return False
+    return True
+
+def account_password_locked(name):
+    # useradd --password "!" ; /etc/shadow is root-only. spwd left Python 3.13.
+    with open("/etc/shadow") as shadow:
+        for line in shadow:
+            fields = line.rstrip("\n").split(":")
+            if fields[0] == name:
+                return len(fields) > 1 and fields[1][:1] in ("!", "*")
+    return False
+
+def account_system_uid(uid):
+    # useradd --system allocates below the first ordinary user ID.
+    first = 1000
+    try:
+        with open("/etc/login.defs") as definitions:
+            for line in definitions:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "UID_MIN" and parts[1].isdigit():
+                    first = int(parts[1])
+    except OSError:
+        pass
+    return 0 < uid < first
+
+def account_reserve_or_adopt(name, pending, identity, save):
+    """Under the account lock: None after reserving a creation the caller now
+    performs, or the identity of the account a reserved creation left."""
+    try:
+        pending.lstat()
+    except FileNotFoundError:
+        reserved = False
+    else:
+        # Only this installer writes the reservation, as a private regular file.
+        if account_read(pending) != {"accountVersion": 1, "state": "creating"}:
+            raise ValueError("INSTALL_STATE_INVALID")
+        reserved = True
+    if account_absent(name):
+        save(pending, {"accountVersion": 1, "state": "creating"})
+        return None
+    if not reserved:
+        # Not created by this installer: never adopted, never changed.
+        raise ValueError("INSTALL_ACCOUNT_CONFLICT")
+    try:
+        value = identity(name)
+    except (KeyError, ValueError):
+        raise ValueError("INSTALL_ACCOUNT_CONFLICT") from None
+    if not account_system_uid(value["uid"]) or not account_password_locked(name):
+        raise ValueError("INSTALL_ACCOUNT_CONFLICT")
+    return value
+
 def provision_runtime_account():
     if os.geteuid() != 0:
         raise ValueError("INSTALL_PRIVILEGE_REQUIRED")
@@ -102,23 +161,14 @@ def provision_runtime_account():
             if previous is None:
                 raise ValueError("INSTALL_STATE_INVALID")
             return account_identity(previous)
-        # Existence includes dangling links; never follow or clear a prior
-        # incomplete reservation, even if useradd appears not to have run.
-        try:
-            pending.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            raise ValueError("INSTALL_RECOVERY_REQUIRED")
-        for lookup in (pwd.getpwnam, grp.getgrnam):
-            try:
-                lookup(ACCOUNT_NAME)
-            except KeyError:
-                continue
-            raise ValueError("INSTALL_RECOVERY_REQUIRED")
-        account_save(pending, {"accountVersion": 1, "state": "creating"})
-        # A timeout may leave a partially created system account. The durable
-        # reservation prevents retries from adopting it or issuing useradd again.
+        adopted = account_reserve_or_adopt(ACCOUNT_NAME, pending, lambda name: account_identity(), account_save)
+        if adopted is not None:
+            account_save(receipt, adopted)
+            pending.unlink()
+            account_sync()
+            return adopted
+        # A timeout may leave a partially created system account; the durable
+        # reservation lets the next run adopt it only if it is exact.
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         process = subprocess.Popen(
             ["/usr/sbin/useradd", "--system", "--user-group", "--no-create-home",
@@ -251,19 +301,12 @@ def provision_profile_account(name):
             if previous is None:
                 raise ValueError("INSTALL_STATE_INVALID")
             return profile_account_identity(name, previous)
-        try:
-            pending.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            raise ValueError("INSTALL_RECOVERY_REQUIRED")
-        for lookup in (pwd.getpwnam, grp.getgrnam):
-            try:
-                lookup(name)
-            except KeyError:
-                continue
-            raise ValueError("INSTALL_RECOVERY_REQUIRED")
-        profile_account_save(pending, {"accountVersion": 1, "state": "creating"})
+        adopted = account_reserve_or_adopt(name, pending, profile_account_identity, profile_account_save)
+        if adopted is not None:
+            profile_account_save(receipt, adopted)
+            pending.unlink()
+            profile_account_sync()
+            return adopted
         if account_run(["/usr/sbin/useradd", "--system", "--user-group", "--no-create-home", "--home-dir",
                         ACCOUNT_HOME, "--shell", ACCOUNT_SHELL, "--password", "!", name]):
             raise ValueError("INSTALL_RECOVERY_REQUIRED")

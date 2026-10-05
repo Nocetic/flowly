@@ -254,3 +254,46 @@ def test_uv_command_enforces_hashes_and_no_implicit_dependency_or_interpreter_do
     assert command[command.index("--python") + 1] == sys.executable
     assert command[command.index("--index-url") + 1] == "https://pypi.org/simple"
     assert spawn.call_args.kwargs["stderr"] == subprocess.DEVNULL
+
+
+def uncertain(root, operation, state="recovery_required", updated=1):
+    worker.private_directory(root, create=True)
+    worker.save(root / (operation + ".json"), {
+        "installVersion": 1, "operationId": operation, "planId": "a" * 64, "state": state,
+        "phase": "complete" if state == "succeeded" else "installing",
+        "error": None if state in {"succeeded", "running"} else "INSTALL_PYTHON_FAILED",
+        "updatedAt": updated, "restartRequired": True})
+
+
+@pytest.mark.parametrize("state", ["recovery_required", "running"])
+def test_a_new_operation_reinstalls_what_an_interrupted_one_left_and_needs_a_restart(running_worker, monkeypatch, capsys, state):
+    uncertain(running_worker.root, "3" * 32, state)
+    # Metadata may look complete after an interruption; a repair does not trust it.
+    monkeypatch.setattr(worker, "ready", lambda: True)
+    assert worker.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "succeeded" and result["restartRequired"] is True
+    running_worker.install.assert_called_once()
+    assert running_worker.install.call_args.kwargs == {"reinstall": True}
+    # The interrupted operation is history, not replayed.
+    assert worker.read(running_worker.root / ("3" * 32 + ".json"))["state"] == state
+
+
+def test_a_later_success_leaves_nothing_to_reinstall(running_worker, monkeypatch, capsys):
+    uncertain(running_worker.root, "3" * 32, updated=1)
+    uncertain(running_worker.root, "4" * 32, "succeeded", updated=2)
+    monkeypatch.setattr(worker, "ready", lambda: True)
+    assert worker.main() == 0
+    assert json.loads(capsys.readouterr().out)["restartRequired"] is False
+    running_worker.install.assert_not_called()
+
+
+def test_reinstall_is_the_same_hash_pinned_command(monkeypatch, tmp_path):
+    process = Mock()
+    process.wait.return_value = 0
+    spawn = Mock(return_value=process)
+    monkeypatch.setattr(worker.subprocess, "Popen", spawn)
+    worker.install("/usr/local/bin/uv", tmp_path / "requirements.txt")
+    plain = spawn.call_args.args[0]
+    worker.install("/usr/local/bin/uv", tmp_path / "requirements.txt", reinstall=True)
+    assert spawn.call_args.args[0] == [*plain, "--reinstall"]

@@ -56,7 +56,8 @@ def test_success_is_durable_idempotent_and_has_fixed_argv(worker, capsys):
 
 
 @pytest.mark.parametrize("responses,code,state,calls", [
-    ([(0, b"dirty")], "INSTALL_RECOVERY_REQUIRED", "recovery_required", 1),
+    # Unfinished package work this installer did not leave is not touched: nothing changed.
+    ([(0, b"dirty")], "INSTALL_HOST_PACKAGES_BROKEN", "failed", 1),
     ([(0, b""), (100, b"")], "INSTALL_INDEX_FAILED", "failed", 2),
     ([(0, b""), (0, b""), (100, b"")], "INSTALL_PACKAGES_FAILED", "recovery_required", 3),
     ([TimeoutError()], "INSTALL_TIMEOUT", "recovery_required", 1),
@@ -83,18 +84,55 @@ def test_lock_is_host_wide_and_does_not_create_an_operation_on_contention(worker
     worker.command.assert_not_called()
 
 
-def test_interrupted_receipt_blocks_new_operations_across_users(worker, capsys, monkeypatch):
+REPAIR = [(["/usr/bin/dpkg", "--configure", "-a"], 300)]
+
+
+def receipt(state, updated, operation=OPERATION, uid="1000", error=None):
+    return {"installVersion": 1, "operationId": operation, "planId": PLAN, "state": state,
+            "phase": "complete" if state == "succeeded" else "installing",
+            "error": error if error or state in {"succeeded", "running"} else "INSTALL_RECOVERY_REQUIRED",
+            "updatedAt": updated}
+
+
+def test_an_interrupted_operation_is_reported_never_replayed_and_repaired_by_a_new_one(worker, capsys, monkeypatch):
     worker.directory()
-    value = {"installVersion": 1, "operationId": OPERATION, "planId": PLAN,
-             "state": "running", "phase": "installing", "error": None, "updatedAt": 1}
-    worker.save(worker.ROOT / ("1000-" + OPERATION + ".json"), value)
-    monkeypatch.setenv("SUDO_UID", "1001")
-    assert worker.main() == 1
-    assert json.loads(capsys.readouterr().out) == {"error": "INSTALL_RECOVERY_REQUIRED"}
-    monkeypatch.setenv("SUDO_UID", "1000")
+    worker.save(worker.ROOT / ("1000-" + OPERATION + ".json"), receipt("running", 1))
+    # The interrupted operation itself only reports what happened.
     assert worker.main() == 1
     assert json.loads(capsys.readouterr().out)["state"] == "recovery_required"
     worker.command.assert_not_called()
+    # A new operation, from any account, repairs before running the same recipe.
+    monkeypatch.setenv("SUDO_UID", "1001")
+    monkeypatch.setattr(worker.sys, "argv", ["worker", "2" * 32, PLAN, "aarch64"])
+    assert worker.main() == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
+    calls = [call.args for call in worker.command.call_args_list]
+    assert calls[0] == REPAIR[0]
+    repair = calls[1][0]
+    assert repair[-5:] == ["install", "-f", "-y", "--no-install-recommends", "--no-remove"] and calls[1][1] == 600
+    assert calls[2] == (["/usr/bin/dpkg", "--audit"], 30)
+    assert calls[-1][0][-len(worker.PACKAGES):] == list(worker.PACKAGES)
+    # History stays as it happened.
+    assert worker.read(worker.ROOT / ("1000-" + OPERATION + ".json"))["state"] == "recovery_required"
+
+
+def test_a_later_success_means_nothing_is_left_to_repair(worker, capsys):
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    worker.save(worker.ROOT / ("1000-" + "4" * 32 + ".json"), receipt("succeeded", 2, "4" * 32))
+    assert worker.main() == 0
+    assert worker.command.call_args_list[0].args == (["/usr/bin/dpkg", "--audit"], 30)
+    assert len(worker.command.call_args_list) == 3
+
+
+@pytest.mark.parametrize("responses", [[(1, b"")], [(0, b""), (100, b"")], [(0, b""), (0, b""), (0, b"dirty")]])
+def test_a_repair_that_does_not_converge_needs_recovery(worker, capsys, responses):
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    worker.command.side_effect = responses
+    assert worker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "recovery_required" and result["error"] == "INSTALL_PACKAGES_FAILED"
 
 
 def test_symlink_lock_and_corrupted_receipt_fail_closed(worker):
@@ -180,3 +218,18 @@ def test_account_failure_is_durable_and_blocks_python_success(worker, monkeypatc
 def test_nonroot_caller_does_not_provision_an_account(worker):
     assert worker.main() == 0
     worker.provision_runtime_account.assert_not_called()
+
+
+def test_someone_elses_account_is_a_plain_failure_with_its_own_reason(worker, capsys, monkeypatch):
+    monkeypatch.setenv("SUDO_UID", "0")
+    worker.provision_runtime_account = Mock(side_effect=ValueError("INSTALL_ACCOUNT_CONFLICT"))
+    assert worker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "failed" and result["error"] == "INSTALL_ACCOUNT_CONFLICT"
+
+
+def test_an_interrupted_account_creation_still_needs_repair(worker, capsys, monkeypatch):
+    monkeypatch.setenv("SUDO_UID", "0")
+    worker.provision_runtime_account = Mock(side_effect=ValueError("INSTALL_RECOVERY_REQUIRED"))
+    assert worker.main() == 1
+    assert json.loads(capsys.readouterr().out)["state"] == "recovery_required"

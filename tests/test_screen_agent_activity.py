@@ -65,7 +65,7 @@ async def test_maintenance_rejects_turn_before_any_conversation_side_effect():
     with gate.environment_activity(exclusive=True):
         result = await loop._process_message(message())
     assert result.metadata["error"]["code"] == "INSTALL_BUSY"
-    assert "installation is running" in result.content
+    assert "being set up" in result.content
     loop._process_message_in_environment.assert_not_called()
 
 
@@ -76,6 +76,9 @@ async def test_durable_maintenance_condition_blocks_agent_after_lock_loss(monkey
     result = await loop._process_message(message())
     assert result.metadata["error"]["code"] == code
     loop._process_message_in_environment.assert_not_called()
+    if code != "INSTALL_RESTART_REQUIRED":
+        # A paused agent says how to get it back.
+        assert "flowly screen install" in result.content and "Flowly Desktop" in result.content
     with gate.environment_activity(exclusive=True):
         pass
 

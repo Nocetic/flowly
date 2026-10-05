@@ -490,3 +490,20 @@ def test_an_overdue_job_still_holding_the_environment_excludes_a_repair(fixture,
         monkeypatch.setattr(jobs.time, "time", lambda: now)
         release.set()
     finished(service)
+
+
+def test_any_unfinished_installation_is_reported_until_a_later_success(fixture):
+    service, _ = fixture
+    assert jobs.environment_installation_uncertain() is False  # nothing installed yet
+    jobs.install_system.return_value = {"state": "recovery_required", "error": "INSTALL_PACKAGES_FAILED"}
+    service.submit(PLAN, OP)
+    finished(service)
+    assert jobs.environment_installation_uncertain() is True
+    jobs.install_system.return_value = {"state": "failed", "error": "INSTALL_INDEX_FAILED"}
+    service.submit(PLAN, "2" * 32)
+    finished(service, "2" * 32)
+    assert jobs.environment_installation_uncertain() is True  # a plain failure repairs nothing
+    jobs.install_system.return_value = {"state": "succeeded", "error": None}
+    service.submit(PLAN, "3" * 32)
+    finished(service, "3" * 32)
+    assert jobs.environment_installation_uncertain() is False

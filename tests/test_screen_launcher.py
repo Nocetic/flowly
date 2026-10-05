@@ -381,3 +381,26 @@ def test_signal_checks_identity_after_opening_pidfd(monkeypatch):
             os.fstat(read_fd)
     finally:
         os.close(write_fd)
+
+
+@pytest.mark.parametrize("answer,reason", [
+    (True, "INSTALL_RECOVERY_REQUIRED"),
+    (ScreenError("INSTALL_STATE_INVALID"), "INSTALL_STATE_INVALID"),
+])
+def test_a_screen_is_not_offered_over_an_unfinished_installation(monkeypatch, answer, reason):
+    """Half-installed programs may be on disk; the screen waits for a repair."""
+    from flowly.desktop_runtime import install_jobs
+
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher.os, "pidfd_open", lambda pid: 1, raising=False)
+    monkeypatch.setattr(launcher.shutil, "which", lambda name, **kw: "/usr/bin/" + name)
+    monkeypatch.setattr(launcher.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(launcher.os, "geteuid", lambda: 1000)
+    def uncertain():
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+    monkeypatch.setattr(install_jobs, "environment_installation_uncertain", uncertain)
+    assert ScreenRuntime.capabilities() == {"supported": False, "reason": reason, "missing": []}
+    monkeypatch.setattr(install_jobs, "environment_installation_uncertain", lambda: False)
+    assert ScreenRuntime.capabilities()["supported"] is True

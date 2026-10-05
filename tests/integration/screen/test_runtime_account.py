@@ -81,21 +81,50 @@ def test_invalid_existing_provenance_is_not_replaced(provisioned, raw):
         path.write_bytes(original)
 
 
-@pytest.mark.parametrize("pending", [False, True])
-def test_preexisting_account_without_provenance_is_not_adopted(provisioned, pending):
+def test_an_account_this_installer_never_reserved_is_not_adopted(provisioned):
     path, marker = ROOT / "account.json", ROOT / "account.pending"
     original = path.read_bytes()
     path.unlink()
     try:
-        if pending:
-            marker.write_text('{"accountVersion":1,"state":"creating"}')
-            marker.chmod(0o600)
         result = worker()
-        assert result.returncode != 0 and "INSTALL_RECOVERY_REQUIRED" in result.stderr
-        assert not path.exists()
-        if pending:
-            assert marker.exists()
+        assert result.returncode != 0 and "INSTALL_ACCOUNT_CONFLICT" in result.stderr
+        assert not path.exists() and not marker.exists()
     finally:
+        path.write_bytes(original)
+        path.chmod(0o600)
+
+
+def test_a_reserved_creation_whose_account_is_exact_is_completed_by_the_next_run(provisioned):
+    """useradd finished, the receipt was never written (crash, timeout)."""
+    path, marker = ROOT / "account.json", ROOT / "account.pending"
+    original = path.read_bytes()
+    path.unlink()
+    marker.write_text('{"accountVersion":1,"state":"creating"}')
+    marker.chmod(0o600)
+    try:
+        result = worker()
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == provisioned
+        assert json.loads(path.read_bytes()) == json.loads(original) and not marker.exists()
+    finally:
+        path.write_bytes(original)
+        path.chmod(0o600)
+        marker.unlink(missing_ok=True)
+
+
+def test_a_reserved_creation_with_a_changed_account_is_not_adopted(provisioned):
+    path, marker = ROOT / "account.json", ROOT / "account.pending"
+    original = path.read_bytes()
+    path.unlink()
+    marker.write_text('{"accountVersion":1,"state":"creating"}')
+    marker.chmod(0o600)
+    subprocess.run(["/usr/sbin/usermod", "--shell", "/bin/bash", "flowly-screen"], check=True)
+    try:
+        result = worker()
+        assert result.returncode != 0 and "INSTALL_ACCOUNT_CONFLICT" in result.stderr
+        assert not path.exists() and marker.exists()
+    finally:
+        subprocess.run(["/usr/sbin/usermod", "--shell", "/usr/sbin/nologin", "flowly-screen"], check=True)
         path.write_bytes(original)
         path.chmod(0o600)
         marker.unlink(missing_ok=True)
@@ -522,9 +551,11 @@ def test_an_unreceipted_account_with_the_profile_name_is_never_adopted(provision
                "source": hashlib.sha256(os.fsencode(directory)).hexdigest()}
     (directory / "application-layout.json").write_text(json.dumps(mapping))
     (directory / "application-layout.json").chmod(0o600)
-    for create in (False, True):
-        with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED"):
-            root_application_layout(directory, create=create)
+    # Reading finds no receipt of ours; creating finds someone else's account.
+    with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED"):
+        root_application_layout(directory, create=False)
+    with pytest.raises(ScreenError, match="RUNTIME_ACCOUNT_CONFLICT"):
+        root_application_layout(directory, create=True)
 
 
 def test_legacy_shared_layout_is_readable_but_never_started_again(provisioned):
