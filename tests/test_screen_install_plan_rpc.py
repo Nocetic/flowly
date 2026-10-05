@@ -200,3 +200,51 @@ async def test_install_plan_says_whether_the_gateway_restarts_itself(display_gat
     target = {"profileId": "default", "expectedHostId": status["hostId"], "expectedBotId": status["botId"]}
     assert (await f.rpc("display.install.plan", target))["result"]["selfRestart"] is owned
     assert ownership.await_args.args[1] == os.getpid()
+
+
+@pytest.mark.parametrize("root,sudo,system_ok,python_ok,admissible", [
+    (True, False, True, True, True),
+    (False, True, True, True, True),
+    (False, False, True, True, False),
+    (True, True, False, True, False),    # e.g. Ubuntu: the fixed recipe is Debian 12 only.
+    (True, True, True, False, False),
+])
+def test_a_host_says_whether_it_can_install_screens_by_the_plans_own_admission(
+        monkeypatch, tmp_path, root, sudo, system_ok, python_ok, admissible):
+    system = {"planId": "a" * 64, "runtimeAccountRequired": root, "supported": system_ok, "sudoAvailable": sudo}
+    python = {"planId": "b" * 64, "upToDate": False, "supported": python_ok}
+    monkeypatch.setattr(plans, "install_plan", lambda: dict(system))
+    monkeypatch.setattr(plans, "python_plan", lambda: dict(python))
+    assert plans.installation_admissible() is admissible
+    session = display.DisplaySession({"hostId": "host", "botId": "bot", "profileId": "default", "screenId": "browser"}, tmp_path)
+    missing = {"supported": False, "reason": "DEPENDENCIES_MISSING", "missing": ["Xvnc"]}
+    assert session._capabilities(missing, None)["installable"] is admissible
+
+
+def test_a_running_or_impossible_host_answers_installable_without_reading_plans(monkeypatch, tmp_path):
+    monkeypatch.setattr(plans, "install_plan", Mock(side_effect=AssertionError("plan read")))
+    monkeypatch.setattr(plans, "python_plan", Mock(side_effect=AssertionError("plan read")))
+    session = display.DisplaySession({"hostId": "host", "botId": "bot", "profileId": "default", "screenId": "browser"}, tmp_path)
+    assert session._capabilities({"supported": True, "reason": None, "missing": []}, None)["installable"] is True
+    assert session._capabilities({"supported": False, "reason": "UNSUPPORTED_HOST", "missing": []}, None)["installable"] is False
+
+
+@pytest.mark.parametrize("capability,admissible,installable", [
+    ({"supported": True, "reason": None, "missing": []}, False, True),
+    ({"supported": False, "reason": "DEPENDENCIES_MISSING", "missing": ["Xvnc"]}, True, True),
+    ({"supported": False, "reason": "DEPENDENCIES_MISSING", "missing": ["Xvnc"]}, False, False),
+    ({"supported": False, "reason": "UNSUPPORTED_HOST", "missing": []}, True, False),
+])
+def test_capability_discovery_says_whether_this_host_can_have_a_screen(monkeypatch, capability, admissible, installable):
+    from flowly.channels import feature_rpc
+
+    monkeypatch.setattr(ScreenRuntime, "capabilities", staticmethod(lambda: dict(capability)))
+    monkeypatch.setattr(plans, "installation_admissible", lambda: admissible)
+    assert feature_rpc.system_capabilities()["screen"] == {"installable": installable}
+
+
+def test_capability_discovery_answers_when_the_screen_probe_breaks(monkeypatch):
+    from flowly.channels import feature_rpc
+
+    monkeypatch.setattr(ScreenRuntime, "capabilities", staticmethod(Mock(side_effect=OSError("unreadable"))))
+    assert feature_rpc.system_capabilities()["screen"] == {"installable": False}

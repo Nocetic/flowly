@@ -5340,6 +5340,19 @@ async def gateway_restart() -> dict:
     return {"ok": True, "willRestart": True}
 
 
+def _screen_installable() -> bool:
+    try:
+        from flowly.desktop_runtime.install_plan import host_screen_installable
+
+        return host_screen_installable()
+    except Exception as exc:
+        # Capability discovery must answer; an unreadable host has no screen to offer.
+        from loguru import logger
+
+        logger.debug(f"[screen] capability probe failed: {exc}")
+        return False
+
+
 def system_capabilities() -> dict:
     """Advertise this bot's version + its full feature-method surface.
 
@@ -5381,6 +5394,9 @@ def system_capabilities() -> dict:
             "role": runtime.role.value,
             "profile": runtime.profile_name,
         },
+        # Whether a profile screen runs or can be installed here. Read over any
+        # connection, including one too insecure to carry the screen itself.
+        "screen": {"installable": _screen_installable()},
         **({
             "board": {
                 "protocolVersion": 2,

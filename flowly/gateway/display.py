@@ -25,7 +25,7 @@ from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.handoff import RunHandoffs
 from flowly.desktop_runtime.input_service import InputServiceClient
 from flowly.desktop_runtime.install_jobs import ScreenInstallJobs
-from flowly.desktop_runtime.install_plan import installation_plan
+from flowly.desktop_runtime.install_plan import installation_plan, screen_installable
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.desktop_runtime.lifecycle import ScreenLifecycle
 from flowly.desktop_runtime.profile_lifecycle import assert_not_retired, construction_guard
@@ -108,6 +108,8 @@ class DisplaySession:
                 "viewerClose": bool(state and state.get("inputServiceVersion") == 3
                                     and state.get("observerServiceVersion") == 3),
                 "lifecycle": capability["supported"], "lifecycleVersion": 1, "installSupported": True, "installRestartVersion": 1,
+                # Clients offer a screen only where one runs or can be installed.
+                "installable": screen_installable(capability),
                 "statusEvents": True, "resumeSupported": True,
                 "doctorVersion": 1, "installPlanVersion": 1}
 
