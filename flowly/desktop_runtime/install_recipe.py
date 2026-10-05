@@ -18,6 +18,9 @@ BROWSER_ROOT = "/opt/flowly-screen/chromium"
 APPARMOR_PROFILE = "/etc/apparmor.d/flowly-screen-chromium"
 APPARMOR_KNOB = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
 APPARMOR_PARSER = "/usr/sbin/apparmor_parser"
+# The userns rule needs AppArmor 4 (Ubuntu 24.04+). A 22.04 host on a newer
+# kernel may have the knob with an AppArmor 3 parser that cannot express it.
+APPARMOR_ABI4 = "/etc/apparmor.d/abi/4.0"
 
 # Chromium pinned to the screen extra's Playwright (1.58.0 -> revision 1208).
 # x86_64 is Google's Chrome for Testing build; Google publishes no Linux arm64
@@ -69,6 +72,16 @@ UBUNTU_BROWSER_LIBRARIES = {
         "libxfixes3", "libxkbcommon0", "libxrandr2",
     ),
 }
+# Fedora and Enterprise Linux 9 (Rocky, Alma, CentOS Stream): the
+# distribution's Chromium; EL9 takes Xfce and Chromium from EPEL (with CRB).
+# EL10 has no Xorg server or Xfce at all, so no recipe; RHEL itself needs a
+# subscription to enable CRB, so none yet either.
+DNF_DESKTOP = (
+    "tigervnc-server-minimal", "xorg-x11-xauth", "dbus-daemon", "dbus-x11", "xdotool", "xkbcomp",
+    "dejavu-sans-fonts", "xfwm4", "xfdesktop", "xfce4-panel", "xfce4-settings", "xfce4-terminal", "xfconf",
+    "adwaita-icon-theme", "Thunar", "python3", "bash", "nftables", "chromium",
+)
+EL9_IDS = ("rocky", "almalinux", "centos")
 # Derivatives (Mint, Pop!_OS, ...) name the Ubuntu release they are built on.
 UBUNTU_CODENAMES = {"jammy": "22.04", "noble": "24.04", "oracular": "24.10", "plucky": "25.04",
                     "questing": "25.10"}
@@ -106,8 +119,28 @@ def screen_recipe(release, machine, exists):
     """The reviewed recipe for this host, or None where none exists yet."""
     if machine not in PINNED_BROWSER or not isinstance(release, dict):
         return None
-    if not (exists("/usr/bin/apt-get") and exists("/usr/bin/dpkg")):
+    if exists("/usr/bin/apt-get") and exists("/usr/bin/dpkg"):
+        return _apt_recipe(release, machine, exists)
+    if exists("/usr/bin/dnf") and exists("/usr/bin/rpm"):
+        return _dnf_recipe(release, machine)
+    return None
+
+def _dnf_recipe(release, machine):
+    version = _release_version(release.get("VERSION_ID"))
+    if version is None:
         return None
+    if release.get("ID") == "fedora" and version >= (41,):
+        distribution, packages, repositories = "fedora-%d" % version[0], DNF_DESKTOP + ("xprop",), []
+    elif release.get("ID") in EL9_IDS and version[0] == 9:
+        distribution, packages = "%s-9" % release["ID"], DNF_DESKTOP + ("xorg-x11-utils",)
+        repositories = ["epel", "crb"]
+    else:
+        return None
+    return {"recipeVersion": RECIPE_VERSION, "family": "dnf", "distribution": distribution,
+            "architecture": machine, "packages": list(packages), "repositories": repositories,
+            "browser": {"source": "distribution", "package": "chromium"}, "apparmor": False}
+
+def _apt_recipe(release, machine, exists):
     family = [release.get("ID", "")] + release.get("ID_LIKE", "").split()
     if release.get("ID") == "debian":
         version = _release_version(release.get("VERSION_ID"))
@@ -115,7 +148,7 @@ def screen_recipe(release, machine, exists):
             return None
         packages = APT_DESKTOP[:3] + DEBIAN_BROWSER + APT_DESKTOP[3:]
         return {"recipeVersion": RECIPE_VERSION, "family": "apt", "distribution": "debian-%d" % version[0],
-                "architecture": machine, "packages": list(packages),
+                "architecture": machine, "packages": list(packages), "repositories": [],
                 "browser": {"source": "distribution", "package": "chromium"}, "apparmor": False}
     if "ubuntu" in family:
         label = release.get("VERSION_ID") if release.get("ID") == "ubuntu" else UBUNTU_CODENAMES.get(
@@ -127,9 +160,9 @@ def screen_recipe(release, machine, exists):
         pinned = PINNED_BROWSER[machine]
         # Ubuntu 23.10+ kernels can deny unprivileged user namespaces; the
         # profile lets only the pinned browser create its sandbox's.
-        apparmor = bool(exists(APPARMOR_KNOB) and exists(APPARMOR_PARSER))
+        apparmor = bool(exists(APPARMOR_KNOB) and exists(APPARMOR_PARSER) and exists(APPARMOR_ABI4))
         return {"recipeVersion": RECIPE_VERSION, "family": "apt", "distribution": "ubuntu-%d.%02d" % version,
-                "architecture": machine, "packages": list(APT_DESKTOP + libraries),
+                "architecture": machine, "packages": list(APT_DESKTOP + libraries), "repositories": [],
                 "browser": {"source": "pinned", "version": PINNED_BROWSER["version"], "size": pinned["size"],
                             "sha256": pinned["sha256"]},
                 "apparmor": apparmor}
@@ -298,7 +331,7 @@ def install_pinned_browser(machine):
         if staging is not None:
             _browser_shutil.rmtree(staging, ignore_errors=True)
 
-def apparmor_profile_text(abi):
+def apparmor_profile_text(abi=True):
     return ("# Flowly Screen: only the pinned Chromium may create the user namespaces its\n"
             "# sandbox needs where the kernel restricts them (Ubuntu 23.10+). Sandbox stays on.\n"
             + ("abi <abi/4.0>,\n" if abi else "")
@@ -307,7 +340,7 @@ def apparmor_profile_text(abi):
             + "  userns,\n  include if exists <local/flowly-screen-chromium>\n}\n")
 
 def install_apparmor_profile():
-    text = apparmor_profile_text(os.path.exists("/etc/apparmor.d/abi/4.0"))
+    text = apparmor_profile_text(True)
     directory = Path(APPARMOR_PROFILE).parent
     fd, name = tempfile.mkstemp(prefix=".flowly-screen-", dir=directory)
     try:
@@ -342,7 +375,22 @@ def screen_browser() -> str | None:
     if machine in PINNED_BROWSER and _BROWSER["browser_manifest_valid"](version, machine):
         return os.path.join(BROWSER_ROOT, version, PINNED_BROWSER[machine]["directory"], "chrome")
     root = hasattr(os, "geteuid") and os.geteuid() == 0
-    found = shutil.which("chromium", path="/usr/bin:/bin" if root else None)
-    if not found or "/snap/" in found or os.path.basename(os.path.realpath(found)) == "snap":
-        return None
-    return os.path.abspath(found)
+    # Debian names it chromium; Fedora and EPEL chromium-browser (a wrapper).
+    for name in ("chromium", "chromium-browser"):
+        found = shutil.which(name, path="/usr/bin:/bin" if root else None)
+        if found and not _snap(found):
+            return os.path.abspath(found)
+    return None
+
+
+def _snap(path: str) -> bool:
+    """A snap Chromium, or Ubuntu's transitional script that starts one."""
+    if "/snap/" in path or os.path.basename(os.path.realpath(path)) == "snap":
+        return True
+    try:
+        with open(path, "rb") as source:
+            head = source.read(65536)
+    except OSError:
+        # Unreadable is not evidence of a snap shim; starting it will tell.
+        return False
+    return head.startswith(b"#!") and b"/snap/" in head

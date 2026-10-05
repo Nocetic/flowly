@@ -46,6 +46,7 @@ def install_plan() -> dict:
             "architecture": architecture if architecture in {"x86_64", "aarch64"} else None,
             "packages": list(recipe["packages"]) if supported else [],
             "browser": dict(recipe["browser"]) if supported else None,
+            "repositories": list(recipe["repositories"]) if supported else [],
             "recipeId": recipe_id(recipe) if supported else None,
             "supported": reason is None, "reason": reason, "scope": "system-packages", "requiresRoot": True,
             "pythonExtra": "screen", "runtimeAccountRequired": bool(hasattr(os, "geteuid") and os.geteuid() == 0),

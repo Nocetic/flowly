@@ -153,7 +153,7 @@ def installation_system(plan_id: str = typer.Option(...), operation_id: str = ty
 # What the person can do about each outcome of `flowly screen install`.
 _ADVICE = {
     "INSTALL_UNSUPPORTED_HOST": "This server's Linux distribution or architecture is not supported for screens yet.",
-    "INSTALL_TOOLS_MISSING": "This server lacks the package tools screens need (apt-get, dpkg, python3).",
+    "INSTALL_TOOLS_MISSING": "This server lacks the tools screens need (python3).",
     "INSTALL_MANAGED_BUILD_REQUIRED": "This Flowly is a packaged build. Install Flowly with install.sh to use screens.",
     "INSTALL_VIRTUALENV_REQUIRED": "Flowly is not in its own virtual environment. Reinstall it with install.sh.",
     "INSTALL_UV_REQUIRED": "uv was not found. Reinstall Flowly with install.sh.",
@@ -163,7 +163,8 @@ _ADVICE = {
     "INSTALL_INDEX_FAILED": "The package lists could not be refreshed. Check the server's internet connection, "
                             "then run `flowly screen install` again.",
     "INSTALL_HOST_PACKAGES_BROKEN": "The server's package manager has unfinished work that Flowly did not start. "
-                                    "Run `sudo dpkg --configure -a`, then `flowly screen install` again.",
+                                    "Finish it (Debian, Ubuntu: `sudo dpkg --configure -a`; Fedora, Rocky, Alma: "
+                                    "`sudo dnf remove --duplicates`), then run `flowly screen install` again.",
     "INSTALL_ACCOUNT_CONFLICT": "An account named flowly-screen exists on this server that Flowly did not create. "
                                 "Remove or rename it, then run `flowly screen install` again.",
     "INSTALL_HISTORY_FULL": "This server has too many installation records. Contact Flowly support.",
@@ -230,6 +231,8 @@ def install(yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask befo
             raise ScreenError("INSTALL_ADMISSION_UNAVAILABLE")
         system = plan["system"]
         typer.echo(f"Flowly will install screen components on this server ({system.get('distribution') or 'Linux'}):")
+        if system.get("repositories"):
+            typer.echo("  Adds package repositories first: " + ", ".join(name.upper() for name in system["repositories"]))
         typer.echo("  System packages: " + ", ".join(system["packages"]))
         typer.echo("  Python packages: " + ", ".join(f"{item['name']} {item['version']}" for item in plan["python"]["packages"]))
         typer.echo("The agent restarts once when this is done; its current work finishes first.")

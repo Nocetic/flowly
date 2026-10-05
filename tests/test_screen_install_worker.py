@@ -270,7 +270,8 @@ def test_an_interrupted_account_creation_still_needs_repair(worker, capsys, monk
     assert json.loads(capsys.readouterr().out)["state"] == "recovery_required"
 
 
-UBUNTU_PROBES = APT | {"/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "/usr/sbin/apparmor_parser"}
+UBUNTU_PROBES = APT | {"/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "/usr/sbin/apparmor_parser",
+                         "/etc/apparmor.d/abi/4.0"}
 UBUNTU = screen_recipe({"ID": "ubuntu", "VERSION_ID": "24.04"}, "x86_64", UBUNTU_PROBES.__contains__)
 
 
@@ -314,3 +315,56 @@ def test_a_host_that_changed_since_review_is_refused_before_anything_runs(ubuntu
     assert json.loads(capsys.readouterr().out) == {"error": "INSTALL_PLAN_CHANGED"}
     ubuntu.command.assert_not_called()
     assert not list(ubuntu.ROOT.glob("*.json"))
+
+
+DNF_PROBES = {"/usr/bin/dnf", "/usr/bin/rpm"}
+
+
+@pytest.fixture
+def dnf_host(worker, monkeypatch):
+    def use(release, machine="x86_64"):
+        worker.os_release = lambda: release
+        worker.PROBE = DNF_PROBES.__contains__
+        monkeypatch.setattr(worker.platform, "machine", lambda: machine)
+        recipe = screen_recipe(release, machine, DNF_PROBES.__contains__)
+        monkeypatch.setattr(worker.sys, "argv", ["worker", OPERATION, PLAN, recipe_id(recipe)])
+        return recipe
+    return use
+
+
+def test_el9_enables_epel_and_crb_then_installs_with_dnf(worker, dnf_host, capsys):
+    recipe = dnf_host({"ID": "rocky", "ID_LIKE": "rhel centos fedora", "VERSION_ID": "9.4"})
+    assert worker.main() == 0
+    calls = [call.args[0] for call in worker.command.call_args_list]
+    assert calls[0][:3] == ["/usr/bin/rpm", "-qa", "--qf"]
+    assert calls[1][-3:] == ["install", "epel-release", "dnf-plugins-core"]
+    assert calls[2] == ["/usr/bin/dnf", "config-manager", "--set-enabled", "crb"]
+    assert calls[3][-1] == "makecache"
+    assert calls[4][:3] == ["/usr/bin/dnf", "-y", "--setopt=install_weak_deps=False"]
+    assert calls[4][3:] == ["install", *recipe["packages"]]
+    assert not any("apt-get" in call[0] for call in calls)
+
+
+def test_fedora_adds_no_repository(worker, dnf_host, capsys):
+    dnf_host({"ID": "fedora", "VERSION_ID": "42"}, "aarch64")
+    assert worker.main() == 0
+    calls = [call.args[0] for call in worker.command.call_args_list]
+    assert not any("epel-release" in call or "config-manager" in call for call in calls)
+
+
+def test_duplicate_rpms_someone_else_left_are_not_touched(worker, dnf_host, capsys):
+    dnf_host({"ID": "fedora", "VERSION_ID": "42"})
+    worker.command.side_effect = lambda args, *rest, **kw: (0, b"bash.x86_64\nglibc.x86_64\nglibc.x86_64\n")
+    assert worker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "failed" and result["error"] == "INSTALL_HOST_PACKAGES_BROKEN"
+    assert len(worker.command.call_args_list) == 1
+
+
+def test_duplicates_an_interrupted_run_left_are_removed_first(worker, dnf_host, capsys):
+    dnf_host({"ID": "fedora", "VERSION_ID": "42"})
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    assert worker.main() == 0
+    calls = [call.args[0] for call in worker.command.call_args_list]
+    assert calls[0][-2:] == ["remove", "--duplicates"]

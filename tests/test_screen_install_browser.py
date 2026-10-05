@@ -167,6 +167,7 @@ def test_an_endless_download_stops_at_the_pinned_size(worker):
     (True, False, {}, None),
     (False, False, {"chromium": "/usr/local/bin/chromium"}, "/usr/local/bin/chromium"),  # the agent's PATH, as before
     (False, False, {"chromium": "/snap/bin/chromium"}, None),  # never a snap
+    (True, False, {"chromium-browser": "/usr/bin/chromium-browser"}, "fedora"),  # Fedora/EPEL wrapper
 ])
 def test_a_screen_runs_the_published_pinned_browser_else_the_distributions(monkeypatch, root, pinned, found, expected):
     from flowly.desktop_runtime import install_recipe
@@ -179,8 +180,17 @@ def test_a_screen_runs_the_published_pinned_browser_else_the_distributions(monke
         assert system is root
         return found.get(name) if not root or found.get(name, "").startswith("/usr/bin/") else None
     monkeypatch.setattr("shutil.which", which)
+    # Ubuntu's chromium-browser starts the snap; Fedora's runs its own build.
+    def content(path):
+        if path.endswith("chromium-browser"):
+            return (b"#!/usr/bin/bash\nexec /usr/lib64/chromium-browser/chromium-browser \"$@\"\n" if expected == "fedora"
+                    else b"#!/bin/sh\nexec /snap/bin/chromium \"$@\"\n")
+        return b"\x7fELF\x02\x01\x01"  # a real executable
+    monkeypatch.setattr(install_recipe, "open", lambda path, mode="r": __import__("io").BytesIO(content(path)), raising=False)
     result = install_recipe.screen_browser()
-    if expected == "pinned":
+    if expected == "fedora":
+        assert result == "/usr/bin/chromium-browser"
+    elif expected == "pinned":
         assert result == f"{install_recipe.BROWSER_ROOT}/145.0.7632.6/chrome-linux64/chrome"
     else:
         assert result == expected

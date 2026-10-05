@@ -176,6 +176,53 @@ def prepare_packages(repair):
         return "failed", "INSTALL_HOST_PACKAGES_BROKEN"
     return None
 
+DNF = ["/usr/bin/dnf", "-y", "--setopt=install_weak_deps=False"]
+
+def rpm_duplicates():
+    """Packages rpm lists twice (an interrupted transaction leaves both
+    versions); None if the database cannot be read."""
+    code, raw = command(["/usr/bin/rpm", "-qa", "--qf", "%{NAME}.%{ARCH}\\n"], 120, capture=1 << 22)
+    if code or len(raw) >= 1 << 22:
+        return None
+    seen, duplicates = set(), set()
+    for name in raw.decode("utf-8", "replace").splitlines():
+        if name in seen:
+            duplicates.add(name)
+        seen.add(name)
+    return sorted(duplicates)
+
+def prepare_rpm(repair):
+    if repair:
+        # Keep the newer of two half-replaced versions; never anything else.
+        command([*DNF, "remove", "--duplicates"], 600)
+    duplicates = rpm_duplicates()
+    if duplicates is None or duplicates:
+        return ("recovery_required", "INSTALL_PACKAGES_FAILED") if repair else ("failed", "INSTALL_HOST_PACKAGES_BROKEN")
+    return None
+
+def prepare(recipe, repair):
+    return prepare_packages(repair) if recipe["family"] == "apt" else prepare_rpm(repair)
+
+def refresh(recipe):
+    """Refresh package indexes (and enable the recipe's repositories)."""
+    if recipe["family"] == "apt":
+        return command([*APT, "-o", "APT::Update::Error-Mode=any", "update"], 180)[0]
+    if "epel" in recipe["repositories"]:
+        code, _ = command([*DNF, "install", "epel-release", "dnf-plugins-core"], 300)
+        if code:
+            return code
+    if "crb" in recipe["repositories"]:
+        code, _ = command(["/usr/bin/dnf", "config-manager", "--set-enabled", "crb"], 60)
+        if code:
+            return code
+    return command([*DNF, "makecache"], 300)[0]
+
+def install_packages(recipe):
+    if recipe["family"] == "apt":
+        return command([*APT, "install", "-y", "--no-install-recommends", "--no-remove", "--no-upgrade",
+                        *recipe["packages"]], 600)[0]
+    return command([*DNF, "install", *recipe["packages"]], 900)[0]
+
 def main():
     if os.geteuid() != 0 or len(sys.argv) != 4:
         return fail("INSTALL_PRIVILEGE_REQUIRED")
@@ -235,21 +282,18 @@ def main():
                  "updatedAt": int(time.time())}
         save(path, value)
         try:
-            problem = prepare_packages(repair)
+            problem = prepare(recipe, repair)
             if problem:
                 value.update(state=problem[0], error=problem[1])
             else:
                 value.update(phase="updating", updatedAt=int(time.time()))
                 save(path, value)
-                code, _ = command([*APT, "-o", "APT::Update::Error-Mode=any", "update"], 180)
-                if code:
+                if refresh(recipe):
                     value.update(state="failed", error="INSTALL_INDEX_FAILED")
                 else:
                     value.update(phase="installing", updatedAt=int(time.time()))
                     save(path, value)
-                    code, _ = command([*APT, "install", "-y", "--no-install-recommends", "--no-remove", "--no-upgrade",
-                                       *recipe["packages"]], 600)
-                    if code:
+                    if install_packages(recipe):
                         value.update(state="recovery_required", error="INSTALL_PACKAGES_FAILED")
                     else:
                         # Root-hosted agents need a separate locked application
