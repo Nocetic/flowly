@@ -28,7 +28,10 @@ def account_directory(path, create=False):
         if create and component == path:
             component.mkdir(mode=0o755, exist_ok=True)
         info = component.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        # Changeable by root alone: never by others; by the group only if it
+        # is root's ('/' is 775 on some Fedora images).
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o002
+                or (info.st_mode & 0o020 and info.st_gid != 0)):
             raise ValueError("INSTALL_STATE_INVALID")
 
 def account_read(path):

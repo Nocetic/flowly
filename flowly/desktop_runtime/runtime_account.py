@@ -33,7 +33,10 @@ def _trusted_root(path: Path) -> None:
     # protect a root process from a user replacing a writable parent directory.
     for component in reversed((path, *path.parents)):
         info = component.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        # Changeable by root alone: never by others; by the group only if it
+        # is root's ('/' is 775 on some Fedora images).
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o002
+                or (info.st_mode & 0o020 and info.st_gid != 0)):
             raise ValueError()
 
 

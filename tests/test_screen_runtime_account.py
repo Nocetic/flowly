@@ -74,15 +74,15 @@ def test_untrusted_ancestor_is_rejected(monkeypatch, bad):
 
     def inspect(path):
         seen.append(str(path))
-        mode, uid = stat.S_IFDIR | 0o755, 0
+        mode, uid, gid = stat.S_IFDIR | 0o755, 0, 0
         if str(path) == "/var/lib":
             if bad == "symlink":
                 mode = stat.S_IFLNK | 0o777
             elif bad == "writable":
-                mode |= 0o020
+                mode, gid = mode | 0o020, 1000  # an ordinary group may write
             else:
                 uid = 1000
-        return SimpleNamespace(st_mode=mode, st_uid=uid)
+        return SimpleNamespace(st_mode=mode, st_uid=uid, st_gid=gid)
 
     monkeypatch.setattr(account.Path, "lstat", inspect)
     with pytest.raises(ValueError):
