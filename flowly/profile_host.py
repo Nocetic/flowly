@@ -220,6 +220,39 @@ def _profile_reply_text(value: Any) -> str:
     ).strip()
 
 
+def _tool_activity(event: str, payload: dict[str, Any]) -> dict[str, str] | None:
+    """The compact signal an agent's roster draws from: which tool, start or end.
+
+    A directory socket (the apps' strip, agents list and groups) never sees a
+    conversation's own events, yet draws every agent as a character that looks
+    at a terminal while a command runs and scans while it searches. This is all
+    it needs: the tool's name and call id, and when the conversation's turn
+    ends (``idle``, which ends whatever it left open). A call's arguments and
+    result never leave the conversation.
+    """
+    scope = payload.get("sessionKey")
+    scope = scope[:512] if isinstance(scope, str) else ""
+    if event == "chat":
+        if payload.get("state") in ("final", "aborted", "error"):
+            return {"phase": "idle", "scope": scope}
+        return None
+    if event not in ("tool.start", "tool.complete"):
+        return None
+    call_id = payload.get("toolCallId")
+    name = payload.get("name")
+    if not isinstance(call_id, str) or not isinstance(name, str):
+        return None
+    call_id, name = call_id.strip(), name.strip()
+    if not 0 < len(call_id) <= 256 or not 0 < len(name) <= 128:
+        return None
+    return {
+        "phase": "start" if event == "tool.start" else "end",
+        "scope": scope,
+        "callId": call_id,
+        "name": name,
+    }
+
+
 def _profile_terminal_state(payload: dict[str, Any]) -> str:
     """The gateway emits interrupted turns as final + aborted, with partial text."""
     if payload.get("aborted") is True or payload.get("state") == "aborted":
@@ -2266,6 +2299,12 @@ class ProfileHost:
                 event == "chat" and payload.get("state") in _ATTENTION_CHAT_STATES
             ):
                 self._schedule_attention_refresh(runtime)
+        if not internal_turn:
+            # Before the group-room hand-off: an agent working in a group is
+            # still that agent working, and its character shows it.
+            activity = _tool_activity(event, payload)
+            if activity is not None:
+                await self._emit(profile, "tool.activity", activity)
         if await self._rooms.handle_profile_event(profile, event, payload):
             return
         if event == "exec.approval.requested" and payload.get("id"):

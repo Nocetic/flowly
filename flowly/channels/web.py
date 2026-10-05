@@ -677,7 +677,9 @@ class WebChannel(BaseChannel):
             return
         targets: set[str] = set()
 
-        if event_type == "directory":
+        # A tool's activity is for the roster: the conversation's own readers
+        # have the full tool events already.
+        if event_type in ("directory", "tool.activity"):
             targets.update(self._profile_directory_sessions)
         elif event_type in {"connection", "error", "needsInput"}:
             targets.update(self._profile_directory_sessions)

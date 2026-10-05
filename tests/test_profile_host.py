@@ -1368,7 +1368,12 @@ async def test_interactive_task_uses_visible_session_and_preserves_questions(pro
     assert sent['turnOrigin'] == 'user'
     assert sent['disabledTools'] == []
     assert result['response'] == 'Report ready'
-    assert len(events) == 3
+    # The question, the approval and the turn's end reach the visible work
+    # conversation; the roster is told separately that the turn went idle.
+    assert [e['type'] for e in events if e['type'] != 'tool.activity'] == [
+        'agent.clarify.requested', 'exec.approval.requested', 'chat',
+    ]
+    assert [e['data']['phase'] for e in events if e['type'] == 'tool.activity'] == ['idle']
     assert not host._interactive_task_sessions
     assert host.task_audit(profile, 'voice-run')['outcome'] == 'ok'
 

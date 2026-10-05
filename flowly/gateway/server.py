@@ -5559,7 +5559,9 @@ class GatewayServer:
         for client_id, subscription in tuple(
             self._profile_client_subscriptions.items()
         ):
-            if event_type == "directory" and subscription.directory:
+            # A tool's activity is for the roster: the conversation's own
+            # readers have the full tool events already.
+            if event_type in ("directory", "tool.activity") and subscription.directory:
                 targets.add(client_id)
             elif event_type in {"connection", "error", "needsInput"} and (
                 subscription.directory
