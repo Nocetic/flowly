@@ -358,3 +358,19 @@ def test_the_plan_names_a_dependency_conflict_before_anything_is_installed(host,
     monkeypatch.setattr(worker, "conflicts", lambda: ["greenlet"])
     plan = installer.python_plan()
     assert plan["supported"] is False and plan["reason"] == "INSTALL_DEPENDENCY_CONFLICT"
+
+
+def test_verification_also_proves_the_agent_still_starts(monkeypatch):
+    commands = []
+    monkeypatch.setattr(worker, "run_command", lambda command, timeout: commands.append(command[-1]) or 0)
+    assert worker.verify()
+    assert commands[-1] == worker.AGENT_IMPORT
+    monkeypatch.setattr(worker, "run_command", lambda command, timeout: 1 if command[-1] == worker.AGENT_IMPORT else 0)
+    assert not worker.verify()
+
+
+def test_the_agent_import_check_imports_for_real():
+    # The modules named must exist, or verification would always fail.
+    import importlib
+    for module in worker.AGENT_IMPORT.removeprefix("import ").split(", "):
+        importlib.import_module(module)

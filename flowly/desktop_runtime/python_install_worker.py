@@ -187,11 +187,18 @@ def install(uv, requirements, reinstall=False):
     ], 300)
 
 
+# The agent's own gateway must still import in a fresh process: a package
+# change that breaks it is caught here, before any restart, so the running
+# agent stays up instead of restarting into a crash loop.
+AGENT_IMPORT = "import flowly.gateway.server, flowly.agent.loop"
+
+
 def verify():
     # Fresh imports and the actual bundled driver prove more than dist-info.
     # Starting Playwright's driver does not download or launch a browser.
-    return run_command([sys.executable, "-I", "-c",
-                        "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); p.stop()"], 15) == 0
+    return (run_command([sys.executable, "-I", "-c",
+                         "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); p.stop()"], 15) == 0
+            and run_command([sys.executable, "-I", "-c", AGENT_IMPORT], 60) == 0)
 
 
 def main():
