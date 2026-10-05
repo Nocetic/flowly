@@ -337,6 +337,21 @@ def _validate_access_policy(method: str, value: dict[str, Any]) -> dict[str, Any
     return value
 
 
+def profile_rpc_session_key(method: str, params: dict[str, Any]) -> str:
+    """The conversation a validated profile call is about, or "".
+
+    Every ``agent.home.*`` call is about the agent's home conversation, though
+    none carries its key: the introduction it starts streams there, and the
+    caller must be watching it before the first words are sent.
+    """
+    if method.startswith("agent.home."):
+        from flowly.agent_home import HOME_SESSION
+
+        return HOME_SESSION
+    session_key = params.get("sessionKey")
+    return session_key if isinstance(session_key, str) else ""
+
+
 def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(method, str) or method not in PROFILE_RPC_TIMEOUTS:
         raise ProfileHostError(

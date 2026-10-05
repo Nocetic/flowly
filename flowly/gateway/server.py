@@ -53,7 +53,7 @@ from flowly.profile_collaboration import (
 from flowly.profile_collaboration import (
     ProfileRunBinding as _ProfileRunBinding,
 )
-from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
+from flowly.profile_host_contract import ProfileHostError, profile_rpc_session_key, validate_profile_rpc
 from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
@@ -5512,8 +5512,10 @@ class GatewayServer:
                 )
             except ProfileHostError:
                 return
+            # A home call binds its conversation too: the introduction it
+            # starts streams there, before any history read binds it.
             session_key = (
-                str(validated_params.get("sessionKey") or "")
+                profile_rpc_session_key(_inner_method, validated_params)
                 if isinstance(validated_params, dict)
                 else ""
             )

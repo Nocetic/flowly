@@ -31,7 +31,7 @@ from flowly.live_voice.relay_events import RelayOutbound, RelayRecipients
 from flowly.live_voice.relay_transport import CAPABILITY as RELAY_VOICE_CAPABILITY
 from flowly.live_voice.relay_transport import RelayBrowserVerifier, RelayMessage, RelayPrincipal
 from flowly.profile import get_flowly_home
-from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
+from flowly.profile_host_contract import ProfileHostError, profile_rpc_session_key, validate_profile_rpc
 from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
 
@@ -775,12 +775,14 @@ class WebChannel(BaseChannel):
             inner_method = str(params.get("method") or "")
             inner_params = params.get("params")
             try:
-                _validated_method, validated_params = validate_profile_rpc(
+                validated_method, validated_params = validate_profile_rpc(
                     inner_method, inner_params
                 )
             except ProfileHostError:
-                validated_params = {}
-            inner_session_key = str(validated_params.get("sessionKey") or "")
+                validated_method, validated_params = "", {}
+            # A home call binds its conversation too: the introduction it
+            # starts streams there, before any history read binds it.
+            inner_session_key = profile_rpc_session_key(validated_method, validated_params)
             if inner_session_key:
                 # Bind before dispatch: chat.send may emit its first event
                 # immediately after the acknowledgement on a fast local model.
