@@ -179,17 +179,15 @@ def prepare_packages(repair):
 DNF = ["/usr/bin/dnf", "-y", "--setopt=install_weak_deps=False"]
 
 def rpm_duplicates():
-    """Packages rpm lists twice (an interrupted transaction leaves both
-    versions); None if the database cannot be read."""
-    code, raw = command(["/usr/bin/rpm", "-qa", "--qf", "%{NAME}.%{ARCH}\\n"], 120, capture=1 << 22)
+    """Packages installed in two versions (an interrupted transaction leaves
+    both); None if that cannot be read. dnf's own query: kernels and GPG keys
+    are installed many times by design (a plain rpm -qa count flagged every
+    EL9 host with two signing keys, seen live)."""
+    code, raw = command(["/usr/bin/dnf", "-q", "repoquery", "--duplicates", "--qf", "%{name}.%{arch}\\n"], 300,
+                        capture=1 << 22)
     if code or len(raw) >= 1 << 22:
         return None
-    seen, duplicates = set(), set()
-    for name in raw.decode("utf-8", "replace").splitlines():
-        if name in seen:
-            duplicates.add(name)
-        seen.add(name)
-    return sorted(duplicates)
+    return sorted({line.strip() for line in raw.decode("utf-8", "replace").splitlines() if line.strip()})
 
 def prepare_rpm(repair):
     if repair:

@@ -336,7 +336,7 @@ def test_el9_enables_epel_and_crb_then_installs_with_dnf(worker, dnf_host, capsy
     recipe = dnf_host({"ID": "rocky", "ID_LIKE": "rhel centos fedora", "VERSION_ID": "9.4"})
     assert worker.main() == 0
     calls = [call.args[0] for call in worker.command.call_args_list]
-    assert calls[0][:3] == ["/usr/bin/rpm", "-qa", "--qf"]
+    assert calls[0][:4] == ["/usr/bin/dnf", "-q", "repoquery", "--duplicates"]
     assert calls[1][-3:] == ["install", "epel-release", "dnf-plugins-core"]
     assert calls[2] == ["/usr/bin/dnf", "config-manager", "--set-enabled", "crb"]
     assert calls[3][-1] == "makecache"
@@ -354,7 +354,7 @@ def test_fedora_adds_no_repository(worker, dnf_host, capsys):
 
 def test_duplicate_rpms_someone_else_left_are_not_touched(worker, dnf_host, capsys):
     dnf_host({"ID": "fedora", "VERSION_ID": "42"})
-    worker.command.side_effect = lambda args, *rest, **kw: (0, b"bash.x86_64\nglibc.x86_64\nglibc.x86_64\n")
+    worker.command.side_effect = lambda args, *rest, **kw: (0, b"glibc.x86_64\n")
     assert worker.main() == 1
     result = json.loads(capsys.readouterr().out)
     assert result["state"] == "failed" and result["error"] == "INSTALL_HOST_PACKAGES_BROKEN"
