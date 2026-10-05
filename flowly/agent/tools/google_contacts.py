@@ -6,10 +6,10 @@ Read-only — no write operations, no approval needed.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
-from loguru import logger
 
 from flowly.agent.tools.base import Tool
 from flowly.channels import gmail_auth
@@ -57,7 +57,12 @@ class GoogleContactsTool(Tool):
         }
 
     async def execute(self, action: str, **kwargs: Any) -> str:
-        token, _ = gmail_auth.get_valid_access_token()
+        token, _ = await asyncio.to_thread(gmail_auth.get_valid_access_token, "contacts")
+        credentials = gmail_auth.load_credentials("contacts")
+        if credentials and credentials.get("mode") == "flowly_broker":
+            from flowly.integrations.google_permissions import granted_services
+            if "contacts" not in granted_services(credentials):
+                return "Error: PERMISSION_REQUIRED: Request contacts access with google_connection."
         if not token:
             return "Error: Google account not connected."
 

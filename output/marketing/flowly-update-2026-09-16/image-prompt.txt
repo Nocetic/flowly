@@ -1,0 +1,20 @@
+Generated with the built-in image_gen tool. Logo reference: /Users/hakanoren/flowly-app/public/icon-512x512.png
+
+Use case: ads-marketing
+Create one polished English social announcement graphic for Flowly's upcoming product update. Landscape 3:2 format, high resolution. The user's request is a SIMPLE visual matching the actual Flowly web app's 2026 dark editorial design language.
+Reference image: the supplied image is ONLY a reference for Flowly's existing white woven-loop brand mark. Reproduce the mark faithfully, small, beside the Flowly wordmark at top left. Do not use the reference's square background.
+Design: pure black #000 background, charcoal cards #0c0d0e, fine #353535 hairline vertical rails and horizontal dividers, white text, restrained cyan #61e1fe accent only on small icons and status dots. Spacious editorial composition. Figtree-like UI text and Overused Grotesk-like contemporary sans headline, tight clean kerning, one short italic phrase. A few very faint radial dash marks behind the upper right area echo the website. No purple background, no loud glow, no generic gradients, no large color fills. Flat front-on graphic, not a device mockup.
+Layout: generous outer margins. Top left small brand mark plus "Flowly"; top right small label "PRODUCT UPDATE". Large headline in the top half aligned left. Below it a single row of three beautifully typeset simple dark UI-style feature cards, with generous spacing, fine borders, and small cyan line icons. No screenshot simulation, no dense dashboard. Card 1 uses a tiny linked-nodes icon. Card 2 uses three small distinct woven-loop profile symbols. Card 3 uses a tiny understated check icon. Footer separated by a fine horizontal rule.
+Exact text, and no other text:
+Brand: "Flowly"
+Label: "PRODUCT UPDATE"
+Headline on two lines: "More capable." / "Less to manage."
+Card 1 title: "Advanced MCP"
+Card 1 body: "Easier connections.\nMore reliable tools."
+Card 2 title: "Flowly Bots"
+Card 2 body: "Separate memory, models\nand integrations."
+Card 3 title: "Smoother every day"
+Card 3 body: "Less setup.\nMore autonomous work."
+Footer left: "Desktop · iOS · Android"
+Footer right: "Knows your world. Answers to you."
+Keep all lettering very crisp and legible on a social feed, card titles clearly larger than body text. Do not add a version number, date, release availability claim, app store badges, competitor logos, arbitrary metrics, or any extra features. Calm, premium, restrained.

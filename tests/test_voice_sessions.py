@@ -305,3 +305,22 @@ def test_transcript_rows_keep_their_first_heard_time_in_utc(voice):
     corrected = append(voice, text='Raporu hemen hazırla.', revision=2)['message']['voice']
     assert corrected['createdAt'] == first and corrected['revision'] == 2
     assert voice.history({'conversationId': 'conversation-1'})['messages'][0]['voice']['createdAt'] == first
+
+
+def test_a_connection_records_the_app_holding_the_call(voice):
+    opened = open_call(voice, client='ios')
+    assert opened['lastConnection']['client'] == 'ios' and opened['lastConnection']['endedAt'] is None
+    # Another device reading the conversation sees where the call runs.
+    assert voice.get('conversation-1')['lastConnection']['client'] == 'ios'
+    # Replaying the same open is idempotent; the same connection cannot change app.
+    assert open_call(voice, client='ios')['lastConnection']['client'] == 'ios'
+    with pytest.raises(VoiceError):
+        open_call(voice, client='desktop')
+    voice.end({'conversationId': 'conversation-1', 'connectionId': 'connection-1'})
+    assert open_call(voice, connectionId='connection-2', client='desktop')['lastConnection']['client'] == 'desktop'
+
+
+def test_older_clients_send_no_app_and_unknown_apps_are_refused(voice):
+    assert 'client' not in open_call(voice)['lastConnection']
+    with pytest.raises(VoiceError):
+        open_call(voice, connectionId='connection-2', client='watch')

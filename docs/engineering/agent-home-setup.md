@@ -227,6 +227,12 @@ words and survives reloads and other devices:
 | `agent.home.introduce` | `expectedBotId?`, `locale?` | public view (starts the introduction once) |
 | `agent.home.setup` | `expectedBotId?`, `state: complete\|skipped` | public view |
 
+Every `agent.home.*` call is about the home conversation, though none
+carries its key. The gateway and the relay bind the caller to
+`(profile, desktop:profile-home)` before dispatching it
+(`profile_rpc_session_key`), so the introduction it starts streams to the
+app that asked from its first word, not only after a later history read.
+
 Public view (version 1, additive):
 `{version, botId, sessionKey, setup, introduction, introductionRunId?, pendingAsk, card}`.
 `introductionRunId` is present only while `running`. `pendingAsk`/`card` are

@@ -6,7 +6,6 @@ prompt is accepted. The authenticated profile host chooses the runtime.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import sqlite3
@@ -16,11 +15,10 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from flowly.compaction.redaction import redact_secrets
+from flowly.live_voice.conversation_recall import search_conversations
+from flowly.live_voice.memory_view import GovernedMemory, read_db, read_memory_file, revision_of
 from flowly.live_voice.sessions import VoiceError, bounded_text, integer
 from flowly.memory.summary import SENTINEL_END, SENTINEL_START
-
-MAX_SOURCE_BYTES = 128_000
-MAX_GOVERNED = 10_000
 
 
 def validate_context(params: dict) -> dict:
@@ -30,17 +28,17 @@ def validate_context(params: dict) -> dict:
             'limit': integer(params.get('limit', 8), 'limit', minimum=1, maximum=12)}
 
 
-def _revision(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:24]
+_revision = revision_of
+_read_db = read_db
 
 
-def _read_db(path: Path, sql: str, values: tuple = ()) -> list[dict]:
-    connection = sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True, timeout=0.25)
-    connection.row_factory = sqlite3.Row
-    try:
-        return [dict(row) for row in connection.execute(sql, values)]
-    finally:
-        connection.close()
+def manual_memory(text: str) -> str:
+    """MEMORY.md without its generated block(s): the human-written notes.
+
+    The generated block renders governed items; callers take those from the
+    governance view instead, so a withdrawn item is never read back from it.
+    """
+    return _manual(text)
 
 
 def _manual(text: str) -> str:
@@ -51,11 +49,15 @@ def _manual(text: str) -> str:
 
 class VoiceContext:
     def __init__(self, workspace: Path, *, state_db: Callable[[str], Path],
-                 profile: Callable[[], tuple[str, str]], index: Callable[[], Any] = lambda: None):
+                 profile: Callable[[], tuple[str, str]], index: Callable[[], Any] = lambda: None,
+                 conversations: Callable[[], tuple[Path, Path] | None] = lambda: None):
         self.workspace = workspace.resolve()
         self.state_db = state_db
         self.profile = profile
         self.index = index
+        # (conversation index, sessions folder): past conversations recall
+        # searches as the agent's session_search does.
+        self.conversations = conversations
 
     async def search(self, params: dict) -> dict:
         request = validate_context(params)
@@ -64,66 +66,52 @@ class VoiceContext:
         words = set(re.findall(r'\w+', query.casefold()))
         facts: list[dict] = []
         sources: dict[str, dict] = {}
-        protected: list[str] = []
-        governed: list[dict] = []
-        excluded_triples: set[str] = set()
-        governance_ok = True
         now = datetime.now(timezone.utc).isoformat()
 
         def rank(text: str) -> int:
             folded = text.casefold()
             return sum(word in folded for word in words) if words else 1
 
-        def add(text: str, ref: str, revision: str, updated_at: Any = None, **provenance) -> None:
+        searched: set[int] = set()
+
+        def add(text: str, ref: str, revision: str, updated_at: Any = None, *, matched: bool = False,
+                **provenance) -> None:
             text = redact_secrets(text).strip()
-            if not text or (words and not rank(text)):
+            # A memory-search match is relevant by the agent's own search (as
+            # in its chat), even without the query's literal words.
+            if not text or (words and not matched and not rank(text)):
                 return
+            if matched:
+                searched.add(len(facts))
             facts.append({'text': text[:900], 'sourceRef': ref, 'revision': revision,
                           'updatedAt': updated_at, **provenance})
 
-        gov_path = self.state_db('memory_governance.sqlite3')
-        try:
-            if gov_path.exists():
-                governed = _read_db(gov_path, 'SELECT * FROM memory_items LIMIT ?', (MAX_GOVERNED + 1,))
-                if len(governed) > MAX_GOVERNED:
-                    raise ValueError('Governance projection limit')
-                for item in governed:
-                    allowed = (item['status'] == 'active' and item['privacy_level'] == 'normal'
-                               and (not item['valid_to'] or item['valid_to'] > now)
-                               and (not item['valid_from'] or item['valid_from'] <= now))
-                    if not allowed:
-                        if item['text'].strip():
-                            protected.append(item['text'].casefold().strip())
-                        if item['ref_kind'] == 'kg_triple' and item['ref_id']:
-                            excluded_triples.add(str(item['ref_id']))
-                    else:
-                        add(item['text'], f"memory://item/{quote(item['id'], safe='')}", _revision(item),
-                            item.get('updated_at'), sourceSession=item['source_session'],
-                            sourceMessageIds=json.loads(item['source_message_ids']))
-            sources['governance'] = {'status': 'ok' if governed else 'empty', 'revision': _revision(governed)}
-        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
-            governance_ok = False
-            sources['governance'] = {'status': 'unavailable'}
-            facts = []
+        governed = GovernedMemory.load(self.state_db, now)
+        governance_ok = governed.available
+        protected, excluded_triples = governed.protected, governed.excluded_triples
+        if governance_ok:
+            try:
+                for item in governed.allowed:
+                    add(item['text'], f"memory://item/{quote(item['id'], safe='')}", _revision(item),
+                        item.get('updated_at'), sourceSession=item['source_session'],
+                        sourceMessageIds=json.loads(item['source_message_ids']))
+            except (ValueError, KeyError, TypeError):
+                # A malformed governed row is an unreadable index: export nothing.
+                governance_ok = False
+                facts = []
+        sources['governance'] = ({'status': governed.status, 'revision': governed.revision}
+                                 if governance_ok else {'status': 'unavailable'})
 
         def read_file(relative: str) -> tuple[str, str, str] | None:
-            path = (self.workspace / relative).resolve()
-            if not path.is_relative_to(self.workspace):
+            source = read_memory_file(self.workspace, relative)
+            if source is None:
                 return None
-            if not path.is_file():
-                return None
-            if path.stat().st_size > MAX_SOURCE_BYTES:
-                raise ValueError('Memory source limit')
-            with path.open('rb') as handle:
-                raw = handle.read(MAX_SOURCE_BYTES + 1)
-            if len(raw) > MAX_SOURCE_BYTES:
-                raise ValueError('Memory source limit')
-            text = raw.decode('utf-8')
+            text, revision, updated_at = source
             # A manually copied governed item does not bypass its privacy or
             # lifecycle. Conservatively withhold that file if it contains one.
-            if any(item in text.casefold() for item in protected):
+            if governed.withholds(text):
                 return None
-            return _manual(text), _revision(raw.hex()), datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+            return _manual(text), revision, updated_at
 
         if governance_ok:
             for name, relative in [('user', 'USER.md'), ('memory', 'memory/MEMORY.md')]:
@@ -142,7 +130,9 @@ class VoiceContext:
 
             try:
                 index = self.index()
-                matches = await asyncio.wait_for(index.search(query, max_results=12), 1.5) if query and index else []
+                matches = await asyncio.wait_for(
+                    index.search(query, max_results=12, embedding_timeout=0.8), 1.5
+                ) if query and index else []
                 for match in matches:
                     relative = str(match.path)
                     # Search results are data. Do not follow an index entry
@@ -155,10 +145,13 @@ class VoiceContext:
                     text, revision, updated_at = source
                     # Verify the snippet against current manual source content;
                     # stale/generated index entries cannot restore removed facts.
-                    snippet = str(match.snippet).strip()
+                    # Display snippets may end with a synthetic ellipsis. Use
+                    # full evidence for verification, then bound the exported
+                    # fact in add(); never loosen the stale/privacy check.
+                    snippet = str(getattr(match, 'source_text', '') or match.snippet).strip()
                     if snippet and snippet in text:
                         add(snippet, f'memory://file/{quote(relative, safe="/")}#L{match.start_line}', revision,
-                            updated_at, startLine=match.start_line, endLine=match.end_line)
+                            updated_at, matched=True, startLine=match.start_line, endLine=match.end_line)
                 sources['search'] = {'status': 'ok' if index else 'unavailable'}
             except (OSError, ValueError, RuntimeError, asyncio.TimeoutError):
                 sources['search'] = {'status': 'unavailable'}
@@ -184,13 +177,34 @@ class VoiceContext:
                 sources['knowledge'] = {'status': 'ok' if triples else 'empty', 'revision': _revision(triples)}
             except (OSError, sqlite3.Error, ValueError):
                 sources['knowledge'] = {'status': 'unavailable'}
+
+            # What was said: the best matching moments of past conversations
+            # (chats and calls), as the agent's own session_search finds them.
+            located = self.conversations() if query else None
+            if located:
+                try:
+                    hits = await asyncio.wait_for(asyncio.to_thread(search_conversations, *located, query), 1.5)
+                    for hit in hits:
+                        if governed.withholds(hit.text):
+                            continue
+                        heading = f"{'Call' if hit.is_call else 'Conversation'}{': ' + hit.title if hit.title else ''}"
+                        when = datetime.fromtimestamp(hit.at, timezone.utc).isoformat() if hit.at else None
+                        add(f"{heading} ({when[:10] if when else 'earlier'})\n{hit.text}",
+                            f"memory://conversation/{_revision(hit.key)}", _revision(hit.text), when,
+                            matched=True, kind='conversation')
+                    sources['conversations'] = {'status': 'ok' if hits else 'empty'}
+                except (OSError, sqlite3.Error, ValueError, asyncio.TimeoutError):
+                    sources['conversations'] = {'status': 'unavailable'}
         else:
             # A corrupt/unreadable privacy index is not equivalent to no
             # private items. Do not export unfiltered mirrors as a fallback.
             sources.update({name: {'status': 'unavailable'} for name in ('user', 'memory', 'search', 'knowledge')})
 
         unique: dict[str, dict] = {}
-        for fact in sorted(facts, key=lambda f: -rank(f['text'])):
+        # Keyword overlap ranks; a memory-search match counts one more, so a
+        # semantic hit is not pushed out by facts that merely share a word.
+        order = sorted(range(len(facts)), key=lambda i: -(rank(facts[i]['text']) + (i in searched)))
+        for fact in (facts[i] for i in order):
             unique.setdefault(fact['text'].casefold(), fact)
         selected = list(unique.values())[:limit]
         return {'scope': {'profile': scope_profile, 'botId': bot_id}, 'facts': selected, 'sources': sources,

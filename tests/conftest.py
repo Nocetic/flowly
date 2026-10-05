@@ -29,9 +29,12 @@ import pytest  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _fresh_push_notifications():
-    """Each test starts with no pushed or scheduled notification events."""
-    from flowly.push import notifications
+    """Each test starts with no pushed or scheduled notification events, and
+    no computer reporting its owner present."""
+    from flowly.push import notifications, presence
 
     notifications._reset_for_tests()
+    presence._reset_for_tests()
     yield
     notifications._reset_for_tests()
+    presence._reset_for_tests()

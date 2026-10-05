@@ -11,8 +11,7 @@ from typing import Any
 
 from loguru import logger
 
-from flowly.memory.chunker import chunk_text, Chunk
-
+from flowly.memory.chunker import chunk_text
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -104,9 +103,9 @@ class MemoryIndexer:
 
     # ── Sync ──────────────────────────────────────────────────────────────────
 
-    def needs_reindex(self, path: Path) -> bool:
+    def needs_reindex(self, path: Path, workspace: Path | None = None) -> bool:
         """Return True if the file has changed since last index."""
-        rel = str(path)
+        rel = str(path.relative_to(workspace)) if workspace and path.is_relative_to(workspace) else str(path)
         cur = self._conn.execute("SELECT hash FROM files WHERE path = ?", (rel,))
         row = cur.fetchone()
         if row is None:
@@ -213,9 +212,24 @@ class MemoryIndexer:
     def get_all_chunks(self) -> list[dict[str, Any]]:
         """Return all chunks with their embeddings (for vector search)."""
         rows = self._conn.execute(
-            "SELECT id, path, start_line, end_line, text, embedding FROM chunks"
+            "SELECT id, path, start_line, end_line, text, hash, model, embedding FROM chunks"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def store_embeddings(self, chunks: list[dict[str, Any]], embeddings: list[list[float]], model: str) -> None:
+        """Enrich only the exact indexed text used by this request.
+
+        A concurrent sync may have replaced or removed a chunk while the
+        provider was running; never attach an old vector to its new text.
+        """
+        if len(chunks) != len(embeddings):
+            return
+        with self._conn:
+            for chunk, embedding in zip(chunks, embeddings):
+                self._conn.execute(
+                    "UPDATE chunks SET embedding = ?, model = ? WHERE id = ? AND hash = ?",
+                    (json.dumps(embedding), model, chunk["id"], chunk["hash"]),
+                )
 
     def get_chunks_fts(
         self,
@@ -277,4 +291,4 @@ def _fts5_escape(query: str) -> str:
     if not words:
         return ""
     # Use OR so partial matches are found; BM25 ranking handles relevance
-    return " OR ".join(f'"{w}"' for w in words[:20])  # cap at 20 terms
+    return " OR ".join('"' + w.replace('"', '""') + '"' for w in words[:20])  # cap at 20 terms

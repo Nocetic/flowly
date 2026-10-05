@@ -22,7 +22,7 @@ def main():
     home_b.mkdir()
     with httpx.Client(timeout=5, follow_redirects=False, trust_env=False) as fixture:
         def request(req: httpx.Request):
-            assert req.url.host in {"useflowlyapp.com", "gmail.googleapis.com"}
+            assert req.url.host in {"useflowlyapp.com", "gmail.googleapis.com", "openidconnect.googleapis.com"}
             # These fixture credentials can only reach the explicit localhost test server.
             return fixture.request(req.method, origin + req.url.raw_path.decode(), headers=dict(req.headers), content=req.content)
 
@@ -46,6 +46,15 @@ def main():
             assert json.loads((home_a / "config.json").read_text())["channels"]["email"]["enabled"]
             assert first.setup_status(setup["requestId"])["connected"]
 
+            assert connected["services"] == ["gmail"]
+            upgraded = first.begin(services=["gmail", "gmail_manage", "tasks"], connection_id=setup["requestId"])
+            assert load_credentials()["grant_id"] == setup["requestId"]
+            fixture.post(origin + "/fixture/approve", json={**upgraded, "dropTasks": True}).raise_for_status()
+            updated = first.setup_status(upgraded["requestId"])
+            assert updated["services"] == ["gmail", "gmail_manage"]
+            assert updated["requestedServices"] == ["gmail", "gmail_manage", "tasks"]
+            assert load_credentials()["grant_id"] == upgraded["requestId"]
+
             os.environ["FLOWLY_HOME"] = str(home_b)
             second = GmailConnection(client=client)
             assert second.status()["status"] == "not_configured"
@@ -53,11 +62,28 @@ def main():
             fixture.post(origin + "/fixture/approve", json=other).raise_for_status()
             assert second.setup_status(other["requestId"])["connected"]
             os.environ["FLOWLY_HOME"] = str(home_a)
-            assert first.disconnect(setup["requestId"])["status"] == "not_configured"
+            assert first.disconnect(upgraded["requestId"])["status"] == "not_configured"
             assert get_valid_access_token() == (None, None)
             os.environ["FLOWLY_HOME"] = str(home_b)
             assert second.status()["connected"]
-    print("PASS: create, resume, authorize, claim, Gmail validation, token use, disconnect and profile isolation")
+            os.environ["FLOWLY_HOME"] = str(home_a)
+            config_before = (home_a / "config.json").read_bytes()
+            independent = {}
+            for service in ("drive", "tasks"):
+                connection = GmailConnection(client=client, service=service)
+                setup = connection.begin()
+                assert setup["services"] == [service]
+                fixture.post(origin + "/fixture/approve", json=setup).raise_for_status()
+                assert connection.setup_status(setup["requestId"])["services"] == [service]
+                assert get_valid_access_token(service) == ("fixture-google-access", "fixture@example.test")
+                independent[service] = connection, setup
+            assert (home_a / "config.json").read_bytes() == config_before
+            drive, drive_setup = independent["drive"]
+            drive.disconnect(drive_setup["requestId"])
+            assert get_valid_access_token("drive") == (None, None)
+            assert independent["tasks"][0].status()["connected"]
+            assert get_valid_access_token() == (None, None)
+    print("PASS: create, resume, authorize, claim, upgrade, partial consent, standalone Drive/Tasks, disconnect and profile isolation")
 
 
 if __name__ == "__main__":

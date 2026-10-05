@@ -1,54 +1,48 @@
-"""D2: the embedding key-routing fix.
-
-A non-OpenAI active-provider key must not be used as the embedding key — the
-"auto" resolver would mis-detect it as a Gemini key, the embedding call would
-401, and search would silently fall back to keyword-only while claiming vectors.
-"""
-
-from __future__ import annotations
-
+"""Embedding credentials and endpoint belong to the same provider."""
 from types import SimpleNamespace
 
-from flowly.memory.embeddings import _resolve_provider_and_model
+import pytest
+
+from flowly.config.schema import Config
+from flowly.memory.embeddings import resolve_embedding_settings
+from flowly.memory.manager import MemoryIndexManager
 
 
-def test_auto_resolver_misroutes_non_openai_key():
-    # sk- → OpenAI; any other non-empty key under "auto" → Gemini. That mis-route
-    # is exactly why the loop must not hand a non-OpenAI active key to embeddings.
-    assert _resolve_provider_and_model("auto", "", "sk-abc", None)[0] == "openai"
-    assert _resolve_provider_and_model("auto", "", "xai-abc", None)[0] == "gemini"
-    # No key + no configured providers → no vector provider (honest keyword-only).
-    assert _resolve_provider_and_model("auto", "", "", None) == (None, None)
+@pytest.mark.parametrize('key', ['sk-or-v1-dummy', 'sk-ant-dummy', 'xai-dummy', 'flw_dummy'])
+def test_foreign_key_is_not_inferred_as_openai_or_gemini(key):
+    assert resolve_embedding_settings('auto', '', key, '', None) == (None, '', '', '')
 
 
-def test_build_memory_manager_only_seeds_openai_key(tmp_path, monkeypatch):
-    import flowly.memory.manager as mgr
+def test_openrouter_chat_does_not_supply_embedding_credentials(tmp_path):
     from flowly.agent.loop import AgentLoop
+    config = Config()
+    config.providers.openrouter.api_key = 'sk-or-v1-dummy'
+    config.providers.openrouter.api_base = 'https://openrouter.invalid/api/v1'
+    agent = SimpleNamespace(_memory_search_config=config.agents.defaults.memory_search,
+                            _main_config=config, _state_dir=tmp_path, workspace=tmp_path)
+    manager = AgentLoop._build_memory_manager(agent)
+    try:
+        assert manager.status()['provider'] == 'none'
+        assert manager._api_key == manager._api_base == ''
+    finally:
+        manager._indexer.close()
 
-    captured: dict = {}
-    monkeypatch.setattr(mgr, "get_manager", lambda **kw: captured.update(kw) or "MGR")
 
-    def _fake(active_key: str):
-        ms = SimpleNamespace(
-            api_key="", provider="auto", model="", api_base=None,
-            chunk_tokens=400, overlap_tokens=80, max_results=6, min_score=0.35,
-            vector_weight=0.7, text_weight=0.3,
-        )
-        return SimpleNamespace(
-            _memory_search_config=ms,
-            _main_config=SimpleNamespace(get_api_key=lambda: active_key),
-            _state_dir=tmp_path,
-            workspace=tmp_path,
-        )
+def test_auto_uses_openai_key_and_base_even_when_chat_uses_openrouter(tmp_path):
+    config = Config()
+    config.providers.openrouter.api_key = 'sk-or-v1-dummy'
+    config.providers.openai.api_key = 'sk-openai-dummy'
+    config.providers.openai.api_base = 'https://embeddings.invalid/v1'
+    manager = MemoryIndexManager(tmp_path, tmp_path, config=config, model='custom-embedding')
+    try:
+        assert (manager._emb_provider, manager._emb_model, manager._api_key, manager._api_base) == (
+            'openai', 'custom-embedding', 'sk-openai-dummy', 'https://embeddings.invalid/v1')
+    finally:
+        manager._indexer.close()
 
-    captured.clear()
-    AgentLoop._build_memory_manager(_fake("xai-abc123"))
-    assert captured["api_key"] == ""           # non-OpenAI active key not seeded
 
-    captured.clear()
-    AgentLoop._build_memory_manager(_fake("flw_abc123"))
-    assert captured["api_key"] == ""           # Flowly proxy key not seeded
-
-    captured.clear()
-    AgentLoop._build_memory_manager(_fake("sk-abc123"))
-    assert captured["api_key"] == "sk-abc123"  # genuine OpenAI key is seeded
+def test_explicit_compatible_endpoint_and_key_are_preserved():
+    assert resolve_embedding_settings('openai', 'vendor/embedding', 'vendor-key',
+                                      'https://vendor.invalid/v1', None) == (
+        'openai', 'vendor/embedding', 'vendor-key', 'https://vendor.invalid/v1')
+    assert resolve_embedding_settings('none', '', 'sk-dummy', '', None) == (None, '', '', '')

@@ -8,7 +8,7 @@ import pytest
 
 from flowly.exec.approval_manager import ApprovalManager
 from flowly.exec.types import ExecRequest, PendingApproval
-from flowly.push import approval_push, notifications, relay_push
+from flowly.push import approval_push, notifications, presence, relay_push
 
 
 def pending(identifier: str = 'approval-1') -> PendingApproval:
@@ -75,6 +75,8 @@ async def test_the_approval_push_waits_for_screens_and_never_blocks(monkeypatch)
 
     monkeypatch.setattr(relay_push, 'notify_devices', phones)
     monkeypatch.setattr(notifications, 'APPROVAL_PUSH_DELAY_SECONDS', 0.05)
+    # In a voice call on the computer: it can be answered there, so it waits.
+    presence.report('desktop-a', True, [], 90, in_call=True)
     approval_push.schedule_approval_push(pending('approval-unanswered'))
     approval_push.schedule_approval_push(pending('approval-answered'))
     approval_push.cancel_approval_push('approval-answered')

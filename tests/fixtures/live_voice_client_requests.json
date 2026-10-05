@@ -1,0 +1,27 @@
+{
+  "contract": "flowly.live-voice.client-requests",
+  "version": 1,
+  "about": "The exact requests each client sends to reach an agent's own memory during a call. Canonical copy: Nocetic/flowly tests/fixtures/live_voice_client_requests.json. Desktop and iOS keep byte-identical copies and test that their request builders produce these envelopes; Core tests that every envelope reaches the handler. $-values are placeholders. voiceAccess (the call's access certificate) is added by every client and verified separately; it is not part of this routing contract.",
+  "requests": [
+    {"id": "ios.snapshot.default", "client": "ios", "profile": "default",
+     "envelope": {"method": "profiles.rpc", "params": {"name": "default", "method": "voice.memory.snapshot", "params": {},
+       "expectedHostId": "$hostId", "expectedBotId": "$botId", "timeoutMs": 25000}}},
+    {"id": "ios.recall.default", "client": "ios", "profile": "default",
+     "envelope": {"method": "profiles.rpc", "params": {"name": "default", "method": "voice.context", "params": {"query": "", "limit": 8},
+       "expectedHostId": "$hostId", "expectedBotId": "$botId", "timeoutMs": 25000}}},
+    {"id": "ios.snapshot.named", "client": "ios", "profile": "writer",
+     "envelope": {"method": "profiles.rpc", "params": {"name": "writer", "method": "voice.memory.snapshot", "params": {},
+       "expectedHostId": "$hostId", "expectedBotId": "$botId", "timeoutMs": 25000}}},
+    {"id": "ios.recall.named", "client": "ios", "profile": "writer",
+     "envelope": {"method": "profiles.rpc", "params": {"name": "writer", "method": "voice.context", "params": {"query": "", "limit": 8},
+       "expectedHostId": "$hostId", "expectedBotId": "$botId", "timeoutMs": 25000}}},
+    {"id": "desktop.snapshot.default", "client": "desktop", "profile": "default",
+     "envelope": {"method": "voice.memory.snapshot", "params": {}}},
+    {"id": "desktop.recall.default", "client": "desktop", "profile": "default",
+     "envelope": {"method": "voice.context", "params": {"query": "", "limit": 8}}},
+    {"id": "desktop.snapshot.named", "client": "desktop", "profile": "writer",
+     "envelope": {"method": "profiles.rpc", "params": {"name": "writer", "method": "voice.memory.snapshot", "params": {}}}},
+    {"id": "desktop.recall.named", "client": "desktop", "profile": "writer",
+     "envelope": {"method": "profiles.rpc", "params": {"name": "writer", "method": "voice.context", "params": {"query": "", "limit": 8}}}}
+  ]
+}

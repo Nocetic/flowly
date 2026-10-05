@@ -130,3 +130,30 @@ async def test_probe_uses_profile_credentials_and_does_not_claim_file_means_conn
     monkeypatch.setattr(GmailConnection, "status", lambda self: {"connected": True})
     assert (await probe_email({"enabled": True})).status == "ok"
     assert (await probe_email({"enabled": False})).status == "disabled"
+
+
+async def test_one_socket_starts_all_google_status_checks_before_any_finishes(monkeypatch):
+    import threading
+    import aiohttp
+    from flowly.gateway.server import GatewayServer
+
+    barrier = threading.Barrier(5, timeout=3)
+    def status(self):
+        barrier.wait()
+        return {"service": self.service, "status": "not_configured", "connected": False}
+    monkeypatch.setattr(GmailConnection, "status", status)
+    server = GatewayServer(host="127.0.0.1", auth_token="fixture-only", require_loopback_auth=True,
+                           on_chat_message=AsyncMock(), advertise_control=False)
+    try:
+        async with TestServer(server._create_app()) as http, aiohttp.ClientSession() as session:
+            async with session.post(http.make_url("/api/auth/ws-ticket"),
+                                    headers={"Authorization": "Bearer fixture-only"}) as reply:
+                ticket = (await reply.json())["ticket"]
+            async with session.ws_connect(http.make_url(f"/ws?ticket={ticket}")) as ws:
+                services = {"gmail", "calendar", "drive", "contacts", "tasks"}
+                for service in services:
+                    await ws.send_json({"type": "rpc", "id": service, "method": "gmail.status", "params": {"service": service}})
+                replies = [await ws.receive_json(timeout=5) for _ in services]
+                assert {reply["result"]["service"] for reply in replies} == services
+    finally:
+        server.chat_commands.close()

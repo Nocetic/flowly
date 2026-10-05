@@ -76,8 +76,11 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "gmail.setup.status": 30_000,
     "gmail.setup.cancel": 30_000,
     "gmail.disconnect": 30_000,
+    "gmail.chat.pending": 30_000,
+    "gmail.chat.cancel": 60_000,
     "voice.context": 10_000,
     "voice.memory.append": 10_000,
+    "voice.memory.snapshot": 10_000,
     "provider.list": 30_000,
     "provider.active": 30_000,
     "model.list": 60_000,
@@ -334,6 +337,21 @@ def _validate_access_policy(method: str, value: dict[str, Any]) -> dict[str, Any
     return value
 
 
+def profile_rpc_session_key(method: str, params: dict[str, Any]) -> str:
+    """The conversation a validated profile call is about, or "".
+
+    Every ``agent.home.*`` call is about the agent's home conversation, though
+    none carries its key: the introduction it starts streams there, and the
+    caller must be watching it before the first words are sent.
+    """
+    if method.startswith("agent.home."):
+        from flowly.agent_home import HOME_SESSION
+
+        return HOME_SESSION
+    session_key = params.get("sessionKey")
+    return session_key if isinstance(session_key, str) else ""
+
+
 def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(method, str) or method not in PROFILE_RPC_TIMEOUTS:
         raise ProfileHostError(
@@ -384,6 +402,14 @@ def validate_profile_rpc(method: Any, params: Any) -> tuple[str, dict[str, Any]]
 
         try:
             value = validate_context(value)
+        except VoiceError as exc:
+            raise ProfileHostError(exc.code, str(exc)) from exc
+    if method == "voice.memory.snapshot":
+        from flowly.live_voice.memory_snapshot import validate_snapshot
+        from flowly.live_voice.sessions import VoiceError
+
+        try:
+            value = validate_snapshot(value)
         except VoiceError as exc:
             raise ProfileHostError(exc.code, str(exc)) from exc
     if method == "voice.memory.append":

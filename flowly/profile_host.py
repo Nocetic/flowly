@@ -220,6 +220,39 @@ def _profile_reply_text(value: Any) -> str:
     ).strip()
 
 
+def _tool_activity(event: str, payload: dict[str, Any]) -> dict[str, str] | None:
+    """The compact signal an agent's roster draws from: which tool, start or end.
+
+    A directory socket (the apps' strip, agents list and groups) never sees a
+    conversation's own events, yet draws every agent as a character that looks
+    at a terminal while a command runs and scans while it searches. This is all
+    it needs: the tool's name and call id, and when the conversation's turn
+    ends (``idle``, which ends whatever it left open). A call's arguments and
+    result never leave the conversation.
+    """
+    scope = payload.get("sessionKey")
+    scope = scope[:512] if isinstance(scope, str) else ""
+    if event == "chat":
+        if payload.get("state") in ("final", "aborted", "error"):
+            return {"phase": "idle", "scope": scope}
+        return None
+    if event not in ("tool.start", "tool.complete"):
+        return None
+    call_id = payload.get("toolCallId")
+    name = payload.get("name")
+    if not isinstance(call_id, str) or not isinstance(name, str):
+        return None
+    call_id, name = call_id.strip(), name.strip()
+    if not 0 < len(call_id) <= 256 or not 0 < len(name) <= 128:
+        return None
+    return {
+        "phase": "start" if event == "tool.start" else "end",
+        "scope": scope,
+        "callId": call_id,
+        "name": name,
+    }
+
+
 def _profile_terminal_state(payload: dict[str, Any]) -> str:
     """The gateway emits interrupted turns as final + aborted, with partial text."""
     if payload.get("aborted") is True or payload.get("state") == "aborted":
@@ -320,6 +353,22 @@ class _Runtime:
     attention: dict[str, Any] = field(default_factory=dict)
     attention_task: asyncio.Task[None] | None = None
     attention_dirty: bool = False
+
+
+#: Further pages read to fill one remote `sessions.list` page past internal rows.
+_SESSIONS_FILL_ROUNDS = 8
+
+
+def _remote_sessions(sessions: list) -> list:
+    """The conversations a remote client may open: no internal collaboration."""
+    return [
+        session
+        for session in sessions
+        if isinstance(session, dict)
+        and isinstance(session.get("key"), str)
+        and session["key"].startswith(REMOTE_SESSION_PREFIXES)
+        and not is_internal_profile_session(session["key"])
+    ]
 
 
 class ProfileHost:
@@ -1031,17 +1080,26 @@ class ProfileHost:
         if method == "sessions.list" and isinstance(result, dict):
             sessions = result.get("sessions")
             if isinstance(sessions, list):
-                result = {
-                    **result,
-                    "sessions": [
-                        session
-                        for session in sessions
-                        if isinstance(session, dict)
-                        and isinstance(session.get("key"), str)
-                        and session["key"].startswith(REMOTE_SESSION_PREFIXES)
-                        and not is_internal_profile_session(session["key"])
-                    ],
-                }
+                rows = _remote_sessions(sessions)
+                # A page is cut before this filter, so a page of internal
+                # sessions would come back short or empty while older
+                # conversations remain. Read on until it is full; the
+                # cursor stays the agent's, so no row is skipped or repeated.
+                limit, cursor = safe.get("limit"), result.get("next")
+                for _ in range(_SESSIONS_FILL_ROUNDS):
+                    if not isinstance(limit, int) or len(rows) >= limit or not isinstance(cursor, str):
+                        break
+                    more = await self._target_rpc(
+                        name, method, {**safe, "before": cursor}, bounded_timeout(method, timeout_ms),
+                        **identity_options,
+                    )
+                    if not isinstance(more, dict) or not isinstance(more.get("sessions"), list):
+                        break
+                    rows += _remote_sessions(more["sessions"])
+                    cursor = more.get("next")
+                if expected_bot_id is not None and ensure_profile_bot_id(name).bot_id != expected_bot_id:
+                    raise ProfileHostError('PROFILE_IDENTITY_CHANGED', 'The selected agent has changed.')
+                result = {**result, "sessions": rows, **({"next": cursor} if "next" in result else {})}
         return result
 
     async def run_task(
@@ -2252,6 +2310,12 @@ class ProfileHost:
                 event == "chat" and payload.get("state") in _ATTENTION_CHAT_STATES
             ):
                 self._schedule_attention_refresh(runtime)
+        if not internal_turn:
+            # Before the group-room hand-off: an agent working in a group is
+            # still that agent working, and its character shows it.
+            activity = _tool_activity(event, payload)
+            if activity is not None:
+                await self._emit(profile, "tool.activity", activity)
         if await self._rooms.handle_profile_event(profile, event, payload):
             return
         if event == "exec.approval.requested" and payload.get("id"):

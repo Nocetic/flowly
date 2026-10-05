@@ -10,12 +10,15 @@ from typing import Any
 
 from flowly.live_voice.access import VoicePrincipal
 from flowly.live_voice.authority import RequestOwner
+from flowly.live_voice.language import VoiceLanguagePreferences, detect_language
 from flowly.session.manager import Session, SessionManager
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$")
 _DIAGNOSTIC_ID = re.compile(r"^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$", re.I)
 MAX_MESSAGES = 4000
 MAX_CONNECTIONS = 100
+# The apps a call can run in (voice.open ``client``).
+VOICE_CLIENTS = frozenset({"ios", "android", "desktop", "web"})
 MAX_TOOL_RECORDS = 100
 MAX_ATTACHMENT_RECORDS = 200
 TOOL_STATUSES = frozenset({"running", "completed", "failed", "denied", "timed_out", "interrupted"})
@@ -73,16 +76,19 @@ def _public(session: Session) -> dict:
 
 
 class VoiceSessions:
-    def __init__(self, sessions: SessionManager, *, principal: VoicePrincipal | None = None):
+    def __init__(self, sessions: SessionManager, *, principal: VoicePrincipal | None = None,
+                 languages: VoiceLanguagePreferences | None = None):
         self.sessions = sessions
         self._owner = {'kind': 'account', 'uid': principal.uid} if principal else {'kind': 'host'}
+        # The language the owner speaks to each agent (see language.py).
+        self._languages = languages
 
     def for_principal(self, principal: VoicePrincipal | None) -> VoiceSessions:
         """A request-local view; identity must come from verified access, not RPC data."""
-        return VoiceSessions(self.sessions, principal=principal)
+        return VoiceSessions(self.sessions, principal=principal, languages=self._languages)
 
     def for_owner(self, owner: RequestOwner) -> VoiceSessions:
-        view = VoiceSessions(self.sessions)
+        view = VoiceSessions(self.sessions, languages=self._languages)
         view._owner = {'kind': 'account', 'uid': owner.uid} if owner.uid is not None else {'kind': 'host'}
         return view
 
@@ -99,6 +105,14 @@ class VoiceSessions:
         language = params.get("language", "en")
         if not isinstance(language, str) or language not in {"en", "tr", "es"}:
             raise VoiceError("INVALID_PARAMS", "Unsupported conversation language.")
+        # Which app holds the call, so another of the user's devices can say
+        # where it is running. Optional: older clients do not send it.
+        client = params.get("client")
+        if client is not None and client not in VOICE_CLIENTS:
+            raise VoiceError("INVALID_PARAMS", "Unsupported voice client.")
+        # A new conversation starts in the language the owner speaks to this
+        # agent; the client's (interface) language only when none is known.
+        spoken = (self._languages.get(self._owner, bot_id) if self._languages else None) or language
 
         def update(session: Session) -> dict:
             if session.metadata and session.metadata.get("kind") != "voice":
@@ -110,14 +124,14 @@ class VoiceSessions:
                     "kind": "voice", "voiceConversationId": params["conversationId"],
                     "voiceOwner": dict(self._owner),
                     "title": {"tr": "Sesli sohbet", "es": "Conversación de voz", "en": "Voice chat"}[language],
-                    "voice": {"profile": profile, "botId": bot_id, "revision": 0, "connections": [], "spokenLanguage": language},
+                    "voice": {"profile": profile, "botId": bot_id, "revision": 0, "connections": [], "spokenLanguage": spoken},
                 })
             voice = self._metadata(session)
             if (voice["profile"], voice["botId"]) != (profile, bot_id):
                 raise VoiceError("TARGET_CONFLICT", "Resume this conversation with its original agent.")
             existing = next((c for c in voice["connections"] if c["id"] == connection_id), None)
             if existing:
-                if existing["language"] != language:
+                if existing["language"] != language or existing.get("client") != client:
                     raise VoiceError("CONFLICT", "Connection identity already has different settings.")
                 if existing is not voice["connections"][-1] or existing["endedAt"]:
                     raise VoiceError("STALE_CONNECTION", "Create a new connection to resume this conversation.")
@@ -127,6 +141,7 @@ class VoiceSessions:
             voice["connections"].append({
                 "id": connection_id, "generation": len(voice["connections"]) + 1,
                 "language": language, "openedAt": _now(), "endedAt": None,
+                **({'client': client} if client else {}),
                 **({'diagnosticRunId': diagnostic_run_id} if diagnostic_run_id else {}),
             })
             voice["revision"] += 1
@@ -327,9 +342,22 @@ class VoiceSessions:
             voice["revision"] += 1
             session.updated_at = datetime.now()
             voice["updatedAt"] = session.updated_at.isoformat()
+            if role == "user":
+                heard_bot.append(voice["botId"])
             return {"message": copy.deepcopy(row), "replayed": False}
 
-        return self.sessions.mutate(key, update)
+        heard_bot: list[str] = []
+        result = self.sessions.mutate(key, update)
+        # The owner's own words say which language they speak (outside the
+        # session lock; a detection failure never fails the transcript).
+        if self._languages and heard_bot:
+            spoken = detect_language(text)
+            if spoken:
+                try:
+                    self._languages.heard(self._owner, heard_bot[0], spoken)
+                except OSError:
+                    pass
+        return result
 
     def history(self, params: dict) -> dict:
         session = self._read(params.get("conversationId"))
@@ -528,9 +556,17 @@ class VoiceSessions:
             voice["revision"] += 1
             session.updated_at = datetime.now()
             voice["updatedAt"] = session.updated_at.isoformat()
+            reported_bot.append(voice["botId"])
             return _public(session)
 
-        return self.sessions.mutate(key, update)
+        reported_bot: list[str] = []
+        result = self.sessions.mutate(key, update)
+        if self._languages and reported_bot:
+            try:
+                self._languages.reported(self._owner, reported_bot[0], language)
+            except OSError:
+                pass
+        return result
 
     def end(self, params: dict) -> dict:
         key = session_key(params.get("conversationId"))

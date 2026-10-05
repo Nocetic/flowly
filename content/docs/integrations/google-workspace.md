@@ -30,56 +30,48 @@ Notes:
 API base URLs used: Calendar API v3, People API (contacts), Drive API v3, Tasks
 API v1.
 
-## Enabling the tools
+## Connect and choose access
 
-> [!IMPORTANT]
-> The four Workspace tools (and the Gmail `email` tool) register together, gated on the **email channel** being enabled — not on the `integrations.googleWorkspace` card.
+In Desktop, open Gmail for the selected agent, or review a Google connection
+request in chat. Choose Gmail management and any optional Calendar, Drive,
+Contacts or Tasks access before continuing to Google. Google presents its own
+consent screen. The app shows which permissions were actually granted; declined
+services remain unavailable. “Extend Google access” adds services later while
+keeping the old connection until the new authorization succeeds for the same
+Google account.
 
-```json
-{
-  "channels": {
-    "email": { "enabled": true }
-  }
-}
+From a terminal:
+
+```sh
+flowly gmail connect --services gmail,gmail_manage,calendar,drive,contacts,tasks
+flowly gmail connect --extend --services gmail,gmail_manage,tasks
 ```
 
-When `channels.email.enabled` is `true`, Flowly registers `email`,
-`google_calendar`, `google_contacts`, `google_drive`, and `google_tasks` at agent
-boot. Enabling the `integrations.googleWorkspace` card alone does **not** register
-these native tools.
+The plain `flowly gmail connect` command keeps the original Gmail read/send
+selection. Native tools become available without restarting the agent after
+consent. The separate `integrations.googleWorkspace.enabled` card still refers
+to the optional CLI setup below, not native tool permission grants.
 
-The `integrations.googleWorkspace` block is a separate, display/opt-in toggle:
+## Credentials and permissions
 
-```json
-{
-  "integrations": {
-    "googleWorkspace": {
-      "enabled": false,
-      "email": ""
-    }
-  }
-}
-```
+Managed connections store a profile-local grant secret and short-lived access
+token under `credentials/gmail.json`; the broker retains encrypted Google refresh
+tokens. OAuth client secrets and refresh tokens are not sent to the agent or chat.
+Historical local OAuth credential files remain supported.
 
-`email` here is display-only (the connected Google account address); `enabled`
-flags the integration card. Neither field controls native-tool registration.
+| Access | OAuth scopes |
+|---|---|
+| Gmail read/send | `gmail.readonly`, `gmail.send` |
+| Gmail management | `gmail.modify` (includes read/send; no immediate permanent deletion) |
+| Calendar | `calendar.events` |
+| Drive | `drive.readonly`, `drive.file` (browse/read existing files, create new files) |
+| Contacts | `contacts.readonly` |
+| Tasks | `tasks` |
 
-## Credentials
-
-The native tools authenticate with an OAuth 2.0 access token obtained via a
-refresh-token grant. The credentials file is read from:
-
-```
-~/.flowly/credentials/gmail.json
-```
-
-It contains `refresh_token`, `client_id`, and `client_secret`. Flowly exchanges
-the refresh token at `https://oauth2.googleapis.com/token` for a short-lived
-access token and sends `Authorization: Bearer <token>` on every API call. The
-same token is shared across Gmail, Calendar, Contacts, Drive, and Tasks.
-
-> [!WARNING]
-> **Unverified:** The exact command/flow that *writes* `gmail.json` (including the requested OAuth scopes and the OAuth client configuration) is not present in this repository. The file appears to be produced by an external web/gateway OAuth flow (e.g. Flowly Cloud). If you do not have a `gmail.json`, obtain one through your Flowly Cloud account or the gateway's Google connect flow. The precise scope strings are not documented here because they are not defined in code we can cite — do not assume a specific scope set.
+Google API scopes above use the `https://www.googleapis.com/auth/` prefix.
+Enabled tools are bounded by both requested services and actual granted scopes.
+Sending, Gmail management and Workspace writes require approval. There are no
+native full-document editing tools for Sheets or Docs in this integration.
 
 ## `flowly setup google-workspace`
 
@@ -99,7 +91,7 @@ This wizard installs and authenticates the Google Workspace CLI (`gws`):
    binary so the agent can run `gws *` commands without per-command approval.
 
 > [!IMPORTANT]
-> This wizard wires up the `gws` *command-line* path (driven through the `exec` tool), which is distinct from the native `google_calendar`/`google_drive`/`google_contacts`/`google_tasks` tools. The native tools still require `channels.email.enabled` and a valid `~/.flowly/credentials/gmail.json`. Both paths can coexist.
+> This wizard wires up the `gws` *command-line* path (driven through the `exec` tool), which is distinct from the native `google_calendar`/`google_drive`/`google_contacts`/`google_tasks` tools. Native tools use the profile-local Google connection and granted service permissions. Both paths can coexist.
 
 ## Related
 

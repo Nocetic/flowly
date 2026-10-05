@@ -546,6 +546,38 @@ def config_set(params: dict) -> dict:
     return {"ok": True, "willRestart": bool(params.get("restart"))}
 
 
+# ── Owner presence (phone notifications) ───────────────────────────────────
+
+
+def presence_report(params: dict) -> dict:
+    """A Flowly Desktop says its user is at the computer: which kinds of
+    notification it shows there (so the phone is not rung for them too), which
+    conversations are on its screen and whether a voice call is on (so a
+    request waiting there gives the owner a minute to answer it there).
+
+    Accepted only from the owner's own connection: someone reaching this agent
+    through shared voice access must not be able to silence the owner's
+    phone. See :mod:`flowly.push.presence`.
+    """
+    from flowly.live_voice.authority import current_request_owner
+    from flowly.push import presence
+
+    if current_request_owner() is not None:
+        raise FeatureRpcError("UNAVAILABLE", "Presence is reported by the owner's own connection.")
+    try:
+        presence.report(
+            params.get("sourceId"),
+            params.get("present") is True,
+            params.get("kinds"),
+            params.get("ttlSeconds"),
+            watching=params.get("watching"),
+            in_call=params.get("inCall"),
+        )
+    except ValueError as exc:
+        raise FeatureRpcError("INVALID", str(exc)) from None
+    return {"ok": True}
+
+
 # ── Model tool access (safe settings projection) ───────────────────────────
 
 
@@ -1355,12 +1387,13 @@ def memory_update_user(params: dict) -> dict:
 
 
 def _open_memory_gov():
-    from flowly.memory.governance import GovernanceStore
-    from flowly.memory.coordinator import MemoryGovernance
-    from flowly.agent.memory import MemoryStore
+    # The panel's accept/reject/correct keep the graph in agreement, as the
+    # agent's own facade does (open_memory_governance wires the mirror).
+    from flowly.memory.coordinator import open_memory_governance
 
-    gov = GovernanceStore(state_db("memory_governance.sqlite3"))
-    return MemoryGovernance(gov, memory_store=MemoryStore(workspace_dir()))
+    return open_memory_governance(get_flowly_home(), workspace_dir(),
+                                  governance_db=state_db("memory_governance.sqlite3"),
+                                  kg_path=state_db("knowledge_graph.sqlite3"))
 
 
 def _obsidian_cfg():
@@ -1449,6 +1482,7 @@ def memory_gov(action: str, params: dict) -> dict:
         if not item_id:
             raise FeatureRpcError("INVALID", "id required")
         item = getattr(mg, action)(item_id)
+        _refresh_memory_md(mg)
         return {"item": item.to_dict() if item else None}
     if action == "correct":
         item_id = params.get("id", "")
@@ -1456,6 +1490,7 @@ def memory_gov(action: str, params: dict) -> dict:
         if not item_id or not text:
             raise FeatureRpcError("INVALID", "id and text required")
         item = mg.correct(item_id, text, confidence=params.get("confidence"))
+        _refresh_memory_md(mg)
         return {"item": item.to_dict() if item else None}
     if action == "feedback":
         item_id = params.get("id", "")
@@ -1466,8 +1501,19 @@ def memory_gov(action: str, params: dict) -> dict:
             bool(params.get("helpful", False)),
             params.get("note", ""),
         )
+        _refresh_memory_md(mg)
         return {"item": item.to_dict() if item else None}
     raise FeatureRpcError("INVALID", f"unknown memory action: {action}")
+
+
+def _refresh_memory_md(mg) -> None:
+    """An owner's decision reaches the agent's next prompt: MEMORY.md (which
+    the prompt reads) is rebuilt at once instead of at some later write."""
+    try:
+        mg.refresh()
+    except Exception as exc:  # noqa: BLE001 — the decision itself is saved
+        from loguru import logger
+        logger.warning(f"[memory-gov] MEMORY.md refresh after a panel action failed: {type(exc).__name__}")
 
 
 def _consolidate_run(dry_run: bool) -> dict:
@@ -1571,17 +1617,14 @@ def _dream_run(max_messages: int) -> dict:
     no-ops. ``loop=None`` tells the extractor to drive its own ``asyncio.run``
     here (there is no live event loop on this thread), mirroring how
     ``memory_consolidate`` streams its proposal."""
-    from flowly.agent.memory import MemoryStore
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
-    from flowly.memory.coordinator import MemoryGovernance
     from flowly.memory.dreamer import (
         MemoryDreamerService,
         SessionIndexDeltaSource,
         read_user_profile,
     )
     from flowly.memory.extractor import SubagentExtractor
-    from flowly.memory.governance import GovernanceStore
     from flowly.memory.kg_mirror import SqliteKGMirror
     from flowly.providers.factory import build_provider
 
@@ -1599,8 +1642,8 @@ def _dream_run(max_messages: int) -> dict:
     si_path = str(state_db("session_index.sqlite"))
     kg_path = state_db("knowledge_graph.sqlite3")
     ws = workspace_dir()
-    gov = GovernanceStore(state_db("memory_governance.sqlite3"))
-    coordinator = MemoryGovernance(gov, memory_store=MemoryStore(ws))
+    coordinator = _open_memory_gov()
+    gov = coordinator.gov
     extractor = SubagentExtractor(provider=provider, model=model, loop=None)
     dreamer = MemoryDreamerService(
         gov,
@@ -1676,12 +1719,9 @@ def memory_import_prompt(params: dict) -> dict:
 def _import_run(params: dict) -> dict:
     """Blocking external memory import. Mirrors ``flowly memory import`` and
     runs in a worker thread because it makes an LLM round-trip."""
-    from flowly.agent.memory import MemoryStore
     from flowly.config.loader import load_config
     from flowly.integrations.active_provider import resolve_active_provider
-    from flowly.memory.coordinator import MemoryGovernance
     from flowly.memory.dreamer import read_user_profile
-    from flowly.memory.governance import GovernanceStore
     from flowly.memory.importer import normalize_source, run_import
     from flowly.providers.factory import build_provider
 
@@ -1702,8 +1742,8 @@ def _import_run(params: dict) -> dict:
     provider = build_provider(ap, default_model=model, config=config)
 
     ws = workspace_dir()
-    gov = GovernanceStore(state_db("memory_governance.sqlite3"))
-    coordinator = MemoryGovernance(gov, memory_store=MemoryStore(ws))
+    coordinator = _open_memory_gov()
+    gov = coordinator.gov
     res = run_import(
         gov,
         provider=provider,
@@ -1850,9 +1890,10 @@ _voice_provider = None
 _voice_access_verifier = None
 _voice_context_provider = None
 _voice_memory_provider = None
+_voice_snapshot_provider = None
 _work_output_provider = None
 # Served by every runtime for its own profile, not only by the primary one.
-_PER_RUNTIME_VOICE_METHODS = frozenset({"voice.context", "voice.memory.append"})
+_PER_RUNTIME_VOICE_METHODS = frozenset({"voice.context", "voice.memory.append", "voice.memory.snapshot"})
 
 
 def set_work_output_provider(provider) -> None:
@@ -1896,16 +1937,60 @@ async def voice_memory_append(params: dict) -> dict:
         raise FeatureRpcError(exc.code, str(exc)) from exc
 
 
+def set_voice_snapshot_provider(provider) -> None:
+    global _voice_snapshot_provider
+    _voice_snapshot_provider = provider
+
+
+async def voice_memory_snapshot(params: dict) -> dict:
+    """The agent's memory and identity for a voice call (see memory_snapshot)."""
+    import asyncio
+
+    from flowly.live_voice.sessions import VoiceError
+
+    from loguru import logger
+
+    snapshot = _voice_snapshot_provider() if _voice_snapshot_provider is not None else None
+    if snapshot is None:
+        logger.warning("Live Voice memory snapshot requested before the runtime was ready")
+        raise FeatureRpcError("UNAVAILABLE", "Voice memory is not ready on this runtime.")
+    try:
+        # File and SQLite reads; keep them off the event loop.
+        result = await asyncio.to_thread(snapshot.snapshot, params)
+    except VoiceError as exc:
+        logger.warning("Live Voice memory snapshot refused: {}", exc.code)
+        raise FeatureRpcError(exc.code, str(exc)) from exc
+    # Shape only, never content: what a call started with.
+    sections = result.get("sections") or []
+    logger.info(
+        "Live Voice memory snapshot served: sections={} bytes={} profileBytes={} truncated={} partial={} unchanged={}",
+        ",".join(section.get("kind", "?") for section in sections),
+        sum(len(str(section.get("text", "")).encode()) for section in sections),
+        len(str(result.get("profile", "")).encode()), bool(result.get("truncated")),
+        bool(result.get("partial")), bool(result.get("unchanged")),
+    )
+    return result
+
+
 async def voice_context(params: dict) -> dict:
     from flowly.live_voice.sessions import VoiceError
 
+    from loguru import logger
+
     context = _voice_context_provider() if _voice_context_provider is not None else None
     if context is None:
+        logger.warning("Live Voice recall requested before the runtime was ready")
         raise FeatureRpcError("UNAVAILABLE", "Voice context is not ready on this runtime.")
     try:
-        return await context.search(params)
+        result = await context.search(params)
     except VoiceError as exc:
+        logger.warning("Live Voice recall refused: {}", exc.code)
         raise FeatureRpcError(exc.code, str(exc)) from exc
+    # Shape only, never the query or the facts.
+    logger.info("Live Voice recall served: query={} facts={}",
+                "empty" if not str(params.get("query") or "").strip() else "given",
+                len(result.get("facts") or []))
+    return result
 
 
 def set_voice_provider(provider) -> None:
@@ -3791,102 +3876,152 @@ def _session_title(path) -> str | None:
     return title if isinstance(title, str) and title.strip() else None
 
 
-def sessions_list() -> dict:
-    """Conversation sessions — mirrors the desktop's activity:sessions-list
-    exactly (key/fileName/sizeBytes/modifiedAt/channel/chatId)."""
-    sessions_dir = get_flowly_home() / "sessions"
-    # A session is "running" right now iff the in-flight registry still holds its
-    # turn (begin() on chat.send, finish() at true run completion). Lets every
-    # client — gateway and relay — surface a live "working" indicator straight
-    # from the bot's runtime state, no separate flag to drift.
+_SESSIONS_CURSOR = re.compile(r"v1:(\d{1,20}):([^/\\\x00-\x1f]{1,255})")
+
+
+def _sessions_cursor(params: dict, key: str) -> tuple[int, str] | None:
+    raw = params.get(key)
+    if raw is None:
+        return None
+    match = _SESSIONS_CURSOR.fullmatch(raw) if isinstance(raw, str) else None
+    if match is None:
+        raise FeatureRpcError("INVALID_PARAMS", f"{key} must be a cursor from a previous sessions.list page.")
+    return int(match.group(1)), match.group(2)
+
+
+def _session_row(p, st, waiting: dict) -> dict | None:
+    """One conversation's list row, or None when this caller may not see it."""
     from flowly.agent.inflight import get as _inflight_get
     from flowly.live_voice.authority import current_request_owner
     from flowly.session.keys import read_session_header, session_key_from_header
     from flowly.session.ownership import require_session_file, session_visible
 
+    base = p.stem
+    sep = base.find("_")
+    if sep == -1:
+        channel, chat_id = "unknown", base
+    else:
+        channel, chat_id = base[:sep], base[sep + 1 :]
+    header = read_session_header(p)
+    key = session_key_from_header(p, header)
+    modified_ms = int(st.st_mtime * 1000)
+    # A session is "running" right now iff the in-flight registry still holds
+    # its turn (begin() on chat.send, finish() at true run completion), so
+    # every client surfaces a live "working" indicator from runtime state.
+    # Auto-generated descriptive title, so every
+    # relay client can show the SAME name the gateway/CLI surfaces
+    # instead of a random session-key suffix. The client writes it
+    # to its (encrypted) Firestore conversation doc; the relay
+    # itself is untouched — this only enriches the RPC payload.
+    metadata = header.get('metadata') if current_request_owner() is None else require_session_file(p, key)
+    if metadata is None or not session_visible(key, metadata):
+        return None
+    raw_title = metadata.get("title")
+    title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
+    raw_completion_id = metadata.get("last_assistant_run_id")
+    last_assistant_run_id = (
+        raw_completion_id.strip()
+        if isinstance(raw_completion_id, str) and raw_completion_id.strip()
+        else None
+    )
+    raw_completed_at = metadata.get("last_assistant_at")
+    last_assistant_at = (
+        raw_completed_at
+        if isinstance(raw_completed_at, (str, int, float))
+        and not isinstance(raw_completed_at, bool)
+        else None
+    )
+    return {
+        "key": key,
+        "fileName": p.name,
+        "sizeBytes": st.st_size,
+        "modifiedAt": modified_ms,
+        "channel": channel,
+        "chatId": chat_id,
+        "title": title,
+        **({"kind": "voice", "voiceConversationId": metadata.get("voiceConversationId")}
+           if metadata.get("kind") == "voice" else {}),
+        # Superset fields for the TUI gateway client (which reads
+        # ``displayName`` / ``updatedAt``). Same content, one shape
+        # serves every client + transport.
+        "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
+        "updatedAt": modified_ms,
+        "lastAssistantRunId": last_assistant_run_id,
+        "lastAssistantAt": last_assistant_at,
+        # True while a turn for this session is in flight — drives the
+        # client's "running" shimmer. Old clients ignore the field.
+        "running": _inflight_get(key) is not None,
+        # Set while the conversation waits for the owner:
+        # {kind: approval|question|plan|connection, since (ms),
+        # count}. Absent otherwise; old clients ignore it.
+        **({"needsInput": waiting[key]} if key in waiting else {}),
+        # Conversation-scoped model selection. This is safe to
+        # expose (it is a public model id, never a credential)
+        # and lets local profile clients label each chat
+        # without opening every JSONL file a second time.
+        "modelOverride": (
+            str(metadata.get("model_override") or "").strip()
+            or None
+        ),
+    }
+
+
+def sessions_list(params: dict | None = None) -> dict:
+    """Conversation sessions, newest first — mirrors the desktop's
+    activity:sessions-list (key/fileName/sizeBytes/modifiedAt/channel/chatId).
+
+    Without ``limit`` the whole list (what every client before paging asks
+    for). With ``limit`` (1–200) one page: ``{sessions, next}``, where
+    ``next`` is the cursor to pass as ``before`` for the page after it, or
+    None at the end. ``through`` stops at the row a cursor names, including
+    it, so a client that has scrolled can refresh everything down to the end
+    of the first page it loaded, however many conversations arrived since;
+    with ``before`` too it reads on between two cursors.
+
+    A cursor is a position (modification time, file name), not an offset: a
+    conversation that gets a message moves to the top, and the pages after a
+    cursor neither skip nor repeat a row. Only the page's own session
+    headers are read; the rest of the list costs a directory listing.
+    """
+    params = params or {}
+    limit = _activity_int(params, "limit", default=None, low=1, high=200)
+    before = _sessions_cursor(params, "before") if limit is not None else None
+    through = _sessions_cursor(params, "through") if limit is not None else None
+    sessions_dir = get_flowly_home() / "sessions"
     # What each conversation is waiting on from the owner (an approval, a
     # question, a plan, a connection), read once for the whole list.
     waiting = _pending_inputs()
-    out = []
+    entries = []
     if sessions_dir.exists():
         from flowly.session.manager import iter_session_files
 
         for p in iter_session_files(sessions_dir):
             try:
                 st = p.stat()
-                base = p.stem
-                sep = base.find("_")
-                if sep == -1:
-                    channel, chat_id = "unknown", base
-                else:
-                    channel, chat_id = base[:sep], base[sep + 1 :]
-                header = read_session_header(p)
-                key = session_key_from_header(p, header)
-                modified_ms = int(st.st_mtime * 1000)
-                # Auto-generated descriptive title, so every
-                # relay client can show the SAME name the gateway/CLI surfaces
-                # instead of a random session-key suffix. The client writes it
-                # to its (encrypted) Firestore conversation doc; the relay
-                # itself is untouched — this only enriches the RPC payload.
-                metadata = header.get('metadata') if current_request_owner() is None else require_session_file(p, key)
-                if metadata is None:
-                    continue
-                if not session_visible(key, metadata):
-                    continue
-                raw_title = metadata.get("title")
-                title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
-                raw_completion_id = metadata.get("last_assistant_run_id")
-                last_assistant_run_id = (
-                    raw_completion_id.strip()
-                    if isinstance(raw_completion_id, str) and raw_completion_id.strip()
-                    else None
-                )
-                raw_completed_at = metadata.get("last_assistant_at")
-                last_assistant_at = (
-                    raw_completed_at
-                    if isinstance(raw_completed_at, (str, int, float))
-                    and not isinstance(raw_completed_at, bool)
-                    else None
-                )
-                out.append(
-                    {
-                        "key": key,
-                        "fileName": p.name,
-                        "sizeBytes": st.st_size,
-                        "modifiedAt": modified_ms,
-                        "channel": channel,
-                        "chatId": chat_id,
-                        "title": title,
-                        **({"kind": "voice", "voiceConversationId": metadata.get("voiceConversationId")}
-                           if metadata.get("kind") == "voice" else {}),
-                        # Superset fields for the TUI gateway client (which reads
-                        # ``displayName`` / ``updatedAt``). Same content, one shape
-                        # serves every client + transport.
-                        "displayName": title or (key.split(":", 1)[-1] if ":" in key else key),
-                        "updatedAt": modified_ms,
-                        "lastAssistantRunId": last_assistant_run_id,
-                        "lastAssistantAt": last_assistant_at,
-                        # True while a turn for this session is in flight — drives the
-                        # client's "running" shimmer. Old clients ignore the field.
-                        "running": _inflight_get(key) is not None,
-                        # Set while the conversation waits for the owner:
-                        # {kind: approval|question|plan|connection, since (ms),
-                        # count}. Absent otherwise; old clients ignore it.
-                        **({"needsInput": waiting[key]} if key in waiting else {}),
-                        # Conversation-scoped model selection. This is safe to
-                        # expose (it is a public model id, never a credential)
-                        # and lets local profile clients label each chat
-                        # without opening every JSONL file a second time.
-                        "modelOverride": (
-                            str(metadata.get("model_override") or "").strip()
-                            or None
-                        ),
-                    }
-                )
-            except Exception:
+            except OSError:
                 continue
-    out.sort(key=lambda s: s["modifiedAt"], reverse=True)
-    return {"sessions": out}
+            entries.append((st.st_mtime_ns, p.name, p, st))
+    entries.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+    if before is not None:
+        entries = [entry for entry in entries if (entry[0], entry[1]) < before]
+    if through is not None:
+        entries = [entry for entry in entries if (entry[0], entry[1]) >= through]
+    out = []
+    next_cursor = None
+    for index, (mtime_ns, name, p, st) in enumerate(entries):
+        if limit is not None and len(out) == limit:
+            previous = entries[index - 1]
+            next_cursor = f"v1:{previous[0]}:{previous[1]}"
+            break
+        try:
+            row = _session_row(p, st, waiting)
+        except Exception:
+            continue
+        if row is not None:
+            out.append(row)
+    if limit is None:
+        return {"sessions": out}
+    return {"sessions": out, "next": next_cursor}
 
 
 def _pending_inputs() -> dict:
@@ -5238,6 +5373,10 @@ def system_capabilities() -> dict:
         "version": __version__,
         "featureMethods": sorted(methods),
         "chatSteeringVersion": 2 if _chat_steering_callback is not None else 0,
+        # 2: ``sessions.list`` pages by cursor (``limit``/``before`` → ``next``).
+        # Clients send ``limit`` only to a bot that says so: an old gateway
+        # cut its list at ``limit`` and returned no way to the rest.
+        "sessionsListVersion": 2,
         "runtime": {
             "role": runtime.role.value,
             "profile": runtime.profile_name,
@@ -5392,11 +5531,13 @@ async def media_models_refresh(_params: dict) -> dict:
 _DISPATCH: dict[str, tuple] = {
     "voice.context": (voice_context, True, False),
     "voice.memory.append": (voice_memory_append, True, False),
+    "voice.memory.snapshot": (voice_memory_snapshot, True, False),
     "system.capabilities": (system_capabilities, False, False),
     # Only the main agent's gateway restarts itself; a named agent's runtime
     # never exposes it.
     "gateway.restart": (gateway_restart, False, True),
     "connections.list": (connections_list, False, False),
+    "presence.report": (presence_report, True, False),
     "connections.secret.get": (connections_secret_get, True, False),
     "connections.set": (connections_set, True, True),
     "gmail.set_credentials": (gmail_set_credentials, True, True),
@@ -5537,7 +5678,7 @@ _DISPATCH: dict[str, tuple] = {
     "skills.remove": (skills_remove, True, True),
     "kg.graph": (kg_graph, False, False),
     "kg.delete_entity": (kg_delete_entity, True, False),
-    "sessions.list": (sessions_list, False, False),
+    "sessions.list": (sessions_list, True, False),
     "sessions.attention": (sessions_attention, False, False),
     "activity.list": (activity_list, True, False),
     "activity.get": (activity_get, True, False),
@@ -5588,6 +5729,8 @@ _PRIMARY_RUNTIME_METHOD_PREFIXES = ("board.", "flowlets.", "voice.", "gateway.")
 # WebSocket transports dispatch them in tracked background tasks so their
 # receive loops keep processing control frames, pings, and unrelated RPCs.
 LONG_RUNNING_METHODS = frozenset({
+    # Status checks call Google; all service reads must overlap on one socket.
+    "gmail.status",
     "memory.editor.list",
     "memory.editor.document",
     "memory.editor.save",
@@ -5638,6 +5781,10 @@ async def dispatch(method: str, params: dict) -> tuple[dict, bool]:
             validate_chat_target(params)
         except ValueError as exc:
             raise FeatureRpcError('PROFILE_IDENTITY_CHANGED', str(exc)) from exc
+        if method in _PER_RUNTIME_VOICE_METHODS:
+            # The pin is checked; the strict voice validators accept only
+            # their own fields (profiles.rpc adds the pin for a phone).
+            params = {key: value for key, value in params.items() if key != 'expectedBotId'}
     if method.startswith(_PRIMARY_RUNTIME_METHOD_PREFIXES) and method not in _PER_RUNTIME_VOICE_METHODS:
         from flowly.runtime_capabilities import resolve_runtime_capabilities
 

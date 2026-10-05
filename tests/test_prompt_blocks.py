@@ -241,7 +241,9 @@ class TestDisciplineBlock:
         # The whole point of this block is to ground answers the model
         # likes to fabricate. Verify the high-frequency fabrication
         # targets are listed.
-        assert "Current time" in self.out
+        # Dates come from the turn's <turn_time> note, the live clock from `date`.
+        assert "<turn_time>" in self.out and "never guess a date" in self.out
+        assert "The exact clock right now" in self.out
         assert "System state" in self.out
         assert "File contents" in self.out
         assert "web_search" in self.out

@@ -55,7 +55,7 @@ from flowly.profile_collaboration import (
 from flowly.profile_collaboration import (
     ProfileRunBinding as _ProfileRunBinding,
 )
-from flowly.profile_host_contract import ProfileHostError, validate_profile_rpc
+from flowly.profile_host_contract import ProfileHostError, profile_rpc_session_key, validate_profile_rpc
 from flowly.profile_rooms import PROFILE_ROOM_METHODS
 from flowly.render_capabilities import normalize_render_capabilities
 from flowly.session.manager import SessionManager
@@ -1599,7 +1599,7 @@ class GatewayServer:
         # Gmail management uses the same TLS/SSH boundary as its HTTP endpoint.
         # No change to ordinary chat RPCs or other features on this connection.
         requested = params.get("method", "") if method == "profiles.rpc" and isinstance(params, dict) else method
-        if isinstance(requested, str) and requested.startswith("gmail.") and requested != "gmail.capabilities":
+        if isinstance(requested, str) and requested.startswith("gmail.") and requested not in {"gmail.capabilities", "gmail.chat.pending"}:
             from flowly.gateway.mcp_management import _protected_socket
             request = getattr(ws, "_req", None)
             if request is None or not _protected_socket(request):
@@ -5617,8 +5617,10 @@ class GatewayServer:
                 )
             except ProfileHostError:
                 return
+            # A home call binds its conversation too: the introduction it
+            # starts streams there, before any history read binds it.
             session_key = (
-                str(validated_params.get("sessionKey") or "")
+                profile_rpc_session_key(_inner_method, validated_params)
                 if isinstance(validated_params, dict)
                 else ""
             )
@@ -5664,7 +5666,9 @@ class GatewayServer:
         for client_id, subscription in tuple(
             self._profile_client_subscriptions.items()
         ):
-            if event_type == "directory" and subscription.directory:
+            # A tool's activity is for the roster: the conversation's own
+            # readers have the full tool events already.
+            if event_type in ("directory", "tool.activity") and subscription.directory:
                 targets.add(client_id)
             elif event_type in {"connection", "error", "needsInput"} and (
                 subscription.directory

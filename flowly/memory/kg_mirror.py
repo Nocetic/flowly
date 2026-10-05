@@ -41,6 +41,31 @@ class SqliteKGMirror:
             logger.warning(f"[kg-mirror] supersede({triple_id}) failed: {exc}")
             return 0
 
+    def triple_states(self, triple_ids: list[str]) -> dict[str, bool]:
+        """Whether each triple is current (True) or closed (False). A triple
+        the graph does not have is left out. Empty when the graph is
+        unreadable, so a caller repairs nothing it cannot see."""
+        ids = list(dict.fromkeys(t for t in triple_ids if t))
+        if not ids:
+            return {}
+        try:
+            conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5)
+            try:
+                states: dict[str, bool] = {}
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start:start + 500]
+                    rows = conn.execute(
+                        f"SELECT id, valid_to IS NULL FROM triples WHERE id IN ({','.join('?' * len(chunk))})",
+                        chunk,
+                    )
+                    states.update({row[0]: bool(row[1]) for row in rows})
+                return states
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            logger.warning(f"[kg-mirror] triple_states failed: {exc}")
+            return {}
+
     def restore(self, triple_id: str) -> int:
         """Re-open a triple (undo). Returns rows affected."""
         try:

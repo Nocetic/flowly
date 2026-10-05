@@ -1,0 +1,47 @@
+{
+  "spawn_interception": {
+    "tool": "builtin_agent",
+    "arguments": {
+      "agent": "researcher",
+      "task": "Research the Composer issue"
+    }
+  },
+  "plain_3000": {
+    "outcome": "ok",
+    "artifact_count": 0,
+    "artifact_ids_count": 0,
+    "saved_result_chars": 3000,
+    "notice_has_run_id": false,
+    "notice_has_artifact_id": false
+  },
+  "list_then_autosave_3000": {
+    "outcome": "ok",
+    "artifact_count": 0,
+    "artifact_ids_count": 0,
+    "saved_result_chars": 3000,
+    "notice_has_run_id": false,
+    "notice_has_artifact_id": false
+  },
+  "explicit_create_3000": {
+    "outcome": "ok",
+    "artifact_count": 1,
+    "artifact_ids_count": 0,
+    "saved_result_chars": 3000,
+    "notice_has_run_id": false,
+    "notice_has_artifact_id": false
+  },
+  "profile_cap_7000": {
+    "outcome": "ok",
+    "artifact_count": 1,
+    "artifact_ids_count": 1,
+    "saved_result_chars": 7000,
+    "notice_has_run_id": false,
+    "notice_has_artifact_id": true
+  },
+  "profile_library_visibility": {
+    "primary_count": 0,
+    "profile_count": 1,
+    "shared_list_count": 0,
+    "get_by_known_local_id_works": true
+  }
+}

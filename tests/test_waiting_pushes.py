@@ -14,7 +14,7 @@ from flowly.clarify.manager import ClarifyManager
 from flowly.clarify.types import ClarifyRequest
 from flowly.plans.approval import PlanApprovalManager
 from flowly.plans.models import PlanApproval
-from flowly.push import approval_push, notifications, relay_push
+from flowly.push import approval_push, notifications, presence, relay_push
 
 
 @pytest.fixture
@@ -63,8 +63,9 @@ async def test_an_unanswered_question_is_pushed_once_as_the_question(phones, man
 
 
 @pytest.mark.asyncio
-async def test_a_question_answered_within_the_minute_stays_off_the_phone(phones, managers):
+async def test_a_question_on_a_computer_screen_answered_within_the_minute_stays_off_the_phone(phones, managers):
     questions, _ = managers
+    presence.report('desktop-a', True, [], 90, watching=['web:1'])
 
     async def answer():
         while 'q2' not in questions._pending:
@@ -91,8 +92,9 @@ async def test_an_unreviewed_plan_is_pushed_once(phones, managers):
 
 
 @pytest.mark.asyncio
-async def test_a_plan_decided_within_the_minute_stays_off_the_phone(phones, managers):
+async def test_a_plan_decided_within_the_minute_of_a_call_stays_off_the_phone(phones, managers):
     _, plans = managers
+    presence.report('desktop-a', True, [], 90, in_call=True)
 
     async def approve():
         await asyncio.sleep(0.01)
@@ -102,6 +104,22 @@ async def test_a_plan_decided_within_the_minute_stays_off_the_phone(phones, mana
     assert (await plans.request_and_wait(plan('pa2'), 'plan-8')).approved
     await asyncio.sleep(0.1)
     assert phones == []
+
+
+@pytest.mark.asyncio
+async def test_a_question_nobody_is_looking_at_on_a_computer_is_pushed_at_once(phones, managers, monkeypatch):
+    # 2026-10-03: asked from the phone, which was then closed; the push waited a
+    # minute for a computer that was not showing the conversation.
+    questions, _ = managers
+    monkeypatch.setattr(notifications, 'APPROVAL_PUSH_DELAY_SECONDS', 30)
+    presence.report('desktop-a', True, ['chat'], 90, watching=['web:another-chat'])
+    waiting = asyncio.create_task(questions.request_and_wait(question('q3')))
+    while 'q3' not in questions._pending:
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.05)
+    assert [sent['data']['eventKey'] for sent in phones] == ['clarify:q3']
+    assert questions.resolve('q3', 'Yes')
+    assert await waiting == 'Yes'
 
 
 @pytest.mark.asyncio

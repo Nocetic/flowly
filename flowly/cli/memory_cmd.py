@@ -22,10 +22,7 @@ memory_app = typer.Typer(help="Inspect and correct long-term memory")
 def _open():
     """Open a MemoryGovernance facade against the active profile's stores."""
     from flowly.config.loader import load_config, get_data_dir
-    from flowly.agent.memory import MemoryStore
-    from flowly.memory.governance import GovernanceStore
-    from flowly.memory.coordinator import MemoryGovernance
-    from flowly.memory.kg_mirror import SqliteKGMirror
+    from flowly.memory.coordinator import open_memory_governance
 
     config = load_config()
     workspace = config.workspace_path
@@ -34,23 +31,7 @@ def _open():
     state_dir = get_data_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    gov = GovernanceStore(state_dir / "memory_governance.sqlite3")
-    memory_store = MemoryStore(workspace)
-    kg_path = state_dir / "knowledge_graph.sqlite3"
-
-    def _kg_summary() -> str:
-        if not kg_path.exists():
-            return ""
-        try:
-            from flowly.memory.knowledge_graph import KnowledgeGraph
-            return KnowledgeGraph(str(kg_path)).summary(max_entities=20)
-        except Exception:
-            return ""
-
-    mirror = SqliteKGMirror(str(kg_path)) if kg_path.exists() else None
-    return MemoryGovernance(
-        gov, memory_store=memory_store, kg_mirror=mirror, kg_summary_fn=_kg_summary
-    )
+    return open_memory_governance(state_dir, workspace)
 
 
 def _render(items) -> None:

@@ -16,6 +16,7 @@ class SearchResult:
     score: float          # 0.0 – 1.0 combined score
     vector_score: float   # cosine similarity (0 if no vector)
     text_score: float     # BM25 normalized (0 if no keyword match)
+    source_text: str = ""  # Unabridged evidence; snippet is only the display excerpt.
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -145,6 +146,7 @@ def hybrid_search(
             score=round(final, 4),
             vector_score=round(vs, 4),
             text_score=round(ts, 4),
+            source_text=data["text"],
         ))
 
     results.sort(key=lambda r: r.score, reverse=True)
