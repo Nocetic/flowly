@@ -209,8 +209,10 @@ def refresh(recipe):
         code, _ = command([*DNF, "install", "epel-release", "dnf-plugins-core"], 300)
         if code:
             return code
-    if "crb" in recipe["repositories"]:
-        code, _ = command(["/usr/bin/dnf", "config-manager", "--set-enabled", "crb"], 60)
+    if recipe["repositories"]:
+        # Enabled for good, as the plan says: an installed but disabled EPEL
+        # (seen live) would leave Chromium without its security updates.
+        code, _ = command(["/usr/bin/dnf", "config-manager", "--set-enabled", *recipe["repositories"]], 60)
         if code:
             return code
     return command([*DNF, "makecache"], 300)[0]

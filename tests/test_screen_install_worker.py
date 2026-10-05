@@ -338,7 +338,7 @@ def test_el9_enables_epel_and_crb_then_installs_with_dnf(worker, dnf_host, capsy
     calls = [call.args[0] for call in worker.command.call_args_list]
     assert calls[0][:4] == ["/usr/bin/dnf", "-q", "repoquery", "--duplicates"]
     assert calls[1][-3:] == ["install", "epel-release", "dnf-plugins-core"]
-    assert calls[2] == ["/usr/bin/dnf", "config-manager", "--set-enabled", "crb"]
+    assert calls[2] == ["/usr/bin/dnf", "config-manager", "--set-enabled", "epel", "crb"]
     assert calls[3][-1] == "makecache"
     assert calls[4][:3] == ["/usr/bin/dnf", "-y", "--setopt=install_weak_deps=False"]
     assert calls[4][3:] == ["install", *recipe["packages"]]
