@@ -126,19 +126,54 @@ def command(args, timeout, capture=False):
             process.wait(timeout=5)
             raise TimeoutError() from None
         output.seek(0)
-        return result, output.read(1) if capture else b""
+        # capture: how many bytes of output the caller needs (True reads one).
+        return result, output.read(int(capture)) if capture else b""
+
+PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9+.-]+(:[a-z0-9-]+)?")
+CONFIGURE = ["/usr/bin/dpkg", "--configure", "-a"]
+
+def damaged_packages():
+    """Packages dpkg left half-installed or marked reinstall-required, by name
+    from dpkg's own database; None if that cannot be read safely."""
+    code, raw = command(["/usr/bin/dpkg-query", "-W", "--showformat=${db:Status-Abbrev} ${binary:Package}\n"], 60,
+                        capture=1 << 20)
+    if code or len(raw) >= 1 << 20:
+        return None
+    names = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        flags, name = line[:3], line[3:].strip()
+        if len(flags) == 3 and (flags[1] == "H" or flags[2] == "R"):
+            if not PACKAGE_NAME.fullmatch(name):
+                return None
+            names.append(name)
+    return names
+
+def repair_packages():
+    """Converge what an interrupted run of this installer left: finish pending
+    configuration, reinstall half-installed packages (configuration cannot
+    fix those; seen live when dpkg was stopped mid-unpack), then let apt fix
+    dependencies. Never removes a package. True when every step succeeded."""
+    # May fail on a half-installed package; the steps below and the final
+    # audit decide.
+    command(CONFIGURE, 300)
+    damaged = damaged_packages()
+    if damaged is None:
+        return False
+    if damaged:
+        code, _ = command([*APT, "install", "--reinstall", "-y", "--no-install-recommends", "--no-remove", *damaged], 600)
+        if code:
+            return False
+    code, _ = command(CONFIGURE, 300)
+    if code:
+        return False
+    code, _ = command([*APT, "install", "-f", "-y", "--no-install-recommends", "--no-remove"], 600)
+    return not code
 
 def prepare_packages(repair):
     """None when the package system is ready for this installation, else the
     terminal (state, error) to record."""
-    if repair:
-        # Finish what an interrupted run of this installer left unfinished;
-        # never remove a package to get there.
-        code, _ = command(["/usr/bin/dpkg", "--configure", "-a"], 300)
-        if not code:
-            code, _ = command([*APT, "install", "-f", "-y", "--no-install-recommends", "--no-remove"], 600)
-        if code:
-            return "recovery_required", "INSTALL_PACKAGES_FAILED"
+    if repair and not repair_packages():
+        return "recovery_required", "INSTALL_PACKAGES_FAILED"
     code, dirty = command(["/usr/bin/dpkg", "--audit"], 30, capture=True)
     if code or dirty:
         if repair:

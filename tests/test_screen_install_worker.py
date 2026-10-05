@@ -84,7 +84,8 @@ def test_lock_is_host_wide_and_does_not_create_an_operation_on_contention(worker
     worker.command.assert_not_called()
 
 
-REPAIR = [(["/usr/bin/dpkg", "--configure", "-a"], 300)]
+CONFIGURE = (["/usr/bin/dpkg", "--configure", "-a"], 300)
+QUERY = ["/usr/bin/dpkg-query", "-W", "--showformat=${db:Status-Abbrev} ${binary:Package}\n"]
 
 
 def receipt(state, updated, operation=OPERATION, uid="1000", error=None):
@@ -107,10 +108,9 @@ def test_an_interrupted_operation_is_reported_never_replayed_and_repaired_by_a_n
     assert worker.main() == 0
     assert json.loads(capsys.readouterr().out)["state"] == "succeeded"
     calls = [call.args for call in worker.command.call_args_list]
-    assert calls[0] == REPAIR[0]
-    repair = calls[1][0]
-    assert repair[-5:] == ["install", "-f", "-y", "--no-install-recommends", "--no-remove"] and calls[1][1] == 600
-    assert calls[2] == (["/usr/bin/dpkg", "--audit"], 30)
+    assert calls[0] == CONFIGURE and calls[1][0] == QUERY and calls[2] == CONFIGURE
+    assert calls[3][0][-5:] == ["install", "-f", "-y", "--no-install-recommends", "--no-remove"] and calls[3][1] == 600
+    assert calls[4] == (["/usr/bin/dpkg", "--audit"], 30)
     assert calls[-1][0][-len(worker.PACKAGES):] == list(worker.PACKAGES)
     # History stays as it happened.
     assert worker.read(worker.ROOT / ("1000-" + OPERATION + ".json"))["state"] == "recovery_required"
@@ -125,7 +125,37 @@ def test_a_later_success_means_nothing_is_left_to_repair(worker, capsys):
     assert len(worker.command.call_args_list) == 3
 
 
-@pytest.mark.parametrize("responses", [[(1, b"")], [(0, b""), (100, b"")], [(0, b""), (0, b""), (0, b"dirty")]])
+def test_a_half_installed_package_is_reinstalled_before_anything_else(worker, capsys):
+    """A dpkg killed while unpacking leaves a package half-installed (seen live
+    with perl-base); dpkg --configure -a cannot fix that, a reinstall does."""
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    status = b"ii  bash\niHR perl-base\niU  libfoo1:arm64\nhi  held\n"
+    worker.command.side_effect = lambda args, *rest, **kw: (1, b"") if args == CONFIGURE[0] and \
+        worker.command.call_count == 1 else (0, status if args == QUERY else b"")
+    assert worker.main() == 0
+    calls = [call.args[0] for call in worker.command.call_args_list]
+    reinstall = calls[2]
+    # Only the half-installed / reinstall-required ones; unpacked ones are configured.
+    assert reinstall[-6:] == ["install", "--reinstall", "-y", "--no-install-recommends", "--no-remove", "perl-base"]
+    assert calls[3] == CONFIGURE[0]
+
+
+def test_package_names_from_dpkg_are_checked_before_reaching_apt(worker, capsys):
+    worker.directory()
+    worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))
+    worker.command.side_effect = lambda args, *rest, **kw: (0, b"iHR -o-evil\n" if args == QUERY else b"")
+    assert worker.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "recovery_required" and result["error"] == "INSTALL_PACKAGES_FAILED"
+    assert not any("--reinstall" in call.args[0] for call in worker.command.call_args_list)
+
+
+@pytest.mark.parametrize("responses", [
+    [(0, b""), (1, b"")],                               # dpkg-query failed
+    [(0, b""), (0, b""), (0, b""), (100, b"")],          # apt-get -f install failed
+    [(0, b""), (0, b""), (0, b""), (0, b""), (0, b"dirty")],  # still not clean
+])
 def test_a_repair_that_does_not_converge_needs_recovery(worker, capsys, responses):
     worker.directory()
     worker.save(worker.ROOT / ("1000-" + "3" * 32 + ".json"), receipt("recovery_required", 1, "3" * 32))

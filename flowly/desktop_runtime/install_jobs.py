@@ -415,6 +415,9 @@ class ScreenInstallJobs:
                     install_status(record["operationId"])
                 except ScreenError as status_error:
                     safe = status_error.code == "OPERATION_NOT_FOUND"
+                if not safe:
+                    # The worker had accepted the operation: it was interrupted.
+                    code = "INSTALL_RECOVERY_REQUIRED"
             record.update(state="failed" if safe else "recovery_required", error=code)
         finally:
             password = None

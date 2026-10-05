@@ -232,6 +232,9 @@ def test_privilege_errors_are_retryable_only_before_worker_acceptance(fixture, m
     service.submit(PLAN, OP, password="wrong-synthetic-password")
     result = finished(service)
     assert result["state"] == ("recovery_required" if accepted_receipt else "failed")
+    # An accepted worker that went silent (killed with its service) was
+    # interrupted, not refused: the record says so (seen live).
+    assert result["error"] == ("INSTALL_RECOVERY_REQUIRED" if accepted_receipt else "INSTALL_PRIVILEGE_REQUIRED")
     jobs.install_python.assert_not_called()
     # Either way a new, explicit operation may follow; an uncertain one repairs.
     jobs.install_system.side_effect = None

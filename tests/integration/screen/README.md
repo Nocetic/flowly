@@ -479,9 +479,10 @@ separate integration task and must preserve active tasks.
 
 One private lock and at most 128 receipts belong to each virtualenv, shared by
 its profiles. Accepted work survives loss of its invoking process. Same-ID
-retries return the recorded result; interrupted or partially installed work
-requires explicit recovery instead of automatic replay. Recovery and receipt
-maintenance are still pending. Installation has a 300-second command timeout,
+retries return the recorded result; interrupted or partially installed work is
+never replayed. A later, explicit operation repairs it: it reinstalls the
+hash-pinned set (`--reinstall`) and requires a restart. Receipt pruning is
+still pending (history is bounded at 128). Installation has a 300-second command timeout,
 driver verification 15 seconds, and the caller a 330-second observation timeout;
 timeout cleanup preserves the process-group leader until signals are sent.
 
@@ -859,3 +860,29 @@ headless relay E2E in which a relay chat with no browser field claims the
 running screen, pauses for the person and releases on Stop. The same E2E fails
 with the scope disabled. The Desktop GUI smoke was updated (no selector; first
 read, takeover, explicit resume) but has not been re-run in this change.
+
+
+## Installation recovery
+
+An interrupted or failed installation never disables the host. Accepted
+operations are never replayed; a new, explicit one (`flowly screen install`,
+the Screen panel's install, or Desktop's automatic set-up once per session)
+converges the environment:
+
+| Outcome | Agent turns | Screen | Way out |
+|---|---|---|---|
+| Job pending/running (live) | wait | off | finishes |
+| Definitive failure, nothing changed (package index, verified download) | run | off | retry |
+| System packages, runtime account or browser left uncertain | run | off (`INSTALL_RECOVERY_REQUIRED`) | repair |
+| The agent's own Python environment left uncertain | paused, with the repair named | off | repair |
+| Unfinished package work Flowly did not leave | run | off (`INSTALL_HOST_PACKAGES_BROKEN`) | `sudo dpkg --configure -a`, then retry |
+| A `flowly-screen` account Flowly did not create | run | off (`INSTALL_ACCOUNT_CONFLICT`) | the person removes or renames it |
+
+The system worker repairs with `dpkg --configure -a` and `apt-get -f install
+--no-remove` before the same recipe; the Python worker reinstalls; an account
+creation this installer reserved is completed (created if absent, adopted only
+if exactly what `useradd` was asked for). A later success supersedes earlier
+uncertainty. Live proof: `FLOWLY_SCREEN_AUTO_TEST=screen-auto-repair-live.test.ts
+bash tests/smoke/run-screen-install-auto.sh` in the Desktop checkout restarts the
+gateway while dpkg runs, checks agent turns still pass, and lets Desktop's
+automatic set-up repair the host.
