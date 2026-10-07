@@ -1413,3 +1413,36 @@ def test_create_cli_accepts_a_pinned_seed(profile_roots) -> None:
     )
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["profile"]["markSeed"] == 12
+
+
+def test_stream_identity_reads_only_target_metadata_and_observes_replacement(profile_roots, monkeypatch):
+    default, root = profile_roots
+    profiles.create_profile("writer", local_runtime=True)
+    expected = {name: profiles.ensure_profile_bot_id(name).bot_id for name in ("default", "writer")}
+
+    def forbidden():
+        pytest.fail("stream identity must not enumerate profiles or their skills")
+
+    monkeypatch.setattr(profiles, "list_profiles", forbidden)
+    for _ in range(20):
+        assert profiles.active_profile_identity() == ("default", default, expected["default"])
+        assert profiles.profile_identity("writer") == (root / "writer", expected["writer"])
+    replacement = str(uuid.uuid4())
+    metadata = profiles._profile_metadata(root / "writer")
+    metadata["botId"] = replacement
+    profiles._atomic_write_json(root / "writer" / "profile.json", metadata)
+    assert profiles.profile_identity("writer")[1] == replacement
+    (root / "writer").rename(root / "old-writer")
+    with pytest.raises(FileNotFoundError):
+        profiles.profile_identity("writer")
+    (root / "writer").symlink_to(root / "old-writer", target_is_directory=True)
+    with pytest.raises(FileNotFoundError):
+        profiles.profile_identity("writer")
+
+
+def test_stream_identity_backfills_legacy_metadata_once(profile_roots):
+    default, _ = profile_roots
+    path, identity = profiles.profile_identity("default")
+    assert path == default
+    assert str(uuid.UUID(identity)) == identity
+    assert profiles.profile_identity("default") == (path, identity)

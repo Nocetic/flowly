@@ -106,8 +106,11 @@ class BrowserTabTool(Tool):
             return {key: value for key, value in result.items() if key != "_screenObservation"}
         return result
 
-    def __init__(self, gateway_server: Any = None, provider: Any = None, registry: Any = None):
+    def __init__(self, gateway_server: Any = None, provider: Any = None, registry: Any = None,
+                 *, screen_only: bool = False, screen_enabled: bool = True):
         self._gateway = gateway_server
+        self.screen_only = screen_only
+        self.screen_enabled = screen_enabled
         # Optional. When set, the `find` action transparently upgrades
         # to semantic matching via an inner Haiku call. When None we
         # fall through to the extension's substring matcher.
@@ -184,7 +187,7 @@ class BrowserTabTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Interact with web pages in the user's visible browser (embedded Flowly browser or Chrome). "
+            "Interact with web pages in the user's visible browser (profile Screen, embedded Flowly browser or Chrome). "
             "The user can see every action in real-time.\n\n"
             "Actions:\n"
             "- read_page: Get element map with ref IDs (text, NOT a screenshot). "
@@ -580,6 +583,25 @@ class BrowserTabTool(Tool):
         }
 
     async def execute(self, action: str = "", **kwargs: Any) -> str:
+        from flowly.desktop_runtime.authority import ScreenError
+        from flowly.desktop_runtime.host_screen_run import current_screen_run, unavailable
+
+        run = current_screen_run()
+        if not self.screen_enabled and run is not None and run.uses_screen():
+            return json.dumps({"error": "Screen browser access is disabled.", "error_code": "SCREEN_DISABLED"})
+        if self.screen_only:
+            if run is None or run.gateway is not self._gateway or not run.uses_screen():
+                return json.dumps({"error": "The profile Screen is not available for this run.",
+                                   "error_code": "SCREEN_NOT_AVAILABLE"})
+            # Pin the provider before any await/dispatch can re-evaluate availability.
+            # A disappearing Screen must never fall back to a connected native browser.
+            try:
+                if await run.bind() is None:
+                    return json.dumps({"error": "The profile Screen is not available for this run.",
+                                       "error_code": "SCREEN_NOT_AVAILABLE"})
+            except ScreenError as exc:
+                return json.dumps(unavailable(exc))
+
         if not self._gateway:
             return json.dumps({"error": "Gateway not available"})
 

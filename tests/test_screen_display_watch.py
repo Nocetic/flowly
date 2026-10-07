@@ -95,13 +95,10 @@ async def test_unsubscribe_preserves_human_ownership(display_gateway):
 async def test_profile_replacement_closes_subscription_with_original_identity(display_gateway, monkeypatch):
     fixture = display_gateway
     watch = await subscribe(fixture, "writer")
-    original = profiles.ensure_profile_bot_id
-
-    def replaced(name):
-        profile = original(name)
-        return SimpleNamespace(path=profile.path, bot_id="replacement")
-
-    monkeypatch.setattr(profiles, "ensure_profile_bot_id", replaced)
+    path, _ = profiles.profile_identity("writer")
+    metadata = profiles._profile_metadata(path)
+    metadata["botId"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    profiles._atomic_write_json(path / "profile.json", metadata)
     event = await fixture.socket.receive_json(timeout=3)
     assert event["event"] == "display.subscription.closed"
     assert event["data"]["botId"] == watch["status"]["botId"]

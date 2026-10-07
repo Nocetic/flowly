@@ -419,13 +419,10 @@ async def test_deleted_profile_identity_cannot_continue_streaming(display_gatewa
     _, headers = await observe(display_gateway, "writer")
     ws = await display_gateway.client.ws_connect(display_gateway.server.make_url(STREAM_PATH), headers=headers)
     await RfbSocket(ws).handshake()
-    original = profiles.ensure_profile_bot_id
-
-    def recreated(name):
-        info = original(name)
-        return SimpleNamespace(path=info.path, bot_id="replacement")
-
-    monkeypatch.setattr(profiles, "ensure_profile_bot_id", recreated)
+    path, _ = profiles.profile_identity("writer")
+    metadata = profiles._profile_metadata(path)
+    metadata["botId"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    profiles._atomic_write_json(path / "profile.json", metadata)
     assert (await ws.receive(timeout=5)).type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED}
     await ws.close()
 

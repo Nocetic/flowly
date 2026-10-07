@@ -1298,6 +1298,31 @@ def ensure_profile_bot_id(name: str) -> ProfileInfo:
     return profile
 
 
+def profile_identity(name: str) -> tuple[Path, str]:
+    """Read fresh identity without enumerating profiles, config or skill inventories.
+
+    Streaming checks call this for every input/output batch. Never cache the
+    identity: deletion/replacement must invalidate existing viewers immediately.
+    Legacy metadata still uses the existing migration path once.
+    """
+    if name == "default":
+        path = _DEFAULT_HOME
+    else:
+        validate_profile_name(name)
+        path = _PROFILES_ROOT / name
+        if not _is_describable_profile_dir(path):
+            raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    raw = str(_profile_metadata(path).get("botId") or "").strip()
+    try:
+        canonical = str(uuid.UUID(raw))
+    except (ValueError, AttributeError):
+        canonical = None
+    if canonical is not None and raw == canonical:
+        return path, canonical
+    info = ensure_profile_bot_id(name)
+    return info.path, info.bot_id
+
+
 def active_profile_identity() -> tuple[str, Path, str]:
     """``(name, home, botId)`` of this process's own profile.
 
@@ -1309,8 +1334,8 @@ def active_profile_identity() -> tuple[str, Path, str]:
     name = current_profile_name()
     home = get_flowly_home()
     if name != "default" or home.resolve() == _DEFAULT_HOME.resolve():
-        info = ensure_profile_bot_id(name)
-        return name, info.path, info.bot_id
+        path, bot_id = profile_identity(name)
+        return name, path, bot_id
     current = _profile_metadata(home)
     raw = str(current.get("botId") or "").strip()
     try:

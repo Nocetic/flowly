@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -928,7 +929,12 @@ _SCREEN_RUN_ERRORS = frozenset({"SCREEN_BUSY", "HUMAN_HAS_CONTROL", "STALE_GENER
                                 "HANDOFF_RECOVERY_REQUIRED", "HANDOFF_STATE_INVALID"})
 SCREEN_HANDOFF_GUIDANCE = (
     "[Screen task] This task runs in the browser on the user's own server screen, which they can watch and "
-    "take over. When a step needs them (signing in with a password, a two-factor or verification code, a "
+    "take over. Use browser_tab for this browser: tabs_list to see open tabs, navigate with a URL to open "
+    "a site, then read_page for fresh element refs. The browser runs in an isolated Screen environment; "
+    "a missing shell DISPLAY or xdg-open failure does not mean it is absent. Do not search host browser "
+    "binaries, scan debugging ports or write your own CDP driver. If browser_tab is unavailable under "
+    "the current tool policy, report that limitation instead of bypassing it with shell commands. "
+    "When a step needs them (signing in with a password, a two-factor or verification code, a "
     "CAPTCHA, or approving a payment), do not guess and do not ask them to paste passwords or codes into "
     "chat. Say what is needed and ask them to take control on the Screen, complete it there and give "
     "control back; this same task then continues from a fresh look at the page."
@@ -2852,7 +2858,12 @@ class AgentLoop:
         browser_tab_enabled = False
         if self._main_config and hasattr(self._main_config, "tools"):
             browser_tab_enabled = self._main_config.tools.browser_tab.enabled
-        if browser_tab_enabled:
+        screen_browser_enabled = (
+            sys.platform == "linux"
+            and bool(getattr(getattr(getattr(self._main_config, "tools", None), "browser_tab", None),
+                             "screen_enabled", True))
+        )
+        if browser_tab_enabled or screen_browser_enabled:
             from flowly.agent.tools.browser_tab import BrowserTabTool
             # Provider is wired now so the `find` action can transparently
             # upgrade to LLM-powered semantic matching (Haiku 4.5 inner
@@ -2863,8 +2874,11 @@ class AgentLoop:
                 gateway_server=None,
                 provider=self.provider,
                 registry=self.tools,
+                screen_only=not browser_tab_enabled,
+                screen_enabled=screen_browser_enabled,
             ))
 
+        if browser_tab_enabled:
             # Planning subsystem — exposed alongside browser_tab whenever
             # browser_tab itself is enabled. Per user directive: plan tool
             # is always available for browser tasks, no adaptive gate.
@@ -4345,6 +4359,18 @@ class AgentLoop:
             disabled_toolsets=getattr(cfg, "disabled_toolsets", None),
         )
 
+    def _screen_unavailable_tools(self) -> frozenset[str]:
+        get_tool = getattr(self.tools, "get", None)
+        browser = get_tool("browser_tab") if callable(get_tool) else None
+        if not browser:
+            return frozenset()
+        from flowly.desktop_runtime.host_screen_run import current_screen_run
+
+        run = current_screen_run()
+        if run is not None and run.gateway is getattr(browser, "_gateway", None) and run.uses_screen():
+            return frozenset() if getattr(browser, "screen_enabled", True) else frozenset({"browser_tab"})
+        return frozenset({"browser_tab"}) if getattr(browser, "screen_only", False) else frozenset()
+
     def _routed_tool_names(
         self,
         platform: str | None,
@@ -4358,7 +4384,7 @@ class AgentLoop:
                 platform=platform,
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
-                disabled_tools=frozenset(disabled_tools or ()),
+                disabled_tools=frozenset(disabled_tools or ()) | self._screen_unavailable_tools(),
             ))
         # Lightweight test/plugin registries predating routing may only expose
         # mapping semantics. Preserve their former all-tools behavior.
@@ -4382,7 +4408,7 @@ class AgentLoop:
                 platform=platform,
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
-                disabled_tools=frozenset(disabled_tools or ()),
+                disabled_tools=frozenset(disabled_tools or ()) | self._screen_unavailable_tools(),
             )
         except TypeError:
             # Compatibility for third-party registries implementing the old
@@ -4394,7 +4420,8 @@ class AgentLoop:
         origin = current_tool_origin()
         if origin is not None and origin.allowed_tools is not None:
             definitions = [item for item in definitions if item.get("function", {}).get("name") in origin.allowed_tools]
-        return definitions
+        unavailable = self._screen_unavailable_tools()
+        return [item for item in definitions if item.get("function", {}).get("name") not in unavailable]
 
     def _build_tool_disclosure(
         self,

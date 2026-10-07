@@ -241,10 +241,10 @@ def _resolve_locked(gateway, params: dict, *, pinned: bool = False) -> DisplaySe
     from flowly.profile import (
         active_profile_identity,
         current_profile_name,
-        ensure_profile_bot_id,
         get_flowly_home,
         get_or_create_profile_host_id,
         is_default_home,
+        profile_identity,
     )
 
     profile = params.get("profileId", current_profile_name())
@@ -265,10 +265,9 @@ def _resolve_locked(gateway, params: dict, *, pinned: bool = False) -> DisplaySe
         if gateway.profile_host is None or not is_default_home():
             raise ScreenError("PROFILE_NOT_AVAILABLE")
         try:
-            info = ensure_profile_bot_id(profile)
+            path, bot_id = profile_identity(profile)
         except (ValueError, FileNotFoundError):
             raise ScreenError("PROFILE_NOT_AVAILABLE") from None
-        path, bot_id = info.path, info.bot_id
     host = gateway.profile_host.host_id if gateway.profile_host else get_or_create_profile_host_id()
     identity = {"hostId": host, "profileId": profile, "botId": bot_id, "screenId": "browser"}
     guarded = pinned or "expectedHostId" in params or "expectedBotId" in params
