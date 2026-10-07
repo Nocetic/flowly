@@ -117,6 +117,7 @@ include = [
     "flowly/skills/**/*.sh",
     "flowly/skills/**/*.txt",
     "flowly/mcp_catalog/**/*.yaml",
+    "flowly/compaction/data/*",
 ]
 
 [tool.hatch.build.targets.sdist]

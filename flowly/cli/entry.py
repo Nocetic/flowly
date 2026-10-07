@@ -17,6 +17,9 @@
 # nuitka-project: --include-package=tzdata
 # nuitka-project: --include-package-data=tzdata
 
+# Token estimation must work offline on the first turn in standalone builds.
+# nuitka-project: --include-package-data=flowly.compaction
+
 """CLI entry point — extracts --profile BEFORE any Flowly module import.
 
 This is critical because many modules evaluate ``get_flowly_home()`` at
