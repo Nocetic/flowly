@@ -13,9 +13,9 @@ class Chunk:
 def _count_tokens(text: str) -> int:
     """Estimate token count using tiktoken (cl100k_base)."""
     try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
+        from flowly.compaction.estimator import estimate_tokens
+
+        return estimate_tokens(text)
     except Exception:
         # Fallback: ~4 chars per token
         return len(text) // 4

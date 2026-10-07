@@ -65,6 +65,9 @@ from flowly.compaction.estimator import estimate_tokens, estimate_messages_token
 assert estimate_tokens("Hello, world!") == 4
 assert estimate_tokens("şğıİçöü 日本語 👋") > 0
 assert estimate_messages_tokens([{"role":"user", "content":"Hello, world!"}]) == 10
+from flowly.memory.chunker import _count_tokens, chunk_text
+assert _count_tokens("Hello, world!") == 4  # existing fallback would return 3
+assert [c.text for c in chunk_text("Hello, world!\\nGoodbye!", chunk_tokens=4, overlap_tokens=0)] == ["Hello, world!", "Goodbye!"]
 print("offline cold estimation passed")
 '''
     result = subprocess.run([sys.executable, "-c", script],
