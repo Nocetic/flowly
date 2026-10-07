@@ -170,6 +170,12 @@ def _decide(
 
     if tracks_edge:
         cond = _eval_cond(watch, values, now_min)
+        # `after` is a daily gate. A sleeping/offline host may never observe
+        # its false morning phase; re-arm across a local date boundary without
+        # changing continuously edge-triggered rules that have no daily gate.
+        if last_fired is not None and _parse_hhmm(watch.get("after")) is not None:
+            if datetime.fromtimestamp(last_fired / 1000, tz).date() < dt.date():
+                last_cond = False
         rising = cond and not last_cond
         if not rising:
             return False, cond

@@ -59,7 +59,7 @@ def test_ids_are_stable_and_unique():
     # Clients key their picker off these; renaming one is a breaking change, so
     # it should take a deliberate edit here.
     assert [t.id for t in TEMPLATES] == [
-        "water", "habits", "expenses", "tasks", "sleep", "mood",
+        "water", "habits", "expenses", "tasks", "sleep", "mood", "meals",
     ]
 
 

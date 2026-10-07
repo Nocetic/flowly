@@ -139,8 +139,16 @@ def _coerce_field(ftype: str, v: Any) -> Any:
             return v
         return str(v).strip().lower() in ("true", "1", "yes", "evet")
     if ftype == "date":
+        from datetime import date
+
         s = str(v).strip()[:10]
-        return s if _DATE_RE.match(s) else None
+        if not _DATE_RE.match(s):
+            return None
+        try:
+            date.fromisoformat(s)
+        except ValueError:
+            return None
+        return s
     return None
 
 

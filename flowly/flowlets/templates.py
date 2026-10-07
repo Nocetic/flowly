@@ -508,6 +508,74 @@ def _mood(say: Say) -> dict:
     }
 
 
+def _meals(say: Say) -> dict:
+    """Photo and manual entry share the same dated, editable journal."""
+    return {
+        "state": {
+            "goal_kcal": {"type": "number", "default": 2200, "min": 1, "max": 10000},
+            "meals": {"type": "list", "max": 200, "item": {
+                "name": "string", "kcal": "number", "portion": "string",
+                "date": "date", "shot": "image",
+            }},
+        },
+        "computed": {
+            "today_kcal": {"list": "meals", "field": "kcal", "agg": "sum",
+                           "where": "days_since(date) == 0"},
+            "meal_count": {"list": "meals", "agg": "count", "where": "days_since(date) == 0"},
+            "remaining": {"expr": "max(0, goal_kcal - today_kcal)"},
+        },
+        "layout": [
+            {"type": "card", "children": [
+                {"type": "stat", "value": "today_kcal", "unit": "kcal",
+                 "label": say("Today", "Bugün", "Hoy")},
+                {"type": "progress", "value": "today_kcal", "max": "goal_kcal",
+                 "label": say("Daily goal", "Günlük hedef", "Objetivo diario")},
+                {"type": "stat", "value": "remaining",
+                 "label": say("Remaining (kcal)", "Kalan (kcal)", "Restante (kcal)")},
+            ]},
+            {"type": "photo", "id": "mealPhoto",
+             "label": say("Add meal photo", "Öğün fotoğrafı ekle", "Añadir foto de comida"),
+             "action": {"op": "vision", "into": "meals", "dateDefaults": ["date"], "prompt": say(
+                 "Estimate the food or drink name, calories and portion. Use today's date for date.",
+                 "Yiyecek veya içeceğin adını, kalorisini ve porsiyonunu tahmin et. Tarih için bugünü kullan.",
+                 "Estima el nombre, las calorías y la porción de la comida o bebida. Usa la fecha de hoy.",
+             )}},
+            {"type": "form", "id": "addMeal", "into": "meals",
+             "title": say("Add manually", "Elle ekle", "Añadir manualmente"),
+             "fields": [
+                 {"field": "name", "label": say("Meal", "Öğün", "Comida")},
+                 {"field": "kcal", "label": say("Calories (kcal)", "Kalori (kcal)", "Calorías (kcal)")},
+                 {"field": "portion", "label": say("Portion", "Porsiyon", "Porción")},
+                 {"field": "date", "label": say("Date", "Tarih", "Fecha"), "default": "today"},
+             ], "submit": {"label": say("Add", "Ekle", "Añadir")}},
+            {"type": "tracker_card", "id": "week", "list": "meals", "field": "kcal",
+             "window": "7d", "chart": "bar",
+             "title": say("Last 7 days", "Son 7 gün", "Últimos 7 días")},
+            {"type": "repeater", "source": "meals", "navigate": "meal",
+             "sortBy": {"field": "date", "dir": "desc"},
+             "empty": say("Add your first meal", "İlk öğününü ekle", "Añade tu primera comida"),
+             "item": {"type": "list_row", "title": "$.name", "subtitle": "$.portion",
+                      "value": "{$.kcal} kcal", "badge": "$.date", "thumb": "$.shot"}},
+            {"type": "number_input", "id": "goal", "value": "goal_kcal",
+             "label": say("Daily goal (kcal)", "Günlük hedef (kcal)", "Objetivo diario (kcal)"),
+             "action": {"op": "set", "key": "goal_kcal"}},
+            {"type": "text", "text": say("{meal_count} meals today", "Bugün {meal_count} öğün",
+                                         "{meal_count} comidas hoy")},
+        ],
+        "screens": {"meal": {"title": "{$.name}", "layout": [
+            {"type": "image", "src": "$.shot"},
+            *[{"type": kind, "id": f"edit_{field}", "label": label, "value": f"$.{field}",
+               "action": {"op": "item_update", "key": "meals", "field": field}}
+              for field, kind, label in [
+                  ("name", "input", say("Meal", "Öğün", "Comida")),
+                  ("kcal", "number_input", say("Calories", "Kalori", "Calorías")),
+                  ("portion", "input", say("Portion", "Porsiyon", "Porción")),
+                  ("date", "date", say("Date", "Tarih", "Fecha")),
+              ]],
+        ]}},
+    }
+
+
 class Template(NamedTuple):
     id: str
     icon: str
@@ -577,6 +645,16 @@ TEMPLATES: tuple[Template, ...] = (
             "Un registro diario de un toque, 90 días en cuadrícula y espacio para notas.",
         ),
         build=_mood,
+    ),
+    Template(
+        id="meals", icon="camera", accent="#F97316",
+        title=("Meal Journal", "Kalori Takibim", "Diario de comidas"),
+        description=(
+            "Photo estimates, manual entry, editable meals and daily calorie totals.",
+            "Fotoğraftan tahmin, elle kayıt, düzenlenebilir öğünler ve günlük kalori toplamı.",
+            "Estimaciones por foto, registro manual, comidas editables y calorías diarias.",
+        ),
+        build=_meals,
     ),
 )
 

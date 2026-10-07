@@ -766,6 +766,12 @@ def _validate_action(ctype, cid, action, ctx: _Ctx) -> None:
                 f"{ctype} (id={cid}) action `vision` `into` targets '{into}', which is "
                 "owned by a data source and is read-only"
             )
+        defaults = action.get("dateDefaults")
+        if defaults is not None and (
+            not isinstance(defaults, list)
+            or not all(isinstance(f, str) and ctx.list_keys[into].get(f) == "date" for f in defaults)
+        ):
+            raise _err(f"{ctype} (id={cid}) vision dateDefaults must list declared date fields")
     elif op == "batch":
         ops = action.get("ops")
         if not isinstance(ops, list) or not ops:
@@ -1470,6 +1476,8 @@ def _validate_watch_schedule(where: str, w: dict) -> None:
     every = w.get("everyMinutes")
     if at is None and every is None:
         raise _err(f'{where}: a schedule watch needs `at` ("HH:MM") or `everyMinutes`')
+    if at is not None and every is not None:
+        raise _err(f'{where}: specify exactly one of `at` or `everyMinutes`')
     if at is not None and (not isinstance(at, str) or not _HHMM_RE.match(at)):
         raise _err(f'{where}: `at` must be a 24-hour time like "20:00"')
     if every is not None and (not isinstance(every, int) or isinstance(every, bool) or every <= 0):

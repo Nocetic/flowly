@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from datetime import tzinfo
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -79,6 +79,12 @@ async def apply_capture(
         raise FlowletCaptureError("INVALID", f"vision `into` '{into}' is not a list")
     fields = spec.get("item") or {}
     keeps_photo = any(t == "image" for t in fields.values())
+    limit = int(spec.get("max") or catalog.MAX_LIST_ITEMS)
+    if len(store.get_state(flowlet_id).get(into) or []) >= limit:
+        # Do not pay for vision or save a photo that cannot be added.
+        raise FlowletCaptureError("INVALID", f"'{into}' is full ({limit} items)")
+    captured_at = _now_ms()
+    captured_date = datetime.fromtimestamp(captured_at / 1000, tz).date().isoformat()
 
     # Store the photo only if the list has somewhere to hold it — otherwise this
     # is an analyze-only capture and keeping the file would orphan it.
@@ -98,7 +104,8 @@ async def apply_capture(
         tmp = Path(name)
         image_path = tmp
     try:
-        prompt = _build_vision_prompt(action.get("prompt", ""), fields)
+        prompt = (f"Capture date (execution host local time): {captured_date}.\n"
+                  + _build_vision_prompt(action.get("prompt", ""), fields))
         reply = await runner(flowlet, prompt, str(image_path))
         # The item's own field names disambiguate the reply: a model that pads
         # its answer with a tool-call preamble can't have the preamble win.
@@ -139,8 +146,14 @@ async def apply_capture(
             "UNAVAILABLE", "couldn't read the photo — add the details manually"
         )
 
+    # Explicit date defaults keep undated photos in the right daily aggregate.
+    # A date actually read from a receipt wins. Use capture time even when the
+    # model call finishes after midnight; defaults never rescue an unreadable photo.
+    for field in action.get("dateDefaults") or []:
+        if fields.get(field) == "date" and field not in item:
+            item[field] = captured_date
+
     items = list(store.get_state(flowlet_id).get(into) or [])
-    limit = int(spec.get("max") or catalog.MAX_LIST_ITEMS)
     if len(items) >= limit:
         if att_id:
             store.delete_attachment(flowlet_id, att_id)
