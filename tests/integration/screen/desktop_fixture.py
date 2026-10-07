@@ -47,6 +47,10 @@ document.querySelector('#result').style.backgroundColor='#16803c';
 async def main():
     if os.environ.get("FLOWLY_SCREEN_LINUX_TEST") != "1":
         raise RuntimeError("Requires the isolated Linux screen runner")
+    if os.environ.get("FLOWLY_SCREEN_TRACEBACKS") == "1":
+        import faulthandler
+
+        faulthandler.dump_traceback_later(25, repeat=True)
     if os.getuid() == 0:
         if os.environ.get("FLOWLY_SCREEN_ROOT_TEST") != "1" or not Path("/.dockerenv").is_file():
             raise RuntimeError("Root fixture requires explicit disposable-container opt-in")
