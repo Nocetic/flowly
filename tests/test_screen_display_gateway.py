@@ -1,10 +1,12 @@
 """Real authenticated gateway and private Unix transport; synthetic RFB peer."""
 
 import asyncio
+import base64
 import json
 import os
 import struct
 import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -225,6 +227,68 @@ async def test_a_partial_key_cannot_cross_a_takeover_epoch(display_gateway):
         await rfb.send(key[3:], epoch=2)
         assert (await ws.receive(timeout=5)).type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED}
         assert fixture.input_services["default"]._broker is None
+
+
+@pytest.mark.parametrize("release_control", [False, True])
+async def test_slow_input_delivery_does_not_starve_websocket_heartbeat(display_gateway, monkeypatch, release_control):
+    fixture = display_gateway
+    view, _ = await observe(fixture)
+    human = (await fixture.rpc("display.control.acquire", control_params(view, 1, "acquire")))["result"]["control"]
+    # Acquire a fresh ticket for the same holder after the control transition.
+    request = {key: value for key, value in control_params(view, human["epoch"], "unused").items()
+               if key not in {"epoch", "operationId"}}
+    ticket = (await fixture.rpc("display.observe", request))["result"]
+    headers = {"Authorization": "Bearer display-test-owner", "X-Flowly-Profile": view["profileId"],
+               "X-Flowly-Host-Id": view["hostId"], "X-Flowly-Bot-Id": view["botId"],
+               "X-Flowly-Screen-Generation": view["generation"],
+               "X-Flowly-Screen-Ticket": ticket["ticket"], "X-Flowly-Screen-Input": "epoch-u64-v1"}
+    entered, release = threading.Event(), threading.Event()
+    deliveries = []
+    original = InputServiceClient.request
+
+    def stalled(client, method, **params):
+        if method == "attach":
+            return {"handle": "test-handle", "nextSequence": 0}
+        if method == "send":
+            deliveries.append(base64.b64decode(params["data"]))
+            entered.set()
+            release.wait(5)
+            return {"nextSequence": params["sequence"] + 1}
+        return original(client, method, **params)
+
+    monkeypatch.setattr(InputServiceClient, "request", stalled)
+    async with fixture.client.ws_connect(fixture.server.make_url(STREAM_PATH), headers=headers, autoping=False) as ws:
+        rfb = RfbSocket(ws, epoch=human["epoch"])
+        await rfb.handshake()
+        try:
+            await rfb.send(struct.pack("!BBHH", 5, 0, 20, 20))
+            assert await asyncio.to_thread(entered.wait, 2)
+            # Build a backlog while the prior delivery waits for its ACK.
+            moves = [struct.pack("!BBHH", 5, 0, x, 20) for x in range(100)]
+            key = struct.pack("!BBHI", 4, 1, 0, ord("a"))
+            update = struct.pack("!BBHHHH", 3, 1, 0, 0, 64, 48)
+            for move in moves:
+                await rfb.send(move)
+            await rfb.send(key + update)
+            await ws.ping(b"still-responsive")
+            pong = await ws.receive(timeout=1)
+            assert pong.type == aiohttp.WSMsgType.PONG and pong.data == b"still-responsive"
+            if release_control:
+                result = await fixture.rpc("display.control.release", control_params(view, human["epoch"], "release"))
+                assert result["result"]["control"]["control"] == "agent"
+            release.set()
+            await asyncio.wait_for(fixture.received_event.wait(), 2)
+            assert fixture.received == [("default", update)]
+            if release_control:
+                # Permission is rechecked at consumption, not queue admission.
+                assert len(deliveries) == 1
+            else:
+                async with asyncio.timeout(2):
+                    while len(deliveries) < 2:
+                        await asyncio.sleep(0.01)
+                assert deliveries[1:] == [moves[0] + moves[-1] + key]
+        finally:
+            release.set()
 
 
 class RfbSocket:

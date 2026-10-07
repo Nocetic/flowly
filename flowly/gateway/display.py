@@ -31,6 +31,7 @@ from flowly.desktop_runtime.lifecycle import ScreenLifecycle
 from flowly.desktop_runtime.profile_lifecycle import assert_not_retired, construction_guard
 from flowly.desktop_runtime.rfb import RfbClientGate
 from flowly.desktop_runtime.status import StatusSequence
+from flowly.desktop_runtime.stream_input import ScreenInputQueue, coalesce_pointer_moves
 from flowly.desktop_runtime.tickets import StreamScope, StreamTickets
 from flowly.desktop_runtime.viewers import ViewerCredentials
 from flowly.gateway.auth import extract_request_token, host_origin_allowed, token_matches
@@ -578,23 +579,24 @@ def register_display(app: web.Application, gateway) -> None:
                     await check_current()
                     await asyncio.wait_for(ws.send_bytes(data), 5)
 
+            inbox = ScreenInputQueue(bool(input_protocol))
+
+            async def receive_viewer():
+                # aiohttp handles ping/pong inside receive(). Never wait here
+                # for filesystem locks or input ACKs: they otherwise starve
+                # heartbeats behind mouse traffic and kill a healthy stream.
+                async for message in ws:
+                    if message.type != WSMsgType.BINARY:
+                        raise ScreenError("INVALID_RFB_STREAM")
+                    inbox.put(message.data)
+
             async def viewer_to_server():
                 input_client = InputServiceClient(session.runtime.socket_directory / "input.sock")
                 input_state = None
                 input_epoch = None
-                async for message in ws:
-                    if message.type != WSMsgType.BINARY:
-                        raise ScreenError("INVALID_RFB_STREAM")
+                while True:
+                    epoch, payload = await inbox.get()
                     await check_current()
-                    payload = message.data
-                    epoch = None
-                    if input_protocol:
-                        if not 8 < len(payload) <= MAX_FRAME + 8:
-                            raise ScreenError("INVALID_RFB_STREAM")
-                        epoch = int.from_bytes(payload[:8], "big")
-                        if epoch >= 2**53:
-                            raise ScreenError("INVALID_RFB_STREAM")
-                        payload = payload[8:]
                     inputs = []
                     allowed = bool(input_protocol and epoch and await asyncio.to_thread(
                         session.runtime.authority.may_input, viewer, generation, epoch))
@@ -611,7 +613,7 @@ def register_display(app: web.Application, gateway) -> None:
                             )
                             input_epoch = epoch
                         batch = bytearray()
-                        for item in [*inputs, b""]:
+                        for item in [*coalesce_pointer_moves(inputs), b""]:
                             if batch and (not item or len(batch) + len(item) > 64 * 1024 + 8):
                                 result = await asyncio.to_thread(
                                     input_client.request, "send", viewer=viewer, generation=generation, epoch=epoch,
@@ -630,7 +632,7 @@ def register_display(app: web.Application, gateway) -> None:
                                                    session.identity["botId"]):
                         raise ScreenError("VIEWER_EXPIRED")
 
-            tasks.extend(asyncio.create_task(operation()) for operation in (server_to_viewer, viewer_to_server, monitor))
+            tasks.extend(asyncio.create_task(operation()) for operation in (server_to_viewer, receive_viewer, viewer_to_server, monitor))
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         except (ScreenError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
             if not ws.prepared:
