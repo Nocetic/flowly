@@ -607,11 +607,19 @@ def test_stop_and_crashed_supervisor_leave_no_account_process(layout):
 
 def test_account_applications_are_bounded_and_cannot_undo_their_oom_floor(layout):
     from flowly.desktop_runtime.launcher import ScreenRuntime
+    from flowly.desktop_runtime.resource_scope import MEMORY_MAX, available
 
     directory, application = layout
     runtime = ScreenRuntime(directory)
     state = runtime.start()
     try:
+        if available():
+            assert state["resourceLimits"]["enforced"] is True
+            assert state["resourceLimits"]["memoryMaxBytes"] == MEMORY_MAX
+            scope = (Path("/proc") / str(state["supervisor"]["pid"]) / "cgroup").read_text()
+            assert scope != Path("/proc/self/cgroup").read_text()
+            for child in state["children"]:
+                assert (Path("/proc") / str(child["pid"]) / "cgroup").read_text() == scope
         assert state["keymap"] == "seeded", "layout keys are seeded as the application account"
         for child in state["children"]:
             proc = Path("/proc") / str(child["pid"])

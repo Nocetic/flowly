@@ -334,13 +334,19 @@ class ScreenRuntime:
         # No parent pipe survives. Gateway/viewer disconnects do not end the
         # browser, and a restarted gateway adopts its original generation.
         try:
+            from flowly.desktop_runtime.resource_scope import scoped_command
+
             command = [sys.executable, "-m", "flowly.desktop_runtime.supervisor", str(self.directory), generation]
+            command, scoped = scoped_command(command if root else ["dbus-run-session", "--", *command],
+                                              self.directory, generation)
+            state = self.read_manifest()
+            write_state(self.manifest, {**state, "resourceScope": scoped})
             process = subprocess.Popen(
-                command if root else ["dbus-run-session", "--", *command],
+                command,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, close_fds=True,
             )
-        except OSError as exc:
+        except (OSError, ScreenError) as exc:
             write_state(self.manifest, dict(schema=1, generation=generation, phase="failed",
                                            supervisor=None, children=[], error="RUNTIME_START_FAILED"))
             raise ScreenError("RUNTIME_START_FAILED") from exc
@@ -414,6 +420,10 @@ class ScreenRuntime:
                 if idle_revision is not None:
                     # Recovery ends human claims; only an explicit stop may.
                     raise ScreenError("RUNTIME_RECOVERY_REQUIRED")
+                if state.get("resourceScope") is True:
+                    from flowly.desktop_runtime.resource_scope import stop_scope
+
+                    stop_scope(self.directory, generation)
                 if any(is_alive(child) for child in state["children"]):
                     # A crashed supervisor left applications behind. A
                     # dedicated-account layout identifies every one of them;
@@ -443,6 +453,10 @@ class ScreenRuntime:
                     # Terminal jobs may have daemonized out of the supervisor's
                     # process tree; none may outlive the profile's screen.
                     self._reap_account_processes()
+                    if state.get("resourceScope") is True:
+                        from flowly.desktop_runtime.resource_scope import stop_scope
+
+                        stop_scope(self.directory, generation)
                     if idle_revision is not None:
                         # Tells the user why the screen stopped by itself.
                         write_state(self.manifest, {**current, "error": "IDLE_STOPPED"})

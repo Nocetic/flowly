@@ -886,3 +886,43 @@ uncertainty. Live proof: `FLOWLY_SCREEN_AUTO_TEST=screen-auto-repair-live.test.t
 bash tests/smoke/run-screen-install-auto.sh` in the Desktop checkout restarts the
 gateway while dpkg runs, checks agent turns still pass, and lets Desktop's
 automatic set-up repair the host.
+
+## Private resource scopes (2026-10-07)
+
+On systemd/cgroup-v2 hosts, new generations run in their own transient scope:
+1 GiB `MemoryMax`, 768 MiB `MemoryHigh`, 256 MiB `MemorySwapMax`, 4096 `TasksMax`.
+The gateway remains outside. The supervisor reads kernel counters before any
+application starts; a rejected scope or missing controller fails startup rather
+than retrying unbounded. Non-root services require an active user manager and
+delegated controllers. Existing generations are adopted without moving running
+processes; stop/reopen applies the new limits. Other hosts keep the previous
+runtime with `resourceLimits.enforced=false` in the private manifest and require
+operator/container limits. This field is not a public RPC or a host-wide budget.
+
+The scope also reaps detached descendants on explicit stop, including after a
+supervisor crash. Human/active-task and idle-revision guards run first. A failed
+scope stop cannot falsely complete dead-generation recovery. Root application
+accounts retain their existing process and filesystem isolation. User scopes
+are not isolation from another process with the same OS UID.
+
+Build `Dockerfile.resource-scope` after the gateway image. In a **disposable**
+systemd-as-PID-1 container with a private cgroup namespace, mount this checkout
+read-only at `/workspace`, then run:
+
+```sh
+FLOWLY_SCREEN_SCOPE_TEST=1 python -m pytest \
+  tests/integration/screen/test_resource_scope.py -q -p no:cacheprovider
+```
+
+The root OOM test first verifies all shipped limits, then disables only
+`memory.high` reclaim throttling in its throwaway child to reach `memory.max`
+promptly. It requires SIGKILL of that allocator while its sibling and parent
+survive. A second test reaps a double-forked, detached daemon and checks repeated
+stop. Do not run these tests on the user's actual VPS.
+
+The third test requires a real desktop and an unprivileged systemd user manager:
+also set `FLOWLY_SCREEN_SCOPE_RUNTIME_TEST=1` and run only `-k unprivileged_runtime`
+as that user. It checks supervisor and applications share the verified scope,
+distinct from the caller. The root `test_runtime_account.py` suite checks the
+same membership/limits automatically on systemd hosts, alongside normal startup,
+crash recovery and application isolation.

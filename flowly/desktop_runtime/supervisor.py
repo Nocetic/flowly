@@ -189,6 +189,10 @@ def run(directory: Path, generation: str) -> None:
             raise ScreenError("RUNTIME_START_TIMEOUT")
 
         try:
+            from flowly.desktop_runtime.resource_scope import verify_scope
+
+            state["resourceLimits"] = (verify_scope(directory, generation)
+                                       if state.get("resourceScope") is True else {"enforced": False})
             if os.geteuid() == 0:
                 from flowly.desktop_runtime.application_layout import root_application_layout
 

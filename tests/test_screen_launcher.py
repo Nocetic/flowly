@@ -260,8 +260,12 @@ def test_start_failure_never_releases_human_control(runtime, monkeypatch):
         runtime.start()
 
 
-def test_stop_refuses_human_and_active_run_before_signalling(runtime, monkeypatch):
-    manifest(runtime)
+@pytest.mark.parametrize("scoped", [False, True])
+def test_stop_refuses_human_and_active_run_before_signalling(runtime, monkeypatch, scoped):
+    from flowly.desktop_runtime import resource_scope
+
+    manifest(runtime, resourceScope=scoped)
+    monkeypatch.setattr(resource_scope, "stop_scope", lambda *args: pytest.fail("must not stop scope"))
     runtime.authority.start("generation-1")
     monkeypatch.setattr(launcher, "is_alive", lambda value: bool(value))
     monkeypatch.setattr(launcher, "signal_process", lambda *args: pytest.fail("must not signal"))
@@ -292,6 +296,40 @@ def test_stop_of_a_dead_generation_ends_its_human_and_run_claims(runtime, monkey
     assert json.loads(runtime.manifest.read_text())["phase"] == "stopped"
     with pytest.raises(ScreenError, match="STALE_GENERATION"):
         runtime.stop("generation-0")
+
+
+@pytest.mark.parametrize("scope_failure", [False, True])
+def test_dead_scoped_runtime_reaps_orphans_before_ending_human_claims(runtime, monkeypatch, scope_failure):
+    from flowly.desktop_runtime import resource_scope
+
+    generation = "a" * 32
+    manifest(runtime, generation=generation, resourceScope=True)
+    runtime.authority.start(generation)
+    runtime.authority.acquire("viewer", generation, 1)
+    monkeypatch.setattr(launcher, "is_alive", lambda value: False)
+    calls = []
+
+    def reap(directory, observed_generation):
+        assert runtime.authority.snapshot()["control"] == "human"
+        calls.append((directory, observed_generation))
+        if scope_failure:
+            raise ScreenError("RUNTIME_STOP_FAILED")
+
+    monkeypatch.setattr(resource_scope, "stop_scope", reap)
+    # An idle timer must not use dead-generation recovery to end human control.
+    with pytest.raises(ScreenError, match="RUNTIME_RECOVERY_REQUIRED"):
+        runtime.stop(generation, idle_revision=runtime.authority.snapshot()["revision"])
+    assert not calls
+    if scope_failure:
+        with pytest.raises(ScreenError, match="RUNTIME_STOP_FAILED"):
+            runtime.stop(generation)
+        assert runtime.authority.snapshot()["control"] == "human"
+        assert runtime.read_manifest()["phase"] == "running"
+    else:
+        runtime.stop(generation)
+        assert not runtime.authority.snapshot()["running"]
+        assert runtime.read_manifest()["phase"] == "stopped"
+    assert calls == [(runtime.directory, generation)]
 
 
 def test_idle_stop_is_refused_after_any_change_and_never_recovers_a_dead_screen(runtime, monkeypatch):
