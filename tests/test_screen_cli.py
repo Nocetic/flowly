@@ -181,6 +181,43 @@ def setup(monkeypatch):
     return type("Setup", (), {"plan": plan, "jobs": jobs, "reservation": reservation, "restart": restart})
 
 
+@pytest.mark.parametrize("profile", ["default", "writer"])
+@pytest.mark.parametrize("accept", [True, False])
+def test_install_real_cli_identity_matches_gateway_plan(monkeypatch, tmp_path, profile, accept):
+    """Exercise the real CLI identity/plan boundary, not two compatible mocks."""
+    from flowly import profile as profiles
+    from flowly.desktop_runtime import install_jobs, install_plan
+
+    monkeypatch.setattr(profiles, "active_profile_identity", lambda: (profile, tmp_path, "bot"))
+    monkeypatch.setattr(profiles, "get_or_create_profile_host_id", lambda: "host")
+    monkeypatch.setattr(screen_cmd, "current_profile_name", lambda: profile)
+    monkeypatch.setattr(screen_cmd, "_sudo_needs_password", lambda: False)
+    monkeypatch.setattr(install_plan, "install_plan", lambda: {
+        "planId": "a" * 64, "supported": True, "runtimeAccountRequired": True,
+        "sudoAvailable": True, "distribution": "ubuntu-24.04", "packages": ["xfwm4"],
+    })
+    monkeypatch.setattr(install_plan, "python_plan", lambda: {
+        "planId": "b" * 64, "supported": True, "packages": [],
+    })
+    jobs = Mock()
+    jobs.status.return_value = {"state": "succeeded", "phase": "complete", "error": None}
+    jobs.restart_reservation.return_value = (False, None)
+    factory = Mock(return_value=jobs)
+    monkeypatch.setattr(install_jobs, "ScreenInstallJobs", factory)
+
+    gateway_identity = {"hostId": "host", "botId": "bot", "profileId": profile, "screenId": "browser"}
+    expected = install_plan.installation_plan(gateway_identity)
+    result = CliRunner().invoke(screen_cmd.screen_app, ["install"], input="y\n" if accept else "n\n")
+    assert result.exit_code == (0 if accept else 1), repr(result.exception)
+    assert "ubuntu-24.04" in result.output
+    if accept:
+        assert factory.call_args.args[0] == gateway_identity
+        assert jobs.submit.call_args.args[0] == expected["planId"]
+        assert "Screens are ready" in result.output
+    else:
+        factory.assert_not_called()
+
+
 def test_install_shows_the_plan_installs_and_restarts_the_agent_while_it_is_idle(setup):
     result = CliRunner().invoke(screen_cmd.screen_app, ["install", "--yes"])
     assert result.exit_code == 0, result.output

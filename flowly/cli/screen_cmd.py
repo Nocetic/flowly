@@ -182,7 +182,8 @@ def _screen_identity() -> dict:
     from flowly.profile import active_profile_identity, get_or_create_profile_host_id
 
     _, _, bot_id = active_profile_identity()
-    return {"hostId": get_or_create_profile_host_id(), "botId": bot_id, "profileId": current_profile_name()}
+    return {"hostId": get_or_create_profile_host_id(), "botId": bot_id,
+            "profileId": current_profile_name(), "screenId": "browser"}
 
 
 def _sudo_needs_password() -> bool:
