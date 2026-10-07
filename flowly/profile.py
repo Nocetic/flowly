@@ -82,7 +82,7 @@ _PROFILE_MUTATION_LOCK_FILE = ".profiles.lock"
 # Deleted profiles are renamed here first, then removed. Not a valid profile
 # name, so listings and the capacity count never see it.
 _PROFILE_TRASH_DIR = ".trash"
-# The profile directory a process started with, as "device:inode". A runtime
+# The profile directory a process started with, as "device:inode:botId". A runtime
 # compares it before claiming its lease, so a directory deleted and recreated
 # underneath it (by its own start-up writes) is never taken for the profile.
 PROFILE_DIR_IDENTITY_ENV = "FLOWLY_PROFILE_DIR_ID"
@@ -1962,20 +1962,33 @@ def release_runtime_lease(instance_id: str) -> None:
 
 
 def profile_dir_identity(path: Path) -> str | None:
-    """``device:inode`` of a real (non-symlink) directory, else None."""
+    """Directory and durable profile identity, resistant to inode reuse.
+
+    Directory metadata such as ctime changes during ordinary startup writes.
+    The profile UUID is stable across those writes, but changes on recreation.
+    A stray directory without metadata cannot match an admitted profile.
+    """
     try:
         info = path.lstat()
     except OSError:
         return None
     if not stat.S_ISDIR(info.st_mode):
         return None
-    return f"{info.st_dev}:{info.st_ino}"
+    bot_id = str(_profile_metadata(path).get("botId") or "").strip()
+    return f"{info.st_dev}:{info.st_ino}:{bot_id}"
 
 
 def named_profile_identity(name: str) -> str | None:
     """Identity of a named profile's directory (see PROFILE_DIR_IDENTITY_ENV)."""
     validate_profile_name(name)
-    return profile_dir_identity(_PROFILES_ROOT / name)
+    # CLI admission happens before the per-profile sandbox. Backfill legacy
+    # identity under the same lock as deletion; the runtime itself never needs
+    # that shared lock, nor may it create metadata for a deleted profile.
+    with _profile_mutation_lock():
+        if profile_dir_identity(_PROFILES_ROOT / name) is None:
+            return None
+        ensure_profile_bot_id(name)
+        return profile_dir_identity(_PROFILES_ROOT / name)
 
 
 def _remove_retired_profile(path: Path) -> bool:
