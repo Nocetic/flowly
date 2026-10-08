@@ -193,7 +193,7 @@ async def test_compaction_note_lists_only_unfinished_steps(tmp_path: Path):
     assert "1. A" not in note        # completed → omitted
     assert "[>] 2. B" in note        # in_progress → marked
     assert "[ ] 3. C" in note        # pending → listed
-    assert "update_step" in note
+    assert "action='update'" in note
 
 
 def test_compaction_note_absent_without_an_active_plan(tmp_path: Path):

@@ -1,0 +1,399 @@
+{
+  "about": "Shared behaviour of every flowlet interpreter (core Python, Desktop TS, iOS Swift, Android Kotlin). The core copy is the source of truth; each app keeps a byte-identical copy and runs it in its own tests. Change all four together.",
+  "version": 1,
+  "nowMs": 1783598400000,
+  "tz": "UTC",
+  "rules": {
+    "round": "half away from zero: round(2.5)=3, round(-2.5)=-3, round(1.25,1)=1.3",
+    "division": "x/0, x//0 and x%0 are 0; // floors; % takes the sign of the divisor (Python)",
+    "booleans": "true=1, false=0; comparisons and and/or/not yield 1 or 0",
+    "names": "a missing name, or a name holding text, is unresolved",
+    "visibleWhen": "unresolved or broken → visible",
+    "where": "unresolved or broken → row excluded",
+    "template": "{key}: missing → empty; integer → no decimals; else one decimal (half away from zero); bool → yes/no, or the locale's words; with a locale, its thousands and decimal marks"
+  },
+  "expr": [
+    {
+      "expr": "1 + 2 * 3",
+      "expect": 7
+    },
+    {
+      "expr": "(1 + 2) * 3",
+      "expect": 9
+    },
+    {
+      "expr": "7 // 2",
+      "expect": 3
+    },
+    {
+      "expr": "-7 // 2",
+      "expect": -4
+    },
+    {
+      "expr": "7 % 3",
+      "expect": 1
+    },
+    {
+      "expr": "-7 % 3",
+      "expect": 2
+    },
+    {
+      "expr": "7 % -3",
+      "expect": -2
+    },
+    {
+      "expr": "2 ** 3",
+      "expect": 8
+    },
+    {
+      "expr": "1 / 0",
+      "expect": 0
+    },
+    {
+      "expr": "5 // 0",
+      "expect": 0
+    },
+    {
+      "expr": "5 % 0",
+      "expect": 0
+    },
+    {
+      "expr": "round(2.5)",
+      "expect": 3
+    },
+    {
+      "expr": "round(-2.5)",
+      "expect": -3
+    },
+    {
+      "expr": "round(0.5)",
+      "expect": 1
+    },
+    {
+      "expr": "round(2.4)",
+      "expect": 2
+    },
+    {
+      "expr": "round(1.25, 1)",
+      "expect": 1.3
+    },
+    {
+      "expr": "floor(-1.5)",
+      "expect": -2
+    },
+    {
+      "expr": "ceil(-1.5)",
+      "expect": -1
+    },
+    {
+      "expr": "abs(-3)",
+      "expect": 3
+    },
+    {
+      "expr": "min(3, 1, 2)",
+      "expect": 1
+    },
+    {
+      "expr": "max(3, 1, 2)",
+      "expect": 3
+    },
+    {
+      "expr": "1e3 + .5",
+      "expect": 1000.5
+    },
+    {
+      "expr": "0 < x < 10",
+      "values": {
+        "x": 5
+      },
+      "expect": 1
+    },
+    {
+      "expr": "0 < x < 10",
+      "values": {
+        "x": 10
+      },
+      "expect": 0
+    },
+    {
+      "expr": "x > 1 and y",
+      "values": {
+        "x": 2,
+        "y": true
+      },
+      "expect": 1
+    },
+    {
+      "expr": "a or b",
+      "values": {
+        "a": 0,
+        "b": false
+      },
+      "expect": 0
+    },
+    {
+      "expr": "not done",
+      "values": {
+        "done": false
+      },
+      "expect": 1
+    },
+    {
+      "expr": "x == 2",
+      "values": {
+        "x": 2
+      },
+      "expect": 1
+    },
+    {
+      "expr": "x != 2",
+      "values": {
+        "x": 2
+      },
+      "expect": 0
+    },
+    {
+      "expr": "-x + 1",
+      "values": {
+        "x": 3
+      },
+      "expect": -2
+    },
+    {
+      "expr": "max(0, goal - total)",
+      "values": {
+        "goal": 2000,
+        "total": 2600
+      },
+      "expect": 0
+    },
+    {
+      "expr": "goal - total",
+      "values": {
+        "goal": 2000
+      },
+      "expect": "unresolved"
+    },
+    {
+      "expr": "label > 1",
+      "values": {
+        "label": "text"
+      },
+      "expect": "unresolved"
+    },
+    {
+      "expr": "days_until(\"2026-07-15\")",
+      "expect": 6
+    },
+    {
+      "expr": "days_since(past)",
+      "values": {
+        "past": "2026-07-01"
+      },
+      "expect": 8
+    },
+    {
+      "expr": "days_until(\"2026-07-09\")",
+      "expect": 0
+    },
+    {
+      "expr": "weekday()",
+      "expect": 3
+    },
+    {
+      "expr": "days_until(due) > 3 and weekday() < 5",
+      "values": {
+        "due": "2026-07-15"
+      },
+      "expect": 1
+    },
+    {
+      "expr": "days_since(d)",
+      "values": {
+        "d": "2026-07-09"
+      },
+      "nowMs": 1783627200000,
+      "tz": "Asia/Tokyo",
+      "expect": 1
+    },
+    {
+      "expr": "days_until(\"nope\")",
+      "expect": "unresolved"
+    }
+  ],
+  "visibleWhen": [
+    {
+      "expr": "n > 0",
+      "values": {
+        "n": 0
+      },
+      "expect": false
+    },
+    {
+      "expr": "n > 0",
+      "values": {
+        "n": 2
+      },
+      "expect": true
+    },
+    {
+      "expr": "missing > 0",
+      "values": {},
+      "expect": true
+    },
+    {
+      "expr": "",
+      "values": {},
+      "expect": true
+    }
+  ],
+  "where": [
+    {
+      "expr": "days_since(date) == 0",
+      "item": {
+        "date": "2026-07-09"
+      },
+      "expect": true
+    },
+    {
+      "expr": "days_since(date) == 0",
+      "item": {
+        "date": "2026-07-08"
+      },
+      "expect": false
+    },
+    {
+      "expr": "days_since(date) == 0",
+      "item": {
+        "name": "no date"
+      },
+      "expect": false
+    },
+    {
+      "expr": "kcal > 100",
+      "item": {
+        "kcal": 50
+      },
+      "expect": false
+    },
+    {
+      "expr": "done",
+      "item": {
+        "done": true
+      },
+      "expect": true
+    },
+    {
+      "expr": "days_since(date) == 0",
+      "item": {
+        "date": "2026-07-10"
+      },
+      "nowMs": 1783627200000,
+      "tz": "Asia/Tokyo",
+      "expect": true
+    }
+  ],
+  "template": [
+    {
+      "text": "{n}/{goal}",
+      "values": {
+        "n": 3,
+        "goal": 8
+      },
+      "expect": "3/8"
+    },
+    {
+      "text": "{r}",
+      "values": {
+        "r": 0.5
+      },
+      "expect": "0.5"
+    },
+    {
+      "text": "{r}",
+      "values": {
+        "r": 0.25
+      },
+      "expect": "0.3"
+    },
+    {
+      "text": "{r}",
+      "values": {
+        "r": 2.0
+      },
+      "expect": "2"
+    },
+    {
+      "text": "{done}",
+      "values": {
+        "done": true
+      },
+      "expect": "yes"
+    },
+    {
+      "text": "{done}",
+      "values": {
+        "done": true
+      },
+      "locale": "tr",
+      "expect": "evet"
+    },
+    {
+      "text": "{done}",
+      "values": {
+        "done": false
+      },
+      "locale": "es",
+      "expect": "no"
+    },
+    {
+      "text": "{missing} left",
+      "values": {},
+      "expect": " left"
+    },
+    {
+      "text": "{n} kcal",
+      "values": {
+        "n": 1450
+      },
+      "locale": "tr",
+      "expect": "1.450 kcal"
+    },
+    {
+      "text": "{n} kcal",
+      "values": {
+        "n": 1450
+      },
+      "locale": "en",
+      "expect": "1,450 kcal"
+    },
+    {
+      "text": "{n}",
+      "values": {
+        "n": 1234.5
+      },
+      "locale": "es",
+      "expect": "1.234,5"
+    },
+    {
+      "text": "{t}s",
+      "values": {
+        "t": {
+          "running": true,
+          "elapsed": 12.0
+        }
+      },
+      "expect": "12s"
+    }
+  ],
+  "invalid": [
+    "0x10 + 1",
+    "1_000",
+    "2j",
+    "x.y",
+    "f(x)",
+    "'a' == 'a'",
+    "[1]",
+    "x if y else z"
+  ]
+}

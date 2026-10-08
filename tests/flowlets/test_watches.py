@@ -119,12 +119,43 @@ def test_parse_hhmm():
     assert _parse_hhmm(None) is None
 
 
+def test_daily_after_condition_rearms_when_host_missed_the_morning():
+    watch = {"trigger": "condition", "when": "glasses < goal", "after": "18:00"}
+    ws = {"last_fired_ms": at(19, day=8), "last_cond": True}
+    # Host slept overnight and stayed offline until the next evening. It never
+    # observed the false morning edge; the daily reminder must still resume.
+    assert _decide(watch, {"glasses": 1, "goal": 8}, ws, at(19, day=9), UTC, None) == (True, True)
+    assert _decide(watch, {"glasses": 1, "goal": 8}, ws, at(20, day=8), UTC, None) == (False, True)
+
+
+def test_schedule_rejects_ambiguous_time_and_interval():
+    with pytest.raises(FlowletValidationError, match="exactly one"):
+        validate_definition(_with_watches([{
+            "id": "evening", "trigger": "schedule", "at": "21:00", "everyMinutes": 1,
+            "notify": {"title": "Summary"},
+        }]))
+
+
+def test_schedule_catches_up_once_on_dst_gap_and_fold():
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("America/New_York")
+    watch = {"trigger": "schedule", "at": "02:30"}
+    after_gap = int(datetime(2026, 3, 8, 3, 1, tzinfo=tz).timestamp() * 1000)
+    assert _decide(watch, {}, {}, after_gap, tz, None) == (True, None)
+    assert _decide(watch, {}, {"last_fired_ms": after_gap}, after_gap + HOUR, tz, None) == (False, None)
+    watch["at"] = "01:30"
+    first = int(datetime(2026, 11, 1, 1, 30, tzinfo=tz, fold=0).timestamp() * 1000)
+    second = int(datetime(2026, 11, 1, 1, 30, tzinfo=tz, fold=1).timestamp() * 1000)
+    assert _decide(watch, {}, {}, first, tz, None) == (True, None)
+    assert _decide(watch, {}, {"last_fired_ms": first}, second, tz, None) == (False, None)
+
+
 def test_render_templating():
     vals = {"glasses": 3.0, "goal": 8, "ratio": 0.5, "done": True}
     assert render("{glasses}/{goal}", vals) == "3/8"
     assert render("{ratio}", vals) == "0.5"
     assert render("{done}", vals) == "yes"
-    assert render("{missing} left", vals) == "{missing} left"  # unknown left verbatim
+    assert render("{missing} left", vals) == " left"  # people never read a raw placeholder
     assert render("", vals) == ""
     assert render(None, vals) == ""
 

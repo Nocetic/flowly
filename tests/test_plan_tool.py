@@ -1,5 +1,5 @@
 """PlanTool: the agent-facing surface. Verifies propose blocks-then-reports,
-update_step/complete tick the plan, and the emergency kill switch."""
+update/complete tick the plan, and the emergency kill switch."""
 
 from __future__ import annotations
 
@@ -76,8 +76,8 @@ async def test_propose_approved_then_execute(tmp_path: Path):
     assert out["plan"]["status"] == "executing"
 
     # tick a step
-    up = json.loads(await tool.execute(action="update_step", id=1, status="completed"))
-    assert up["success"] and up["progress"]["completed"] == 1
+    up = json.loads(await tool.execute(action="update", steps=[{"id": 1, "status": "completed"}]))
+    assert up["ok"] and up["progress"] == "1/2" and up["current"]["id"] == 2
 
     # complete
     done = json.loads(await tool.execute(action="complete", summary="done"))

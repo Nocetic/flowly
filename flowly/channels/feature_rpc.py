@@ -3118,18 +3118,42 @@ def _flowlet_store():
     return get_store()
 
 
-def _flowlet_values(flowlet: dict) -> dict:
+def _flowlet_values(flowlet: dict, tz: Any = None) -> dict:
+    """Live values, computed in ``tz`` or the flowlet's remembered device zone."""
     from flowly.flowlets import queries
-    from flowly.flowlets.store import get_store, now_ms
+    from flowly.flowlets.store import now_ms
+    from flowly.flowlets.zones import zone_for
 
-    store = get_store()
+    store = _flowlet_store()
     return queries.resolve_values(
         flowlet["definition"],
         store.get_state(flowlet["id"]),
         store.get_events(flowlet["id"]),
         now_ms(),
-        None,
+        tz if tz is not None else zone_for(flowlet),
     )
+
+
+def _flowlet_zone(flowlet: dict, params: dict) -> Any:
+    """Adopt the zone a client sent (``tz``) and return the one to compute in."""
+    from flowly.flowlets.zones import adopt_client_zone
+
+    return adopt_client_zone(_flowlet_store(), flowlet, params)
+
+
+async def _broadcast_flowlet_state(flowlet_id: str, values: dict, rev: int,
+                                   preview: Any = None) -> None:
+    """Fan fresh values out to every other client. ``rev`` lets each one drop a
+    map older than what it already shows."""
+    if _flowlet_broadcast_cb is None:
+        return
+    data: dict = {"id": flowlet_id, "values": values, "rev": rev}
+    if preview is not None:
+        data["preview"] = preview
+    try:
+        await _flowlet_broadcast_cb("flowlet.state", data)
+    except Exception:
+        pass
 
 
 def _flowlet_summary(flowlet: dict, values: dict | None = None) -> dict:
@@ -3140,6 +3164,7 @@ def _flowlet_summary(flowlet: dict, values: dict | None = None) -> dict:
         "accent": flowlet.get("accent"),
         "pinned": flowlet.get("pinned"),
         "version": flowlet.get("version"),
+        "rev": flowlet.get("rev", 0),
         "catalog": flowlet.get("catalog"),
         "updatedAt": flowlet.get("updated_at"),
     }
@@ -3173,9 +3198,11 @@ def flowlets_get(params: dict) -> dict:
     flowlet_id = str(params.get("id", "") or "")
     if not flowlet_id:
         raise FeatureRpcError("INVALID", "id required")
-    flowlet = _flowlet_store().get(flowlet_id)
+    store = _flowlet_store()
+    flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FeatureRpcError("NOT_FOUND", "Flowlet not found")
+    zone = _flowlet_zone(flowlet, params)
     # Opening the screen refreshes its due data sources in the background — the
     # fresh values arrive as a `flowlet.state` broadcast a moment later.
     if _flowlet_refresh_cb is not None and (flowlet.get("definition") or {}).get("sources"):
@@ -3185,30 +3212,12 @@ def flowlets_get(params: dict) -> dict:
             _asyncio.get_running_loop().create_task(_flowlet_refresh_cb(flowlet_id, False))
         except Exception:
             pass  # no loop / best-effort
-    # Serving-time guarantees (never persisted): every user-owned list row is
-    # EDITABLE (a drill screen with edit inputs — synthesized if the agent
-    # authored none), and a list with an `image` field always DISPLAYS its
-    # photos (row thumbnail + full photo). Editable runs first so a synthesized
-    # drill screen also picks up its full photo from the photo pass.
-    from flowly.flowlets.composites import expand_composites
-    from flowly.flowlets.normalize import (
-        assign_missing_ids,
-        ensure_chart_layout,
-        ensure_editable_drill,
-        ensure_photo_display,
-    )
+    # Serving-time guarantees (never persisted) live in one place shared with
+    # the action path: composites expand, ids are assigned, list rows become
+    # editable, photo lists display photos, a title-only header is dropped.
+    from flowly.flowlets.normalize import served_definition
 
-    # Composites (catalog 3) expand to primitives FIRST, so the photo/edit
-    # augmentation and the client both see plain v2 nodes; an old client renders
-    # the expansion with no changes. Forgotten ids are assigned (same
-    # deterministic ids resolve_values/apply_action derive, so values and taps
-    # line up). Then a chart-bearing multi-column grid is forced full-width
-    # (charts don't fit side by side on a phone).
-    definition = ensure_chart_layout(
-        ensure_photo_display(
-            ensure_editable_drill(assign_missing_ids(expand_composites(flowlet["definition"])))
-        )
-    )
+    definition = served_definition(flowlet["definition"], flowlet.get("name"))
     return {
         "flowlet": {
             "id": flowlet["id"],
@@ -3221,7 +3230,8 @@ def flowlets_get(params: dict) -> dict:
             "definition": definition,
             "updatedAt": flowlet.get("updated_at"),
         },
-        "values": _flowlet_values(flowlet),
+        "values": _flowlet_values(flowlet, zone),
+        "rev": store.rev(flowlet_id),
     }
 
 
@@ -3241,8 +3251,11 @@ async def flowlets_refresh(params: dict) -> dict:
             refreshed = await _flowlet_refresh_cb(flowlet_id, True)
         except Exception as exc:
             raise FeatureRpcError("UNAVAILABLE", f"couldn't refresh: {exc}")
-    fresh = _flowlet_store().get(flowlet_id) or flowlet  # re-read post-refresh
-    return {"id": flowlet_id, "refreshed": refreshed, "values": _flowlet_values(fresh)}
+    store = _flowlet_store()
+    fresh = store.get(flowlet_id) or flowlet  # re-read post-refresh
+    zone = _flowlet_zone(fresh, params)
+    return {"id": flowlet_id, "refreshed": refreshed,
+            "values": _flowlet_values(fresh, zone), "rev": store.rev(flowlet_id)}
 
 
 def flowlets_state(params: dict) -> dict:
@@ -3251,10 +3264,12 @@ def flowlets_state(params: dict) -> dict:
     flowlet_id = str(params.get("id", "") or "")
     if not flowlet_id:
         raise FeatureRpcError("INVALID", "id required")
-    flowlet = _flowlet_store().get(flowlet_id)
+    store = _flowlet_store()
+    flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FeatureRpcError("NOT_FOUND", "Flowlet not found")
-    return {"id": flowlet_id, "values": _flowlet_values(flowlet)}
+    zone = _flowlet_zone(flowlet, params)
+    return {"id": flowlet_id, "values": _flowlet_values(flowlet, zone), "rev": store.rev(flowlet_id)}
 
 
 async def flowlets_action(params: dict) -> dict:
@@ -3279,6 +3294,9 @@ async def flowlets_action(params: dict) -> dict:
         flowlet_id
     ):
         raise FeatureRpcError("RATE_LIMITED", "too many requests; try again in a moment")
+    if _fl is None:
+        raise FeatureRpcError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
+    op_id = params.get("opId")
     try:
         result = await apply_action(
             store,
@@ -3286,9 +3304,13 @@ async def flowlets_action(params: dict) -> dict:
             component_id,
             value=params.get("value"),
             agent_runner=_flowlet_agent_runner_cb,
+            tz=_flowlet_zone(_fl, params),
+            op_id=str(op_id) if op_id else None,
         )
     except FlowletActionError as exc:
         raise FeatureRpcError(exc.code, exc.message)
+    if result.get("duplicate"):
+        return result  # a retried tap: nothing changed, nothing to fan out
     # Recompute the card headline so list tiles update live (not just the open
     # screen) — carry it in both the reply and the broadcast.
     from flowly.flowlets.queries import flowlet_preview
@@ -3299,14 +3321,7 @@ async def flowlets_action(params: dict) -> dict:
     )
     if preview is not None:
         result["preview"] = preview
-    if _flowlet_broadcast_cb is not None:
-        try:
-            data = {"id": flowlet_id, "values": result["values"]}
-            if preview is not None:
-                data["preview"] = preview
-            await _flowlet_broadcast_cb("flowlet.state", data)
-        except Exception:
-            pass
+    await _broadcast_flowlet_state(flowlet_id, result["values"], result["rev"], preview)
     # Evaluate reactive watches immediately (goal celebration / threshold nudge
     # shouldn't wait for the next heartbeat). Best-effort — never fail the tap.
     if _flowlet_watch_hook_cb is not None:
@@ -3420,30 +3435,35 @@ async def flowlets_capture(params: dict) -> dict:
     flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FeatureRpcError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
-    component = _find_component(flowlet.get("definition") or {}, component_id)
+    from flowly.flowlets.normalize import served_definition
+
+    component = _find_component(served_definition(flowlet["definition"], flowlet.get("name")),
+                                component_id)
     if not component:
         raise FeatureRpcError("NOT_FOUND", f"component '{component_id}' not found")
+    op_id = str(params.get("opId") or "")
+    if op_id and not store.claim_op(flowlet_id, op_id):
+        # A retried upload: the photo was already read and saved once.
+        return {"id": flowlet_id, "values": _flowlet_values(flowlet), "rev": store.rev(flowlet_id),
+                "duplicate": True}
     try:
         values = await apply_capture(
-            store, flowlet, component, data, runner=_flowlet_vision_runner_cb
+            store, flowlet, component, data, runner=_flowlet_vision_runner_cb,
+            tz=_flowlet_zone(flowlet, params),
         )
     except FlowletCaptureError as exc:
+        if op_id:
+            store.release_op(flowlet_id, op_id)
         raise FeatureRpcError(exc.code, exc.message)
+    rev = store.rev(flowlet_id)
 
     from flowly.flowlets.queries import flowlet_preview
 
     preview = flowlet_preview(flowlet.get("definition") or {}, values)
-    result = {"id": flowlet_id, "values": values}
+    result = {"id": flowlet_id, "values": values, "rev": rev}
     if preview is not None:
         result["preview"] = preview
-    if _flowlet_broadcast_cb is not None:
-        try:
-            msg = {"id": flowlet_id, "values": values}
-            if preview is not None:
-                msg["preview"] = preview
-            await _flowlet_broadcast_cb("flowlet.state", msg)
-        except Exception:
-            pass
+    await _broadcast_flowlet_state(flowlet_id, values, rev, preview)
     return result
 
 
@@ -3475,19 +3495,13 @@ async def flowlets_item_remove(params: dict) -> dict:
 
     from flowly.flowlets.queries import flowlet_preview
 
-    values = _flowlet_values(flowlet)
+    values = _flowlet_values(flowlet, _flowlet_zone(flowlet, params))
+    rev = store.rev(flowlet_id)
     preview = flowlet_preview(defn, values)
-    result = {"id": flowlet_id, "values": values}
+    result = {"id": flowlet_id, "values": values, "rev": rev}
     if preview is not None:
         result["preview"] = preview
-    if _flowlet_broadcast_cb is not None:
-        try:
-            msg = {"id": flowlet_id, "values": values}
-            if preview is not None:
-                msg["preview"] = preview
-            await _flowlet_broadcast_cb("flowlet.state", msg)
-        except Exception:
-            pass
+    await _broadcast_flowlet_state(flowlet_id, values, rev, preview)
     return result
 
 

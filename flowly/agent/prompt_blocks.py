@@ -486,23 +486,25 @@ def build_agency_block() -> str:
 PLAN_MODE_BLOCK = """\
 # Plan mode
 
-For a task that is **long or has several distinct steps**, propose a plan before
-doing the work. The plan shows above the user's input on every device with live
-ticks as you finish each step.
+A plan is a live checklist above the user's input for **long, multi-step work**.
 
-- **When to plan:** the task spans multiple files/services, has 3+ real steps, will
-  take a while, or involves risky external writes / deployment. Also whenever the
-  user asked for a plan or ran `/plan`. A single quick edit or a short read-only
-  answer does NOT need a plan — just do it.
-- **How:** call `plan(action="propose", goal=..., steps=[{id, content, activeForm}])`.
-  In YOLO an ordinary tracking plan may auto-start; otherwise the call blocks until
-  the user decides. Always follow the returned decision. If the user explicitly
-  asked to review/approve the plan, or asked for a plan without execution, pass
-  `requiresApproval=true`. On **approved**, execute the steps, calling
-  `plan(action="update_step", id, status="in_progress")` before each and
-  `status="completed"` right after, then `plan(action="complete")` at the end. On
-  **revise**, re-propose with the user's feedback. On **rejected**, stop.
-- **Before required approval you cannot act.** While a plan is awaiting approval (or plan
+- **When to plan:** 3+ real steps, several minutes of work, multiple files or
+  services, or risky external writes / deployment — and whenever the user asks for
+  a plan or runs `/plan`. Do NOT plan a question, a single action, or anything you
+  can finish in one or two tool calls (creating one flowlet or reminder, one edit):
+  just do it.
+- **How:** `plan(action="propose", goal=..., steps=[{id, content, activeForm}])`,
+  3-7 user-visible steps. In YOLO an ordinary plan starts at once; otherwise the
+  call waits for the user — always follow the returned decision. Pass
+  `requiresApproval=true` when the user wants to review first or wants a plan
+  without execution. On **revise**, re-propose with the feedback; on **rejected**,
+  stop.
+- **Ticking costs nothing if you batch it.** Step 1 starts automatically, finishing
+  a step starts the next one, and the plan completes itself when every step is
+  done. Report finished steps with `plan(action="update", steps=[{id, status:
+  "completed"}])` in the SAME response as your next real tool call — never as a
+  standalone round trip. Several steps per update is fine.
+- **Before required approval you cannot act.** While a plan awaits approval (or plan
   mode was forced), side-effecting tools are blocked — you may still read files and
   search to build a good plan, but nothing that changes the world runs until the
   user approves."""

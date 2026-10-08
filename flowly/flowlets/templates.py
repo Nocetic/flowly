@@ -258,7 +258,7 @@ def _expenses(say: Say) -> dict:
             {"type": "header", "text": say("By category", "Kategoriye göre", "Por categoría")},
             {"id": "byCategory", "type": "chart", "kind": "donut",
              "data": {"list": "expenses", "agg": "sum", "field": "amount",
-                      "groupBy": "category", "window": "30d"}},
+                      "by": "category", "window": "30d"}},
             {"type": "divider"},
             {"id": "receiptShot", "type": "photo",
              "label": say("Add from a receipt", "Fişten ekle", "Añadir desde un recibo"),
@@ -508,6 +508,96 @@ def _mood(say: Say) -> dict:
     }
 
 
+def _meals(say: Say) -> dict:
+    """Photo and manual entry share the same dated, editable journal."""
+    return {
+        "state": {
+            "goal_kcal": {"type": "number", "default": 2200, "min": 1, "max": 10000},
+            "meals": {"type": "list", "max": 200, "item": {
+                "name": "string", "kcal": "number", "portion": "string",
+                "date": "date", "shot": "image",
+            }},
+        },
+        "computed": {
+            "today_kcal": {"list": "meals", "field": "kcal", "agg": "sum",
+                           "where": "days_since(date) == 0"},
+            "meal_count": {"list": "meals", "agg": "count", "where": "days_since(date) == 0"},
+            "remaining": {"expr": "max(0, goal_kcal - today_kcal)"},
+            "over": {"expr": "max(0, today_kcal - goal_kcal)"},
+            "kcal_status": {"cases": [
+                {"when": "today_kcal > goal_kcal",
+                 "text": say("{over} kcal over your goal.", "Hedefi {over} kcal aştın.",
+                             "{over} kcal por encima del objetivo.")},
+            ], "else": say("{remaining} kcal left.", "Hedefe {remaining} kcal kaldı.",
+                           "Quedan {remaining} kcal.")},
+        },
+        "watches": [
+            {"id": "daily_summary", "trigger": "schedule", "at": "21:00",
+             "when": "meal_count > 0",
+             "notify": {
+                 "title": say("Today's meals", "Günün özeti", "Resumen del día"),
+                 "body": say("{today_kcal} / {goal_kcal} kcal · {meal_count} logged. {kcal_status}",
+                             "{meal_count} öğün, {today_kcal} / {goal_kcal} kcal. {kcal_status}",
+                             "{today_kcal} / {goal_kcal} kcal · {meal_count} registradas. {kcal_status}"),
+             },
+             "otherwise": {
+                 "title": say("Today's meals", "Günün özeti", "Resumen del día"),
+                 "body": say("Nothing logged today. One photo is enough to add a meal.",
+                             "Bugün öğün kaydetmedin. Eklemek için bir fotoğraf yeter.",
+                             "Hoy no registraste nada. Basta una foto para añadir una comida."),
+             }},
+        ],
+        "layout": [
+            {"type": "card", "children": [
+                {"type": "stat", "value": "today_kcal", "unit": "kcal",
+                 "label": say("Today", "Bugün", "Hoy")},
+                {"type": "progress", "value": "today_kcal", "max": "goal_kcal",
+                 "label": say("Daily goal", "Günlük hedef", "Objetivo diario")},
+                {"type": "text", "text": "{kcal_status}"},
+                {"type": "text", "text": say("{meal_count} meals today", "Bugün {meal_count} öğün",
+                                             "{meal_count} comidas hoy")},
+            ]},
+            {"type": "photo", "id": "mealPhoto",
+             "label": say("Add meal photo", "Öğün fotoğrafı ekle", "Añadir foto de comida"),
+             "action": {"op": "vision", "into": "meals", "dateDefaults": ["date"], "prompt": say(
+                 "Estimate the food or drink name, calories and portion. Use today's date for date.",
+                 "Yiyecek veya içeceğin adını, kalorisini ve porsiyonunu tahmin et. Tarih için bugünü kullan.",
+                 "Estima el nombre, las calorías y la porción de la comida o bebida. Usa la fecha de hoy.",
+             )}},
+            {"type": "form", "id": "addMeal", "into": "meals",
+             "title": say("Add manually", "Elle ekle", "Añadir manualmente"),
+             "fields": [
+                 {"field": "name", "label": say("Meal", "Öğün", "Comida")},
+                 {"field": "kcal", "label": say("Calories (kcal)", "Kalori (kcal)", "Calorías (kcal)")},
+                 {"field": "portion", "label": say("Portion", "Porsiyon", "Porción")},
+                 {"field": "date", "label": say("Date", "Tarih", "Fecha"), "default": "today"},
+             ], "submit": {"label": say("Add", "Ekle", "Añadir")}},
+            {"type": "tracker_card", "id": "week", "list": "meals", "field": "kcal",
+             "window": "7d", "chart": "bar",
+             "title": say("Last 7 days", "Son 7 gün", "Últimos 7 días")},
+            {"type": "repeater", "source": "meals", "navigate": "meal",
+             "sortBy": {"field": "date", "dir": "desc"},
+             "empty": say("Add your first meal", "İlk öğününü ekle", "Añade tu primera comida"),
+             "item": {"type": "list_row", "title": "$.name", "subtitle": "$.portion",
+                      "value": "{$.kcal} kcal", "badge": "$.date", "thumb": "$.shot"}},
+            {"type": "number_input", "id": "goal", "value": "goal_kcal",
+             "label": say("Daily goal (kcal)", "Günlük hedef (kcal)", "Objetivo diario (kcal)"),
+             "action": {"op": "set", "key": "goal_kcal"}},
+        ],
+        "screens": {"meal": {"title": "{$.name}", "layout": [
+            {"type": "image", "src": "$.shot"},
+            *[{"type": kind, "id": f"edit_{field}", "label": label, "value": f"$.{field}",
+               "action": {"op": "item_update", "key": "meals", "field": field}}
+              for field, kind, label in [
+                  ("name", "input", say("Meal", "Öğün", "Comida")),
+                  ("kcal", "number_input", say("Calories", "Kalori", "Calorías")),
+                  ("portion", "input", say("Portion", "Porsiyon", "Porción")),
+                  ("date", "date", say("Date", "Tarih", "Fecha")),
+              ]],
+        ]}},
+    }
+
+
 class Template(NamedTuple):
     id: str
     icon: str
@@ -578,6 +668,16 @@ TEMPLATES: tuple[Template, ...] = (
         ),
         build=_mood,
     ),
+    Template(
+        id="meals", icon="camera", accent="#F97316",
+        title=("Meal Journal", "Kalori Takibim", "Diario de comidas"),
+        description=(
+            "Photo estimates, manual entry, editable meals and daily calorie totals.",
+            "Fotoğraftan tahmin, elle kayıt, düzenlenebilir öğünler ve günlük kalori toplamı.",
+            "Estimaciones por foto, registro manual, comidas editables y calorías diarias.",
+        ),
+        build=_meals,
+    ),
 )
 
 _BY_ID = {t.id: t for t in TEMPLATES}
@@ -587,11 +687,16 @@ def list_templates(lang: str | None = None) -> list[dict]:
     """The picker's cards — metadata only, no definitions (a picker never needs
     to know what a flowlet is made of)."""
     i = LANGS.index(normalize_lang(lang))
-    return [
-        {"id": t.id, "title": t.title[i], "description": t.description[i],
-         "icon": t.icon, "accent": t.accent}
-        for t in TEMPLATES
-    ]
+    out = []
+    for t in TEMPLATES:
+        card = {"id": t.id, "title": t.title[i], "description": t.description[i],
+                "icon": t.icon, "accent": t.accent}
+        reminders = template_reminders(t.id, lang)
+        if reminders:
+            card["reminders"] = [{"id": rid, "when": describe_reminder(w)}
+                                 for rid, w in reminders.items()]
+        out.append(card)
+    return out
 
 
 def build_template(template_id: str, lang: str | None = None) -> dict:
@@ -606,4 +711,25 @@ def build_template(template_id: str, lang: str | None = None) -> dict:
     defn["name"] = tpl.title[LANGS.index(code)]
     defn["icon"] = tpl.icon
     defn["accent"] = tpl.accent
+    defn["locale"] = code  # reminders format numbers for the user's language
     return defn
+
+
+def template_reminders(template_id: str, lang: str | None = None) -> dict[str, dict]:
+    """The reminders a template ships, by id, localized — ready-made watches the
+    agent can attach by name (``watches=["daily_summary"]``) instead of writing
+    notification copy itself. Raises KeyError for an unknown template."""
+    defn = build_template(template_id, lang)
+    return {w["id"]: w for w in defn.get("watches") or [] if isinstance(w, dict) and w.get("id")}
+
+
+def describe_reminder(watch: dict) -> str:
+    """One line a model can choose from: trigger and timing."""
+    trig = watch.get("trigger")
+    if trig == "schedule":
+        when = f"daily at {watch.get('at')}" if watch.get("at") else f"every {watch.get('everyMinutes')} min"
+        return when + (" (only if something was logged, else a nudge)" if watch.get("otherwise") else "")
+    if trig == "stale":
+        return f"after {watch.get('idleMinutes')} min without activity"
+    after = f" after {watch['after']}" if watch.get("after") else ""
+    return f"when {watch.get('when')}{after}"

@@ -29,6 +29,7 @@ from flowly.flowlets import catalog
 from flowly.flowlets.queries import coerce_state, flowlet_preview, render_template, resolve_values
 from flowly.flowlets.store import FlowletStore
 from flowly.flowlets.store import now_ms as _now_ms
+from flowly.flowlets.zones import zone_for
 
 AgentSourceRunner = Callable[[dict, str], Awaitable[str | None]]
 
@@ -139,8 +140,16 @@ def _coerce_field(ftype: str, v: Any) -> Any:
             return v
         return str(v).strip().lower() in ("true", "1", "yes", "evet")
     if ftype == "date":
+        from datetime import date
+
         s = str(v).strip()[:10]
-        return s if _DATE_RE.match(s) else None
+        if not _DATE_RE.match(s):
+            return None
+        try:
+            date.fromisoformat(s)
+        except ValueError:
+            return None
+        return s
     return None
 
 
@@ -173,7 +182,7 @@ def _coerce_into(into_spec: dict, data: Any, limit: int | None) -> Any:
 
 def _build_prompt(flowlet: dict, sid: str, spec: dict, into_spec: dict, values: dict) -> str:
     name = flowlet.get("name") or "Flowlet"
-    task = render_template(spec.get("prompt", ""), values)
+    task = render_template(spec.get("prompt", ""), values, keep_unknown=True)
     header = (
         f"[Flowlet data source — {sid} · {name}]\n"
         f"Fetch data for this panel of the user's '{name}' screen and return it as "
@@ -311,9 +320,10 @@ class SourceEngine:
 
         if self._broadcast is not None:
             fresh = resolve_values(
-                defn, self._store.get_state(fid), self._store.get_events(fid), _now_ms(), self._tz
+                defn, self._store.get_state(fid), self._store.get_events(fid), _now_ms(),
+                zone_for(self._store.get(fid), self._tz),
             )
-            data = {"id": fid, "values": fresh}
+            data = {"id": fid, "values": fresh, "rev": self._store.rev(fid)}
             preview = flowlet_preview(defn, fresh)
             if preview is not None:
                 data["preview"] = preview

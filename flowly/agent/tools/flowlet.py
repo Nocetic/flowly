@@ -20,8 +20,15 @@ from loguru import logger
 
 from flowly.agent.tools.base import Tool
 from flowly.flowlets import catalog, queries
+from flowly.flowlets.authoring import (
+    definition_parameters,
+    guide,
+    repair_definition,
+    structural_errors,
+)
 from flowly.flowlets.schema import FlowletValidationError, validate_definition
 from flowly.flowlets.store import now_ms
+from flowly.flowlets.zones import zone_for
 
 
 def _compact_preview(values: dict) -> dict:
@@ -58,6 +65,7 @@ def _summary(flowlet: dict, values: dict | None = None) -> dict:
         "accent": flowlet.get("accent"),
         "pinned": flowlet.get("pinned"),
         "version": flowlet.get("version"),
+        "rev": flowlet.get("rev", 0),
         "catalog": flowlet.get("catalog"),
         "updatedAt": flowlet.get("updated_at"),
     }
@@ -67,6 +75,17 @@ def _summary(flowlet: dict, values: dict | None = None) -> dict:
         if preview is not None:
             s["preview"] = preview
     return s
+
+
+def _screen_ref(flowlet: dict) -> dict:
+    """The few fields a chat card needs to open the screen, placed first in
+    the result so they survive any truncation of the long values map."""
+    return {"id": flowlet["id"], "name": flowlet.get("name"),
+            "icon": flowlet.get("icon"), "accent": flowlet.get("accent")}
+
+
+_FIX_HINT = ("Fix every listed problem in ONE retry. flowlet(action='guide') has the "
+             "contract; template(template_id) gives a valid starting point.")
 
 
 class FlowletTool(Tool):
@@ -112,26 +131,50 @@ class FlowletTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Build and maintain flowlets — personal, persistent mini-screens the "
-            "user controls on Desktop and iOS (a water tracker, a habit grid, a "
-            "mood log). A flowlet is a declarative JSON `definition` written "
-            "against the component catalog; it renders natively and stays in sync "
-            "across the user's devices. Read the `flowlets` skill for the full "
-            "catalog and worked examples before authoring one.\n\n"
-            "Actions:\n"
-            "- create: Create a flowlet from a `definition` object.\n"
-            "- update: Replace a flowlet's `definition` (versioned) or set `pinned`.\n"
-            "- get: Get one flowlet's definition AND its current live values "
-            "(use this to answer questions like 'how much water today?').\n"
-            "- list: List the user's flowlets with their current values.\n"
-            "- delete: Delete a flowlet permanently.\n"
-            "- log: Append a data point to a series (e.g. the user tells you they "
-            "drank 500ml) — updates every connected screen.\n"
-            "- set_state: Set a state value (e.g. change a goal).\n"
-            "- query: Aggregate a series (agg over a window) to answer a question.\n\n"
-            "The user taps buttons/sliders themselves — you do NOT relay those; "
-            "they are applied instantly without you. Use `log`/`set_state` only "
-            "when the user tells YOU something in chat."
+            "Build and maintain flowlets: personal, persistent mini-screens the user "
+            "controls on every device (a water tracker, a habit grid, a calorie "
+            "journal). One call makes a working screen; no skill, file read or shell "
+            "command is needed.\n\n"
+            "STANDARD: create(template_id, lang, pinned). Templates: water, habits, "
+            "expenses, tasks, sleep, mood, meals (photo calorie journal). Requested "
+            "reminders go in the SAME call: watches=[{preset:'daily_summary'}] "
+            "(ready-made, localized; add at:'21:30' to move it). `templates` lists "
+            "each template's reminders.\n\n"
+            "CUSTOM: create(definition), written straight from this contract:\n"
+            "- {catalog:3, name, icon?, accent?, locale?:'en'|'tr'|'es', state, series?, "
+            "computed?, layout:[...], screens?, watches?}\n"
+            "- state: {goal:{type:'number',default:2000}, rows:{type:'list',item:"
+            "{name:'string',kcal:'number',date:'date',shot:'image'}}}; types number|bool|"
+            "string|timer|list; a list holds at most 200 rows.\n"
+            "- computed: {total:{list:'rows',field:'kcal',agg:'sum',where:"
+            "'days_since(date)==0'}}, {left:{expr:'max(0, goal-total)'}}, {mood:{cases:"
+            "[{when:'total>goal',text:'Over by {left}'}],else:'On track'}}; a series "
+            "aggregate is {series:'water',agg:'sum',window:'today'}.\n"
+            "- Binds are key strings (stat/progress value:'total', max:'goal'); text "
+            "interpolates {key}.\n"
+            "- Entry: form{id,into:'rows',fields:[{field:'name'},{field:'date',default:"
+            "'today'}]}; photo{id,label,action:{op:'vision',into:'rows',prompt,"
+            "dateDefaults:['date']}}; button{id,text,action:{op:'increment',key,by} or "
+            "{op:'log',series,value}}.\n"
+            "- Lists: repeater{source:'rows',item:{type:'list_row',title:'$.name',value:"
+            "'{$.kcal} kcal',thumb:'$.shot'}}; tracker_card{id,list:'rows',field:'kcal',"
+            "window:'7d',chart:'bar'}.\n"
+            "- Reminders: watches:[{id,trigger:'schedule',at:'21:00',when?:'total>0',"
+            "notify:{title,body:'{total} today'},otherwise?:{title,body}}]; trigger "
+            "'condition'/'goal' take when (+after:'18:00'), 'stale' takes idleMinutes. "
+            "Times are the host's local time.\n"
+            "- The screen is already titled with name: don't open with a header repeating it.\n"
+            "Every problem is reported at once: fix them all in one retry. Slips with "
+            "one meaning are repaired and listed under `normalized`. guide returns the "
+            "full component catalog; template(template_id) returns an editable example.\n\n"
+            "EXISTING: list/get are the inventory, never memory. update replaces the "
+            "definition (versioned) or sets pinned.\n\n"
+            "Actions: create, update, get (definition + live values, e.g. 'how much "
+            "water today?'), list, delete, log (append to a series when the user tells "
+            "you a value), set_state, query (aggregate a series), notify, templates, "
+            "template, guide, validate (dry run; create/update already validate).\n"
+            "The user's own taps apply instantly without you; use log/set_state only "
+            "for what the user tells YOU in chat."
         )
 
     @property
@@ -142,24 +185,26 @@ class FlowletTool(Tool):
                 "action": {
                     "type": "string",
                     "enum": ["create", "update", "get", "list",
-                             "delete", "log", "set_state", "query", "notify"],
+                             "delete", "log", "set_state", "query", "notify",
+                             "templates", "template", "guide", "validate"],
                     "description": "The action to perform",
                 },
                 "flowlet_id": {
                     "type": "string",
-                    "description": "Target flowlet id (all actions except create/list)",
+                    "description": "Target flowlet id for update/get/delete/log/set_state/query/notify",
                 },
-                "definition": {
-                    "type": "object",
-                    "description": (
-                        "The full flowlet definition (catalog, name, icon, accent, "
-                        "state, series, computed, layout). Required for create; for "
-                        "update it replaces the definition and bumps the version."
-                    ),
-                },
+                "definition": definition_parameters(),
+                "template_id": {"type": "string", "description":
+                    "Template for create/template: water, habits, expenses, tasks, sleep, mood, meals."},
+                "lang": {"type": "string", "description": "Template UI language: en, tr or es."},
+                "name": {"type": "string", "description": "Optional name for template creation."},
+                "watches": {"type": "array", "items": {"type": "object"}, "description":
+                    "create: requested reminders only. A template's ready-made one by "
+                    "name {preset:'daily_summary'} (optionally with at:'21:30'), or a full "
+                    "watch object. Joins a custom definition's own watches."},
                 "pinned": {
                     "type": "boolean",
-                    "description": "Pin/unpin (update action)",
+                    "description": "Pin at creation or pin/unpin on update",
                 },
                 "series": {"type": "string", "description": "Series name (log/query)"},
                 "key": {"type": "string", "description": "State key (set_state)"},
@@ -193,6 +238,10 @@ class FlowletTool(Tool):
             "set_state": self._set_state,
             "query": self._query,
             "notify": self._notify_action,
+            "templates": self._templates,
+            "template": self._template,
+            "guide": self._guide,
+            "validate": self._validate,
         }
         handler = handlers.get(action)
         if not handler:
@@ -200,8 +249,9 @@ class FlowletTool(Tool):
         try:
             return await handler(**kwargs)
         except FlowletValidationError as exc:
-            # Surface the precise, fixable message so the model can correct it.
-            return json.dumps({"error": f"invalid definition: {exc}", "action": action})
+            # Surface every precise, fixable problem so one retry fixes them all.
+            return json.dumps({"error": "invalid definition", "errors": exc.errors,
+                               "action": action, "hint": _FIX_HINT}, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             logger.error("Flowlet {} error: {}", action, exc)
             return json.dumps({"error": str(exc), "action": action})
@@ -214,7 +264,7 @@ class FlowletTool(Tool):
             self._store.get_state(flowlet["id"]),
             self._store.get_events(flowlet["id"]),
             now_ms(),
-            None,  # local tz
+            zone_for(flowlet),  # the user's device zone once a client has opened it
         )
 
     @staticmethod
@@ -239,18 +289,126 @@ class FlowletTool(Tool):
             logger.debug("flowlet preview failed: {}", exc)
         return review
 
+    @staticmethod
+    def _prepare(definition: Any) -> tuple[dict | None, list[str], str | None]:
+        """Repair unambiguous slips, then validate everything at once.
+
+        Returns ``(definition, notes, None)`` when it is ready to persist, or
+        ``(None, notes, error_json)`` listing every problem found.
+        """
+        if not isinstance(definition, dict):
+            return None, [], json.dumps({"error": "definition (object) is required"})
+        definition, notes = repair_definition(definition)
+        errors = [f"{e['path']}: {e['message']}" for e in structural_errors(definition)]
+        if not errors:
+            from flowly.flowlets.normalize import assign_missing_ids
+            definition = assign_missing_ids(definition)
+            try:
+                validate_definition(definition)
+            except FlowletValidationError as exc:
+                errors = exc.errors
+        if errors:
+            out: dict[str, Any] = {"error": "invalid definition", "errors": errors,
+                                   "hint": _FIX_HINT}
+            if notes:
+                out["normalized"] = notes
+            return None, notes, json.dumps(out, ensure_ascii=False)
+        return definition, notes, None
+
     # ── actions ───────────────────────────────────────────────────────────────
+
+    async def _guide(self, **kw: Any) -> str:
+        return json.dumps(guide(), ensure_ascii=False)
+
+    async def _templates(self, **kw: Any) -> str:
+        from flowly.flowlets.templates import list_templates
+        return json.dumps({"templates": list_templates(kw.get("lang"))}, ensure_ascii=False)
+
+    async def _template(self, **kw: Any) -> str:
+        from flowly.flowlets.templates import (
+            build_template,
+            describe_reminder,
+            list_templates,
+            template_reminders,
+        )
+        try:
+            definition = build_template(kw.get("template_id"), kw.get("lang"))
+        except KeyError:
+            return json.dumps({"error": "Unknown template_id", "templates": list_templates(kw.get("lang"))})
+        # Conversational creation only includes reminders the user requested;
+        # the ready-made ones are offered by id instead.
+        definition.pop("watches", None)
+        out: dict[str, Any] = {"definition": definition}
+        reminders = template_reminders(kw.get("template_id"), kw.get("lang"))
+        if reminders:
+            out["reminders"] = {rid: describe_reminder(w) for rid, w in reminders.items()}
+        return json.dumps(out, ensure_ascii=False)
+
+    @staticmethod
+    def _resolve_watches(requested: Any, presets: dict[str, dict]) -> tuple[list | None, str | None]:
+        """Turn ``watches`` entries into watch objects: a preset id
+        (``"daily_summary"``), a preset with overrides
+        (``{"preset": "daily_summary", "at": "21:30"}``) or a full watch."""
+        if not isinstance(requested, list):
+            return None, "watches must be an array"
+        out: list = []
+        for w in requested:
+            name = w if isinstance(w, str) else (w.get("preset") if isinstance(w, dict) else None)
+            if name is not None:
+                base = presets.get(name)
+                if base is None:
+                    return None, (f"Unknown reminder {name!r}. Available: {sorted(presets) or 'none'}; "
+                                  "or pass a full watch object.")
+                overrides = {k: v for k, v in w.items() if k != "preset"} if isinstance(w, dict) else {}
+                if "everyMinutes" in overrides:
+                    base = {k: v for k, v in base.items() if k != "at"}
+                out.append({**base, **overrides})
+            else:
+                out.append(w)
+        return out, None
+
+    async def _validate(self, **kw: Any) -> str:
+        definition, notes, error = self._prepare(kw.get("definition"))
+        if error:
+            return error
+        out: dict[str, Any] = {"valid": True, **self._review(definition)}
+        if notes:
+            out["normalized"] = notes
+        return json.dumps(out, ensure_ascii=False)
 
     async def _create(self, **kw: Any) -> str:
         definition = kw.get("definition")
-        if not isinstance(definition, dict):
-            return json.dumps({"error": "definition (object) is required"})
-        # Forgotten ids are ASSIGNED, not rejected — "button carries an action,
-        # so it needs a unique `id`" was a whole authoring-failure class, and an
-        # id-less chart silently rendered empty. Persist the assigned ids.
-        from flowly.flowlets.normalize import assign_missing_ids
-        definition = assign_missing_ids(definition)
-        validate_definition(definition)
+        if kw.get("template_id"):
+            if definition is not None:
+                return json.dumps({"error": "Supply template_id OR definition, not both"})
+            result = json.loads(await self._template(**kw))
+            if "error" in result:
+                return json.dumps(result)
+            definition = result["definition"]
+            if kw.get("name"):
+                definition["name"] = kw["name"]
+            if kw.get("watches"):
+                from flowly.flowlets.templates import template_reminders
+                watches, err = self._resolve_watches(
+                    kw["watches"], template_reminders(kw["template_id"], kw.get("lang")))
+                if err:
+                    return json.dumps({"error": err})
+                definition["watches"] = watches
+        elif kw.get("watches"):
+            # Same call either way: reminders passed beside a custom definition
+            # join its own watches instead of costing a retry.
+            if not isinstance(definition, dict):
+                return json.dumps({"error": "definition (object) is required"})
+            watches, err = self._resolve_watches(kw["watches"], {})
+            if err:
+                return json.dumps({"error": err})
+            definition = {**definition,
+                          "watches": [*(definition.get("watches") or []), *watches]}
+        # Unambiguous slips are repaired (and reported), forgotten ids are
+        # ASSIGNED, and every remaining problem is returned at once.
+        definition, notes, error = self._prepare(definition)
+        if error:
+            return error
         meta = _extract_meta(definition)
         flowlet = self._store.create(
             name=meta["name"],
@@ -265,10 +423,12 @@ class FlowletTool(Tool):
         await self._notify("flowlet.created", _summary(flowlet, values))
         return json.dumps({
             "action": "create",
+            "screen": _screen_ref(flowlet),
             "flowlet": _summary(flowlet, values),
             "message": f"Flowlet '{meta['name']}' created (id: {flowlet['id']})",
+            **({"normalized": notes} if notes else {}),
             **self._review(definition),
-        })
+        }, ensure_ascii=False)
 
     async def _update(self, **kw: Any) -> str:
         flowlet_id = kw.get("flowlet_id", "")
@@ -279,12 +439,11 @@ class FlowletTool(Tool):
 
         definition = kw.get("definition")
         name = icon = accent = None
+        notes: list[str] = []
         if definition is not None:
-            if not isinstance(definition, dict):
-                return json.dumps({"error": "definition must be an object"})
-            from flowly.flowlets.normalize import assign_missing_ids
-            definition = assign_missing_ids(definition)
-            validate_definition(definition)
+            definition, notes, error = self._prepare(definition)
+            if error:
+                return error
             meta = _extract_meta(definition)
             name, icon, accent = meta["name"], meta["icon"], meta["accent"]
 
@@ -300,10 +459,12 @@ class FlowletTool(Tool):
         await self._notify("flowlet.updated", _summary(flowlet, values))
         return json.dumps({
             "action": "update",
+            "screen": _screen_ref(flowlet),
             "flowlet": _summary(flowlet, values),
             "message": f"Flowlet updated (v{flowlet['version']})",
+            **({"normalized": notes} if notes else {}),
             **(self._review(definition) if definition is not None else {}),
-        })
+        }, ensure_ascii=False)
 
     async def _get(self, **kw: Any) -> str:
         flowlet_id = kw.get("flowlet_id", "")
@@ -354,7 +515,7 @@ class FlowletTool(Tool):
             return json.dumps({"error": "value must be a number"})
         self._store.add_event(flowlet_id, series, value)
         values = self._values(flowlet)
-        _ev = {"id": flowlet_id, "values": values}
+        _ev = {"id": flowlet_id, "values": values, "rev": self._store.rev(flowlet_id)}
         _pv = queries.flowlet_preview(flowlet["definition"], values)
         if _pv is not None:
             _ev["preview"] = _pv
@@ -372,7 +533,7 @@ class FlowletTool(Tool):
             return json.dumps({"error": f"state key '{key}' is not declared"})
         self._store.set_state(flowlet_id, key, queries.coerce_state(kw.get("value"), spec))
         values = self._values(flowlet)
-        _ev = {"id": flowlet_id, "values": values}
+        _ev = {"id": flowlet_id, "values": values, "rev": self._store.rev(flowlet_id)}
         _pv = queries.flowlet_preview(flowlet["definition"], values)
         if _pv is not None:
             _ev["preview"] = _pv

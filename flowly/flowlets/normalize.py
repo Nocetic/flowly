@@ -176,7 +176,41 @@ def _collect_ids(node: Any, acc: set[str]) -> None:
         _collect_ids(item, acc)
 
 
-def _edit_input(field: str, ftype: str, list_key: str, used_ids: set[str]) -> dict:
+def _entry_labels(defn: dict) -> dict[str, str]:
+    """Labels the author already gave each row field on an entry form.
+
+    By serve time a ``form`` is expanded into controls bound to draft keys
+    ``<form>__<field>``; their labels ("Amount", "Tutar") are the best name for
+    the same field on the row's edit screen.
+    """
+    labels: dict[str, str] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+            return
+        if not isinstance(node, dict):
+            return
+        action = node.get("action")
+        key = action.get("key") if isinstance(action, dict) else None
+        label = node.get("label")
+        if isinstance(key, str) and "__" in key and isinstance(label, str) and label.strip():
+            labels.setdefault(key.rsplit("__", 1)[1], label.strip())
+        walk(node.get("children"))
+
+    walk(defn.get("layout"))
+    return labels
+
+
+def _humanize(field: str) -> str:
+    """"payment_method" → "Payment method" — never a raw identifier on screen."""
+    text = field.replace("_", " ").strip()
+    return text[:1].upper() + text[1:] if text else field
+
+
+def _edit_input(field: str, ftype: str, list_key: str, used_ids: set[str],
+                label: str | None = None) -> dict:
     """An input component bound to one row field via an item op, seeded with the
     row's current value (``$.field``) so the client shows what it's editing."""
     # Letter-leading id (the id grammar requires it); the counter keeps it
@@ -188,7 +222,7 @@ def _edit_input(field: str, ftype: str, list_key: str, used_ids: set[str]) -> di
         cid = f"edit_{field}_{n}"
         n += 1
     used_ids.add(cid)
-    common = {"id": cid, "label": field, "value": f"$.{field}"}
+    common = {"id": cid, "label": label or _humanize(field), "value": f"$.{field}"}
     if ftype == "bool":
         return {"type": "toggle", **common,
                 "action": {"op": "item_toggle", "key": list_key, "field": field}}
@@ -225,6 +259,7 @@ def ensure_editable_drill(defn: dict) -> dict:
     if not isinstance(screens, dict):
         screens = {}
     patched = False
+    labels = _entry_labels(out)
 
     nav_targets: dict[str, str] = {}          # screenId → list it drills into
     orphan_repeaters: list[tuple[dict, str]] = []  # repeaters with no valid drill
@@ -261,7 +296,7 @@ def ensure_editable_drill(defn: dict) -> dict:
         used_ids: set[str] = set()
         _collect_ids(layout, used_ids)
         added = [
-            _edit_input(f, t, list_key, used_ids)
+            _edit_input(f, t, list_key, used_ids, labels.get(f))
             for f, t in editable
             if f not in covered
         ]
@@ -282,7 +317,7 @@ def ensure_editable_drill(defn: dict) -> dict:
             sid = f"edit_{list_key}_{n}"
             n += 1
         used_ids: set[str] = set()
-        inputs = [_edit_input(f, t, list_key, used_ids) for f, t in editable]
+        inputs = [_edit_input(f, t, list_key, used_ids, labels.get(f)) for f, t in editable]
         screen: dict = {"layout": inputs}
         # Title from the first text field so the header names the row.
         title_field = next((f for f, t in editable if t == "string"), None)
@@ -433,3 +468,51 @@ def ensure_chart_layout(defn: dict) -> dict:
             walk(screen.get("layout"))
 
     return out if changed else defn
+
+
+def _norm_title(text: Any) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def drop_title_header(defn: dict, name: Any) -> dict:
+    """Drop a leading ``header`` that only repeats the screen's name.
+
+    Every client already titles the screen with the flowlet's name, so a first
+    header saying the same thing printed the title twice. A subtitle on that
+    header survives as plain text. Only the very first top-level node is
+    considered; headers anywhere else are deliberate section titles.
+    """
+    layout = defn.get("layout")
+    if not isinstance(layout, list) or not layout:
+        return defn
+    first = layout[0]
+    if not (isinstance(first, dict) and first.get("type") == "header"
+            and _norm_title(first.get("text")) == _norm_title(name)
+            and _norm_title(name)):
+        return defn
+    rest = list(layout[1:])
+    subtitle = first.get("subtitle")
+    if isinstance(subtitle, str) and subtitle.strip():
+        rest.insert(0, {"type": "text", "text": subtitle, "style": "muted"})
+    if not rest:
+        return defn
+    return {**defn, "layout": rest}
+
+
+def served_definition(stored: dict, name: Any = None) -> dict:
+    """The one definition every client renders and every tap resolves against.
+
+    Composites expand to primitives first, forgotten ids are assigned (the
+    same deterministic ids the action path derives), every user-owned list row
+    becomes editable, photo lists display their photos, chart grids go full
+    width, and a header that only repeats the screen title is dropped. Serving
+    and acting share this function so a tapped id always exists in both.
+    """
+    from flowly.flowlets.composites import expand_composites
+
+    definition = ensure_chart_layout(
+        ensure_photo_display(
+            ensure_editable_drill(assign_missing_ids(expand_composites(stored)))
+        )
+    )
+    return drop_title_header(definition, name if name is not None else stored.get("name"))

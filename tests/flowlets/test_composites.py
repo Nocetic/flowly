@@ -226,11 +226,12 @@ def test_form_injects_typed_draft_state():
     out = expand_composites(_form_defn(_EXPENSE_FORM))
     st = out["state"]
     assert st["addExpense__title"] == {"type": "string", "default": ""}
-    assert st["addExpense__amount"] == {"type": "number", "default": 0}
+    # empty until typed — a seeded 0 rendered as text and hid the placeholder
+    assert st["addExpense__amount"] == {"type": "number", "default": None, "nullable": True}
     # first option preselected so the category is never unset
     assert st["addExpense__category"] == {"type": "string", "default": "Market"}
     # a date defaulting to today seeds the literal the item_add resolves
-    assert st["addExpense__date"] == {"type": "string", "default": "today"}
+    assert st["addExpense__date"] == {"type": "string", "default": "today", "format": "date"}
 
 
 def test_many_options_expand_to_a_select():
@@ -367,3 +368,14 @@ def test_tracker_headlines_the_grid_tile_preview():
     defn = _form_defn(_TRACKER)
     pv = flowlet_preview(defn, {"spend__agg": 300})
     assert pv is not None and "300" in pv["text"] and "Bu ay" in pv["text"]
+
+
+def test_list_row_text_with_several_bare_field_refs():
+    """`"$.category · $.merchant"` once rendered verbatim as
+    `{$.category · $.merchant}` on every client."""
+    from flowly.flowlets.composites import _text_template
+    assert _text_template("$.category · $.merchant") == "{$.category} · {$.merchant}"
+    assert _text_template("$.title") == "{$.title}"
+    assert _text_template("{$.amount} ₺") == "{$.amount} ₺"
+    assert _text_template("$.a – {$.b}") == "{$.a} – {$.b}"
+    assert _text_template("Plain text") == "Plain text"

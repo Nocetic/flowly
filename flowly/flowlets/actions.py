@@ -124,7 +124,7 @@ def _resolve_field_value(tpl: Any, field_type: str, ns: dict, tz: tzinfo | None)
     """
     if isinstance(tpl, str):
         m = _LONE_TOKEN_RE.match(tpl.strip())
-        val: Any = ns.get(m.group(1)) if m else queries.render_template(tpl, ns)
+        val: Any = ns.get(m.group(1)) if m else queries.render_template(tpl, ns, keep_unknown=True)
     else:
         val = tpl  # a literal number/bool passes straight through
     if field_type == "date" and isinstance(val, str) and val.strip().lower() == "today":
@@ -177,38 +177,56 @@ async def apply_action(
     *,
     tz: tzinfo | None = None,
     agent_runner: AgentRunner | None = None,
+    op_id: str | None = None,
 ) -> dict:
     """Apply the action declared on ``component_id`` and return the new values.
 
-    Returns ``{"flowletId": id, "values": {...}}``. Raises
-    :class:`FlowletActionError` (``code`` in NOT_FOUND / INVALID / UNAVAILABLE).
+    Returns ``{"flowletId": id, "values": {...}, "rev": n}``. ``rev`` orders
+    every values map the client sees. ``op_id`` makes a retried tap idempotent:
+    an id already applied returns current values with ``duplicate: true``.
+    Raises :class:`FlowletActionError` (``code`` in NOT_FOUND / INVALID /
+    UNAVAILABLE); a failed action changes nothing.
     """
     flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FlowletActionError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
-    # Expand composites first: a form's submit / a tracker's quick-add lives
-    # inside a composite in the STORED definition, so _find_component (and the
-    # injected draft-state specs it coerces against) only see it after
-    # expansion. Then assign the ids the author forgot — the client renders the
-    # SERVED definition (same deterministic assignment), so a tap can arrive
-    # for an auto-assigned id. Both idempotent no-ops when clean.
-    from flowly.flowlets.composites import expand_composites
-    from flowly.flowlets.normalize import assign_missing_ids
-    definition = assign_missing_ids(expand_composites(flowlet["definition"]))
+    if op_id and not store.claim_op(flowlet_id, op_id):
+        return {**current_values(store, flowlet, tz), "duplicate": True}
+    try:
+        return await _apply_action(store, flowlet, component_id, value,
+                                   tz=tz, agent_runner=agent_runner)
+    except BaseException:
+        if op_id:
+            store.release_op(flowlet_id, op_id)
+        raise
+
+
+def current_values(store, flowlet: dict, tz: tzinfo | None = None) -> dict:
+    """The live values of ``flowlet`` with the revision they were computed at."""
+    fid = flowlet["id"]
+    values = resolve_values(
+        flowlet["definition"], store.get_state(fid), store.get_events(fid),
+        queries_now_ms(), tz,
+    )
+    return {"flowletId": fid, "values": values, "rev": store.rev(fid)}
+
+
+async def _apply_action(
+    store,
+    flowlet: dict,
+    component_id: str,
+    value: Any,
+    *,
+    tz: tzinfo | None,
+    agent_runner: AgentRunner | None,
+) -> dict:
+    flowlet_id = flowlet["id"]
+    # Resolve the tap against the SAME definition clients render: composites
+    # expanded, forgotten ids assigned, serve-time edit inputs present.
+    from flowly.flowlets.normalize import served_definition
+    definition = served_definition(flowlet["definition"], flowlet.get("name"))
 
     component = _find_component(definition, component_id)
-    if component is None:
-        # The client renders the SERVE-augmented definition, so the tapped
-        # component may be an edit input the editable-drill guarantee injected
-        # (present only in the augmented tree, not the stored one). Re-resolve
-        # against the same augmentation; its action targets real state, so the
-        # op below applies normally.
-        from flowly.flowlets.normalize import ensure_editable_drill
-        augmented = ensure_editable_drill(definition)
-        if augmented is not definition:
-            found = _find_component(augmented, component_id)
-            if found is not None:
-                definition, component = augmented, found
     if component is None:
         raise FlowletActionError("NOT_FOUND", f"component '{component_id}' not found")
 
@@ -254,7 +272,8 @@ async def apply_action(
             if bucket is not None:
                 store.set_state(flowlet_id, guard_key, bucket)
 
-    # Recompute the full values map from the post-mutation state + events.
+    # Recompute the full values map from the post-mutation state + events, and
+    # read the revision with no await in between: the pair is consistent.
     values = resolve_values(
         definition,
         store.get_state(flowlet_id),
@@ -262,7 +281,7 @@ async def apply_action(
         queries_now_ms(),
         tz,
     )
-    return {"flowletId": flowlet_id, "values": values}
+    return {"flowletId": flowlet_id, "values": values, "rev": store.rev(flowlet_id)}
 
 
 def queries_now_ms() -> int:
@@ -319,10 +338,14 @@ async def _apply_op(
         key = action["key"]
         spec = _state_spec(definition, key)
         v = effective_value()
-        if v is None:
+        if spec.get("nullable") and (v is None or v == ""):
+            store.set_state(flowlet_id, key, None)  # the user cleared the field
+            v = None
+        elif v is None:
             raise FlowletActionError("INVALID", f"action `set` on '{key}' needs a value")
-        v = _validate_component_value(component, spec, v)
-        store.set_state(flowlet_id, key, coerce_state(v, spec))
+        if v is not None:
+            v = _validate_component_value(component, spec, v)
+            store.set_state(flowlet_id, key, coerce_state(v, spec))
 
     elif op in ("increment", "decrement"):
         key = action["key"]
@@ -345,8 +368,13 @@ async def _apply_op(
     elif op == "toggle":
         key = action["key"]
         spec = _state_spec(definition, key)
-        cur = _current_scalar(store, flowlet_id, definition, key)
-        store.set_state(flowlet_id, key, coerce_state(not bool(cur), spec))
+        if isinstance(passed_value, bool):
+            # The client says which state it wants: a retried or doubled tap
+            # lands on the same answer instead of flipping back.
+            store.set_state(flowlet_id, key, coerce_state(passed_value, spec))
+        else:
+            cur = _current_scalar(store, flowlet_id, definition, key)
+            store.set_state(flowlet_id, key, coerce_state(not bool(cur), spec))
 
     elif op == "timer_toggle":
         key = action["key"]
@@ -386,7 +414,7 @@ async def _apply_op(
             )
             if passed_value is not None and not isinstance(passed_value, (dict, list)):
                 ns = {**ns, "value": passed_value}
-            cat = queries.render_template(cat_tpl, ns).strip()[: catalog.MAX_CATEGORY_LEN]
+            cat = queries.render_template(cat_tpl, ns, keep_unknown=True).strip()[: catalog.MAX_CATEGORY_LEN]
             if cat:
                 meta = {"category": cat}
         # Stamp the event with the same injectable clock the query/window engine
@@ -436,7 +464,7 @@ async def _apply_op(
             if isinstance(v, str):
                 v = v.strip()[:500]  # same cap as the `input` component
             ns = {**ns, "value": v}
-        message = queries.render_template(message, ns)
+        message = queries.render_template(message, ns, keep_unknown=True)
         try:
             await agent_runner(flowlet, message)
         except Exception as exc:  # noqa: BLE001 — never crash the action path
@@ -506,7 +534,7 @@ async def _apply_op(
 
         if op == "item_toggle":
             f = action["field"]
-            item[f] = not bool(item.get(f))
+            item[f] = inner_value if isinstance(inner_value, bool) else not bool(item.get(f))
         elif op == "item_update":
             if "fields" in action:  # fixed updates declared on the action
                 for f, v in (action.get("fields") or {}).items():
@@ -530,11 +558,18 @@ async def _apply_op(
     elif op == "batch":
         if _depth > 0:
             raise FlowletActionError("INVALID", "nested batch is not allowed")
-        for sub in action.get("ops", []):
-            await _apply_op(
-                store, flowlet_id, definition, component, sub, passed_value,
-                agent_runner=agent_runner, tz=tz, _depth=_depth + 1,
-            )
+        # All or nothing: a form submit whose reset fails must not leave a
+        # half-applied row behind.
+        snap = store.snapshot(flowlet_id)
+        try:
+            for sub in action.get("ops", []):
+                await _apply_op(
+                    store, flowlet_id, definition, component, sub, passed_value,
+                    agent_runner=agent_runner, tz=tz, _depth=_depth + 1,
+                )
+        except BaseException:
+            store.restore(flowlet_id, snap)
+            raise
 
     else:
         raise FlowletActionError("INVALID", f"unknown action op '{op}'")
