@@ -30,7 +30,7 @@ from flowly.desktop_runtime.resources import resource_report
 
 # The browser is resolved separately (install_recipe.screen_browser).
 REQUIRED_PROGRAMS = ("Xvnc", "dbus-run-session", "python3", "bash",
-                     "xfwm4", "xfsettingsd", "xfdesktop", "xfce4-panel", "xfce4-terminal",
+                     "xfwm4", "xfsettingsd", "xfce4-panel", "xfce4-terminal",
                      "xfce4-settings-manager", "xfconf-query", "xdotool", "xprop")
 _UNPINNED = object()
 

@@ -97,16 +97,15 @@ def desktop(tmp_path):
             os.close(read_fd)
             if write_fd >= 0:
                 os.close(write_fd)
-        spawn(["xfwm4", "--compositor=on", "--vblank=off"])
+        spawn(["xfwm4", "--compositor=off"])
         spawn(["xfsettingsd"])
-        spawn(["xfdesktop"])
         spawn(["xfce4-panel"])
         panel = wait_for(lambda: window("^xfce4-panel$"))
         spawn(["/usr/bin/python3", "-I", "-c", BROWSER_MANAGER_SOURCE,
                "/usr/bin/chromium", str(browser_profile)])
         wait_for(lambda: window("^chromium$"))
         yield dict(env=environment, command=command, wait_for=wait_for, window=window,
-                   panel=panel, profile=browser_profile, root=tmp_path)
+                   panel=panel, profile=browser_profile, root=tmp_path, rfb=sockets / "rfb.sock")
     finally:
         for child in reversed(children):
             try:
@@ -195,3 +194,69 @@ def test_dock_opens_terminal_and_settings_and_focuses_same_browser(desktop):
         reopened = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{reopened_port}")
         cookies = reopened.contexts[0].cookies("http://screen.test")
         assert any(c["name"] == "durable" and c["value"] == "after-reopen" for c in cookies)
+
+
+def framebuffer(path):
+    """One complete Raw 32bpp framebuffer from the private RFB socket."""
+    import socket
+    import struct
+
+    def read(connection, size):
+        data = bytearray()
+        while len(data) < size:
+            part = connection.recv(size - len(data))
+            assert part, "RFB peer closed"
+            data.extend(part)
+        return bytes(data)
+
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(10)
+        connection.connect(str(path))
+        assert read(connection, 12) == b"RFB 003.008\n"
+        connection.sendall(b"RFB 003.008\n")
+        read(connection, 2)
+        connection.sendall(b"\x01")
+        assert read(connection, 4) == bytes(4)
+        connection.sendall(b"\x01")
+        init = read(connection, 24)
+        read(connection, int.from_bytes(init[20:24], "big"))
+        width, height = struct.unpack("!HH", init[:4])
+        connection.sendall(struct.pack("!BBHi", 2, 0, 1, 0))
+        connection.sendall(struct.pack("!BBHHHH", 3, 0, 0, 0, width, height))
+        pixels = bytearray(width * height * 4)
+        header = read(connection, 4)
+        for _ in range(int.from_bytes(header[2:4], "big")):
+            x, y, w, h, encoding = struct.unpack("!HHHHi", read(connection, 12))
+            assert encoding == 0
+            body = read(connection, w * h * 4)
+            for row in range(h):
+                start = ((y + row) * width + x) * 4
+                pixels[start:start + w * 4] = body[row * w * 4:(row + 1) * w * 4]
+
+    def pixel(x, y):
+        blue, green, red = pixels[(y * width + x) * 4:(y * width + x) * 4 + 3]
+        return red, green, blue
+    return width, height, pixel
+
+
+def test_plain_black_desktop_and_a_dock_of_flowly_icons(desktop):
+    command = desktop["command"]
+    # Flowly's own entries replace a previous release's theme icon names.
+    entries = Path(desktop["env"]["XDG_DATA_HOME"]) / "applications"
+    for name in ("browser", "terminal", "settings"):
+        icon = next(line for line in (entries / f"flowly-{name}.desktop").read_text().splitlines()
+                    if line.startswith("Icon="))[5:]
+        assert Path(icon).is_absolute() and Path(icon).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    width, height, pixel = framebuffer(desktop["rfb"])
+    # Beside the dock, under any maximized window: the server's black root.
+    assert pixel(4, height - 4) == (0, 0, 0)
+    assert command("pgrep", "-x", "xfdesktop").returncode != 0
+    geometry = command("xdotool", "getwindowgeometry", "--shell", desktop["panel"])
+    bounds = {key: int(value) for key, value in (line.split("=", 1) for line in geometry.stdout.splitlines())
+              if key in {"X", "Y", "WIDTH", "HEIGHT"}}
+    dock = [pixel(x, y) for x in range(bounds["X"], bounds["X"] + bounds["WIDTH"])
+            for y in range(bounds["Y"], bounds["Y"] + bounds["HEIGHT"])]
+    # Neutral, fully bright glyphs: neither a coloured theme icon nor a
+    # faded grey symbolic fallback.
+    assert max(max(rgb) - min(rgb) for rgb in dock) <= 24
+    assert sum(1 for rgb in dock if min(rgb) >= 220) >= 150

@@ -32,18 +32,26 @@ def handshake(connection):
 
 
 def capture(connection):
-    connection.sendall(struct.pack("!BBHHHH", 3, 0, 600, 500, 32, 32))
-    header = recv_exact(connection, 4)
-    assert header[0] == 0
+    """The 32x32 patch and any cursor shapes sent with it.
+
+    One request may be answered by a cursor-only update, with the pixels
+    (possibly split into several rectangles) after another request; without
+    a compositor this happens regularly. Ask again until the patch is whole.
+    """
     shapes, pixels = [], bytearray()
-    for _ in range(int.from_bytes(header[2:4], "big")):
-        _, _, width, height, encoding = struct.unpack("!HHHHi", recv_exact(connection, 12))
-        if encoding == -239:
-            shapes.append((width, height))
-            recv_exact(connection, width * height * 4 + ((width + 7) // 8) * height)
-        else:
-            assert encoding == 0
-            pixels.extend(recv_exact(connection, width * height * 4))
+    while len(pixels) < 32 * 32 * 4:
+        pixels.clear()
+        connection.sendall(struct.pack("!BBHHHH", 3, 0, 600, 500, 32, 32))
+        header = recv_exact(connection, 4)
+        assert header[0] == 0
+        for _ in range(int.from_bytes(header[2:4], "big")):
+            _, _, width, height, encoding = struct.unpack("!HHHHi", recv_exact(connection, 12))
+            if encoding == -239:
+                shapes.append((width, height))
+                recv_exact(connection, width * height * 4 + ((width + 7) // 8) * height)
+            else:
+                assert encoding == 0
+                pixels.extend(recv_exact(connection, width * height * 4))
     return shapes, {bytes(pixels[i : i + 3]) for i in range(0, len(pixels), 4)}
 
 

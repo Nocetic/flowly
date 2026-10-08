@@ -58,7 +58,7 @@ def test_desktop_processes_do_not_inherit_agent_environment(tmp_path, monkeypatc
     wrappers = tmp_path / "executables"
     wrappers.mkdir()
     reports = []
-    for program in ("Xvnc", "xfwm4", "xfsettingsd", "xfdesktop", "xfce4-panel", "chromium"):
+    for program in ("Xvnc", "xfwm4", "xfsettingsd", "xfce4-panel", "chromium"):
         executable = shutil.which(program)
         assert executable
         report = tmp_path / (program + ".json")

@@ -260,13 +260,15 @@ def run(directory: Path, generation: str) -> None:
             if not application_check(["python3", "-I", "-c", DESKTOP_DEFAULTS_SOURCE,
                                       browser_command, str(browser_profile)], env):
                 raise ScreenError("RUNTIME_START_FAILED")
-            spawn(["xfwm4", "--compositor=on", "--vblank=off"], env)
+            # No compositor: in a software-only Xvnc it roughly doubled the
+            # window manager's and server's CPU for every repaint. No xfdesktop:
+            # the screen keeps the server's plain black root window, identical
+            # on every distribution, without a wallpaper process.
+            spawn(["xfwm4", "--compositor=off"], env)
             spawn(["xfsettingsd"], env)
-            spawn(["xfdesktop"], env)
             spawn(["xfce4-panel"], env)
-            wait_for(lambda: all(application_check(
-                ["xdotool", "search", "--onlyvisible", "--class", pattern], env)
-                for pattern in ("^xfce4-panel$", "^xfdesktop$")))
+            wait_for(lambda: application_check(
+                ["xdotool", "search", "--onlyvisible", "--class", "^xfce4-panel$"], env))
             # Before the browser or a terminal reads the keymap: layout
             # characters become ordinary keys (see desktop_keymap). Without it
             # ASCII still works; the manifest records which keymap is active.

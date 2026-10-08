@@ -84,3 +84,19 @@ def test_seeding_refuses_links_without_changing_their_target(application, tmp_pa
         assert list(outside.iterdir()) == []
     else:
         assert outside.read_text() == "preserve this"
+
+
+def test_dock_entries_use_flowly_icons_and_replace_older_theme_names(application):
+    environment, _, _ = application
+    entries = Path(environment["XDG_DATA_HOME"]) / "applications"
+    entries.mkdir(mode=0o700)
+    old = entries / "flowly-terminal.desktop"
+    old.write_text("[Desktop Entry]\nName=Terminal\nIcon=utilities-terminal\n")
+    old.chmod(0o600)
+    assert seed(application).returncode == 0
+    for name in ("browser", "terminal", "settings"):
+        entry = (entries / f"flowly-{name}.desktop").read_text()
+        icon = Path(next(line[5:] for line in entry.splitlines() if line.startswith("Icon=")))
+        assert icon.parent == Path(environment["XDG_DATA_HOME"]) / "flowly-dock"
+        assert icon.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        assert icon.stat().st_mode & 0o777 == 0o600
