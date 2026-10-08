@@ -176,7 +176,41 @@ def _collect_ids(node: Any, acc: set[str]) -> None:
         _collect_ids(item, acc)
 
 
-def _edit_input(field: str, ftype: str, list_key: str, used_ids: set[str]) -> dict:
+def _entry_labels(defn: dict) -> dict[str, str]:
+    """Labels the author already gave each row field on an entry form.
+
+    By serve time a ``form`` is expanded into controls bound to draft keys
+    ``<form>__<field>``; their labels ("Amount", "Tutar") are the best name for
+    the same field on the row's edit screen.
+    """
+    labels: dict[str, str] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+            return
+        if not isinstance(node, dict):
+            return
+        action = node.get("action")
+        key = action.get("key") if isinstance(action, dict) else None
+        label = node.get("label")
+        if isinstance(key, str) and "__" in key and isinstance(label, str) and label.strip():
+            labels.setdefault(key.rsplit("__", 1)[1], label.strip())
+        walk(node.get("children"))
+
+    walk(defn.get("layout"))
+    return labels
+
+
+def _humanize(field: str) -> str:
+    """"payment_method" → "Payment method" — never a raw identifier on screen."""
+    text = field.replace("_", " ").strip()
+    return text[:1].upper() + text[1:] if text else field
+
+
+def _edit_input(field: str, ftype: str, list_key: str, used_ids: set[str],
+                label: str | None = None) -> dict:
     """An input component bound to one row field via an item op, seeded with the
     row's current value (``$.field``) so the client shows what it's editing."""
     # Letter-leading id (the id grammar requires it); the counter keeps it
@@ -188,7 +222,7 @@ def _edit_input(field: str, ftype: str, list_key: str, used_ids: set[str]) -> di
         cid = f"edit_{field}_{n}"
         n += 1
     used_ids.add(cid)
-    common = {"id": cid, "label": field, "value": f"$.{field}"}
+    common = {"id": cid, "label": label or _humanize(field), "value": f"$.{field}"}
     if ftype == "bool":
         return {"type": "toggle", **common,
                 "action": {"op": "item_toggle", "key": list_key, "field": field}}
@@ -225,6 +259,7 @@ def ensure_editable_drill(defn: dict) -> dict:
     if not isinstance(screens, dict):
         screens = {}
     patched = False
+    labels = _entry_labels(out)
 
     nav_targets: dict[str, str] = {}          # screenId → list it drills into
     orphan_repeaters: list[tuple[dict, str]] = []  # repeaters with no valid drill
@@ -261,7 +296,7 @@ def ensure_editable_drill(defn: dict) -> dict:
         used_ids: set[str] = set()
         _collect_ids(layout, used_ids)
         added = [
-            _edit_input(f, t, list_key, used_ids)
+            _edit_input(f, t, list_key, used_ids, labels.get(f))
             for f, t in editable
             if f not in covered
         ]
@@ -282,7 +317,7 @@ def ensure_editable_drill(defn: dict) -> dict:
             sid = f"edit_{list_key}_{n}"
             n += 1
         used_ids: set[str] = set()
-        inputs = [_edit_input(f, t, list_key, used_ids) for f, t in editable]
+        inputs = [_edit_input(f, t, list_key, used_ids, labels.get(f)) for f, t in editable]
         screen: dict = {"layout": inputs}
         # Title from the first text field so the header names the row.
         title_field = next((f for f, t in editable if t == "string"), None)

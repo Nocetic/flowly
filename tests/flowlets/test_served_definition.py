@@ -64,3 +64,22 @@ def test_rpc_get_serves_the_shared_definition(store, monkeypatch):
     got = feature_rpc.flowlets_get({"id": f["id"]})["flowlet"]["definition"]
     assert got == served_definition(store.get(f["id"])["definition"], "Kalori Takibim")
     assert all(n.get("type") != "header" or n.get("text") != "Kalori  takibim" for n in got["layout"])
+
+
+def test_injected_edit_fields_reuse_the_entry_form_labels():
+    """A row's edit screen once labelled its fields "title", "amount" — raw
+    identifiers. They now reuse the form's own labels, else a readable name."""
+    defn = {
+        "catalog": 3, "name": "Spend",
+        "state": {"rows": {"type": "list", "item": {"title": "string", "amount": "number",
+                                                     "payment_method": "string"}}},
+        "layout": [
+            {"type": "form", "id": "add", "into": "rows", "fields": [
+                {"field": "title", "label": "Ne"}, {"field": "amount", "label": "Tutar"}]},
+            {"type": "repeater", "source": "rows", "item": {"type": "list_row", "title": "$.title"}},
+        ],
+    }
+    served = served_definition(defn)
+    screen = next(iter(served["screens"].values()))
+    labels = {n["value"]: n["label"] for n in screen["layout"] if "value" in n}
+    assert labels == {"$.title": "Ne", "$.amount": "Tutar", "$.payment_method": "Payment method"}
