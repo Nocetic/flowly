@@ -99,3 +99,34 @@ to physical devices were not exercised. These deterministic regressions verify
 the repaired paths, not every production configuration or every possible custom
 definition. A production p95 below three minutes still needs a live provider,
 relay and device measurement after the changes are integrated.
+
+## Second pass — round trips, custom screens, sync (same day)
+
+The first pass removed the skill-reading loop. Device screenshots still showed
+minutes of work for one screen, because most of the remaining time was model
+round trips that were not flowlet calls at all:
+
+- **Plan bookkeeping.** The plan tool asked for `in_progress` before and
+  `completed` after every step plus a final `complete` — about seven extra
+  model turns for a three-step plan. The manager now starts step 1, advances
+  on completion and completes the plan itself; ticks are batched
+  (`update(steps=[…])`) and sent in the same response as real work. Plan
+  calls are hidden from tool blocks on every client (the tray shows them).
+  The prompt says not to plan anything that fits in one or two tool calls.
+- **One tool call per response.** The ChatGPT-subscription provider sent
+  `parallel_tool_calls: false`, so even independent calls cost a turn each.
+  It is now on, with an automatic fallback if the backend rejects it.
+- **Custom screens.** The tool description carries the everyday contract,
+  unambiguous slips are repaired and reported, and validation reports every
+  independent problem at once, so a non-template screen lands in one call or
+  one retry.
+
+Correctness and UX fixed in the same pass: nullable form drafts (no literal
+"0"), real dates in date drafts, a single served-definition pipeline, title
+headers not repeated, gated localized summaries (`when`/`otherwise`,
+`locale`, template reminder presets), a per-flowlet `rev` on every values
+payload, idempotent taps (`opId`), atomic batches, the user's own time zone,
+shared interpreter conformance vectors, and a reference-parity test.
+
+Still unmeasured: end-to-end latency with a live provider, relay and device.
+That needs the integrated build on a phone.
