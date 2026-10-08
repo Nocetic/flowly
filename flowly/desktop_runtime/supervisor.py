@@ -131,6 +131,7 @@ def run(directory: Path, generation: str) -> None:
         write_state(runtime.manifest, state)
         processes: list[subprocess.Popen] = []
         input_service = None
+        captures = None
         observers = None
         stopping = False
         application = None
@@ -234,7 +235,7 @@ def run(directory: Path, generation: str) -> None:
                 spawn(["Xvnc", "-displayfd", str(write_fd), "-geometry", "1440x900", "-depth", "24",
                        "-auth", str(xauthority), "-nolisten", "tcp", "-rfbport", "-1",
                        "-rfbunixpath", str(rfb), "-rfbunixmode", "0600", "-SecurityTypes", "None",
-                       "-AlwaysShared", "-FrameRate", "30",
+                       "-AlwaysShared", "-FrameRate", "60",
                        # What the person in control or the agent copies may be a
                        # password: never push it to viewers. Paste keeps working
                        # (typed), and client cut text matches the gate's bound.
@@ -310,13 +311,17 @@ def run(directory: Path, generation: str) -> None:
             (sockets / "observers.sock").unlink(missing_ok=True)
             viewers = ViewerCredentials(StreamTickets(directory / "admission"))
             observers = ObserverRegistry(runtime.authority, generation, sockets, viewers=viewers)
+            from flowly.desktop_runtime.capture_service import CaptureService
+
+            (sockets / "captures.sock").unlink(missing_ok=True)
+            captures = CaptureService(generation, sockets, rfb, observers=observers, viewers=viewers)
             input_service = InputService(runtime.authority, generation, sockets, observers=observers, viewers=viewers,
-                                         rfb_socket=rfb, keymap=keymap)
+                                         rfb_socket=rfb, keymap=keymap, captures=captures)
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
-                         cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, error=None)
+                         cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, captureServiceVersion=1, error=None)
             write_state(runtime.manifest, state)
             while not stopping:
-                if (not input_service.is_alive or not observers.is_alive
+                if (not input_service.is_alive or not observers.is_alive or not captures.is_alive
                         or any(process_identity(child.pid) is None for child in processes)):
                     raise ScreenError("RUNTIME_FAILED")
                 current_port = browser_port()
@@ -341,6 +346,11 @@ def run(directory: Path, generation: str) -> None:
                     input_service.close()
                 except Exception:
                     state.update(phase="failed", error="INPUT_SERVICE_CLOSE_FAILED")
+            if captures is not None:
+                try:
+                    captures.close()
+                except Exception:
+                    state.update(phase="failed", error="CAPTURE_SERVICE_CLOSE_FAILED")
             if state["phase"] == "stopped" and state.get("cdpPort"):
                 try:
                     asyncio.run(close_browser(state["cdpPort"]))

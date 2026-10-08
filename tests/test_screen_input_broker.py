@@ -6,6 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -15,6 +16,16 @@ from flowly.desktop_runtime.input_broker import ScreenInputBroker
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="private Unix transport")
 KEY = struct.pack("!BBHI", 4, 1, 0, 0xFFE1)
 POINTER = struct.pack("!BBHH", 5, 1, 50, 60)
+
+
+@pytest.mark.parametrize("error", [ScreenError("VIEWER_MISMATCH"), OSError("state unavailable")])
+def test_rejected_admission_returns_unwritten_shared_capture(error):
+    authority, shared = Mock(), Mock()
+    authority.begin_input.side_effect = error
+    with pytest.raises(type(error)):
+        ScreenInputBroker(authority, "viewer", "generation", 2, Path("unused"), shared_connection=shared)
+    shared.release.assert_called_once_with()
+    shared.sendall.assert_not_called()
 
 
 def read(peer, size):

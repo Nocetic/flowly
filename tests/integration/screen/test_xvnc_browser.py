@@ -838,7 +838,7 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                         async with client.ws_connect(server.make_url(STREAM_PATH), headers=framed_headers) as ws:
                             stream = RfbSocket(ws, epoch=epoch)
                             await stream.handshake()
-                            await stream.send(struct.pack("!BBHi", 2, 0, 1, 0))
+                            await stream.send(struct.pack("!BBHii", 2, 0, 2, -239, 0))
                             yield stream
 
                     async def frame_barrier(stream):
@@ -847,8 +847,8 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                         assert update[0] == 0
                         for _ in range(int.from_bytes(update[2:4], "big")):
                             _, _, width, height, encoding = struct.unpack("!HHHHi", await stream.read(12))
-                            assert encoding == 0
-                            await stream.read(width * height * 4)
+                            assert encoding in (0, -239)
+                            await stream.read(width * height * 4 + (((width + 7) // 8) * height if encoding == -239 else 0))
 
                     def key(character):
                         return b"".join(struct.pack("!BBHI", 4, down, 0, ord(character)) for down in (1, 0))
@@ -903,6 +903,28 @@ async def test_authenticated_display_endpoint_streams_real_profile_pixels(tmp_pa
                                             y: Math.round(screenY + outerHeight - innerHeight + box.y + 10)};
                                 }""")
                                 async with input_stream(human["epoch"]) as active:
+                                    # The PUBLIC gateway path must use the same
+                                    # physical RFB client for capture and input:
+                                    # a local cursor shape, no delayed cursor
+                                    # embedded in the otherwise blank pixels.
+                                    await page.evaluate("addEventListener('mousemove', e => window.lastX = e.screenX)")
+                                    await active.send(struct.pack("!BBHH", 5, 0, 600, 500))
+                                    await page.wait_for_function("window.lastX === 600")
+                                    await active.send(struct.pack("!BBHHHH", 3, 0, 600, 500, 32, 32))
+                                    update = await active.read(4)
+                                    assert update[0] == 0
+                                    shapes, colors = [], set()
+                                    for _ in range(int.from_bytes(update[2:4], "big")):
+                                        _, _, width, height, encoding = struct.unpack("!HHHHi", await active.read(12))
+                                        pixels = await active.read(width * height * 4)
+                                        if encoding == -239:
+                                            shapes.append((width, height))
+                                            await active.read(((width + 7) // 8) * height)
+                                        else:
+                                            assert encoding == 0
+                                            colors.update(pixels[i:i+3] for i in range(0, len(pixels), 4))
+                                    assert any(width and height for width, height in shapes)
+                                    assert len(colors) == 1
                                     clicks = b"".join(struct.pack("!BBHH", 5, mask, point["x"], point["y"])
                                                        for mask in (0, 1, 0))
                                     await active.send(clicks)

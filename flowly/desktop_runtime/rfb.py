@@ -19,7 +19,10 @@ class RfbClientGate:
     # noVNC 1.7: QEMU keys, extended mouse, desktop resize and extended clipboard.
     _UNSUPPORTED = {value & 0xffffffff for value in (-258, -316, -308, 0xc0a1e5ce)}
 
-    def __init__(self):
+    def __init__(self, *, shared_capture: bool = False):
+        self.shared_capture = shared_capture
+        self.client_fence = False
+        self.server_fence = False
         self._buffer = bytearray()
         self._stage = 0
         self._failed = False
@@ -78,7 +81,28 @@ class RfbClientGate:
                 break
             message = bytes(self._buffer[:size])
             del self._buffer[:size]
-            if on_input is not None and kind == 2:
+            if self.shared_capture and kind == 0:
+                # The shared server framer supports the fixed true-colour format
+                # negotiated by Desktop. Never parse images using a stale bpp.
+                if (message[4:8] not in (b"\x20\x18\x00\x01", b"\x20\x18\x01\x01")
+                        or message[8:14] != b"\x00\xff" * 3
+                        or sorted(message[14:17]) != [0, 8, 16]):
+                    self._reject()
+                output.extend(message)
+            elif self.shared_capture and kind == 2:
+                from flowly.desktop_runtime.rfb_server import ENCODINGS
+
+                proposed = [int.from_bytes(message[index:index + 4], "big", signed=True)
+                            for index in range(4, len(message), 4)]
+                self.client_fence = -312 in proposed
+                self.server_fence = True
+                selected = [value for value in proposed if value in ENCODINGS
+                            or -256 <= value <= -247 or -32 <= value <= -23]
+                if -312 not in selected:
+                    selected.append(-312)  # input drain still needs server acknowledgement
+                output.extend(b"\x02\x00" + len(selected).to_bytes(2, "big") + b"".join(
+                    value.to_bytes(4, "big", signed=True) for value in selected))
+            elif on_input is not None and kind == 2:
                 encodings = [message[index:index + 4] for index in range(4, len(message), 4)
                              if int.from_bytes(message[index:index + 4], "big") not in self._UNSUPPORTED]
                 output.extend(b"\x02\x00" + len(encodings).to_bytes(2, "big") + b"".join(encodings))

@@ -1,7 +1,7 @@
 """Private RFB input connection with an acknowledged drain boundary.
 
-No framebuffer requests are made on this connection. Fence responses therefore
-cannot be confused with bytes inside compressed pixel updates. The caller must
+Legacy connections request no pixels; shared captures use a trusted server-side
+framer to distinguish fences from compressed pixels. The caller must
 keep the broker alive across viewer disconnects; abandoning it never gives
 control back. This is a synchronous worker API, not an event-loop callback.
 """
@@ -14,9 +14,13 @@ import struct
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError
 from flowly.desktop_runtime.desktop_keymap import EXTRA_SLOTS, needs_mapping
+
+if TYPE_CHECKING:
+    from flowly.desktop_runtime.shared_rfb import SharedRfbInput
 
 REQUEST = 1 << 31
 BLOCK_BEFORE = 1
@@ -44,7 +48,8 @@ def _chunks(value: bytes, limit: int):
 
 class ScreenInputBroker:
     def __init__(self, authority: ScreenAuthority, viewer: str, generation: str,
-                 epoch: int, socket_path: Path, *, timeout: float = 5, keymap=None):
+                 epoch: int, socket_path: Path, *, timeout: float = 5, keymap=None,
+                 shared_connection: SharedRfbInput | None = None):
         if not 0 < timeout <= 5:
             raise ScreenError("INVALID_PARAMS")
         self.authority = authority
@@ -57,14 +62,22 @@ class ScreenInputBroker:
         self._keys: set[int] = set()
         self._pointer: tuple[int, int] | None = None
         self._closed = False
-        self._socket: socket.socket | None = None
-        self._admission = authority.begin_input(viewer, generation, epoch)
+        self._socket: socket.socket | SharedRfbInput | None = None
         try:
-            self._socket = socket.socket(socket.AF_UNIX)
+            self._admission = authority.begin_input(viewer, generation, epoch)
+        except (OSError, ScreenError):
+            if shared_connection is not None:
+                shared_connection.release()
+            raise
+        try:
+            self._socket = shared_connection or socket.socket(socket.AF_UNIX)
             self._deadline = time.monotonic() + timeout
             self._remaining()
-            self._socket.connect(str(socket_path))
-            self._handshake()
+            if shared_connection is None:
+                self._socket.connect(str(socket_path))
+                self._handshake()
+            else:
+                self._drain()  # capture already negotiated the shared RFB connection
         except (OSError, ScreenError):
             self._abort()
             # Handshake sends metadata only; no input was admitted to Xvnc.
@@ -236,16 +249,20 @@ class ScreenInputBroker:
                 if reset:
                     self._write(reset)
                 self._drain()
-                self._abort()
+                self._abort(drained=True)
             except (OSError, ScreenError):
                 self._abort()
                 raise ScreenError("INPUT_OUTCOME_UNKNOWN") from None
             return self.authority.end_input(self._admission, release=release)
 
-    def _abort(self) -> None:
+    def _abort(self, *, drained: bool = False) -> None:
         self._closed = True
         if self._socket is not None:
-            self._socket.close()
+            if drained and hasattr(self._socket, "release"):
+                self._socket.release()
+            else:
+                self._socket.close()
+            self._socket = None
 
     def abandon(self) -> None:
         """Dispose after worker shutdown without claiming drain or handback."""

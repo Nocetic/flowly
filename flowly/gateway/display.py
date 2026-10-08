@@ -560,8 +560,18 @@ def register_display(app: web.Application, gateway) -> None:
                     raise ScreenError("VIEWER_REVOKED")
 
                 tasks.append(asyncio.create_task(revoked()))
-            socket = session.runtime.rfb_socket_for(state)
+            shared_capture = state.get("captureServiceVersion") == 1
+            socket = (session.runtime.socket_directory / "captures.sock" if shared_capture
+                      else session.runtime.rfb_socket_for(state))
             reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(socket, limit=128 * 1024), 5)
+            if shared_capture:
+                async with asyncio.timeout(3):
+                    hello = json.dumps({"viewer": viewer, "generation": generation, "stream": stream_id}).encode()
+                    writer.write(len(hello).to_bytes(4, "big") + hello)
+                    await writer.drain()
+                    size = int.from_bytes(await reader.readexactly(4), "big")
+                    if not 0 < size <= 4096 or json.loads(await reader.readexactly(size)) != {"ok": True}:
+                        raise ScreenError("CONTROL_UNAVAILABLE")
             writer.transport.set_write_buffer_limits(high=128 * 1024, low=32 * 1024)
             await ws.prepare(request)
             session.streams.add(ws)
@@ -607,7 +617,7 @@ def register_display(app: web.Application, gateway) -> None:
                     if inputs:
                         if input_epoch != epoch:
                             input_state = await asyncio.to_thread(
-                                input_client.request, "attach", viewer=viewer, generation=generation,
+                                input_client.request, "attach.capture" if shared_capture else "attach", viewer=viewer, generation=generation,
                                 epoch=epoch, stream=stream_id,
                             )
                             input_epoch = epoch

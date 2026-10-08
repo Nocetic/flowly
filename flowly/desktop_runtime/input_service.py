@@ -89,9 +89,10 @@ class InputService:
     """One runtime's input broker; no control release on client EOF/shutdown."""
 
     def __init__(self, authority: ScreenAuthority, generation: str, socket_directory: Path, *, observers=None, viewers=None,
-                 rfb_socket: Path | None = None, keymap=None):
+                 rfb_socket: Path | None = None, keymap=None, captures=None):
         self.authority, self.generation = authority, generation
         self.keymap = keymap
+        self.captures = captures
         self.observers = observers
         self.viewers = viewers
         self.path = socket_directory / "input.sock"
@@ -177,7 +178,7 @@ class InputService:
     def _dispatch(self, request: dict) -> dict:
         method = request.get("method")
         fields = {"method", "generation", "viewer", "epoch"}
-        extras = {"open": set(), "attach": {"stream"}, "send": {"handle", "sequence", "data"},
+        extras = {"open": set(), "attach": {"stream"}, "attach.capture": {"stream"}, "send": {"handle", "sequence", "data"},
                   "finish": {"handle", "release"}, "acquire": set(),
                   "control.acquire": {"operationId"}, "control.release": {"operationId"},
                   "control.reclaim": {"operationId"}, "viewer.close": {"operationId"}}
@@ -206,10 +207,10 @@ class InputService:
                     if error.code != "TAKEOVER_PENDING":
                         raise
             return state
-        if method in {"open", "attach"}:
+        if method in {"open", "attach", "attach.capture"}:
             if not self.authority.may_input(viewer, self.generation, epoch):
                 raise ScreenError("VIEWER_MISMATCH")
-            stream = _identity(request["stream"]) if method == "attach" else None
+            stream = _identity(request["stream"]) if method in {"attach", "attach.capture"} else None
             if stream is not None:
                 if self.observers is None or not self.observers.is_current(viewer, stream):
                     raise ScreenError("VIEWER_REVOKED")
@@ -218,8 +219,13 @@ class InputService:
                     # input source, while leaving human ownership unchanged.
                     self._finish(False)
             if self._broker is None:
+                shared = None
+                if method == "attach.capture":
+                    if self.captures is None:
+                        raise ScreenError("SCREEN_UPGRADE_REQUIRED")
+                    shared = self.captures.claim(viewer, stream)
                 self._broker = ScreenInputBroker(self.authority, viewer, self.generation, epoch, self.rfb,
-                                                 keymap=self.keymap)
+                                                 keymap=self.keymap, shared_connection=shared)
                 self._viewer, self._epoch = viewer, epoch
                 self._handle, self._sequence = secrets.token_urlsafe(32), 0
                 self._last_digest = None

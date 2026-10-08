@@ -78,6 +78,38 @@ No external model, account or Desktop UI is involved in this Linux test.
 The profile routing tests use real authenticated primary and named-gateway
 WebSockets with stubbed browser I/O. They verify closed grant validation,
 destination generation checks, and original run identity across the broker.
+
+### Pinned noVNC shared-capture regression
+
+`test_novnc_capture.py` runs the real pinned noVNC client against a disposable
+Core supervisor and authenticated `GatewayServer`. It needs the Desktop
+worktree's installed `@novnc/novnc` package mounted read-only at `/novnc`; the
+test skips when that package or the gateway-runner environment flags are absent.
+The local test bridge supplies the gateway authentication headers and epoch
+envelope, while capture and acknowledged input still go through the product
+gateway, supervisor capture service and `ScreenInputBroker`. It covers Tight
+decoding, local cursor shape with clean background pixels, live quality and
+compression renegotiation, reconnect, and releasing a held Shift key at
+handback. `test_cursor_transport.py` separately characterizes the real Xvnc
+cursor behavior for default and writer viewers. This fixture does not exercise
+Electron, relay, WAN or a deployed VPS.
+
+Build the gateway image above, set `screen_desktop` to the Desktop checkout that
+has the locked noVNC package installed, then run from the Core worktree:
+
+```sh
+screen_desktop=/path/to/flowly-desktop
+docker run --rm --init --security-opt seccomp=unconfined --shm-size=512m \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  --mount "type=bind,source=$screen_desktop/node_modules/@novnc/novnc,target=/novnc,readonly" \
+  -e PYTHONPATH=/workspace -e FLOWLY_SCREEN_LINUX_TEST=1 \
+  -e FLOWLY_SCREEN_GATEWAY_TEST=1 -e FLOWLY_HOME=/tmp/test-flowly-home \
+  flowly-screen-gateway-test:bookworm \
+  python -m pytest tests/integration/screen/test_novnc_capture.py \
+    tests/integration/screen/test_cursor_transport.py -q \
+    --basetemp=/tmp/screen-novnc-tests -p no:cacheprovider
+```
+
 The expanded Linux screen suite passed **291 tests** on the environment above.
 The authenticated direct display endpoint also delivers real Xvnc pixels for
 the default and named profiles. Its single-use tickets are bound to the host,
@@ -89,15 +121,23 @@ viewing-only, even when the viewer owns human control. Public direct lifecycle i
 now implemented as durable operations, described below; installation and recovery
 remain unfinished.
 
-The input broker now uses a separate private RFB connection that never requests
-pixels. It negotiates Fence support and requires a matching BlockBefore response
-after input and after releasing pressed keys/buttons. The real Linux test holds
-Shift and a mouse button in Chromium, then checks their release and preservation
-of the original run lease through handback. Synthetic tests delay/drop/change
-acknowledgements and verify that no agent action or reclaim can bypass drain.
-Clipboard data containing a fence-shaped payload cannot substitute for an ACK.
-The durable authority schema is now version two, with exact version-one upgrade
-and a persistent input reservation containing no keystrokes or clipboard text.
+Legacy input brokers use a separate private RFB connection that never requests
+pixels. Supervisors advertising `captureServiceVersion: 1` instead share one
+supervisor-owned physical RFB connection between viewer capture and the
+acknowledged input broker. Both paths negotiate Fence support and require a
+matching BlockBefore response after input and after releasing pressed
+keys/buttons. In shared mode the trusted server framer recognizes Fence ACKs
+only at RFB message boundaries, so bytes inside framebuffer or clipboard data
+cannot acknowledge input. The real Linux tests hold Shift and a mouse button in
+Chromium, then check their release, clean background pixels/local cursor shape,
+and preservation of the original run lease through handback. Synthetic tests
+delay/drop/change acknowledgements and verify that no agent action or reclaim
+can bypass drain. The durable authority schema remains version two, with exact
+version-one upgrade and a persistent input reservation containing no keystrokes
+or clipboard text. If authority admission fails before the broker writes any
+input, including a local state-file `OSError`, the unused shared-capture claim is
+returned. The parameterized rejection regression is
+`test_screen_input_broker.py::test_rejected_admission_returns_unwritten_shared_capture`.
 
 This proves the Xvnc input processing boundary, not arbitrary asynchronous website
 effects or completed production task resume. The supervisor now owns the broker

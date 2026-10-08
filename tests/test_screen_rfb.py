@@ -14,6 +14,37 @@ EXTENDED_KEY = b"\xff\0" + bytes(10)
 RESIZE = b"\xfb\0\x05\xa0\x03\x84\x01\0" + bytes(16)
 
 
+def test_shared_capture_limits_encodings_and_never_forwards_public_input():
+    proposed = [16, 7, 1, 0, -239, -223, -224, -307, -313, -258, -316, -308, -250, -26]
+    encodings = struct.pack("!BBH", 2, 0, len(proposed)) + b"".join(struct.pack("!i", e) for e in proposed)
+    for fragment in (1, 7, len(encodings)):
+        gate = RfbClientGate(shared_capture=True)
+        gate.feed(HELLO, lambda: False)
+        wire = encodings + KEY + POINTER + CLIPBOARD + REQUEST
+        result = b"".join(gate.feed(wire[i:i+fragment], lambda: False) for i in range(0, len(wire), fragment))
+        selected = [7, 1, 0, -239, -223, -224, -307, -313, -250, -26, -312]
+        expected = struct.pack("!BBH", 2, 0, len(selected)) + b"".join(struct.pack("!i", e) for e in selected)
+        assert result == expected + REQUEST
+        assert gate.server_fence and not gate.client_fence
+        assert gate.feed(struct.pack("!BBHi", 2, 0, 1, -312), lambda: False) == struct.pack("!BBHi", 2, 0, 1, -312)
+        assert gate.client_fence
+
+
+@pytest.mark.parametrize("bpp,depth,truecolor,red,green,blue", [
+    (32, 24, 1, 16, 8, 0), (32, 24, 1, 0, 8, 16),
+    (16, 16, 1, 11, 5, 0), (32, 24, 0, 16, 8, 0), (32, 24, 1, 16, 16, 0),
+])
+def test_shared_capture_fixed_pixel_format(bpp, depth, truecolor, red, green, blue):
+    gate = RfbClientGate(shared_capture=True)
+    gate.feed(HELLO, lambda: False)
+    message = bytes(4) + struct.pack("!BBBBHHHBBB3x", bpp, depth, 0, truecolor, 255, 255, 255, red, green, blue)
+    if bpp == 32 and truecolor and sorted((red, green, blue)) == [0, 8, 16]:
+        assert gate.feed(message, lambda: False) == message
+    else:
+        with pytest.raises(ScreenError, match="INVALID_RFB_STREAM"):
+            gate.feed(message, lambda: False)
+
+
 @pytest.mark.parametrize("split", range(len(HELLO) + 1))
 def test_fragmented_handshake_forces_shared_mode(split):
     gate = RfbClientGate()
