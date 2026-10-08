@@ -132,6 +132,55 @@ def _resolve_field_value(tpl: Any, field_type: str, ns: dict, tz: tzinfo | None)
     return val
 
 
+_FILL_FIRST = {
+    "en": "Fill in first: {}",
+    "tr": "Önce şunları doldur: {}",
+    "es": "Rellena primero: {}",
+}
+
+
+def _input_label(definition: dict, state_key: str) -> str | None:
+    """The label of the input that writes `state_key`, if the screen has one."""
+    stack = list(definition.get("layout") or [])
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        act = node.get("action") or {}
+        if (act.get("op") == "set" and act.get("key") == state_key
+                and isinstance(node.get("label"), str) and node["label"].strip()):
+            return node["label"].strip()
+        stack.extend(node.get("children") or [])
+    return None
+
+
+def _inferred_require(definition: dict, fields: dict, fields_tpl: dict) -> list[dict]:
+    """A hand-written add (`item_add` + `fields` read from inputs) gets the
+    form's rule: the row's numbers and its first text field must be typed.
+    Only fields filled from a single state key count — a literal or a mixed
+    template always carries something."""
+    out: list[dict] = []
+    first_text = True
+    for f, tpl in fields_tpl.items():
+        ftype = fields.get(f)
+        m = _LONE_TOKEN_RE.match(tpl.strip()) if isinstance(tpl, str) else None
+        if m is None or m.group(1) == "value" or ftype not in ("number", "string"):
+            if ftype == "string":
+                first_text = False
+            continue
+        if ftype == "number" or first_text:
+            out.append({"field": f, "label": _input_label(definition, m.group(1)) or f})
+        if ftype == "string":
+            first_text = False
+    return out
+
+
+def _fill_first(labels: list[str], locale: Any) -> str:
+    """"Önce şunları doldur: Ne, Tutar" — the message a person reads."""
+    return _FILL_FIRST.get(locale if isinstance(locale, str) else "en", _FILL_FIRST["en"]).format(
+        ", ".join(str(label) for label in labels))
+
+
 def _item_envelope(passed_value: Any) -> tuple[str, Any]:
     """Row-scoped ops arrive as ``{"itemId": ..., "value": ...}`` — the repeater
     on the client attaches the tapped row's id."""
@@ -516,6 +565,16 @@ async def _apply_op(
             )
             if target is not None:
                 new[target] = _coerce_field(key, target, fields[target], pv)
+        # A form names what must be filled; an empty one adds nothing and
+        # says which fields, in the screen's language (the batch rolls back,
+        # so what was typed stays in the form).
+        require = action.get("require")
+        if require is None and isinstance(fields_tpl, dict):
+            require = _inferred_require(definition, fields, fields_tpl)
+        missing = [r.get("label") or r.get("field") for r in require or []
+                   if isinstance(r, dict) and new.get(r.get("field")) in ("", None)]
+        if missing:
+            raise FlowletActionError("REQUIRED", _fill_first(missing, definition.get("locale")))
         # Drop a fully-empty add (an empty quick-add input) instead of storing
         # a blank row.
         if not any(v not in ("", None) for v in new.values()):

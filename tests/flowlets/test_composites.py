@@ -216,7 +216,10 @@ def test_form_expands_to_card_with_controls_and_submit():
     ops = submit["action"]["ops"]
     assert ops[0] == {"op": "item_add", "key": "expenses", "fields": {
         "title": "{addExpense__title}", "amount": "{addExpense__amount}",
-        "category": "{addExpense__category}", "date": "{addExpense__date}"}}
+        "category": "{addExpense__category}", "date": "{addExpense__date}"},
+        # the row's name and its number must be typed; choices and dates can't be empty
+        "require": [{"field": "title", "label": ops[0]["require"][0]["label"]},
+                    {"field": "amount", "label": ops[0]["require"][1]["label"]}]}
     assert {o["key"] for o in ops[1:]} == {
         "addExpense__title", "addExpense__amount",
         "addExpense__category", "addExpense__date"}

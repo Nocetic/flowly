@@ -164,6 +164,8 @@ def _expand_form(node: dict, injected: dict, item_schema: dict) -> dict:
 
     add_fields: dict[str, str] = {}
     resets: list[dict] = []
+    required: list[dict] = []
+    first_text = True
     for fspec in fields:
         field = fspec["field"]
         ftype = item_schema.get(field, "string")
@@ -185,6 +187,18 @@ def _expand_form(node: dict, injected: dict, item_schema: dict) -> dict:
                 injected["state"][draft]["format"] = "date"
         children.append(_form_control(form_id, fspec, ftype))
         add_fields[field] = "{" + draft + "}"
+        # What a person must type before the row is worth saving: every
+        # number and the first free-text field (the row's name). Fields with
+        # options, dates and switches always carry a value; an author's
+        # `required` decides either way.
+        free_text = ftype == "string" and not isinstance(fspec.get("options"), list)
+        needed = fspec.get("required")
+        if needed is None:
+            needed = ftype == "number" or (free_text and first_text)
+        if free_text:
+            first_text = False
+        if needed:
+            required.append({"field": field, "label": str(fspec.get("label") or field)})
         resets.append({"op": "reset", "key": draft})
 
     submit = node.get("submit") or {}
@@ -192,7 +206,8 @@ def _expand_form(node: dict, injected: dict, item_schema: dict) -> dict:
         "type": "button", "id": f"{form_id}_submit",
         "text": submit.get("label") or "Add", "style": "primary",
         "action": {"op": "batch", "ops": [
-            {"op": "item_add", "key": into, "fields": add_fields},
+            {"op": "item_add", "key": into, "fields": add_fields,
+             **({"require": required} if required else {})},
             *resets,
         ]},
     })
