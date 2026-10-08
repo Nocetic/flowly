@@ -4,14 +4,18 @@ Hand-written (not jsonschema) so the error messages are precise enough for the
 agent to *fix* a bad definition on the next turn — e.g.
 ``slider 'goalSlider': min (4000) must be < max (1000)`` rather than a generic
 schema path. :func:`validate_definition` raises :class:`FlowletValidationError`
-with a single human-readable message on the first problem it finds.
+listing EVERY independent problem it finds (one per line, capped), so a draft
+is fixed in one retry instead of one paid round trip per mistake. A problem
+inside one section or component never hides problems in its siblings.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator
 
 from flowly.flowlets import catalog
 
@@ -21,7 +25,35 @@ _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")  # 24h "HH:MM"
 
 
 class FlowletValidationError(ValueError):
-    """A definition failed validation. ``str(exc)`` is LLM-facing guidance."""
+    """A definition failed validation. ``str(exc)`` is LLM-facing guidance;
+    ``errors`` lists each independent problem."""
+
+    def __init__(self, msg: str, errors: list[str] | None = None):
+        super().__init__(msg)
+        self.errors = errors or [msg]
+
+
+#: Bound on reported problems — enough to fix a draft in one pass without
+#: flooding the model's context with cascades of one root mistake.
+MAX_REPORTED_ERRORS = 12
+
+_SINK: ContextVar[list[str] | None] = ContextVar("flowlet_validation_sink", default=None)
+
+
+@contextmanager
+def _unit() -> Iterator[None]:
+    """Validate one independent unit: while collecting, its failure is recorded
+    and validation continues with the next unit; otherwise it propagates."""
+    sink = _SINK.get()
+    if sink is None:
+        yield
+        return
+    try:
+        yield
+    except FlowletValidationError as exc:
+        for msg in exc.errors:
+            if msg not in sink and len(sink) < MAX_REPORTED_ERRORS:
+                sink.append(msg)
 
 
 def _err(msg: str) -> "FlowletValidationError":
@@ -50,7 +82,23 @@ def _expr_key_refs(expr: str) -> set[str]:
 
 def validate_definition(defn: Any) -> dict:
     """Validate a flowlet definition. Returns the (unchanged) definition dict on
-    success; raises :class:`FlowletValidationError` with actionable guidance.
+    success; raises :class:`FlowletValidationError` naming every independent
+    problem (see module docstring).
+    """
+    sink: list[str] = []
+    token = _SINK.set(sink)
+    try:
+        with _unit():
+            _validate_definition(defn)
+    finally:
+        _SINK.reset(token)
+    if sink:
+        raise FlowletValidationError("\n".join(sink), list(sink))
+    return defn
+
+
+def _validate_definition(defn: Any) -> dict:
+    """The checks behind :func:`validate_definition`.
 
     Collects the full namespace of scalar keys (state + computed + component
     ids) and series keys, then checks every `bind`, `action`, and `data`
@@ -70,99 +118,116 @@ def validate_definition(defn: Any) -> dict:
             "(~64 KB). Split it into more than one flowlet or trim the layout."
         )
 
-    # ── catalog version ───────────────────────────────────────────────────────
-    catalog_ver = defn.get("catalog")
-    if not isinstance(catalog_ver, int) or isinstance(catalog_ver, bool):
-        raise _err("top-level `catalog` must be an integer (use catalog: 1)")
-    if catalog_ver > catalog.CATALOG_VERSION:
-        raise _err(
-            f"catalog {catalog_ver} is newer than this bot supports "
-            f"(max {catalog.CATALOG_VERSION}). Use catalog: {catalog.CATALOG_VERSION}."
-        )
-
-    # ── name / icon / accent ──────────────────────────────────────────────────
-    name = defn.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise _err("`name` is required and must be a non-empty string")
-    if len(name) > catalog.MAX_NAME_LEN:
-        raise _err(f"`name` must be ≤ {catalog.MAX_NAME_LEN} characters")
-
-    icon = defn.get("icon")
-    if icon is not None and not isinstance(icon, str):
-        raise _err("`icon` must be a string icon name")
-
-    accent = defn.get("accent")
-    if accent is not None:
-        if not isinstance(accent, str) or not _HEX_RE.match(accent):
-            raise _err("`accent` must be a hex color like #00A6C8 or #0AC")
+    # ── catalog version / name / icon / accent — independent of each other ────
+    with _unit():
+        catalog_ver = defn.get("catalog")
+        if not isinstance(catalog_ver, int) or isinstance(catalog_ver, bool):
+            raise _err(
+                f"top-level `catalog` must be an integer (use catalog: {catalog.CATALOG_VERSION})"
+            )
+        if catalog_ver > catalog.CATALOG_VERSION:
+            raise _err(
+                f"catalog {catalog_ver} is newer than this bot supports "
+                f"(max {catalog.CATALOG_VERSION}). Use catalog: {catalog.CATALOG_VERSION}."
+            )
+    with _unit():
+        name = defn.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise _err("`name` is required and must be a non-empty string")
+        if len(name) > catalog.MAX_NAME_LEN:
+            raise _err(f"`name` must be ≤ {catalog.MAX_NAME_LEN} characters")
+    with _unit():
+        locale = defn.get("locale")
+        if locale is not None and locale not in ("en", "tr", "es"):
+            raise _err('`locale` must be "en", "tr" or "es" (formats numbers in reminders)')
+    with _unit():
+        icon = defn.get("icon")
+        if icon is not None and not isinstance(icon, str):
+            raise _err("`icon` must be a string icon name")
+    with _unit():
+        accent = defn.get("accent")
+        if accent is not None:
+            if not isinstance(accent, str) or not _HEX_RE.match(accent):
+                raise _err("`accent` must be a hex color like #00A6C8 or #0AC")
 
     # ── state schema ──────────────────────────────────────────────────────────
+    # A key whose spec is broken is still registered (by its declared type when
+    # readable) so references to it don't cascade into misleading errors.
     state_defs = defn.get("state", {})
     if not isinstance(state_defs, dict):
-        raise _err("`state` must be an object of {key: {type, default, ...}}")
-    if len(state_defs) > catalog.MAX_STATE_KEYS:
-        raise _err(f"too many state keys (max {catalog.MAX_STATE_KEYS})")
+        with _unit():
+            raise _err("`state` must be an object of {key: {type, default, ...}}")
+        state_defs = {}
+    with _unit():
+        if len(state_defs) > catalog.MAX_STATE_KEYS:
+            raise _err(f"too many state keys (max {catalog.MAX_STATE_KEYS})")
     scalar_keys: set[str] = set()
     timer_keys: set[str] = set()     # state keys of type "timer"
     list_keys: dict[str, dict] = {}  # list state key → {field: type}
     source_keys: set[str] = set()    # state keys a `source` owns (user-read-only)
     for key, spec in state_defs.items():
-        if not _KEY_RE.match(key):
-            raise _err(
-                f"state key '{key}' is invalid; keys must start with a letter "
-                "and contain only letters, digits, and underscores"
-            )
-        _validate_state_spec(key, spec)
-        if isinstance(spec, dict) and spec.get("source") is not None:
-            if not isinstance(spec["source"], bool):
-                raise _err(f"state '{key}': `source` must be true or false")
-            if spec["source"]:
-                source_keys.add(key)
         if isinstance(spec, dict) and spec.get("type") == "list":
             # A list resolves to an item array, not a scalar — it may not be
             # referenced by exprs/binds, only by a repeater / item ops.
-            list_keys[key] = dict(spec.get("item") or {})
+            item = spec.get("item")
+            list_keys[key] = dict(item) if isinstance(item, dict) else {}
         else:
             scalar_keys.add(key)
             if isinstance(spec, dict) and spec.get("type") == "timer":
                 timer_keys.add(key)
+        with _unit():
+            if not _KEY_RE.match(key):
+                raise _err(
+                    f"state key '{key}' is invalid; keys must start with a letter "
+                    "and contain only letters, digits, and underscores"
+                )
+            _validate_state_spec(key, spec)
+            if isinstance(spec, dict) and spec.get("source") is not None:
+                if not isinstance(spec["source"], bool):
+                    raise _err(f"state '{key}': `source` must be true or false")
+                if spec["source"]:
+                    source_keys.add(key)
 
     # ── series schema ─────────────────────────────────────────────────────────
     series_defs = defn.get("series", {})
     if not isinstance(series_defs, dict):
-        raise _err("`series` must be an object of {name: {unit?}}")
-    if len(series_defs) > catalog.MAX_SERIES:
-        raise _err(f"too many series (max {catalog.MAX_SERIES})")
+        with _unit():
+            raise _err("`series` must be an object of {name: {unit?}}")
+        series_defs = {}
+    with _unit():
+        if len(series_defs) > catalog.MAX_SERIES:
+            raise _err(f"too many series (max {catalog.MAX_SERIES})")
     series_keys: set[str] = set()
     for key, spec in series_defs.items():
-        if not _KEY_RE.match(key):
-            raise _err(f"series key '{key}' is invalid (letters/digits/underscore)")
-        if spec is not None and not isinstance(spec, dict):
-            raise _err(f"series '{key}' must be an object (e.g. {{\"unit\": \"ml\"}})")
         series_keys.add(key)
+        with _unit():
+            if not _KEY_RE.match(key):
+                raise _err(f"series key '{key}' is invalid (letters/digits/underscore)")
+            if spec is not None and not isinstance(spec, dict):
+                raise _err(f"series '{key}' must be an object (e.g. {{\"unit\": \"ml\"}})")
 
     # ── computed schema ───────────────────────────────────────────────────────
     computed_defs = defn.get("computed", {})
     if not isinstance(computed_defs, dict):
-        raise _err("`computed` must be an object of {key: {series|expr, ...}}")
-    if len(computed_defs) > catalog.MAX_COMPUTED:
-        raise _err(f"too many computed keys (max {catalog.MAX_COMPUTED})")
+        with _unit():
+            raise _err("`computed` must be an object of {key: {series|expr, ...}}")
+        computed_defs = {}
+    with _unit():
+        if len(computed_defs) > catalog.MAX_COMPUTED:
+            raise _err(f"too many computed keys (max {catalog.MAX_COMPUTED})")
     computed_keys: set[str] = set()
     for key, spec in computed_defs.items():
-        if not _KEY_RE.match(key):
-            raise _err(f"computed key '{key}' is invalid (letters/digits/underscore)")
-        if key in scalar_keys or key in list_keys:
-            raise _err(f"computed key '{key}' collides with a state key of the same name")
-        _validate_computed_spec(key, spec, series_keys, list_keys)
         computed_keys.add(key)
+        with _unit():
+            if not _KEY_RE.match(key):
+                raise _err(f"computed key '{key}' is invalid (letters/digits/underscore)")
+            if key in scalar_keys or key in list_keys:
+                raise _err(f"computed key '{key}' collides with a state key of the same name")
+            _validate_computed_spec(key, spec, series_keys, list_keys)
 
     scalar_keys |= computed_keys  # both resolve to scalars in `values`
 
     # ── layout tree ───────────────────────────────────────────────────────────
-    layout = defn.get("layout")
-    if not isinstance(layout, list) or not layout:
-        raise _err("`layout` must be a non-empty array of components")
-
     ctx = _Ctx(
         scalar_keys=scalar_keys,
         series_keys=series_keys,
@@ -172,55 +237,70 @@ def validate_definition(defn: Any) -> dict:
     )
     ctx.source_keys = source_keys
     ctx.timer_keys = timer_keys
-    ctx.screens = _validate_screens_structure(defn.get("screens"))
+    with _unit():
+        ctx.screens = _validate_screens_structure(defn.get("screens"))
+    layout = defn.get("layout")
+    if not isinstance(layout, list) or not layout:
+        with _unit():
+            raise _err("`layout` must be a non-empty array of components")
+        layout = []
     for node in layout:
-        _validate_node(node, ctx, depth=1)
+        with _unit():
+            _validate_node(node, ctx, depth=1)
 
-    if ctx.count > catalog.MAX_COMPONENTS:
-        raise _err(f"too many components ({ctx.count}); the limit is {catalog.MAX_COMPONENTS}")
+    with _unit():
+        if ctx.count > catalog.MAX_COMPONENTS:
+            raise _err(f"too many components ({ctx.count}); the limit is {catalog.MAX_COMPONENTS}")
 
     # search targets are checked after the walk (a `search` may precede its
     # target repeater/table in reading order).
     for cid, target, fields in ctx.searches:
-        if target not in ctx.filterable:
-            raise _err(
-                f"search (id={cid}) `target` must name a repeater or data-bound table id; "
-                f"got {target!r}"
-            )
-        if fields is not None:
-            list_fields = ctx.list_keys.get(ctx.filterable[target], {})
-            for f in fields:
-                if f not in list_fields:
-                    raise _err(
-                        f"search (id={cid}) `fields` entry '{f}' is not a field of the "
-                        f"target's list (declared: {sorted(list_fields)})"
-                    )
+        with _unit():
+            if target not in ctx.filterable:
+                raise _err(
+                    f"search (id={cid}) `target` must name a repeater or data-bound table id; "
+                    f"got {target!r}"
+                )
+            if fields is not None:
+                list_fields = ctx.list_keys.get(ctx.filterable[target], {})
+                for f in fields:
+                    if f not in list_fields:
+                        raise _err(
+                            f"search (id={cid}) `fields` entry '{f}' is not a field of the "
+                            f"target's list (declared: {sorted(list_fields)})"
+                        )
 
     # ── drill-down screens — validated against their navigator's item scope ────
     for sid in ctx.screens:
-        if sid not in ctx.navigations:
-            raise _err(
-                f"screen '{sid}' is never navigated to — add `navigate: \"{sid}\"` on a "
-                "repeater or data-bound table"
-            )
+        with _unit():
+            if sid not in ctx.navigations:
+                raise _err(
+                    f"screen '{sid}' is never navigated to — add `navigate: \"{sid}\"` on a "
+                    "repeater or data-bound table"
+                )
     for sid, list_key in ctx.navigations.items():
-        _validate_screen_layout(sid, ctx.screens[sid], ctx, list_key)
+        with _unit():
+            _validate_screen_layout(sid, ctx.screens[sid], ctx, list_key)
 
     # ── watches (reactive rules; evaluated LLM-free — see watches.py) ─────────
     watches = defn.get("watches")
     if watches is not None:
-        _validate_watches(watches, scalar_keys)
+        with _unit():
+            _validate_watches(watches, scalar_keys)
 
     # ── sources (live/external data bindings — see sources.py) ────────────────
     sources = defn.get("sources")
     if sources is not None:
-        _validate_sources(sources, state_defs, source_keys)
+        with _unit():
+            _validate_sources(sources, state_defs, source_keys)
     # Every source-owned key must actually be written by a source (else it's a
     # dead read-only key the user can never fill).
-    written = {s.get("into") for s in (sources or {}).values() if isinstance(s, dict)}
+    written = {s.get("into") for s in (sources or {}).values() if isinstance(s, dict)} \
+        if isinstance(sources, dict) else set()
     for k in source_keys:
-        if k not in written:
-            raise _err(f"state '{k}' is marked `source:true` but no source writes it")
+        with _unit():
+            if k not in written:
+                raise _err(f"state '{k}' is marked `source:true` but no source writes it")
 
     return defn
 
@@ -246,6 +326,8 @@ def _validate_state_spec(key: str, spec: Any) -> None:
             raise _err(f"state '{key}': max must be a number")
         if mn is not None and mx is not None and mn >= mx:
             raise _err(f"state '{key}': min ({mn}) must be < max ({mx})")
+        if spec.get("nullable") is not None and not isinstance(spec["nullable"], bool):
+            raise _err(f"state '{key}': nullable must be true or false")
     elif stype == "bool":
         if default is not None and not isinstance(default, bool):
             raise _err(f"state '{key}': default must be true or false")
@@ -255,6 +337,8 @@ def _validate_state_spec(key: str, spec: Any) -> None:
         ml = spec.get("maxLength")
         if ml is not None and (not isinstance(ml, int) or isinstance(ml, bool) or ml <= 0):
             raise _err(f"state '{key}': maxLength must be a positive integer")
+        if spec.get("format") not in (None, "date"):
+            raise _err(f"state '{key}': format may only be \"date\"")
     elif stype == "timer":
         # Structured, managed state ({running, since_ms, accum_s}); the agent
         # doesn't set a default — a timer_toggle action drives it.
@@ -491,26 +575,27 @@ def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
     # addressable; must be unique and not collide with scalar keys.
     cid = node.get("id")
     has_action = bool(node.get("action"))
-    if cid is not None:
-        if not isinstance(cid, str) or not _KEY_RE.match(cid):
-            raise _err(
-                f"component id '{cid}' is invalid; ids must start with a letter "
-                "and contain only letters, digits, and underscores"
-            )
-        if cid in ctx.component_ids:
-            raise _err(f"duplicate component id '{cid}'")
-        # Only chart/sparkline/heatmap ids are written into the `values` map
-        # (as their resolved series), so only those may not collide with a
-        # scalar key. An `input` whose id equals the state key it writes is
-        # both natural and safe.
-        if ctype in catalog.SERIES_COMPONENTS and cid in ctx.scalar_keys:
-            raise _err(
-                f"chart component id '{cid}' collides with a state/computed key; "
-                "give the chart a distinct id"
-            )
-        ctx.component_ids.add(cid)
-    if has_action and cid is None:
-        raise _err(f"{ctype} carries an action, so it needs a unique `id`")
+    with _unit():
+        if cid is not None:
+            if not isinstance(cid, str) or not _KEY_RE.match(cid):
+                raise _err(
+                    f"component id '{cid}' is invalid; ids must start with a letter "
+                    "and contain only letters, digits, and underscores"
+                )
+            if cid in ctx.component_ids:
+                raise _err(f"duplicate component id '{cid}'")
+            # Only chart/sparkline/heatmap ids are written into the `values` map
+            # (as their resolved series), so only those may not collide with a
+            # scalar key. An `input` whose id equals the state key it writes is
+            # both natural and safe.
+            ctx.component_ids.add(cid)
+            if ctype in catalog.SERIES_COMPONENTS and cid in ctx.scalar_keys:
+                raise _err(
+                    f"chart component id '{cid}' collides with a state/computed key; "
+                    "give the chart a distinct id"
+                )
+        if has_action and cid is None:
+            raise _err(f"{ctype} carries an action, so it needs a unique `id`")
 
     # Optional conditional visibility — any component may carry
     # `visibleWhen: "<expr>"`, evaluated client-side against live values (a
@@ -519,55 +604,63 @@ def _validate_node(node: Any, ctx: _Ctx, depth: int) -> None:
     # caught at author time instead of silently always-showing.
     vw = node.get("visibleWhen")
     if vw is not None:
-        if not isinstance(vw, str) or not vw.strip():
-            raise _err(f"{ctype} (id={cid}): `visibleWhen` must be a non-empty expression string")
-        from flowly.flowlets.queries import validate_expr
-        try:
-            validate_expr(vw)
-        except ValueError as exc:
-            raise _err(f"{ctype} (id={cid}): visibleWhen {exc}")
-        for _name in _expr_key_refs(vw):
-            if _name not in ctx.scalar_keys:
-                raise _err(
-                    f"{ctype} (id={cid}): visibleWhen references unknown key '{_name}' — "
-                    "it must be a declared state or computed key"
-                )
+        with _unit():
+            if not isinstance(vw, str) or not vw.strip():
+                raise _err(f"{ctype} (id={cid}): `visibleWhen` must be a non-empty expression string")
+            from flowly.flowlets.queries import validate_expr
+            try:
+                validate_expr(vw)
+            except ValueError as exc:
+                raise _err(f"{ctype} (id={cid}): visibleWhen {exc}")
+            for _name in _expr_key_refs(vw):
+                if _name not in ctx.scalar_keys:
+                    raise _err(
+                        f"{ctype} (id={cid}): visibleWhen references unknown key '{_name}' — "
+                        "it must be a declared state or computed key"
+                    )
 
-    # required props
+    # required props — all missing ones are reported together
     for prop in spec.get("required", []):
-        if prop not in node:
-            raise _err(f"{ctype} (id={cid}) is missing required prop `{prop}`")
+        with _unit():
+            if prop not in node:
+                raise _err(f"{ctype} (id={cid}) is missing required prop `{prop}`")
 
     # label length guard (any string prop named text/label/title)
     for prop in ("text", "label", "title"):
-        v = node.get(prop)
-        if isinstance(v, str) and len(v) > catalog.MAX_LABEL_LEN:
-            raise _err(f"{ctype}: `{prop}` exceeds {catalog.MAX_LABEL_LEN} characters")
+        with _unit():
+            v = node.get(prop)
+            if isinstance(v, str) and len(v) > catalog.MAX_LABEL_LEN:
+                raise _err(f"{ctype}: `{prop}` exceeds {catalog.MAX_LABEL_LEN} characters")
 
     # scalar bindings — a binds prop is either a numeric literal or a known key
     for prop in spec.get("binds", []):
         if prop in node:
-            _validate_scalar_ref(ctype, cid, prop, node[prop], ctx)
+            with _unit():
+                _validate_scalar_ref(ctype, cid, prop, node[prop], ctx)
 
     # action
     if has_action:
-        _validate_action(ctype, cid, node["action"], ctx)
+        with _unit():
+            _validate_action(ctype, cid, node["action"], ctx)
 
     # series data (chart / sparkline / heatmap)
     if ctype in catalog.SERIES_COMPONENTS:
-        _validate_data(ctype, cid, node.get("data"), ctx, node.get("kind"))
+        with _unit():
+            _validate_data(ctype, cid, node.get("data"), ctx, node.get("kind"))
 
     # component-specific extra checks
-    _validate_component_extras(ctype, cid, node, ctx, depth)
+    with _unit():
+        _validate_component_extras(ctype, cid, node, ctx, depth)
 
-    # children
+    # children — each validated independently
     children = node.get("children")
     if spec.get("container"):
         if children is not None:
             if not isinstance(children, list):
                 raise _err(f"{ctype} `children` must be an array")
             for child in children:
-                _validate_node(child, ctx, depth + 1)
+                with _unit():
+                    _validate_node(child, ctx, depth + 1)
     elif children:
         raise _err(f"{ctype} cannot have children")
 
@@ -1414,16 +1507,7 @@ def _validate_watch(i: int, w: Any, scalar_keys: set[str], seen: set[str]) -> No
     notify = w.get("notify")
     if not isinstance(notify, dict):
         raise _err(f"{where}: a `notify` object with a `title` is required")
-    title = notify.get("title")
-    if not isinstance(title, str) or not title.strip():
-        raise _err(f"{where}: notify.title must be a non-empty string")
-    if len(title) > catalog.MAX_NAME_LEN:
-        raise _err(f"{where}: notify.title must be ≤ {catalog.MAX_NAME_LEN} characters")
-    body = notify.get("body")
-    if body is not None and not isinstance(body, str):
-        raise _err(f"{where}: notify.body must be a string")
-    if isinstance(body, str) and len(body) > catalog.MAX_LABEL_LEN:
-        raise _err(f"{where}: notify.body must be ≤ {catalog.MAX_LABEL_LEN} characters")
+    _validate_notify(where, "notify", notify)
     # compose: the agent writes the notification text with live context when
     # the watch fires (title/body above stay as the deterministic fallback).
     if "compose" in notify and not isinstance(notify["compose"], bool):
@@ -1431,7 +1515,7 @@ def _validate_watch(i: int, w: Any, scalar_keys: set[str], seen: set[str]) -> No
 
     # trigger-specific fields
     if trigger == "schedule":
-        _validate_watch_schedule(where, w)
+        _validate_watch_schedule(where, w, scalar_keys)
     elif trigger in ("condition", "goal"):
         _validate_watch_expr(where, w, scalar_keys)
     elif trigger == "stale":
@@ -1471,7 +1555,32 @@ def _validate_watch(i: int, w: Any, scalar_keys: set[str], seen: set[str]) -> No
             raise _err(f"{where}: also.message must be ≤ {catalog.MAX_WATCH_MESSAGE_LEN} characters")
 
 
-def _validate_watch_schedule(where: str, w: dict) -> None:
+def _validate_notify(where: str, label: str, notify: dict) -> None:
+    title = notify.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise _err(f"{where}: {label}.title must be a non-empty string")
+    if len(title) > catalog.MAX_NAME_LEN:
+        raise _err(f"{where}: {label}.title must be ≤ {catalog.MAX_NAME_LEN} characters")
+    body = notify.get("body")
+    if body is not None and not isinstance(body, str):
+        raise _err(f"{where}: {label}.body must be a string")
+    if isinstance(body, str) and len(body) > catalog.MAX_LABEL_LEN:
+        raise _err(f"{where}: {label}.body must be ≤ {catalog.MAX_LABEL_LEN} characters")
+
+
+def _validate_watch_schedule(where: str, w: dict, scalar_keys: set[str] | None = None) -> None:
+    # Optional gate checked when the time comes: `when` true → `notify`;
+    # false → `otherwise` if given, else the day's reminder is skipped quietly
+    # (a summary of nothing is noise).
+    if w.get("when") is not None:
+        _validate_watch_expr(where, {"when": w["when"]}, scalar_keys or set())
+    otherwise = w.get("otherwise")
+    if otherwise is not None:
+        if w.get("when") is None:
+            raise _err(f"{where}: `otherwise` needs a `when` to be the alternative to")
+        if not isinstance(otherwise, dict):
+            raise _err(f"{where}: `otherwise` must be a notify object {{title, body}}")
+        _validate_notify(where, "otherwise", otherwise)
     at = w.get("at")
     every = w.get("everyMinutes")
     if at is None and every is None:

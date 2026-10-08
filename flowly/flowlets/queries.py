@@ -262,26 +262,43 @@ def _eval_node(node: ast.AST, ns: dict[str, Any]) -> float:
 _TEMPLATE_RE = re.compile(r"\{([a-zA-Z][a-zA-Z0-9_]*)\}")
 
 
-def _fmt_value(v: Any) -> str:
+#: Human-facing number/bool wording per definition ``locale`` (thousands
+#: separator, decimal mark, yes, no). Without a locale, text stays machine-plain
+#: — item_add templates, categories and prompts must never get "1,450".
+_LOCALE_FORMATS: dict[str, tuple[str, str, str, str]] = {
+    "en": (",", ".", "yes", "no"),
+    "tr": (".", ",", "evet", "hayır"),
+    "es": (".", ",", "sí", "no"),
+}
+
+
+def _fmt_value(v: Any, locale: str | None = None) -> str:
+    fmt = _LOCALE_FORMATS.get(locale or "")
     if isinstance(v, bool):
+        if fmt:
+            return fmt[2] if v else fmt[3]
         return "yes" if v else "no"
     if isinstance(v, (int, float)):
         f = float(v)
-        return str(int(f)) if f == int(f) else f"{f:.1f}"
+        if fmt is None:
+            return str(int(f)) if f == int(f) else f"{f:.1f}"
+        text = f"{int(f):,}" if f == int(f) else f"{f:,.1f}"
+        return text.replace(",", "\0").replace(".", fmt[1]).replace("\0", fmt[0])
     if isinstance(v, dict):  # a timer resolves to {running, elapsed}
-        return _fmt_value(v.get("elapsed", ""))
+        return _fmt_value(v.get("elapsed", ""), locale)
     return str(v)
 
 
-def render_template(text: Any, values: dict) -> str:
+def render_template(text: Any, values: dict, locale: str | None = None) -> str:
     """Substitute ``{key}`` placeholders in a string with formatted values.
-    Unknown keys are left verbatim so a stray brace never explodes."""
+    Unknown keys are left verbatim so a stray brace never explodes. A
+    ``locale`` (``en``/``tr``/``es``) formats numbers and yes/no for people."""
     if not text:
         return ""
 
     def repl(m: "re.Match[str]") -> str:
         key = m.group(1)
-        return _fmt_value(values[key]) if key in values else m.group(0)
+        return _fmt_value(values[key], locale) if key in values else m.group(0)
 
     return _TEMPLATE_RE.sub(repl, str(text))
 
@@ -324,15 +341,15 @@ def _aggregate_list(spec: dict, values: dict, now_ms: int, tz: tzinfo | None) ->
     return float(_apply_agg(nums, agg))
 
 
-def _resolve_cases(spec: dict, values: dict) -> str:
+def _resolve_cases(spec: dict, values: dict, locale: str | None = None) -> str:
     """A conditional-text computed: the first case whose ``when`` is truthy
     wins; its ``text`` (templated with ``{key}``) becomes the value. Falls back
     to ``else`` (default empty). Raises ``_UnresolvedNameError`` to defer in
     the fixpoint when a referenced name isn't resolved yet."""
     for case in spec.get("cases") or []:
         if eval_expr(str(case.get("when", "")), values) != 0:
-            return render_template(case.get("text", ""), values)
-    return render_template(spec.get("else", ""), values)
+            return render_template(case.get("text", ""), values, locale)
+    return render_template(spec.get("else", ""), values, locale)
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
@@ -640,6 +657,8 @@ def coerce_state(value: Any, spec: dict) -> Any:
     """Coerce/clamp a stored or incoming state value to its declared type."""
     stype = spec.get("type")
     if stype == "number":
+        if spec.get("nullable") and (value is None or value == ""):
+            return None  # an empty field stays empty, not a fabricated 0
         try:
             v = float(value)
         except (TypeError, ValueError):
@@ -725,6 +744,11 @@ def resolve_values(
         else:
             raw = state_map.get(key, spec.get("default") if isinstance(spec, dict) else None)
             values[key] = coerce_state(raw, spec) if isinstance(spec, dict) else raw
+            if (isinstance(spec, dict) and spec.get("format") == "date"
+                    and str(values[key]).strip().lower() == "today"):
+                # A date draft defaulting to "today" renders as the real date,
+                # so a date picker never receives the literal word.
+                values[key] = datetime.fromtimestamp(now_ms / 1000, tz).strftime("%Y-%m-%d")
 
     # group events by series once
     by_series: dict[str, list[dict]] = {}
@@ -766,7 +790,7 @@ def resolve_values(
                     continue
             elif "cases" in spec:  # conditional text
                 try:
-                    values[key] = _resolve_cases(spec, values)
+                    values[key] = _resolve_cases(spec, values, definition.get("locale"))
                     del pending[key]
                     progressed = True
                 except _UnresolvedNameError:

@@ -186,29 +186,12 @@ async def apply_action(
     flowlet = store.get(flowlet_id)
     if not flowlet:
         raise FlowletActionError("NOT_FOUND", f"flowlet '{flowlet_id}' not found")
-    # Expand composites first: a form's submit / a tracker's quick-add lives
-    # inside a composite in the STORED definition, so _find_component (and the
-    # injected draft-state specs it coerces against) only see it after
-    # expansion. Then assign the ids the author forgot — the client renders the
-    # SERVED definition (same deterministic assignment), so a tap can arrive
-    # for an auto-assigned id. Both idempotent no-ops when clean.
-    from flowly.flowlets.composites import expand_composites
-    from flowly.flowlets.normalize import assign_missing_ids
-    definition = assign_missing_ids(expand_composites(flowlet["definition"]))
+    # Resolve the tap against the SAME definition clients render: composites
+    # expanded, forgotten ids assigned, serve-time edit inputs present.
+    from flowly.flowlets.normalize import served_definition
+    definition = served_definition(flowlet["definition"], flowlet.get("name"))
 
     component = _find_component(definition, component_id)
-    if component is None:
-        # The client renders the SERVE-augmented definition, so the tapped
-        # component may be an edit input the editable-drill guarantee injected
-        # (present only in the augmented tree, not the stored one). Re-resolve
-        # against the same augmentation; its action targets real state, so the
-        # op below applies normally.
-        from flowly.flowlets.normalize import ensure_editable_drill
-        augmented = ensure_editable_drill(definition)
-        if augmented is not definition:
-            found = _find_component(augmented, component_id)
-            if found is not None:
-                definition, component = augmented, found
     if component is None:
         raise FlowletActionError("NOT_FOUND", f"component '{component_id}' not found")
 
@@ -319,10 +302,14 @@ async def _apply_op(
         key = action["key"]
         spec = _state_spec(definition, key)
         v = effective_value()
-        if v is None:
+        if spec.get("nullable") and (v is None or v == ""):
+            store.set_state(flowlet_id, key, None)  # the user cleared the field
+            v = None
+        elif v is None:
             raise FlowletActionError("INVALID", f"action `set` on '{key}' needs a value")
-        v = _validate_component_value(component, spec, v)
-        store.set_state(flowlet_id, key, coerce_state(v, spec))
+        if v is not None:
+            v = _validate_component_value(component, spec, v)
+            store.set_state(flowlet_id, key, coerce_state(v, spec))
 
     elif op in ("increment", "decrement"):
         key = action["key"]

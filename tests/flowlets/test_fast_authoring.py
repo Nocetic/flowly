@@ -92,9 +92,14 @@ async def test_screenshot_errors_reported_together_without_mutation(store):
                          {"type": "photo_input"}]}
     original = copy.deepcopy(broken)
     result = json.loads(await FlowletTool(store).execute("create", definition=broken))
-    paths = {e["path"] for e in result["errors"]}
-    assert {"$.catalog", "$.lists", "$.state.meals.max", "$.computed.remaining.expr",
-            "$.layout[0].text", "$.layout[1].value", "$.layout[2].type"} <= paths
+    # Slips with one reading are repaired and reported, not bounced back …
+    normalized = " | ".join(result["normalized"])
+    for fixed in ("catalog: string → integer", "`title` → `text`",
+                  "{ref: …} → key string", "'photo_input' → 'photo'"):
+        assert fixed in normalized
+    # … and every genuinely ambiguous problem comes back in the same reply.
+    paths = {e.split(":", 1)[0] for e in result["errors"]}
+    assert {"$.lists", "$.state.meals.max", "$.computed.remaining.expr"} <= paths
     assert broken == original
     assert not store.list()
 

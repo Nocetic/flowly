@@ -290,8 +290,19 @@ class WatchEngine:
                 self._store.set_watch_state(fid, wid, last_fired_ms=now, last_cond=new_cond)
 
                 notify = w.get("notify") or {}
-                title = render(notify.get("title"), values) or (flowlet.get("name") or "Flowlet")
-                body = render(notify.get("body"), values)
+                if w.get("trigger") == "schedule" and w.get("when"):
+                    # The slot is spent either way (no retry every minute);
+                    # only the message depends on the gate.
+                    if not _eval_bool(w["when"], values):
+                        notify = w.get("otherwise")
+                        if not isinstance(notify, dict):
+                            logger.debug("[flowlet] watch '{}' skipped: when is false", wid)
+                            continue
+                        notify = {**notify, "compose": False}
+                locale = defn.get("locale")
+                title = (render(notify.get("title"), values, locale)
+                         or (flowlet.get("name") or "Flowlet"))
+                body = render(notify.get("body"), values, locale)
                 also = w.get("also")
                 # A model turn (compose or `also`) is gated by a hard minimum
                 # window regardless of the watch's own cooldown.

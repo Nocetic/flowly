@@ -3185,30 +3185,12 @@ def flowlets_get(params: dict) -> dict:
             _asyncio.get_running_loop().create_task(_flowlet_refresh_cb(flowlet_id, False))
         except Exception:
             pass  # no loop / best-effort
-    # Serving-time guarantees (never persisted): every user-owned list row is
-    # EDITABLE (a drill screen with edit inputs — synthesized if the agent
-    # authored none), and a list with an `image` field always DISPLAYS its
-    # photos (row thumbnail + full photo). Editable runs first so a synthesized
-    # drill screen also picks up its full photo from the photo pass.
-    from flowly.flowlets.composites import expand_composites
-    from flowly.flowlets.normalize import (
-        assign_missing_ids,
-        ensure_chart_layout,
-        ensure_editable_drill,
-        ensure_photo_display,
-    )
+    # Serving-time guarantees (never persisted) live in one place shared with
+    # the action path: composites expand, ids are assigned, list rows become
+    # editable, photo lists display photos, a title-only header is dropped.
+    from flowly.flowlets.normalize import served_definition
 
-    # Composites (catalog 3) expand to primitives FIRST, so the photo/edit
-    # augmentation and the client both see plain v2 nodes; an old client renders
-    # the expansion with no changes. Forgotten ids are assigned (same
-    # deterministic ids resolve_values/apply_action derive, so values and taps
-    # line up). Then a chart-bearing multi-column grid is forced full-width
-    # (charts don't fit side by side on a phone).
-    definition = ensure_chart_layout(
-        ensure_photo_display(
-            ensure_editable_drill(assign_missing_ids(expand_composites(flowlet["definition"])))
-        )
-    )
+    definition = served_definition(flowlet["definition"], flowlet.get("name"))
     return {
         "flowlet": {
             "id": flowlet["id"],

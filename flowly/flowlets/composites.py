@@ -165,7 +165,8 @@ def _expand_form(node: dict, injected: dict, item_schema: dict) -> dict:
         draft = _draft_key(form_id, field)
         # inject the draft state key (namespaced, typed)
         if ftype == "number":
-            injected["state"][draft] = {"type": "number", "default": 0}
+            # Empty until typed: a seeded 0 rendered as text and hid the placeholder.
+            injected["state"][draft] = {"type": "number", "default": None, "nullable": True}
         elif ftype == "bool":
             injected["state"][draft] = {"type": "bool", "default": False}
         else:  # string / date drafts are strings
@@ -175,6 +176,8 @@ def _expand_form(node: dict, injected: dict, item_schema: dict) -> dict:
             elif isinstance(fspec.get("options"), list) and fspec["options"]:
                 default = str(fspec["options"][0])  # first option, so nothing is unset
             injected["state"][draft] = {"type": "string", "default": default}
+            if ftype == "date":
+                injected["state"][draft]["format"] = "date"
         children.append(_form_control(form_id, fspec, ftype))
         add_fields[field] = "{" + draft + "}"
         resets.append({"op": "reset", "key": draft})

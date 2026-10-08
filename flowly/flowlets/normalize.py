@@ -433,3 +433,51 @@ def ensure_chart_layout(defn: dict) -> dict:
             walk(screen.get("layout"))
 
     return out if changed else defn
+
+
+def _norm_title(text: Any) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def drop_title_header(defn: dict, name: Any) -> dict:
+    """Drop a leading ``header`` that only repeats the screen's name.
+
+    Every client already titles the screen with the flowlet's name, so a first
+    header saying the same thing printed the title twice. A subtitle on that
+    header survives as plain text. Only the very first top-level node is
+    considered; headers anywhere else are deliberate section titles.
+    """
+    layout = defn.get("layout")
+    if not isinstance(layout, list) or not layout:
+        return defn
+    first = layout[0]
+    if not (isinstance(first, dict) and first.get("type") == "header"
+            and _norm_title(first.get("text")) == _norm_title(name)
+            and _norm_title(name)):
+        return defn
+    rest = list(layout[1:])
+    subtitle = first.get("subtitle")
+    if isinstance(subtitle, str) and subtitle.strip():
+        rest.insert(0, {"type": "text", "text": subtitle, "style": "muted"})
+    if not rest:
+        return defn
+    return {**defn, "layout": rest}
+
+
+def served_definition(stored: dict, name: Any = None) -> dict:
+    """The one definition every client renders and every tap resolves against.
+
+    Composites expand to primitives first, forgotten ids are assigned (the
+    same deterministic ids the action path derives), every user-owned list row
+    becomes editable, photo lists display their photos, chart grids go full
+    width, and a header that only repeats the screen title is dropped. Serving
+    and acting share this function so a tapped id always exists in both.
+    """
+    from flowly.flowlets.composites import expand_composites
+
+    definition = ensure_chart_layout(
+        ensure_photo_display(
+            ensure_editable_drill(assign_missing_ids(expand_composites(stored)))
+        )
+    )
+    return drop_title_header(definition, name if name is not None else stored.get("name"))
