@@ -21,6 +21,7 @@ always passes — the expansion only ever emits declared refs.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 from flowly.flowlets import catalog
@@ -33,18 +34,22 @@ _SEGMENTED_MAX = 4
 # ── prop → template helpers ───────────────────────────────────────────────────
 
 
+#: A bare ``$.field`` reference not already wrapped in braces.
+_BARE_FIELD_RE = re.compile(r"(?<!\{)\$\.([A-Za-z][A-Za-z0-9_]*)")
+
+
 def _text_template(v: Any) -> str | None:
     """A composite prop → the string a ``text`` node should show.
 
-    ``"$.title"`` → ``"{$.title}"`` (interpolated); ``"{$.amount} ₺"`` → as-is;
-    a bare literal → itself. ``None``/non-string → None (sub-node omitted)."""
+    Every bare ``$.field`` becomes ``{$.field}``: ``"$.title"`` →
+    ``"{$.title}"``, ``"$.category · $.merchant"`` →
+    ``"{$.category} · {$.merchant}"``. Already-braced refs (``"{$.amount} ₺"``)
+    and plain literals are kept. ``None``/non-string → None (sub-node omitted).
+    Wrapping the whole string once printed ``{$.category · $.merchant}``
+    verbatim on every client."""
     if not isinstance(v, str) or not v:
         return None
-    if "{" in v:
-        return v
-    if v.startswith("$."):
-        return "{" + v + "}"
-    return v
+    return _BARE_FIELD_RE.sub(r"{$.\1}", v)
 
 
 def _field_ref(v: Any) -> str | None:

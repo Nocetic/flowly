@@ -368,3 +368,14 @@ def test_tracker_headlines_the_grid_tile_preview():
     defn = _form_defn(_TRACKER)
     pv = flowlet_preview(defn, {"spend__agg": 300})
     assert pv is not None and "300" in pv["text"] and "Bu ay" in pv["text"]
+
+
+def test_list_row_text_with_several_bare_field_refs():
+    """`"$.category · $.merchant"` once rendered verbatim as
+    `{$.category · $.merchant}` on every client."""
+    from flowly.flowlets.composites import _text_template
+    assert _text_template("$.category · $.merchant") == "{$.category} · {$.merchant}"
+    assert _text_template("$.title") == "{$.title}"
+    assert _text_template("{$.amount} ₺") == "{$.amount} ₺"
+    assert _text_template("$.a – {$.b}") == "{$.a} – {$.b}"
+    assert _text_template("Plain text") == "Plain text"
