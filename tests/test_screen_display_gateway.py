@@ -16,10 +16,11 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 import flowly.profile as profiles
-from flowly.desktop_runtime.authority import ScreenAuthority
+from flowly.desktop_runtime.authority import ScreenAuthority, ScreenError
 from flowly.desktop_runtime.input_service import InputService, InputServiceClient
 from flowly.desktop_runtime.launcher import ScreenRuntime
 from flowly.desktop_runtime.observers import ObserverRegistry
+from flowly.gateway import display
 from flowly.gateway.display import STREAM_PATH, _resolve
 from flowly.gateway.server import GatewayServer
 
@@ -48,6 +49,7 @@ async def display_gateway(tmp_path, monkeypatch):
     tasks = set()
     received = []
     received_event = asyncio.Event()
+    peers = {}
     with tempfile.TemporaryDirectory(prefix="display-gateway-", dir="/tmp") as short:
         for profile in ("default", "writer"):
             service = _resolve(gateway, {"profileId": profile})
@@ -85,6 +87,7 @@ async def display_gateway(tmp_path, monkeypatch):
                     assert await reader.readexactly(1) == b"\x01"
                     writer.write(bytes(24))
                     await writer.drain()
+                    peers[name] = writer
                     while data := await reader.read(65536):
                         received.append((name, data))
                         received_event.set()
@@ -108,7 +111,8 @@ async def display_gateway(tmp_path, monkeypatch):
                 return await socket.receive_json(timeout=5)
 
             yield SimpleNamespace(server=server, client=client, gateway=gateway, rpc=rpc,
-                                  socket=socket, received=received, received_event=received_event, input_services=input_services)
+                                  socket=socket, received=received, received_event=received_event, input_services=input_services,
+                                  peers=peers)
             await socket.close()
         await server.close()
         for registry in registries:
@@ -425,6 +429,65 @@ async def test_deleted_profile_identity_cannot_continue_streaming(display_gatewa
     profiles._atomic_write_json(path / "profile.json", metadata)
     assert (await ws.receive(timeout=5)).type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED}
     await ws.close()
+
+
+async def test_frames_do_not_queue_behind_agent_work_in_the_default_executor(display_gateway):
+    _, headers = await observe(display_gateway)
+    async with display_gateway.client.ws_connect(display_gateway.server.make_url(STREAM_PATH), headers=headers) as ws:
+        rfb = RfbSocket(ws)
+        await rfb.handshake()
+        # Agent tools share the default executor; occupy all of it, as a busy
+        # agent does, past the stream's verification lease.
+        release = threading.Event()
+        blocked = [asyncio.create_task(asyncio.to_thread(release.wait)) for _ in range(64)]
+        try:
+            await asyncio.sleep(display.CURRENT_LEASE_SECONDS + 0.2)
+            display_gateway.peers["default"].write(b"pixels")
+            assert await asyncio.wait_for(rfb.read(6), 1) == b"pixels"
+        finally:
+            release.set()
+            await asyncio.gather(*blocked)
+
+
+async def test_pixels_are_not_verified_from_disk_per_chunk(display_gateway, monkeypatch):
+    calls = 0
+    original = display._resolve
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    _, headers = await observe(display_gateway)
+    async with display_gateway.client.ws_connect(display_gateway.server.make_url(STREAM_PATH), headers=headers) as ws:
+        rfb = RfbSocket(ws)
+        await rfb.handshake()
+        monkeypatch.setattr(display, "_resolve", counted)
+        chunk = bytes(64 * 1024)
+        started = asyncio.get_running_loop().time()
+        for _ in range(200):
+            display_gateway.peers["default"].write(chunk)
+        assert await rfb.read(200 * len(chunk)) == chunk * 200
+        elapsed = asyncio.get_running_loop().time() - started
+    # Only the background monitor (and a lapsed lease) verify, never each chunk.
+    assert calls <= 2 + elapsed / display.CURRENT_CHECK_SECONDS
+
+
+async def test_a_stream_whose_proof_lapses_fails_closed_without_its_monitor(display_gateway, monkeypatch):
+    monkeypatch.setattr(display, "CURRENT_CHECK_SECONDS", 3600)  # the monitor never runs
+    _, headers = await observe(display_gateway)
+    async with display_gateway.client.ws_connect(display_gateway.server.make_url(STREAM_PATH), headers=headers) as ws:
+        rfb = RfbSocket(ws)
+        await rfb.handshake()
+
+        def changed(*_args, **_kwargs):
+            raise ScreenError("PROFILE_IDENTITY_CHANGED")
+
+        monkeypatch.setattr(display, "_resolve", changed)
+        await asyncio.sleep(display.CURRENT_LEASE_SECONDS + 0.1)
+        display_gateway.peers["default"].write(b"secret")
+        message = await ws.receive(timeout=5)
+        assert message.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED}
 
 
 async def test_active_stream_limit_and_disconnect_cleanup(display_gateway):

@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
+import functools
 import json
 import os
 import secrets
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -48,6 +51,13 @@ STREAM_PATH = "/api/display/stream"
 MAX_FRAME = 256 * 1024
 MAX_STREAMS = 4
 INPUT_PROTOCOL = "epoch-u64-v1"
+# A stream re-verifies its profile, generation and control state this often in
+# the background. Pixels and input are only checked inline when that proof is
+# older than the lease (a stalled monitor), so a stale stream stops instead of
+# continuing unverified. Revocation and takeover arrive immediately through the
+# supervisor's observer socket.
+CURRENT_CHECK_SECONDS = 0.25
+CURRENT_LEASE_SECONDS = 0.5
 # An unused running screen is stopped after this long; an agent that needs its
 # browser again starts it (host_screen_run). Use is an attached viewer stream,
 # a viewer/control request, human control or an agent run/action; a static
@@ -360,6 +370,25 @@ async def _restart_holding(gateway, reservation) -> None:
         reservation.__exit__(None, None, None)
 
 
+_stream_workers: ThreadPoolExecutor | None = None
+_stream_workers_lock = threading.Lock()
+
+
+async def _stream_call(function, /, *args, **kwargs):
+    """Run a stream's blocking check off the loop, in workers of its own.
+
+    The default executor is shared with agent tools; a few blocking jobs there
+    queued every frame and keystroke behind them (hundreds of milliseconds).
+    """
+    global _stream_workers
+    with _stream_workers_lock:
+        if _stream_workers is None:
+            _stream_workers = ThreadPoolExecutor(max_workers=8, thread_name_prefix="flowly-screen-stream")
+    # Same semantics as asyncio.to_thread, including the caller's context.
+    call = functools.partial(contextvars.copy_context().run, function, *args, **kwargs)
+    return await asyncio.get_running_loop().run_in_executor(_stream_workers, call)
+
+
 def _error(code: str, status: int = 400) -> web.Response:
     return web.json_response({"error": {"code": code}}, status=status, headers={"Cache-Control": "no-store"})
 
@@ -576,16 +605,26 @@ def register_display(app: web.Application, gateway) -> None:
             await ws.prepare(request)
             session.streams.add(ws)
             gate = RfbClientGate()
+            verified = time.monotonic()
 
             async def check_current():
-                fresh = await asyncio.to_thread(_resolve, gateway, params, pinned=True)
+                nonlocal verified
+                started = time.monotonic()
+                fresh = await _stream_call(_resolve, gateway, params, pinned=True)
                 if fresh is not session:
                     raise ScreenError("PROFILE_IDENTITY_CHANGED")
-                await asyncio.to_thread(session.current, generation, viewer)
+                await _stream_call(session.current, generation, viewer)
+                verified = max(verified, started)
+
+            async def still_current():
+                # Never disk reads per frame or keystroke: the monitor proves
+                # this every CURRENT_CHECK_SECONDS; only a stale proof is redone.
+                if time.monotonic() - verified > CURRENT_LEASE_SECONDS:
+                    await check_current()
 
             async def server_to_viewer():
                 while data := await reader.read(64 * 1024):
-                    await check_current()
+                    await still_current()
                     await asyncio.wait_for(ws.send_bytes(data), 5)
 
             inbox = ScreenInputQueue(bool(input_protocol))
@@ -605,9 +644,9 @@ def register_display(app: web.Application, gateway) -> None:
                 input_epoch = None
                 while True:
                     epoch, payload = await inbox.get()
-                    await check_current()
+                    await still_current()
                     inputs = []
-                    allowed = bool(input_protocol and epoch and await asyncio.to_thread(
+                    allowed = bool(input_protocol and epoch and await _stream_call(
                         session.runtime.authority.may_input, viewer, generation, epoch))
                     data = gate.feed(payload, lambda: allowed, epoch=epoch,
                                      on_input=inputs.append if input_protocol else None)
@@ -616,7 +655,7 @@ def register_display(app: web.Application, gateway) -> None:
                         await asyncio.wait_for(writer.drain(), 5)
                     if inputs:
                         if input_epoch != epoch:
-                            input_state = await asyncio.to_thread(
+                            input_state = await _stream_call(
                                 input_client.request, "attach.capture" if shared_capture else "attach", viewer=viewer, generation=generation,
                                 epoch=epoch, stream=stream_id,
                             )
@@ -624,7 +663,7 @@ def register_display(app: web.Application, gateway) -> None:
                         batch = bytearray()
                         for item in [*coalesce_pointer_moves(inputs), b""]:
                             if batch and (not item or len(batch) + len(item) > 64 * 1024 + 8):
-                                result = await asyncio.to_thread(
+                                result = await _stream_call(
                                     input_client.request, "send", viewer=viewer, generation=generation, epoch=epoch,
                                     handle=input_state["handle"], sequence=input_state["nextSequence"],
                                     data=base64.b64encode(batch).decode(),
@@ -635,10 +674,10 @@ def register_display(app: web.Application, gateway) -> None:
 
             async def monitor():
                 while True:
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(CURRENT_CHECK_SECONDS)
                     await check_current()
-                    if not await asyncio.to_thread(session.viewers.active, viewer, session.scope(generation),
-                                                   session.identity["botId"]):
+                    if not await _stream_call(session.viewers.active, viewer, session.scope(generation),
+                                              session.identity["botId"]):
                         raise ScreenError("VIEWER_EXPIRED")
 
             tasks.extend(asyncio.create_task(operation()) for operation in (server_to_viewer, receive_viewer, viewer_to_server, monitor))

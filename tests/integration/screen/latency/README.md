@@ -79,3 +79,25 @@ baked-in cursor and an empty local cursor shape. Using the same connection
 produces clean pixels and a local cursor shape. The direct pointer write in that
 test is **only a diagnostic control**; bypassing the product input broker would
 break the current handback boundary and is not a proposed fix.
+
+## Product path benchmarks
+
+Two smaller benchmarks measure the product code itself, with synthetic peers
+(no Xvnc, no browser) inside the existing gateway image:
+
+```sh
+docker run --rm --init --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  -e PYTHONPATH=/workspace -e FLOWLY_HOME=/tmp/fh flowly-screen-gateway-test:bookworm \
+  sh -c 'cd /workspace && for load in 0 6; do
+    python tests/integration/screen/latency/gateway_stream_benchmark.py --load "$load"; done
+    python tests/integration/screen/latency/capture_proxy_benchmark.py'
+```
+
+`gateway_stream_benchmark.py` sends 48 KiB frames at 60 fps through the real
+authenticated gateway stream. `--load N` keeps N blocking jobs in the default
+thread pool, as agent tools do. Before the stream checks moved to a lease and
+private workers, 6 such jobs raised frame latency from about 4 ms to about
+360 ms (p50) and cut delivery to 37 fps; afterwards both stay under 1 ms
+(p50) at 60 fps. `capture_proxy_benchmark.py` compares a direct socket with
+the supervisor's shared-capture proxy (`SharedRfbPeer`); the proxy adds well
+under a millisecond at p50. Neither includes Desktop, relay or WAN latency.
