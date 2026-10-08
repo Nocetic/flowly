@@ -256,6 +256,16 @@ def repair_definition(definition: Any) -> tuple[Any, list[str]]:
                 computed[key] = {"expr": spec}
                 notes.append(f"computed.{key}: bare expression wrapped as {{expr}}")
 
+    watches = d.get("watches")
+    if isinstance(watches, list):
+        for i, w in enumerate(watches):
+            if (isinstance(w, dict) and w.get("trigger") == "schedule"
+                    and w.get("at") is not None and w.get("everyMinutes") is not None):
+                # Screens saved before the two were exclusive ran on the
+                # interval and ignored `at`; keep exactly that behaviour.
+                del w["at"]
+                notes.append(f"watches[{i}]: kept everyMinutes, dropped the ignored `at`")
+
     def fix(node: Any, path: str) -> None:
         if isinstance(node, list):
             for i, n in enumerate(node):

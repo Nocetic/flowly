@@ -93,6 +93,13 @@ CREATE TABLE IF NOT EXISTS flowlet_watch_state (
     PRIMARY KEY (flowlet_id, watch_id)
 );
 
+CREATE TABLE IF NOT EXISTS flowlet_ops (
+    flowlet_id  TEXT NOT NULL REFERENCES flowlets(id) ON DELETE CASCADE,
+    op_id       TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (flowlet_id, op_id)
+);
+
 CREATE TABLE IF NOT EXISTS flowlet_source_state (
     flowlet_id   TEXT NOT NULL REFERENCES flowlets(id) ON DELETE CASCADE,
     source_id    TEXT NOT NULL,
@@ -104,7 +111,23 @@ CREATE TABLE IF NOT EXISTS flowlet_source_state (
 );
 """
 
-_SCHEMA_VERSION = "3"
+_SCHEMA_VERSION = "4"
+
+#: Columns added after the first schema, applied in place on open.
+#:   rev — bumped by every write that can change what a client renders, so a
+#:         client keeps the newest values whatever order replies and pushes
+#:         arrive in (a values map carrying a lower rev is stale).
+#:   tz  — the IANA zone of the device that last opened the screen: what
+#:         "today" and reminder times mean for this user.
+_ADDED_COLUMNS = (
+    ("rev", "INTEGER NOT NULL DEFAULT 0"),
+    ("tz", "TEXT"),
+)
+
+#: How long an applied client operation id is remembered (retries of a tap
+#: arrive within seconds; a day is generous) and how many per flowlet.
+_OP_TTL_MS = 24 * 60 * 60 * 1000
+_OPS_KEPT = 500
 
 
 def now_ms() -> int:
@@ -169,14 +192,93 @@ class FlowletStore:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
-            row = self._conn.execute(
-                "SELECT value FROM meta WHERE key = 'schema_version'"
-            ).fetchone()
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO meta VALUES ('schema_version', ?)", (_SCHEMA_VERSION,)
-                )
+            have = {r["name"] for r in self._conn.execute("PRAGMA table_info(flowlets)")}
+            for column, decl in _ADDED_COLUMNS:
+                if column not in have:
+                    self._conn.execute(f"ALTER TABLE flowlets ADD COLUMN {column} {decl}")
+            self._conn.execute(
+                """INSERT INTO meta VALUES ('schema_version', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (_SCHEMA_VERSION,),
+            )
             self._conn.commit()
+
+    def _bump(self, flowlet_id: str) -> None:
+        """Advance the render revision; call inside the mutating transaction."""
+        self._conn.execute("UPDATE flowlets SET rev = rev + 1 WHERE id = ?", (flowlet_id,))
+
+    def rev(self, flowlet_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT rev FROM flowlets WHERE id = ?", (flowlet_id,)
+            ).fetchone()
+        return int(row["rev"]) if row else 0
+
+    def set_tz(self, flowlet_id: str, tz: str) -> None:
+        """Remember the device zone; a change re-bases "today", so it bumps rev."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE flowlets SET tz = ? WHERE id = ? AND (tz IS NULL OR tz != ?)",
+                (tz, flowlet_id, tz),
+            )
+            if cur.rowcount:
+                self._bump(flowlet_id)
+
+    def claim_op(self, flowlet_id: str, op_id: str) -> bool:
+        """Record a client operation id. False when it was already applied —
+        the caller then answers with current values instead of re-applying a
+        retried tap (a +250 ml sent twice over a flaky link is one drink)."""
+        ts = now_ms()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO flowlet_ops (flowlet_id, op_id, created_at)
+                   VALUES (?, ?, ?)""",
+                (flowlet_id, op_id[:128], ts),
+            )
+            claimed = cur.rowcount > 0
+            if claimed:
+                self._conn.execute(
+                    """DELETE FROM flowlet_ops WHERE flowlet_id = ? AND (created_at < ?
+                       OR op_id NOT IN (SELECT op_id FROM flowlet_ops WHERE flowlet_id = ?
+                                        ORDER BY created_at DESC LIMIT ?))""",
+                    (flowlet_id, ts - _OP_TTL_MS, flowlet_id, _OPS_KEPT),
+                )
+        return claimed
+
+    def release_op(self, flowlet_id: str, op_id: str) -> None:
+        """Forget an operation that failed, so the client may retry it."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM flowlet_ops WHERE flowlet_id = ? AND op_id = ?",
+                (flowlet_id, op_id[:128]),
+            )
+
+    def snapshot(self, flowlet_id: str) -> tuple[list, list]:
+        """Raw state + event rows, for undoing a multi-step action that failed."""
+        with self._lock:
+            state = [tuple(r) for r in self._conn.execute(
+                "SELECT key, value, updated_at FROM flowlet_state WHERE flowlet_id = ?",
+                (flowlet_id,))]
+            events = [tuple(r) for r in self._conn.execute(
+                "SELECT id, series, value, meta, ts FROM flowlet_events WHERE flowlet_id = ?",
+                (flowlet_id,))]
+        return state, events
+
+    def restore(self, flowlet_id: str, snap: tuple[list, list]) -> None:
+        state, events = snap
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM flowlet_state WHERE flowlet_id = ?", (flowlet_id,))
+            self._conn.execute("DELETE FROM flowlet_events WHERE flowlet_id = ?", (flowlet_id,))
+            self._conn.executemany(
+                "INSERT INTO flowlet_state (flowlet_id, key, value, updated_at) VALUES (?, ?, ?, ?)",
+                [(flowlet_id, *row) for row in state],
+            )
+            self._conn.executemany(
+                """INSERT INTO flowlet_events (id, flowlet_id, series, value, meta, ts)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [(row[0], flowlet_id, *row[1:]) for row in events],
+            )
+            self._bump(flowlet_id)
 
     # ── Flowlet CRUD ──────────────────────────────────────────────────────────
 
@@ -261,6 +363,7 @@ class FlowletStore:
                 params.append(1 if pinned else 0)
             if version_bump:
                 sets.append("version = version + 1")
+            sets.append("rev = rev + 1")
             params.append(flowlet_id)
             self._conn.execute(
                 f"UPDATE flowlets SET {', '.join(sets)} WHERE id = ?", params
@@ -383,6 +486,7 @@ class FlowletStore:
                    DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
                 (flowlet_id, key, json.dumps(value), ts),
             )
+            self._bump(flowlet_id)
 
     def reset_state(self, flowlet_id: str, key: str) -> None:
         with self._lock, self._conn:
@@ -390,6 +494,7 @@ class FlowletStore:
                 "DELETE FROM flowlet_state WHERE flowlet_id = ? AND key = ?",
                 (flowlet_id, key),
             )
+            self._bump(flowlet_id)
 
     # ── Events ────────────────────────────────────────────────────────────────
 
@@ -409,6 +514,7 @@ class FlowletStore:
                 (flowlet_id, series, float(value),
                  json.dumps(meta) if meta else None, ts),
             )
+            self._bump(flowlet_id)
             return int(cur.lastrowid)
 
     def get_events(self, flowlet_id: str) -> list[dict]:
@@ -436,6 +542,7 @@ class FlowletStore:
             if row is None:
                 return False
             self._conn.execute("DELETE FROM flowlet_events WHERE id = ?", (row["id"],))
+            self._bump(flowlet_id)
             return True
 
     def reset_events(self, flowlet_id: str, series: str) -> int:
@@ -444,6 +551,8 @@ class FlowletStore:
                 "DELETE FROM flowlet_events WHERE flowlet_id = ? AND series = ?",
                 (flowlet_id, series),
             )
+            if cur.rowcount:
+                self._bump(flowlet_id)
             return int(cur.rowcount)
 
     def last_activity_ms(self, flowlet_id: str) -> int | None:

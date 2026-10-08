@@ -155,7 +155,7 @@ def test_render_templating():
     assert render("{glasses}/{goal}", vals) == "3/8"
     assert render("{ratio}", vals) == "0.5"
     assert render("{done}", vals) == "yes"
-    assert render("{missing} left", vals) == "{missing} left"  # unknown left verbatim
+    assert render("{missing} left", vals) == " left"  # people never read a raw placeholder
     assert render("", vals) == ""
     assert render(None, vals) == ""
 

@@ -113,3 +113,24 @@ async def test_the_contract_in_the_tool_description_is_itself_valid(store):
     result = json.loads(await FlowletTool(store).execute("create", definition=defn))
     assert "error" not in result, result
     assert "normalized" not in result
+
+
+async def test_legacy_schedule_with_both_at_and_interval_keeps_its_behaviour(store):
+    """Saved before the two were exclusive, such a watch ran on its interval."""
+    legacy = {"catalog": 3, "name": "Stretch", "state": {"n": {"type": "number", "default": 0}},
+              "layout": [{"type": "stat", "value": "n"}],
+              "watches": [{"id": "w", "trigger": "schedule", "at": "09:00", "everyMinutes": 60,
+                           "notify": {"title": "Stretch"}}]}
+    f = store.create("Stretch", legacy)
+    out = json.loads(await FlowletTool(store).execute(
+        "update", flowlet_id=f["id"], definition={**legacy, "name": "Stretch break"}))
+    assert "error" not in out, out
+    assert store.get(f["id"])["definition"]["watches"][0] == {
+        "id": "w", "trigger": "schedule", "everyMinutes": 60, "notify": {"title": "Stretch"}}
+
+
+async def test_create_result_opens_with_a_screen_reference_for_chat_cards(store):
+    out = await FlowletTool(store).execute("create", template_id="water", lang="en")
+    head = out[:200]  # what survives even a hard truncation of the tool result
+    assert head.startswith('{"action": "create", "screen": {"id": "flt_')
+    assert json.loads(out)["screen"]["name"] == "Water"

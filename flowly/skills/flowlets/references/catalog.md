@@ -561,6 +561,18 @@ Four triggers:
 
 Each watch needs a stable `"id"` and a `"notify": { "title", "body" }`. The
 title/body may template current values with `{key}` — e.g. `"{today_ml} / {goal_ml} ml"`.
+Set a top-level `"locale"` (`"en"`, `"tr"`, `"es"`) so numbers read naturally
+(`1.450` in Turkish, `1,450` in English).
+
+A `schedule` watch can carry a gate: `"when": "meal_count > 0"` sends `notify`
+when true; when false it sends `"otherwise": { "title", "body" }` if given,
+and otherwise skips that day quietly. A summary of nothing is noise — gate
+daily summaries this way. Templates ship such reminders ready-made: attach
+them by name with `create(template_id, watches=[{"preset": "daily_summary"}])`.
+
+Times and "today" follow the time zone of the device that last opened the
+screen (the host's own zone until then), so a core running elsewhere still
+ends the user's day at the user's midnight.
 
 ```json
 "watches": [
@@ -570,7 +582,10 @@ title/body may template current values with `{key}` — e.g. `"{today_ml} / {goa
   { "id": "goal_hit", "trigger": "goal", "when": "today_ml >= goal_ml", "once": true,
     "notify": { "title": "Goal reached 🎉", "body": "{today_ml} ml today — nice." } },
   { "id": "morning", "trigger": "schedule", "at": "09:00",
-    "notify": { "title": "New day", "body": "Fresh water goal for today." } }
+    "notify": { "title": "New day", "body": "Fresh water goal for today." } },
+  { "id": "summary", "trigger": "schedule", "at": "21:00", "when": "today_ml > 0",
+    "notify": { "title": "Today", "body": "{today_ml} ml of {goal_ml}." },
+    "otherwise": { "title": "Today", "body": "No water logged yet." } }
 ]
 ```
 
@@ -582,8 +597,9 @@ when composing isn't possible. Use it where a personal touch beats a template;
 plain templated pushes are cheaper and instant.
 
 Guidance: keep reminders kind and rare. `when` expressions support
-`+ - * / min() max() abs() round()`, comparisons `< <= > >= == !=`, and
-`and / or / not`. Names must be declared state or computed keys. Default
+`+ - * / // % ** min() max() abs() round() floor() ceil()`, comparisons
+`< <= > >= == !=`, and `and / or / not`. `round` rounds half away from zero
+(2.5 → 3); numbers are plain decimals (`1500`, `0.5`, `1e3`). Names must be declared state or computed keys. Default
 cooldowns already stop nagging (condition 6h, goal 12h, stale 12h); override
 with `"cooldownMinutes"`. Only add `"also": { "op": "agent", "message": "…" }` when
 the reminder genuinely needs you to *do* something (draft a message, look

@@ -165,7 +165,8 @@ def test_render_template():
     assert render_template("{ratio}", vals) == "0.5"
     assert render_template("{done}", vals) == "yes"
     assert render_template("{t}s", vals) == "12s"
-    assert render_template("{missing} left", vals) == "{missing} left"
+    assert render_template("{missing} left", vals) == " left"  # display: empty, as on every client
+    assert render_template("{missing} left", vals, keep_unknown=True) == "{missing} left"
     assert render_template(None, vals) == ""
 
 

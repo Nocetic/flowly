@@ -59,8 +59,20 @@ _CMP_OPS = {
 }
 
 
+def round_half_away(x: float, ndigits: int = 0) -> float:
+    """Round half away from zero (2.5 → 3, -2.5 → -3, 1.25 → 1.3) — what people
+    expect, and the rule every client implements. Python's own ``round`` is
+    banker's rounding (2.5 → 2) and disagreed with the apps. Works on the
+    shortest decimal repr so 2.675 rounds as written, not as stored."""
+    from decimal import ROUND_HALF_UP, Decimal
+
+    nd = int(ndigits)
+    q = Decimal(1).scaleb(-nd)
+    return float(Decimal(repr(float(x))).quantize(q, rounding=ROUND_HALF_UP))
+
+
 def _safe_round(x, ndigits=0):
-    return round(x, int(ndigits))
+    return round_half_away(x, ndigits)
 
 
 _FUNCS = {
@@ -123,9 +135,16 @@ def _eval_date_fn(name: str, arg_nodes: list, ns: dict) -> float:
     return float(delta if name == "days_until" else -delta)
 
 
+#: Number spellings Python accepts but the app interpreters don't (hex, octal,
+#: binary, digit separators, imaginary). Plain decimals, ``.5`` and ``1e3`` are fine.
+_FOREIGN_NUMBER_RE = re.compile(r"\b0[xXoObB]|\d_\d|\d[jJ]\b")
+
+
 def validate_expr(expr: str) -> None:
     """Confirm ``expr`` parses under the safe grammar. Raises ``ValueError`` with
     a specific reason otherwise. Does not evaluate — only shapes are checked."""
+    if _FOREIGN_NUMBER_RE.search(re.sub(r"(\"[^\"]*\"|'[^']*')", "", expr)):
+        raise ValueError("numbers must be plain decimals like 1500, 0.5 or 1e3")
     try:
         tree = ast.parse(expr, mode="eval")
     except SyntaxError as exc:
@@ -280,6 +299,8 @@ def _fmt_value(v: Any, locale: str | None = None) -> str:
         return "yes" if v else "no"
     if isinstance(v, (int, float)):
         f = float(v)
+        if f != int(f):
+            f = round_half_away(f, 1)
         if fmt is None:
             return str(int(f)) if f == int(f) else f"{f:.1f}"
         text = f"{int(f):,}" if f == int(f) else f"{f:,.1f}"
@@ -289,16 +310,25 @@ def _fmt_value(v: Any, locale: str | None = None) -> str:
     return str(v)
 
 
-def render_template(text: Any, values: dict, locale: str | None = None) -> str:
+def render_template(text: Any, values: dict, locale: str | None = None,
+                    *, keep_unknown: bool = False) -> str:
     """Substitute ``{key}`` placeholders in a string with formatted values.
-    Unknown keys are left verbatim so a stray brace never explodes. A
-    ``locale`` (``en``/``tr``/``es``) formats numbers and yes/no for people."""
+
+    Text people read (screens, case text, reminders) renders a key with no
+    value as empty — the same on every client, so a screen and its reminder
+    never disagree. Machine-facing templates (an agent message, a row field, a
+    source prompt) pass ``keep_unknown`` so the placeholder survives verbatim.
+    A ``locale`` (``en``/``tr``/``es``) formats numbers and yes/no for people.
+    """
     if not text:
         return ""
 
     def repl(m: "re.Match[str]") -> str:
         key = m.group(1)
-        return _fmt_value(values[key], locale) if key in values else m.group(0)
+        v = values.get(key)
+        if v is None:
+            return m.group(0) if keep_unknown else ""
+        return _fmt_value(v, locale)
 
     return _TEMPLATE_RE.sub(repl, str(text))
 
@@ -1014,3 +1044,34 @@ def flowlet_preview(definition: dict, values: dict) -> dict | None:
                 return {"text": f"{done}/{total}", "pct": done / total}
             return {"text": str(total), "pct": None}
     return None
+
+
+# ── Client-side semantics, defined here once ─────────────────────────────────
+# The apps evaluate `visibleWhen` and list `where` filters locally. These two
+# reference functions pin the shared rule the conformance vectors check every
+# interpreter against (flowly/flowlets/conformance/vectors.json).
+
+def is_visible(expr: Any, values: dict, now_ms: int | None = None,
+               tz: tzinfo | None = None) -> bool:
+    """`visibleWhen`: shown unless the expression evaluates to false. A broken
+    or unresolvable expression shows the component (hiding content on an error
+    would make it vanish without a trace)."""
+    if not isinstance(expr, str) or not expr.strip():
+        return True
+    try:
+        return eval_expr(expr, {**values, "__now__": now_ms, "__tz__": tz}) != 0
+    except Exception:
+        return True
+
+
+def passes_where(expr: Any, item: dict, now_ms: int | None = None,
+                 tz: tzinfo | None = None) -> bool:
+    """A list `where` filter: a row is kept only when the expression is true.
+    A row the expression can't evaluate (a missing field) is left out — the
+    same rule the server's totals use, so a list and its total always agree."""
+    if not isinstance(expr, str) or not expr.strip():
+        return True
+    try:
+        return eval_expr(expr, {**item, "__now__": now_ms, "__tz__": tz}) != 0
+    except Exception:
+        return False

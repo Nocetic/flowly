@@ -28,6 +28,7 @@ from flowly.flowlets.authoring import (
 )
 from flowly.flowlets.schema import FlowletValidationError, validate_definition
 from flowly.flowlets.store import now_ms
+from flowly.flowlets.zones import zone_for
 
 
 def _compact_preview(values: dict) -> dict:
@@ -64,6 +65,7 @@ def _summary(flowlet: dict, values: dict | None = None) -> dict:
         "accent": flowlet.get("accent"),
         "pinned": flowlet.get("pinned"),
         "version": flowlet.get("version"),
+        "rev": flowlet.get("rev", 0),
         "catalog": flowlet.get("catalog"),
         "updatedAt": flowlet.get("updated_at"),
     }
@@ -73,6 +75,13 @@ def _summary(flowlet: dict, values: dict | None = None) -> dict:
         if preview is not None:
             s["preview"] = preview
     return s
+
+
+def _screen_ref(flowlet: dict) -> dict:
+    """The few fields a chat card needs to open the screen, placed first in
+    the result so they survive any truncation of the long values map."""
+    return {"id": flowlet["id"], "name": flowlet.get("name"),
+            "icon": flowlet.get("icon"), "accent": flowlet.get("accent")}
 
 
 _FIX_HINT = ("Fix every listed problem in ONE retry. flowlet(action='guide') has the "
@@ -255,7 +264,7 @@ class FlowletTool(Tool):
             self._store.get_state(flowlet["id"]),
             self._store.get_events(flowlet["id"]),
             now_ms(),
-            None,  # local tz
+            zone_for(flowlet),  # the user's device zone once a client has opened it
         )
 
     @staticmethod
@@ -414,6 +423,7 @@ class FlowletTool(Tool):
         await self._notify("flowlet.created", _summary(flowlet, values))
         return json.dumps({
             "action": "create",
+            "screen": _screen_ref(flowlet),
             "flowlet": _summary(flowlet, values),
             "message": f"Flowlet '{meta['name']}' created (id: {flowlet['id']})",
             **({"normalized": notes} if notes else {}),
@@ -449,6 +459,7 @@ class FlowletTool(Tool):
         await self._notify("flowlet.updated", _summary(flowlet, values))
         return json.dumps({
             "action": "update",
+            "screen": _screen_ref(flowlet),
             "flowlet": _summary(flowlet, values),
             "message": f"Flowlet updated (v{flowlet['version']})",
             **({"normalized": notes} if notes else {}),
@@ -504,7 +515,7 @@ class FlowletTool(Tool):
             return json.dumps({"error": "value must be a number"})
         self._store.add_event(flowlet_id, series, value)
         values = self._values(flowlet)
-        _ev = {"id": flowlet_id, "values": values}
+        _ev = {"id": flowlet_id, "values": values, "rev": self._store.rev(flowlet_id)}
         _pv = queries.flowlet_preview(flowlet["definition"], values)
         if _pv is not None:
             _ev["preview"] = _pv
@@ -522,7 +533,7 @@ class FlowletTool(Tool):
             return json.dumps({"error": f"state key '{key}' is not declared"})
         self._store.set_state(flowlet_id, key, queries.coerce_state(kw.get("value"), spec))
         values = self._values(flowlet)
-        _ev = {"id": flowlet_id, "values": values}
+        _ev = {"id": flowlet_id, "values": values, "rev": self._store.rev(flowlet_id)}
         _pv = queries.flowlet_preview(flowlet["definition"], values)
         if _pv is not None:
             _ev["preview"] = _pv

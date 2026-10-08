@@ -34,6 +34,7 @@ from flowly.flowlets import catalog
 from flowly.flowlets.queries import eval_expr, render_template, resolve_values
 from flowly.flowlets.store import FlowletStore
 from flowly.flowlets.store import now_ms as _now_ms
+from flowly.flowlets.zones import zone_for
 
 # ── Pure helpers (no I/O — unit-tested directly) ──────────────────────────────
 
@@ -264,7 +265,8 @@ class WatchEngine:
         async with self._lock:
             state_map = self._store.get_state(fid)
             events = self._store.get_events(fid)
-            values = resolve_values(defn, state_map, events, now, self._tz)
+            zone = zone_for(flowlet, self._tz)
+            values = resolve_values(defn, state_map, events, now, zone)
             ws_all = self._store.get_watch_state(fid)
             activity = self._store.last_activity_ms(fid)
             if activity is None:
@@ -276,7 +278,7 @@ class WatchEngine:
                     continue
                 ws = ws_all.get(wid, {})
                 try:
-                    fire, new_cond = _decide(w, values, ws, now, self._tz, activity)
+                    fire, new_cond = _decide(w, values, ws, now, zone, activity)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("[flowlet] watch '{}' decide error: {}", wid, exc)
                     continue
