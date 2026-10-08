@@ -281,6 +281,13 @@ def repair_definition(definition: Any) -> tuple[Any, list[str]]:
                 for k, v in alias[1].items():
                     node.setdefault(k, v)
                 notes.append(f"{path}: type {kind!r} → {alias[0]!r}")
+        data = node.get("data")
+        if isinstance(data, dict) and "by" not in data:
+            for alias in ("groupBy", "group_by", "groupby"):
+                if isinstance(data.get(alias), str):
+                    data["by"] = data.pop(alias)
+                    notes.append(f"{path}.data: `{alias}` → `by`")
+                    break
         spec = catalog.COMPONENTS.get(node.get("type"))
         if spec is not None:
             if "text" in spec.get("required", []) and "text" not in node:

@@ -258,7 +258,7 @@ def _expenses(say: Say) -> dict:
             {"type": "header", "text": say("By category", "Kategoriye göre", "Por categoría")},
             {"id": "byCategory", "type": "chart", "kind": "donut",
              "data": {"list": "expenses", "agg": "sum", "field": "amount",
-                      "groupBy": "category", "window": "30d"}},
+                      "by": "category", "window": "30d"}},
             {"type": "divider"},
             {"id": "receiptShot", "type": "photo",
              "label": say("Add from a receipt", "Fişten ekle", "Añadir desde un recibo"),

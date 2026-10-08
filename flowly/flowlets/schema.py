@@ -1017,6 +1017,10 @@ def _validate_list_chart_data(cid, data, ctx: _Ctx) -> None:
             f"got {date_f!r}"
         )
 
+    for alias in ("groupBy", "group_by", "groupby"):
+        if alias in data and "by" not in data:
+            # Silently ignoring it drew a pie as a time series ("No data yet").
+            raise _err(f"chart (id={cid}) groups rows with `data.by`, not `{alias}`")
     by = data.get("by")
     if by is not None:  # ── categorical from rows ──
         if not isinstance(by, str) or fields.get(by) != "string":
