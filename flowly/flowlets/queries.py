@@ -991,43 +991,42 @@ def _num(v: Any, values: dict, default: float = 0.0) -> float:
     return default
 
 
-def _interp(text: Any, values: dict) -> str:
+def _interp(text: Any, values: dict, locale: str | None = None) -> str:
     if not isinstance(text, str):
         return ""
-    import re as _re
-    return _re.sub(
-        r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}",
-        lambda m: str(_clean_number(values.get(m.group(1), ""))),
-        text,
-    )
+    return render_template(text, values, locale)
 
 
-def flowlet_preview(definition: dict, values: dict) -> dict | None:
+def flowlet_preview(definition: dict, values: dict, locale: str | None = None) -> dict | None:
     """A compact headline for a list card: the first progress/ring/gauge (with a
     percent for a mini bar) or the first stat — as ready-to-show ``text`` plus an
-    optional ``pct`` (0..1). Lets a tile read as content, not just an icon."""
+    optional ``pct`` (0..1). Lets a tile read as content, not just an icon.
+    Numbers are written in ``locale`` (default: the definition's own)."""
     # Expand composites so a tracker_card's metric (hidden in the composite in
     # the stored definition) can headline the tile. Idempotent no-op otherwise.
     from flowly.flowlets.composites import expand_composites
     definition = expand_composites(definition)
+    if locale is None and isinstance(definition.get("locale"), str):
+        locale = definition["locale"]
     for comp in _iter_ordered(definition.get("layout", []) or []):
         t = comp.get("type")
         if t in ("progress", "ring", "gauge"):
             val = _num(comp.get("value"), values)
             mx = _num(comp.get("max"), values, 100.0)
-            label = _interp(comp.get("label"), values)
-            text = label or f"{_clean_number(val)} / {_clean_number(mx)}"
+            label = _interp(comp.get("label"), values, locale)
+            text = label or f"{_fmt_value(_clean_number(val), locale)} / {_fmt_value(_clean_number(mx), locale)}"
             pct = min(1.0, max(0.0, val / mx)) if mx else 0.0
             return {"text": text, "pct": pct}
         if t in ("stat", "metric") and comp.get("value") is not None:
             val = _num(comp.get("value"), values)
             label = comp.get("label")
+            shown = _fmt_value(_clean_number(val), locale)
             if isinstance(label, str) and "{" in label:
-                text = _interp(label, values)
+                text = _interp(label, values, locale)
             elif isinstance(label, str) and label:
-                text = f"{_clean_number(val)} · {label}"
+                text = f"{shown} · {label}"
             else:
-                text = str(_clean_number(val))
+                text = shown
             return {"text": text, "pct": None}
         if t == "repeater":
             # A list screen headlines as its progress: "done/total" when the

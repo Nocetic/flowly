@@ -3170,9 +3170,9 @@ def _flowlet_summary(flowlet: dict, values: dict | None = None) -> dict:
     }
     if values is not None:
         s["values"] = values
-        from flowly.flowlets.queries import flowlet_preview
+        from flowly.flowlets.card import preview_for
 
-        preview = flowlet_preview(flowlet.get("definition") or {}, values)
+        preview = preview_for(flowlet, values, _flowlet_store())
         if preview is not None:
             s["preview"] = preview
     return s
@@ -3313,12 +3313,10 @@ async def flowlets_action(params: dict) -> dict:
         return result  # a retried tap: nothing changed, nothing to fan out
     # Recompute the card headline so list tiles update live (not just the open
     # screen) — carry it in both the reply and the broadcast.
-    from flowly.flowlets.queries import flowlet_preview
+    from flowly.flowlets.card import preview_for
 
     flowlet = store.get(flowlet_id)
-    preview = (
-        flowlet_preview(flowlet.get("definition") or {}, result["values"]) if flowlet else None
-    )
+    preview = preview_for(flowlet, result["values"], store) if flowlet else None
     if preview is not None:
         result["preview"] = preview
     await _broadcast_flowlet_state(flowlet_id, result["values"], result["rev"], preview)
@@ -3457,9 +3455,9 @@ async def flowlets_capture(params: dict) -> dict:
         raise FeatureRpcError(exc.code, exc.message)
     rev = store.rev(flowlet_id)
 
-    from flowly.flowlets.queries import flowlet_preview
+    from flowly.flowlets.card import preview_for
 
-    preview = flowlet_preview(flowlet.get("definition") or {}, values)
+    preview = preview_for(store.get(flowlet_id) or flowlet, values, store)
     result = {"id": flowlet_id, "values": values, "rev": rev}
     if preview is not None:
         result["preview"] = preview
@@ -3493,11 +3491,11 @@ async def flowlets_item_remove(params: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         raise FeatureRpcError("INVALID", str(exc))
 
-    from flowly.flowlets.queries import flowlet_preview
+    from flowly.flowlets.card import preview_for
 
     values = _flowlet_values(flowlet, _flowlet_zone(flowlet, params))
     rev = store.rev(flowlet_id)
-    preview = flowlet_preview(defn, values)
+    preview = preview_for(flowlet, values, store)
     result = {"id": flowlet_id, "values": values, "rev": rev}
     if preview is not None:
         result["preview"] = preview

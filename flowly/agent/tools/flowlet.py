@@ -20,6 +20,7 @@ from loguru import logger
 
 from flowly.agent.tools.base import Tool
 from flowly.flowlets import catalog, queries
+from flowly.flowlets.card import preview_for
 from flowly.flowlets.authoring import (
     definition_parameters,
     guide,
@@ -71,7 +72,7 @@ def _summary(flowlet: dict, values: dict | None = None) -> dict:
     }
     if values is not None:
         s["values"] = values
-        preview = queries.flowlet_preview(flowlet.get("definition") or {}, values)
+        preview = preview_for(flowlet, values)
         if preview is not None:
             s["preview"] = preview
     return s
@@ -516,7 +517,7 @@ class FlowletTool(Tool):
         self._store.add_event(flowlet_id, series, value)
         values = self._values(flowlet)
         _ev = {"id": flowlet_id, "values": values, "rev": self._store.rev(flowlet_id)}
-        _pv = queries.flowlet_preview(flowlet["definition"], values)
+        _pv = preview_for(flowlet, values, self._store)
         if _pv is not None:
             _ev["preview"] = _pv
         await self._notify("flowlet.state", _ev)
@@ -534,7 +535,7 @@ class FlowletTool(Tool):
         self._store.set_state(flowlet_id, key, queries.coerce_state(kw.get("value"), spec))
         values = self._values(flowlet)
         _ev = {"id": flowlet_id, "values": values, "rev": self._store.rev(flowlet_id)}
-        _pv = queries.flowlet_preview(flowlet["definition"], values)
+        _pv = preview_for(flowlet, values, self._store)
         if _pv is not None:
             _ev["preview"] = _pv
         await self._notify("flowlet.state", _ev)

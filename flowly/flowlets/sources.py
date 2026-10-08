@@ -26,7 +26,8 @@ from typing import Any, Awaitable, Callable, Iterable
 from loguru import logger
 
 from flowly.flowlets import catalog
-from flowly.flowlets.queries import coerce_state, flowlet_preview, render_template, resolve_values
+from flowly.flowlets.card import preview_for
+from flowly.flowlets.queries import coerce_state, render_template, resolve_values
 from flowly.flowlets.store import FlowletStore
 from flowly.flowlets.store import now_ms as _now_ms
 from flowly.flowlets.zones import zone_for
@@ -324,7 +325,8 @@ class SourceEngine:
                 zone_for(self._store.get(fid), self._tz),
             )
             data = {"id": fid, "values": fresh, "rev": self._store.rev(fid)}
-            preview = flowlet_preview(defn, fresh)
+            preview = preview_for(self._store.get(fid) or {"id": fid, "definition": defn},
+                                  fresh, self._store, tz=zone_for(self._store.get(fid), self._tz))
             if preview is not None:
                 data["preview"] = preview
             try:

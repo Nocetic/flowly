@@ -681,7 +681,14 @@ class FlowletStore:
     # ── Row conversion ────────────────────────────────────────────────────────
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict:
+        from flowly.flowlets.authoring import repair_definition
+
         d = dict(row)
-        d["definition"] = _parse_json(d.get("definition"), {})
+        # Screens saved before a slip was repaired on create (a chart's
+        # `groupBy`, an `at` beside `everyMinutes`) are healed as they are
+        # read, so every reader — values, cards, clients, reminders — sees the
+        # same corrected definition. Lossless and idempotent; nothing is
+        # rewritten on disk.
+        d["definition"], _ = repair_definition(_parse_json(d.get("definition"), {}))
         d["pinned"] = bool(d.get("pinned", 0))
         return d
