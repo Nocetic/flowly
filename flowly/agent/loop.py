@@ -6076,6 +6076,17 @@ class AgentLoop:
         # block near the loop tail for the full rationale.
         self._plan_nudged_this_turn = False
         self._general_plan_nudged_this_turn = False
+        # Which general plan (and which revision of it) existed when this turn
+        # began, so the end-turn guard can tell a plan this turn worked on
+        # from one left over by an earlier conversation.
+        try:
+            from flowly.plans.manager import get_plan_manager as _gpm_start
+            _start_plan = _gpm_start().get_current(_current_session_key)
+            self._turn_start_plan = (
+                (_start_plan.id, _start_plan.updatedAt) if _start_plan else None
+            )
+        except Exception:
+            self._turn_start_plan = None
 
         # NOTE: the repetition detector that lived here was removed in
         # 2026-05-02 because it produced false positives on legitimate
@@ -7490,7 +7501,13 @@ class AgentLoop:
                             s.status in ("completed", "blocked", "skipped")
                             for s in gplan.steps
                         )
-                        if g_progress and g_unfinished:
+                        # A plan proposed or ticked during this turn counts
+                        # even with nothing finished: ending on it would leave
+                        # the tray stuck at 0/N.
+                        g_touched = getattr(self, "_turn_start_plan", None) != (
+                            gplan.id, gplan.updatedAt
+                        )
+                        if (g_progress or g_touched) and g_unfinished:
                             self._general_plan_nudged_this_turn = True
                             g_summary = ", ".join(
                                 f"#{s.id} ({s.status})" for s in g_unfinished[:5]
