@@ -519,6 +519,11 @@ class CodexResponsesProvider(LLMProvider):
             else float(request_timeout_seconds) if request_timeout_seconds
             else 180.0
         )
+        # Several tool calls per response let the model batch independent work
+        # (e.g. a plan tick alongside the real call) instead of paying one full
+        # model round trip per call. If this backend ever rejects the flag, the
+        # provider falls back to one call per response for its lifetime.
+        self._parallel_tool_calls = True
 
     def _issuer_key(self) -> str:
         account = hashlib.sha256(
@@ -696,7 +701,7 @@ class CodexResponsesProvider(LLMProvider):
             payload["tool_choice"] = (
                 tool_choice if tool_choice in {"auto", "none", "required"} else "auto"
             )
-            payload["parallel_tool_calls"] = False
+            payload["parallel_tool_calls"] = self._parallel_tool_calls
         return payload, session_id
 
     def _merge_response_state(
@@ -758,6 +763,10 @@ class CodexResponsesProvider(LLMProvider):
         payload: dict[str, Any],
     ) -> bool:
         """Mutate session-local state for one safe provider downgrade."""
+        if payload.get("parallel_tool_calls") and "parallel_tool_calls" in str(detail):
+            self._parallel_tool_calls = False
+            logger.warning("Codex backend rejected parallel tool calls; using one call per response")
+            return True
         scope = _REQUEST_SCOPE.get()
         if scope is None:
             return False

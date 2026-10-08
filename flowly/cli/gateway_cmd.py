@@ -2314,9 +2314,10 @@ Respond to the user now:"""
                 + ("; ".join(done) or "nothing yet")
                 + ". Remaining: "
                 + ("; ".join(remaining) or "none")
-                + ". Continue from where it left off, ticking each step with "
-                "plan(action='update_step') and calling plan(action='complete') "
-                "at the end. The plan is already approved — do not re-propose."
+                + ". Continue from where it left off. Report finished steps with "
+                "plan(action='update') alongside your next real tool call; the plan "
+                "completes itself when every step is done. The plan is already "
+                "approved — do not re-propose."
             )
             try:
                 await agent.process_direct(content=prompt, session_key=session_key)

@@ -7503,13 +7503,13 @@ class AgentLoop:
                                 "role": "user",
                                 "content": (
                                     f"You're ending the turn but the plan is still "
-                                    f"active. Unfinished steps: {g_summary}. Either "
-                                    f"finish them (mark each in_progress then "
-                                    f"completed with plan(action='update_step')), or "
-                                    f"if genuinely blocked call "
-                                    f"plan(action='block', summary='why'), or if the "
-                                    f"work is done call plan(action='complete'). "
-                                    f"Don't claim done if the steps aren't."
+                                    f"active. Unfinished steps: {g_summary}. If that "
+                                    f"work is done, mark them all in ONE call: "
+                                    f"plan(action='update', steps=[{{id, status: "
+                                    f"'completed'}}, ...]) (or 'skipped'). If it isn't, "
+                                    f"finish it, or call plan(action='block', "
+                                    f"summary='why') if you genuinely can't. Don't "
+                                    f"claim done if the steps aren't."
                                 ),
                                 _EPHEMERAL_NUDGE: True,
                             })

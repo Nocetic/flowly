@@ -1601,7 +1601,7 @@ class ContextBuilder:
             parts.append(f"""# Skills
 
 Scan skills below. If one matches your task, load it with `skill_view(name)` and follow its instructions.
-The flowlet tool is self-contained: use its templates/guide directly; a Flowlet task does not require a skill read.
+Skip the read when a first-class tool already documents the workflow (flowlet, cron, plan): its description, templates and guide are the contract. A skill is for knowledge a tool doesn't give you.
 Skills with available="false" need dependencies — try installing with apt/brew.
 
 {skills_summary}""")
@@ -2381,8 +2381,9 @@ When in doubt, ASK FIRST. A wrong action can't be undone.""")
                     "Relevant skills include descriptions; every remaining skill "
                     "is still named in the compact index. Load a matching skill "
                     "with `skill_view(name)` and follow it. Skills marked "
-                    "available=\"false\" need setup. The flowlet tool is self-contained: "
-                    "use its templates/guide directly; no skill read is required for Flowlets.\n\n"
+                    "available=\"false\" need setup. Skip the read when a first-class "
+                    "tool already documents the workflow (flowlet, cron, plan): its "
+                    "description, templates and guide are the contract.\n\n"
                     f"{skills_summary}"
                 )
 

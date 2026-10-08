@@ -14,6 +14,7 @@ from textual.binding import Binding
 
 from flowly.integrations import Field, FieldType, IntegrationCard
 from flowly.compaction.service import count_conversational_messages
+from flowly.plans.models import PLAN_TOOL_NAMES
 from flowly.session.manager import COMPACTION_BOUNDARY_CONTENT
 from flowly.tui.artifact_open import (
     is_external_artifact_type,
@@ -1141,6 +1142,8 @@ class FlowlyTUI(App[None]):
         if isinstance(ev, ToolStart):
             if ev.session_key and ev.session_key != self._session_key:
                 return
+            if ev.name in PLAN_TOOL_NAMES:
+                return  # the composer's checklist already shows plan progress
             if not self._current_bubble:
                 self._current_bubble = transcript.start_assistant()
                 self._current_bubble.mark_streaming(True)
@@ -1157,6 +1160,8 @@ class FlowlyTUI(App[None]):
 
         if isinstance(ev, ToolComplete):
             if ev.session_key and ev.session_key != self._session_key:
+                return
+            if ev.name in PLAN_TOOL_NAMES:
                 return
             self._refresh_command_palette_after_skill_write(ev)
             line = transcript.find_tool(ev.tool_call_id)

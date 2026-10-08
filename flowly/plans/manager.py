@@ -2,7 +2,7 @@
 
 Single ownership rule: **all durable plan mutation goes through here.** The
 proposing agent turn awaits :meth:`propose`; every surface resolves through
-:meth:`resolve_approval`; every step tick goes through :meth:`update_step`.
+:meth:`resolve_approval`; every step tick goes through :meth:`update_steps`.
 Each mutation persists (via the store) and broadcasts a full ``plan.updated``
 snapshot, so the four clients stay in sync and a re-entry can rehydrate from
 ``plan.get``.
@@ -58,6 +58,22 @@ def _cap(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+def _start_next_step(plan: GeneralPlan) -> None:
+    """Mark the first pending step in progress unless one already is.
+
+    Starting work is implied by a plan beginning or a step finishing; asking the
+    model to announce it would cost a full model round trip per step.
+    """
+    if any(s.status == "in_progress" for s in plan.steps):
+        return
+    for s in plan.steps:
+        if s.status == "pending":
+            s.status = "in_progress"  # type: ignore[assignment]
+            if s.startedAt is None:
+                s.startedAt = time.time()
+            return
+
 
 BroadcastCallback = Callable[[str, dict], Awaitable[None]]
 
@@ -177,8 +193,9 @@ class PlanManager:
             marker = "[>]" if s.status == "in_progress" else "[ ]"
             lines.append(f"- {marker} {s.id}. {s.content}")
         lines.append(
-            "Continue the remaining steps, ticking each with "
-            "plan(action='update_step') and finishing with plan(action='complete')."
+            "Continue the remaining steps. Report finished ones with "
+            "plan(action='update') alongside your next real tool call; the plan "
+            "completes itself when every step is done."
         )
         return "\n".join(lines)
 
@@ -257,6 +274,7 @@ class PlanManager:
 
         if auto_start:
             plan.approval = None
+            _start_next_step(plan)
             self._store.save(plan)
             await self._broadcast(plan)
             return plan, PlanDecision("approve", via="policy")
@@ -333,6 +351,8 @@ class PlanManager:
             # A live proposing turn will execute now; without one (restart
             # window) the plan is approved-but-idle until plan.resume runs it.
             plan.status = "executing" if live_turn else "approved"
+            if live_turn:
+                _start_next_step(plan)
             plan.touch("approved")
             # Approval ENDS the standing mode — the same contract Claude
             # Code's plan mode keeps: plan → approve → execute in whatever
@@ -365,23 +385,54 @@ class PlanManager:
         *,
         note: Optional[str] = None,
     ) -> Optional[GeneralPlan]:
+        return await self.update_steps(
+            plan_id, [{"id": step_id, "status": status, "note": note}]
+        )
+
+    async def update_steps(
+        self, plan_id: str, updates: list[dict[str, Any]]
+    ) -> Optional[GeneralPlan]:
+        """Apply several step transitions as ONE mutation (one save, one
+        broadcast), then let the plan advance itself.
+
+        Progress bookkeeping is the server's job, not a model round trip each:
+        when a step finishes and nothing is in progress, the next pending step
+        starts; when every step is completed or skipped, the plan completes.
+        A ``blocked`` step never auto-completes the plan. Callers validate ids
+        and statuses first — an unknown id here aborts the whole batch.
+        """
         plan = self._store.get(plan_id)
         if not plan:
             return None
-        step = plan.get_step(step_id)
-        if not step:
+        if any(not plan.get_step(u.get("id")) for u in updates):
             return None
         now = time.time()
-        if status == "in_progress" and step.startedAt is None:
-            step.startedAt = now
-        if status in ("completed", "blocked", "skipped") and step.completedAt is None:
-            step.completedAt = now
-        step.status = status  # type: ignore[assignment]
-        if note is not None:
-            step.note = _cap(note, MAX_NOTE_CHARS)
+        finished_any = False
+        for u in updates:
+            step = plan.get_step(u["id"])
+            status = u.get("status") or "in_progress"
+            if status == "in_progress" and step.startedAt is None:
+                step.startedAt = now
+            if status in ("completed", "blocked", "skipped"):
+                if step.completedAt is None:
+                    step.completedAt = now
+                if step.startedAt is None:
+                    step.startedAt = now
+                finished_any = finished_any or status != "blocked"
+            step.status = status  # type: ignore[assignment]
+            if u.get("note") is not None:
+                step.note = _cap(str(u["note"]), MAX_NOTE_CHARS)
         if plan.status in ("approved", "paused"):
             plan.status = "executing"
-        plan.touch(f"step {step_id} → {status}")
+        label = ", ".join(f"step {u['id']} → {u.get('status') or 'in_progress'}" for u in updates)
+        if finished_any:
+            _start_next_step(plan)
+        if plan.status == "executing" and plan.steps and all(
+            s.status in ("completed", "skipped") for s in plan.steps
+        ):
+            plan.status = "completed"
+            label += "; all steps done"
+        plan.touch(label)
         self._store.save(plan)
         await self._broadcast(plan)
         return plan
@@ -440,6 +491,7 @@ class PlanManager:
         if not plan or plan.status not in ("paused", "approved"):
             return None
         plan.status = "executing"
+        _start_next_step(plan)
         plan.touch("resumed")
         self._store.save(plan)
         await self._broadcast(plan)
