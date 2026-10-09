@@ -22,6 +22,7 @@ resolved values and the event log, so it costs nothing to keep live.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, tzinfo
 from typing import Any
 
@@ -116,6 +117,23 @@ def _clean(v: float) -> int | float:
     return int(v) if float(v).is_integer() else round(v, 2)
 
 
+_PLACEHOLDER_RE = re.compile(r"\{[a-zA-Z][a-zA-Z0-9_]*\}")
+_UNIT_RE = re.compile(r"^[^\d\s/{}]{1,6}$")
+
+
+def _unit(comp: dict) -> str | None:
+    """The component's unit: its own ``unit``, else what a label like
+    "{today_ml} ml" or "{last_night}h" leaves around its number."""
+    if isinstance(comp.get("unit"), str) and comp["unit"].strip():
+        return comp["unit"].strip()
+    label = comp.get("label")
+    if isinstance(label, str) and len(_PLACEHOLDER_RE.findall(label)) == 1:
+        rest = _PLACEHOLDER_RE.sub("", label).strip()
+        if _UNIT_RE.match(rest):
+            return rest
+    return None
+
+
 def _figure(defn: dict, values: dict) -> dict | None:
     """The headline number, in reading order: the first goal (progress, ring,
     gauge), stat or metric, or a list's done/total."""
@@ -132,8 +150,8 @@ def _figure(defn: dict, values: dict) -> dict | None:
             fig: dict = {"value": _clean(val), "max": _clean(mx)}
             if label:
                 fig["label"] = label
-            if isinstance(comp.get("unit"), str) and comp["unit"].strip():
-                fig["unit"] = comp["unit"].strip()
+            if _unit(comp):
+                fig["unit"] = _unit(comp)
             return fig
         if t in ("stat", "metric") and comp.get("value") is not None:
             val = _scalar(comp.get("value"), values)
@@ -142,8 +160,8 @@ def _figure(defn: dict, values: dict) -> dict | None:
             fig = {"value": _clean(val)}
             if label:
                 fig["label"] = label
-            if isinstance(comp.get("unit"), str) and comp["unit"].strip():
-                fig["unit"] = comp["unit"].strip()
+            if _unit(comp):
+                fig["unit"] = _unit(comp)
             return fig
         if t == "repeater":
             items = values.get(comp.get("source") or "")

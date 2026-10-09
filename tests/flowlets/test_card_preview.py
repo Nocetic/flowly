@@ -53,7 +53,7 @@ def test_a_goal_fills_the_card_and_numbers_speak_the_screen_language():
     c = card(defn, events=events)
 
     assert c["fill"] == 1.0
-    assert c["figure"]["value"] == 2250 and c["figure"]["max"] == 2000
+    assert c["figure"] == {"value": 2250, "max": 2000, "unit": "ml"}   # unit read off "{today_ml} ml"
     assert c["portrait"]["v"][-1] == 1.0
 
 
