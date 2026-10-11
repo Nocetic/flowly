@@ -208,27 +208,31 @@ def run(directory: Path, generation: str) -> None:
             write_xauthority(xauthority, account=application.account if application else None)
             env = application.environment() if application else application_environment(directory, application_sockets)
             env.update(XDG_CURRENT_DESKTOP="XFCE", XDG_SESSION_TYPE="x11", SHELL="/bin/bash")
-            if application:
-                # The root supervisor keeps its own control sockets. Only this
-                # private unprivileged bus is forwarded to the applications.
-                bus = application_sockets / "bus"
-                bus.unlink(missing_ok=True)
-                read_fd, write_fd = os.pipe()
-                try:
-                    address = "unix:path=" + str(bus)
-                    spawn(["dbus-daemon", "--session", "--nofork", "--nopidfile",
-                           "--address=" + address, "--print-address=" + str(write_fd)], env, pass_fds=(write_fd,))
+            # Every runtime starts its own session bus with the desktop's
+            # environment. Services it activates (xfconfd) inherit the
+            # bus daemon's environment: an outer bus (the launcher's
+            # dbus-run-session) would point them at the agent's own
+            # ~/.config, ignoring Flowly's dock and theme and writing the
+            # person's Xfce settings. The root supervisor keeps its own
+            # control sockets; only this private bus reaches the applications.
+            bus = application_sockets / "bus"
+            bus.unlink(missing_ok=True)
+            read_fd, write_fd = os.pipe()
+            try:
+                address = "unix:path=" + str(bus)
+                spawn(["dbus-daemon", "--session", "--nofork", "--nopidfile",
+                       "--address=" + address, "--print-address=" + str(write_fd)], env, pass_fds=(write_fd,))
+                os.close(write_fd)
+                write_fd = -1
+                wait_for(lambda: select.select([read_fd], [], [], 0)[0])
+                actual = os.read(read_fd, 1024).strip().decode("ascii")
+                if re.fullmatch(re.escape(address) + r",guid=[a-f0-9]{32}", actual) is None:
+                    raise ScreenError("RUNTIME_START_FAILED")
+                env["DBUS_SESSION_BUS_ADDRESS"] = actual
+            finally:
+                os.close(read_fd)
+                if write_fd >= 0:
                     os.close(write_fd)
-                    write_fd = -1
-                    wait_for(lambda: select.select([read_fd], [], [], 0)[0])
-                    actual = os.read(read_fd, 1024).strip().decode("ascii")
-                    if re.fullmatch(re.escape(address) + r",guid=[a-f0-9]{32}", actual) is None:
-                        raise ScreenError("RUNTIME_START_FAILED")
-                    env["DBUS_SESSION_BUS_ADDRESS"] = actual
-                finally:
-                    os.close(read_fd)
-                    if write_fd >= 0:
-                        os.close(write_fd)
             rfb.unlink(missing_ok=True)
             read_fd, write_fd = os.pipe()
             try:
