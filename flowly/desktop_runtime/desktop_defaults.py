@@ -167,9 +167,12 @@ applications = directory(data / "applications")
 xfce = directory(config / "xfce4")
 xfconf = directory(xfce / "xfconf")
 channels = directory(xfconf / "xfce-perchannel-xml")
-browser, profile = sys.argv[1:]
+browser, profile, accent = (sys.argv[1:] + [""])[:3]
 if not Path(browser).is_absolute() or not Path(profile).is_absolute():
     raise ValueError("application paths must be absolute")
+# A named bot's avatar colour, or "" for the main agent's neutral black.
+if accent and (len(accent) != 7 or accent[0] != "#" or any(c not in "0123456789abcdef" for c in accent[1:])):
+    raise ValueError("invalid accent colour")
 launcher = runtime / "launch-browser"
 if any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-" for character in str(launcher)):
     raise ValueError("invalid launcher path")
@@ -238,8 +241,21 @@ seed(channels / "xfce4-panel.xml", '''<?xml version="1.0" encoding="UTF-8"?>
 </channel>
 ''')
 gtk = directory(config / "gtk-3.0")
+if accent:
+    red, green, blue = (int(accent[index:index + 2], 16) / 255 for index in (1, 3, 5))
+    luminance = sum(weight * (value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4)
+                    for weight, value in zip((0.2126, 0.7152, 0.0722), (red, green, blue)))
+    ink = "#111318" if luminance > 0.45 else "#ffffff"
+    # Without a compositor nothing paints outside a rounded dock: its corners
+    # would show black on a coloured wallpaper. Square on colour, rounded on black.
+    themed = (".xfce4-panel { border-radius: 0; }\n"
+              ".xfce4-panel button:hover { background-color: alpha(" + accent + ", 0.32); }\n"
+              "selection, *:selected, *:selected:focus { background-color: " + accent + "; color: " + ink + "; }\n")
+else:
+    themed = ".xfce4-panel button:hover { background-color: #41444c; }\n"
+# Flowly's own file: rewritten on every start, so the theme follows the bot's colour.
 seed(gtk / "gtk.css", '''
-/* Only the remote desktop dock; application widgets retain their own theme. */
+/* Only the remote desktop dock and selection; application widgets keep their theme. */
 .xfce4-panel {
   background-color: #24262b;
   border: 1px solid #41444c;
@@ -251,6 +267,5 @@ seed(gtk / "gtk.css", '''
   border-radius: 10px;
   box-shadow: none;
 }
-.xfce4-panel button:hover { background-color: #41444c; }
-''')
+''' + themed, managed=True)
 """

@@ -31,9 +31,9 @@ def application(tmp_path):
     return environment, browser, profile
 
 
-def seed(application):
+def seed(application, *accent):
     environment, browser, profile = application
-    return subprocess.run([sys.executable, "-I", "-c", DESKTOP_DEFAULTS_SOURCE, str(browser), str(profile)],
+    return subprocess.run([sys.executable, "-I", "-c", DESKTOP_DEFAULTS_SOURCE, str(browser), str(profile), *accent],
                           env=environment, capture_output=True, text=True, timeout=10)
 
 
@@ -100,3 +100,21 @@ def test_dock_entries_use_flowly_icons_and_replace_older_theme_names(application
         assert icon.parent == Path(environment["XDG_DATA_HOME"]) / "flowly-dock"
         assert icon.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
         assert icon.stat().st_mode & 0o777 == 0o600
+
+
+def test_theme_follows_the_bot_colour_and_the_main_agent_stays_neutral(application):
+    environment, _, _ = application
+    css = Path(environment["XDG_CONFIG_HOME"]) / "gtk-3.0" / "gtk.css"
+    assert seed(application, "#3b82f6").returncode == 0
+    assert "alpha(#3b82f6, 0.32)" in css.read_text()
+    assert "background-color: #3b82f6; color: #ffffff" in css.read_text()
+    # A recoloured bot's next start rewrites Flowly's own file.
+    assert seed(application, "#e7c940").returncode == 0
+    assert "#3b82f6" not in css.read_text() and "color: #111318" in css.read_text()
+    assert seed(application).returncode == 0
+    assert "#e7c940" not in css.read_text() and "*:selected" not in css.read_text()
+
+
+@pytest.mark.parametrize("accent", ["red", "#FFF", "#12345g", "#1234567", "#3b82f6; }"])
+def test_an_invalid_accent_is_refused(application, accent):
+    assert seed(application, accent).returncode != 0

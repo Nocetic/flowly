@@ -261,9 +261,27 @@ def run(directory: Path, generation: str) -> None:
             browser_command = screen_browser()
             if browser_command is None:
                 raise ScreenError("DEPENDENCIES_MISSING")
+            from flowly.desktop_runtime.desktop_color import ROOT_COLOR_SOURCE, screen_color
+
+            # A named bot's screen wears its avatar colour; the main agent's
+            # stays the server's black. A colour that cannot be read is black.
+            try:
+                color = screen_color(directory)
+            except Exception:
+                color = None
             if not application_check(["python3", "-I", "-c", DESKTOP_DEFAULTS_SOURCE,
-                                      browser_command, str(browser_profile)], env):
+                                      browser_command, str(browser_profile), color or ""], env):
                 raise ScreenError("RUNTIME_START_FAILED")
+            if color:
+                application_check(["python3", "-I", "-c", ROOT_COLOR_SOURCE, color], env)
+            metadata = directory.parent / "profile.json"
+
+            def metadata_stamp():
+                try:
+                    info = metadata.stat()
+                except OSError:
+                    return None
+                return info.st_mtime_ns, info.st_size
             # No compositor: in a software-only Xvnc it roughly doubled the
             # window manager's and server's CPU for every repaint. No xfdesktop:
             # the screen keeps the server's plain black root window, identical
@@ -326,10 +344,23 @@ def run(directory: Path, generation: str) -> None:
             state.update(phase="running", display=env["DISPLAY"], socket=str(rfb),
                          cdpPort=port, inputServiceVersion=3, observerServiceVersion=3, captureServiceVersion=1, error=None)
             write_state(runtime.manifest, state)
+            stamp, ticks = metadata_stamp(), 0
             while not stopping:
                 if (not input_service.is_alive or not observers.is_alive or not captures.is_alive
                         or any(process_identity(child.pid) is None for child in processes)):
                     raise ScreenError("RUNTIME_FAILED")
+                ticks += 1
+                if ticks % 10 == 0 and (current := metadata_stamp()) != stamp:
+                    # The owner recoloured the bot: the desktop follows within
+                    # seconds (dock and selection on the next start).
+                    stamp = current
+                    try:
+                        recolored = screen_color(directory)
+                    except Exception:
+                        recolored = color
+                    if recolored != color:
+                        color = recolored
+                        application_check(["python3", "-I", "-c", ROOT_COLOR_SOURCE, color or "#000000"], env)
                 current_port = browser_port()
                 if state.get("cdpPort") != current_port:
                     state["cdpPort"] = current_port

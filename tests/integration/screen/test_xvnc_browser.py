@@ -1312,3 +1312,42 @@ def test_screen_clipboard_never_reaches_viewers(tmp_path, login_site):
             except socket.timeout:
                 pass
             assert b"copied-secret-4711" not in received
+
+
+def test_a_named_bots_desktop_wears_its_avatar_colour_and_follows_a_recolour():
+    import json
+    import shutil
+    import time
+
+    from flowly.desktop_runtime.desktop_color import avatar_color
+    from tests.integration.screen.test_desktop_session import framebuffer
+
+    home = Path.home() / ".flowly" / "profiles" / "painter"
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True)
+    (home / "profile.json").write_text(json.dumps({"markTone": "#3b82f6"}))
+    try:
+        with running_screen(home / "desktop") as screen:
+            def corner(top=False):
+                width, height, pixel = framebuffer(screen["socket"])
+                return "#%02x%02x%02x" % pixel(4, 4 if top else height - 4)
+
+            def wait_for(expected, top=False):
+                deadline = time.monotonic() + 10
+                while (value := corner(top)) != expected and time.monotonic() < deadline:
+                    time.sleep(0.2)
+                return value
+
+            assert wait_for("#3b82f6") == "#3b82f6"
+            # The runtime's own bus serves the runtime's own Xfce settings:
+            # Flowly's single dock, not the stock top panel a session bus
+            # inherited from the agent (its ~/.config) would start.
+            assert wait_for("#3b82f6", top=True) == "#3b82f6"
+            css = (home / "desktop" / "config" / "gtk-3.0" / "gtk.css")
+            if css.exists():  # the application account's tree may be private
+                assert "#3b82f6" in css.read_text()
+            # The owner recolours the bot while its screen runs.
+            (home / "profile.json").write_text(json.dumps({"markTone": "", "markSeed": 1}))
+            assert wait_for(avatar_color("painter", "", 1)) == avatar_color("painter", "", 1)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
