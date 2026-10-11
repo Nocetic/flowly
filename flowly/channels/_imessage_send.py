@@ -35,7 +35,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from flowly.profile import get_flowly_home
+from flowly.profile import desktop_bridge_file
 
 OSASCRIPT_TIMEOUT = 10  # a stuck consent prompt must not wedge the dispatcher
 HELPER_TIMEOUT = 15  # helper re-execs itself + may surface a consent prompt
@@ -160,7 +160,7 @@ def split_bubbles(text: str, limit: int = MAX_BUBBLE_CHARS) -> list[str]:
 
 
 def _electron_api_file() -> Path:
-    return get_flowly_home() / "electron-api.json"
+    return desktop_bridge_file()
 
 
 def _send_via_electron_sync(payload: dict) -> str | None:

@@ -27,8 +27,8 @@ from loguru import logger
 from flowly.agent.tools.base import Tool
 
 def _electron_api_file() -> Path:
-    from flowly.profile import get_flowly_home
-    return get_flowly_home() / "electron-api.json"
+    from flowly.profile import desktop_bridge_file
+    return desktop_bridge_file()
 _PLATFORM = sys.platform  # "darwin", "linux", "win32"
 
 
@@ -321,7 +321,64 @@ class ComputerTool(Tool):
         else:
             result = {"error": f"Unsupported platform: {_PLATFORM}"}
 
-        return json.dumps({"action": action, **result})
+        return json.dumps({"action": action, **self._explain_fallback_error(action, result)})
+
+    # The last tier's raw errors are opaque to the agent and to the owner it
+    # reports to: "Unknown action" for an action that only the Desktop helper
+    # implements, a bare AppleScript code when macOS refused the call. Say
+    # what is actually wrong and, for a permission, where to grant it.
+    _AUTOMATION_DENIED_MARKERS = ("(-10004)", "(-1743)", "Not authorized to send Apple events")
+    _ACCESSIBILITY_DENIED_MARKERS = ("(-25211)", "not allowed assistive access")
+
+    def _explain_fallback_error(self, action: str, result: dict) -> dict:
+        error = result.get("error")
+        if not isinstance(error, str):
+            return result
+        if error == f"Unknown action: {action}":
+            valid = self.parameters["properties"]["action"]["enum"]
+            if action not in valid:
+                return {
+                    "error": f"Unknown action: {action}. Valid actions: {', '.join(valid)}",
+                    "error_kind": "INVALID_PARAMS",
+                    "retryable": False,
+                }
+            if _PLATFORM == "darwin":
+                return {
+                    "error": (
+                        f"{action} needs the Flowly Desktop app's native helper, which is not reachable. "
+                        "Ask the owner to open Flowly Desktop, then try again."
+                    ),
+                    "error_kind": "HELPER_NOT_AVAILABLE",
+                    "retryable": False,
+                }
+            return {
+                "error": f"{action} is not supported on {_PLATFORM}.",
+                "error_kind": "UNSUPPORTED_PLATFORM",
+                "retryable": False,
+            }
+        if any(marker in error for marker in self._AUTOMATION_DENIED_MARKERS):
+            return {
+                "error": (
+                    "macOS blocked controlling another app (Automation permission). The owner can allow it in "
+                    "System Settings → Privacy & Security → Automation, or open Flowly Desktop, whose helper "
+                    "already has access."
+                ),
+                "error_kind": "AUTOMATION_PERMISSION_DENIED",
+                "retryable": False,
+                "detail": error,
+            }
+        if any(marker in error for marker in self._ACCESSIBILITY_DENIED_MARKERS):
+            return {
+                "error": (
+                    "macOS blocked controlling the keyboard and mouse (Accessibility permission). The owner can "
+                    "allow it in System Settings → Privacy & Security → Accessibility, or open Flowly Desktop, "
+                    "whose helper already has access."
+                ),
+                "error_kind": "ACCESSIBILITY_PERMISSION_DENIED",
+                "retryable": False,
+                "detail": error,
+            }
+        return result
 
     # -- Helpers ---------------------------------------------------------------
 

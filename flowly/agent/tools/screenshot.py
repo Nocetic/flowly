@@ -16,8 +16,8 @@ from flowly.agent.tools.base import Tool
 
 # Electron desktop app API discovery file
 def _electron_api_file() -> Path:
-    from flowly.profile import get_flowly_home
-    return get_flowly_home() / "electron-api.json"
+    from flowly.profile import desktop_bridge_file
+    return desktop_bridge_file()
 
 
 class ScreenshotTool(Tool):

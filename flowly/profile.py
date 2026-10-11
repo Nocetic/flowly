@@ -182,6 +182,18 @@ def default_home() -> Path:
     return _DEFAULT_HOME
 
 
+def desktop_bridge_file() -> Path:
+    """Flowly Desktop's local API discovery file (port + token).
+
+    The Desktop app writes it once, into the canonical home: there is one app
+    per machine, whichever agents it runs. A named agent's ``FLOWLY_HOME`` is
+    its own profile directory, so the file must be looked up here, not there,
+    or that agent never reaches the app's native helper, screenshots or
+    iMessage bridge.
+    """
+    return _DEFAULT_HOME / "electron-api.json"
+
+
 def is_default_home() -> bool:
     """True iff the active ``FLOWLY_HOME`` is the default (``~/.flowly``)."""
     return get_flowly_home() == _DEFAULT_HOME
