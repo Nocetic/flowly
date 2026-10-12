@@ -809,9 +809,29 @@ docker run --rm --user 0 --cap-add SYS_RESOURCE --cap-add NET_ADMIN --security-o
     tests/test_screen_runtime_account.py -q -p no:cacheprovider
 ```
 
-Root hosts guard each profile browser's DevTools port with nftables (only root may connect);
-`NET_ADMIN` stands in for a real root host here. Without it a screen refuses to start with
-`SCREEN_ISOLATION_UNAVAILABLE`.
+Root hosts guard each profile browser's DevTools port with nftables; `NET_ADMIN` stands in
+for a real root host here. Without it a screen refuses to start with
+`SCREEN_ISOLATION_UNAVAILABLE`. This container has no systemd, so the rule admits any root
+socket (`devtoolsAdmission: "root"`).
+
+On systemd hosts each named agent's gateway runs in its own scope and the rule admits only
+the profile's own agent (`agent_scope`, `devtoolsAdmission: "agent"`). Run the same suite in
+a disposable systemd-as-PID-1 container (`Dockerfile.resource-scope`), from a transient scope
+so the test process has a real cgroup of its own:
+
+```sh
+docker run -d --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock --shm-size=512m \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" flowly-screen-scope-test:bookworm
+docker exec <container> sh -c 'cd /workspace && systemd-run --scope --quiet --collect \
+  -E PYTHONPATH=/workspace -E FLOWLY_SCREEN_ACCOUNT_TEST=1 -E HOME=/root -E "PATH=$PATH" -- \
+  python -m pytest tests/integration/screen/test_runtime_account.py -q -p no:cacheprovider'
+```
+
+`test_only_a_profiles_own_agent_reaches_its_browser` starts alpha's screen and two agents the
+way the profile host starts named gateways: alpha's reaches its browser, beta's and the test's
+own root process are refused, and a restarted alpha is admitted again. With the earlier
+root-only rule beta reaches alpha's browser. `test_a_named_agent_stops_and_restarts_with_the_gateway_service`
+checks the agent scope stops with its gateway's service. Use a fresh container per run.
 
 The Desktop runner accepts `FLOWLY_SCREEN_ROOT_TEST=1` to select the root fixture;
 without it the existing unprivileged fixture is unchanged. Its test-only bootstrap
