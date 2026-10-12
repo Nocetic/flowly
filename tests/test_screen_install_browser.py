@@ -40,6 +40,7 @@ def worker(tmp_path, monkeypatch):
     module = types.ModuleType("screen_browser_test")
     exec(compile(RECIPE_SOURCE + BROWSER_SOURCE, "<screen-browser>", "exec"), module.__dict__)
     module.BROWSER_ROOT = str(tmp_path / "opt" / "flowly-screen" / "chromium")
+    module.BROWSER_POLICY_DIRECTORY = str(tmp_path / "etc" / "opt" / "chrome_for_testing" / "policies" / "managed")
     module.PINNED_BROWSER = {"version": "1.2.3", "x86_64": {
         "directory": "chrome-linux64", "size": len(GOOD), "sha256": hashlib.sha256(GOOD).hexdigest(),
         "urls": ["https://first.example/chrome.zip", "https://second.example/chrome.zip"]}}
@@ -215,3 +216,57 @@ def test_the_browser_is_started_with_one_window_class_and_no_testing_bar_for_the
     assert '"--class=chromium"' in BROWSER_MANAGER_SOURCE
     assert '["--test-type"] if browser.startswith("/opt/flowly-screen/chromium/")' in BROWSER_MANAGER_SOURCE
     assert "--no-sandbox" not in BROWSER_MANAGER_SOURCE
+
+
+def policy(worker):
+    return worker.Path(worker.BROWSER_POLICY_DIRECTORY) / "flowly-screen.json"
+
+
+def test_chrome_for_testing_gets_the_policy_that_hides_its_testing_bar(worker):
+    worker.install_pinned_browser("x86_64")
+    assert json.loads(policy(worker).read_text()) == {"CommandLineFlagSecurityWarningsEnabled": False}
+    assert stat.S_IMODE(policy(worker).stat().st_mode) == 0o644
+    assert sorted(path.name for path in policy(worker).parent.iterdir()) == ["flowly-screen.json"]
+    written = policy(worker).stat().st_ino
+    worker.install_pinned_browser("x86_64")
+    assert policy(worker).stat().st_ino == written  # unchanged: not rewritten
+
+
+def test_a_browser_installed_before_the_policy_gets_it_without_a_download(worker):
+    worker.install_pinned_browser("x86_64")
+    policy(worker).unlink()
+    worker.served.clear()  # any download now would fail
+    worker.install_pinned_browser("x86_64")
+    assert policy(worker).exists()
+
+
+def test_a_changed_policy_file_is_put_back(worker):
+    worker.install_pinned_browser("x86_64")
+    policy(worker).write_text('{"CommandLineFlagSecurityWarningsEnabled": true}\n')
+    worker.install_browser_policy("x86_64")
+    assert json.loads(policy(worker).read_text()) == {"CommandLineFlagSecurityWarningsEnabled": False}
+
+
+def test_the_arm64_chromium_build_gets_no_policy(worker):
+    worker.PINNED_BROWSER["aarch64"] = dict(worker.PINNED_BROWSER["x86_64"], directory="chrome-linux")
+    worker.install_browser_policy("aarch64")
+    assert not policy(worker).exists()
+
+
+@pytest.mark.parametrize("root, browser, called", [
+    (True, "/opt/flowly-screen/chromium/145.0.7632.6/chrome-linux64/chrome", True),
+    (False, "/opt/flowly-screen/chromium/145.0.7632.6/chrome-linux64/chrome", False),
+    (True, "/usr/bin/chromium", False),
+])
+def test_a_root_screen_start_gives_an_installed_pinned_browser_its_policy(monkeypatch, root, browser, called):
+    from flowly.desktop_runtime import install_recipe
+
+    calls = []
+    monkeypatch.setattr(install_recipe.os, "geteuid", lambda: 0 if root else 1000)
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    monkeypatch.setitem(install_recipe._BROWSER, "install_browser_policy", calls.append)
+    install_recipe.ensure_browser_policy(browser)
+    assert calls == (["x86_64"] if called else [])
+    # Never fatal: the screen still starts, only with the bar.
+    monkeypatch.setitem(install_recipe._BROWSER, "install_browser_policy", lambda _machine: 1 / 0)
+    install_recipe.ensure_browser_policy(browser)

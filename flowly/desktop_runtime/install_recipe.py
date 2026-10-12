@@ -206,6 +206,14 @@ from pathlib import PurePosixPath as _BrowserPurePath
 
 BROWSER_MANIFEST = "browser.json"
 DOWNLOAD_SECONDS = 600
+# Chrome for Testing (the x86_64 build) puts a "only for automated testing"
+# bar in every window. --test-type does not hide it: Chromium adds it before
+# that switch is read (chrome/browser/ui/startup/infobar_utils.cc). Only this
+# managed policy does; Chrome then lists itself as managed. Arm64's Chromium
+# build has no such bar.
+BROWSER_POLICY_DIRECTORY = "/etc/opt/chrome_for_testing/policies/managed"
+BROWSER_POLICY_FILE = "flowly-screen.json"
+BROWSER_POLICY = {"CommandLineFlagSecurityWarningsEnabled": False}
 
 class BrowserInstallError(Exception):
     """code: INSTALL_DOWNLOAD_FAILED or INSTALL_BROWSER_FAILED; nothing half-done."""
@@ -297,10 +305,40 @@ def _extract(archive, build, staging):
             # Never keep setuid/setgid or group/other write bits from an archive.
             os.chmod(target, 0o755 if mode & 0o111 else 0o644)
 
+def install_browser_policy(machine):
+    """Publish the pinned Chrome for Testing build's policy; idempotent."""
+    if PINNED_BROWSER[machine]["directory"] != "chrome-linux64":
+        return
+    directory = Path(BROWSER_POLICY_DIRECTORY)
+    _root_directory(directory, create=True)
+    path = directory / BROWSER_POLICY_FILE
+    text = json.dumps(BROWSER_POLICY, sort_keys=True) + "\n"
+    try:
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd) as source:
+                if source.read(4096) == text:
+                    return
+    except FileNotFoundError:
+        pass
+    fd, name = tempfile.mkstemp(prefix=".flowly-screen-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as output:
+            output.write(text)
+            output.flush()
+            os.fchmod(output.fileno(), 0o644)
+            os.fsync(output.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
 def install_pinned_browser(machine):
     """Download, verify and publish the pinned browser; the manifest last."""
     version, build = PINNED_BROWSER["version"], PINNED_BROWSER[machine]
     if browser_manifest_valid(version, machine):
+        install_browser_policy(machine)
         return
     root = Path(BROWSER_ROOT)
     _root_directory(root, create=True)
@@ -333,6 +371,7 @@ def install_pinned_browser(machine):
         os.unlink(archive)
         if staging is not None:
             _browser_shutil.rmtree(staging, ignore_errors=True)
+    install_browser_policy(machine)
 
 def apparmor_profile_text(abi=True):
     return ("# Flowly Screen: only the pinned Chromium may create the user namespaces its\n"
@@ -384,6 +423,22 @@ def screen_browser() -> str | None:
         if found and not _snap(found):
             return os.path.abspath(found)
     return None
+
+
+def ensure_browser_policy(browser: str) -> None:
+    """On a root host, give an already installed pinned browser its policy at
+    screen start, so hosts installed before it need no new installation.
+    Best effort: without it the browser only shows its testing bar."""
+    import platform
+
+    machine = platform.machine()
+    if (not hasattr(os, "geteuid") or os.geteuid() != 0 or machine not in PINNED_BROWSER
+            or not browser.startswith(BROWSER_ROOT + "/")):
+        return
+    try:
+        _BROWSER["install_browser_policy"](machine)
+    except Exception:
+        pass
 
 
 def _snap(path: str) -> bool:

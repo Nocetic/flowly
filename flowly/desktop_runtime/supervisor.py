@@ -267,6 +267,9 @@ def run(directory: Path, generation: str) -> None:
             browser_command = screen_browser()
             if browser_command is None:
                 raise ScreenError("DEPENDENCIES_MISSING")
+            from flowly.desktop_runtime.install_recipe import ensure_browser_policy
+
+            ensure_browser_policy(browser_command)
             from flowly.desktop_runtime.desktop_color import ROOT_COLOR_SOURCE, screen_color
 
             # A named bot's screen wears its avatar colour; the main agent's
