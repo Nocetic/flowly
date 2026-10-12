@@ -118,3 +118,39 @@ def test_theme_follows_the_bot_colour_and_the_main_agent_stays_neutral(applicati
 @pytest.mark.parametrize("accent", ["red", "#FFF", "#12345g", "#1234567", "#3b82f6; }"])
 def test_an_invalid_accent_is_refused(application, accent):
     assert seed(application, accent).returncode != 0
+
+
+def test_a_dock_kept_from_an_earlier_release_shows_the_current_entries(application):
+    """xfce4-panel copies launcher entries on first start and keeps the copies:
+    an upgraded profile would show the old release's icons forever."""
+    environment, _, _ = application
+    config = Path(environment["XDG_CONFIG_HOME"])
+    for leaf in ("xfce4", "xfce4/panel", "xfce4/xfconf", "xfce4/xfconf/xfce-perchannel-xml"):
+        (config / leaf).mkdir(mode=0o700)  # private, as the desktop account keeps them
+    copied = config / "xfce4" / "panel" / "launcher-1"
+    copied.mkdir(mode=0o700)
+    (copied / "17918055181.desktop").write_text("[Desktop Entry]\nName=Browser\nIcon=web-browser\n")
+    kept = config / "xfce4" / "panel" / "launcher-2"
+    kept.mkdir(mode=0o700)
+    (kept / "notes.txt").write_text("not a launcher entry")
+    channel = config / "xfce4" / "xfconf" / "xfce-perchannel-xml" / "xfce4-panel.xml"
+    channel.write_text('<channel name="xfce4-panel"><value type="string" value="17918055181.desktop"/></channel>')
+    channel.chmod(0o600)
+    assert seed(application).returncode == 0
+    assert not copied.exists()
+    assert (kept / "notes.txt").exists()
+    assert "17918055181.desktop" not in channel.read_text()
+    assert "flowly-browser.desktop" in channel.read_text()
+
+
+def test_a_linked_panel_launcher_directory_is_refused(application, tmp_path):
+    environment, _, _ = application
+    panel = Path(environment["XDG_CONFIG_HOME"]) / "xfce4" / "panel"
+    panel.parent.mkdir(mode=0o700)
+    panel.mkdir(mode=0o700)
+    outside = tmp_path / "outside-launcher"
+    outside.mkdir()
+    (outside / "keep.desktop").write_text("preserve")
+    (panel / "launcher-1").symlink_to(outside)
+    assert seed(application).returncode != 0
+    assert (outside / "keep.desktop").read_text() == "preserve"

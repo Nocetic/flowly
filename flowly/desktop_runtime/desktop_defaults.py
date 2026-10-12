@@ -214,6 +214,29 @@ seed(channels / "xsettings.xml", '''<?xml version="1.0" encoding="UTF-8"?>
   <property name="Gtk" type="empty"><property name="FontName" type="string" value="Sans 10"/></property>
 </channel>
 ''')
+# The dock is Flowly's own. xfce4-panel copies each launcher's entry into
+# xfce4/panel/launcher-N/ on first start and keeps using that copy, so a later
+# release's entries (new icons) would never show. Drop the copies of Flowly's
+# launchers and point the dock at the current entries again on every start;
+# the panel copies them afresh.
+panel = xfce / "panel"
+try:
+    launchers = list(panel.iterdir())
+except FileNotFoundError:
+    launchers = []
+for launcher in launchers:
+    if not launcher.name.startswith("launcher-") or not launcher.name[9:].isdigit():
+        continue
+    info = launcher.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise ValueError("invalid panel launcher directory")
+    for entry in launcher.iterdir():
+        if entry.name.endswith(".desktop") and stat.S_ISREG(entry.lstat().st_mode):
+            entry.unlink()
+    try:
+        launcher.rmdir()
+    except OSError:
+        pass  # something else lives there; leave it
 seed(channels / "xfce4-panel.xml", '''<?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfce4-panel" version="1.0">
   <property name="configver" type="int" value="2"/>
@@ -239,7 +262,7 @@ seed(channels / "xfce4-panel.xml", '''<?xml version="1.0" encoding="UTF-8"?>
     <property name="plugin-3" type="string" value="launcher"><property name="items" type="array"><value type="string" value="flowly-settings.desktop"/></property></property>
   </property>
 </channel>
-''')
+''', managed=True)
 gtk = directory(config / "gtk-3.0")
 if accent:
     red, green, blue = (int(accent[index:index + 2], 16) / 255 for index in (1, 3, 5))
