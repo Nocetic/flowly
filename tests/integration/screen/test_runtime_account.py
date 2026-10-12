@@ -295,7 +295,7 @@ def test_root_agent_runs_real_browser_and_input_as_unprivileged_account(layout, 
     generation = state["generation"]
     try:
         assert state["socketLayoutVersion"] == 3
-        assert len(state["children"]) == 7  # private D-Bus, Xvnc, four desktop components, Chromium
+        assert len(state["children"]) == 6  # private D-Bus, Xvnc, three desktop components, Chromium
         assert Path(state["socket"]) == application.sockets / "rfb.sock"
         assert (application.sockets / "bus").stat().st_uid == application.account.uid
         assert (runtime.socket_directory / "input.sock").stat().st_uid == 0
