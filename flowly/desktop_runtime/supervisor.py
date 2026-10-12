@@ -19,6 +19,12 @@ from urllib.parse import urlsplit
 
 from filelock import FileLock
 
+from flowly.desktop_runtime.agent_scope import (
+    AGENT_CGROUP_FILE,
+    CGROUP_ROOT,
+    admitted_agent_cgroup,
+    own_cgroup,
+)
 from flowly.desktop_runtime.application_layout import read_browser_port
 from flowly.desktop_runtime.authority import ScreenError
 from flowly.desktop_runtime.browser_lifecycle import BROWSER_MANAGER_SOURCE
@@ -309,11 +315,54 @@ def run(directory: Path, generation: str) -> None:
             port_file.unlink(missing_ok=True)
             (application_sockets / "browser-open.sock").unlink(missing_ok=True)
             fixed_port = []
+            # Only this profile's agent and this supervisor may reach its
+            # DevTools (devtools_guard, agent_scope): another profile's account
+            # or agent must not drive this browser.
+            supervisor_cgroup = own_cgroup() if state.get("resourceScope") is True else None
+            agent_home = directory.parent
+            guard_view = None
+
+            def agent_view():
+                """What the rule depends on: the agent's record and its cgroup's identity."""
+                try:
+                    record = (agent_home / AGENT_CGROUP_FILE).lstat()
+                    stamp = (record.st_ino, record.st_mtime_ns, record.st_size)
+                except OSError:
+                    stamp = None
+                agent = admitted_agent_cgroup(agent_home)
+                try:
+                    inode = (CGROUP_ROOT / agent).stat().st_ino if agent else None
+                except OSError:
+                    agent, inode = None, None
+                return stamp, agent, inode
+
+            def install_guard():
+                """Admit the current agent; the root-only rule where cgroups cannot be told apart."""
+                nonlocal guard_view
+                view = agent_view()
+                if supervisor_cgroup is None:
+                    guard(application.directory.name, devtools_port)
+                    state["devtoolsAdmission"] = "root"
+                    return
+                try:
+                    guard(application.directory.name, devtools_port,
+                          [supervisor_cgroup, *([view[1]] if view[1] else [])])
+                except ScreenError:
+                    try:
+                        # The agent's cgroup may have just gone; admit it on the next look.
+                        guard(application.directory.name, devtools_port, [supervisor_cgroup])
+                        view = (None, None, None)
+                    except ScreenError:
+                        # No ``socket cgroupv2`` in this kernel (before 5.13).
+                        guard(application.directory.name, devtools_port)
+                        state["devtoolsAdmission"] = "root"
+                        return
+                guard_view = view
+                state["devtoolsAdmission"] = "agent"
+
             if application:
-                # Only root (the agent's gateway) may reach this profile's
-                # DevTools: another profile's account must not drive its browser.
                 devtools_port = free_port()
-                guard(application.directory.name, devtools_port)
+                install_guard()
                 guarded = application.directory.name
                 fixed_port = [str(devtools_port)]
             spawn(["python3", "-I", "-c", BROWSER_MANAGER_SOURCE, browser_command, str(browser_profile),
@@ -349,6 +398,11 @@ def run(directory: Path, generation: str) -> None:
                 if (not input_service.is_alive or not observers.is_alive or not captures.is_alive
                         or any(process_identity(child.pid) is None for child in processes)):
                     raise ScreenError("RUNTIME_FAILED")
+                if (application and state.get("devtoolsAdmission") == "agent"
+                        and agent_view() != guard_view):
+                    # The agent (re)started or stopped: admit its new cgroup.
+                    install_guard()
+                    write_state(runtime.manifest, state)
                 ticks += 1
                 if ticks % 10 == 0 and (current := metadata_stamp()) != stamp:
                     # The owner recoloured the bot: the desktop follows within

@@ -1929,7 +1929,13 @@ class ProfileHost:
                 env["FLOWLY_DESKTOP_MANAGER_IDENTITY"] = identity
         except Exception:
             pass
-        command = [*_runtime_command(), "--profile", name, "serve", "--port", "0"]
+        from flowly.desktop_runtime.agent_scope import agent_scope_command
+
+        # A root host gives each named agent a cgroup of its own, so its screen
+        # can admit it and no other agent (agent_scope, devtools_guard).
+        command = await asyncio.to_thread(
+            agent_scope_command, [*_runtime_command(), "--profile", name, "serve", "--port", "0"], name
+        )
         process = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.DEVNULL,

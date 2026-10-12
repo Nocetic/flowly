@@ -5968,6 +5968,11 @@ class GatewayServer:
             except Exception as exc:  # pragma: no cover
                 logger.debug("MCP control advertise failed: {}", exc)
         notable("gateway.started", address=f"http://{self.host}:{self.port}")
+        # On a root host this profile's screen admits only this gateway's
+        # cgroup to its browser (agent_scope); publish it before any agent run.
+        from flowly.desktop_runtime.agent_scope import record_agent_cgroup
+
+        record_agent_cgroup(get_flowly_home())
         if self._profile_host is not None:
             self._profile_host.start_keeping_agents()
         if self.on_chat_message:

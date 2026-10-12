@@ -177,6 +177,11 @@ def layout(provisioned, request):
     directory.mkdir(parents=True, mode=0o700)
     directory.chmod(0o700)
     result = root_application_layout(directory, create=True)
+    # These tests drive the browser as the screen's agent: record this process
+    # as that agent, as a gateway does when it starts (agent_scope).
+    from flowly.desktop_runtime.agent_scope import record_agent_cgroup
+
+    record_agent_cgroup(directory.parent)
     return directory, result
 
 
@@ -717,3 +722,121 @@ def test_another_profile_account_cannot_reach_a_profile_browser_or_screen(layout
         assert "connected" not in _as_account(other, rfb, state["socket"]).stdout
     finally:
         runtime.stop(state["generation"])
+
+
+_AGENT = """
+import sys, time, urllib.request
+from pathlib import Path
+from flowly.desktop_runtime.agent_scope import record_agent_cgroup
+record_agent_cgroup(Path(sys.argv[1]))  # what a profile gateway does when it starts
+url = "http://127.0.0.1:%s/json/version" % sys.argv[2]
+deadline, reached = time.monotonic() + float(sys.argv[3]), False
+while time.monotonic() < deadline and not reached:
+    try:
+        reached = b"webSocketDebuggerUrl" in urllib.request.urlopen(url, timeout=2).read()
+    except Exception:
+        time.sleep(0.1)
+print("reached" if reached else "refused", flush=True)
+time.sleep(float(sys.argv[4]))
+"""
+
+
+def _launch_agent(name, home, port, *, seconds, hold=0.0):
+    """An agent process started the way ProfileHost starts a named gateway."""
+    from flowly.desktop_runtime.agent_scope import agent_scope_command
+
+    command = agent_scope_command([sys.executable, "-c", _AGENT, str(home), str(port), str(seconds), str(hold)], name)
+    assert Path(command[0]).name == "systemd-run", "agent scopes must be available on this host"
+    return subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=os.environ)
+
+
+def _systemd():
+    from flowly.desktop_runtime import resource_scope
+
+    return resource_scope.available()
+
+
+@pytest.mark.skipif(not _systemd(), reason="agent scopes need a systemd manager")
+def test_only_a_profiles_own_agent_reaches_its_browser(provisioned, monkeypatch):
+    """Every agent of a root host is root: the screen must still admit only its own
+    agent, not another named agent improvising with a shell, nor any other root."""
+    import shutil
+    import urllib.request
+
+    import flowly.profile as profiles
+    from flowly.desktop_runtime.launcher import ScreenRuntime
+
+    # A root-owned home: the shared test HOME under /tmp is (rightly) untrusted.
+    # The supervisor inherits HOME and finds the profiles root from it.
+    owner_home = Path("/root/agent-isolation")
+    monkeypatch.setenv("HOME", str(owner_home))
+    monkeypatch.setattr(profiles, "_PROFILES_ROOT", owner_home / ".flowly" / "profiles")
+    homes = {name: owner_home / ".flowly" / "profiles" / name for name in ("alpha", "beta")}
+    for home in homes.values():
+        shutil.rmtree(home, ignore_errors=True)
+        home.mkdir(parents=True, mode=0o700)
+    directory = homes["alpha"] / "desktop"
+    directory.mkdir(mode=0o700)
+    root_application_layout(directory, create=True)
+    runtime = ScreenRuntime(directory)
+    state = runtime.start()
+    port = state["cdpPort"]
+    agents = []
+    try:
+        assert runtime.read_manifest()["devtoolsAdmission"] == "agent"
+        owner = _launch_agent("alpha", homes["alpha"], port, seconds=10, hold=30)
+        agents.append(owner)
+        assert owner.stdout.readline().strip() == "reached"
+        # Another named agent tries alpha's browser for a while; never gets in.
+        intruder = _launch_agent("beta", homes["beta"], port, seconds=3)
+        agents.append(intruder)
+        assert intruder.stdout.readline().strip() == "refused"
+        # Nor does a root process outside every agent's cgroup (this test).
+        with pytest.raises(OSError):
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
+        # A restarted agent comes back in a new scope; the screen follows it.
+        owner.kill()
+        owner.wait(10)
+        restarted = _launch_agent("alpha", homes["alpha"], port, seconds=10)
+        agents.append(restarted)
+        assert restarted.stdout.readline().strip() == "reached"
+    finally:
+        for process in agents:
+            process.kill()
+            process.wait(10)
+        runtime.stop(state["generation"])
+        shutil.rmtree(owner_home, ignore_errors=True)
+
+
+@pytest.mark.skipif(not _systemd(), reason="agent scopes need a systemd manager")
+def test_a_named_agent_stops_and_restarts_with_the_gateway_service(tmp_path):
+    """The agent's own scope is PartOf the gateway's service, as it was while it
+    shared the service's cgroup: stopping the service still stops the agent."""
+    import time
+
+    record = tmp_path / "agent.pid"
+    gateway = ("import subprocess, sys, time\n"
+               "from flowly.desktop_runtime.agent_scope import agent_scope_command\n"
+               "child = subprocess.Popen(agent_scope_command(['sleep', '300'], 'alpha'))\n"
+               f"open({str(record)!r}, 'w').write(str(child.pid))\n"
+               "time.sleep(300)\n")
+    unit = "flowly-test-gateway.service"
+    subprocess.run(["systemd-run", "--quiet", "--unit", unit, "--setenv=PYTHONPATH=" + os.environ["PYTHONPATH"],
+                    sys.executable, "-c", gateway], check=True)
+    try:
+        deadline = time.monotonic() + 20
+        while not record.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        pid = int(record.read_text())
+        # systemd-run registers the scope, moves itself in, then becomes the agent.
+        while "/flowly-agent-" not in (membership := Path(f"/proc/{pid}/cgroup").read_text()) \
+                and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert "/flowly-agent-" in membership and unit not in membership
+        subprocess.run(["systemctl", "stop", unit], check=True, timeout=30)
+        deadline = time.monotonic() + 10
+        while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not Path(f"/proc/{pid}").exists(), "the agent outlived its gateway service"
+    finally:
+        subprocess.run(["systemctl", "stop", unit], timeout=30)
