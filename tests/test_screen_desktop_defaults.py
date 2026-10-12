@@ -124,23 +124,25 @@ def test_a_dock_kept_from_an_earlier_release_shows_the_current_entries(applicati
     """xfce4-panel copies launcher entries on first start and keeps the copies:
     an upgraded profile would show the old release's icons forever."""
     environment, _, _ = application
-    config = Path(environment["XDG_CONFIG_HOME"])
-    for leaf in ("xfce4", "xfce4/panel", "xfce4/xfconf", "xfce4/xfconf/xfce-perchannel-xml"):
-        (config / leaf).mkdir(mode=0o700)  # private, as the desktop account keeps them
-    copied = config / "xfce4" / "panel" / "launcher-1"
-    copied.mkdir(mode=0o700)
-    (copied / "17918055181.desktop").write_text("[Desktop Entry]\nName=Browser\nIcon=web-browser\n")
-    kept = config / "xfce4" / "panel" / "launcher-2"
-    kept.mkdir(mode=0o700)
-    (kept / "notes.txt").write_text("not a launcher entry")
-    channel = config / "xfce4" / "xfconf" / "xfce-perchannel-xml" / "xfce4-panel.xml"
-    channel.write_text('<channel name="xfce4-panel"><value type="string" value="17918055181.desktop"/></channel>')
-    channel.chmod(0o600)
+    config, data = Path(environment["XDG_CONFIG_HOME"]), Path(environment["XDG_DATA_HOME"])
+    (config / "xfce4").mkdir(mode=0o700)
+    # xfce4-panel creates its own directories with its umask (0755 without one).
+    (config / "xfce4" / "panel").mkdir(mode=0o755)
+    copies = config / "xfce4" / "panel" / "launcher-1"
+    copies.mkdir(mode=0o755)
+    source = "file://" + str(data / "applications" / "flowly-browser.desktop")
+    ours = copies / "17918055181.desktop"
+    ours.write_text("[Desktop Entry]\nName=Browser\nIcon=web-browser\nX-XFCE-Source=" + source + "\n")
+    foreign = copies / "17918055189.desktop"
+    foreign.write_text("[Desktop Entry]\nName=Mine\nIcon=web-browser\nX-XFCE-Source=file:///usr/share/x.desktop\n")
+    for item in (ours, foreign):
+        item.chmod(0o600)
     assert seed(application).returncode == 0
-    assert not copied.exists()
-    assert (kept / "notes.txt").exists()
-    assert "17918055181.desktop" not in channel.read_text()
-    assert "flowly-browser.desktop" in channel.read_text()
+    # Same path (a running panel keeps it), current content, same source.
+    lines = ours.read_text().splitlines()
+    assert "Icon=" + str(data / "flowly-dock" / "browser.png") in lines
+    assert lines[-1] == "X-XFCE-Source=" + source
+    assert "Icon=web-browser" in foreign.read_text()
 
 
 def test_a_linked_panel_launcher_directory_is_refused(application, tmp_path):
