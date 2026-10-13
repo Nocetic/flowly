@@ -179,28 +179,45 @@ is treated as a turn that never came back and stops counting.
 ## The wake-up turn
 
 The service publishes an `InboundMessage(channel="system", sender_id="agenda",
-chat_id=<sessionKey>, metadata={"agenda_item": <id>})` — the same re-entry path
-a finished background task uses. `AgentLoop._process_message` routes it to
-`_process_agenda_wake`, which runs `_process_system_message` in the target
-conversation:
+chat_id=<sessionKey>, metadata={"agenda_item": <id>, "agenda_goal": <goal id,
+for a check-in>})` — the same re-entry path a finished background task uses.
+`AgentLoop._dispatch_inbound` runs it as its **own task** (like a relay chat),
+so a wake-up that researches for minutes never holds up another
+conversation's system turn; the agenda itself never wakes a conversation while
+a turn runs there. `_process_message` routes it to `_process_agenda_wake`,
+which runs `_process_system_message` in the target conversation:
 
-- the model sees the whole conversation plus the wake-up prompt
+- **Tools:** the turn runs on the `agenda` route (`flowly/agent/tools/routing.py`,
+  `DEFAULT_ENABLED_TOOLSETS_BY_PLATFORM`): `web`, `memory`, `sessions` and
+  `agenda` only. Nothing that acts — no commands, files, messages, email,
+  calendar writes, delegation, MCP — runs with nobody watching. A configured
+  allowlist can narrow this, never widen it, and it holds even when tool
+  routing is switched off in config.
+- **Nothing streams.** The turn has no outbound channel while it runs, so no
+  live iteration events go out (through the relay they would have been written
+  to the conversation's tool turns even when the turn then stayed silent).
+- The model sees the whole conversation plus the wake-up prompt
   (`flowly/agenda/prompts.py: wake_prompt`): the note, lateness if the computer
   slept, the goal (plan, stage, progress, last 5 log lines, rhythm), and how
-  long the owner has been silent there;
-- it may use its tools first (look things up, update the goal, plan the next
-  check-in);
-- a reply of `[SILENT]` (anywhere, case-insensitive), `NO_REPLY` or nothing:
-  **nothing is saved and nothing is sent**; tool side effects (a goal log)
-  remain;
-- otherwise the turn is saved like any system turn (the trigger is stored as
-  `[System: agenda] …` with `user_display_hidden`) and delivered: local
-  surfaces (`cli`, `tui`, `desktop`, `ios`, `android`) through
-  `gateway.push_session_message`, relay and channels through the returned
-  `OutboundMessage`;
+  long the owner has been silent there. It may use its tools first.
+- **It speaks only with `[SEND]`** (`wake_decision`): a reply that starts with
+  `[SEND]` is delivered without the marker. Anything else — `[SILENT]`,
+  nothing, `[SEND]` with no message, or a remark such as "nothing new to
+  report" — is **silent: nothing is saved, nothing is sent**; tool side
+  effects (a goal log) remain. A missed check-in costs less than a message
+  that only nags.
+- A delivered reply is saved like any system turn (the trigger is stored as
+  `[System: agenda] …` with `user_display_hidden`, so it is never shown, never
+  indexed and never mined into memory) and delivered: local surfaces (`cli`,
+  `tui`, `desktop`, `ios`, `android`) through `gateway.push_session_message`,
+  relay and channels through the returned `OutboundMessage`. A check-in about
+  a goal carries the goal's card (`event: "checkin"`), see below.
 - `agenda.turn_finished(...)` reports the outcome; an exception reports
   `failed=True` at once so the service retries in 30 minutes (3 attempts in
-  all) instead of holding the agenda for the 15-minute turn timeout.
+  all) instead of waiting out the 10-minute turn timeout.
+
+The service runs at most **2 wake-ups at once**, never two in one
+conversation; the rest wait for the next pass.
 
 `ios`/`android` were added to the local-push list of `_process_system_message`
 in this change; before it, background-task announces into a phone chat served
@@ -214,7 +231,7 @@ agent name, body = first line, `conversationId` via `phone_conversation`) for
 conversations the agent serves itself (`desktop:`, `ios:`, `android:`, `cli:`,
 `tui:`). The presence report holds it while the owner is at a Desktop showing
 chats. Relay chats (`web:`) are pushed by the relay itself when the message
-lands; messaging channels notify natively.
+lands; messaging channels notify natively. Named agents: see below.
 
 ## The daily review
 
@@ -225,12 +242,12 @@ days). The day is marked first, so a crashing review is not retried every tick.
 It runs `agent.process_direct(prompt, session_key="agenda:review")` in a fresh
 session, deleted again when the review ends (what it planned lives in the
 agenda; no client should ever list it as a conversation — Desktop's named-agent
-list also skips the `agenda:` prefix). Channel `agenda` is in `_NON_USER_CHANNELS` (not owner activity, not
-an Activity task) and its route disables the `delivery`, `interactive` and
-`scheduling` toolsets: the review cannot write to the owner, ask them
-anything or create scheduled tasks; it plans with `objective` / `follow_up`
-(its other tools, such as search, stay available for looking things up). The
-prompt carries the settings, today's
+list also skips the `agenda:` prefix, and the dreamer never mines `agenda:`
+sessions into memory). Channel `agenda` is in `_NON_USER_CHANNELS` (not owner
+activity, not an Activity task) and runs on the same `agenda` tool route as a
+wake-up: it can look things up and read memory and past conversations, and
+plans with `objective` / `follow_up`; it cannot write to the owner, ask them
+anything, act, or create scheduled tasks. The prompt carries the settings, today's
 remaining budget, every active goal with its next check-in, what is already
 planned, and the owner's last 8 conversations with their reply state. Because
 the review has no owner conversation of its own, its tools must name one
@@ -248,6 +265,11 @@ cron runs cannot use.
   cancels the check-in), `list`, `get`.
 - `follow_up` — `schedule` (when, note, keep_if_owner_replies), `list`,
   `cancel`.
+
+- `proactivity` — `get`, `set` (`level`, `quiet_start`, `quiet_end`): when the
+  owner says how often the agent may write first ("write less", "nothing
+  before ten"), the agent sets it itself and confirms; it changes the same
+  settings the app shows.
 
 Times (`flowly/agenda/timeparse.py`): `+30m`/`+2h`/`+1d`/`+1w`, `HH:MM` (next),
 `today HH:MM`, `tomorrow [HH:MM]` (09:00 default), ISO date (09:00) or
@@ -299,10 +321,12 @@ away for the model, like `usage`). They go out as `goalCards`:
 - on the direct gateway's final chat event (`message.goalCards`);
 - in `chat.history` rows (`goalCards` on that assistant row), so a reopened
   conversation shows the same card;
-- in the relay's final data block (`goalCards`) — **the relay does not persist
-  it yet** (it stores a whitelist of fields, and an encrypted conversation
-  must not store a goal title in clear), so a relay chat shows the card live
-  only until the relay learns to store it encrypted.
+- in the relay's final data block (`goalCards`). The relay (branch
+  `feat/agent-goals` in `flowly-relay-service`, `goal-cards.ts`) stores it with
+  the message through an allowlist of fields and bounds; in an encrypted
+  conversation it is sealed with the conversation key (`encryptedGoalCards` +
+  `goalCardsIv`), never stored in clear. Until that relay is deployed, a relay
+  chat shows the card live only.
 
 ```json
 {"id": "obj_…", "event": "created", "title": "A month of physics", "category": "learning",
@@ -311,8 +335,10 @@ away for the model, like `usage`). They go out as `goalCards`:
 ```
 
 A card is a snapshot; clients compute time progress from `createdAt`/`endsAt`
-when drawing and open the goal for anything current. Wake-up turns carry no
-card.
+when drawing and open the goal for anything current. A message the agent wrote
+first about a goal carries that goal's card with `event: "checkin"`
+(`checkin_card`), on the saved reply, on `push_session_message`'s final event
+and in the relay block, so a check-in always leads to its goal.
 
 ## Owner-facing RPCs (`flowly/agenda/rpc.py`)
 
@@ -334,12 +360,23 @@ plans one (next turn in that conversation or the next daily review).
 ## Named agents
 
 Each named agent runs the same service in its own runtime, with its own
-stores, and writes into its single conversation (`desktop:profile-home`). The
-budget is shared through the canonical home. **Gap:** named runtimes hold no
-device push registrations (they live on the primary host, see
-`profile-cron-push-2026-09-21.md`), so a named agent's first message reaches
-Desktop and the conversation but does not ring the phone yet. Fix: forward the
-delivered event through the profile host like `profiles.cron.notify`.
+stores, and writes into its single conversation (`desktop:profile-home`).
+
+**Phone.** Named runtimes hold no device registrations (they live on the
+primary host, see `profile-cron-push-2026-09-21.md`). When a named agent's
+wake-up delivers, its runtime only broadcasts `agenda.delivered` with the
+wake-up id. The primary host, observing the runtime (`ProfileHost._handle_profile_event`),
+and Desktop, managing it (`profile-runtime-supervisor.ts`), forward that
+identity to `profiles.agenda.notify`; `flowly/push/profile_agenda_push.py`
+reads the exact settled wake-up from that agent's own agenda history and
+pushes its preview only if it was delivered. A caller never supplies the text,
+destination or keys. An exclusive `.<id>.mobile-push` claim in the agent's
+agenda folder makes the two forwarders one push.
+
+**Budget.** The daily budget is shared by every agent on one machine through
+the canonical home. Agents on different machines (a VPS and a Mac) each count
+their own machine's budget; one owner-wide count needs a ledger both can
+reach (the account), which this change does not add.
 
 ## Failure modes
 
@@ -348,23 +385,21 @@ delivered event through the profile host like `profiles.cron.notify`.
 | Computer asleep at the due time | the wake-up runs on the next tick after waking; the prompt says how late it is and the agent may stay silent |
 | Process dies mid-turn | at start, `running` items are rescheduled +5 min (attempts +1); 3 attempts then `failed` |
 | Turn raises | reported at once; retried in 30 min; 3 attempts then `failed` |
-| Turn exceeds 15 min | treated as failed; a late delivery still counts (`turn_finished` without a waiter) |
+| Turn exceeds 10 min | treated as failed; a late delivery still counts (`turn_finished` without a waiter) |
+| A wake-up runs long | it runs in its own task; one other conversation can wake meanwhile (2 at once) |
 | Two agents race for the last slot | `reserve` is atomic under the lock; the loser defers to tomorrow |
 | Corrupt JSON | the store raises `CORRUPT`; the service logs and skips that tick; the file is never overwritten blindly |
 | Local agent and the Mac is off | nothing runs until it is on again: proactivity needs an always-on agent (VPS / cloud) |
 
 ## Not done yet
 
-- Desktop (branch `feat/agent-goals` in `flowly-desktop`, see its
-  `docs/engineering/agent-goals.md`): the Goals section above routines in the agent panel
-  and the "how often" setting are done; a chat card when a goal is created and
-  the goal on the sidebar row are not.
-- iOS / Android: same surfaces.
-- Phone push for named agents (above).
+- iOS / Android surfaces (goals list, goal page, cards, settings).
+- One owner-wide budget across machines (above).
 - One combined morning message across agents instead of separate ones.
 - Learning from outcomes beyond backoff (which kinds of message the owner
   answers), event-driven wake-ups (new email, calendar, flowlet data), and a
-  client event when goals change (clients refresh on open and after actions).
+  server event when goals change (Desktop re-reads after each settled turn).
+- The relay change is not deployed.
 
 ## Tests
 
@@ -372,7 +407,10 @@ delivered event through the profile host like `profiles.cron.notify`.
 (goal/agenda files, budget), `test_agenda_service.py` (runner with a faked
 turn: delivered, silent, failed, quiet hours, busy, caps, backoff, goal
 check-ins, review), `test_agenda_tools.py` (tools bound to the calling
-conversation), `test_agenda_wake_turn.py` (the loop's hidden turn, silence,
-failure, owner signal), `test_internal_tool_visibility.py` (hidden on every
-surface; fails without the fix), `test_feature_rpc_agenda.py` (RPCs, profile
-host allowlist).
+conversation), `test_agenda_wake_turn.py` (the loop's hidden turn, `[SEND]`,
+silence, failure, owner signal, the agenda tool route and no streaming, its
+own task, the check-in card), `test_internal_tool_visibility.py` (hidden on
+every surface; fails without the fix), `test_feature_rpc_agenda.py` (RPCs,
+profile host allowlist), `test_goal_cards.py` (cards on replies, history and
+proactive pushes; owner step/rename), `test_profile_agenda_push.py` (named
+agents' pushes through the primary host, once).
