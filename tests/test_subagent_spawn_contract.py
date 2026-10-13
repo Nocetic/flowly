@@ -198,3 +198,25 @@ async def test_the_completion_message_names_the_run_and_hands_over_the_result(tm
     with tool_execution_scope("web:someone-else"):
         hidden = json.loads(await reader.execute(run_id=run_id))
     assert "No subagent run" in hidden["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_goal_waits_until_results_are_handled_not_just_finished(tmp_path):
+    bus = MessageBus()
+    manager = SubagentManager(
+        provider=_ChildProvider("done"), workspace=tmp_path, bus=bus,
+        registry=SubagentRegistry(tmp_path / "runs.json"), state_dir=tmp_path,
+    )
+    started = json.loads(await manager.spawn(
+        task="Part A", origin_channel="web", origin_chat_id="g1",
+        origin="agent", display_name="Rakip A",
+    ))
+    await manager.spawn("Self review", origin_channel="web", origin_chat_id="g1",
+                        label="self-review", silent=True)
+    notice = await asyncio.wait_for(bus.consume_inbound(), 5)
+    await asyncio.sleep(0.05)
+    # Finished and announced, but the conversation has not handled it yet.
+    assert manager.pending_for_goal("web:g1") == ["Rakip A"]
+    manager.mark_delivered([started["run_id"]])
+    assert manager.pending_for_goal("web:g1") == []
+    assert started["run_id"] in notice.content

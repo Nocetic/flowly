@@ -507,6 +507,10 @@ def _with_plugin_context(messages: list[dict[str, Any]], injected: str) -> list[
     return result if changed else messages
 
 
+# A subagent's notice names its run as "run_id=<uuid>".
+_SUBAGENT_RUN_ID_RE = re.compile(r"run_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+
+
 def _announces_untaken_step(text: str | None) -> bool:
     """True when a tool-less reply ends by announcing its next step.
 
@@ -1378,6 +1382,8 @@ class AgentLoop:
             plan_manager = get_plan_manager()
 
             def session_is_waiting(target: str) -> bool:
+                if target.startswith("subagents:"):
+                    return bool(self.subagents.pending_for_goal(target.removeprefix("subagents:")))
                 if target.startswith("plan:"):
                     plan = plan_manager.get_plan(target.removeprefix("plan:"))
                     return bool(plan and plan.status in {"draft", "awaiting_approval"})
@@ -1413,6 +1419,7 @@ class AgentLoop:
                     workspace=self.workspace,
                 ),
                 pending_plan=pending_plan,
+                pending_subagents=self.subagents.pending_for_goal,
             )
             self.goal_manager = manager
             self.goal_runtime = runtime
@@ -9304,6 +9311,10 @@ class AgentLoop:
             turn_start_index=turn_start_index,
         )
         self.sessions.save(session)
+        if msg.sender_id == "subagent":
+            # The conversation has now handled these results; a goal waiting
+            # on them may continue.
+            self.subagents.mark_delivered(_SUBAGENT_RUN_ID_RE.findall(msg.content or ""))
         # A system/announce turn has no inbound attachment — it is triggered by
         # the agent's own machinery, not by a person handing it a file.
         await self._index_turn_media(session, reply_media_assets, None, origin_channel)

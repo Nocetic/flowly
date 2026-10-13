@@ -86,12 +86,14 @@ class GoalRuntime:
         background_processes: Callable[[str], Awaitable[Iterable[Mapping[str, Any]]]] | None = None,
         session_cwd: Callable[[str], Path] | None = None,
         pending_plan: Callable[[str], str | None] | None = None,
+        pending_subagents: Callable[[str], list[str]] | None = None,
     ) -> None:
         self.manager = manager
         self._current_user_epoch = current_user_epoch
         self._background_processes = background_processes or _empty_processes
         self._session_cwd = session_cwd or (lambda _session_key: Path.cwd())
         self._pending_plan = pending_plan or (lambda _session_key: None)
+        self._pending_subagents = pending_subagents or (lambda _session_key: [])
         self._queues: dict[str, asyncio.Queue[_Work]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._routes: dict[str, GoalDelivery] = {}
@@ -263,6 +265,32 @@ class GoalRuntime:
                     verdict=GoalVerdict.WAITING,
                     reason="waiting for plan approval",
                     message="⏳ Goal parked — waiting for plan approval.",
+                    goal_id=state.goal_id,
+                    revision=state.revision,
+                )
+            )
+            self._schedule_wait_wake(turn.session_key, delivery)
+            return
+
+        # Subagents this conversation started are part of the goal's work: a
+        # turn that ends while they run, or before their results reached the
+        # agent, has not finished anything yet. Park until they have.
+        waiting_for = [] if unsuccessful else list(self._pending_subagents(turn.session_key))
+        if waiting_for and not state.has_wait:
+            names = ", ".join(waiting_for[:3]) + (" …" if len(waiting_for) > 3 else "")
+            reason = f"waiting for {len(waiting_for)} subagent(s): {names}"
+            try:
+                state = self.manager.wait_on_session(
+                    turn.session_key, f"subagents:{turn.session_key}", reason=reason,
+                )
+            except RuntimeError:
+                return
+            await delivery.deliver_notice(
+                GoalDecision(
+                    status=state.status,
+                    verdict=GoalVerdict.WAITING,
+                    reason=reason,
+                    message=f"⏳ Goal parked — waiting for {len(waiting_for)} subagent(s) to finish.",
                     goal_id=state.goal_id,
                     revision=state.revision,
                 )

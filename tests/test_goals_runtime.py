@@ -355,3 +355,45 @@ async def test_a_parked_goal_rearms_its_barrier_on_wake(tmp_path):
 
     assert scheduled == ["web:c1"], "the barrier must be watched again"
     assert manager.get("web:c1").goal_id == state.goal_id
+
+
+@pytest.mark.asyncio
+async def test_running_subagents_park_the_goal_until_their_results_are_handled(
+    tmp_path: Path,
+) -> None:
+    """A goal turn that ends while its subagents work has not finished anything.
+
+    Before, the judge saw no running process and either declared the goal
+    done on the strength of "I started two agents" or asked for another turn
+    that redid their work. Now the goal parks, without spending a turn, until
+    the subagents ended and their results reached the agent; then it resumes.
+    """
+    provider = Provider('{"verdict":"done","reason":"complete"}')
+    epochs = {"s": 1}
+    children = {"pending": ["Rakip A", "Rakip B"]}
+    manager, runtime = _runtime(
+        tmp_path,
+        provider,
+        epochs,
+        pending_subagents=lambda _session: list(children["pending"]),
+        session_is_waiting=lambda target: target == "subagents:s" and bool(children["pending"]),
+    )
+    manager.set("s", "compare competitors")
+    delivery = Delivery("compared with both results")
+
+    runtime.delivered(DeliveredGoalTurn("s", "Started two agents.", user_epoch=1), delivery)
+    await asyncio.sleep(0.05)
+    state = manager.get("s")
+    assert state is not None and state.turns_used == 0
+    assert state.waiting_on_session == "subagents:s"
+    assert "Rakip A" in (state.waiting_reason or "")
+    assert delivery.events == [("notice", "waiting")]
+
+    children["pending"] = []
+    await asyncio.wait_for(delivery.finished.wait(), timeout=3)
+    assert delivery.events[-3:] == [
+        ("run", {"goal_id": state.goal_id, "kickoff": False}),
+        ("assistant", "compared with both results"),
+        ("notice", "done"),
+    ]
+    await runtime.close()

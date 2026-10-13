@@ -394,6 +394,28 @@ class SubagentManager:
     def is_busy(self, session_key: str) -> bool:
         return session_key in self._busy_sessions
 
+    def pending_for_goal(self, parent_session_key: str) -> list[str]:
+        """Titles of this conversation's subagents a goal must still wait for.
+
+        A run counts until it has ended and its result has been handled by the
+        conversation (not merely published), so a goal never continues ahead
+        of the results it is waiting for. System runs are not the goal's work.
+        """
+        titles: list[str] = []
+        for record in self._registry.all():
+            if record.parent_session_key != parent_session_key or record.origin == "system":
+                continue
+            if record.ended_at is None or record.delivery_state in ("pending", "queued"):
+                titles.append(record.display_name or record.label)
+        return titles
+
+    def mark_delivered(self, run_ids: list[str]) -> None:
+        """Record that the conversation has handled these finished runs' results."""
+        for run_id in dict.fromkeys(run_ids):
+            record = self._registry.get(run_id)
+            if record is not None and record.ended_at is not None and record.delivery_state != "not_required":
+                self._registry.update(run_id, delivery_state="delivered")
+
     def _running_siblings(self, parent_session_key: str) -> list[SubagentRunRecord]:
         """Owner/agent-started runs still going for one conversation."""
         records = []
