@@ -129,6 +129,22 @@ class SubagentToolRegistry(ToolRegistry):
         super().register(tool)
 
 
+def _created_artifact_id(payload: Any, tool_args: dict[str, Any]) -> str | None:
+    """The id of an artifact a ``create`` call actually stored, else None.
+
+    The artifact tool answers ``{"artifact": {"id": …}}``; reading a top-level
+    ``id`` never matched, so a child's saved report was never linked to its
+    run. Listing or reading artifacts links nothing.
+    """
+    if str(tool_args.get("action") or "") != "create" or not isinstance(payload, dict):
+        return None
+    if payload.get("ok") is False or payload.get("error"):
+        return None
+    artifact = payload.get("artifact")
+    candidate = artifact.get("id") if isinstance(artifact, dict) else payload.get("id")
+    return candidate if isinstance(candidate, str) and candidate else None
+
+
 def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + f" […{len(text) - limit} more]"
 
@@ -344,6 +360,10 @@ class SubagentManager:
         self._web_search_server_id = web_search_server_id
         self._web_search_auth_token = web_search_auth_token
         self._artifact_on_change: Any | None = None  # Broadcast callback for S3 sync
+        # Builds the artifact tool a child uses. A named profile sets this to
+        # the same shared-Library tool its main agent uses, so what a child
+        # saves lands where the owner looks, not in the profile's own store.
+        self.artifact_tool_factory: Callable[[], Tool] | None = None
         # P1.1 — optional bridge for subagent→parent activity heartbeat. Parent
         # wires this to `AIAgent._touch_activity` so the cron inactivity
         # poller doesn't timeout the main turn while a background subagent
@@ -627,6 +647,8 @@ class SubagentManager:
                 return KnowledgeGraphTool(state_dir=kg_state)
 
             def _build_artifact_tool() -> Any:
+                if self.artifact_tool_factory is not None:
+                    return self.artifact_tool_factory()
                 from flowly.artifacts.store import get_store
                 from flowly.agent.tools.artifact import ArtifactTool
                 art_tool = ArtifactTool(store=get_store(self._state_dir))
@@ -987,8 +1009,8 @@ class SubagentManager:
                         if effective_tool_name == "artifact" and _tool_status == "ok":
                             try:
                                 payload = json.loads(result)
-                                artifact_id = payload.get("id") if isinstance(payload, dict) else None
-                                if isinstance(artifact_id, str):
+                                artifact_id = _created_artifact_id(payload, tool_args)
+                                if artifact_id:
                                     self._link_artifact(run_id, artifact_id)
                             except (TypeError, ValueError):
                                 pass

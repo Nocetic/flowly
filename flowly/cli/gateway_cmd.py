@@ -2060,6 +2060,13 @@ Respond to the user now:"""
             if shared_tool.name == "artifact" and getattr(agent, "_artifact_store", None) is None:
                 continue
             agent.tools.register(shared_tool)
+        if getattr(agent, "_artifact_store", None) is not None:
+            from flowly.agent.tools.shared_service import SharedArtifactTool
+
+            # A subagent's saved work belongs in the same Library.
+            agent.subagents.artifact_tool_factory = lambda: SharedArtifactTool(
+                gateway_server, agent._artifact_store,
+            )
 
     # A standing goal's turns re-enter through each surface's OWN chat entry,
     # so an autonomous turn is indistinguishable from a typed one: the direct
