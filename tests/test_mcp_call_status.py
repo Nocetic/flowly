@@ -166,7 +166,6 @@ async def test_chat_loop_records_mcp_error_as_failed_operation(tmp_path, monkeyp
             {"role": "system", "content": "test"},
             {"role": "user", "content": "Read service issues."},
         ],
-        action_turn=False,
         turn_content="Read service issues.",
         session_key="web:test",
         tool_platform="web",

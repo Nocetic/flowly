@@ -64,7 +64,6 @@ def test_scoped_exclusion_keeps_requested_tool_execution_enabled(content):
     decision = resolve_turn_tool_policy({}, content)
     assert decision.allowed is True
     assert decision.source == "content_scoped_exclusion"
-    assert AgentLoop._is_action_turn(object.__new__(AgentLoop), "cli", content) is True
 
 
 @pytest.mark.parametrize(
@@ -137,14 +136,13 @@ def test_exclusive_scope_prefers_an_exact_remote_tool_name():
     assert scope == frozenset({"mcp_context7_resolve_library_id"})
 
 
-def test_named_tool_with_scoped_exclusion_is_an_enforced_action_turn():
+def test_named_tool_with_scoped_exclusion_resolves_to_an_exclusive_scope():
     content = "Use resolve-library-id and do not use any other tools."
 
     decision = resolve_turn_tool_policy({}, content)
 
     assert decision.allowed is True
     assert decision.exclusive is True
-    assert AgentLoop._is_action_turn(object.__new__(AgentLoop), "cli", content) is True
 
 
 def test_exclusive_scope_fails_closed_for_an_unknown_target():
@@ -154,18 +152,6 @@ def test_exclusive_scope_fails_closed_for_an_unknown_target():
     )
 
     assert scope == frozenset()
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        "Explain how tool calling works.",
-        "Bu aracın kullanımını anlat.",
-        "MCP araçlarının nasıl çalıştığını açıkla.",
-    ],
-)
-def test_tool_discussion_does_not_force_an_action_turn(content):
-    assert AgentLoop._is_action_turn(object.__new__(AgentLoop), "cli", content) is False
 
 
 class _TripwireTool(Tool):
@@ -314,7 +300,6 @@ async def test_executor_blocks_hallucinated_call_even_with_no_schemas(
                     {"role": "system", "content": "test"},
                     {"role": "user", "content": "Answer without tools"},
                 ],
-                action_turn=True,
                 turn_content="Answer without tools",
                 session_key="web:no-tools",
                 tool_platform="web",

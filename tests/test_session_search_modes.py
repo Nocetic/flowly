@@ -345,7 +345,6 @@ async def test_agent_runtime_injects_current_session_into_search_tool(
                 {"role": "system", "content": "test"},
                 {"role": "user", "content": "find docker"},
             ],
-            action_turn=False,
             turn_content="find docker",
             session_key="web:active-conversation",
             tool_platform="web",

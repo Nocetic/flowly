@@ -99,7 +99,6 @@ from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.run_steering import ProviderSteeredError, RunSteeringController, SteeringError
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
 from flowly.agent.tool_policy import (
-    has_explicit_tool_invocation_intent,
     normalize_tool_allowlist,
     resolve_exclusive_tool_scope,
     resolve_turn_tool_policy,
@@ -486,6 +485,18 @@ _DEEPSEEK_MARK_RE = re.compile(rf"<\s*{_PIPE}\s*tool[▁_ ]*calls?[▁_ ]*(?:beg
 _XML_TOOLCALLS_RE = re.compile(r"<\s*(tool_calls|function_calls)\s*>.*?</\s*\1\s*>", re.DOTALL | re.IGNORECASE)
 _XML_INVOKE_RE = re.compile(r"<\s*invoke\b[^>]*>.*?</\s*invoke\s*>", re.DOTALL | re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"(```.*?```|~~~.*?~~~)", re.DOTALL)
+
+
+def _announces_untaken_step(text: str | None) -> bool:
+    """True when a tool-less reply ends by announcing its next step.
+
+    "Ekrana bakıyorum:" or "Let me check…" followed by nothing means the model
+    stopped mid-action. The test is the reply's shape (a trailing colon or
+    ellipsis), never its vocabulary, so a question or an explanation that
+    happens to mention an action is not mistaken for one.
+    """
+    stripped = (text or "").rstrip()
+    return bool(stripped) and stripped.endswith((":", "…", "..."))
 
 
 def _contains_leaked_tool_markup(text: str | None) -> bool:
@@ -4694,24 +4705,6 @@ class AgentLoop:
                 return match.group(1).strip().lower()
         return content.lower()
 
-    def _all_tools_disabled(self, disabled_tools: object) -> bool:
-        """True when ``disabled_tools`` leaves NO tool callable this turn.
-
-        Action-turn enforcement demands a tool call; with zero available tools
-        that is impossible, so the caller must not enforce it. The flowlet
-        vision runner disables every tool by name — this is how we detect that
-        and avoid the retry/alarm/fallback spin. Fails safe: if the tool set
-        can't be read, assume tools exist (keep enforcing)."""
-        if not disabled_tools:
-            return False
-        try:
-            all_names = set(self.tools.tool_names)
-        except Exception:  # noqa: BLE001 — never let this guard break the turn
-            return False
-        if not all_names:
-            return False
-        return not (all_names - set(disabled_tools))
-
     @staticmethod
     def _turn_tools_allowed(
         metadata: dict[str, Any] | None,
@@ -4719,192 +4712,6 @@ class AgentLoop:
     ) -> bool:
         """Compatibility wrapper around the structured policy resolver."""
         return resolve_turn_tool_policy(metadata, content).allowed
-
-    def _is_action_turn(self, channel: str, content: str) -> bool:
-        """Detect whether this turn is an action request that should execute tools strictly."""
-        lowered = content.lower()
-        if "voice_call(" in lowered or "cron(" in lowered:
-            return True
-
-        intent_text = self._extract_action_intent_text(content)
-        if has_explicit_tool_invocation_intent(intent_text):
-            return True
-        action_patterns = (
-            # Call / phone
-            r"\bcall\b",
-            r"\bdial\b",
-            r"\bphone\b",
-            r"\bring\b",
-            r"\barasana\b",
-            r"\barar\s+m[ıi]s[ıi]n\b",
-            r"\baray[ıi]p\b",
-            r"\barama\b",
-            r"\btelefon(?:la)?\b",
-            # Retry
-            r"\btry\s+again\b",
-            r"\bretry\b",
-            r"\btekrar\s+dene\b",
-            r"\btekrar\s+b[iı]\s+dene\b",
-            r"\btekrar\s+bir\s+dene\b",
-            r"\btekrar\s+dener\s+m[ıi]s[ıi]n\b",
-            r"\btekrar\b.*\bden\w+\b",
-            r"\byeniden\s+dene\b",
-            r"\bbir\s+daha\s+dene\b",
-            # Reminder / notification
-            r"\bremind(?:er)?\b",
-            r"\bnotify\b",
-            r"\balert\b",
-            r"\bhat[ıi]rlat\b",
-            r"\bhaber\s+ver\b",
-            r"\bbildir\b",
-            # Schedule / cron
-            r"\bschedule\b",
-            r"\bplanla\b",
-            r"\bcron\s+olu[şs]tur\b",
-            # Send / share
-            r"\bsend\b",
-            r"\bshare\b",
-            r"\bg[öo]nder\b",
-            r"\bpayla[şs]\b",
-            # Screenshot
-            r"\bscreenshot\b",
-            r"\bss\b",
-            r"\bekran\s+g[öo]r[üu]nt[üu]s[üu]\b",
-            # Generic
-            r"\brun\s+tool\b",
-            r"\bexecute\b",
-        )
-        return any(re.search(pattern, intent_text) for pattern in action_patterns)
-
-    def _is_retry_action_followup(self, content: str) -> bool:
-        """Detect short follow-up prompts that usually mean 'retry previous action'."""
-        intent_text = self._extract_action_intent_text(content)
-        retry_patterns = (
-            r"\btry\s+again\b",
-            r"\bretry\b",
-            r"\bdo\s+it\s+again\b",
-            r"\bone\s+more\s+time\b",
-            r"\btekrar\s+dene\b",
-            r"\btekrar\s+b[iı]\s+dene\b",
-            r"\btekrar\s+bir\s+dene\b",
-            r"\btekrar\s+dener\s+m[ıi]s[ıi]n\b",
-            r"\btekrar\b.*\bden\w+\b",
-            r"\byeniden\s+dene\b",
-            r"\bbir\s+daha\s+dene\b",
-        )
-        return any(re.search(pattern, intent_text) for pattern in retry_patterns)
-
-    def _is_cancel_action_followup(self, content: str) -> bool:
-        """Detect explicit cancellation for pending actions."""
-        intent_text = self._extract_action_intent_text(content)
-        cancel_patterns = (
-            r"\bcancel\b",
-            r"\bstop\b",
-            r"\bforget\s+it\b",
-            r"\bnever\s*mind\b",
-            r"\babort\b",
-            r"\bvazge[cç]\b",
-            r"\biptal\b",
-            r"\bbo[sş]ver\b",
-        )
-        return any(re.search(pattern, intent_text) for pattern in cancel_patterns)
-
-    def _consume_pending_action_lock(self, session: Any, content: str) -> bool:
-        """
-        Consume a pending-action lock set by a previous failed action turn.
-
-        If active, force this turn into action mode unless user explicitly cancels.
-        """
-        pending = session.metadata.get("pending_action_lock")
-        if not isinstance(pending, dict):
-            return False
-        if not pending.get("active"):
-            return False
-
-        remaining = int(pending.get("remaining_turns", 0) or 0)
-        if remaining <= 0:
-            session.metadata.pop("pending_action_lock", None)
-            return False
-
-        if self._is_cancel_action_followup(content):
-            session.metadata.pop("pending_action_lock", None)
-            return False
-
-        pending["remaining_turns"] = remaining - 1
-        pending["last_consumed_at"] = datetime.now().isoformat()
-        session.metadata["pending_action_lock"] = pending
-        return True
-
-    def _set_pending_action_lock(self, session: Any, request_text: str) -> None:
-        """Arm pending-action lock so next follow-up is forced into action mode."""
-        session.metadata["pending_action_lock"] = {
-            "active": True,
-            "remaining_turns": 2,
-            "request": request_text[:300],
-            "set_at": datetime.now().isoformat(),
-        }
-
-    def _clear_pending_action_lock(self, session: Any) -> None:
-        """Clear pending-action lock after successful action execution."""
-        session.metadata.pop("pending_action_lock", None)
-
-    def _should_promote_retry_to_action(
-        self,
-        content: str,
-        history: list[dict[str, Any]],
-    ) -> bool:
-        """Promote retry follow-ups to action turns when recent context indicates pending action."""
-        if not self._is_retry_action_followup(content):
-            return False
-
-        if not history:
-            return False
-
-        recent_messages = history[-6:]
-        recent_text = " ".join(
-            str(msg.get("content", "")).lower()
-            for msg in recent_messages
-            if isinstance(msg, dict)
-        )
-        retry_context_markers = (
-            "tool call could not be verified",
-            "tool calls failed",
-            "no action was taken",
-        )
-        if any(marker in recent_text for marker in retry_context_markers):
-            return True
-
-        # If recent user messages were action-like, treat retry as action.
-        for msg in reversed(recent_messages):
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") != "user":
-                continue
-            text = str(msg.get("content", ""))
-            if text and self._is_action_turn("", text):
-                return True
-        return False
-
-    def _contains_unverified_completion_claim(self, text: str) -> bool:
-        """Detect response phrases that claim completion without tool evidence."""
-        lowered = (text or "").lower()
-        claim_patterns = (
-            r"\byapt[ıi]m\b",
-            r"\bg[öo]nderdim\b",
-            r"\bald[ıi]m\b",
-            r"\ba[cç]t[ıi]m\b",
-            r"\bkapatt[ıi]m\b",
-            r"\btamamlad[ıi]m\b",
-            r"\bi did\b",
-            r"\bi sent\b",
-            r"\bi took\b",
-            r"\bi opened\b",
-            r"\bi closed\b",
-            r"\bdone\b",
-            r"\bcompleted\b",
-            r"\bfinished\b",
-        )
-        return any(re.search(pattern, lowered) for pattern in claim_patterns)
 
     # Hardcoded fallback messages that should be replaced by model-generated summaries.
     _HARDCODED_FALLBACKS = frozenset({
@@ -5832,7 +5639,6 @@ class AgentLoop:
     async def _run_llm_tool_loop(
         self,
         messages: list[dict[str, Any]],
-        action_turn: bool,
         live_call_turn: bool = False,
         turn_content: str = "",
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
@@ -5993,13 +5799,15 @@ class AgentLoop:
         _current_session_key: str = session_key
         successful_tools_were_used = False
         no_tool_retry_count = 0
-        forced_tool_retry = False
         strict_live_call_action = live_call_turn and self._is_strict_live_call_action_intent(turn_content)
-        enforce_action_tools = (
-            tools_allowed
-            and action_turn
-            and (not live_call_turn or strict_live_call_action)
-        )
+        # Only an active phone call still enforces a tool call: there, a short
+        # spoken command ("kapat", "call him") must act, and the spoken reply
+        # is not a chat answer the owner can read and correct. Everywhere else
+        # the model decides whether a message asks for an action.
+        enforce_action_tools = tools_allowed and live_call_turn and strict_live_call_action
+        # One continuation when a reply ends announcing a step it did not take
+        # ("Ekrana bakıyorum:"). Structural, not a word list; the reply is kept.
+        announced_step_nudged = False
 
         # Counter for per-iteration WS events the channel layer
         # forwards to clients so the desktop / iOS tool-turn panel
@@ -6050,7 +5858,7 @@ class AgentLoop:
         # a single job can run on a different model than the gateway default).
         # Falls back to self.model when no override is supplied.
         selected_model = model_override or self.model
-        selected_temperature = self.action_temperature if action_turn else 0.7
+        selected_temperature = self.action_temperature if enforce_action_tools else 0.7
         max_turn_iterations = self.max_iterations
         if live_call_turn and not enforce_action_tools:
             max_turn_iterations = min(max_turn_iterations, 3)
@@ -6282,7 +6090,7 @@ class AgentLoop:
             else:
                 tool_choice = (
                     "required"
-                    if ((enforce_action_tools or forced_tool_retry) and not successful_tools_were_used)
+                    if (enforce_action_tools and not successful_tools_were_used)
                     else "auto"
                 )
             # Mid-turn tool result compaction — prevent context bloat
@@ -6307,7 +6115,7 @@ class AgentLoop:
                 f"{disclosure.disclosed_schema_tokens}, "
                 f"capability_guidance={_active_capability_guidance}, "
                 f"dynamic_guidance_chars={_dynamic_guidance_chars}, "
-                f"action_turn={action_turn}, live_call_turn={live_call_turn}, "
+                f"live_call_turn={live_call_turn}, "
                 f"tools_allowed={tools_allowed}, "
                 f"blocked_tools={sorted(set(blocked_tools))}, "
                 f"iteration={iteration}/{max_turn_iterations}"
@@ -6570,7 +6378,7 @@ class AgentLoop:
             logger.info(
                 "LLM response telemetry: "
                 f"has_tool_calls={response.has_tool_calls}, content_len={len(response.content or '')}, "
-                f"action_turn={action_turn}, live_call_turn={live_call_turn}, iteration={iteration}"
+                f"live_call_turn={live_call_turn}, iteration={iteration}"
             )
 
             # Two different accumulation semantics live in the same
@@ -6627,16 +6435,11 @@ class AgentLoop:
                     if asked and asked not in setup_question_text:
                         setup_question_text = f"{setup_question_text}\n\n{asked}".strip()
 
-                assistant_content = None
-                if response.content and not setup_question:
-                    content_lower = response.content.lower()
-                    hallucination_phrases = [
-                        "i did", "i sent", "i took", "i opened", "i closed",
-                        "done", "completed", "finished",
-                        "yaptım", "gönderdim", "aldım", "açtım", "kapattım", "tamamlandı",
-                    ]
-                    if not any(phrase in content_lower for phrase in hallucination_phrases):
-                        assistant_content = response.content
+                # The text written with a tool call is part of the model's own
+                # reasoning trail; keep it, whatever words it uses.
+                assistant_content = (
+                    response.content if response.content and not setup_question else None
+                )
 
                 messages = _add_assistant_turn_message(
                     messages,
@@ -7289,7 +7092,6 @@ class AgentLoop:
                 tools_were_used = True
                 if turn_success_count > 0:
                     successful_tools_were_used = True
-                    forced_tool_retry = False
 
                 if steering.has_pending(outbound_run_id):
                     continue
@@ -7345,38 +7147,6 @@ class AgentLoop:
 
                 continue
 
-            # Provider/model may hallucinate completion without emitting tool calls.
-            # Guard: force a corrective tool-only retry before responding.
-            # Gated on action_turn: a completion claim is only suspicious when the
-            # USER asked for an action this turn. On Q&A / retrospective turns
-            # ("toplam tool kullanımlarını söyler misin?") the model naturally says
-            # "şunları yaptım/kullandım" while reporting history — firing here
-            # discarded a correct streamed answer and forced an irrelevant tool
-            # call (observed 2026-06-11: sessions_list forced on a usage question).
-            if (
-                action_turn
-                and not successful_tools_were_used
-                and response.content
-                and self._contains_unverified_completion_claim(response.content)
-                and no_tool_retry_count < self.action_tool_retries
-            ):
-                no_tool_retry_count += 1
-                forced_tool_retry = True
-                logger.warning(
-                    "Completion claim without tool call; retrying with forced tool instruction "
-                    f"({no_tool_retry_count}/{self.action_tool_retries})"
-                )
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "The previous response claims the action was done but no tool was called. "
-                        "You must call the appropriate tool now. "
-                        "Do not claim completion without executing a tool."
-                    ),
-                    _EPHEMERAL_NUDGE: True,
-                })
-                continue
-
             if enforce_action_tools and not successful_tools_were_used:
                 if no_tool_retry_count < self.action_tool_retries:
                     no_tool_retry_count += 1
@@ -7397,10 +7167,6 @@ class AgentLoop:
                 final_content = "Tool call could not be verified, no action was taken."
                 break
 
-            if forced_tool_retry and not successful_tools_were_used:
-                final_content = "Tool call could not be verified, no action was taken."
-                break
-
             # Guard: think-only empty response — model produced thinking
             # but no content and no tool calls. Retry up to 2 times.
             if not response.content or not response.content.strip():
@@ -7413,6 +7179,28 @@ class AgentLoop:
                     continue
                 # Give up after 2 retries
                 logger.error("Empty response after 2 retries — using fallback")
+
+            # A reply that ends announcing a step ("Ekrana bakıyorum:") but
+            # took none gets one continuation. Its text stays the answer if the
+            # model still answers in prose.
+            if (
+                tools_allowed
+                and not live_call_turn
+                and not announced_step_nudged
+                and _announces_untaken_step(response.content)
+            ):
+                announced_step_nudged = True
+                logger.info("Reply announced a step without taking it; continuing once")
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Continue: take the step you just announced. If no tool is "
+                        "needed after all, give your answer."
+                    ),
+                    _EPHEMERAL_NUDGE: True,
+                })
+                continue
 
             # ── Plan end-turn guard (Phase 2b) ──────────────────────
             # If a plan was created in this turn AND it's still active
@@ -7610,20 +7398,10 @@ class AgentLoop:
         if run_was_aborted and final_content is None:
             final_content = ""
 
-        if (
-            final_content
-            and not run_was_aborted
-            and not executed_tool_names
-            and (action_turn or self._is_retry_action_followup(turn_content))
-            and self._contains_unverified_completion_claim(final_content)
-        ):
-            logger.warning("Suppressed unverified completion claim because no tool was executed.")
-            final_content = "No tool was executed, no action was taken."
-
         logger.info(
             "LLM final telemetry: "
             f"final_content_length={len(final_content)}, executed_tools={executed_tool_names}, "
-            f"action_turn={action_turn}, live_call_turn={live_call_turn}, "
+            f"live_call_turn={live_call_turn}, "
             f"blocked_tools={sorted(set(blocked_tools))}"
         )
 
@@ -9140,39 +8918,12 @@ class AgentLoop:
             voice_mode=voice_mode_flag,
         )
 
-        action_turn = self._is_action_turn(msg.channel, msg.content)
-        if not action_turn and self._should_promote_retry_to_action(msg.content, history):
-            action_turn = True
-        if (
-            not action_turn
-            and tools_allowed
-            and self._consume_pending_action_lock(session, msg.content)
-        ):
-            action_turn = True
-            logger.info("Pending action lock promoted this turn to action_turn=True")
         live_call_turn = self._is_live_call_turn(msg.content)
         stream_callback = msg.metadata.get("stream_callback")
         on_iteration = msg.metadata.get("on_iteration")
         on_tool_progress = msg.metadata.get("on_tool_progress")
         model_override = msg.metadata.get("model_override")
         disabled_tools = msg.metadata.get("disabled_tools")
-
-        # A tool-less turn can NEVER satisfy action-turn enforcement — the loop
-        # would spin retrying for a tool call that is impossible, alarm, and fall
-        # back to a summary. The flowlet vision runner deliberately disables ALL
-        # tools and feeds an attacker-supplied photo whose prompt may contain
-        # action words ("card statement screenshot" hit the \bscreenshot\b
-        # pattern). If every tool is disabled, drop the action-turn flag.
-        if action_turn and (
-            not tools_allowed
-            or not turn_available_tools
-            or self._all_tools_disabled(disabled_tools)
-        ):
-            action_turn = False
-            logger.info(
-                "Action-turn flag cleared: no tools available for this turn "
-                "(nothing to enforce)."
-            )
 
         # Append-only durable delta for this turn. The provider-facing working
         # list can be rebound or shrunk by recovery/compaction without changing
@@ -9211,7 +8962,6 @@ class AgentLoop:
         ):
             final_content, tool_results, _executed_tools, usage, _loop_messages = await self._run_llm_tool_loop(
                 messages=messages,
-                action_turn=action_turn,
                 live_call_turn=live_call_turn,
                 turn_content=msg.content,
                 stream_callback=stream_callback,
@@ -9242,14 +8992,6 @@ class AgentLoop:
             0,
             int((time.monotonic() - turn_started_at) * 1000),
         )
-
-        if action_turn:
-            successful_tools = [r for r in tool_results if r.get("success")]
-            if successful_tools:
-                self._clear_pending_action_lock(session)
-            else:
-                self._set_pending_action_lock(session, display_content)
-                logger.warning("Action turn ended without successful tool execution; pending lock armed.")
 
         # P4 — voice mode response sanitizer. The prompt already tells
         # the model not to emit markdown/emoji/URLs for TTS, but models
@@ -9572,22 +9314,6 @@ class AgentLoop:
             messages, session_key=f"{origin_channel}:{origin_chat_id}",
         )
 
-        # A system wake-up (subagent announce, board / exec / delegate
-        # notification) delivers a RESULT for the parent to synthesize and hand
-        # to the user — it is NOT a user action request. Classifying it from the
-        # announce CONTENT (the subagent's own report, which routinely contains
-        # words like "gönder" / "bildir" / "send") wrongly flips this into
-        # action-enforce mode: the parent is then forced to call a tool AFTER
-        # the real work is already done, and when it has nothing valid left to
-        # call the loop emits the misleading "Tool calls failed, no action was
-        # taken." (Observed with multi-subagent research fan-out: each
-        # completion woke the parent into a forced-tool turn that failed.)
-        #
-        # A delivery turn must never enforce tools — the model summarizes (and
-        # MAY optionally call message / artifact) without being forced. This
-        # mirrors how an async-delegation completion re-enters as a plain,
-        # non-enforced message turn rather than an action request.
-        action_turn = False
         live_call_turn = self._is_live_call_turn(msg.content)
         turn_messages: list[dict[str, Any]] = []
         reply_media: list[str] = []
@@ -9598,7 +9324,6 @@ class AgentLoop:
         provider_state_out: dict[str, Any] = {}
         final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
             messages=messages,
-            action_turn=action_turn,
             live_call_turn=live_call_turn,
             turn_content=msg.content,
             session_key=f"{origin_channel}:{origin_chat_id}",
@@ -9612,10 +9337,6 @@ class AgentLoop:
             provider_state=provider_state,
             provider_state_out=provider_state_out,
         )
-
-        # No pending-action-lock bookkeeping here: a system/announce turn is a
-        # delivery turn (action_turn is always False above), so it neither sets
-        # nor clears the lock — that lifecycle belongs to real user action turns.
 
         # Save to session (mark as system message in history). Full
         # tool-protocol structure is preserved by

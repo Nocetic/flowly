@@ -177,7 +177,6 @@ async def test_final_provider_replay_is_journaled_and_persisted(
                 {"role": "system", "content": "test"},
                 {"role": "user", "content": "question"},
             ],
-            action_turn=False,
             turn_content="question",
             session_key="web:one",
             turn_messages_out=turn_messages,
