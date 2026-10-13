@@ -2060,6 +2060,8 @@ If a scheduled job tool call fails, include the error in your response — do no
                 "While subagents run, keep doing the parts that don't depend on them; "
                 "each result reaches you as a message. Treat a result as the "
                 "subagent's own report: check what matters, don't redo its work.",
+                "Steer or answer a running subagent with `agent_message`; read a "
+                "finished one's full result with `agent_read`.",
             ])
         if has_tool("sessions_list"):
             background_lines.extend([

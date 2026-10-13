@@ -9,6 +9,7 @@ from flowly.agent.tool_context import current_tool_origin
 from flowly.agent.tools.base import Tool
 
 if TYPE_CHECKING:
+    from flowly.agent.subagent import SubagentManager
     from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
 
 _READ_DEFAULT_CHARS = 8_000
@@ -122,3 +123,122 @@ class AgentReadTool(Tool):
         elif record.ended_at is None:
             view["note"] = "Still running; its result will reach you as a message."
         return json.dumps(view, ensure_ascii=False)
+
+
+_REPLY_WAIT_SECONDS = 300.0
+
+
+class AgentMessageTool(Tool):
+    """The main agent's line to the subagents it started, while they run."""
+
+    def __init__(self, manager: "SubagentManager"):
+        self._manager = manager
+
+    @property
+    def name(self) -> str:
+        return "agent_message"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Send a message to one or more of your running subagents — to steer, "
+            "narrow or answer them. Each reads it at its next step; it does not "
+            "interrupt a tool call in progress. Use to=\"all\" for every subagent "
+            "of this conversation that is still running."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "description": "A run_id, a list of run_ids, or \"all\".",
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
+                "message": {"type": "string", "description": "What to tell them."},
+            },
+            "required": ["to", "message"],
+        }
+
+    async def execute(self, to: Any, message: str, **kwargs: Any) -> str:
+        text = (message or "").strip()
+        if not text:
+            return json.dumps({"error": "The message is empty."})
+        origin = current_tool_origin()
+        session_key = origin.session_key if origin else None
+        registry = self._manager.registry
+        if to == "all":
+            targets = [
+                record.run_id for record in registry.all()
+                if record.ended_at is None and record.origin != "system"
+                and (session_key is None or record.parent_session_key == session_key)
+            ]
+            if not targets:
+                return json.dumps({"error": "No subagent of this conversation is running."})
+        else:
+            wanted = [to] if isinstance(to, str) else list(to or [])
+            targets = []
+            for item in wanted:
+                record, problem = resolve_own_run(registry, str(item), session_key)
+                if record is None:
+                    return json.dumps({"error": problem})
+                targets.append(record.run_id)
+        results = [await self._manager.send_to_child(run_id, text) for run_id in dict.fromkeys(targets)]
+        return json.dumps({"sent": results}, ensure_ascii=False)
+
+
+class ChildAgentMessageTool(Tool):
+    """A subagent's line to the main agent that started it."""
+
+    def __init__(self, manager: "SubagentManager", run_id: str):
+        self._manager = manager
+        self._run_id = run_id
+
+    @property
+    def name(self) -> str:
+        return "agent_message"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Send a message to the main agent that started you — a question you "
+            "can't resolve yourself, or something it must know before you finish. "
+            "Set await_reply to wait (up to 5 minutes) for its answer; otherwise "
+            "keep working and its reply reaches you at a later step."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "What to tell or ask."},
+                "await_reply": {
+                    "type": "boolean",
+                    "description": "Wait for the main agent's answer before going on.",
+                },
+            },
+            "required": ["message"],
+        }
+
+    async def execute(self, message: str, await_reply: bool = False, **kwargs: Any) -> str:
+        text = (message or "").strip()
+        if not text:
+            return json.dumps({"error": "The message is empty."})
+        sent = await self._manager.message_parent(self._run_id, text)
+        if sent.get("status") != "delivered":
+            return json.dumps({"error": "The main agent could not be reached."})
+        if not await_reply:
+            return json.dumps({"status": "sent", "to": "orchestrator"})
+        replies = await self._manager._wait_for_inbox(self._run_id, _REPLY_WAIT_SECONDS)
+        if not replies:
+            return json.dumps({
+                "status": "sent", "to": "orchestrator",
+                "reply": None, "note": "No reply within 5 minutes; continue with your best judgment.",
+            })
+        return json.dumps({"status": "sent", "to": "orchestrator", "reply": "\n\n".join(replies)},
+                          ensure_ascii=False)

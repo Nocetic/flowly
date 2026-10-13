@@ -27,6 +27,7 @@ from flowly.exec.types import ExecConfig
 from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
 from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
+from flowly.agent.tools.agent_tools import ChildAgentMessageTool
 from flowly.agent.subagent_observation import TaskEvents, run_view
 from flowly.agent.subagent_announce_queue import AnnounceItem, get_or_create_queue
 
@@ -331,6 +332,10 @@ class SubagentManager:
         # (other sessions / other cron jobs keep running).
         self._children_by_parent: dict[str, set[str]] = {}
         self._busy_sessions: set[str] = set()
+        # Messages from the main agent waiting for a running child's next
+        # step, and a wake-up for a child waiting on a reply.
+        self._inboxes: dict[str, list[str]] = {}
+        self._inbox_events: dict[str, asyncio.Event] = {}
         self._on_event = on_event  # async callback(event_name, data)
         self._events = TaskEvents(self._deliver_event)
         self._cancel_outcomes: dict[str, str] = {}
@@ -540,6 +545,8 @@ class SubagentManager:
                     _task.exception()
                 self._cancel_outcomes.pop(_rid, None)
                 self._running_tasks.pop(_rid, None)
+                self._inboxes.pop(_rid, None)
+                self._inbox_events.pop(_rid, None)
                 siblings = self._children_by_parent.get(_pk)
                 if siblings is not None:
                     siblings.discard(_rid)
@@ -650,9 +657,14 @@ class SubagentManager:
                 "skill_manage": lambda: SkillManageTool(workspace=self.workspace),
                 "knowledge_graph": _build_kg_tool,
                 "artifact": _build_artifact_tool,
+                "agent_message": lambda: ChildAgentMessageTool(self, run_id),
             }
 
             requested = set(_TOOL_FACTORIES.keys())
+            own = self._registry.get(run_id)
+            if own is not None and own.origin == "system":
+                # Background bookkeeping has no conversation to talk to.
+                requested.discard("agent_message")
             if label == "self-review":
                 # Self-review is only for memory/KG evolution. Replace the
                 # default tool set so it cannot create skills indirectly via
@@ -752,6 +764,12 @@ class SubagentManager:
 
             while iteration < max_iterations:
                 iteration += 1
+                # Messages the main agent sent since the last step.
+                for note in self._take_inbox(run_id):
+                    messages.append({
+                        "role": "user",
+                        "content": f"[Message from the main agent]\n{note}",
+                    })
                 await self._progress(run_id, {"phase": "thinking", "iteration": iteration})
                 _heartbeat(
                     f"subagent {label}: iteration {iteration}/{max_iterations}",
@@ -1271,6 +1289,83 @@ class SubagentManager:
             await self._emit_event("subagent.completed", run_id, label, status, error_str)
         return final_result
 
+    # ------------------------------------------------------------------
+    # Messages between the main agent and a running subagent
+    # ------------------------------------------------------------------
+
+    async def send_to_child(self, run_id: str, text: str) -> dict[str, Any]:
+        """Queue a message from the main agent for a running subagent.
+
+        The child reads it at its next step — after the tool call it is in,
+        never by interrupting one. A finished run cannot receive messages.
+        """
+        record = self._registry.get(run_id)
+        if record is None:
+            return {"run_id": run_id, "status": "not_found"}
+        if record.ended_at is not None or run_id not in self._running_tasks:
+            return {"run_id": run_id, "status": "finished",
+                    "error": "This subagent has already finished; it can't receive messages."}
+        self._inboxes.setdefault(run_id, []).append(text)
+        self._inbox_events.setdefault(run_id, asyncio.Event()).set()
+        self._transcribe(run_id, {"kind": "message_in", "from": "orchestrator", "content": text})
+        await self._progress(run_id, {"phase": "message_received"})
+        return {"run_id": run_id, "status": "delivered"}
+
+    def _take_inbox(self, run_id: str) -> list[str]:
+        messages = self._inboxes.pop(run_id, [])
+        event = self._inbox_events.get(run_id)
+        if event is not None:
+            event.clear()
+        return messages
+
+    async def _wait_for_inbox(self, run_id: str, timeout: float) -> list[str]:
+        if self._inboxes.get(run_id):
+            return self._take_inbox(run_id)
+        event = self._inbox_events.setdefault(run_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return []
+        return self._take_inbox(run_id)
+
+    async def message_parent(self, run_id: str, text: str) -> dict[str, Any]:
+        """Deliver a running subagent's message to the conversation that started it."""
+        record = self._registry.get(run_id)
+        if record is None:
+            return {"status": "not_found"}
+        title = record.display_name or record.label
+        self._transcribe(run_id, {"kind": "message_out", "to": "orchestrator", "content": text})
+        await self._progress(run_id, {"phase": "message_sent"})
+        prompt = (
+            f"[Message from subagent '{title}' (run_id={run_id}), still running]\n\n"
+            f"{text}\n\n"
+            f"If it needs an answer, reply with agent_message(to=\"{run_id}\", ...). "
+            "Don't show run ids to the owner."
+        )
+        await self._deliver_to_parent(
+            record.parent_session_key, prompt, summary=f"{title} — message", run_id=run_id,
+        )
+        return {"status": "delivered"}
+
+    async def _deliver_to_parent(
+        self, parent_session_key: str, prompt: str, *, summary: str, run_id: str,
+    ) -> None:
+        async def _send(content: str) -> None:
+            await self.bus.publish_inbound(InboundMessage(
+                channel="system",
+                sender_id="subagent",
+                chat_id=parent_session_key,
+                content=content,
+            ))
+            logger.debug(f"[SubagentManager] [{run_id[:8]}] delivered to {parent_session_key}")
+
+        if self.is_busy(parent_session_key):
+            # The parent is mid-turn: queue it for when that turn ends.
+            queue = get_or_create_queue(parent_session_key, _send)
+            await queue.enqueue(AnnounceItem(prompt=prompt, summary=summary))
+        else:
+            await _send(prompt)
+
     def _transcribe(self, run_id: str, item: dict[str, Any]) -> None:
         """Record one step for the owner to read; never fails the run."""
         try:
@@ -1354,29 +1449,10 @@ class SubagentManager:
             "request in your own words; don't show run ids."
         )
 
-        parent_session_key = record.parent_session_key
-
-        async def _send(prompt: str) -> None:
-            msg = InboundMessage(
-                channel="system",
-                sender_id="subagent",
-                chat_id=parent_session_key,
-                content=prompt,
-            )
-            await self.bus.publish_inbound(msg)
-            logger.debug(f"[SubagentManager] [{run_id[:8]}] announced to {parent_session_key}")
-
-        if self.is_busy(parent_session_key):
-            # Parent is currently processing — queue the announce
-            q = get_or_create_queue(parent_session_key, _send)
-            await q.enqueue(AnnounceItem(
-                prompt=announce_content,
-                summary=f"{_disp} — {status_text}",
-            ))
-            logger.debug(f"[SubagentManager] [{run_id[:8]}] queued announce (parent busy)")
-        else:
-            await _send(announce_content)
-
+        await self._deliver_to_parent(
+            record.parent_session_key, announce_content,
+            summary=f"{_disp} — {status_text}", run_id=run_id,
+        )
         self._registry.update(run_id, announced=True, delivery_state="queued")
 
     # ------------------------------------------------------------------
@@ -1387,8 +1463,15 @@ class SubagentManager:
         """Build a focused system prompt for the subagent."""
         base = f"""# Subagent
 
-Complete ONLY the assigned task. Stay focused, be concise, do not initiate side tasks.
-You MUST use tools to take action — never describe what you would do without doing it.
+The main agent started you for one task. Complete ONLY that task. Stay focused, be
+concise, do not initiate side tasks. Use tools to act — never describe what you
+would do without doing it.
+
+Your final reply is your report to the main agent: lead with the answer, give the
+evidence it can check (URLs, file paths, ids), and say plainly what you could not
+do. Use `agent_message` only when you need something from the main agent to go on
+or it must know something before you finish; messages from it appear as
+"[Message from the main agent]".
 Workspace: {self.workspace}
 """
 

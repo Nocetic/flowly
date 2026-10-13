@@ -32,6 +32,10 @@ When it starts one, the agent writes the subagent's brief itself: the goal, what
 
 Starting a subagent returns at once with its run id; the agent carries on with whatever doesn't depend on it. When the subagent finishes, its result reaches the agent as a message: the title, the run id, the tools it used and up to 8,000 characters of its result. The agent reads anything beyond that with `agent_read`, which only ever shows runs started in the same conversation. If the conversation is busy when a subagent finishes, the message waits until it frees up.
 
+### Talking while they work
+
+The agent can message its running subagents at any time with `agent_message` — one, several, or all of the conversation's — to steer, narrow or answer them. A subagent reads the message at its next step; a tool call already in progress is never cut short. A subagent can message the agent in turn, to ask something it can't settle itself or to report something the agent must know before it finishes, and it can wait up to five minutes for the answer. In the chat these exchanges show only as "Sent message to …" steps; the full exchange is in the subagent's transcript.
+
 ### Limits
 
 - Each subagent run is bounded by a **30-minute** wall-clock timeout and **30** model calls, with a 120-second per-tool timeout.
