@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 KINDS: tuple[str, ...] = (
-    "search", "web", "read", "write", "exec", "mcp", "bot", "agent", "media", "memory", "other",
+    "search", "web", "read", "write", "exec", "mcp", "bot", "agent", "media", "memory", "goal", "other",
 )
 TARGET_MAX_CHARS = 80
 
@@ -30,6 +30,11 @@ _BOT = {"message_profile": ("profile", "target", "name"), "delegate_to": ("profi
 _AGENT = {"spawn": ("label", "name"), "builtin_agent": ("agent", "name")}
 _MEDIA = {"image_generate": (), "video_generate": (), "voice_generate": (), "video_analyze": ()}
 _MEMORY_PREFIX = "memory_"
+# The agent's own goal keeping: a goal it tracks (its title is the target), a
+# check-in it plans, how often it may write first. Hidden from the chat's tool
+# panel (``flowly.tool_activity.INTERNAL_TOOLS``) but shown here, where the
+# owner looks to see what the agent did.
+_GOAL = {"objective": ("title",), "follow_up": (), "proactivity": ()}
 
 # Tools that belong to talking, not to work done for the owner: recalling
 # from its own memory or past conversations, noting something down, asking
@@ -40,6 +45,9 @@ CONVERSATION_TOOLS = frozenset({
     "knowledge_graph", "session_search", "sessions_list",
     "clarify", "agent_setup_ask", "plan",
     "skills_list", "skill_view",
+    # Planning to look again, or how often to write first, is part of talking;
+    # starting to track a goal (``objective``) is work.
+    "follow_up", "proactivity",
 })
 
 # A value that looks like a credential never becomes a target, whatever key it
@@ -159,4 +167,6 @@ def describe_step(tool_name: str, args: Any) -> dict[str, str]:
         return {"tool": tool, "kind": "media", "target": ""}
     if tool.startswith(_MEMORY_PREFIX):
         return {"tool": tool, "kind": "memory", "target": ""}
+    if tool in _GOAL:
+        return {"tool": tool, "kind": "goal", "target": _line(_first(values, _GOAL[tool]))}
     return {"tool": tool, "kind": "other", "target": ""}

@@ -5165,6 +5165,19 @@ def pairing_approve(params: dict) -> dict:
 # adding an RPC here lights it up over both relay and gateway at once.
 
 from functools import partial as _partial
+
+
+def _agenda_handler(name: str):
+    """Tracked goals and the agent's agenda (flowly/agenda/rpc.py)."""
+    def handle(params: dict) -> dict:
+        from flowly.agenda import rpc as agenda_rpc
+        from flowly.objectives.store import ObjectiveError
+
+        try:
+            return getattr(agenda_rpc, name)(params or {})
+        except ObjectiveError as exc:
+            raise FeatureRpcError(exc.code, str(exc)) from None
+    return handle
 import inspect as _inspect
 
 
@@ -5533,6 +5546,11 @@ _DISPATCH: dict[str, tuple] = {
     "activity.step": (activity_step, True, False),
     "activity.seen": (activity_seen, True, False),
     "sessions.read": (sessions_read, True, False),
+    "objectives.list": (_agenda_handler("objectives_list"), True, False),
+    "objectives.update": (_agenda_handler("objectives_update"), True, False),
+    "agenda.list": (_agenda_handler("agenda_list"), True, False),
+    "agenda.settings.get": (_agenda_handler("agenda_settings_get"), True, False),
+    "agenda.settings.set": (_agenda_handler("agenda_settings_set"), True, False),
     "audit.list": (audit_list, True, False),
     "audit.stats": (audit_stats, False, False),
     "audit.clear": (audit_clear, False, False),

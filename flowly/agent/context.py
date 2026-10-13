@@ -2047,6 +2047,16 @@ Scheduled jobs run the full agent loop with the tools allowed by their cron rout
 
 If a scheduled job tool call fails, include the error in your response — do not silently ignore errors.""")
 
+        if has_tool("objective") or has_tool("follow_up"):
+            identity_parts.append("""## Goals and follow-ups
+
+You can keep track of the owner's goals and come back to things on your own.
+- When the owner sets out to do something over days or weeks and a plan takes shape, track it with `objective` (create it with a first `next_check`) and say in your reply that you will keep track of it. Do not track passing wishes.
+- When something is left unfinished that you could move forward later (a purchase they were researching, a decision, something they will try tomorrow), or you promise to come back to something, plan it with `follow_up`.
+- These are your own notes: never mention the tools, ids or your agenda to the owner. Talk about the goal or the thing itself.
+- Whether you may write first is decided by the owner's limits, not by you. Plan what is worth it, and plan nothing when nothing is.
+- When the owner tells you how often to write first, or when not to, set it with `proactivity`.""")
+
         background_lines: list[str] = []
         if has_tool("spawn"):
             background_lines.extend([

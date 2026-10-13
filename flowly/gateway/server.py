@@ -254,6 +254,7 @@ _PROFILE_HOST_LONG_RUNNING_METHODS = frozenset({
     "profiles.delete.commit",
     "profiles.rpc",
     "profiles.cron.notify",
+    "profiles.agenda.notify",
     "profiles.stop",
 })
 _PROFILE_CLIENT_SUBSCRIPTION_LIMIT = 128
@@ -2882,6 +2883,8 @@ class GatewayServer:
                 msg["voice"] = m["voice"]
             if m.get("kind") == "agent_setup_card" and isinstance(m.get("setupCard"), dict):
                 msg["setupCard"] = m["setupCard"]
+            if isinstance(m.get("goal_cards"), list) and m["goal_cards"]:
+                msg["goalCards"] = m["goal_cards"]
             if m.get("boundaryKind"):
                 msg["boundaryKind"] = m["boundaryKind"]
             if m.get("compactionId"):
@@ -3658,6 +3661,11 @@ class GatewayServer:
                 )
                 if atts:
                     final_message["attachments"] = atts
+            # Goals the turn started tracking or finished: a card under the
+            # reply, the same shape chat.history returns (flowly/objectives/cards.py).
+            goal_cards = (metadata or {}).get("goalCards")
+            if isinstance(goal_cards, list) and goal_cards:
+                final_message["goalCards"] = goal_cards
 
             final_data: dict[str, Any] = {
                 "state": "final",
@@ -5031,6 +5039,10 @@ class GatewayServer:
         }
         if isinstance(goal_snapshot, dict):
             data["goal"] = goal_snapshot
+        # A check-in the agent wrote first about a goal: its card, the same
+        # shape a reply's goalCards have (flowly/objectives/cards.py).
+        if isinstance(metadata.get("goalCards"), list) and metadata["goalCards"]:
+            final_message["goalCards"] = metadata["goalCards"]
         if metadata.get("goal_run") is True:
             data["goalRun"] = True
         if metadata.get("goalTerminal") is True:

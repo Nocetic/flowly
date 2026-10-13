@@ -19,6 +19,36 @@ from typing import Any, Iterable, Mapping
 TOOL_ACTIVITY_SCHEMA_VERSION = 1
 _DEFERRED_CALL_PROTOCOL_NAME = "tool_call"
 
+#: The agent's own bookkeeping: the goals it tracks and the follow-ups it
+#: plans (flowly/agenda), and its memory — recalling, searching, writing and
+#: tidying what it knows. Calls to these never reach a conversation — not the
+#: tool panel, not the history a reopened chat renders. There they would show
+#: the owner the machinery instead of the result: the agent tells the owner
+#: itself when it starts tracking something (and the reply carries the goal's
+#: card), and what it remembers shows in what it says. Activity, where the
+#: owner looks to see what the agent did, does show them as steps
+#: (:mod:`flowly.activity.steps`).
+INTERNAL_TOOLS = frozenset({
+    "objective", "follow_up", "proactivity",
+    "memory_search", "memory_get", "memory_recall", "memory_feedback",
+    "memory_append", "memory_consolidate", "memory_import", "knowledge_graph",
+})
+
+
+def is_internal_tool(name: Any) -> bool:
+    return isinstance(name, str) and name in INTERNAL_TOOLS
+
+
+def _has_text(content: Any) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(part, Mapping) and isinstance(part.get("text"), str) and part["text"].strip()
+            for part in content
+        ) or any(isinstance(part, Mapping) and part.get("type") not in (None, "text") for part in content)
+    return content is not None and content != ""
+
 
 def _object_arguments(value: Any) -> dict[str, Any] | None:
     if isinstance(value, Mapping):
@@ -89,16 +119,25 @@ def project_tool_call_for_ui(call: Mapping[str, Any]) -> dict[str, Any]:
 
 def project_tool_messages_for_ui(
     messages: Iterable[Mapping[str, Any]],
+    *,
+    internal_call_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Project a tool-message sequence, preserving call/result linkage.
 
     Result messages do not contain the wrapper arguments, so the assistant
     call's stable id is used to give the corresponding result the same
     effective name.  Orphans and non-tool messages remain losslessly copied.
+
+    Calls to :data:`INTERNAL_TOOLS` and their results are left out. A caller
+    projecting one message at a time (live iteration events) passes the same
+    ``internal_call_ids`` set for the whole run, so a result arriving after its
+    call is still recognised.
     """
 
     projected_messages: list[dict[str, Any]] = []
     effective_name_by_call_id: dict[str, str] = {}
+    if internal_call_ids is None:
+        internal_call_ids = set()
 
     for source in messages:
         # Shallow-copy the message envelope. History DTOs may contain large
@@ -114,9 +153,13 @@ def project_tool_messages_for_ui(
                     projected_calls.append(deepcopy(call))
                     continue
                 projected_call = project_tool_call_for_ui(call)
-                projected_calls.append(projected_call)
                 call_id = projected_call.get("id")
                 function = projected_call.get("function")
+                if isinstance(function, Mapping) and is_internal_tool(function.get("name")):
+                    if isinstance(call_id, str):
+                        internal_call_ids.add(call_id)
+                    continue
+                projected_calls.append(projected_call)
                 activity = projected_call.get("tool_activity")
                 if (
                     isinstance(call_id, str)
@@ -127,9 +170,20 @@ def project_tool_messages_for_ui(
                     effective_name = function.get("name")
                     if isinstance(effective_name, str) and effective_name:
                         effective_name_by_call_id[call_id] = effective_name
-            projected["tool_calls"] = projected_calls
+            if projected_calls or len(projected_calls) == len(calls):
+                projected["tool_calls"] = projected_calls
+            else:
+                projected.pop("tool_calls", None)
+                if not _has_text(source.get("content")):
+                    # Only internal calls and nothing said: no step at all.
+                    continue
 
         tool_call_id = source.get("tool_call_id")
+        if source.get("role") == "tool" and (
+            (isinstance(tool_call_id, str) and tool_call_id in internal_call_ids)
+            or is_internal_tool(source.get("name"))
+        ):
+            continue
         effective_name = (
             effective_name_by_call_id.get(tool_call_id) if isinstance(tool_call_id, str) else None
         )

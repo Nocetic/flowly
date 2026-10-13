@@ -545,6 +545,7 @@ class Session:
         aborted: bool = False,
         duration_ms: int | None = None,
         run_id: str | None = None,
+        goal_cards: list[dict[str, Any]] | None = None,
     ) -> None:
         """Append a completed turn — user message + all assistant/tool
         messages the loop produced — to the session.
@@ -607,6 +608,11 @@ class Session:
             assistant record and, for non-aborted turns, copied to session
             metadata so lightweight ``sessions.list`` callers can reconcile
             unread state without scanning chat history.
+        goal_cards:
+            Goals this turn started tracking or finished
+            (:mod:`flowly.objectives.cards`), kept on the closing assistant
+            record so a reopened conversation shows the same card as the live
+            reply. Display-only; projected away for the LLM.
         """
         # Persist the media file paths alongside the user message so chat
         # history can reconstruct attachment previews (the direct gateway has
@@ -679,6 +685,8 @@ class Session:
                 extras["duration_ms"] = max(0, int(duration_ms))
             if i == closing_idx and clean_run_id:
                 extras["run_id"] = clean_run_id
+            if i == closing_idx and goal_cards:
+                extras["goal_cards"] = list(goal_cards)
             content = new_msg.get("content") or ""
             if i == closing_idx and final_content:
                 content = final_content
@@ -707,6 +715,8 @@ class Session:
                 extras["duration_ms"] = max(0, int(duration_ms))
             if clean_run_id:
                 extras["run_id"] = clean_run_id
+            if goal_cards:
+                extras["goal_cards"] = list(goal_cards)
             self.add_message("assistant", final_content or "", **extras)
             persisted_closing = self.messages[-1]
 
