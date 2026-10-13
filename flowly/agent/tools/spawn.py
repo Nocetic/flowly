@@ -126,12 +126,14 @@ class SpawnTool(Tool):
         if context != "none" and turn and turn.conversation:
             transcript = render_conversation(turn.conversation)
 
+        channel = (turn.origin_channel if turn else "") or self._origin_channel
+        chat_id = (turn.origin_chat_id if turn else "") or self._origin_chat_id
         return await self._manager.spawn(
             task=task,
             label=label,
             display_name=(title or "").strip() or None,
-            origin_channel=self._origin_channel,
-            origin_chat_id=self._origin_chat_id,
+            origin_channel=channel,
+            origin_chat_id=chat_id,
             model=chosen_model,
             is_subagent_caller=self._is_subagent,
             origin=decision.origin,

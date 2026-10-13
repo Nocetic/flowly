@@ -105,6 +105,14 @@ _SUBAGENT_WALL_CLOCK_TIMEOUT = 1_800
 # A subagent exists for work too big to share a turn with: give it room.
 _SUBAGENT_MAX_ITERATIONS = 30
 _MAX_CONCURRENT_SUBAGENTS = 8
+# A finished run's result that the conversation has not handled in this long
+# no longer holds a goal (see pending_for_goal).
+_UNDELIVERED_GRACE_SECONDS = 600
+# After a restart, a finished run whose result was never handled is announced
+# again only if it ended this recently; older ones are recorded undelivered.
+_REANNOUNCE_WITHIN_SECONDS = 3_600
+# How long a child may wait for the main agent's reply (agent_message).
+_REPLY_WAIT_SECONDS = 300
 # Result text handed to the parent with the completion notice; the rest
 # is one agent_read call away.
 _ANNOUNCE_RESULT_CHARS = 8_000
@@ -402,19 +410,50 @@ class SubagentManager:
         of the results it is waiting for. System runs are not the goal's work.
         """
         titles: list[str] = []
+        now = time.time()
         for record in self._registry.all():
             if record.parent_session_key != parent_session_key or record.origin == "system":
                 continue
-            if record.ended_at is None or record.delivery_state in ("pending", "queued"):
+            waiting = record.ended_at is None or (
+                record.delivery_state in ("pending", "queued")
+                # A result that was never handled within the grace period
+                # (a crash between publishing and handling) stops holding
+                # the goal rather than parking it for good.
+                and now - record.ended_at < _UNDELIVERED_GRACE_SECONDS
+            )
+            if waiting:
                 titles.append(record.display_name or record.label)
         return titles
 
-    def mark_delivered(self, run_ids: list[str]) -> None:
+    def mark_delivered(self, parent_session_key: str, run_ids: list[str]) -> None:
         """Record that the conversation has handled these finished runs' results."""
         for run_id in dict.fromkeys(run_ids):
             record = self._registry.get(run_id)
-            if record is not None and record.ended_at is not None and record.delivery_state != "not_required":
+            if (
+                record is not None
+                and record.parent_session_key == parent_session_key
+                and record.ended_at is not None
+                and record.delivery_state in ("pending", "queued")
+            ):
                 self._registry.update(run_id, delivery_state="delivered")
+
+    def _reconcile_undelivered(self) -> None:
+        now = time.time()
+        for record in self._registry.all():
+            if record.ended_at is None or record.delivery_state not in ("pending", "queued"):
+                continue
+            recent = now - record.ended_at < _REANNOUNCE_WITHIN_SECONDS
+            if recent and record.outcome in ("ok", "error", "timeout"):
+                try:
+                    result = self._registry.read_result(record.run_id, 0, 200_000)["content"]
+                except (FileNotFoundError, ValueError, OSError):
+                    result = record.result_preview or record.error or ""
+                task = asyncio.create_task(self._announce(record.run_id, result, record.outcome))
+                task.add_done_callback(
+                    lambda t: t.exception() if not t.cancelled() and t.exception() else None
+                )
+            else:
+                self._registry.update(record.run_id, delivery_state="undelivered")
 
     def _running_siblings(self, parent_session_key: str) -> list[SubagentRunRecord]:
         """Owner/agent-started runs still going for one conversation."""
@@ -426,7 +465,18 @@ class SubagentManager:
         return records
 
     def resume_pending(self) -> None:
-        """Called on startup: announce any tasks that were running when process crashed."""
+        """Called on startup: settle what the previous process left unfinished.
+
+        Runs that were still going are marked failed and announced. Runs that
+        had finished but whose result never reached their conversation (the
+        process stopped between publishing and handling it) are announced
+        again if recent, and otherwise recorded as undelivered so nothing
+        waits on them.
+        """
+        try:
+            self._reconcile_undelivered()
+        except (OSError, ValueError):
+            logger.exception("Subagent delivery recovery unavailable")
         try:
             pending = self._registry.pending()
         except (OSError, ValueError):
@@ -757,7 +807,7 @@ class SubagentManager:
                 {"role": "user", "content": first_message},
             ]
             self._transcribe(run_id, {
-                "kind": "brief", "content": task, "withConversation": bool(context),
+                "kind": "brief", "content": _clip(task, 8_000), "withConversation": bool(context),
             })
 
             # Run agent loop (limited iterations)
@@ -1003,7 +1053,12 @@ class SubagentManager:
                                 tool_args["session_key"] = f"{origin_channel}:{origin_chat_id}"
                             result = await asyncio.wait_for(
                                 tools.execute(effective_tool_name, tool_args),
-                                timeout=120,  # Per-tool timeout
+                                # Per-tool timeout; a question to the main agent
+                                # may wait the full reply window instead.
+                                timeout=(
+                                    _REPLY_WAIT_SECONDS + 30
+                                    if effective_tool_name == "agent_message" else 120
+                                ),
                             )
                         except asyncio.TimeoutError:
                             result = f"Error: Tool '{effective_tool_name}' timed out after 120s"
@@ -1171,6 +1226,11 @@ class SubagentManager:
 
                     # Successful response — reset error counter
                     _consecutive_errors = 0
+                    if self._inboxes.get(run_id) and iteration < max_iterations:
+                        # The main agent wrote while this answer was being
+                        # produced: read it before finishing, never drop it.
+                        messages.append({"role": "assistant", "content": response.content})
+                        continue
                     final_result = response.content
                     break
 
@@ -1411,7 +1471,14 @@ class SubagentManager:
             await _send(prompt)
 
     def _transcribe(self, run_id: str, item: dict[str, Any]) -> None:
-        """Record one step for the owner to read; never fails the run."""
+        """Record one step for the owner to read; never fails the run.
+
+        System runs (self-review, Board) carry the owner's conversation and
+        memory and are never opened from a chat: they keep no transcript.
+        """
+        record = self._registry.get(run_id)
+        if record is None or record.origin == "system":
+            return
         try:
             self._registry.append_transcript(run_id, item)
         except Exception:
@@ -1497,7 +1564,11 @@ class SubagentManager:
             record.parent_session_key, announce_content,
             summary=f"{_disp} — {status_text}", run_id=run_id,
         )
-        self._registry.update(run_id, announced=True, delivery_state="queued")
+        # A run that needs no delivery (cancelled, interrupted, waited on)
+        # keeps that state: a goal must not wait for a result nobody handles.
+        current = self._registry.get(run_id)
+        delivery = "not_required" if current and current.delivery_state == "not_required" else "queued"
+        self._registry.update(run_id, announced=True, delivery_state=delivery)
 
     # ------------------------------------------------------------------
     # Helpers

@@ -35,6 +35,9 @@ MAX_CHILDREN_PER_CONVERSATION = 3
 # A quote shorter than this proves nothing ("ver", "ok").
 _MIN_QUOTE_CHARS = 6
 
+# How the runtime stores a system trigger in a conversation's user slot.
+_SYSTEM_ROW_PREFIX = "[System:"
+
 # Conversation handed to a child: the most recent exchange, bounded.
 _CONTEXT_MAX_CHARS = 24_000
 _CONTEXT_MESSAGE_MAX_CHARS = 4_000
@@ -50,8 +53,14 @@ class DelegationTurn:
     conversation: tuple[tuple[str, str], ...] = ()
     model: str | None = None
     # False when the turn was not written by the owner (a subagent's result
-    # arriving, a system notice): nothing in it can count as an owner request.
+    # arriving, a goal continuation, a system notice): nothing in it can
+    # count as an owner request.
     owner_authored: bool = True
+    # Where a subagent started in this turn reports back. Carried with the
+    # turn, never read from the shared tool object, so two conversations
+    # running at once cannot swap each other's children.
+    origin_channel: str = ""
+    origin_chat_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -97,7 +106,17 @@ def spawn_batch_scope(size: int) -> Iterator[None]:
 
 
 def count_spawn_calls(tool_calls: Any) -> int:
-    return sum(1 for call in tool_calls or () if getattr(call, "name", "") == "spawn")
+    """Distinct pieces of work the response asks subagents for.
+
+    Two identical spawn calls are one part asked twice, not a split.
+    """
+    tasks = set()
+    for call in tool_calls or ():
+        if getattr(call, "name", "") != "spawn":
+            continue
+        arguments = getattr(call, "arguments", None) or {}
+        tasks.add(_normalize(str(arguments.get("task") or arguments.get("title") or "")))
+    return len(tasks)
 
 
 def begin_spawn_batch(tool_calls: Any) -> None:
@@ -159,15 +178,26 @@ def conversation_from_history(
     Keeps what was said and answered; drops tool calls, tool output and
     reasoning, the way a forked conversation should look to a newcomer.
     """
+    from flowly.compaction.types import is_summary_message
+
     pairs: list[tuple[str, str]] = []
     for message in history or ():
         role = message.get("role")
-        if role not in ("user", "assistant"):
-            continue
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             continue
+        if is_summary_message(message):
+            pairs.append(("summary", content.strip()))
+            continue
+        if role not in ("user", "assistant"):
+            continue
         if role == "assistant" and message.get("tool_calls"):
+            continue
+        if role == "user" and (
+            message.get("_display_hidden") or content.lstrip().startswith(_SYSTEM_ROW_PREFIX)
+        ):
+            # A subagent's report or a system notice the runtime stored in
+            # the user slot: not the owner's words, and possibly web-derived.
             continue
         pairs.append((role, content.strip()))
     if current_owner_text.strip():
@@ -182,7 +212,7 @@ def render_conversation(conversation: tuple[tuple[str, str], ...]) -> str:
     for role, text in reversed(conversation):
         if len(text) > _CONTEXT_MESSAGE_MAX_CHARS:
             text = text[:_CONTEXT_MESSAGE_MAX_CHARS] + " […]"
-        speaker = "Owner" if role == "user" else "Agent"
+        speaker = {"user": "Owner", "assistant": "Agent"}.get(role, "Summary of earlier conversation")
         line = f"**{speaker}:** {text}"
         if used + len(line) > _CONTEXT_MAX_CHARS and lines:
             lines.append("[earlier messages left out]")

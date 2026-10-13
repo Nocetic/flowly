@@ -26,6 +26,17 @@ _REGISTRY_PATH = None  # resolved lazily
 # A finished run, its result and its transcript are kept this long: long
 # enough to reopen a conversation days later and still open its subagents.
 _PRUNE_AFTER_SECONDS = 30 * 86_400
+# System work (self-review, Board) and runs started with cleanup="delete" are
+# bookkeeping nobody reopens; they hold conversation and memory text, so they
+# go after a day.
+_SYSTEM_PRUNE_AFTER_SECONDS = 86_400
+_SETTLED_DELIVERY = frozenset({"not_required", "delivered", "undelivered"})
+
+
+def _retention_seconds(record: "SubagentRunRecord") -> int:
+    if record.origin == "system" or record.cleanup == "delete":
+        return _SYSTEM_PRUNE_AFTER_SECONDS
+    return _PRUNE_AFTER_SECONDS
 
 
 @dataclass
@@ -144,11 +155,11 @@ class SubagentRegistry:
                     logger.warning("Skipping invalid subagent history record")
                     continue
                 records[record.run_id] = record
-        cutoff = time.time() - _PRUNE_AFTER_SECONDS
+        now = time.time()
         records = {
             key: rec for key, rec in records.items()
-            if rec.ended_at is None or rec.ended_at >= cutoff
-            or not (rec.announced or rec.delivery_state == "not_required")
+            if rec.ended_at is None or rec.ended_at >= now - _retention_seconds(rec)
+            or not (rec.announced or rec.delivery_state in _SETTLED_DELIVERY)
         }
         # Preserve references held by the live manager/board.
         for key, rec in records.items():

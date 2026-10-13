@@ -217,6 +217,6 @@ async def test_a_goal_waits_until_results_are_handled_not_just_finished(tmp_path
     await asyncio.sleep(0.05)
     # Finished and announced, but the conversation has not handled it yet.
     assert manager.pending_for_goal("web:g1") == ["Rakip A"]
-    manager.mark_delivered([started["run_id"]])
+    manager.mark_delivered("web:g1", [started["run_id"]])
     assert manager.pending_for_goal("web:g1") == []
     assert started["run_id"] in notice.content

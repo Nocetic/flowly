@@ -508,7 +508,10 @@ def _with_plugin_context(messages: list[dict[str, Any]], injected: str) -> list[
 
 
 # A subagent's notice names its run as "run_id=<uuid>".
-_SUBAGENT_RUN_ID_RE = re.compile(r"run_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+_SUBAGENT_RUN_ID_RE = re.compile(
+    r"^\[Subagent '.*?'.*?\] run_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.MULTILINE,
+)
 
 
 # Tools that only read, so several in one response may run together.
@@ -520,13 +523,14 @@ _PARALLEL_READ_TOOLS = frozenset({
 def _announces_untaken_step(text: str | None) -> bool:
     """True when a tool-less reply ends by announcing its next step.
 
-    "Ekrana bakıyorum:" or "Let me check…" followed by nothing means the model
-    stopped mid-action. The test is the reply's shape (a trailing colon or
-    ellipsis), never its vocabulary, so a question or an explanation that
-    happens to mention an action is not mistaken for one.
+    "Ekrana bakıyorum:" followed by nothing means the model stopped
+    mid-action. The test is the reply's shape (a trailing colon), never its
+    vocabulary, so a question or an explanation that happens to mention an
+    action is not mistaken for one. A trailing ellipsis is too common in
+    finished prose to count.
     """
     stripped = (text or "").rstrip()
-    return bool(stripped) and stripped.endswith((":", "…", "..."))
+    return bool(stripped) and stripped.endswith(":")
 
 
 def _contains_leaked_tool_markup(text: str | None) -> bool:
@@ -4846,32 +4850,69 @@ class AgentLoop:
             or ("call sid:" in lowered and "kullanıcı şunu söyledi:" in lowered)
         )
 
-    def _prefetch_parallel_reads(
+    def _delegation_owner_text(self, msg: InboundMessage) -> tuple[str, bool]:
+        """What the owner wrote this turn, and whether it may authorise a subagent.
+
+        Only the owner's own words count. A goal continuation carries the
+        objective the owner set — its prompt also holds a drafted contract and
+        fixed instructions, which must not. A voice turn carries what the
+        owner said, not its wrapper. Introductions, goal controls and system
+        senders authorise nothing.
+        """
+        metadata = getattr(msg, "metadata", None) or {}
+        goal_id = metadata.get(_GOAL_CONTINUATION_ID)
+        if goal_id:
+            manager = getattr(self, "goal_manager", None)
+            state = manager.get(msg.session_key) if manager is not None else None
+            objective = str(getattr(state, "goal", "") or "")
+            return objective, bool(objective)
+        if (
+            metadata.get(_AGENT_INTRODUCTION)
+            or _is_goal_control_message(msg)
+            or not _is_user_activity_channel(msg.channel)
+            or msg.sender_id in {"goal", "process", "system", "subagent"}
+        ):
+            return msg.content or "", False
+        content = msg.content or ""
+        spoken = re.search(r'User said:\s*"(.*?)"', content, flags=re.DOTALL | re.IGNORECASE)
+        return (spoken.group(1).strip() if spoken else content), True
+
+    def _parallel_read_groups(
         self,
         tool_calls: Any,
         *,
         tools_allowed: bool,
         live_call_turn: bool,
         available_tool_names: set[str],
+    ) -> dict[str, list[Any]]:
+        """Runs of two or more consecutive pure reads, keyed by their first call.
+
+        Only pure reads qualify (see ``_PARALLEL_READ_TOOLS``) and only when
+        they sit next to each other: a read after a write must see what the
+        write did, so it waits its turn. Anything that writes, sends, asks or
+        looks at the screen keeps running one at a time, in order.
+        """
+        if not tools_allowed or live_call_turn:
+            return {}
+        groups: dict[str, list[Any]] = {}
+        current: list[Any] = []
+        for call in list(tool_calls or ()) + [None]:
+            if call is not None and call.name in _PARALLEL_READ_TOOLS and call.name in available_tool_names:
+                current.append(call)
+                continue
+            if len(current) >= 2:
+                groups[current[0].id] = current
+            current = []
+        return groups
+
+    def _start_parallel_reads(
+        self,
+        calls: list[Any],
+        *,
         outbound_run_id: str,
         execute_kwargs: dict[str, Any],
         toolset_route: tuple[Any, Any],
     ) -> dict[str, asyncio.Task]:
-        """Start a response's independent reads together; key tasks by call id.
-
-        Only pure reads qualify (see ``_PARALLEL_READ_TOOLS``) and only when a
-        response holds two or more of them: a read cannot conflict with
-        another read, and anything that writes, sends, asks or looks at the
-        screen keeps running one at a time, in order.
-        """
-        if not tools_allowed or live_call_turn:
-            return {}
-        eligible = [
-            call for call in tool_calls or ()
-            if call.name in _PARALLEL_READ_TOOLS and call.name in available_tool_names
-        ]
-        if len(eligible) < 2:
-            return {}
         enabled_toolsets, disabled_toolsets = toolset_route
         kwargs = {
             **execute_kwargs,
@@ -4881,11 +4922,17 @@ class AgentLoop:
 
         def _start(call: Any) -> asyncio.Task:
             name, args = call.name, dict(call.arguments)
-            return asyncio.create_task(self._run_aborts.run_cancellable(
+            task = asyncio.create_task(self._run_aborts.run_cancellable(
                 outbound_run_id, lambda: self.tools.execute(name, args, **kwargs),
             ))
+            # A read the loop never awaits (the turn stopped or failed) must
+            # not surface as an unretrieved task error.
+            task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None
+            )
+            return task
 
-        return {call.id: _start(call) for call in eligible}
+        return {call.id: _start(call) for call in calls}
 
     def _apply_turn_tool_policy(
         self,
@@ -6498,20 +6545,27 @@ class AgentLoop:
                 # Independent reads in one response run at the same time; the
                 # loop below still takes every call in order, through every
                 # gate, and only swaps its execution for the finished read.
-                _prefetched = self._prefetch_parallel_reads(
+                _read_groups = self._parallel_read_groups(
                     response.tool_calls,
                     tools_allowed=tools_allowed,
                     live_call_turn=live_call_turn,
                     available_tool_names=available_tool_names,
-                    outbound_run_id=outbound_run_id,
-                    execute_kwargs={
-                        "session_key": _current_session_key,
-                        "platform": tool_platform or outbound_channel,
-                        "disabled_tools": frozenset(disabled_tools or ()),
-                    },
-                    toolset_route=self._resolve_toolset_route(tool_platform or outbound_channel),
                 )
+                _prefetched: dict[str, asyncio.Task] = {}
                 for tool_call in response.tool_calls:
+                    if tool_call.id in _read_groups:
+                        # A run of reads starts together only when the loop
+                        # reaches it: never ahead of a write before it.
+                        _prefetched.update(self._start_parallel_reads(
+                            _read_groups[tool_call.id],
+                            outbound_run_id=outbound_run_id,
+                            execute_kwargs={
+                                "session_key": _current_session_key,
+                                "platform": tool_platform or outbound_channel,
+                                "disabled_tools": frozenset(disabled_tools or ()),
+                            },
+                            toolset_route=self._resolve_toolset_route(tool_platform or outbound_channel),
+                        ))
                     # Stop is checked per call, not just per LLM iteration.
                     # This guarantees a batch of N tool calls never starts call
                     # N+1 after the user has stopped the run.
@@ -7210,7 +7264,9 @@ class AgentLoop:
             ):
                 announced_step_nudged = True
                 logger.info("Reply announced a step without taking it; continuing once")
-                messages.append({"role": "assistant", "content": response.content})
+                # Already streamed to the owner: keep it in the history too,
+                # so the transcript matches what they saw.
+                _append_turn_message(messages, {"role": "assistant", "content": response.content})
                 messages.append({
                     "role": "user",
                     "content": (
@@ -8970,10 +9026,14 @@ class AgentLoop:
 
         # Keep a positive ceiling for the whole turn, not just a deny list
         # computed from one registry snapshot. Late MCP discovery cannot widen it.
+        owner_text, owner_authored = self._delegation_owner_text(msg)
         delegation_turn = DelegationTurn(
-            owner_text=msg.content or "",
-            conversation=conversation_from_history(history, msg.content or ""),
+            owner_text=owner_text,
+            conversation=conversation_from_history(history, owner_text if owner_authored else ""),
             model=effective_model,
+            owner_authored=owner_authored,
+            origin_channel=tool_channel,
+            origin_chat_id=tool_chat_id,
         )
         with tool_execution_scope(msg.session_key, allowed_tools=allowed_tools if tools_allowed else frozenset()), self._steering().register(
             msg.metadata.get("run_id") or "", msg.session_key, persist_guidance
@@ -9340,6 +9400,8 @@ class AgentLoop:
             conversation=conversation_from_history(self._history_with_summary_anchor(session)),
             model=self.model,
             owner_authored=False,
+            origin_channel=origin_channel,
+            origin_chat_id=origin_chat_id,
         )
         with delegation_turn_scope(system_turn):
             final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
@@ -9385,7 +9447,10 @@ class AgentLoop:
         if msg.sender_id == "subagent":
             # The conversation has now handled these results; a goal waiting
             # on them may continue.
-            self.subagents.mark_delivered(_SUBAGENT_RUN_ID_RE.findall(msg.content or ""))
+            self.subagents.mark_delivered(
+                f"{origin_channel}:{origin_chat_id}",
+                _SUBAGENT_RUN_ID_RE.findall(msg.content or ""),
+            )
         # A system/announce turn has no inbound attachment — it is triggered by
         # the agent's own machinery, not by a person handing it a file.
         await self._index_turn_media(session, reply_media_assets, None, origin_channel)

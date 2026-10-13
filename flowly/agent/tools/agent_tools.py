@@ -30,14 +30,17 @@ def resolve_own_run(
     this conversation's business.
     """
     wanted = (run_id or "").strip()
+    if session_key is None:
+        # No conversation is running this call (a scheduled tool job, an
+        # external caller): it owns no subagents.
+        return None, "No conversation owns this call, so it has no subagents."
     if len(wanted) < _MIN_ID_PREFIX:
         return None, "Give the run_id from the subagent's start or completion message."
     candidates = [
         record for record in registry.all()
         if record.run_id == wanted or record.run_id.startswith(wanted)
     ]
-    if session_key is not None:
-        candidates = [r for r in candidates if r.parent_session_key == session_key]
+    candidates = [r for r in candidates if r.parent_session_key == session_key]
     if not candidates:
         return None, f"No subagent run {wanted} in this conversation."
     if len(candidates) > 1:
@@ -125,7 +128,7 @@ class AgentReadTool(Tool):
         return json.dumps(view, ensure_ascii=False)
 
 
-_REPLY_WAIT_SECONDS = 300.0
+_REPLY_WAIT_SECONDS = 300.0  # keep in step with subagent._REPLY_WAIT_SECONDS
 
 
 class AgentMessageTool(Tool):
@@ -170,12 +173,14 @@ class AgentMessageTool(Tool):
             return json.dumps({"error": "The message is empty."})
         origin = current_tool_origin()
         session_key = origin.session_key if origin else None
+        if session_key is None:
+            return json.dumps({"error": "No conversation owns this call, so it has no subagents."})
         registry = self._manager.registry
         if to == "all":
             targets = [
                 record.run_id for record in registry.all()
                 if record.ended_at is None and record.origin != "system"
-                and (session_key is None or record.parent_session_key == session_key)
+                and record.parent_session_key == session_key
             ]
             if not targets:
                 return json.dumps({"error": "No subagent of this conversation is running."})
