@@ -30,6 +30,8 @@ TOOLSET_MEMBERS: dict[str, frozenset[str]] = {
     }),
     "sessions": frozenset({"session_search"}),
     "scheduling": frozenset({"cron"}),
+    # The agent's own follow-ups and the goals it tracks (flowly/agenda).
+    "agenda": frozenset({"follow_up", "objective"}),
     "productivity": frozenset({
         "trello", "x", "linear", "github", "sentry", "email",
         "google_calendar", "google_drive", "google_contacts", "google_tasks",
@@ -54,7 +56,10 @@ ALL_BUILTIN_TOOLSETS: frozenset[str] = frozenset(TOOLSET_MEMBERS)
 # callers already supplied name-level blocks for cron/message; expressing the
 # same boundary as toolsets makes it apply consistently to every cron entrypoint.
 DEFAULT_DISABLED_TOOLSETS_BY_PLATFORM: dict[str, frozenset[str]] = {
-    "cron": frozenset({"delivery", "interactive", "scheduling"}),
+    "cron": frozenset({"delivery", "interactive", "scheduling", "agenda"}),
+    # The daily review plans follow-ups with the agenda tools; it never writes
+    # to the owner, asks them anything, or creates scheduled tasks.
+    "agenda": frozenset({"delivery", "interactive", "scheduling"}),
 }
 
 _TOOLSET_BY_NAME = {

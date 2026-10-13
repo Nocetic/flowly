@@ -62,7 +62,7 @@ from flowly.session.archive import (
     EVENT_SEQ_KEY,
     SUMMARY_COVERS_KEY,
 )
-from flowly.cron.service import CronService
+from flowly.cron.service import CronService, is_silent_response
 from flowly.compaction.service import CompactionService
 from flowly.compaction.request_guard import (
     ProviderRequestCoordinator,
@@ -158,7 +158,7 @@ _DEFAULT_MAX_CHARS = 8000
 # Channels that are NOT genuine user activity: the agent's own background runs.
 # Memory learning (idle + turn dreamer triggers) must ignore these so a periodic
 # heartbeat/cron tick never looks like a conversation worth remembering.
-_NON_USER_CHANNELS = ("system", "heartbeat", "cron")
+_NON_USER_CHANNELS = ("system", "heartbeat", "cron", "agenda")
 
 # Passive group-context buffer bounds (Slack/Discord "listen" mode). Un-answered
 # channel messages accumulate per session until the next mention flushes them
@@ -169,6 +169,8 @@ _GROUP_BUFFER_MAX_CHARS = 6000
 _GOAL_CONTINUATION_ID = "_goal_continuation_goal_id"
 # Mirrors flowly.agent_home.AGENT_INTRODUCTION (kept import-free here).
 _AGENT_INTRODUCTION = "_agent_introduction"
+# Mirrors flowly.agenda.service.AGENDA_ITEM_KEY: the wake-up a system turn is.
+_AGENDA_ITEM = "agenda_item"
 _GOAL_BASE_USER_EPOCH = "_goal_base_user_epoch"
 _GOAL_KICKOFF = "_goal_kickoff"
 _GOAL_USER_EPOCH = "_goal_user_epoch"
@@ -1012,6 +1014,10 @@ class AgentLoop:
         # Gateway reference for turn-level lifecycle broadcasts. Wired by
         # set_gateway_server() once the gateway is constructed.
         self._gateway_server = None
+        # The agent's agenda (flowly/agenda/service.py), wired by the gateway
+        # that runs it. Told when the owner writes and when a wake-up's turn
+        # ends; None in the CLI, where nothing would ever wake the agent.
+        self.agenda: Any | None = None
         self._goal_output_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None
         self.goal_manager: Any | None = None
         self.goal_runtime: GoalRuntime | None = None
@@ -7989,6 +7995,8 @@ class AgentLoop:
         # Handle system messages (subagent announces)
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
+            if msg.metadata.get(_AGENDA_ITEM) and getattr(self, "agenda", None) is not None:
+                return await self._process_agenda_wake(msg)
             return await self._process_system_message(msg)
 
         # pre_gateway_dispatch — let plugins drop or rewrite the inbound
@@ -8026,6 +8034,11 @@ class AgentLoop:
             and not msg.metadata.get(_AGENT_INTRODUCTION)
         ):
             self._dreamer_last_user_ts = time.time()
+            agenda = getattr(self, "agenda", None)
+            if agenda is not None:
+                # The owner's silence there is over: the agent's unanswered
+                # count resets, and follow-ups their reply settles go away.
+                agenda.owner_wrote(msg.session_key)
 
         # Mark parent session busy so subagent announces are queued, not injected mid-processing
         self.subagents.mark_busy(msg.session_key)
@@ -9493,6 +9506,21 @@ class AgentLoop:
             },
         )
 
+    async def _process_agenda_wake(self, msg: InboundMessage) -> OutboundMessage | None:
+        """A follow-up the agent planned for itself (flowly/agenda/service.py).
+
+        It runs as a hidden system turn in the conversation it is about. The
+        agenda waits on its outcome; a turn that fails tells it at once, so
+        the wake-up is retried later instead of holding the agenda for the
+        whole turn timeout.
+        """
+        item_id = str(msg.metadata.get(_AGENDA_ITEM) or "")
+        try:
+            return await self._process_system_message(msg)
+        except Exception:
+            self.agenda.turn_finished(item_id, delivered=False, text="", session_key=msg.chat_id, failed=True)
+            raise
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
@@ -9613,6 +9641,20 @@ class AgentLoop:
             provider_state_out=provider_state_out,
         )
 
+        # An agenda wake-up may decide there is nothing worth saying. Then
+        # nothing of it stays in the conversation: no hidden trigger, no
+        # reply, no push. What its tools recorded (a goal's log) stays.
+        agenda_item = str(msg.metadata.get(_AGENDA_ITEM) or "")
+        if agenda_item and (
+            not (final_content or "").strip()
+            or is_silent_response(final_content)
+            or self.compaction.is_silent_reply(final_content)
+        ):
+            if getattr(self, "agenda", None) is not None:
+                self.agenda.turn_finished(agenda_item, delivered=False, text="", session_key=session_key)
+            logger.info(f"[agenda] {agenda_item} stayed silent in {session_key}")
+            return None
+
         # No pending-action-lock bookkeeping here: a system/announce turn is a
         # delivery turn (action_turn is always False above), so it neither sets
         # nor clears the lock — that lifecycle belongs to real user action turns.
@@ -9652,7 +9694,7 @@ class AgentLoop:
         # so the reply actually shows up. Request-scoped replies don't come
         # through here, so there's no double delivery; remote channels
         # (Telegram/…) are delivered by their adapter via the return below.
-        if final_content and origin_channel in ("cli", "tui", "desktop"):
+        if final_content and origin_channel in ("cli", "tui", "desktop", "ios", "android"):
             gw = getattr(self, "_gateway_server", None)
             if gw is not None and hasattr(gw, "push_session_message"):
                 try:
@@ -9661,6 +9703,11 @@ class AgentLoop:
                     )
                 except Exception as exc:
                     logger.warning(f"[board] local push failed: {exc}")
+
+        if agenda_item and getattr(self, "agenda", None) is not None:
+            self.agenda.turn_finished(
+                agenda_item, delivered=True, text=final_content or "", session_key=session_key,
+            )
 
         return OutboundMessage(
             channel=origin_channel,

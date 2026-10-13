@@ -1573,6 +1573,55 @@ def gateway(
         deliver=hb_cfg.deliver,
     )
 
+    # The agent's agenda (flowly/agenda): follow-ups it plans for itself, the
+    # goals it tracks, and the limits on writing first. Every runtime runs its
+    # own, named agents included; the daily budget is shared through the
+    # canonical home. See docs/engineering/agent-goals.md.
+    from flowly.agenda.service import AGENDA_ITEM_KEY, AGENDA_SENDER, REVIEW_SESSION, AgendaService
+    from flowly.agent.tools.follow_up import FollowUpTool
+    from flowly.agent.tools.objective import ObjectiveTool
+    from flowly.bus.events import InboundMessage as _AgendaInbound
+    from flowly.profile import current_profile_display_name, current_profile_name
+
+    async def _publish_agenda_wake(item: dict, prompt: str) -> None:
+        # Enters the conversation the follow-up is about as a hidden system
+        # turn, like a finished background task reporting back.
+        await bus.publish_inbound(_AgendaInbound(
+            channel="system",
+            sender_id=AGENDA_SENDER,
+            chat_id=item["sessionKey"],
+            content=prompt,
+            metadata={AGENDA_ITEM_KEY: item["id"]},
+        ))
+
+    async def _run_agenda_review(prompt: str) -> None:
+        # A fresh isolated session each day; its route ("agenda") cannot
+        # message the owner, ask them anything or create scheduled tasks.
+        # It is removed afterwards: what it planned lives in the agenda, and
+        # no client should list it as a conversation.
+        review = agent.sessions.get_or_create(REVIEW_SESSION)
+        review.clear()
+        agent.sessions.save(review)
+        try:
+            await agent.process_direct(prompt, session_key=REVIEW_SESSION)
+        finally:
+            try:
+                agent.sessions.delete(REVIEW_SESSION)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[agenda] review session cleanup skipped: {exc}")
+
+    agenda = AgendaService(
+        profile=current_profile_name(),
+        agent_name=current_profile_display_name(),
+        publish_wake=_publish_agenda_wake,
+        is_busy=agent.subagents.is_busy,
+        run_review=_run_agenda_review,
+        list_conversations=agent.sessions.list_sessions,
+    )
+    agent.tools.register(ObjectiveTool())
+    agent.tools.register(FollowUpTool())
+    agent.agenda = agenda
+
     # A managed profile backend is a local RPC process, never a second copy of
     # the account's messaging gateway. Disable every channel in memory even if
     # an older or hand-edited profile config still contains transport secrets.
@@ -2594,6 +2643,7 @@ Respond to the user now:"""
 
                     _manager_task = asyncio.create_task(_watch_desktop_manager())
             await cron.start()
+            await agenda.start()
             if not local_runtime:
                 await heartbeat.start(run_on_start=True)
 
@@ -2823,6 +2873,7 @@ Respond to the user now:"""
             # CronService records one explicit cancelled result before the
             # event loop and agent are torn down.
             await cron.shutdown()
+            agenda.stop()
             await gateway_server.stop()
             heartbeat.stop()
             if delegate is not None and hasattr(delegate, "cancel_all"):
