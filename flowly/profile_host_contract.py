@@ -129,6 +129,12 @@ PROFILE_RPC_TIMEOUTS: dict[str, int] = {
     "cron.remove": 30_000,
     "cron.run": 60_000,
     "cron.output": 30_000,
+    # A named agent's tracked goals and agenda (flowly/agenda/rpc.py).
+    "objectives.list": 30_000,
+    "objectives.update": 30_000,
+    "agenda.list": 30_000,
+    "agenda.settings.get": 30_000,
+    "agenda.settings.set": 30_000,
 }
 
 _EXEC_SECURITY = {"deny", "allowlist", "full"}

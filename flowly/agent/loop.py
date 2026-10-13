@@ -158,7 +158,7 @@ _DEFAULT_MAX_CHARS = 8000
 # Channels that are NOT genuine user activity: the agent's own background runs.
 # Memory learning (idle + turn dreamer triggers) must ignore these so a periodic
 # heartbeat/cron tick never looks like a conversation worth remembering.
-_NON_USER_CHANNELS = ("system", "heartbeat", "cron")
+_NON_USER_CHANNELS = ("system", "heartbeat", "cron", "agenda")
 
 # Passive group-context buffer bounds (Slack/Discord "listen" mode). Un-answered
 # channel messages accumulate per session until the next mention flushes them
@@ -169,6 +169,8 @@ _GROUP_BUFFER_MAX_CHARS = 6000
 _GOAL_CONTINUATION_ID = "_goal_continuation_goal_id"
 # Mirrors flowly.agent_home.AGENT_INTRODUCTION (kept import-free here).
 _AGENT_INTRODUCTION = "_agent_introduction"
+# Mirrors flowly.agenda.service.AGENDA_ITEM_KEY: the wake-up a system turn is.
+_AGENDA_ITEM = "agenda_item"
 _GOAL_BASE_USER_EPOCH = "_goal_base_user_epoch"
 _GOAL_KICKOFF = "_goal_kickoff"
 _GOAL_USER_EPOCH = "_goal_user_epoch"
@@ -1012,6 +1014,10 @@ class AgentLoop:
         # Gateway reference for turn-level lifecycle broadcasts. Wired by
         # set_gateway_server() once the gateway is constructed.
         self._gateway_server = None
+        # The agent's agenda (flowly/agenda/service.py), wired by the gateway
+        # that runs it. Told when the owner writes and when a wake-up's turn
+        # ends; None in the CLI, where nothing would ever wake the agent.
+        self.agenda: Any | None = None
         self._goal_output_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None
         self.goal_manager: Any | None = None
         self.goal_runtime: GoalRuntime | None = None
@@ -3664,7 +3670,10 @@ class AgentLoop:
             await self._record_group_observation(msg)
             return
 
-        if msg.channel == "web":
+        if msg.channel == "web" or (msg.channel == "system" and msg.metadata.get(_AGENDA_ITEM)):
+            # An agenda wake-up may research for minutes; it must not hold up
+            # other conversations' system turns (finished tasks reporting back).
+            # The agenda never wakes a conversation while a turn runs there.
             self._spawn_concurrent_turn(msg)
         else:
             await self._process_turn(msg)
@@ -5733,6 +5742,18 @@ class AgentLoop:
                 metadata={"tool_progress_event": event},
             ))
 
+    def _internal_tool_calls(self, run_id: str) -> set[str]:
+        """Ids of this run's calls to internal tools (flowly.tool_activity),
+        so their results, which arrive as separate iteration events, are left
+        out too. Bounded: only recent runs are remembered."""
+        runs = self.__dict__.setdefault("_internal_tool_call_ids", {})
+        ids = runs.get(run_id)
+        if ids is None:
+            if len(runs) >= 64:
+                runs.pop(next(iter(runs)))
+            ids = runs[run_id] = set()
+        return ids
+
     async def _emit_iteration_event(
         self,
         *,
@@ -5771,7 +5792,12 @@ class AgentLoop:
         from flowly.tool_activity import project_tool_messages_for_ui
 
         self._steering().observe_iteration(outbound_run_id, iteration_idx, message)
-        ui_message = project_tool_messages_for_ui([message])[0]
+        projected = project_tool_messages_for_ui(
+            [message], internal_call_ids=self._internal_tool_calls(outbound_run_id),
+        )
+        if not projected:
+            return  # the agent's own bookkeeping (a goal, a follow-up): no step
+        ui_message = projected[0]
         role = ui_message.get("role") or ""
         if role not in ("assistant", "tool"):
             return
@@ -7989,6 +8015,8 @@ class AgentLoop:
         # Handle system messages (subagent announces)
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
+            if msg.metadata.get(_AGENDA_ITEM) and getattr(self, "agenda", None) is not None:
+                return await self._process_agenda_wake(msg)
             return await self._process_system_message(msg)
 
         # pre_gateway_dispatch — let plugins drop or rewrite the inbound
@@ -8026,6 +8054,11 @@ class AgentLoop:
             and not msg.metadata.get(_AGENT_INTRODUCTION)
         ):
             self._dreamer_last_user_ts = time.time()
+            agenda = getattr(self, "agenda", None)
+            if agenda is not None:
+                # The owner's silence there is over: the agent's unanswered
+                # count resets, and follow-ups their reply settles go away.
+                agenda.owner_wrote(msg.session_key)
 
         # Mark parent session busy so subagent announces are queued, not injected mid-processing
         self.subagents.mark_busy(msg.session_key)
@@ -9275,8 +9308,20 @@ class AgentLoop:
         introduction_failed = introduction_turn and (
             bool(provider_error) or turn_aborted or not str(final_content or "").strip()
         )
+        # Goals this turn started tracking or finished: their cards ride the
+        # closing reply (live and in history), since the objective tool's own
+        # calls never show (flowly/objectives/cards.py).
+        goal_cards: list[dict[str, Any]] = []
+        if not provider_error and not turn_aborted:
+            try:
+                from flowly.objectives.cards import goal_cards_from_turn
+
+                goal_cards = goal_cards_from_turn(turn_messages)
+            except Exception as exc:  # noqa: BLE001 — a card never fails a turn
+                logger.debug(f"[goals] card skipped: {exc}")
         if not introduction_failed:
             session.extend_with_turn_messages(
+                goal_cards=goal_cards or None,
                 user_content=display_content,
                 new_messages=turn_messages,
                 final_content=final_content,
@@ -9404,6 +9449,7 @@ class AgentLoop:
                    if reply_media_assets else {}),
                 "tool_results": tool_results,
                 "executed_tools": _executed_tools,
+                **({"goalCards": goal_cards} if goal_cards else {}),
                 "toolPolicy": "auto" if tools_allowed else "none",
                 # Failed/aborted turns may contain usage from an earlier
                 # successful iteration, not the terminal request. Keep that
@@ -9493,6 +9539,21 @@ class AgentLoop:
             },
         )
 
+    async def _process_agenda_wake(self, msg: InboundMessage) -> OutboundMessage | None:
+        """A follow-up the agent planned for itself (flowly/agenda/service.py).
+
+        It runs as a hidden system turn in the conversation it is about. The
+        agenda waits on its outcome; a turn that fails tells it at once, so
+        the wake-up is retried later instead of holding the agenda for the
+        whole turn timeout.
+        """
+        item_id = str(msg.metadata.get(_AGENDA_ITEM) or "")
+        try:
+            return await self._process_system_message(msg)
+        except Exception:
+            self.agenda.turn_finished(item_id, delivered=False, text="", session_key=msg.chat_id, failed=True)
+            raise
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
@@ -9546,8 +9607,14 @@ class AgentLoop:
         # announce turn is delivered on the parent's origin channel,
         # so the channel hint must match origin_channel rather than
         # the announce message's transport channel.
+        # A wake-up of the agent's own agenda runs with nobody watching: its
+        # tools are the "agenda" route's (look things up, memory, past
+        # conversations, goals and follow-ups — nothing that acts), and nothing
+        # of it streams to a client before it decides to say something.
+        agenda_item = str(msg.metadata.get(_AGENDA_ITEM) or "")
+        tool_route = "agenda" if agenda_item else origin_channel
         system_disclosure = self._routed_tool_disclosure(
-            origin_channel,
+            tool_route,
             intent_text=msg.content,
         )
         system_available_tools = {
@@ -9602,9 +9669,9 @@ class AgentLoop:
             live_call_turn=live_call_turn,
             turn_content=msg.content,
             session_key=f"{origin_channel}:{origin_chat_id}",
-            tool_platform=origin_channel,
-            outbound_channel=origin_channel,
-            outbound_chat_id=origin_chat_id,
+            tool_platform=tool_route,
+            outbound_channel="" if agenda_item else origin_channel,
+            outbound_chat_id="" if agenda_item else origin_chat_id,
             outbound_run_id=msg.metadata.get("run_id") or "",
             reply_media=reply_media,
             reply_media_assets=reply_media_assets,
@@ -9612,6 +9679,34 @@ class AgentLoop:
             provider_state=provider_state,
             provider_state_out=provider_state_out,
         )
+
+        # An agenda wake-up speaks only when its reply starts with [SEND]
+        # (flowly/agenda/prompts.py). Otherwise nothing of it stays in the
+        # conversation: no hidden trigger, no reply, no push. What its tools
+        # recorded (a goal's log) stays.
+        agenda_cards: list[dict[str, Any]] = []
+        if agenda_item:
+            from flowly.agenda.prompts import wake_decision
+
+            send, message = wake_decision(final_content)
+            if not send:
+                if getattr(self, "agenda", None) is not None:
+                    self.agenda.turn_finished(agenda_item, delivered=False, text="", session_key=session_key)
+                logger.info(f"[agenda] {agenda_item} stayed silent in {session_key}")
+                return None
+            final_content = message
+            # A check-in about a goal carries the goal's card, so the message
+            # leads to it (flowly/objectives/cards.py).
+            agenda_goal = str(msg.metadata.get("agenda_goal") or "")
+            if agenda_goal:
+                try:
+                    from flowly.objectives.cards import checkin_card
+
+                    card = checkin_card(agenda_goal)
+                    if card is not None:
+                        agenda_cards = [card]
+                except Exception as exc:  # noqa: BLE001 — a card never fails a turn
+                    logger.debug(f"[agenda] check-in card skipped: {exc}")
 
         # No pending-action-lock bookkeeping here: a system/announce turn is a
         # delivery turn (action_turn is always False above), so it neither sets
@@ -9623,6 +9718,7 @@ class AgentLoop:
         # visible to the parent agent on the next turn.
         turn_start_index = len(session.messages)
         session.extend_with_turn_messages(
+            goal_cards=agenda_cards or None,
             user_content=f"[System: {msg.sender_id}] {msg.content}",
             new_messages=turn_messages,
             final_content=final_content,
@@ -9652,26 +9748,36 @@ class AgentLoop:
         # so the reply actually shows up. Request-scoped replies don't come
         # through here, so there's no double delivery; remote channels
         # (Telegram/…) are delivered by their adapter via the return below.
-        if final_content and origin_channel in ("cli", "tui", "desktop"):
+        if final_content and origin_channel in ("cli", "tui", "desktop", "ios", "android"):
             gw = getattr(self, "_gateway_server", None)
             if gw is not None and hasattr(gw, "push_session_message"):
                 try:
                     await gw.push_session_message(
-                        f"{origin_channel}:{origin_chat_id}", final_content
+                        f"{origin_channel}:{origin_chat_id}", final_content,
+                        **({"metadata": {"goalCards": agenda_cards}} if agenda_cards else {}),
                     )
                 except Exception as exc:
                     logger.warning(f"[board] local push failed: {exc}")
+
+        if agenda_item and getattr(self, "agenda", None) is not None:
+            self.agenda.turn_finished(
+                agenda_item, delivered=True, text=final_content or "", session_key=session_key,
+            )
 
         return OutboundMessage(
             channel=origin_channel,
             chat_id=origin_chat_id,
             content=final_content,
             media=reply_media,
-            metadata=(
-                {ASSETS_META_KEY: assets_to_meta(reply_media_assets)}
-                if reply_media_assets
-                else {}
-            ),
+            metadata={
+                **({ASSETS_META_KEY: assets_to_meta(reply_media_assets)} if reply_media_assets else {}),
+                **({"goalCards": agenda_cards} if agenda_cards else {}),
+                # A relay conversation's id is not a relay session: the web
+                # channel asks the relay to open one, or the message the agent
+                # wrote first is dropped there, unstored and unpushed.
+                **({"agent_first_conversation": origin_chat_id, "session_key": session_key}
+                   if agenda_item and origin_channel == "web" else {}),
+            },
         )
 
     @staticmethod

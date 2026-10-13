@@ -30,6 +30,8 @@ TOOLSET_MEMBERS: dict[str, frozenset[str]] = {
     }),
     "sessions": frozenset({"session_search"}),
     "scheduling": frozenset({"cron"}),
+    # The agent's own follow-ups and the goals it tracks (flowly/agenda).
+    "agenda": frozenset({"follow_up", "objective", "proactivity"}),
     "productivity": frozenset({
         "trello", "x", "linear", "github", "sentry", "email",
         "google_calendar", "google_drive", "google_contacts", "google_tasks",
@@ -54,7 +56,20 @@ ALL_BUILTIN_TOOLSETS: frozenset[str] = frozenset(TOOLSET_MEMBERS)
 # callers already supplied name-level blocks for cron/message; expressing the
 # same boundary as toolsets makes it apply consistently to every cron entrypoint.
 DEFAULT_DISABLED_TOOLSETS_BY_PLATFORM: dict[str, frozenset[str]] = {
-    "cron": frozenset({"delivery", "interactive", "scheduling"}),
+    "cron": frozenset({"delivery", "interactive", "scheduling", "agenda"}),
+    # The daily review plans follow-ups with the agenda tools; it never writes
+    # to the owner, asks them anything, or creates scheduled tasks.
+    "agenda": frozenset({"delivery", "interactive", "scheduling"}),
+}
+
+# The agent's own initiative (flowly/agenda): a wake-up turn and the daily
+# review run with nobody watching, so they may only look things up, read and
+# keep memory, read past conversations, and plan follow-ups and goals. No
+# commands, files, messages, email, calendar writes or delegation — anything
+# that acts goes through a turn the owner starts. A configured allowlist can
+# narrow this, never widen it.
+DEFAULT_ENABLED_TOOLSETS_BY_PLATFORM: dict[str, frozenset[str]] = {
+    "agenda": frozenset({"web", "memory", "sessions", "agenda"}),
 }
 
 _TOOLSET_BY_NAME = {
@@ -92,7 +107,10 @@ def resolve_toolset_filters(
     An explicitly configured empty list means "no tools" for that platform.
     """
     if not enabled:
-        return None, frozenset()
+        # Routing off means "every tool" for the owner's own surfaces; the
+        # agent's own initiative keeps its ceiling regardless.
+        ceiling = DEFAULT_ENABLED_TOOLSETS_BY_PLATFORM.get(str(platform or "").strip().lower())
+        return ceiling, frozenset()
 
     normalized_platform = str(platform or "").strip().lower()
     configured = {
@@ -118,4 +136,7 @@ def resolve_toolset_filters(
         if str(value).strip()
     }
     denied.update(DEFAULT_DISABLED_TOOLSETS_BY_PLATFORM.get(normalized_platform, ()))
+    ceiling = DEFAULT_ENABLED_TOOLSETS_BY_PLATFORM.get(normalized_platform)
+    if ceiling is not None:
+        selected = ceiling if selected is None else selected & ceiling
     return selected, frozenset(denied)
