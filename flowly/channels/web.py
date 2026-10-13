@@ -55,6 +55,12 @@ _PROFILE_BINDING_LIMIT = 1024
 _PROFILE_DIRECTORY_BINDING_LIMIT = 256
 _PROFILE_BINDING_TTL_SECONDS = 6 * 60 * 60
 _PROFILE_RUN_BINDING_LIMIT = 2048
+#: OutboundMessage metadata: the conversation a message the agent wrote first
+#: belongs to; the relay opens a session for it (``_agent_first_session``).
+AGENT_FIRST_CONVERSATION_KEY = "agent_first_conversation"
+_AGENT_FIRST_OPEN_ATTEMPTS = 6
+_AGENT_FIRST_OPEN_TIMEOUT = 10.0
+_AGENT_FIRST_OPEN_RETRY_SECONDS = 10.0
 _PROFILE_LONG_RUNNING_METHODS = frozenset({
     "profiles.connect",
     "profiles.configure",
@@ -321,6 +327,8 @@ class WebChannel(BaseChannel):
         self._profile_subagent_reads: dict[object, str] = {}
         # Map session_key (e.g. "web:FirestoreId") → relay session_id (browser UUID)
         self._session_key_to_relay_id: dict[str, str] = {}
+        # Replies to ``conversation.open``, by request id.
+        self._conversation_open_waiters: dict[str, asyncio.Future] = {}
         # Outbound replay queue. When a send fails (transient WS drop, frame
         # too large after retry, etc.) the serialised payload is parked here
         # so the next successful connection can flush it. Bounded to prevent
@@ -982,6 +990,9 @@ class WebChannel(BaseChannel):
         session_id = msg.chat_id  # chat_id = sessionId for web channel
         canonical_session = msg.metadata.get('session_key')
         session_key = canonical_session if isinstance(canonical_session, str) and canonical_session else self._session_key_for_relay_id(session_id)
+        agent_first = msg.metadata.get(AGENT_FIRST_CONVERSATION_KEY)
+        if isinstance(agent_first, str) and agent_first:
+            session_id = await self._agent_first_session(agent_first) or session_id
 
         progress = msg.metadata.get("tool_progress_event")
         if isinstance(progress, dict) and progress.get("state") == "tool_progress":
@@ -1400,6 +1411,46 @@ class WebChannel(BaseChannel):
                     pending.delivered.add(destination)
                 delivered = True
         return delivered
+
+    async def _agent_first_session(self, conversation_id: str) -> str | None:
+        """A relay session for a message the agent writes first.
+
+        The relay routes a bot's events by client session, and a conversation
+        nobody has open has none: a message sent under the conversation's id
+        was dropped, neither stored nor pushed. The relay opens one on request
+        for a conversation of this server's owner (``conversation.open``,
+        relay ``conversation-open.ts``); the message then takes the ordinary
+        final path. None when the relay cannot (offline through every attempt,
+        or an older relay that does not answer): the caller keeps its own id.
+        """
+        for attempt in range(_AGENT_FIRST_OPEN_ATTEMPTS):
+            socket = self._ws
+            if socket is not None:
+                request_id = uuid.uuid4().hex
+                waiter = asyncio.get_running_loop().create_future()
+                self._conversation_open_waiters[request_id] = waiter
+                try:
+                    await asyncio.wait_for(socket.send(json.dumps({
+                        "type": "conversation.open", "requestId": request_id, "conversationId": conversation_id,
+                    })), timeout=5.0)
+                    reply = await asyncio.wait_for(waiter, timeout=_AGENT_FIRST_OPEN_TIMEOUT)
+                except Exception:  # noqa: BLE001 — closed socket, timeout: try again or give up
+                    reply = None
+                finally:
+                    self._conversation_open_waiters.pop(request_id, None)
+                if isinstance(reply, dict):
+                    session_id = reply.get("sessionId")
+                    if reply.get("ok") is True and isinstance(session_id, str) and session_id:
+                        return session_id
+                    logger.warning(
+                        "[WebChannel] relay would not open web:{} for an agent-first message: {}",
+                        conversation_id, reply.get("error"),
+                    )
+                    return None
+            if attempt + 1 < _AGENT_FIRST_OPEN_ATTEMPTS:
+                await asyncio.sleep(_AGENT_FIRST_OPEN_RETRY_SECONDS)
+        logger.warning("[WebChannel] no relay session for an agent-first message to web:{}", conversation_id)
+        return None
 
     async def _send_or_queue(self, payload: str) -> None:
         pending = RelayOutbound(payload, self._outbound_event_access(payload))
@@ -1907,6 +1958,11 @@ class WebChannel(BaseChannel):
             if (self._ws is ws and self._relay_authority is not None and type(msg.get('version')) is int and msg['version'] == 1
                     and msg.get('linkId') == self._relay_authority.link_id):
                 self._relay_authority_enabled = True
+
+        elif msg_type == "conversation.opened":
+            waiter = self._conversation_open_waiters.get(str(msg.get("requestId") or ""))
+            if waiter is not None and not waiter.done():
+                waiter.set_result(msg)
 
         elif msg_type == "browser-connected":
             session_id = msg.get("sessionId", "")

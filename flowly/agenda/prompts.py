@@ -95,7 +95,7 @@ def wake_prompt(
     late_minutes = max(0, (now_ms - due) // 60_000)
     parts = [
         "[Agenda] You planned to look at this again now. The owner did not just write; "
-        "this is your own follow-up, and nobody is waiting for a reply.",
+        "this is your own follow-up.",
         f"Planned for: {describe(due, zone)}"
         + (f" (you are {late_minutes // 60} h {late_minutes % 60} min late; the computer may have been asleep)"
            if late_minutes >= 30 else ""),
@@ -110,23 +110,44 @@ def wake_prompt(
            if unanswered else "")
     )
     parts.append(
-        "First, if it makes the message worth reading, do the work with your tools "
-        "(look something up, check the calendar, compare options).\n"
-        "Then decide:\n"
-        f"- If there is something genuinely useful to tell the owner now, as {agent_name}, reply with "
-        f"{SEND_MARKER} followed by the message itself: one short message in the owner's language, written "
-        "the way you write in this conversation. It is sent as your message, with a notification on their "
-        "phone. Only a reply that starts with " + SEND_MARKER + " is sent.\n"
-        f"- If not (nothing new, they already handled it, it would only nag), reply with exactly {SILENT_MARKER}. "
-        "Nothing is sent.\n"
-        "Bring something concrete; never ask where they have been or make them feel behind. Do not ask a "
-        "clarifying question through a tool — just write."
+        # The limits are code's job (policy.py) and were checked before this
+        # turn started. A model that applies them again holds back a check-in
+        # the owner asked for at 00:54 "because it is night".
+        "The owner's limits (quiet hours, how often you may write first) were already checked: you may "
+        "write now. Never hold a message back or move it because of them; that is not your call here."
+    )
+    send = (
+        f"reply with {SEND_MARKER} followed by the message itself: one short message in the owner's language, "
+        f"written the way you write in this conversation, as {agent_name}. It is sent as your message, with a "
+        f"notification on their phone. Only a reply that starts with {SEND_MARKER} is sent."
     )
     if goal is not None:
+        parts.append(
+            "This is a check-in on a goal the owner asked you to keep track of, and checking in is the point: "
+            "a missing update is the reason to write, not a reason to stay quiet. Unless they already told you "
+            "how it went since your last check-in, " + send + " Ask how it is going the way a good coach "
+            "would, with one small concrete thing (a tip, the next step for today). If this is your first "
+            "check-in on it, also say when you will ask from now on (\"every evening around 21:00\") and plan "
+            "exactly that.\n"
+            f"Reply with exactly {SILENT_MARKER} only when they already reported, or you would repeat what you "
+            "just said. Nothing is sent then.\n"
+            "Never make them feel behind. Do not ask a clarifying question through a tool — just write."
+        )
         parts.append(
             "For the goal: record what you found with objective(action=\"log\"), adjust the plan or stage "
             "if it should change, and plan the next check-in with objective(action=\"update\", next_check=...) "
             "following its rhythm — or close it with objective(action=\"close\") when it is done or over."
+        )
+    else:
+        parts.append(
+            "First, if it makes the message worth reading, do the work with your tools "
+            "(look something up, check the calendar, compare options).\n"
+            "Then decide:\n"
+            "- If there is something genuinely useful to tell the owner now, " + send + "\n"
+            f"- If not (nothing new, they already handled it, it would only nag), reply with exactly {SILENT_MARKER}. "
+            "Nothing is sent.\n"
+            "Bring something concrete; never ask where they have been or make them feel behind. Do not ask a "
+            "clarifying question through a tool — just write."
         )
     return "\n\n".join(parts)
 

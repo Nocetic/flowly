@@ -207,14 +207,36 @@ which runs `_process_system_message` in the target conversation:
   `[SEND]` is delivered without the marker. Anything else — `[SILENT]`,
   nothing, `[SEND]` with no message, or a remark such as "nothing new to
   report" — is **silent: nothing is saved, nothing is sent**; tool side
-  effects (a goal log) remain. A missed check-in costs less than a message
-  that only nags.
+  effects (a goal log) remain.
+- **What the prompt asks for depends on what woke it.** The prompt tells the
+  model the limits were already checked in code and that it must never hold a
+  message back or move it for them (it did: a check-in the owner asked for at
+  00:54 for 00:57 stayed silent and was moved to 09:00 "because of quiet
+  hours"). For a **goal check-in**, checking in is the point: a missing update
+  is the reason to write, so it writes unless the owner already reported since
+  the last check-in, asks how it is going with one concrete thing, and on the
+  first check-in says when it will ask from now on (Muse's "every evening
+  around 21:00") and plans exactly that. A plain **follow-up** stays silent
+  when there is nothing new.
 - A delivered reply is saved like any system turn (the trigger is stored as
   `[System: agenda] …` with `user_display_hidden`, so it is never shown, never
   indexed and never mined into memory) and delivered: local surfaces (`cli`,
   `tui`, `desktop`, `ios`, `android`) through `gateway.push_session_message`,
   relay and channels through the returned `OutboundMessage`. A check-in about
   a goal carries the goal's card (`event: "checkin"`), see below.
+- **A relay conversation needs a relay session.** The relay routes a bot's
+  events by client session, which exists only while a client has the
+  conversation open (and 30 minutes after); sent under the conversation's id,
+  a message the agent wrote first was dropped there, unstored and unpushed.
+  The returned message carries `agent_first_conversation` (and the canonical
+  `session_key`); the web channel asks the relay to open a session
+  (`conversation.open` → `conversation.opened {ok, sessionId}`, relay
+  `conversation-open.ts`: only a conversation of the connected server's owner,
+  never the Scheduled Tasks one) and sends the final under it. The relay then
+  stores it like any reply, forwards it to a client that has the conversation
+  open and pushes the phone when none does. Up to 6 attempts 10 s apart while
+  the relay is unreachable; a relay that refuses or never answers leaves the
+  conversation's own id, and the message stays only in the agent's history.
 - `agenda.turn_finished(...)` reports the outcome; an exception reports
   `failed=True` at once so the service retries in 30 minutes (3 attempts in
   all) instead of waiting out the 10-minute turn timeout.
@@ -234,7 +256,8 @@ agent name, body = first line, `conversationId` via `phone_conversation`) for
 conversations the agent serves itself (`desktop:`, `ios:`, `android:`, `cli:`,
 `tui:`). The presence report holds it while the owner is at a Desktop showing
 chats. Relay chats (`web:`) are pushed by the relay itself when the message
-lands; messaging channels notify natively. Named agents: see below.
+lands (through the session it opened, above), unless a client has that
+conversation open; messaging channels notify natively. Named agents: see below.
 
 ## The daily review
 

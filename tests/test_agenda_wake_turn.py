@@ -242,3 +242,54 @@ async def test_a_check_in_about_a_goal_carries_its_card():
     assert card["id"] == goal["id"] and card["event"] == "checkin" and card["title"] == "A month of physics"
     assert pushed == [(CHAT, "How did kinematics go?", {"metadata": {"goalCards": [card]}})]
     assert out.metadata["goalCards"] == [card]
+
+
+@pytest.mark.asyncio
+async def test_a_relay_conversation_s_message_asks_the_relay_for_a_session():
+    """A relay conversation's id is no relay session: without asking for one,
+    the message the agent wrote first was dropped there (not stored, no push)."""
+    agent, _session, _agenda, pushed = _agent("[SEND] 20 dakikanı yaptın mı?")
+    msg = InboundMessage(channel="system", sender_id="agenda", chat_id="web:conv1",
+                         content="[Agenda] look again", metadata={"agenda_item": "wk_3"})
+    out = await agent._process_message(msg)
+    assert out.channel == "web" and out.chat_id == "conv1"
+    assert out.metadata["agent_first_conversation"] == "conv1"
+    assert out.metadata["session_key"] == "web:conv1"
+    assert pushed == []  # the relay delivers and pushes it
+
+
+@pytest.mark.asyncio
+async def test_a_local_conversation_s_message_needs_no_relay_session():
+    agent, _session, _agenda, _pushed = _agent("[SEND] Found two laptops.")
+    out = await agent._process_message(_wake())
+    assert "agent_first_conversation" not in out.metadata
+
+
+def _wake_prompt(goal=None):
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    from flowly.agenda.prompts import wake_prompt
+
+    return wake_prompt({"dueAt": 1, "note": "first check-in"}, goal=goal, conversation={}, now_ms=1,
+                       zone=ZoneInfo("Europe/Istanbul"), agent_name="Flowly")
+
+
+def test_a_wake_up_never_applies_the_limits_again():
+    """Code checked quiet hours and caps before the turn; the model holding a
+    check-in back "because it is night" is how the owner's 00:57 check-in
+    turned into silence."""
+    prompt = _wake_prompt()
+    assert "were already checked: you may write now" in prompt
+    assert "Never hold a message back or move it because of them" in prompt
+
+
+def test_a_goal_check_in_writes_when_the_owner_has_not_reported():
+    goal = {"id": "obj_aaaaaaaaaaaa", "title": "Physics daily", "status": "active"}
+    prompt = _wake_prompt(goal)
+    assert "a missing update is the reason to write, not a reason to stay quiet" in prompt
+    assert "first check-in" in prompt and "when you will ask from now on" in prompt
+    assert "only when they already reported" in prompt
+    # The silence-by-default wording stays for plain follow-ups only.
+    assert "nothing new, they already handled it" not in prompt
+    assert "nothing new, they already handled it" in _wake_prompt()

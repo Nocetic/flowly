@@ -9772,6 +9772,11 @@ class AgentLoop:
             metadata={
                 **({ASSETS_META_KEY: assets_to_meta(reply_media_assets)} if reply_media_assets else {}),
                 **({"goalCards": agenda_cards} if agenda_cards else {}),
+                # A relay conversation's id is not a relay session: the web
+                # channel asks the relay to open one, or the message the agent
+                # wrote first is dropped there, unstored and unpushed.
+                **({"agent_first_conversation": origin_chat_id, "session_key": session_key}
+                   if agenda_item and origin_channel == "web" else {}),
             },
         )
 

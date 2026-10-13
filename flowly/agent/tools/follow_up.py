@@ -67,8 +67,9 @@ def timing_note(due_ms: int, zone: dt.tzinfo) -> str:
     if policy.quiet_until(due_ms, zone, start, end) is None:
         return ""
     return (
-        f" That is inside the owner's quiet hours ({start}-{end}): it happens on time only if they "
-        f"are still writing to you then, otherwise at {end}. Say so when you tell them the time."
+        f" That is inside the owner's quiet hours ({start}-{end}), which are enforced for you: it comes "
+        f"on time if the owner has written to you within half an hour before it, otherwise at {end}. "
+        "Tell the owner that; when it comes, you never hold it back yourself."
     )
 
 
