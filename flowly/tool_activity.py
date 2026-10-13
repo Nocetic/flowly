@@ -21,11 +21,13 @@ _DEFERRED_CALL_PROTOCOL_NAME = "tool_call"
 
 #: The agent's own bookkeeping: the goals it tracks and the follow-ups it
 #: plans (flowly/agenda), and its memory — recalling, searching, writing and
-#: tidying what it knows. Calls to these never reach a product surface — not
-#: the tool panel, not the history a reopened chat renders, not the Activity
-#: journal. They would show the owner the machinery instead of the result:
-#: the agent tells the owner itself when it starts tracking something, and
-#: what it remembers shows in what it says (and in the Memory view).
+#: tidying what it knows. Calls to these never reach a conversation — not the
+#: tool panel, not the history a reopened chat renders. There they would show
+#: the owner the machinery instead of the result: the agent tells the owner
+#: itself when it starts tracking something (and the reply carries the goal's
+#: card), and what it remembers shows in what it says. Activity, where the
+#: owner looks to see what the agent did, does show them as steps
+#: (:mod:`flowly.activity.steps`).
 INTERNAL_TOOLS = frozenset({
     "objective", "follow_up", "proactivity",
     "memory_search", "memory_get", "memory_recall", "memory_feedback",

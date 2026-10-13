@@ -298,10 +298,9 @@ class ActivityRecorder:
 
     def note_tool(self, session_key: str, tool_name: str, args: Any, *, ok: bool,
                   duration_ms: int, result: Any = None, call_id: str = "") -> None:
-        from flowly.tool_activity import is_internal_tool
-
-        if is_internal_tool(tool_name):
-            return  # a goal or follow-up the agent keeps for itself is not a step
+        # Every call is a step here, the agent's own goal keeping and memory
+        # included: Activity is where the owner sees what it did. Only the
+        # chat's tool panel leaves those out (``flowly.tool_activity``).
         with self._lock:
             task = self._active.get(session_key)
             if task is None or len(task.steps) >= MAX_STEPS:

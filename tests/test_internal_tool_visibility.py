@@ -84,15 +84,31 @@ async def test_live_tool_progress_never_announces_them():
     assert [e["call"]["name"] for e in events] == ["exec"]
 
 
-def test_the_activity_journal_does_not_record_them(tmp_path, monkeypatch):
+def test_activity_shows_them_as_steps(tmp_path, monkeypatch):
+    """Hidden in the conversation, shown in Activity: there the owner looks to
+    see what the agent did, its goal keeping and memory included."""
     from flowly.activity import store
 
     monkeypatch.setattr(store, "append", lambda *a, **k: None)
     recorder = ActivityRecorder()
     task = recorder.begin(session_key="desktop:chat-1", task_id="t1", trigger={"kind": "owner"}, request="plan")
-    recorder.note_tool("desktop:chat-1", "objective", {"action": "create"}, ok=True, duration_ms=5)
-    recorder.note_tool("desktop:chat-1", "web_search", {"query": "laptops"}, ok=True, duration_ms=5)
-    assert [step["tool"] for step in task.steps] == ["web_search"]
+    recorder.note_tool("desktop:chat-1", "objective", {"action": "create", "title": "Physics daily"}, ok=True, duration_ms=5)
+    recorder.note_tool("desktop:chat-1", "memory_append", {"text": "likes rockets"}, ok=True, duration_ms=5)
+    recorder.note_tool("desktop:chat-1", "follow_up", {"action": "schedule", "note": "ask"}, ok=True, duration_ms=5)
+    assert [(step["tool"], step["kind"], step["target"]) for step in task.steps] == [
+        ("objective", "goal", "Physics daily"),
+        ("memory_append", "memory", ""),
+        ("follow_up", "goal", ""),
+    ]
+
+
+def test_starting_to_track_a_goal_is_work_planning_a_check_in_is_talking():
+    from flowly.activity.steps import describe_step, is_work
+
+    assert is_work(describe_step("objective", {"action": "create", "title": "Physics"}))
+    assert not is_work(describe_step("follow_up", {"action": "schedule"}))
+    assert not is_work(describe_step("proactivity", {"action": "set"}))
+    assert not is_work(describe_step("memory_append", {}))
 
 
 def test_memory_work_is_not_a_step_either():

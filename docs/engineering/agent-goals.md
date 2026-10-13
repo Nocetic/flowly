@@ -156,7 +156,10 @@ top-level `lastOwnerAt`, `lastReviewDay`, `lastReviewAt`.
 2. a goal check-in whose goal is not `active` → **drop** (`goal_not_active`)
 3. 3 unanswered first messages in this conversation → **drop**
    (`owner_not_answering`) — until the owner writes there again
-4. inside quiet hours → **defer** to the end of the window
+4. inside quiet hours → **defer** to the end of the window — unless the owner
+   wrote to this agent in the last 30 minutes (`OWNER_AWAKE_MS`, from the
+   agenda's `lastOwnerAt`): someone who asked at 00:54 for a check-in at 00:57
+   is up. The caps and back-off below still apply.
 5. unanswered > 0 and less than `12 h × 2^(unanswered-1)` since the last one →
    **defer** (`waiting_for_reply`)
 6. this agent's daily cap reached → **defer** to tomorrow's quiet end
@@ -266,10 +269,17 @@ cron runs cannot use.
 - `follow_up` — `schedule` (when, note, keep_if_owner_replies), `list`,
   `cancel`.
 
+When a planned time (a follow-up, a goal's first or next check-in) falls in
+the owner's quiet hours, the tool's reply says so (`timing_note`): it happens
+on time only if the owner is still writing then, otherwise at the window's
+end. The agent tells the owner that time instead of promising one the policy
+may not keep.
+
 - `proactivity` — `get`, `set` (`level`, `quiet_start`, `quiet_end`): when the
   owner says how often the agent may write first ("write less", "nothing
-  before ten"), the agent sets it itself and confirms; it changes the same
-  settings the app shows.
+  before ten"), the agent sets it itself and confirms. Desktop shows no
+  control for the level (only the quiet hours, editable), so this is how the
+  owner changes it.
 
 Times (`flowly/agenda/timeparse.py`): `+30m`/`+2h`/`+1d`/`+1w`, `HH:MM` (next),
 `today HH:MM`, `tomorrow [HH:MM]` (09:00 default), ISO date (09:00) or
@@ -304,7 +314,15 @@ projection boundary every surface uses:
   and live iteration events (`AgentLoop._emit_iteration_event`, which keeps a
   per-run set of hidden call ids so a result arriving later is dropped too);
 - `ToolProgress.announce` never announces them (live tool progress);
-- `ActivityRecorder.note_tool` never records them as Activity steps.
+
+Activity is the exception, on purpose: there the owner looks to see what the
+agent did. `ActivityRecorder.note_tool` records every call, these included;
+`flowly/activity/steps.py` describes them as kind `goal` (an `objective` call's
+target is the goal's title) or `memory`. Starting to track a goal
+(`objective`) is work, so that turn becomes an Activity task; planning a
+check-in (`follow_up`) or changing how often to write first (`proactivity`)
+is part of talking, like recalling memory: shown as steps of a task, never a
+task on its own.
 
 The canonical session/provider history is untouched: the model still sees its
 own calls.
