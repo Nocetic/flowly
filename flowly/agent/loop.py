@@ -511,6 +511,12 @@ def _with_plugin_context(messages: list[dict[str, Any]], injected: str) -> list[
 _SUBAGENT_RUN_ID_RE = re.compile(r"run_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 
 
+# Tools that only read, so several in one response may run together.
+_PARALLEL_READ_TOOLS = frozenset({
+    "web_search", "web_fetch", "web_extract", "read_file", "list_dir",
+})
+
+
 def _announces_untaken_step(text: str | None) -> bool:
     """True when a tool-less reply ends by announcing its next step.
 
@@ -4840,6 +4846,47 @@ class AgentLoop:
             or ("call sid:" in lowered and "kullanıcı şunu söyledi:" in lowered)
         )
 
+    def _prefetch_parallel_reads(
+        self,
+        tool_calls: Any,
+        *,
+        tools_allowed: bool,
+        live_call_turn: bool,
+        available_tool_names: set[str],
+        outbound_run_id: str,
+        execute_kwargs: dict[str, Any],
+        toolset_route: tuple[Any, Any],
+    ) -> dict[str, asyncio.Task]:
+        """Start a response's independent reads together; key tasks by call id.
+
+        Only pure reads qualify (see ``_PARALLEL_READ_TOOLS``) and only when a
+        response holds two or more of them: a read cannot conflict with
+        another read, and anything that writes, sends, asks or looks at the
+        screen keeps running one at a time, in order.
+        """
+        if not tools_allowed or live_call_turn:
+            return {}
+        eligible = [
+            call for call in tool_calls or ()
+            if call.name in _PARALLEL_READ_TOOLS and call.name in available_tool_names
+        ]
+        if len(eligible) < 2:
+            return {}
+        enabled_toolsets, disabled_toolsets = toolset_route
+        kwargs = {
+            **execute_kwargs,
+            "enabled_toolsets": enabled_toolsets,
+            "disabled_toolsets": disabled_toolsets,
+        }
+
+        def _start(call: Any) -> asyncio.Task:
+            name, args = call.name, dict(call.arguments)
+            return asyncio.create_task(self._run_aborts.run_cancellable(
+                outbound_run_id, lambda: self.tools.execute(name, args, **kwargs),
+            ))
+
+        return {call.id: _start(call) for call in eligible}
+
     def _apply_turn_tool_policy(
         self,
         tool_defs: list[dict[str, Any]],
@@ -6448,6 +6495,22 @@ class AgentLoop:
                 terminal_action_executed = False
                 turn_success_count = 0
                 begin_spawn_batch(response.tool_calls)
+                # Independent reads in one response run at the same time; the
+                # loop below still takes every call in order, through every
+                # gate, and only swaps its execution for the finished read.
+                _prefetched = self._prefetch_parallel_reads(
+                    response.tool_calls,
+                    tools_allowed=tools_allowed,
+                    live_call_turn=live_call_turn,
+                    available_tool_names=available_tool_names,
+                    outbound_run_id=outbound_run_id,
+                    execute_kwargs={
+                        "session_key": _current_session_key,
+                        "platform": tool_platform or outbound_channel,
+                        "disabled_tools": frozenset(disabled_tools or ()),
+                    },
+                    toolset_route=self._resolve_toolset_route(tool_platform or outbound_channel),
+                )
                 for tool_call in response.tool_calls:
                     # Stop is checked per call, not just per LLM iteration.
                     # This guarantees a batch of N tool calls never starts call
@@ -6821,14 +6884,18 @@ class AgentLoop:
                             "disabled_toolsets": _disabled_toolsets,
                             "disabled_tools": frozenset(disabled_tools or ()),
                         }
-                        _tool_result = await self._run_aborts.run_cancellable(
-                            outbound_run_id,
-                            lambda: self.tools.execute(
-                                _effective_tool_name,
-                                call_args,
-                                **_execute_kwargs,
-                            ),
-                        )
+                        _prefetch_task = _prefetched.pop(tool_call.id, None)
+                        if _prefetch_task is not None:
+                            _tool_result = await _prefetch_task
+                        else:
+                            _tool_result = await self._run_aborts.run_cancellable(
+                                outbound_run_id,
+                                lambda: self.tools.execute(
+                                    _effective_tool_name,
+                                    call_args,
+                                    **_execute_kwargs,
+                                ),
+                            )
                         # Reply-media envelope: a tool (image_generate, screenshot)
                         # produced file(s) for THIS turn's reply. Peel the paths onto
                         # the turn collector and replace the raw JSON with the human
@@ -7024,6 +7091,10 @@ class AgentLoop:
                         )
                         break
 
+                # A read the loop never reached (a stop, a terminal action, a
+                # gate) is not left running.
+                for _leftover in _prefetched.values():
+                    _leftover.cancel()
                 logger.debug(f"Tool execution telemetry: executed_tools={turn_tools}")
                 if outbound_run_id and self.is_run_aborted(outbound_run_id):
                     # Keep the model's already-streamed preamble as the partial
