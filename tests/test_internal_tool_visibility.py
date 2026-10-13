@@ -22,8 +22,10 @@ def _deferred(call_id: str, name: str) -> dict:
     return _call(call_id, "tool_call", '{"name": "%s", "arguments": {}}' % name)
 
 
-def test_the_internal_tools_are_the_agenda_ones():
-    assert INTERNAL_TOOLS == {"objective", "follow_up"}
+def test_the_internal_tools_are_bookkeeping_and_memory():
+    assert {"objective", "follow_up"} <= INTERNAL_TOOLS
+    assert {"memory_search", "memory_get", "memory_recall", "memory_append", "knowledge_graph"} <= INTERNAL_TOOLS
+    assert not {"web_search", "exec", "cron", "session_search"} & INTERNAL_TOOLS
 
 
 def test_a_turn_shows_its_work_but_not_its_bookkeeping():
@@ -91,3 +93,14 @@ def test_the_activity_journal_does_not_record_them(tmp_path, monkeypatch):
     recorder.note_tool("desktop:chat-1", "objective", {"action": "create"}, ok=True, duration_ms=5)
     recorder.note_tool("desktop:chat-1", "web_search", {"query": "laptops"}, ok=True, duration_ms=5)
     assert [step["tool"] for step in task.steps] == ["web_search"]
+
+
+def test_memory_work_is_not_a_step_either():
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [_call("m", "memory_search"), _call("w", "web_search")]},
+        {"role": "tool", "tool_call_id": "m", "name": "memory_search", "content": "Hakan prefers short answers"},
+        {"role": "tool", "tool_call_id": "w", "name": "web_search", "content": "results"},
+    ]
+    shown = project_tool_messages_for_ui(messages)
+    assert [c["function"]["name"] for c in shown[0]["tool_calls"]] == ["web_search"]
+    assert [m.get("name") for m in shown[1:]] == ["web_search"]

@@ -20,11 +20,17 @@ TOOL_ACTIVITY_SCHEMA_VERSION = 1
 _DEFERRED_CALL_PROTOCOL_NAME = "tool_call"
 
 #: The agent's own bookkeeping: the goals it tracks and the follow-ups it
-#: plans (flowly/agenda). Calls to these never reach a product surface — not
+#: plans (flowly/agenda), and its memory — recalling, searching, writing and
+#: tidying what it knows. Calls to these never reach a product surface — not
 #: the tool panel, not the history a reopened chat renders, not the Activity
-#: journal. They would show the owner the machinery instead of the result,
-#: and the agent tells the owner itself when it starts tracking something.
-INTERNAL_TOOLS = frozenset({"objective", "follow_up"})
+#: journal. They would show the owner the machinery instead of the result:
+#: the agent tells the owner itself when it starts tracking something, and
+#: what it remembers shows in what it says (and in the Memory view).
+INTERNAL_TOOLS = frozenset({
+    "objective", "follow_up",
+    "memory_search", "memory_get", "memory_recall", "memory_feedback",
+    "memory_append", "memory_consolidate", "memory_import", "knowledge_graph",
+})
 
 
 def is_internal_tool(name: Any) -> bool:
