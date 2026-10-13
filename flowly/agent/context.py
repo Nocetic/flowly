@@ -2072,6 +2072,10 @@ You can keep track of the owner's goals and come back to things on your own.
                 "subagent's own report: check what matters, don't redo its work.",
                 "Steer or answer a running subagent with `agent_message`; read a "
                 "finished one's full result with `agent_read`.",
+                "If your next step needs a subagent's result, call `agent_wait` — never "
+                "sleep, poll `sessions_list` or re-check with `agent_read` in a loop. If "
+                "nothing you do next depends on them, end your turn: their results reach "
+                "you as messages.",
             ])
         if has_tool("sessions_list"):
             background_lines.extend([

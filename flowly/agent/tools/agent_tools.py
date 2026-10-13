@@ -247,3 +247,81 @@ class ChildAgentMessageTool(Tool):
             })
         return json.dumps({"status": "sent", "to": "orchestrator", "reply": "\n\n".join(replies)},
                           ensure_ascii=False)
+
+
+_WAIT_DEFAULT_SECONDS = 120
+_WAIT_MAX_SECONDS = 600
+
+
+class AgentWaitTool(Tool):
+    """Wait for this conversation's subagents instead of polling them."""
+
+    def __init__(self, manager: "SubagentManager"):
+        self._manager = manager
+
+    @property
+    def name(self) -> str:
+        return "agent_wait"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Wait for your running subagents when your next step needs what they "
+            "find. Returns as soon as one finishes or sends you a message (with "
+            "its result or message), when the owner writes to you, or at the "
+            "timeout. Use it instead of sleeping or checking task lists; if "
+            "nothing you do next depends on them, just end your turn — their "
+            "results reach you as messages."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "run_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Subagents to wait for (default: all of this conversation's).",
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _WAIT_MAX_SECONDS,
+                    "description": f"Longest wait (default {_WAIT_DEFAULT_SECONDS}).",
+                },
+            },
+        }
+
+    async def execute(
+        self, run_ids: list[str] | None = None, timeout_seconds: int = _WAIT_DEFAULT_SECONDS,
+        **kwargs: Any,
+    ) -> str:
+        from flowly.agent.delegation import current_turn
+
+        origin = current_tool_origin()
+        session_key = origin.session_key if origin else None
+        if session_key is None:
+            return json.dumps({"error": "No conversation owns this call, so it has no subagents."})
+        resolved: list[str] | None = None
+        if run_ids:
+            resolved = []
+            for item in run_ids:
+                record, problem = resolve_own_run(self._manager.registry, str(item), session_key)
+                if record is None:
+                    return json.dumps({"error": problem})
+                resolved.append(record.run_id)
+        try:
+            timeout = max(1, min(int(timeout_seconds), _WAIT_MAX_SECONDS))
+        except (TypeError, ValueError):
+            timeout = _WAIT_DEFAULT_SECONDS
+        turn = current_turn()
+        outcome = await self._manager.wait_for_children(
+            session_key, resolved, timeout=timeout,
+            should_yield=turn.should_yield if turn else None,
+        )
+        if outcome["interrupted"]:
+            outcome["note"] = "The owner wrote to you; read it and answer before waiting again."
+        elif not (outcome["finished"] or outcome["messages"] or outcome["still_running"]):
+            outcome["note"] = "No subagent of this conversation is running or waiting to be read."
+        return json.dumps(outcome, ensure_ascii=False)

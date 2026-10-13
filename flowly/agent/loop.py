@@ -2652,9 +2652,10 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
-        from flowly.agent.tools.agent_tools import AgentMessageTool, AgentReadTool
+        from flowly.agent.tools.agent_tools import AgentMessageTool, AgentReadTool, AgentWaitTool
         self.tools.register(AgentReadTool(registry=self._subagent_registry))
         self.tools.register(AgentMessageTool(manager=self.subagents))
+        self.tools.register(AgentWaitTool(manager=self.subagents))
 
         # Sessions list tool (with cancel capability)
         from flowly.agent.tools.sessions_list import SessionsListTool
@@ -4858,6 +4859,12 @@ class AgentLoop:
             or ("call sid:" in lowered and "user said:" in lowered)
             or ("call sid:" in lowered and "kullanıcı şunu söyledi:" in lowered)
         )
+
+    def _turn_should_yield(self, run_id: str) -> Callable[[], bool] | None:
+        """For a waiting tool: did the owner write into or stop this turn?"""
+        if not run_id:
+            return None
+        return lambda: self._steering().has_pending(run_id) or self.is_run_aborted(run_id)
 
     def _delegation_owner_text(self, msg: InboundMessage) -> tuple[str, bool]:
         """What the owner wrote this turn, and whether it may authorise a subagent.
@@ -9067,6 +9074,8 @@ class AgentLoop:
             owner_authored=owner_authored,
             origin_channel=tool_channel,
             origin_chat_id=tool_chat_id,
+            session_key=msg.session_key,
+            should_yield=self._turn_should_yield(msg.metadata.get("run_id") or ""),
         )
         with tool_execution_scope(msg.session_key, allowed_tools=allowed_tools if tools_allowed else frozenset()), self._steering().register(
             msg.metadata.get("run_id") or "", msg.session_key, persist_guidance
@@ -9393,8 +9402,25 @@ class AgentLoop:
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
         
-        # Use the origin session for context
-        session_key = f"{origin_channel}:{origin_chat_id}"
+        subagents = getattr(self, "subagents", None)
+        if (
+            msg.sender_id == "subagent"
+            and subagents is not None
+            and subagents.notice_already_handled(msg.content or "")
+        ):
+            # The main agent already took this result or message with
+            # agent_wait during its turn; handling it again would repeat it.
+            logger.info("Subagent notice already handled in its turn; skipping")
+            return None
+
+        # The conversation the notice belongs to. Work started in a desktop
+        # chat names that chat's own key; other notices fall back to the
+        # delivery address.
+        session_key = (
+            msg.session_key
+            if not msg.session_key.startswith("system:")
+            else f"{origin_channel}:{origin_chat_id}"
+        )
         session = self.sessions.get_or_create(session_key)
         
         # Update tool contexts
@@ -9469,13 +9495,14 @@ class AgentLoop:
             owner_authored=False,
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,
+            session_key=session_key,
         )
         with delegation_turn_scope(system_turn):
             final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
                 messages=messages,
                 live_call_turn=live_call_turn,
                 turn_content=msg.content,
-                session_key=f"{origin_channel}:{origin_chat_id}",
+                session_key=session_key,
                 tool_platform=tool_route,
                 outbound_channel="" if agenda_item else origin_channel,
                 outbound_chat_id="" if agenda_item else origin_chat_id,
@@ -9541,12 +9568,11 @@ class AgentLoop:
             turn_start_index=turn_start_index,
         )
         self.sessions.save(session)
-        subagents = getattr(self, "subagents", None)
         if msg.sender_id == "subagent" and subagents is not None:
             # The conversation has now handled these results; a goal waiting
             # on them may continue.
             subagents.mark_delivered(
-                f"{origin_channel}:{origin_chat_id}",
+                session_key,
                 _SUBAGENT_RUN_ID_RE.findall(msg.content or ""),
             )
         # A system/announce turn has no inbound attachment — it is triggered by
@@ -9589,6 +9615,10 @@ class AgentLoop:
                 # wrote first is dropped there, unstored and unpushed.
                 **({"agent_first_conversation": origin_chat_id, "session_key": session_key}
                    if agenda_item and origin_channel == "web" else {}),
+                # A reply about work started in a desktop chat belongs to
+                # that chat, whose key is not channel:chat_id.
+                **({"session_key": session_key}
+                   if session_key != f"{origin_channel}:{origin_chat_id}" and not agenda_item else {}),
             },
         )
 

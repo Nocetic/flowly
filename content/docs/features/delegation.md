@@ -30,7 +30,7 @@ When it starts one, the agent writes the subagent's brief itself: the goal, what
 
 ### The agent keeps working
 
-Starting a subagent returns at once with its run id; the agent carries on with whatever doesn't depend on it. When the subagent finishes, its result reaches the agent as a message: the title, the run id, the tools it used and up to 8,000 characters of its result. The agent reads anything beyond that with `agent_read`, which only ever shows runs started in the same conversation. If the conversation is busy when a subagent finishes, the message waits until it frees up.
+Starting a subagent returns at once with its run id; the agent carries on with whatever doesn't depend on it. When its next step needs a subagent's result it waits with `agent_wait`, which returns as soon as a subagent finishes or writes to it, or you write to the agent — it never sleeps or polls a task list. When the subagent finishes, its result reaches the agent as a message: the title, the run id, the tools it used and up to 8,000 characters of its result. The agent reads anything beyond that with `agent_read`, which only ever shows runs started in the same conversation. If the conversation is busy when a subagent finishes, the message waits until it frees up.
 
 ### Talking while they work
 

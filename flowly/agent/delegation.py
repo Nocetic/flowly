@@ -24,7 +24,7 @@ import re
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 Origin = Literal["owner", "agent", "system"]
 
@@ -61,6 +61,12 @@ class DelegationTurn:
     # running at once cannot swap each other's children.
     origin_channel: str = ""
     origin_chat_id: str = ""
+    # The conversation's own key — what its history, turn lock and goal are
+    # stored under. A desktop chat's key is not ``channel:chat_id``.
+    session_key: str = ""
+    # True when the turn should stop waiting and look up: the owner wrote
+    # something new into it, or stopped it.
+    should_yield: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True)

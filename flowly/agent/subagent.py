@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
-from flowly.bus.events import InboundMessage
+from flowly.bus.events import ConversationInboundMessage
 from flowly.bus.queue import MessageBus
 from flowly.providers.base import LLMProvider
 from flowly.agent.tools.base import Tool
@@ -69,7 +69,7 @@ from flowly.agent.subagent_announce_queue import AnnounceItem, get_or_create_que
 # the obviously-dangerous names regardless.
 _BLOCKED_SUBAGENT_TOOLS: frozenset[str] = frozenset({
     # recursion / privilege escalation
-    "spawn", "builtin_agent", "delegate_to", "agent_read",
+    "spawn", "builtin_agent", "delegate_to", "agent_read", "agent_wait",
     # persistent scheduling / background side effects
     "cron",
     # user-facing communication (only main agent may speak for the user)
@@ -135,6 +135,15 @@ class SubagentToolRegistry(ToolRegistry):
                 "See flowly.agent.subagent._BLOCKED_SUBAGENT_TOOLS for rationale."
             )
         super().register(tool)
+
+
+# The header of a notice to the parent: a completion names its run, a message
+# also its message id.
+_NOTICE_HEADER_RE = re.compile(
+    r"^\[(?:Subagent|Message from subagent) '.*?'.*?run_id=(?P<run_id>[0-9a-f-]{36})"
+    r"(?:, message_id=(?P<message_id>[0-9a-f]{16}))?",
+    re.MULTILINE,
+)
 
 
 def _created_artifact_id(payload: Any, tool_args: dict[str, Any]) -> str | None:
@@ -360,6 +369,11 @@ class SubagentManager:
         # step, and a wake-up for a child waiting on a reply.
         self._inboxes: dict[str, list[str]] = {}
         self._inbox_events: dict[str, asyncio.Event] = {}
+        # Messages children sent to a conversation, kept so a waiting main
+        # agent can take them directly, and a wake-up for that wait.
+        self._parent_mail: dict[str, list[dict[str, str]]] = {}
+        self._parent_wake: dict[str, asyncio.Event] = {}
+        self._consumed_mail: dict[str, None] = {}
         self._on_event = on_event  # async callback(event_name, data)
         self._events = TaskEvents(self._deliver_event)
         self._cancel_outcomes: dict[str, str] = {}
@@ -517,6 +531,7 @@ class SubagentManager:
         display_name: str | None = None,
         origin: str = "system",
         context: str | None = None,
+        parent_session_key: str | None = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -539,6 +554,9 @@ class SubagentManager:
                 agent split its work) or "system" (self-review, Board…).
                 Clients show owner and agent runs in the conversation.
             context: The conversation the child may read before its task.
+            parent_session_key: The starting conversation's own key when it
+                is not ``origin_channel:origin_chat_id`` (a desktop chat);
+                results and messages return to that conversation.
 
         Returns:
             JSON status string.
@@ -551,7 +569,7 @@ class SubagentManager:
                 "error": "Subagents cannot spawn other subagents",
             })
 
-        parent_session_key = f"{origin_channel}:{origin_chat_id}"
+        parent_session_key = parent_session_key or f"{origin_channel}:{origin_chat_id}"
         # Concurrency limits — a runaway parent can't pin the event loop, and
         # one conversation can't take every slot from the others.
         if len(self._running_tasks) >= _MAX_CONCURRENT_SUBAGENTS:
@@ -639,6 +657,7 @@ class SubagentManager:
                 self._running_tasks.pop(_rid, None)
                 self._inboxes.pop(_rid, None)
                 self._inbox_events.pop(_rid, None)
+                self._wake(_pk)
                 siblings = self._children_by_parent.get(_pk)
                 if siblings is not None:
                     siblings.discard(_rid)
@@ -1440,26 +1459,38 @@ class SubagentManager:
         title = record.display_name or record.label
         self._transcribe(run_id, {"kind": "message_out", "to": "orchestrator", "content": text})
         await self._progress(run_id, {"phase": "message_sent"})
+        message_id = uuid.uuid4().hex[:16]
+        self._parent_mail.setdefault(record.parent_session_key, []).append(
+            {"id": message_id, "run_id": run_id, "title": title, "text": text},
+        )
+        self._wake(record.parent_session_key)
         prompt = (
-            f"[Message from subagent '{title}' (run_id={run_id}), still running]\n\n"
+            f"[Message from subagent '{title}' (run_id={run_id}, message_id={message_id}), still running]\n\n"
             f"{text}\n\n"
             f"If it needs an answer, reply with agent_message(to=\"{run_id}\", ...). "
             "Don't show run ids to the owner."
         )
-        await self._deliver_to_parent(
-            record.parent_session_key, prompt, summary=f"{title} — message", run_id=run_id,
-        )
+        await self._deliver_to_parent(record, prompt, summary=f"{title} — message")
         return {"status": "delivered"}
 
-    async def _deliver_to_parent(
-        self, parent_session_key: str, prompt: str, *, summary: str, run_id: str,
-    ) -> None:
+    async def _deliver_to_parent(self, record: SubagentRunRecord, prompt: str, *, summary: str) -> None:
+        """Hand a notice to the conversation that started the run.
+
+        The notice is processed as that conversation's own turn — its key,
+        its history and its turn lock — so it never runs alongside the
+        owner's turn or lands in a session named after a connection id. The
+        reply travels to the run's recorded delivery address.
+        """
+        parent_session_key = record.parent_session_key
+        run_id = record.run_id
+
         async def _send(content: str) -> None:
-            await self.bus.publish_inbound(InboundMessage(
+            await self.bus.publish_inbound(ConversationInboundMessage(
                 channel="system",
                 sender_id="subagent",
-                chat_id=parent_session_key,
+                chat_id=f"{record.parent_channel}:{record.parent_chat_id}",
                 content=content,
+                conversation_key=parent_session_key,
             ))
             logger.debug(f"[SubagentManager] [{run_id[:8]}] delivered to {parent_session_key}")
 
@@ -1469,6 +1500,120 @@ class SubagentManager:
             await queue.enqueue(AnnounceItem(prompt=prompt, summary=summary))
         else:
             await _send(prompt)
+
+    def _wake(self, parent_session_key: str) -> None:
+        event = self._parent_wake.get(parent_session_key)
+        if event is not None:
+            event.set()
+
+    def notice_already_handled(self, content: str) -> bool:
+        """True when a queued notice's content was already taken by agent_wait."""
+        header = _NOTICE_HEADER_RE.search(content or "")
+        if header is None:
+            return False
+        run_id, message_id = header.group("run_id"), header.group("message_id")
+        if message_id:
+            return message_id in self._consumed_mail
+        record = self._registry.get(run_id)
+        return record is not None and record.delivery_state == "delivered"
+
+    async def wait_for_children(
+        self,
+        parent_session_key: str,
+        run_ids: list[str] | None = None,
+        *,
+        timeout: float,
+        should_yield: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Wait until a child of this conversation finishes or writes.
+
+        Returns as soon as there is something to act on — finished results
+        not yet handled, messages from children — or the owner wrote into
+        the turn, or the timeout passed. What it returns is marked handled,
+        so the same result or message is not processed again as a notice.
+        """
+        def targets() -> list[SubagentRunRecord]:
+            records = [
+                r for r in self._registry.all()
+                if r.parent_session_key == parent_session_key and r.origin != "system"
+            ]
+            if run_ids:
+                wanted = set(run_ids)
+                return [r for r in records if r.run_id in wanted]
+            return [r for r in records if r.ended_at is None or r.delivery_state in ("pending", "queued")]
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        event = self._parent_wake.setdefault(parent_session_key, asyncio.Event())
+        interrupted = timed_out = False
+        while True:
+            event.clear()
+            current = targets()
+            finished = [
+                r for r in current
+                if r.ended_at is not None and r.delivery_state in ("pending", "queued")
+            ]
+            mail = self._parent_mail.get(parent_session_key) or []
+            if run_ids:
+                wanted = set(run_ids)
+                mail = [m for m in mail if m["run_id"] in wanted]
+            running = [r for r in current if r.ended_at is None]
+            if finished or mail or not running:
+                break
+            if should_yield is not None and should_yield():
+                interrupted = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                # Short slices so an owner's message into the turn is noticed.
+                await asyncio.wait_for(event.wait(), min(1.0, remaining))
+            except asyncio.TimeoutError:
+                pass
+
+        results = []
+        for record in finished:
+            try:
+                text = self._registry.read_result(record.run_id, 0, _ANNOUNCE_RESULT_CHARS)["content"]
+            except (FileNotFoundError, ValueError, OSError):
+                text = record.result_preview or ""
+            item = {
+                "run_id": record.run_id,
+                "title": record.display_name or record.label,
+                "status": record.outcome or "unknown",
+                "result": text,
+            }
+            if record.result_chars > _ANNOUNCE_RESULT_CHARS:
+                item["more"] = (
+                    f"{record.result_chars - _ANNOUNCE_RESULT_CHARS} more characters: "
+                    f'agent_read(run_id="{record.run_id}", offset={_ANNOUNCE_RESULT_CHARS})'
+                )
+            if record.error:
+                item["error"] = record.error
+            results.append(item)
+            self._registry.update(record.run_id, delivery_state="delivered")
+        taken_ids = {m["id"] for m in mail}
+        if taken_ids:
+            self._parent_mail[parent_session_key] = [
+                m for m in self._parent_mail.get(parent_session_key, []) if m["id"] not in taken_ids
+            ]
+            for message_id in taken_ids:
+                self._consumed_mail[message_id] = None
+            while len(self._consumed_mail) > 1_000:
+                self._consumed_mail.pop(next(iter(self._consumed_mail)))
+        still_running = [
+            r.display_name or r.label for r in targets() if r.ended_at is None
+        ]
+        return {
+            "finished": results,
+            "messages": [
+                {"run_id": m["run_id"], "title": m["title"], "text": m["text"]} for m in mail
+            ],
+            "still_running": still_running,
+            "timed_out": timed_out,
+            "interrupted": interrupted,
+        }
 
     def _transcribe(self, run_id: str, item: dict[str, Any]) -> None:
         """Record one step for the owner to read; never fails the run.
@@ -1560,15 +1705,14 @@ class SubagentManager:
             "request in your own words; don't show run ids."
         )
 
-        await self._deliver_to_parent(
-            record.parent_session_key, announce_content,
-            summary=f"{_disp} — {status_text}", run_id=run_id,
-        )
-        # A run that needs no delivery (cancelled, interrupted, waited on)
-        # keeps that state: a goal must not wait for a result nobody handles.
+        await self._deliver_to_parent(record, announce_content, summary=f"{_disp} — {status_text}")
+        # Only a result still waiting becomes "queued": one that needs no
+        # delivery (cancelled, interrupted) or that the main agent already
+        # took with agent_wait keeps its state, so the notice is not handled
+        # twice and a goal never waits for it.
         current = self._registry.get(run_id)
-        delivery = "not_required" if current and current.delivery_state == "not_required" else "queued"
-        self._registry.update(run_id, announced=True, delivery_state=delivery)
+        delivery = "queued" if current and current.delivery_state == "pending" else None
+        self._registry.update(run_id, announced=True, **({"delivery_state": delivery} if delivery else {}))
 
     # ------------------------------------------------------------------
     # Helpers

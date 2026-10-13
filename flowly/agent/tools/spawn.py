@@ -129,6 +129,7 @@ class SpawnTool(Tool):
         channel = (turn.origin_channel if turn else "") or self._origin_channel
         chat_id = (turn.origin_chat_id if turn else "") or self._origin_chat_id
         return await self._manager.spawn(
+            parent_session_key=(turn.session_key if turn else "") or None,
             task=task,
             label=label,
             display_name=(title or "").strip() or None,

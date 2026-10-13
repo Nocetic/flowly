@@ -40,9 +40,10 @@ class SessionsListTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Manage background tasks. Actions: "
+            "Manage this conversation's background tasks. Actions: "
             "list (show running/completed/failed tasks), "
-            "cancel (stop a running task by run_id)."
+            "cancel (stop a running task by run_id). To wait for subagents use "
+            "agent_wait instead of listing repeatedly."
         )
 
     @property
@@ -88,7 +89,9 @@ class SessionsListTool(Tool):
         self._list_call_times.append(now)
         recent_calls = len(self._list_call_times)
 
-        runs = self._registry.all()
+        # Only this conversation's tasks: another chat's work is not this
+        # conversation's business, and listing it confuses the agent.
+        runs = [r for r in self._registry.all() if self._is_own(r)]
 
         if not runs:
             return self._maybe_append_poll_hint("No background tasks found.", recent_calls)
@@ -152,5 +155,17 @@ class SessionsListTool(Tool):
         if not self._manager:
             return "Error: Task cancellation not available."
 
+        matches = [r for r in self._registry.all() if r.run_id.startswith(run_id.strip())]
+        if matches and not any(self._is_own(r) for r in matches):
+            return f"Error: No task {run_id} in this conversation."
         result = await self._manager.cancel(run_id)
         return result
+
+    @staticmethod
+    def _is_own(record: Any) -> bool:
+        from flowly.agent.tool_context import current_tool_origin
+
+        origin = current_tool_origin()
+        if origin is None:
+            return True  # an owner-level caller (CLI) sees every task
+        return record.parent_session_key == origin.session_key
