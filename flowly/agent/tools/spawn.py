@@ -1,7 +1,16 @@
-"""Spawn tool for creating background subagents."""
+"""Spawn tool: start a subagent for a task the agent describes."""
 
-from typing import Any, TYPE_CHECKING
+from __future__ import annotations
 
+import json
+from typing import TYPE_CHECKING, Any
+
+from flowly.agent.delegation import (
+    current_batch_size,
+    current_turn,
+    decide,
+    render_conversation,
+)
 from flowly.agent.tools.base import Tool
 
 if TYPE_CHECKING:
@@ -9,13 +18,11 @@ if TYPE_CHECKING:
 
 
 class SpawnTool(Tool):
-    """
-    Tool to spawn a subagent for background task execution.
+    """Start a subagent that works in the background and reports back.
 
-    The subagent runs asynchronously and announces its result back
-    to the main agent when complete.
-
-    Subagents cannot spawn further subagents (loop prevention).
+    Whether a call may start one is decided by :mod:`flowly.agent.delegation`
+    from facts the runtime bound for this turn; the model's arguments alone
+    can never authorise it. Subagents cannot spawn further subagents.
     """
 
     def __init__(self, manager: "SubagentManager"):
@@ -37,8 +44,14 @@ class SpawnTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Spawn a subagent for background tasks. "
-            "The subagent runs asynchronously and reports back when done."
+            "Start a subagent that works on a task in the background and reports "
+            "back to you. Do the work yourself unless (a) the owner asked for a "
+            "subagent — pass their exact words as owner_request — or (b) the work "
+            "splits into independent parts: then call spawn once per part in the "
+            "same response. A long or detailed task alone is not a reason. Don't "
+            "hand off the step your next action depends on. While subagents run, "
+            "keep working on what doesn't depend on them; their results reach you "
+            "as messages."
         )
 
     @property
@@ -46,54 +59,81 @@ class SpawnTool(Tool):
         return {
             "type": "object",
             "properties": {
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "Short name the owner sees for this subagent, in their "
+                        "language (e.g. 'Rakip B fiyatları')."
+                    ),
+                },
                 "task": {
                     "type": "string",
-                    "description": "The task for the subagent to complete",
+                    "description": (
+                        "The full brief. The subagent sees the conversation so far "
+                        "but nothing of your tool work, so state: the goal, what "
+                        "you already know or ruled out, the sources or files to "
+                        "use, what is out of scope, and what to return. Ask for "
+                        "verifiable references (URLs, file paths, ids) for any "
+                        "claim or change."
+                    ),
                 },
-                "label": {
+                "owner_request": {
                     "type": "string",
-                    "description": "Short human-readable label for this task (shown in notifications)",
+                    "description": (
+                        "Only when the owner asked for a subagent: their exact "
+                        "words asking for it, copied from their message. Omit "
+                        "otherwise."
+                    ),
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional model override for this subagent (e.g. 'openrouter/anthropic/claude-haiku-4.5')",
+                    "description": (
+                        "Only when the owner named a model for this task. Omit to "
+                        "run on your own model."
+                    ),
                 },
-                "cleanup": {
+                "context": {
                     "type": "string",
-                    "enum": ["keep", "delete"],
-                    "description": "Whether to keep or delete the task record after completion (default: keep)",
-                },
-                "timeout_seconds": {
-                    "type": "integer",
-                    "description": "Timeout in seconds. Default: 600 (10 min). For long tasks (research, document creation) use 900-1800. Only short simple tasks should use less than 300.",
+                    "enum": ["conversation", "none"],
+                    "description": (
+                        "'conversation' (default): the subagent reads the owner's "
+                        "messages and your replies so far. 'none': it starts from "
+                        "the brief alone — for work unrelated to this conversation."
+                    ),
                 },
             },
-            "required": ["task"],
+            "required": ["title", "task"],
         }
 
     async def execute(
         self,
         task: str,
-        label: str | None = None,
+        title: str | None = None,
+        owner_request: str | None = None,
         model: str | None = None,
-        cleanup: str = "keep",
-        timeout_seconds: int | None = None,
+        context: str = "conversation",
+        label: str | None = None,
         **kwargs: Any,
     ) -> str:
-        """Spawn a subagent to execute the given task."""
-        # Default 10 min timeout if not specified (prevents LLM from setting too low)
-        if timeout_seconds is None or timeout_seconds <= 0:
-            timeout_seconds = 600
-        # Minimum 120s, maximum 1800s (30 min)
-        timeout_seconds = max(120, min(timeout_seconds, 1800))
+        """Start a subagent, or explain why not."""
+        turn = current_turn()
+        decision = decide(owner_request, batch_size=current_batch_size(), turn=turn)
+        if not decision.allowed:
+            return json.dumps({"status": "refused", "error": decision.reason})
+
+        chosen_model = (model or "").strip() or (turn.model if turn else None)
+        transcript = None
+        if context != "none" and turn and turn.conversation:
+            transcript = render_conversation(turn.conversation)
 
         return await self._manager.spawn(
             task=task,
             label=label,
+            display_name=(title or "").strip() or None,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
-            model=model,
-            cleanup=cleanup,
-            timeout_seconds=timeout_seconds,
+            model=chosen_model,
             is_subagent_caller=self._is_subagent,
+            origin=decision.origin,
+            context=transcript,
         )

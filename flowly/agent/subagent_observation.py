@@ -75,6 +75,8 @@ def run_view(record: SubagentRunRecord, *, detail: bool = False) -> dict[str, An
         "resultPreview": record.result_preview, "resultChars": record.result_chars,
         "resultAvailable": record.result_available, "artifactIds": list(record.artifact_ids),
         "deliveryState": record.delivery_state,
+        "origin": record.origin, "mark": deepcopy(record.mark),
+        "childSessionKey": record.child_session_key,
     }
     if detail:
         view["toolTrace"] = deepcopy(record.tool_trace)

@@ -97,6 +97,12 @@ from flowly.agent.reply_media import extract_reply_media, extract_reply_media_as
 from flowly.media.assets import ASSETS_META_KEY, assets_to_meta
 from flowly.agent.run_abort import RunAbortedError, RunAbortController
 from flowly.agent.run_steering import ProviderSteeredError, RunSteeringController, SteeringError
+from flowly.agent.delegation import (
+    DelegationTurn,
+    begin_spawn_batch,
+    conversation_from_history,
+    delegation_turn_scope,
+)
 from flowly.agent.tool_result_spill import build_spill_pointer, spill_tool_result
 from flowly.agent.tool_policy import (
     normalize_tool_allowlist,
@@ -2623,6 +2629,8 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
+        from flowly.agent.tools.agent_tools import AgentReadTool
+        self.tools.register(AgentReadTool(registry=self._subagent_registry))
 
         # Sessions list tool (with cancel capability)
         from flowly.agent.tools.sessions_list import SessionsListTool
@@ -6431,6 +6439,7 @@ class AgentLoop:
                 turn_tools: list[str] = []
                 terminal_action_executed = False
                 turn_success_count = 0
+                begin_spawn_batch(response.tool_calls)
                 for tool_call in response.tool_calls:
                     # Stop is checked per call, not just per LLM iteration.
                     # This guarantees a batch of N tool calls never starts call
@@ -8882,9 +8891,14 @@ class AgentLoop:
 
         # Keep a positive ceiling for the whole turn, not just a deny list
         # computed from one registry snapshot. Late MCP discovery cannot widen it.
+        delegation_turn = DelegationTurn(
+            owner_text=msg.content or "",
+            conversation=conversation_from_history(history, msg.content or ""),
+            model=effective_model,
+        )
         with tool_execution_scope(msg.session_key, allowed_tools=allowed_tools if tools_allowed else frozenset()), self._steering().register(
             msg.metadata.get("run_id") or "", msg.session_key, persist_guidance
-        ):
+        ), delegation_turn_scope(delegation_turn):
             final_content, tool_results, _executed_tools, usage, _loop_messages = await self._run_llm_tool_loop(
                 messages=messages,
                 live_call_turn=live_call_turn,
@@ -9240,21 +9254,30 @@ class AgentLoop:
         reply_media_assets: list = []
         provider_state = self._provider_continuity_state(session)
         provider_state_out: dict[str, Any] = {}
-        final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
-            messages=messages,
-            live_call_turn=live_call_turn,
-            turn_content=msg.content,
-            session_key=f"{origin_channel}:{origin_chat_id}",
-            tool_platform=origin_channel,
-            outbound_channel=origin_channel,
-            outbound_chat_id=origin_chat_id,
-            outbound_run_id=msg.metadata.get("run_id") or "",
-            reply_media=reply_media,
-            reply_media_assets=reply_media_assets,
-            turn_messages_out=turn_messages,
-            provider_state=provider_state,
-            provider_state_out=provider_state_out,
+        # A system wake-up (a subagent's result, a notice) is not the owner
+        # speaking: nothing in it can authorise a new subagent.
+        system_turn = DelegationTurn(
+            owner_text=msg.content or "",
+            conversation=conversation_from_history(self._history_with_summary_anchor(session)),
+            model=self.model,
+            owner_authored=False,
         )
+        with delegation_turn_scope(system_turn):
+            final_content, tool_results, _executed_tools, system_usage, _loop_messages = await self._run_llm_tool_loop(
+                messages=messages,
+                live_call_turn=live_call_turn,
+                turn_content=msg.content,
+                session_key=f"{origin_channel}:{origin_chat_id}",
+                tool_platform=origin_channel,
+                outbound_channel=origin_channel,
+                outbound_chat_id=origin_chat_id,
+                outbound_run_id=msg.metadata.get("run_id") or "",
+                reply_media=reply_media,
+                reply_media_assets=reply_media_assets,
+                turn_messages_out=turn_messages,
+                provider_state=provider_state,
+                provider_state_out=provider_state_out,
+            )
 
         # Save to session (mark as system message in history). Full
         # tool-protocol structure is preserved by

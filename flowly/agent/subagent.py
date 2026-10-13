@@ -26,6 +26,7 @@ from flowly.agent.tools.shell import ExecTool
 from flowly.exec.types import ExecConfig
 from flowly.agent.tools.web import WebSearchTool, WebFetchTool, WebExtractTool
 from flowly.agent.subagent_registry import SubagentRegistry, SubagentRunRecord
+from flowly.agent.delegation import MAX_CHILDREN_PER_CONVERSATION, assign_mark
 from flowly.agent.subagent_observation import TaskEvents, run_view
 from flowly.agent.subagent_announce_queue import AnnounceItem, get_or_create_queue
 
@@ -67,7 +68,7 @@ from flowly.agent.subagent_announce_queue import AnnounceItem, get_or_create_que
 # the obviously-dangerous names regardless.
 _BLOCKED_SUBAGENT_TOOLS: frozenset[str] = frozenset({
     # recursion / privilege escalation
-    "spawn", "builtin_agent", "delegate_to",
+    "spawn", "builtin_agent", "delegate_to", "agent_read",
     # persistent scheduling / background side effects
     "cron",
     # user-facing communication (only main agent may speak for the user)
@@ -95,11 +96,17 @@ _BLOCKED_SUBAGENT_TOOLS: frozenset[str] = frozenset({
 
 # System-wide wall-clock cap for every subagent run. Not per-run
 # configurable — keeping the user-facing config minimal is worth more
-# than letting operators tune this. 15 min is generous: normal runs
-# finish in 7-15 minutes (15 iterations × 30-60s average); anything
-# over this ceiling is almost always a genuine hang that the per-tool
-# (120s) / per-LLM-call (300s) / heartbeat guards failed to catch.
-_SUBAGENT_WALL_CLOCK_TIMEOUT = 900
+# than letting operators tune this. 30 min covers a long research or
+# coding task (30 iterations × 30-60s); anything over this ceiling is
+# almost always a genuine hang that the per-tool (120s) / per-LLM-call
+# (300s) / heartbeat guards failed to catch.
+_SUBAGENT_WALL_CLOCK_TIMEOUT = 1_800
+# A subagent exists for work too big to share a turn with: give it room.
+_SUBAGENT_MAX_ITERATIONS = 30
+_MAX_CONCURRENT_SUBAGENTS = 8
+# Result text handed to the parent with the completion notice; the rest
+# is one agent_read call away.
+_ANNOUNCE_RESULT_CHARS = 8_000
 
 
 class SubagentToolRegistry(ToolRegistry):
@@ -358,6 +365,15 @@ class SubagentManager:
     def is_busy(self, session_key: str) -> bool:
         return session_key in self._busy_sessions
 
+    def _running_siblings(self, parent_session_key: str) -> list[SubagentRunRecord]:
+        """Owner/agent-started runs still going for one conversation."""
+        records = []
+        for run_id in self._children_by_parent.get(parent_session_key, ()):
+            record = self._registry.get(run_id)
+            if record and record.ended_at is None and record.origin != "system":
+                records.append(record)
+        return records
+
     def resume_pending(self) -> None:
         """Called on startup: announce any tasks that were running when process crashed."""
         try:
@@ -398,6 +414,8 @@ class SubagentManager:
         wait: bool = False,
         silent: bool = False,
         display_name: str | None = None,
+        origin: str = "system",
+        context: str | None = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -416,6 +434,10 @@ class SubagentManager:
                 memory/KG writes) where the child's output is not meant
                 for the user and waking the parent LLM with an announce
                 triggers a wasteful extra turn.
+            origin: Who started it — "owner" (the owner asked), "agent" (the
+                agent split its work) or "system" (self-review, Board…).
+                Clients show owner and agent runs in the conversation.
+            context: The conversation the child may read before its task.
 
         Returns:
             JSON status string.
@@ -428,19 +450,31 @@ class SubagentManager:
                 "error": "Subagents cannot spawn other subagents",
             })
 
-        # Concurrency limit — cap parallel children so a runaway
-        # parent can't spawn N subagents and pin the event loop.
-        MAX_CONCURRENT = 5
-        if len(self._running_tasks) >= MAX_CONCURRENT:
-            logger.warning(f"[SubagentManager] Concurrent limit reached ({MAX_CONCURRENT})")
+        parent_session_key = f"{origin_channel}:{origin_chat_id}"
+        # Concurrency limits — a runaway parent can't pin the event loop, and
+        # one conversation can't take every slot from the others.
+        if len(self._running_tasks) >= _MAX_CONCURRENT_SUBAGENTS:
+            logger.warning(f"[SubagentManager] Concurrent limit reached ({_MAX_CONCURRENT_SUBAGENTS})")
             return json.dumps({
                 "status": "rejected",
-                "error": f"Maximum {MAX_CONCURRENT} concurrent subagents. Wait for one to finish.",
+                "error": (
+                    f"Maximum {_MAX_CONCURRENT_SUBAGENTS} subagents are running. "
+                    "Wait for one to finish, or do this part yourself."
+                ),
+            })
+        siblings = self._running_siblings(parent_session_key)
+        if origin != "system" and len(siblings) >= MAX_CHILDREN_PER_CONVERSATION:
+            return json.dumps({
+                "status": "rejected",
+                "error": (
+                    f"{MAX_CHILDREN_PER_CONVERSATION} subagents are already running "
+                    "for this conversation. Wait for one to finish, or do this part "
+                    "yourself."
+                ),
             })
 
         run_id = str(uuid.uuid4())
         child_session_key = f"subagent:{run_id}"
-        parent_session_key = f"{origin_channel}:{origin_chat_id}"
         # ``label`` is the internal/dedup key (may be a code like
         # "builtin:researcher"). ``display_name`` is what users see and is ALWAYS
         # task-derived — never a code/UUID. Priority: explicit display_name →
@@ -467,6 +501,10 @@ class SubagentManager:
             created_at=time.time(),
             activity={"phase": "queued"},
             delivery_state="not_required" if wait or silent else "pending",
+            origin=origin if origin in ("owner", "agent", "system") else "system",
+            mark=assign_mark(run_id, {
+                str(rec.mark.get("glyph")) for rec in siblings if rec.mark
+            }),
         )
         self._registry.register(record)
 
@@ -476,7 +514,7 @@ class SubagentManager:
         bg_task = asyncio.create_task(
             self._run_subagent(run_id, task, display_label, origin_channel, origin_chat_id,
                                resolved_model, timeout_seconds,
-                               skip_announce=wait or silent)
+                               skip_announce=wait or silent, context=context)
         )
         self._running_tasks[run_id] = bg_task
         self._children_by_parent.setdefault(parent_session_key, set()).add(run_id)
@@ -508,36 +546,20 @@ class SubagentManager:
         if wait:
             return await bg_task
 
-        # Async dispatch envelope. The wording here is load-bearing —
-        # earlier versions said only "Background task started. I'll
-        # notify you when it completes." which the parent LLM happily
-        # misread as "tool done, I can answer now" and then fabricated
-        # an answer from its own knowledge while the real specialist
-        # was still running (the "async amnesia" pattern observed in
-        # production Kimi/Minimax sessions). We now spell out the
-        # required next steps verbatim so there is no room to guess.
+        # The parent keeps working; the result arrives as a message. The
+        # wording stops a parent from answering from memory meanwhile.
         return json.dumps({
-            "status": "dispatched",
-            "run_id": run_id[:8],
-            "label": resolved_display,
+            "status": "started",
+            "run_id": run_id,
+            "title": resolved_display,
+            "model": resolved_model,
             "message": (
-                f"Specialist '{resolved_display}' is now running in the "
-                "background. You DO NOT have its result yet."
+                f"'{resolved_display}' is running in the background. Its result will "
+                "reach you as a message when it finishes. Keep working on whatever "
+                "does not depend on it; don't redo its task or guess its result. If "
+                "nothing else is left, tell the owner briefly what is running and end "
+                "your turn."
             ),
-            "required_next_steps": [
-                "Emit ONE short acknowledgement to the user in their "
-                "language. Keep it under 15 words. Do not preview an "
-                "answer.",
-                "End your turn immediately after the acknowledgement. "
-                "Do not call another tool. Do not attempt to answer "
-                "the user's actual question — you do not have the "
-                "specialist's output yet and guessing from memory "
-                "produces hallucinations.",
-                "When the specialist finishes, its full result will "
-                "be injected as a system message that wakes you on a "
-                "later turn. ONLY THEN compose your final answer "
-                "using the real data.",
-            ],
         })
 
     # ------------------------------------------------------------------
@@ -554,6 +576,7 @@ class SubagentManager:
         model: str,
         timeout_seconds: int | None,
         skip_announce: bool = False,
+        context: str | None = None,
     ) -> str:
         """Execute the subagent task and optionally announce the result.
 
@@ -665,13 +688,17 @@ class SubagentManager:
                     "when a name or compact signature is unclear; its results include "
                     "complete schemas and valid invocation options."
                 )
+            first_message = (
+                f"## Conversation so far\n\n{context}\n\n## Your task\n\n{task}"
+                if context else task
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
+                {"role": "user", "content": first_message},
             ]
 
             # Run agent loop (limited iterations)
-            max_iterations = 15
+            max_iterations = _SUBAGENT_MAX_ITERATIONS
             iteration = 0
             _tool_search_result_sets: dict[tuple[str, ...], int] = {}
             final_result: str | None = None
@@ -1258,15 +1285,20 @@ class SubagentManager:
             secs = int(record.ended_at - record.started_at)
             duration = f" (runtime: {secs}s)"
 
-        # Truncate result for announce — parent sees a summary, not full output
-        # Full content is in the artifact — parent just needs to know it's done
-        _result_preview = result[:2000] if len(result) > 2000 else result
-        if len(result) > 2000:
-            _result_preview += f"\n[... full result truncated from {len(result)} chars — available in the saved task result]"
+        # The parent gets enough of the result to act on, and the run id to
+        # read the rest — never a preview it cannot get past.
+        result_text = result or ""
+        shown = result_text[:_ANNOUNCE_RESULT_CHARS]
+        more = ""
+        if len(result_text) > _ANNOUNCE_RESULT_CHARS:
+            more = (
+                f"\n\n[{len(result_text) - _ANNOUNCE_RESULT_CHARS} more characters — "
+                f"read them with agent_read(run_id=\"{run_id}\", "
+                f"offset={_ANNOUNCE_RESULT_CHARS})]"
+            )
 
-        # P1.2 — one-line "Tools used: web_search×2, exec×1" summary. Helps
-        # the parent LLM reason about what the child actually did instead
-        # of treating the summary as a black box.
+        # One-line "Tools used: web_search×2, exec×1" summary, so the parent
+        # can judge what the child actually did.
         _tool_summary = ""
         if record.tool_trace:
             from collections import Counter
@@ -1275,12 +1307,14 @@ class SubagentManager:
             _tool_summary = f"\nTools used ({len(record.tool_trace)} calls): {', '.join(parts)}"
 
         _disp = record.display_name or record.label
+        brief = record.task if len(record.task) <= 600 else record.task[:600] + " […]"
         announce_content = (
-            f"[Background task '{_disp}' {status_text}{duration}]{_tool_summary}\n\n"
-            f"Task: {record.task}\n\n"
-            f"Result:\n{_result_preview}\n\n"
-            "Summarize this naturally for the user. Keep it brief (1-2 sentences). "
-            "Do not mention technical details like 'subagent' or task IDs."
+            f"[Subagent '{_disp}' {status_text}{duration}] run_id={run_id}{_tool_summary}\n\n"
+            f"Brief: {brief}\n\n"
+            f"Result:\n{shown}{more}\n\n"
+            "This is the subagent's own report: check what matters before relying "
+            "on it, and don't redo its work. Tell the owner what it means for their "
+            "request in your own words; don't show run ids."
         )
 
         parent_session_key = record.parent_session_key
@@ -1451,7 +1485,7 @@ Do not create, patch, install, or manage skills. Do not edit project files or ru
         except asyncio.CancelledError:
             pass
         record = self._registry.get(run_id)
-        return json.dumps({"status": record.outcome if record else "cancelled", "run_id": run_id[:8]})
+        return json.dumps({"status": record.outcome if record else "cancelled", "run_id": run_id})
 
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""

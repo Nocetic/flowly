@@ -4500,6 +4500,8 @@ async def subagents_spawn(params: dict) -> dict:
         origin_chat_id=origin_chat_id,
         cleanup="keep",
         wait=False,
+        # The owner typed this task in a client: it is theirs.
+        origin="owner",
     )
     # An async (wait=False) spawn always returns a JSON envelope: on success
     # ``{"status": "dispatched", "run_id": ..., "label": ...}``, on refusal
@@ -4513,7 +4515,7 @@ async def subagents_spawn(params: dict) -> dict:
         except Exception:
             payload = {}
     status = str(payload.get("status") or "")
-    if status in ("rejected", "forbidden", "error"):
+    if status in ("rejected", "forbidden", "error", "refused"):
         raise FeatureRpcError(
             "REJECTED",
             str(payload.get("error") or payload.get("message") or "subagent spawn refused"),

@@ -2050,8 +2050,16 @@ If a scheduled job tool call fails, include the error in your response — do no
         background_lines: list[str] = []
         if has_tool("spawn"):
             background_lines.extend([
-                "Use `spawn` for tasks taking 15+ seconds (web research, file analysis, builds).",
-                "Do not spawn for quick commands, screenshots, or when the user needs an answer now.",
+                "**Subagents (`spawn`).** Do the work yourself — a long or detailed task "
+                "is still yours. Start a subagent only when the owner asks for one, or "
+                "when the work splits into independent parts (then one `spawn` per "
+                "part, in the same response). Never hand off the step your next action "
+                "depends on.",
+                "Write each brief for a newcomer: the goal, what you already know, the "
+                "sources to use, what is out of scope, and what to return.",
+                "While subagents run, keep doing the parts that don't depend on them; "
+                "each result reaches you as a message. Treat a result as the "
+                "subagent's own report: check what matters, don't redo its work.",
             ])
         if has_tool("sessions_list"):
             background_lines.extend([

@@ -60,6 +60,12 @@ class SubagentRunRecord:
     result_available: bool = False
     artifact_ids: list[str] = field(default_factory=list)
     delivery_state: str = "pending"
+    # Who started it: "owner" (asked for it), "agent" (split its own work) or
+    # "system" (self-review, Board, a scheduled run). Clients show the first
+    # two in the conversation that started them.
+    origin: str = "agent"
+    # The shape and hue every client draws for this run: {"glyph", "hue"}.
+    mark: dict[str, Any] = field(default_factory=dict)
 
 
 
@@ -114,6 +120,10 @@ class SubagentRegistry:
             raise ValueError("invalid tool history")
         if not isinstance(record.artifact_ids, list) or any(not isinstance(x, str) for x in record.artifact_ids):
             raise ValueError("invalid artifact references")
+        if record.origin not in ("owner", "agent", "system"):
+            raise ValueError("invalid run origin")
+        if not isinstance(record.mark, dict):
+            raise ValueError("invalid run mark")
         return record
 
     def _read_locked(self) -> None:

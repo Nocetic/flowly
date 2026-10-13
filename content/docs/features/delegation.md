@@ -7,40 +7,39 @@ group: Automation
 
 The two delegation mechanisms share almost no code, behave differently, and are set up differently:
 
-1. **In-process subagents** — lightweight agent instances that run inside the same Flowly process, with an isolated context and a restricted tool registry. Reached by the agent via the `spawn` tool.
+1. **In-process subagents** — lightweight agent instances that run inside the same Flowly process, with an isolated context and a restricted tool registry. Started by the agent with the `spawn` tool.
 2. **CLI-subprocess agents and teams** — external coding CLIs (Claude Code, Codex, Gemini, opencode, droid) invoked as subprocesses. Reached via the `delegate_to` tool and orchestrated into teams by an orchestrator. Set up with `flowly setup agents`.
 
 The desktop UI unifies both under one "Agents" tab, but the implementations are independent.
 
 ## In-process subagents
 
-When the main agent decides a task should run in isolation (a focused write-up, a research pass, a self-review), it calls the `spawn` tool. The `SubagentManager` then creates a subagent that:
+The agent does its work itself — a long or detailed task is still its own. It starts a subagent with the `spawn` tool only when:
 
-- Runs in the **same Python process** and shares the parent's LLM provider.
-- Gets an **isolated message list** — no parent conversation history is passed in. The subagent only sees a focused system prompt plus the task you assigned it.
-- Gets a **fresh, restricted tool registry**. Subagents can build only these tools: `read_file`, `write_file`, `edit_file`, `list_dir`, `memory_append`, `exec`, `web_search`, `web_fetch`, `skill_manage`, `knowledge_graph`, `artifact`. A `self-review` run is forced to `memory_append` + `knowledge_graph` only.
-- **Cannot spawn its own subagents** (no recursion). The tools `spawn` and `delegate_to` are blocked inside subagents, along with cron, user-facing I/O (`message`, `voice_call`, `email`), external writes (`google_*`, `linear`, `trello`, `x`), GUI/gateway tools (`screenshot`, `browser_tab`, `computer`), cross-session reads (`sessions_list`, `session_search`, `memory_search`, `memory_get` — note `memory_append` stays allowed), and `system` / `docker` / `process`.
+- **you ask for one** ("give this to Luna", "let two agents look at it"). The agent quotes your words in the call and Flowly checks that you really wrote them in that message, so nothing a tool returned or the agent assumed can stand in for you; or
+- **the work splits into independent parts** — say, researching three companies — and the agent starts one subagent per part in the same reply while it keeps the part its next step depends on.
 
-### Results announced back to the parent
+A single subagent the agent starts on its own initiative is refused and the agent does the task itself. At most **3** subagents run per conversation at once (8 across the whole agent).
 
-Subagents do not return their output as a normal tool result you have to wait on. When a subagent finishes, the manager **announces** its result back into the parent session as a system message: a status line, the run duration, a `Tools used: …` summary, and a result preview truncated to **2000 characters**. If the parent session is busy when the child finishes, the announcement is queued and delivered when the session frees up.
+When it starts one, the agent writes the subagent's brief itself: the goal, what it already knows, the sources to use, what is out of scope and what to return. The subagent:
 
-By default `spawn` runs **fire-and-forget** (async): it returns a `dispatched` envelope immediately and the result is announced later. The envelope deliberately includes verbose "required next steps" wording to stop the parent from inventing an answer before the child has actually finished.
+- Runs in the **same Python process** and shares the parent's LLM provider. It runs on the agent's own model unless you named another one for that task.
+- Reads **the conversation so far** — your messages and the agent's replies, without tool calls, tool output or reasoning — then its brief. The agent can start it without the conversation for unrelated work. It also gets your memory and known facts.
+- Gets a **fresh, restricted tool registry**: `read_file`, `write_file`, `edit_file`, `list_dir`, `memory_append`, `exec`, `web_search`, `web_fetch`, `web_extract`, `skill_manage`, `knowledge_graph`, `artifact`. A `self-review` run is forced to `memory_append` + `knowledge_graph` only.
+- **Cannot spawn its own subagents** (no recursion). The tools `spawn`, `agent_read` and `delegate_to` are blocked inside subagents, along with cron, user-facing I/O (`message`, `voice_call`, `email`), external writes (`google_*`, `linear`, `trello`, `x`), GUI/gateway tools (`screenshot`, `browser_tab`, `computer`), cross-session reads (`sessions_list`, `session_search`, `memory_search`, `memory_get` — `memory_append` stays allowed), and `system` / `docker` / `process`.
 
-### Concurrency and timeouts
+### The agent keeps working
 
-> [!WARNING]
-> **Concurrency is a hard cap of `MAX_CONCURRENT = 5`** parallel children per `SubagentManager`. This is a literal constant in the code — **it is not configurable** and there is no config key for it. Spawning over the cap returns a `rejected` status.
+Starting a subagent returns at once with its run id; the agent carries on with whatever doesn't depend on it. When the subagent finishes, its result reaches the agent as a message: the title, the run id, the tools it used and up to 8,000 characters of its result. The agent reads anything beyond that with `agent_read`, which only ever shows runs started in the same conversation. If the conversation is busy when a subagent finishes, the message waits until it frees up.
 
-- **Wall-clock cap:** each subagent run is bounded by a `900`-second wall-clock timeout.
-- **`spawn` per-call timeout:** defaults to `600` seconds if unset, and is clamped to the range `[120, 1800]` seconds.
-- Each subagent also runs a bounded loop (max 15 iterations) and a 120-second per-tool timeout.
+### Limits
 
-If you abort the parent turn, all of that session's running children are cancelled.
+- Each subagent run is bounded by a **30-minute** wall-clock timeout and **30** model calls, with a 120-second per-tool timeout.
+- If you stop the conversation's turn, its running subagents are stopped too.
 
 ### No stored specialists
 
-There are no predefined researcher, writer or coder agents and nothing to set up: the agent creates a subagent for a task itself and writes its instructions then. Assistant files made by earlier versions under `~/.flowly/assistants/` are left on disk and no longer read.
+There are no predefined researcher, writer or coder agents and nothing to set up. Assistant files made by earlier versions under `~/.flowly/assistants/` are left on disk and no longer read.
 
 ## CLI-subprocess agents and teams
 

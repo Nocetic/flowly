@@ -262,19 +262,37 @@ class TestSubagentRecursionGuard:
     async def test_concurrency_cap_is_enforced(self, tmp_path: Path) -> None:
         mgr = _build_manager(tmp_path, sleep=2.0)
         accepted = 0
-        for i in range(7):
+        for i in range(10):
             r = await mgr.spawn(
                 task=f"job {i}",
                 label=f"j{i}",
                 origin_channel="cli",
                 origin_chat_id="cap-test",
             )
-            if '"status": "dispatched"' in r:
+            if '"status": "started"' in r:
                 accepted += 1
-        # Max 5 per the SubagentManager constant — the rest must be rejected.
-        assert accepted == 5
+        # Max 8 across the whole process — the rest must be rejected.
+        assert accepted == 8
         # Clean up.
         mgr.cancel_children("cli:cap-test")
+        await asyncio.sleep(0.1)
+
+    @pytest.mark.asyncio
+    async def test_one_conversation_runs_at_most_three_of_its_own(self, tmp_path: Path) -> None:
+        mgr = _build_manager(tmp_path, sleep=2.0)
+        outcomes = []
+        for i in range(5):
+            r = json.loads(await mgr.spawn(
+                task=f"part {i}", origin_channel="web", origin_chat_id="busy", origin="agent",
+            ))
+            outcomes.append(r["status"])
+        assert outcomes == ["started"] * 3 + ["rejected"] * 2
+        # Another conversation still has room.
+        other = json.loads(await mgr.spawn(
+            task="elsewhere", origin_channel="web", origin_chat_id="calm", origin="owner",
+        ))
+        assert other["status"] == "started"
+        mgr.cancel_all()
         await asyncio.sleep(0.1)
 
 
@@ -665,8 +683,8 @@ class TestMaxIterationsGraceCall:
         )
         # Grace call fired exactly once, with tools=None.
         assert provider.saw_tools_none is True, "grace-call never fired"
-        # provider hit 15 tool-loop calls + 1 grace call = 16 total.
-        assert provider.calls == 16
+        # provider hit 30 tool-loop calls + 1 grace call = 31 total.
+        assert provider.calls == 31
         # The final_result carries the grace-call summary, NOT the
         # silent "no final response" fallback.
         assert "iteration cap" in result
