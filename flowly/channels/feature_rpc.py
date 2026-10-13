@@ -4443,7 +4443,8 @@ def subagents_transcript(params: dict) -> dict:
     sequence number, so a client polls with the ``nextSeq`` it last got;
     ``limit`` (default 200, max 1000). ``done`` tells whether the run ended.
     """
-    registry, record = _subagent_record(params)
+    # A client may still hold an 8-character id from an older notice.
+    registry, record = _subagent_record(params, allow_prefix=True)
     after = params.get("after", 0)
     limit = params.get("limit", 200)
     try:

@@ -94,6 +94,10 @@ class SubagentRegistry:
         self._path = path or _default_registry_path()
         self._transcript_lock = threading.Lock()
         self._transcript_seq: dict[str, int] = {}
+        # run_id → (seq, byte offset just past that step): a client polling
+        # with the cursor it last got resumes there instead of re-reading the
+        # whole transcript on every poll.
+        self._transcript_cursor: dict[str, tuple[int, int]] = {}
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = FileLock(str(self._path) + ".lock", timeout=5)
         self._runs: dict[str, SubagentRunRecord] = {}
@@ -261,18 +265,32 @@ class SubagentRegistry:
         path = self._transcript_path(run_id)
         more = False
         if path.exists():
-            with path.open(encoding="utf-8") as stream:
-                for line in stream:
+            cached = self._transcript_cursor.get(run_id)
+            start = cached[1] if cached and cached[0] == after else 0
+            with path.open("rb") as stream:
+                stream.seek(start)
+                position = start
+                last_seq, last_end = after, start
+                while True:
+                    raw = stream.readline()
+                    if not raw:
+                        break
+                    position += len(raw)
+                    if not raw.endswith(b"\n"):
+                        break  # a step still being written, or torn by a crash
                     try:
-                        entry = json.loads(line)
+                        entry = json.loads(raw)
                     except ValueError:
-                        continue  # a torn last line from a crash
+                        continue
                     if not isinstance(entry, dict) or int(entry.get("seq", 0)) <= after:
                         continue
                     if len(items) >= limit:
                         more = True
                         break
                     items.append(entry)
+                    last_seq, last_end = int(entry["seq"]), position
+            if items:
+                self._transcript_cursor[run_id] = (last_seq, last_end)
         last = items[-1]["seq"] if items else after
         return {"runId": run_id, "items": items, "nextSeq": last,
                 "more": more, "done": record.ended_at is not None}

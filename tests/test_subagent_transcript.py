@@ -117,3 +117,27 @@ async def test_transcripts_are_kept_for_weeks_and_pruned_with_their_run(tmp_path
     with reopened._lock:
         reopened._write_locked()
     assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_polling_resumes_where_it_left_off_and_sees_new_steps(tmp_path):
+    manager, run_id = await _run(tmp_path)
+    registry = manager.registry
+    first = registry.read_transcript(run_id, after=0, limit=2)
+    # A later step written after the client's last poll.
+    registry._runs[run_id].ended_at = None
+    registry.append_transcript(run_id, {"kind": "message_in", "from": "orchestrator", "content": "late"})
+    rest = registry.read_transcript(run_id, after=first["nextSeq"])
+    assert [i["seq"] for i in rest["items"]] == [3, 4, 5]
+    assert rest["items"][-1]["content"] == "late"
+    # A cursor the cache does not hold still reads correctly from the start.
+    again = registry.read_transcript(run_id, after=1, limit=1)
+    assert [i["seq"] for i in again["items"]] == [2]
+
+
+@pytest.mark.asyncio
+async def test_an_old_short_id_still_opens_the_transcript(tmp_path, monkeypatch):
+    manager, run_id = await _run(tmp_path)
+    monkeypatch.setattr(feature_rpc, "_subagent_registry", lambda: manager.registry)
+    result, _ = await dispatch("subagents.transcript", {"runId": run_id[:8]})
+    assert result["runId"] == run_id and len(result["items"]) == 4
