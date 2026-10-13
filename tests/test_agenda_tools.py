@@ -61,6 +61,18 @@ async def test_the_daily_review_names_the_conversation():
 
 
 @pytest.mark.asyncio
+async def test_a_time_in_quiet_hours_is_told_as_it_will_happen():
+    """The agent must not promise 00:57 when the policy may hold it to 09:00."""
+    get_agenda_store().update_settings({"quietStart": "22:00", "quietEnd": "09:00"})
+    night = await _call(FollowUpTool(), CHAT, action="schedule", when="tomorrow 02:00", note="Ask about sleep")
+    assert "quiet hours (22:00-09:00)" in night and "otherwise at 09:00" in night
+    day = await _call(FollowUpTool(), CHAT, action="schedule", when="tomorrow 14:00", note="Ask about lunch")
+    assert "quiet hours" not in day
+    goal = await _call(ObjectiveTool(), CHAT, action="create", title="Sleep earlier", next_check="tomorrow 23:30")
+    assert "First check-in" in goal and "quiet hours" in goal
+
+
+@pytest.mark.asyncio
 async def test_bad_times_and_notes_are_refused_with_a_reason():
     assert (await _call(FollowUpTool(), CHAT, action="schedule", when="someday", note="x")).startswith("Error:")
     assert (await _call(FollowUpTool(), CHAT, action="schedule", when="+1h", note="")).startswith("Error:")

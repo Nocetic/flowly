@@ -221,6 +221,7 @@ class AgendaService:
             session_busy=bool(self._is_busy(item["sessionKey"])),
             objective_status=goal_status,
             is_objective=item.get("kind") == "objective",
+            owner_last_active_ms=self.store.last_owner_at(),
         )
         return facts, settings, zone
 

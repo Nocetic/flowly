@@ -55,6 +55,23 @@ def owner_now() -> tuple[dt.datetime, dt.tzinfo]:
     return dt.datetime.now(zone), zone
 
 
+def timing_note(due_ms: int, zone: dt.tzinfo) -> str:
+    """What the owner should hear about a time inside their quiet hours, so the
+    agent never promises a minute the policy will not keep."""
+    from flowly.agenda import policy
+    from flowly.agenda.store import get_agenda_store
+
+    settings = get_agenda_store().settings()
+    start = settings.get("quietStart") or policy.DEFAULT_QUIET_START
+    end = settings.get("quietEnd") or policy.DEFAULT_QUIET_END
+    if policy.quiet_until(due_ms, zone, start, end) is None:
+        return ""
+    return (
+        f" That is inside the owner's quiet hours ({start}-{end}): it happens on time only if they "
+        f"are still writing to you then, otherwise at {end}. Say so when you tell them the time."
+    )
+
+
 class FollowUpTool(Tool):
     @property
     def name(self) -> str:
@@ -122,6 +139,7 @@ class FollowUpTool(Tool):
                 return (
                     f"Follow-up {item['id']} planned for {describe(due, zone)} in this conversation. "
                     "You will wake up here then; the owner is not told now unless you tell them."
+                    + timing_note(due, zone)
                 )
             if action == "list":
                 _now, zone = owner_now()

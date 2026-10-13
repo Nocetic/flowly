@@ -7,7 +7,9 @@ the owner's settings and from what happened to the agent's earlier messages:
 - **Proactivity level** (per agent): ``off`` never writes first; ``low``,
   ``normal`` and ``high`` allow 1, 2 and 4 messages a day.
 - **Quiet hours** (owner's timezone): nothing is sent inside them; the
-  wake-up waits for the window to end.
+  wake-up waits for the window to end. Unless the owner wrote within
+  :data:`OWNER_AWAKE_MS`: someone who asked at 00:54 for a check-in at 00:57
+  is up, and holding it until morning breaks the promise for nothing.
 - **One budget for every agent**: :data:`GLOBAL_DAILY_CAP` messages a day
   across all of the owner's agents together, so five agents do not mean five
   times the interruptions (:mod:`flowly.agenda.budget`).
@@ -36,6 +38,9 @@ MAX_UNANSWERED = 3
 BACKOFF_BASE_MS = 12 * 60 * 60 * 1000
 #: How long a wake-up waits for a running turn in its conversation.
 BUSY_RETRY_MS = 3 * 60 * 1000
+#: The owner wrote this recently: they are up, and quiet hours do not hold a
+#: wake-up back.
+OWNER_AWAKE_MS = 30 * 60 * 1000
 
 DEFAULT_QUIET_START = "22:00"
 DEFAULT_QUIET_END = "09:00"
@@ -65,6 +70,13 @@ class Facts:
     #: For a goal's check-in: the goal's status; None when not about a goal.
     objective_status: str | None = None
     is_objective: bool = False
+    #: When the owner last wrote to this agent, in any conversation (ms).
+    owner_last_active_ms: int | None = None
+
+
+def owner_awake(facts: Facts) -> bool:
+    last = facts.owner_last_active_ms
+    return last is not None and 0 <= facts.now_ms - last <= OWNER_AWAKE_MS
 
 
 def parse_clock(text: str, fallback: str) -> tuple[int, int]:
@@ -125,7 +137,7 @@ def decide(facts: Facts) -> Decision:
         return Decision("drop", "owner_not_answering")
 
     quiet = quiet_until(facts.now_ms, facts.zone, facts.quiet_start, facts.quiet_end)
-    if quiet is not None:
+    if quiet is not None and not owner_awake(facts):
         return Decision("defer", "quiet_hours", quiet)
 
     if facts.unanswered > 0 and facts.last_proactive_ms is not None:

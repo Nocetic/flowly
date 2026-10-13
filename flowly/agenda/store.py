@@ -345,6 +345,11 @@ class AgendaStore:
     def conversation(self, session_key: str) -> dict[str, Any]:
         return dict(self.snapshot()["conversations"].get(session_key) or {})
 
+    def last_owner_at(self) -> int | None:
+        """When the owner last wrote to this agent, in any conversation."""
+        value = self.snapshot().get("lastOwnerAt")
+        return int(value) if isinstance(value, (int, float)) and value > 0 else None
+
     def owner_wrote(self, session_key: str, now_ms: int | None = None) -> int:
         """The owner wrote in ``session_key``: their silence is over there, and
         follow-ups waiting on that conversation's last exchange are moot.

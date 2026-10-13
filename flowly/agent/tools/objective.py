@@ -17,7 +17,7 @@ import json
 from typing import Any
 
 from flowly.agent.tools.base import Tool
-from flowly.agent.tools.follow_up import owner_now, resolve_conversation
+from flowly.agent.tools.follow_up import owner_now, resolve_conversation, timing_note
 from flowly.objectives.store import CATEGORIES, ObjectiveError
 
 _FIELD_MAP = {
@@ -156,7 +156,7 @@ class ObjectiveTool(Tool):
                     kind="objective", due_at=due, session_key=key, objective_id=goal["id"],
                     note=args.get("check_note") or f"Check in on: {goal['title']}",
                 )
-                message += f" First check-in {describe(due, zone)}."
+                message += f" First check-in {describe(due, zone)}." + timing_note(due, zone)
             else:
                 message += " No check-in planned yet: set one with next_check."
             return message + " Tell the owner you will keep track of it."
@@ -194,7 +194,7 @@ class ObjectiveTool(Tool):
                     kind="objective", due_at=due, session_key=key, objective_id=goal_id,
                     note=args.get("check_note") or f"Check in on: {goal['title']}",
                 )
-                message_parts.append(f"Next check-in {describe(due, zone)}.")
+                message_parts.append(f"Next check-in {describe(due, zone)}." + timing_note(due, zone))
             if not message_parts:
                 return "Error: nothing to update (give fields to change or next_check)."
             return " ".join(message_parts)

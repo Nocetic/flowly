@@ -54,6 +54,19 @@ def test_quiet_hours_wait_for_the_morning_overnight():
     assert policy.decide(_facts(now_ms=early)).until_ms == _ms(2026, 10, 14, 9)
 
 
+def test_quiet_hours_do_not_hold_back_an_owner_who_is_up():
+    """Asked at 00:54 for a check-in at 00:57: the owner is awake, so it goes
+    out then, not at 09:00. Half an hour of silence and the night holds again."""
+    asked, due = _ms(2026, 10, 14, 0, 54), _ms(2026, 10, 14, 0, 57)
+    assert policy.decide(_facts(now_ms=due, owner_last_active_ms=asked)) == policy.Decision("run")
+    later = _ms(2026, 10, 14, 1, 30)
+    decision = policy.decide(_facts(now_ms=later, owner_last_active_ms=asked))
+    assert decision.reason == "quiet_hours" and decision.until_ms == _ms(2026, 10, 14, 9)
+    # The other limits still hold for an owner who is up.
+    capped = policy.decide(_facts(now_ms=due, owner_last_active_ms=asked, sent_today_by_agent=2))
+    assert capped.reason == "agent_daily_limit"
+
+
 def test_quiet_hours_within_one_day():
     afternoon = _ms(2026, 10, 13, 14)
     decision = policy.decide(_facts(now_ms=afternoon, quiet_start="13:00", quiet_end="15:30"))
